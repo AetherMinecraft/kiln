@@ -28,6 +28,7 @@ import type {
 } from "@workspace/contracts"
 
 import { actionsForRole, isActionAllowed } from "./permissions.js"
+import { relayBuildLabel } from "./build-info.js"
 import { isSourceAllowed } from "./source-policy.js"
 import type { RelayAction } from "./permissions.js"
 import type { RelayIdentity } from "./effect/identity.js"
@@ -463,7 +464,7 @@ function authenticateSocket(
       actions: actionsForRole(client.role, client.actions),
       clientId: client.id,
       protocol: relayControlProtocol,
-      relayBuild: process.env.SOURCE_COMMIT?.trim() || "development",
+      relayBuild: relayBuildLabel(),
       role: client.role,
       type: "auth.ready",
       v: 1,

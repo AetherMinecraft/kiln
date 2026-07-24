@@ -1,6 +1,7 @@
 import * as Sentry from "@sentry/node"
 
 const dsn = process.env.SENTRY_DSN?.trim()
+const bakedCommit = String(import.meta.env.KILN_BUILD_SHA ?? "").trim()
 
 if (dsn) {
   Sentry.init({
@@ -9,7 +10,7 @@ if (dsn) {
       process.env.SENTRY_ENVIRONMENT ||
       process.env.KILN_ENVIRONMENT ||
       "production",
-    release: process.env.SENTRY_RELEASE || process.env.SOURCE_COMMIT,
+    release: process.env.SENTRY_RELEASE || bakedCommit || undefined,
     sendDefaultPii: false,
     tracesSampleRate: parseSampleRate(
       process.env.SENTRY_TRACES_SAMPLE_RATE,

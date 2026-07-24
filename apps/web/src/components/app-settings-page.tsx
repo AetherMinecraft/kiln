@@ -647,9 +647,7 @@ const RelayStaticCells = React.memo(function RelayStaticCells({
         </Tooltip>
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden lg:table-cell">
-        <span className="block truncate font-mono text-[9px] text-foreground">
-          {relay.nodeVersion ?? "—"}
-        </span>
+        <RelayVersion version={relay.nodeVersion} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden xl:table-cell">
         <span className="font-mono text-[9px] text-foreground">
@@ -1686,6 +1684,43 @@ function relayRowKey(relay: RelayTableItem): string {
 
 function shortRelayId(id: string): string {
   return id.slice(0, 7)
+}
+
+const hearthRepositoryUrl = "https://github.com/kiln-site/hearth"
+
+function isGitCommitSha(value: string): boolean {
+  return /^[0-9a-f]{7,40}$/i.test(value)
+}
+
+function RelayVersion({ version }: { version: string | null }) {
+  if (!version) {
+    return (
+      <span className="block truncate font-mono text-[9px] text-foreground">
+        —
+      </span>
+    )
+  }
+
+  if (!isGitCommitSha(version)) {
+    return (
+      <span className="block truncate font-mono text-[9px] text-foreground">
+        {version}
+      </span>
+    )
+  }
+
+  const shortCommit = version.slice(0, 7)
+  return (
+    <a
+      href={`${hearthRepositoryUrl}/commit/${version}`}
+      target="_blank"
+      rel="noreferrer"
+      aria-label={`View Relay commit ${version}`}
+      className="block truncate font-mono text-[9px] text-primary/90 transition-colors hover:text-primary focus-visible:text-primary focus-visible:outline-none"
+    >
+      {shortCommit}
+    </a>
+  )
 }
 
 function formatUptime(seconds: number | null): string {

@@ -11,11 +11,12 @@ import { statfs } from "node:fs/promises"
 
 import type { RelayNode } from "@workspace/contracts"
 
+import { relayBuildLabel } from "./build-info.js"
 import type { RelayConfig } from "./config.js"
 import type { DockerDriver } from "./docker.js"
 
 const connectedAt = new Date().toISOString()
-const relayVersion = buildVersion()
+const relayVersion = relayBuildLabel()
 
 export async function nodeSnapshot(
   config: RelayConfig,
@@ -59,13 +60,4 @@ export async function nodeSnapshot(
     },
     connectedAt,
   }
-}
-
-function buildVersion(): string {
-  const commit = (
-    process.env.SOURCE_COMMIT ??
-    process.env.SENTRY_RELEASE ??
-    ""
-  ).trim()
-  return commit ? commit.slice(0, 8) : "development"
 }

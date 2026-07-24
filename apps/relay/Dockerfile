@@ -16,6 +16,9 @@ RUN --mount=type=cache,target=/home/vp/.local/share/pnpm/store,uid=1000,gid=1000
 COPY --chown=vp:vp tsconfig.json vite.config.ts ./
 COPY --chown=vp:vp apps/relay ./apps/relay
 COPY --chown=vp:vp packages/contracts ./packages/contracts
+
+ARG SOURCE_COMMIT
+ENV SOURCE_COMMIT=$SOURCE_COMMIT
 RUN vp run relay#build && \
   npm_config_ignore_scripts=true corepack pnpm --config.allowUnusedPatches=true \
     --filter relay deploy --prod --no-optional --legacy /source/runtime
@@ -24,9 +27,7 @@ FROM docker:29.6.2-cli AS docker-cli
 
 FROM gcr.io/distroless/nodejs24-debian12 AS runtime
 
-ARG SOURCE_COMMIT
 ENV NODE_ENV=production
-ENV SOURCE_COMMIT=$SOURCE_COMMIT
 WORKDIR /app
 
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
