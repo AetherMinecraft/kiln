@@ -474,16 +474,29 @@ export const relayConsoleLevelSchema = z.enum([
   "trace",
 ])
 
+export const relayConsoleSegmentSchema = z.object({
+  text: z.string(),
+  color: z
+    .string()
+    .regex(/^#[\da-f]{6}$/iu)
+    .optional(),
+  bold: z.boolean().optional(),
+  italic: z.boolean().optional(),
+  underline: z.boolean().optional(),
+})
+
 export const relayConsoleLineSchema = z.object({
   id: z.string().min(1),
   timestamp: z.string().datetime().nullable(),
   level: relayConsoleLevelSchema,
   text: z.string(),
+  segments: z.array(relayConsoleSegmentSchema).optional(),
 })
 
 export const relayConsoleSchema = z.object({
   instanceId: z.string().min(1),
   lines: z.array(relayConsoleLineSchema),
+  startedAt: z.string().datetime().nullable().optional(),
   truncated: z.boolean(),
 })
 
@@ -491,6 +504,21 @@ export const relayConsoleStreamEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("ready"),
     instanceId: z.string().min(1),
+    startedAt: z.string().datetime().nullable().optional(),
+  }),
+  z.object({
+    type: z.literal("reset"),
+    instanceId: z.string().min(1),
+    startedAt: z.string().datetime().nullable(),
+    lines: z.array(relayConsoleLineSchema),
+    truncated: z.boolean(),
+  }),
+  z.object({
+    type: z.literal("history"),
+    instanceId: z.string().min(1),
+    startedAt: z.string().datetime().nullable(),
+    lines: z.array(relayConsoleLineSchema),
+    truncated: z.boolean(),
   }),
   z.object({
     type: z.literal("line"),
@@ -552,6 +580,18 @@ export const relayLatestLogSchema = z.object({
   size: z.number().int().nonnegative(),
 })
 
+export const relayConsoleShareInputSchema = z.object({
+  implementation: z.string().min(1),
+  version: z.string().min(1),
+  redactSensitive: z.boolean().default(false),
+})
+
+export const relayMclogsUploadResultSchema = z.object({
+  id: z.string().min(1),
+  url: z.url(),
+  expires: z.number().int(),
+})
+
 export const relayErrorSchema = z.object({
   error: z.string(),
   code: z.string(),
@@ -611,6 +651,7 @@ export type RelayFileActivityEntry = z.infer<
 export type RelayFileActivity = z.infer<typeof relayFileActivitySchema>
 export type RelayInstanceAction = z.infer<typeof relayInstanceActionSchema>
 export type RelayConsoleLevel = z.infer<typeof relayConsoleLevelSchema>
+export type RelayConsoleSegment = z.infer<typeof relayConsoleSegmentSchema>
 export type RelayConsoleLine = z.infer<typeof relayConsoleLineSchema>
 export type RelayConsole = z.infer<typeof relayConsoleSchema>
 export type RelayConsoleStreamEvent = z.infer<
@@ -628,5 +669,11 @@ export type RelayConsoleCompletionInput = z.infer<
 >
 export type RelayConsoleCompletion = z.infer<
   typeof relayConsoleCompletionSchema
+>
+export type RelayConsoleShareInput = z.infer<
+  typeof relayConsoleShareInputSchema
+>
+export type RelayMclogsUploadResult = z.infer<
+  typeof relayMclogsUploadResultSchema
 >
 export type RelayLatestLog = z.infer<typeof relayLatestLogSchema>

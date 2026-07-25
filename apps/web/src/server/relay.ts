@@ -12,9 +12,9 @@ import {
   relayInstanceNameSchema,
   relayInstanceWebRouteInputsSchema,
   relayInstanceWebRouteStateSchema,
+  relayMclogsUploadResultSchema,
   relayIdSchema,
   relayInstanceSchema,
-  relayLatestLogSchema,
   relaySaveFileInputSchema,
   relaySnapshotSchema,
 } from "@workspace/contracts"
@@ -453,25 +453,26 @@ export const uploadToMclogs = createServerFn({ method: "POST" })
     return uploadLog(data)
   })
 
-export const uploadLatestLogToMclogs = createServerFn({ method: "POST" })
+export const uploadConsoleLogToMclogs = createServerFn({ method: "POST" })
   .validator(consoleShareInputSchema)
   .handler(async ({ data }) => {
-    const latest = relayLatestLogSchema.parse(
+    return relayMclogsUploadResultSchema.parse(
       await relayRequest(
-        `/v1/instances/${encodeURIComponent(data.instanceId)}/latest-log`,
-        undefined,
+        `/v1/instances/${encodeURIComponent(data.instanceId)}/console-share`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            implementation: data.implementation,
+            redactSensitive: data.redactSensitive,
+            version: data.version,
+          }),
+        },
         "instance.logs.share",
         data.instanceId,
-        data.relayId
+        data.relayId,
+        60_000
       )
     )
-    return uploadLog({
-      ...data,
-      content: data.redactSensitive
-        ? redactSensitiveText(latest.content)
-        : latest.content,
-      path: latest.path,
-    })
   })
 
 function uploadLog(data: z.infer<typeof mclogsUploadInputSchema>) {
@@ -799,23 +800,4 @@ function publicRelayState<TStatus extends RelayReachability | "paused">(entry: {
     name: entry.relay.name,
     status: entry.status,
   }
-}
-
-function redactSensitiveText(value: string): string {
-  return value
-    .replace(
-      /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/gu,
-      (candidate) =>
-        candidate
-          .split(".")
-          .map(() => "***")
-          .join(".")
-    )
-    .replace(
-      /(?<![\w:])(?:[a-f\d]{0,4}:){2,7}[a-f\d]{0,4}(?![\w:])/giu,
-      (candidate) =>
-        candidate.includes("::") || candidate.split(":").length - 1 >= 5
-          ? candidate.replace(/[a-f\d]/giu, "*")
-          : candidate
-    )
 }

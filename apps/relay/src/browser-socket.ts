@@ -13,15 +13,22 @@ import * as Sentry from "@sentry/node"
 import {
   relayBrowserProofTranscript,
   relayBrowserRequestProofTranscript,
+  relayBrowserConsoleProtocol,
+  relayBrowserConsoleProtocols,
   relayBrowserProtocol,
 } from "@workspace/contracts"
-import type { RelayConsoleLine } from "@workspace/contracts"
+import type { RelayConsole, RelayConsoleLine } from "@workspace/contracts"
 import {
   relayConsoleCommandSchema,
   relayConsoleCompletionInputSchema,
 } from "@workspace/contracts"
 
 import type { DockerDriver } from "./docker.js"
+import {
+  encodeConsoleHistoryFrames,
+  encodeConsoleLineFrame,
+  encodeNewestConsoleBatch,
+} from "./console-frames.js"
 import type { FilesystemDriver } from "./files.js"
 import type { RelayInstanceConfig } from "./config.js"
 import type { RelayIdentity } from "./effect/identity.js"
@@ -128,12 +135,19 @@ export function attachBrowserSocket(
   const requestProofs = new Map<string, number>()
   const pendingRequestProofs = new Set<string>()
   const transfers = { active: 0, byClient: new Map<string, number>() }
-  const hubs = new ConsoleHubRegistry(options.docker)
+  const hubs = new ConsoleHubRegistry(
+    options.docker,
+    options.subscribeSnapshots
+  )
   const resourceHubs = new ResourceHubRegistry(options.subscribeSnapshots)
   const wss = new WebSocketServer({
     clientTracking: false,
-    handleProtocols: (protocols) =>
-      protocols.has(relayBrowserProtocol) ? relayBrowserProtocol : false,
+    handleProtocols: (protocols) => {
+      if (protocols.has(relayBrowserConsoleProtocol)) {
+        return relayBrowserConsoleProtocol
+      }
+      return protocols.has(relayBrowserProtocol) ? relayBrowserProtocol : false
+    },
     maxPayload: 64 * 1024,
     noServer: true,
     perMessageDeflate: false,
@@ -142,9 +156,12 @@ export function attachBrowserSocket(
   options.server.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "/", "http://relay")
     if (url.pathname !== "/v1/browser") return
+    const requestedProtocols = parseProtocols(
+      request.headers["sec-websocket-protocol"]
+    )
     if (
-      !parseProtocols(request.headers["sec-websocket-protocol"]).includes(
-        relayBrowserProtocol
+      !relayBrowserConsoleProtocols.some((protocol) =>
+        requestedProtocols.includes(protocol)
       )
     ) {
       socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n")
@@ -348,13 +365,18 @@ function authenticateBrowser(
     const validProof = verify(
       "sha256",
       Buffer.from(
-        relayBrowserProofTranscript({
-          capabilityId: parsed.payload.capabilityId,
-          expiresAt: challenge.expiresAt,
-          nonce: challenge.nonce,
-          relayId: challenge.relayId,
-          sessionId: challenge.sessionId,
-        })
+        relayBrowserProofTranscript(
+          {
+            capabilityId: parsed.payload.capabilityId,
+            expiresAt: challenge.expiresAt,
+            nonce: challenge.nonce,
+            relayId: challenge.relayId,
+            sessionId: challenge.sessionId,
+          },
+          socket.protocol === relayBrowserConsoleProtocol
+            ? relayBrowserConsoleProtocol
+            : relayBrowserProtocol
+        )
       ),
       { dsaEncoding: "ieee-p1363", key: browserKey },
       Buffer.from(auth.signature, "base64url")
@@ -926,10 +948,15 @@ class ConsoleHubRegistry {
   readonly #docker: DockerDriver
   readonly #hubs = new Map<string, ConsoleHub>()
   readonly #pendingHubs = new Map<string, Promise<ConsoleHub>>()
+  readonly #subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"]
   readonly #subscriptions = new Map<WebSocket, string>()
 
-  constructor(docker: DockerDriver) {
+  constructor(
+    docker: DockerDriver,
+    subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"]
+  ) {
     this.#docker = docker
+    this.#subscribeSnapshots = subscribeSnapshots
   }
 
   async subscribe(socket: WebSocket, instanceId: string): Promise<void> {
@@ -979,9 +1006,14 @@ class ConsoleHubRegistry {
   async #createHub(instanceId: string): Promise<ConsoleHub> {
     const instance = await this.#docker.findInstance(instanceId)
     if (!instance) throw new Error("Instance not found")
-    const hub = new ConsoleHub(this.#docker, instance, () => {
-      if (hub.subscriberCount === 0) this.#hubs.delete(instanceId)
-    })
+    const hub = new ConsoleHub(
+      this.#docker,
+      instance,
+      this.#subscribeSnapshots,
+      () => {
+        if (hub.subscriberCount === 0) this.#hubs.delete(instanceId)
+      }
+    )
     this.#hubs.set(instanceId, hub)
     return hub
   }
@@ -1034,21 +1066,32 @@ class ConsoleHub {
   readonly #abort = new AbortController()
   readonly #docker: DockerDriver
   readonly #instance: RelayInstanceConfig
+  readonly #lineIds = new Set<string>()
   readonly #onEmpty: () => void
   readonly #recent: Array<RelayConsoleLine> = []
   readonly #subscribers = new Set<WebSocket>()
+  #backfillStartedAt: string | null | undefined
   #graceTimer: ReturnType<typeof setTimeout> | null = null
   #retryTimer: ReturnType<typeof setTimeout> | null = null
+  #sessionFloor: string | null = null
+  #sessionStartedAt: string | null | undefined
   #started = false
+  #transitionStartedAt: string | null = null
+  #truncated = false
+  #unsubscribeSnapshots: (() => void) | null
 
   constructor(
     docker: DockerDriver,
     instance: NonNullable<Awaited<ReturnType<DockerDriver["findInstance"]>>>,
+    subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"],
     onEmpty: () => void
   ) {
     this.#docker = docker
     this.#instance = instance
     this.#onEmpty = onEmpty
+    this.#unsubscribeSnapshots = subscribeSnapshots((sample) => {
+      this.#observeSnapshot(sample)
+    })
   }
 
   get subscriberCount(): number {
@@ -1061,8 +1104,7 @@ class ConsoleHub {
     this.#graceTimer = null
     this.#retryTimer = null
     this.#subscribers.add(socket)
-    send(socket, { type: "ready", instanceId: this.#instance.id })
-    for (const line of this.#recent) send(socket, { type: "line", line })
+    if (this.#sessionStartedAt !== undefined) this.#sendSession(socket)
     if (!this.#started) {
       this.#started = true
       void this.#run()
@@ -1083,20 +1125,31 @@ class ConsoleHub {
     if (this.#retryTimer) clearTimeout(this.#retryTimer)
     this.#graceTimer = null
     this.#retryTimer = null
+    this.#unsubscribeSnapshots?.()
+    this.#unsubscribeSnapshots = null
     this.#abort.abort()
     this.#onEmpty()
   }
 
   async #run(): Promise<void> {
     try {
+      const snapshot = await this.#docker.console(this.#instance, 200)
+      const startedAt = snapshot.startedAt ?? null
+      const sessionChanged = this.#sessionStartedAt !== startedAt
+      if (this.#sessionStartedAt === undefined || sessionChanged) {
+        this.#replaceSession(snapshot)
+      } else {
+        for (const line of snapshot.lines) this.#append(line)
+      }
+      if (this.#backfillStartedAt !== startedAt) {
+        this.#backfillStartedAt = startedAt
+        void this.#backfill(startedAt)
+      }
       for await (const line of this.#docker.streamConsole(
         this.#instance,
         this.#abort.signal
       )) {
-        this.#recent.push(line)
-        if (this.#recent.length > 5_000) this.#recent.shift()
-        const encoded = JSON.stringify({ type: "line", line })
-        for (const socket of this.#subscribers) sendEncoded(socket, encoded)
+        this.#append(line)
       }
     } catch (cause) {
       if (!this.#abort.signal.aborted) {
@@ -1118,6 +1171,184 @@ class ConsoleHub {
         }, 1_000)
         this.#retryTimer.unref()
       }
+    }
+  }
+
+  #append(line: RelayConsoleLine): void {
+    if (
+      this.#sessionFloor &&
+      line.timestamp &&
+      line.timestamp < this.#sessionFloor
+    ) {
+      return
+    }
+    if (this.#lineIds.has(line.id)) return
+    this.#lineIds.add(line.id)
+    this.#recent.push(line)
+    if (this.#recent.length > 5_000) {
+      const removed = this.#recent.shift()
+      if (removed) this.#lineIds.delete(removed.id)
+      this.#truncated = true
+    }
+    const encoded = encodeConsoleLineFrame(line)
+    for (const socket of this.#subscribers) sendEncoded(socket, encoded)
+  }
+
+  #observeSnapshot(sample: RelaySnapshotSample): void {
+    if (this.#abort.signal.aborted || this.#sessionStartedAt === undefined) {
+      return
+    }
+    const startedAt = sample.snapshot.instances.find(
+      (instance) => instance.id === this.#instance.id
+    )?.startedAt
+    if (
+      !startedAt ||
+      startedAt === this.#sessionStartedAt ||
+      startedAt === this.#transitionStartedAt
+    ) {
+      return
+    }
+    this.#transitionStartedAt = startedAt
+    void this.#transitionSession(startedAt)
+  }
+
+  #replaceSession(snapshot: RelayConsole): void {
+    const startedAt = snapshot.startedAt ?? null
+    this.#sessionFloor = startedAt
+    this.#sessionStartedAt = startedAt
+    this.#backfillStartedAt = undefined
+    this.#truncated = snapshot.truncated
+    this.#recent.splice(0, this.#recent.length, ...snapshot.lines)
+    this.#lineIds.clear()
+    for (const line of snapshot.lines) this.#lineIds.add(line.id)
+    for (const socket of this.#subscribers) this.#sendSession(socket)
+  }
+
+  async #transitionSession(startedAt: string): Promise<void> {
+    try {
+      const snapshot = await this.#docker.console(this.#instance, 200)
+      if (
+        this.#abort.signal.aborted ||
+        this.#transitionStartedAt !== startedAt ||
+        this.#sessionStartedAt === startedAt ||
+        snapshot.startedAt !== startedAt
+      ) {
+        return
+      }
+      this.#replaceSession(snapshot)
+      this.#backfillStartedAt = startedAt
+      void this.#backfill(startedAt)
+    } catch (cause) {
+      if (!this.#abort.signal.aborted) {
+        Sentry.captureException(cause, {
+          tags: { "kiln.operation": "browser.console.session-transition" },
+        })
+      }
+    } finally {
+      if (this.#transitionStartedAt === startedAt) {
+        this.#transitionStartedAt = null
+      }
+    }
+  }
+
+  async #backfill(startedAt: string | null): Promise<void> {
+    try {
+      const history = await this.#docker.console(this.#instance, 5_000)
+      if (
+        this.#abort.signal.aborted ||
+        this.#sessionStartedAt !== startedAt ||
+        (history.startedAt ?? null) !== startedAt
+      ) {
+        return
+      }
+      const firstRecent = this.#recent[0]
+      const firstRecentIndex = firstRecent
+        ? history.lines.findIndex((line) => line.id === firstRecent.id)
+        : history.lines.length
+      const older =
+        firstRecentIndex >= 0
+          ? history.lines.slice(0, firstRecentIndex)
+          : history.lines.filter(
+              (line) =>
+                line.timestamp !== null &&
+                firstRecent?.timestamp !== null &&
+                line.timestamp < firstRecent.timestamp
+            )
+      if (older.length === 0) {
+        this.#truncated ||= history.truncated
+        return
+      }
+      const fresh = older.filter((line) => !this.#lineIds.has(line.id))
+      if (fresh.length === 0) return
+      for (const line of fresh) this.#lineIds.add(line.id)
+      this.#recent.unshift(...fresh)
+      if (this.#recent.length > 5_000) {
+        const removed = this.#recent.splice(0, this.#recent.length - 5_000)
+        for (const line of removed) this.#lineIds.delete(line.id)
+        this.#truncated = true
+      } else {
+        this.#truncated ||= history.truncated
+      }
+      this.#sendHistory(this.#subscribers, fresh)
+    } catch (cause) {
+      if (!this.#abort.signal.aborted) {
+        Sentry.captureException(cause, {
+          tags: { "kiln.operation": "browser.console.backfill" },
+        })
+      }
+    }
+  }
+
+  #sendSession(socket: WebSocket): void {
+    const startedAt = this.#sessionStartedAt ?? null
+    const snapshotStart = Math.max(0, this.#recent.length - 200)
+    if (socket.protocol === relayBrowserProtocol) {
+      send(socket, {
+        type: "ready",
+        instanceId: this.#instance.id,
+        startedAt,
+      })
+      for (const line of this.#recent.slice(snapshotStart)) {
+        sendEncoded(socket, encodeConsoleLineFrame(line))
+      }
+      return
+    }
+
+    const reset = encodeNewestConsoleBatch({
+      type: "reset",
+      instanceId: this.#instance.id,
+      startedAt,
+      lines: this.#recent.slice(snapshotStart),
+      truncated: this.#truncated || snapshotStart > 0,
+    })
+    sendEncoded(socket, reset.encoded)
+    send(socket, {
+      type: "ready",
+      instanceId: this.#instance.id,
+      startedAt,
+    })
+    this.#sendHistory(
+      new Set([socket]),
+      this.#recent.slice(0, snapshotStart + reset.start)
+    )
+  }
+
+  #sendHistory(
+    sockets: ReadonlySet<WebSocket>,
+    lines: ReadonlyArray<RelayConsoleLine>
+  ): void {
+    const subscribers = [...sockets].filter(
+      (socket) => socket.protocol === relayBrowserConsoleProtocol
+    )
+    if (subscribers.length === 0) return
+    const frames = encodeConsoleHistoryFrames({
+      instanceId: this.#instance.id,
+      startedAt: this.#sessionStartedAt ?? null,
+      lines,
+      truncated: this.#truncated,
+    })
+    for (const encoded of frames) {
+      for (const socket of subscribers) sendEncoded(socket, encoded)
     }
   }
 }

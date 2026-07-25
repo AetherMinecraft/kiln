@@ -2,7 +2,10 @@ import { generateKeyPairSync, sign } from "node:crypto"
 import { WebSocket } from "ws"
 
 import {
+  relayBrowserConsoleProtocol,
   relayBrowserProofTranscript,
+  relayBrowserConsoleProtocols,
+  relayBrowserMaxFrameBytes,
   relayBrowserProtocol,
   relayConsoleStreamEventSchema,
 } from "@workspace/contracts"
@@ -52,13 +55,13 @@ export async function* openHearthRelayConsoleStream(input: {
   const protocol = control.useTls ? "wss" : "ws"
   const socket = new WebSocket(
     `${protocol}://${formatHost(control.hostname)}:${control.port}/v1/browser`,
-    relayBrowserProtocol,
+    [...relayBrowserConsoleProtocols],
     {
       ca: control.useTls
         ? (credentials.caCertificatePem ?? undefined)
         : undefined,
       handshakeTimeout: 5_000,
-      maxPayload: 256 * 1024,
+      maxPayload: relayBrowserMaxFrameBytes,
       origin: kilnPublicUrl().origin,
       perMessageDeflate: false,
       rejectUnauthorized: control.useTls,
@@ -81,13 +84,18 @@ export async function* openHearthRelayConsoleStream(input: {
     const proof = sign(
       "sha256",
       Buffer.from(
-        relayBrowserProofTranscript({
-          capabilityId: capabilityId(capability.capability),
-          expiresAt: challenge.expiresAt,
-          nonce: challenge.nonce,
-          relayId: input.relayId,
-          sessionId: challenge.sessionId,
-        })
+        relayBrowserProofTranscript(
+          {
+            capabilityId: capabilityId(capability.capability),
+            expiresAt: challenge.expiresAt,
+            nonce: challenge.nonce,
+            relayId: input.relayId,
+            sessionId: challenge.sessionId,
+          },
+          socket.protocol === relayBrowserConsoleProtocol
+            ? relayBrowserConsoleProtocol
+            : relayBrowserProtocol
+        )
       ),
       { dsaEncoding: "ieee-p1363", key: keys.privateKey }
     )
@@ -120,7 +128,7 @@ export async function* openHearthRelayConsoleStream(input: {
     }
   } finally {
     inbox.close()
-    socket.close(1000, "Hearth console proxy closed")
+    closeSocket(socket, 1000, "Hearth console proxy closed")
   }
 }
 
@@ -214,7 +222,7 @@ function createSocketInbox(socket: WebSocket, signal: AbortSignal) {
     )
   const abort = () => {
     fail(new Error("Console proxy was cancelled"))
-    socket.close(1000, "Console proxy cancelled")
+    closeSocket(socket, 1000, "Console proxy cancelled")
   }
   socket.on("message", receive)
   socket.once("error", failed)
@@ -240,6 +248,19 @@ function createSocketInbox(socket: WebSocket, signal: AbortSignal) {
         waiters.push({ reject, resolve })
       )
     },
+  }
+}
+
+function closeSocket(socket: WebSocket, code: number, reason: string): void {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.close(code, reason)
+    return
+  }
+  if (socket.readyState === WebSocket.CONNECTING) {
+    // ws reports an aborted handshake through "error"; retain a listener even
+    // after the inbox detaches so cancellation cannot become an uncaught error.
+    socket.once("error", () => undefined)
+    socket.terminate()
   }
 }
 
