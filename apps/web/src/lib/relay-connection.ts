@@ -5,9 +5,11 @@ import { WebSocket } from "ws"
 
 import {
   RelayControlServerMessageSchema,
+  relayAuthenticationWindowMs,
   relayAuthChallengeTranscript,
   relayAuthResponseTranscript,
   relayControlDeadlineMs,
+  relayControlRequestTimeoutMs,
   relayControlProtocol,
 } from "@workspace/contracts"
 import type {
@@ -27,6 +29,10 @@ export interface RelayEndpoint {
 }
 
 const MAX_BACKOFF_MS = 30_000
+
+class RelayRequestTimeoutError extends Error {
+  override readonly name = "RelayRequestTimeoutError"
+}
 
 export type RelayConnectionStatus =
   | "authenticated"
@@ -180,12 +186,16 @@ class RelayConnection {
       throw new Error("Relay control socket is not connected")
     }
     const id = randomUUID()
+    const duration = Math.min(
+      Math.max(timeoutMs, 1),
+      relayControlDeadlineMs(operation)
+    )
     const request: RelayControlRequest = {
-      deadline:
-        Date.now() + Math.min(timeoutMs, relayControlDeadlineMs(operation)),
+      deadline: Date.now() + duration,
       id,
       operation,
       payload,
+      timeoutMs: duration,
       type: "request",
       v: 1,
     }
@@ -200,8 +210,8 @@ class RelayConnection {
             v: 1,
           })
         )
-        reject(new Error(`Relay request timed out after ${timeoutMs}ms`))
-      }, timeoutMs)
+        reject(new Error(`Relay request timed out after ${duration}ms`))
+      }, duration)
       this.#pending.set(id, { reject, resolve, timer })
       socket.send(JSON.stringify(request), (cause) => {
         if (!cause) return
@@ -265,7 +275,7 @@ class RelayConnection {
         let challengeAnswered = false
         const authenticationTimer = setTimeout(
           () => reject(new Error("Relay authentication timed out")),
-          10_000
+          relayAuthenticationWindowMs
         )
         activeSocket.on("message", (data, binary) => {
           if (binary) {
@@ -365,7 +375,6 @@ class RelayConnection {
     if (!credentials) throw new Error("Relay credentials are unavailable")
     if (
       challenge.relayId !== this.#relay.id ||
-      challenge.expiresAt <= Date.now() ||
       !verify(
         null,
         Buffer.from(relayAuthChallengeTranscript(challenge)),
@@ -418,10 +427,10 @@ class RelayConnection {
   async #handleRelayRequest(request: RelayControlRequest): Promise<void> {
     const socket = this.#socket
     if (!socket || socket.readyState !== WebSocket.OPEN) return
+    let timer: ReturnType<typeof setTimeout> | null = null
     try {
-      if (request.deadline <= Date.now()) {
-        throw new Error("Relay request deadline expired")
-      }
+      const duration = relayControlRequestTimeoutMs(request, Date.now())
+      if (duration === null) throw new Error("Relay request timeout is invalid")
       if (request.operation !== "sftp.authorization.resolve") {
         throw new Error("Relay operation is not available from Hearth")
       }
@@ -430,10 +439,23 @@ class RelayConnection {
       if (typeof username !== "string") {
         throw new Error("SFTP username is required")
       }
-      const authorization = await resolveSftpAuthorization(
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new RelayRequestTimeoutError("Relay request timed out")),
+          duration
+        )
+        timer.unref()
+      })
+      const authorizationRequest = resolveSftpAuthorization(
         this.#relay.id,
         username
       )
+      // The database lookup cannot be cancelled, so observe failures after timeout wins.
+      void authorizationRequest.catch(() => undefined)
+      const authorization = await Promise.race([
+        authorizationRequest,
+        timeout,
+      ])
       socket.send(
         JSON.stringify({
           id: randomUUID(),
@@ -445,15 +467,18 @@ class RelayConnection {
       )
     } catch (cause) {
       const error = asError(cause)
-      Sentry.captureException(error, {
-        tags: {
-          "kiln.operation": request.operation,
-          "kiln.relay_id": this.#relay.id,
-        },
-      })
+      const timedOut = error instanceof RelayRequestTimeoutError
+      if (!timedOut) {
+        Sentry.captureException(error, {
+          tags: {
+            "kiln.operation": request.operation,
+            "kiln.relay_id": this.#relay.id,
+          },
+        })
+      }
       socket.send(
         JSON.stringify({
-          code: "hearth_operation_failed",
+          code: timedOut ? "request_cancelled" : "hearth_operation_failed",
           id: randomUUID(),
           message: error.message,
           replyTo: request.id,
@@ -462,6 +487,8 @@ class RelayConnection {
           v: 1,
         })
       )
+    } finally {
+      if (timer) clearTimeout(timer)
     }
   }
 
