@@ -1,6 +1,12 @@
 import { Effect, Schema } from "effect"
 
+import {
+  isKilnNightlyVersion,
+  kilnReleaseVersionCore,
+} from "@workspace/contracts"
+
 import { ExternalServiceError } from "@/effect/errors"
+import { isKilnReleaseVersion, orderKilnReleases } from "@/lib/release-version"
 
 const repositoryApi = "https://api.github.com/repos/kiln-site/hearth/releases"
 const headers = {
@@ -40,6 +46,7 @@ export const ReleaseManifestSchema = Schema.Struct({
     hearth: ReleaseComponentSchema,
     relay: ReleaseComponentSchema,
   }),
+  imageVersion: Schema.optionalKey(Schema.String),
   publishedAt: Schema.String,
   schemaVersion: Schema.Literal(1),
   version: Schema.String,
@@ -47,6 +54,7 @@ export const ReleaseManifestSchema = Schema.Struct({
 
 export type KilnReleaseManifest = typeof ReleaseManifestSchema.Type
 export type PublicKilnRelease = {
+  aliases: ReadonlyArray<string>
   channel: "nightly" | "stable"
   manifestUrl: string
   name: string
@@ -63,27 +71,55 @@ export const listKilnReleasesEffect = Effect.fn("github.releases.list")(
       `${repositoryApi}?per_page=100`,
       Schema.Array(GitHubReleaseSchema)
     )
-    return releases.flatMap((release): Array<PublicKilnRelease> => {
-      if (release.draft || !release.tag_name.startsWith("v")) return []
-      const version = release.tag_name.slice(1)
-      if (!/^0\.\d+\.\d+(?:-nightly\.\d+)?$/u.test(version)) return []
-      const manifest = release.assets.find(
-        (asset) => asset.name === "release-manifest.json"
-      )
-      if (!manifest) return []
-      return [
-        {
-          channel: release.prerelease ? "nightly" : "stable",
-          manifestUrl: manifest.browser_download_url,
-          name: release.name?.trim() || release.tag_name,
-          notes: release.body?.trim() || null,
-          publishedAt: release.published_at,
-          tag: release.tag_name,
-          url: release.html_url,
-          version,
-        },
-      ]
-    })
+    const orderedReleases = orderKilnReleases(
+      releases.flatMap((release): Array<PublicKilnRelease> => {
+        if (release.draft || !release.tag_name.startsWith("v")) return []
+        const version = release.tag_name.slice(1)
+        if (!isKilnReleaseVersion(version)) return []
+        const name = release.name?.trim() || release.tag_name
+        const manifest = release.assets.find(
+          (asset) => asset.name === "release-manifest.json"
+        )
+        if (!manifest) return []
+        return [
+          {
+            aliases: releaseVersionAliases(name, version),
+            channel: release.prerelease ? "nightly" : "stable",
+            manifestUrl: manifest.browser_download_url,
+            name,
+            notes: release.body?.trim() || null,
+            publishedAt: release.published_at,
+            tag: release.tag_name,
+            url: release.html_url,
+            version,
+          },
+        ]
+      })
+    )
+    const latestRelease = orderedReleases[0]
+    if (!latestRelease || latestRelease.channel !== "stable") {
+      return orderedReleases
+    }
+
+    const manifest = yield* requestJson(
+      latestRelease.manifestUrl,
+      ReleaseManifestSchema
+    )
+    if (
+      manifest.imageVersion === undefined ||
+      !isKilnReleaseVersion(manifest.imageVersion) ||
+      kilnReleaseVersionCore(manifest.imageVersion) !==
+        kilnReleaseVersionCore(latestRelease.version)
+    ) {
+      return orderedReleases
+    }
+    return [
+      {
+        ...latestRelease,
+        aliases: [...latestRelease.aliases, manifest.imageVersion],
+      },
+      ...orderedReleases.slice(1),
+    ]
   }
 )
 
@@ -114,6 +150,16 @@ export const kilnReleaseManifestEffect = Effect.fn("github.releases.manifest")(
     )
   }
 )
+
+function releaseVersionAliases(
+  releaseName: string,
+  version: string
+): ReadonlyArray<string> {
+  if (!isKilnNightlyVersion(version)) return []
+  const match = /^v(0\.\d+\.\d+) Nightly #([1-9]\d*)$/u.exec(releaseName)
+  if (!match || match[1] !== kilnReleaseVersionCore(version)) return []
+  return [`${match[1]}-nightly.${match[2]}`]
+}
 
 function requestJson<TValue>(
   url: string,

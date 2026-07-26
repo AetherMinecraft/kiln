@@ -11,6 +11,13 @@ import {
 import { hostname } from "node:os"
 import { join } from "node:path"
 
+import {
+  compareKilnReleaseVersions,
+  isKilnNightlyVersion,
+  isKilnReleaseVersion,
+  kilnReleaseVersionCore,
+} from "@workspace/contracts"
+
 import { command } from "./command.js"
 import type { CommandOptions, CommandResult } from "./command.js"
 import type { RelayConfig } from "./config.js"
@@ -114,6 +121,17 @@ export class SystemUpdateManager {
     }
     if (!eligibility.eligible) {
       throw new Error(eligibility.reason ?? "This container cannot be updated")
+    }
+    if (!isKilnReleaseVersion(input.version)) {
+      throw new Error("The requested Kiln release version is invalid")
+    }
+    if (
+      isKilnReleaseVersion(eligibility.currentVersion) &&
+      isDefiniteReleaseDowngrade(input.version, eligibility.currentVersion)
+    ) {
+      throw new Error(
+        `Refusing to downgrade ${eligibility.currentVersion} to ${input.version}`
+      )
     }
     const targetReference = managedImageChannel(
       target.Config.Image,
@@ -289,16 +307,39 @@ export class SystemUpdateManager {
   }
 }
 
+function isDefiniteReleaseDowngrade(
+  requestedVersion: string,
+  currentVersion: string
+): boolean {
+  if (
+    kilnReleaseVersionCore(requestedVersion) ===
+      kilnReleaseVersionCore(currentVersion) &&
+    isKilnNightlyVersion(requestedVersion) !==
+      isKilnNightlyVersion(currentVersion)
+  ) {
+    // Same-line stable/nightly ordering depends on release publication time,
+    // which Hearth validates before asking Relay to apply the update.
+    return false
+  }
+  return compareKilnReleaseVersions(requestedVersion, currentVersion) === -1
+}
+
 export function imageVersionMatchesRelease(
   imageVersion: string | undefined,
   releaseVersion: string
 ): boolean {
   if (imageVersion === releaseVersion) return true
-  if (!/^0\.\d+\.\d+$/u.test(releaseVersion)) return false
-  return new RegExp(
-    `^${escapeRegularExpression(releaseVersion)}-nightly\\.\\d+$`,
-    "u"
-  ).test(imageVersion ?? "")
+  if (
+    isKilnNightlyVersion(releaseVersion) ||
+    !isKilnReleaseVersion(imageVersion) ||
+    !isKilnNightlyVersion(imageVersion)
+  ) {
+    return false
+  }
+  return (
+    kilnReleaseVersionCore(imageVersion) ===
+    kilnReleaseVersionCore(releaseVersion)
+  )
 }
 
 function updateEligibility(inspected: ContainerInspect): {
@@ -567,10 +608,6 @@ function errorCode(cause: unknown): string | null {
     return cause.code
   }
   return null
-}
-
-function escapeRegularExpression(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")
 }
 
 function decodeJsonArray<T>(

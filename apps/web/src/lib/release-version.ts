@@ -1,3 +1,18 @@
+import {
+  compareKilnReleaseVersions,
+  isKilnNightlyVersion,
+  isKilnReleaseVersion,
+  kilnReleaseVersionCore,
+} from "@workspace/contracts"
+
+export { isKilnReleaseVersion }
+
+type ReleaseVersionMetadata = {
+  aliases?: ReadonlyArray<string>
+  publishedAt: string | null
+  version: string
+}
+
 export function compareReleaseVersions(
   left: string,
   right: string | null,
@@ -5,59 +20,53 @@ export function compareReleaseVersions(
 ): -1 | 0 | 1 {
   if (!right) return 1
   if (left === right) return 0
-  const leftParts = versionParts(left)
-  const rightParts = versionParts(right)
-
-  for (let index = 0; index < 3; index += 1) {
-    const difference =
-      (leftParts.numbers[index] ?? 0) - (rightParts.numbers[index] ?? 0)
-    if (difference !== 0) return difference < 0 ? -1 : 1
+  const semanticComparison = compareKilnReleaseVersions(left, right)
+  if (semanticComparison === null) return 0
+  if (
+    kilnReleaseVersionCore(left) !== kilnReleaseVersionCore(right) ||
+    isKilnNightlyVersion(left) === isKilnNightlyVersion(right)
+  ) {
+    return semanticComparison
   }
 
-  if (leftParts.nightly !== null && rightParts.nightly !== null) {
-    return compareNumbers(leftParts.nightly, rightParts.nightly)
-  }
-  if (leftParts.nightly === null && rightParts.nightly === null) return 0
-
-  const publishedComparison = comparePublishedAt(
-    publishedAtByVersion.get(left),
-    publishedAtByVersion.get(right)
+  return (
+    comparePublishedAt(
+      publishedAtByVersion.get(left),
+      publishedAtByVersion.get(right)
+    ) ?? semanticComparison
   )
-  if (publishedComparison !== null) return publishedComparison
-
-  return leftParts.nightly === null ? 1 : -1
 }
 
-export function isKilnReleaseVersion(
-  version: string | null
-): version is string {
-  return (
-    version !== null && /^0\.\d+\.\d+(?:-nightly\.\d+)?$/u.test(version.trim())
+export function orderKilnReleases<TRelease extends ReleaseVersionMetadata>(
+  releases: ReadonlyArray<TRelease>
+): Array<TRelease> {
+  const publishedAtByVersion = new Map(
+    releases.map((release) => [release.version, release.publishedAt])
+  )
+  return [...releases].sort((left, right) =>
+    invertOrder(
+      compareReleaseVersions(left.version, right.version, publishedAtByVersion)
+    )
   )
 }
 
 export function compareLatestReleaseVersion(
   currentVersion: string | null,
-  releases: ReadonlyArray<{
-    publishedAt: string | null
-    version: string
-  }>
+  releases: ReadonlyArray<ReleaseVersionMetadata>
 ): -1 | 0 | 1 | null {
-  const latestRelease = releases[0]
+  const orderedReleases = orderKilnReleases(releases)
+  const latestRelease = orderedReleases[0]
   if (!latestRelease || !isKilnReleaseVersion(currentVersion)) return null
-  if (latestRelease.version === currentVersion) return 0
-
-  const currentReleaseIndex = releases.findIndex(
-    (release) => release.version === currentVersion
-  )
-  if (currentReleaseIndex > 0) return 1
+  const currentRelease = findKilnRelease(releases, currentVersion)
+  const canonicalCurrentVersion = currentRelease?.version ?? currentVersion
+  if (latestRelease.version === canonicalCurrentVersion) return 0
 
   const publishedAtByVersion = new Map(
-    releases.map((release) => [release.version, release.publishedAt])
+    orderedReleases.map((release) => [release.version, release.publishedAt])
   )
   const comparison = compareReleaseVersions(
     latestRelease.version,
-    currentVersion,
+    canonicalCurrentVersion,
     publishedAtByVersion
   )
 
@@ -66,28 +75,25 @@ export function compareLatestReleaseVersion(
   // build is no longer present in GitHub's retained release window.
   if (
     comparison === -1 &&
-    releaseVersionCore(latestRelease.version) ===
-      releaseVersionCore(currentVersion)
+    kilnReleaseVersionCore(latestRelease.version) ===
+      kilnReleaseVersionCore(canonicalCurrentVersion)
   ) {
     return 1
   }
   return comparison
 }
 
-function versionParts(version: string): {
-  nightly: number | null
-  numbers: [number, number, number]
-} {
-  const match = /^0\.(\d+)\.(\d+)(?:-nightly\.(\d+))?$/u.exec(version.trim())
-  if (!match) return { nightly: null, numbers: [0, 0, 0] }
-  return {
-    nightly: match[3] === undefined ? null : Number(match[3]),
-    numbers: [0, Number(match[1]), Number(match[2])],
-  }
-}
-
-function releaseVersionCore(version: string): string {
-  return version.replace(/-nightly\.\d+$/u, "")
+export function findKilnRelease<TRelease extends ReleaseVersionMetadata>(
+  releases: ReadonlyArray<TRelease>,
+  version: string | null
+): TRelease | null {
+  if (!version) return null
+  return (
+    releases.find(
+      (release) =>
+        release.version === version || release.aliases?.includes(version)
+    ) ?? null
+  )
 }
 
 function comparePublishedAt(
@@ -104,4 +110,9 @@ function comparePublishedAt(
 function compareNumbers(left: number, right: number): -1 | 0 | 1 {
   if (left === right) return 0
   return left < right ? -1 : 1
+}
+
+function invertOrder(order: -1 | 0 | 1): -1 | 0 | 1 {
+  if (order === 0) return 0
+  return order === 1 ? -1 : 1
 }

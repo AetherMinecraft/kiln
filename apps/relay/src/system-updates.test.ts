@@ -37,6 +37,8 @@ const relayContainer = {
 
 class FakeCommand {
   readonly calls: Array<Array<string>> = []
+  currentVersion = "0.1.0-nightly.1"
+  imageVersion = "0.1.0-nightly.18"
   helperRunning = true
   holdPull = false
   pullStarted: Promise<void>
@@ -66,7 +68,7 @@ class FakeCommand {
             Labels: {
               "io.kiln.component": "relay",
               "org.opencontainers.image.source": KILN_IMAGE_SOURCE,
-              "org.opencontainers.image.version": "0.1.0-nightly.18",
+              "org.opencontainers.image.version": this.imageVersion,
             },
           },
         },
@@ -82,7 +84,18 @@ class FakeCommand {
         identifier === relayContainer.Id ||
         arguments_.includes(relayContainer.Id)
       ) {
-        return jsonResult([relayContainer])
+        return jsonResult([
+          {
+            ...relayContainer,
+            Config: {
+              ...relayContainer.Config,
+              Labels: {
+                ...relayContainer.Config.Labels,
+                "org.opencontainers.image.version": this.currentVersion,
+              },
+            },
+          },
+        ])
       }
       throw new Error("No such container")
     }
@@ -99,6 +112,9 @@ class FakeCommand {
 describe("release image versions", () => {
   it("accepts a promoted nightly digest for its stable release", () => {
     expect(imageVersionMatchesRelease("0.1.0-nightly.18", "0.1.0")).toBe(true)
+    expect(
+      imageVersionMatchesRelease("0.1.0-nightly.20260726.171530", "0.1.0")
+    ).toBe(true)
     expect(imageVersionMatchesRelease("0.1.1-nightly.1", "0.1.0")).toBe(false)
     expect(
       imageVersionMatchesRelease("0.1.0-nightly.18", "0.1.0-nightly.19")
@@ -122,6 +138,75 @@ describe("release image versions", () => {
       const run = docker.calls.find((arguments_) => arguments_[0] === "run")
       expect(run).toContain("KILN_UPDATE_VERSION=0.1.0")
       expect(run).toContain(relayContainer.Id)
+    } finally {
+      await removeTemporaryDirectory(dataDirectory)
+    }
+  })
+
+  it("refuses to downgrade a managed container", async () => {
+    const dataDirectory = await temporaryDataDirectory()
+    try {
+      const docker = new FakeCommand()
+      docker.currentVersion = "0.1.0-nightly.12"
+      const manager = new SystemUpdateManager({ dataDirectory }, docker.run)
+
+      await expect(
+        manager.start({
+          helperImage: targetImage,
+          targetContainer: "kiln-relay",
+          targetImage,
+          version: "0.1.0-nightly.8",
+        })
+      ).rejects.toThrow(
+        "Refusing to downgrade 0.1.0-nightly.12 to 0.1.0-nightly.8"
+      )
+      expect(docker.calls.some((arguments_) => arguments_[0] === "pull")).toBe(
+        false
+      )
+    } finally {
+      await removeTemporaryDirectory(dataDirectory)
+    }
+  })
+
+  it("allows a newer nightly on the same stable release line", async () => {
+    const dataDirectory = await temporaryDataDirectory()
+    try {
+      const docker = new FakeCommand()
+      docker.currentVersion = "0.1.0"
+      const manager = new SystemUpdateManager({ dataDirectory }, docker.run)
+
+      const operation = await manager.start({
+        helperImage: targetImage,
+        targetContainer: "kiln-relay",
+        targetImage,
+        version: "0.1.0-nightly.18",
+      })
+
+      expect(operation.status).toBe("running")
+      expect(docker.calls.some((arguments_) => arguments_[0] === "pull")).toBe(
+        true
+      )
+    } finally {
+      await removeTemporaryDirectory(dataDirectory)
+    }
+  })
+
+  it("orders timestamp nightlies chronologically", async () => {
+    const dataDirectory = await temporaryDataDirectory()
+    try {
+      const docker = new FakeCommand()
+      docker.currentVersion = "0.1.0-nightly.20260726.171529"
+      docker.imageVersion = "0.1.0-nightly.20260726.171530"
+      const manager = new SystemUpdateManager({ dataDirectory }, docker.run)
+
+      const operation = await manager.start({
+        helperImage: targetImage,
+        targetContainer: "kiln-relay",
+        targetImage,
+        version: "0.1.0-nightly.20260726.171530",
+      })
+
+      expect(operation.status).toBe("running")
     } finally {
       await removeTemporaryDirectory(dataDirectory)
     }
