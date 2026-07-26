@@ -18,7 +18,10 @@ import type { Dimensions } from "./use-chart-dimensions"
 /** Which chart root a part is composed under — drives the boundary guards. */
 export type ChartType = "area" | "bar" | "line" | "pie" | "radar"
 
-export type ChartConfig = Record<string, { label?: string; color: SeriesColor }>
+export type ChartConfig = Record<
+  string,
+  { label?: string; color: SeriesColor; tooltipDataKey?: string }
+>
 
 export type Margins = {
   top: number
@@ -185,6 +188,7 @@ export function useChartController({
   animate = true,
   animationDuration = 900,
   replayToken = 0,
+  replayOnDataChange = true,
   markerIndex = null,
   hovered = false,
   bloom = "off",
@@ -202,6 +206,7 @@ export function useChartController({
   animate?: boolean
   animationDuration?: number
   replayToken?: number
+  replayOnDataChange?: boolean
   markerIndex?: number | null
   hovered?: boolean
   bloom?: BloomInput
@@ -222,7 +227,7 @@ export function useChartController({
   // Memoized: configKeys is the dep that drives `bands`, `common` and the
   // canvas `targets` memo — a fresh array each render would bust all of them.
   const configKeys = useMemo(() => Object.keys(config), [config])
-  const revision = useRevision(data, replayToken)
+  const revision = useRevision(replayOnDataChange ? data : null, replayToken)
 
   const [selectedDataKey, setSelectedDataKey] = useState<string | null>(
     defaultSelectedDataKey
@@ -389,7 +394,7 @@ export function useChartController({
       labelKey ? String(data[i]?.[labelKey] ?? "") : null,
     itemsAt: (i) =>
       configKeys.map((name) => {
-        const raw = data[i]?.[name]
+        const raw = data[i]?.[config[name]?.tooltipDataKey ?? name]
         return {
           name,
           label: config[name]?.label ?? name,

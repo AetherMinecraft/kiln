@@ -8,10 +8,11 @@ import { Grid } from "@/components/dither-kit/grid"
 import type { Rgb, Seed } from "@/components/dither-kit/palette"
 import { Tooltip } from "@/components/dither-kit/tooltip"
 
-const networkSentColor = "oklch(0.73 0.15 65)"
-
 const NETWORK_SENT_SEED = seedFromOklch(0.73, 0.15, 65)
 const NETWORK_RECEIVED_SEED = seedFromOklch(0.78, 0.11, 205)
+const NODE_STORAGE_COLOR = "oklch(0.72 0.13 75)"
+const NODE_STORAGE_SEED = seedFromCssColor(NODE_STORAGE_COLOR)
+const RESOURCE_VISUAL_FLOOR_RATIO = 0.06
 
 function clamp01(value: number) {
   return Math.min(1, Math.max(0, value))
@@ -47,9 +48,7 @@ function seedFromOklch(L: number, C: number, h: number): Seed {
 }
 
 function seedFromCssColor(color: string): Seed {
-  const match = color.match(
-    /oklch\(\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\)/i
-  )
+  const match = color.match(/oklch\(\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\)/i)
   if (match) {
     return seedFromOklch(Number(match[1]), Number(match[2]), Number(match[3]))
   }
@@ -67,8 +66,8 @@ function HistoryXAxis() {
   return (
     <g className="fill-current font-mono text-[10px] text-muted-foreground">
       {[
-        { index: 0, label: "-1m" },
-        { index: mid, label: "-30s" },
+        { index: 0, label: "-6m" },
+        { index: mid, label: "-3m" },
         { index: last, label: "Now" },
       ].map(({ index, label }) => (
         <text
@@ -95,11 +94,14 @@ export function ResourceHistoryChart({
   resourceId,
   label,
   color,
+  maxValue,
+  replayToken,
   formatValue,
 }: {
   data: Array<{
     timestamp: number
     value: number | null
+    secondary: number | null
     received: number | null
     sent: number | null
   }>
@@ -108,66 +110,138 @@ export function ResourceHistoryChart({
   color: string
   domainStart: number
   domainEnd: number
+  maxValue?: number
+  replayToken: number
   formatValue: (value: number) => string
 }) {
+  const chartSourceData = React.useMemo(() => {
+    if (resourceId !== "storage") return data
+    const firstKnownInstanceUsage = data.findIndex(
+      (sample) => sample.value !== null
+    )
+    return firstKnownInstanceUsage < 0
+      ? data
+      : data.slice(firstKnownInstanceUsage)
+  }, [data, resourceId])
+  const hasPrimaryValues = React.useMemo(
+    () => chartSourceData.some((sample) => sample.value !== null),
+    [chartSourceData]
+  )
   const chartConfig = React.useMemo<ChartConfig>(() => {
     if (resourceId === "network") {
       const config: ChartConfig = {
-        received: { label: "Download", color: NETWORK_RECEIVED_SEED },
-        sent: { label: "Upload", color: NETWORK_SENT_SEED },
+        receivedVisual: {
+          label: "Download",
+          color: NETWORK_RECEIVED_SEED,
+          tooltipDataKey: "received",
+        },
+        sentVisual: {
+          label: "Upload",
+          color: NETWORK_SENT_SEED,
+          tooltipDataKey: "sent",
+        },
+      }
+      return config
+    }
+    if (resourceId === "storage") {
+      const config: ChartConfig = {
+        secondaryVisual: {
+          label: "Node volume",
+          color: NODE_STORAGE_SEED,
+          tooltipDataKey: "secondary",
+        },
+      }
+      if (hasPrimaryValues) {
+        config.valueVisual = {
+          label: "Instance quota",
+          color: seedFromCssColor(color),
+          tooltipDataKey: "value",
+        }
       }
       return config
     }
     const config: ChartConfig = {
-      value: { label, color: seedFromCssColor(color) },
+      valueVisual: {
+        label,
+        color: seedFromCssColor(color),
+        tooltipDataKey: "value",
+      },
     }
     return config
-  }, [color, label, resourceId])
+  }, [color, hasPrimaryValues, label, resourceId])
 
-  const chartData = React.useMemo(
+  const values = React.useMemo(
     () =>
-      data.map((sample) => ({
+      chartSourceData.map((sample) => ({
         timestamp: sample.timestamp,
         value: numericOrZero(sample.value),
+        secondary: numericOrZero(sample.secondary),
         received: numericOrZero(sample.received),
         sent: numericOrZero(sample.sent),
       })),
-    [data]
+    [chartSourceData]
+  )
+
+  const networkMaximum = React.useMemo(
+    () =>
+      values.reduce(
+        (maximum, sample) => Math.max(maximum, sample.received + sample.sent),
+        1
+      ),
+    [values]
   )
 
   const yDomain = React.useMemo((): [number, number] | undefined => {
-    if (resourceId === "network") return undefined
+    if (resourceId === "network") {
+      return [0, networkMaximum * (1 + RESOURCE_VISUAL_FLOOR_RATIO / 2)]
+    }
     if (resourceId === "memory" || resourceId === "storage") return [0, 100]
-    const peak = chartData.reduce(
-      (max, sample) => Math.max(max, sample.value),
-      0
-    )
+    if (resourceId === "cpu" && maxValue) return [0, maxValue]
+    const peak = values.reduce((max, sample) => Math.max(max, sample.value), 0)
     return [0, Math.max(10, Math.ceil(peak * 1.15))]
-  }, [chartData, resourceId])
+  }, [maxValue, networkMaximum, resourceId, values])
+
+  const chartData = React.useMemo(() => {
+    const maximum = yDomain?.[1] ?? 1
+    const floor = maximum * RESOURCE_VISUAL_FLOOR_RATIO
+    const networkFloor = networkMaximum * (RESOURCE_VISUAL_FLOOR_RATIO / 2)
+
+    return values.map((sample) => ({
+      ...sample,
+      valueVisual: Math.max(sample.value, floor),
+      secondaryVisual: Math.max(sample.secondary, floor),
+      receivedVisual: Math.max(sample.received, networkFloor),
+      sentVisual: Math.max(sample.sent, networkFloor),
+    }))
+  }, [networkMaximum, values, yDomain])
 
   const margins = {
-    top: resourceId === "network" ? 18 : 7,
-    right: 16,
+    top: resourceId === "network" || resourceId === "storage" ? 18 : 7,
+    right: 6,
     bottom: 22,
-    left: 16,
+    left: 6,
   }
 
   const chartClassName = "h-32 w-full"
 
   return (
     <div className="relative">
-      {resourceId === "network" ? (
+      {resourceId === "network" || resourceId === "storage" ? (
         <div className="pointer-events-none absolute top-0 right-3 z-10 flex items-center gap-3 font-mono text-[8px] tracking-[0.07em] text-muted-foreground">
           <span className="flex items-center gap-1.5">
-            <span className="h-px w-3" style={{ backgroundColor: color }} />↓
-            DOWN
+            <span
+              className={`h-1.5 w-3 ${resourceId === "network" ? "bg-current opacity-70" : ""}`}
+              style={
+                resourceId === "storage"
+                  ? { backgroundColor: NODE_STORAGE_COLOR }
+                  : undefined
+              }
+            />
+            {resourceId === "network" ? "↓ DOWN" : "NODE"}
           </span>
           <span className="flex items-center gap-1.5">
-            <span
-              className="w-3 border-t border-dashed"
-              style={{ borderColor: networkSentColor }}
-            />
-            ↑ UP
+            <span className="h-1.5 w-3" style={{ backgroundColor: color }} />
+            {resourceId === "network" ? "↑ UP" : "INSTANCE"}
           </span>
         </div>
       ) : null}
@@ -176,10 +250,12 @@ export function ResourceHistoryChart({
         <LineChart
           data={chartData}
           config={chartConfig}
-          animate={false}
+          animate
           bloom="off"
           hovered
           margins={margins}
+          replayOnDataChange={false}
+          replayToken={replayToken}
           className={chartClassName}
           yDomain={yDomain}
         >
@@ -187,27 +263,35 @@ export function ResourceHistoryChart({
           <HistoryXAxis />
           <Tooltip
             valueFormatter={(value, name) =>
-              `${name === "received" ? "↓" : "↑"} ${formatValue(value)}`
+              `${name === "receivedVisual" ? "↓" : "↑"} ${formatValue(value)}`
             }
           />
-          <Line dataKey="received" />
-          <Line dataKey="sent" strokeVariant="dashed" />
+          <Line dataKey="receivedVisual" />
+          <Line dataKey="sentVisual" />
         </LineChart>
       ) : (
         <AreaChart
           data={chartData}
           config={chartConfig}
-          animate={false}
+          animate
           bloom="off"
           hovered
           margins={margins}
+          replayOnDataChange={false}
+          replayToken={replayToken}
           className={chartClassName}
           yDomain={yDomain}
         >
           <Grid horizontal vertical={false} strokeDasharray="2 4" />
           <HistoryXAxis />
           <Tooltip valueFormatter={(value) => formatValue(value)} />
-          <Area dataKey="value" variant="gradient" />
+          {resourceId === "storage" ? (
+            <Area dataKey="secondaryVisual" variant="gradient" />
+          ) : null}
+          {/* Instance is painted last so it stays in front of node usage. */}
+          {hasPrimaryValues ? (
+            <Area dataKey="valueVisual" variant="gradient" />
+          ) : null}
         </AreaChart>
       )}
     </div>

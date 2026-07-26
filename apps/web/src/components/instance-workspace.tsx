@@ -6,7 +6,10 @@ import {
   useSuspenseQuery,
 } from "@tanstack/react-query"
 import { useRouterState } from "@tanstack/react-router"
-import type { RelayObservedState } from "@workspace/contracts"
+import type {
+  RelayInstanceResources,
+  RelayObservedState,
+} from "@workspace/contracts"
 import {
   Check,
   CircleStop,
@@ -50,6 +53,11 @@ import { WorkspaceFrame } from "@/components/workspace-frame"
 import { roleHasPermission } from "@/lib/permissions"
 import { openRelayResourceStream } from "@/lib/relay-resource-stream"
 import {
+  RESOURCE_HISTORY_WINDOW_MS,
+  resourceHistoryStore,
+  type ResourceHistoryStore,
+} from "@/lib/resource-history-store"
+import {
   accessCapabilitiesQueryOptions,
   queryKeys,
   relayConnectionQueryOptions,
@@ -59,7 +67,6 @@ import {
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import {
   selectInstanceObservedState,
-  selectInstanceRuntime,
   selectInstanceWorkspaceInstance,
   selectRelayConnected,
 } from "@/lib/relay-selectors"
@@ -77,11 +84,26 @@ const localTimestampFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
   timeStyle: "long",
 })
+const RESOURCE_VISUAL_FLOOR_PERCENT = 6
+
+function hasKnownStorageUsage(
+  storage: RelayInstanceResources["storage"] | undefined
+): storage is RelayInstanceResources["storage"] & {
+  percent: number
+  usedBytes: number
+} {
+  return (
+    storage !== undefined &&
+    storage.totalBytes > 0 &&
+    storage.usedBytes !== null &&
+    storage.percent !== null
+  )
+}
 
 function clampResourcePercent(value: number | null | undefined): number {
   return value === null || value === undefined
     ? 0
-    : Math.max(1, Math.min(value, 100))
+    : Math.max(RESOURCE_VISUAL_FLOOR_PERCENT, Math.min(value, 100))
 }
 
 export function InstanceWorkspace({
@@ -176,6 +198,10 @@ function RelayResourceStreamController({
             if (cancelled) break
             if (event.sequence <= lastSequence) continue
             lastSequence = event.sequence
+            resourceHistoryStore(instance.relayId, instance.id).record(
+              event.history,
+              event.instance.resources
+            )
             queryClient.setQueryData<RelayFleetSnapshot>(
               queryKeys.relay.snapshot,
               (snapshot) =>
@@ -859,71 +885,6 @@ const RESOURCE_STYLES = {
 type ResourceId = keyof typeof RESOURCE_STYLES
 const RESOURCE_IDS: Array<ResourceId> = ["cpu", "memory", "storage", "network"]
 
-interface ResourceHistoryStore {
-  getSnapshot: () => Array<ResourceHistoryPoint>
-  record: (instance: InstanceRuntime) => void
-  subscribe: (listener: () => void) => () => void
-}
-
-function createResourceHistoryStore(
-  instanceId: string,
-  relayId: string
-): ResourceHistoryStore {
-  let currentInstanceId = instanceId
-  let currentRelayId = relayId
-  let points: Array<ResourceHistoryPoint> = []
-  const listeners = new Set<() => void>()
-
-  return {
-    getSnapshot: () => points,
-    record: (instance) => {
-      let cleared = false
-      if (
-        currentInstanceId !== instance.id ||
-        currentRelayId !== instance.relayId
-      ) {
-        currentInstanceId = instance.id
-        currentRelayId = instance.relayId
-        points = []
-        cleared = true
-      }
-      const resources = instance.resources
-      if (!resources) {
-        if (cleared) for (const listener of listeners) listener()
-        return
-      }
-      const timestamp = Date.parse(resources.sampledAt)
-      if (
-        !Number.isFinite(timestamp) ||
-        points.at(-1)?.timestamp === timestamp
-      ) {
-        if (cleared) for (const listener of listeners) listener()
-        return
-      }
-      const point: ResourceHistoryPoint = {
-        timestamp,
-        cpu: resources.cpu.percent,
-        memory: resources.memory.percent,
-        storage: resources.storage.percent,
-        network: resources.network
-          ? resources.network.receivedBytesPerSecond +
-            resources.network.sentBytesPerSecond
-          : null,
-        networkReceived: resources.network?.receivedBytesPerSecond ?? null,
-        networkSent: resources.network?.sentBytesPerSecond ?? null,
-      }
-      points = [...points, point].filter(
-        (sample) => timestamp - sample.timestamp <= 60_000
-      )
-      for (const listener of listeners) listener()
-    },
-    subscribe: (listener) => {
-      listeners.add(listener)
-      return () => listeners.delete(listener)
-    },
-  }
-}
-
 function LiveResourceMeters({
   instanceId,
   relayId,
@@ -931,8 +892,9 @@ function LiveResourceMeters({
   instanceId: string
   relayId: string
 }) {
-  const [historyStore] = React.useState(() =>
-    createResourceHistoryStore(instanceId, relayId)
+  const historyStore = React.useMemo(
+    () => resourceHistoryStore(relayId, instanceId),
+    [instanceId, relayId]
   )
 
   return (
@@ -940,11 +902,6 @@ function LiveResourceMeters({
       className="hidden min-w-0 md:col-span-2 md:block xl:col-span-1 xl:col-start-2 xl:row-start-1"
       aria-label="Server resource usage"
     >
-      <ResourceHistoryRecorder
-        instanceId={instanceId}
-        relayId={relayId}
-        store={historyStore}
-      />
       <div className="grid h-14 min-w-0 grid-cols-[repeat(3,minmax(0,1fr))_minmax(0,1.25fr)_5.5rem] divide-x divide-border/60 border border-border/80 bg-card/40 px-1.5 py-2 xl:grid-cols-[repeat(3,minmax(0,1fr))_minmax(0,1.15fr)_5.75rem]">
         {RESOURCE_IDS.map((resourceId) => (
           <LiveResourceMeter
@@ -959,31 +916,6 @@ function LiveResourceMeters({
       </div>
     </div>
   )
-}
-
-function ResourceHistoryRecorder({
-  instanceId,
-  relayId,
-  store,
-}: {
-  instanceId: string
-  relayId: string
-  store: ResourceHistoryStore
-}) {
-  const selectRuntime = React.useMemo(
-    () => selectInstanceRuntime(instanceId, relayId),
-    [instanceId, relayId]
-  )
-  const { data: instance } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    select: selectRuntime,
-  })
-
-  React.useEffect(() => {
-    if (instance) store.record(instance)
-  }, [instance, store])
-
-  return null
 }
 
 function LiveResourceMeter({
@@ -1123,7 +1055,11 @@ interface ResourceItem {
   id: "cpu" | "memory" | "storage" | "network"
   label: string
   value: number | null
+  barValue: number | null
+  chartMax?: number
   displayValue: string
+  historyDisplayValue?: string
+  historySecondaryDisplayValue?: string
   receivedDisplayValue?: string
   sentDisplayValue?: string
   receivedValue?: number | null
@@ -1185,9 +1121,13 @@ function resourceItem(instance: InstanceRuntime, id: ResourceId): ResourceItem {
       id: "cpu",
       label: "CPU",
       value: resources?.cpu.percent ?? null,
+      barValue: resources
+        ? (resources.cpu.percent / resources.cpu.capacityPercent) * 100
+        : null,
+      chartMax: resources?.cpu.capacityPercent,
       displayValue: formatPercent(resources?.cpu.percent),
       detail: resources
-        ? `${formatPercent(resources.cpu.percent)} container CPU`
+        ? `${formatPercent(resources.cpu.percent)} of ${formatPercent(resources.cpu.capacityPercent)} · ${resources.cpu.capacityPercent / 100} threads`
         : unavailable,
       indicatorClassName: RESOURCE_STYLES.cpu.indicator,
       valueClassName: RESOURCE_STYLES.cpu.value,
@@ -1199,7 +1139,14 @@ function resourceItem(instance: InstanceRuntime, id: ResourceId): ResourceItem {
       id: "memory",
       label: "RAM",
       value: resources?.memory.percent ?? null,
+      barValue: resources?.memory.percent ?? null,
       displayValue: formatPercent(resources?.memory.percent),
+      historyDisplayValue: resources
+        ? formatResourceBytePair(
+            resources.memory.usedBytes,
+            resources.memory.totalBytes
+          )
+        : "—",
       detail: resources
         ? `${formatBytes(resources.memory.usedBytes)} of ${formatBytes(resources.memory.totalBytes)}`
         : unavailable,
@@ -1209,13 +1156,29 @@ function resourceItem(instance: InstanceRuntime, id: ResourceId): ResourceItem {
     }
   }
   if (id === "storage") {
+    const storage = resources?.storage
+    const usageKnown = hasKnownStorageUsage(storage)
     return {
       id: "storage",
       label: "DISK",
-      value: resources?.storage.percent ?? null,
-      displayValue: formatPercent(resources?.storage.percent),
-      detail: resources
-        ? `${formatBytes(resources.storage.usedBytes)} of ${formatBytes(resources.storage.totalBytes)} on the instance volume`
+      value: usageKnown ? storage.percent : null,
+      barValue: usageKnown ? storage.percent : null,
+      displayValue: usageKnown ? formatPercent(storage.percent) : "—",
+      historyDisplayValue: usageKnown
+        ? formatResourceBytePair(storage.usedBytes, storage.totalBytes)
+        : storage
+          ? "Scanning"
+          : "—",
+      historySecondaryDisplayValue: storage
+        ? formatResourceBytePair(storage.nodeUsedBytes, storage.nodeTotalBytes)
+        : "—",
+      detail: usageKnown
+        ? `${formatBytes(storage.usedBytes)} of ${formatBytes(storage.totalBytes)} quota`
+        : storage
+          ? `Scanning folder usage · ${formatBytes(storage.totalBytes)} quota`
+          : unavailable,
+      historyDetail: storage
+        ? `Node ${formatBytes(storage.nodeUsedBytes)} of ${formatBytes(storage.nodeTotalBytes)}`
         : unavailable,
       indicatorClassName: RESOURCE_STYLES.storage.indicator,
       valueClassName: RESOURCE_STYLES.storage.value,
@@ -1226,6 +1189,12 @@ function resourceItem(instance: InstanceRuntime, id: ResourceId): ResourceItem {
     id: "network",
     label: "NET",
     value: resources?.network
+      ? networkActivityPercent(
+          resources.network.receivedBytesPerSecond +
+            resources.network.sentBytesPerSecond
+        )
+      : null,
+    barValue: resources?.network
       ? networkActivityPercent(
           resources.network.receivedBytesPerSecond +
             resources.network.sentBytesPerSecond
@@ -1276,7 +1245,9 @@ function ResourceBar({
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={
-        resource.value === null ? undefined : Math.min(resource.value, 100)
+        resource.barValue === null
+          ? undefined
+          : Math.min(resource.barValue, 100)
       }
       aria-valuetext={
         resource.id === "network" || resource.value === null
@@ -1304,21 +1275,11 @@ function ResourceBar({
       ) : (
         <div
           className={`h-full transition-[width] duration-500 ease-out ${resource.indicatorClassName}`}
-          style={{ width: `${clampResourcePercent(resource.value)}%` }}
+          style={{ width: `${clampResourcePercent(resource.barValue)}%` }}
         />
       )}
     </div>
   )
-}
-
-interface ResourceHistoryPoint {
-  timestamp: number
-  cpu: number | null
-  memory: number | null
-  storage: number | null
-  network: number | null
-  networkReceived: number | null
-  networkSent: number | null
 }
 
 function ResourceHistoryPopover({
@@ -1330,8 +1291,16 @@ function ResourceHistoryPopover({
   historyStore: ResourceHistoryStore
   children: React.ReactElement
 }) {
+  const [replayToken, setReplayToken] = React.useState(0)
+
   return (
-    <HoverCard openDelay={160} closeDelay={100}>
+    <HoverCard
+      openDelay={160}
+      closeDelay={100}
+      onOpenChange={(open) => {
+        if (open) setReplayToken((current) => current + 1)
+      }}
+    >
       <HoverCardTrigger asChild>{children}</HoverCardTrigger>
       <HoverCardContent
         align="center"
@@ -1340,7 +1309,11 @@ function ResourceHistoryPopover({
         collisionPadding={12}
         className="w-[min(20rem,calc(100vw-1.5rem))] border-border/90 bg-popover p-0 shadow-2xl"
       >
-        <ResourceHistoryCard resource={resource} historyStore={historyStore} />
+        <ResourceHistoryCard
+          resource={resource}
+          historyStore={historyStore}
+          replayToken={replayToken}
+        />
       </HoverCardContent>
     </HoverCard>
   )
@@ -1349,9 +1322,11 @@ function ResourceHistoryPopover({
 function ResourceHistoryCard({
   resource,
   historyStore,
+  replayToken,
 }: {
   resource: ResourceItem
   historyStore: ResourceHistoryStore
+  replayToken: number
 }) {
   const history = React.useSyncExternalStore(
     historyStore.subscribe,
@@ -1359,7 +1334,7 @@ function ResourceHistoryCard({
     historyStore.getSnapshot
   )
   const now = Date.now()
-  const domainStart = now - 60_000
+  const domainStart = now - RESOURCE_HISTORY_WINDOW_MS
   const visibleHistory = history.filter(
     (sample) => sample.timestamp >= domainStart
   )
@@ -1380,6 +1355,7 @@ function ResourceHistoryCard({
   const chartData = visibleHistory.map((sample) => ({
     timestamp: sample.timestamp,
     value: sample[resource.id],
+    secondary: sample.storageNode,
     received: sample.networkReceived,
     sent: sample.networkSent,
   }))
@@ -1396,7 +1372,7 @@ function ResourceHistoryCard({
         sentStats={sentStats}
       />
 
-      <div className="px-2.5 pt-2.5">
+      <div className="px-1.5 pt-2.5">
         <React.Suspense
           fallback={
             <div className="grid h-32 place-items-center border-y border-border/40 font-mono text-[9px] tracking-[0.08em] text-muted-foreground uppercase">
@@ -1411,6 +1387,8 @@ function ResourceHistoryCard({
             color={resource.chartColor}
             domainStart={domainStart}
             domainEnd={now}
+            maxValue={resource.chartMax}
+            replayToken={replayToken}
             formatValue={(value) => formatHistoryValue(resource.id, value)}
           />
         </React.Suspense>
@@ -1443,7 +1421,7 @@ function ResourceHistoryHeader({
           {resource.label}
         </span>
         <span className="font-mono text-[9px] tracking-[0.08em] text-muted-foreground/70">
-          60s window
+          6m window
         </span>
       </div>
 
@@ -1462,13 +1440,26 @@ function ResourceHistoryHeader({
             peak={sentStats.peak}
           />
         </div>
+      ) : resource.id === "storage" ? (
+        <div className="grid h-9 grid-cols-2 divide-x divide-border/55">
+          <DiskHistoryValue
+            label="Server"
+            value={resource.historyDisplayValue ?? "—"}
+            valueClassName={resource.valueClassName}
+          />
+          <DiskHistoryValue
+            label="Node"
+            value={resource.historySecondaryDisplayValue ?? "—"}
+            valueClassName="text-foreground/80"
+          />
+        </div>
       ) : (
         <div className="grid h-9 grid-cols-[1fr_4.5rem_4.5rem] divide-x divide-border/55">
           <div className="flex min-w-0 items-center gap-2 px-3">
             <span
-              className={`truncate font-mono text-xl font-semibold tracking-[-0.04em] tabular-nums ${resource.valueClassName}`}
+              className={`truncate font-mono font-semibold tracking-[-0.04em] tabular-nums ${resource.id === "memory" ? "text-[13px]" : "text-xl"} ${resource.valueClassName}`}
             >
-              {resource.displayValue}
+              {resource.historyDisplayValue ?? resource.displayValue}
             </span>
             <span className="font-mono text-[9px] tracking-[0.06em] text-muted-foreground/60 uppercase">
               Now
@@ -1486,6 +1477,29 @@ function ResourceHistoryHeader({
           />
         </div>
       )}
+    </div>
+  )
+}
+
+function DiskHistoryValue({
+  label,
+  value,
+  valueClassName,
+}: {
+  label: string
+  value: string
+  valueClassName: string
+}) {
+  return (
+    <div className="flex min-w-0 flex-col justify-center px-3">
+      <span className="font-mono text-[8px] leading-none tracking-[0.08em] text-muted-foreground/65 uppercase">
+        {label}
+      </span>
+      <span
+        className={`mt-1 truncate font-mono text-[12px] leading-none font-semibold tracking-[-0.035em] tabular-nums ${valueClassName}`}
+      >
+        {value}
+      </span>
     </div>
   )
 }
@@ -1573,6 +1587,28 @@ function formatBytes(bytes: number): string {
   )
   const value = bytes / 1024 ** exponent
   return `${value.toFixed(value >= 10 || exponent === 0 ? 0 : 1)} ${units[exponent]}`
+}
+
+function resourceByteValue(bytes: number): { value: string; unit: string } {
+  if (!Number.isFinite(bytes) || bytes <= 0) return { value: "0", unit: "B" }
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+  const exponent = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1
+  )
+  const value = bytes / 1024 ** exponent
+  return {
+    value: String(Number(value.toPrecision(3))),
+    unit: units[exponent] ?? "B",
+  }
+}
+
+function formatResourceBytePair(usedBytes: number, totalBytes: number): string {
+  const used = resourceByteValue(usedBytes)
+  const total = resourceByteValue(totalBytes)
+  return used.unit === total.unit
+    ? `${used.value} / ${total.value} ${total.unit}`
+    : `${used.value} ${used.unit} / ${total.value} ${total.unit}`
 }
 
 function formatBytesPerSecond(bytes: number): string {

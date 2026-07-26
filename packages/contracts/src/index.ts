@@ -132,6 +132,36 @@ export const brickRecipeSchema = z
 
 export const brickSourceSchema = z.string().trim().url().max(2_048)
 export const relayInstanceNameSchema = z.string().trim().min(1).max(120)
+export const DEFAULT_INSTANCE_DISK_LIMIT_BYTES = 25 * 1024 ** 3
+export const MINIMUM_INSTANCE_DISK_LIMIT_BYTES = Math.round(0.1 * 1024 ** 3)
+export const RELAY_NODE_DISK_RESERVE_BYTES = 10 * 1024 ** 3
+
+const relayDiskLimitBytesSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .transform((bytes) =>
+    bytes === 0 ? DEFAULT_INSTANCE_DISK_LIMIT_BYTES : bytes
+  )
+  .default(DEFAULT_INSTANCE_DISK_LIMIT_BYTES)
+const relayRequestedDiskLimitBytesSchema = z
+  .number()
+  .int()
+  .min(MINIMUM_INSTANCE_DISK_LIMIT_BYTES)
+  .default(DEFAULT_INSTANCE_DISK_LIMIT_BYTES)
+
+export function relayDiskAllocationAvailableBytes(
+  nodeTotalBytes: number,
+  otherAllocatedBytes: number,
+  currentLimitBytes = 0
+): number {
+  const assignableBytes = Math.max(
+    nodeTotalBytes - RELAY_NODE_DISK_RESERVE_BYTES,
+    0
+  )
+  const remainingBytes = Math.max(assignableBytes - otherAllocatedBytes, 0)
+  return Math.max(remainingBytes, currentLimitBytes)
+}
 
 export const brickSchema = brickRecipeSchema.extend({
   source: brickSourceSchema,
@@ -143,6 +173,7 @@ export const brickVariableValuesSchema = z.record(
 )
 
 export const relayCreateInstanceSchema = z.object({
+  diskLimitBytes: relayRequestedDiskLimitBytesSchema,
   name: relayInstanceNameSchema.optional(),
   recipe: brickSourceSchema,
   variables: brickVariableValuesSchema,
@@ -150,6 +181,7 @@ export const relayCreateInstanceSchema = z.object({
 })
 
 export const relayUpdateInstanceStartupSchema = z.object({
+  diskLimitBytes: relayRequestedDiskLimitBytesSchema.optional(),
   recipe: brickSourceSchema.optional(),
   variables: brickVariableValuesSchema,
   start: z.boolean().default(true),
@@ -324,6 +356,7 @@ export const relayProxyDiagnosticsSchema = z
 export const relayInstanceResourcesSchema = z.object({
   sampledAt: z.string().datetime(),
   cpu: z.object({
+    capacityPercent: z.number().positive().default(100),
     percent: z.number().nonnegative(),
   }),
   memory: z.object({
@@ -333,8 +366,11 @@ export const relayInstanceResourcesSchema = z.object({
   }),
   storage: z.object({
     totalBytes: z.number().nonnegative(),
-    usedBytes: z.number().nonnegative(),
-    percent: z.number().nonnegative(),
+    usedBytes: z.number().nonnegative().nullable(),
+    percent: z.number().nonnegative().nullable(),
+    nodeTotalBytes: z.number().nonnegative().default(0),
+    nodeUsedBytes: z.number().nonnegative().default(0),
+    nodePercent: z.number().nonnegative().default(0),
   }),
   network: z
     .object({
@@ -345,6 +381,13 @@ export const relayInstanceResourcesSchema = z.object({
     })
     .optional(),
 })
+
+export const relayInstanceLimitsSchema = z
+  .object({
+    diskBytes: relayDiskLimitBytesSchema,
+    memoryBytes: z.number().int().nonnegative(),
+  })
+  .strict()
 
 export const relayInstanceSchema = z.object({
   id: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -371,6 +414,10 @@ export const relayInstanceSchema = z.object({
   brickSource: brickSourceSchema.optional(),
   variables: brickVariableValuesSchema.optional(),
   managedByRelay: z.boolean().default(false),
+  limits: relayInstanceLimitsSchema.default({
+    diskBytes: DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
+    memoryBytes: 0,
+  }),
   resources: relayInstanceResourcesSchema.nullable().default(null),
 })
 
@@ -526,10 +573,23 @@ export const relayConsoleStreamEventSchema = z.discriminatedUnion("type", [
   }),
 ])
 
+export const relayResourceHistoryMaxSamples = 256
+
 export const relayResourceStreamEventSchema = z.object({
   type: z.literal("resource"),
   instance: relayInstanceSchema,
+  history: z
+    .array(relayInstanceResourcesSchema)
+    .max(relayResourceHistoryMaxSamples)
+    .default([]),
   sequence: z.number().int().nonnegative(),
+})
+
+export const relayInstanceResourceSnapshotSchema = z.object({
+  instance: relayInstanceSchema,
+  history: z
+    .array(relayInstanceResourcesSchema)
+    .max(relayResourceHistoryMaxSamples),
 })
 
 export const relayConsoleCommandSchema = z.object({
@@ -639,6 +699,7 @@ export type RelayObservedState = z.infer<typeof relayObservedStateSchema>
 export type RelayInstanceResources = z.infer<
   typeof relayInstanceResourcesSchema
 >
+export type RelayInstanceLimits = z.infer<typeof relayInstanceLimitsSchema>
 export type RelayInstance = z.infer<typeof relayInstanceSchema>
 export type RelayNode = z.infer<typeof relayNodeSchema>
 export type RelaySnapshot = z.infer<typeof relaySnapshotSchema>

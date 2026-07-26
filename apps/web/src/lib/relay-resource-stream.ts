@@ -6,7 +6,7 @@ import {
 import type { RelayResourceStreamEvent } from "@workspace/contracts"
 
 import { issueResourceCapability } from "@/server/relay-capability"
-import { getRelaySnapshot } from "@/server/relay"
+import { getRelayInstanceResources } from "@/server/relay"
 
 export async function* openRelayResourceStream(
   relayId: string,
@@ -107,18 +107,17 @@ async function* openHearthResourceStream(
   instanceId: string,
   signal: AbortSignal
 ): AsyncGenerator<RelayResourceStreamEvent> {
+  const historyForPoll = warmHistoryOnce()
   let sequence = Date.now()
   while (!signal.aborted) {
     // Polls are deliberately sequential so only one snapshot request is in flight.
     // oxlint-disable-next-line react-doctor/async-await-in-loop
-    const snapshot = await getRelaySnapshot()
-    const instance = snapshot.instances.find(
-      (candidate) =>
-        candidate.id === instanceId && candidate.relayId === relayId
-    )
-    if (!instance) throw new Error("Instance is no longer available")
+    const snapshot = await getRelayInstanceResources({
+      data: { instanceId, relayId },
+    })
     yield relayResourceStreamEventSchema.parse({
-      instance,
+      history: historyForPoll(snapshot.history),
+      instance: snapshot.instance,
       sequence: sequence++,
       type: "resource",
     })
@@ -126,12 +125,21 @@ async function* openHearthResourceStream(
   }
 }
 
+export function warmHistoryOnce<T>(): (history: Array<T>) => Array<T> {
+  let delivered = false
+  return (history) => {
+    if (delivered) return []
+    delivered = true
+    return history
+  }
+}
+
 function waitForPoll(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve()
   return new Promise((resolve) => {
-    const timer = window.setTimeout(done, 2_000)
+    const timer = globalThis.setTimeout(done, 2_000)
     function done() {
-      window.clearTimeout(timer)
+      globalThis.clearTimeout(timer)
       signal.removeEventListener("abort", done)
       resolve()
     }

@@ -11,6 +11,7 @@ import {
   relayNetworkingSchema,
   relaySnapshotSchema,
   relayUpdateInstanceStartupSchema,
+  relayDiskAllocationAvailableBytes,
 } from "@workspace/contracts"
 import { z } from "zod"
 
@@ -152,7 +153,37 @@ export const getInstanceStartup = createServerFn({ method: "GET" })
           definition.default === undefined ? [] : [[name, definition.default]]
         )
       )
+    const otherInstances = snapshot.instances.filter(
+      (candidate) => candidate.id !== instance.id
+    )
+    const otherMemoryBytes = otherInstances.reduce(
+      (total, candidate) => total + candidate.limits.memoryBytes,
+      0
+    )
+    const otherDiskBytes = otherInstances.reduce(
+      (total, candidate) => total + candidate.limits.diskBytes,
+      0
+    )
     return {
+      allocation: {
+        memory: {
+          availableBytes: Math.max(
+            snapshot.node.memory.totalBytes - otherMemoryBytes,
+            instance.limits.memoryBytes
+          ),
+          nodeTotalBytes: snapshot.node.memory.totalBytes,
+          nodeUsedBytes: snapshot.node.memory.usedBytes,
+        },
+        storage: {
+          availableBytes: relayDiskAllocationAvailableBytes(
+            snapshot.node.storage.totalBytes,
+            otherDiskBytes,
+            instance.limits.diskBytes
+          ),
+          nodeTotalBytes: snapshot.node.storage.totalBytes,
+          nodeUsedBytes: snapshot.node.storage.usedBytes,
+        },
+      },
       brick,
       brickSource,
       instance: relayInstanceSchema.parse(instance),
