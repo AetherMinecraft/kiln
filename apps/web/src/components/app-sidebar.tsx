@@ -52,6 +52,7 @@ import { HearthMark } from "@/components/hearth-mark"
 import { ServerTypeIcon } from "@/components/server-type-icon"
 import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
+import { clearAppearanceCache } from "@/lib/appearance"
 import {
   accessCapabilitiesQueryOptions,
   relayConnectionQueryOptions,
@@ -111,7 +112,6 @@ function persistSelectedInstance(routeId: string) {
 interface AppSidebarViewProps {
   user: AuthenticatedUser
   canManageAccess: boolean
-  isPlatformAdmin: boolean
   initialSelectedInstanceRouteId: string | null
   relayConfigured: boolean
 }
@@ -135,7 +135,6 @@ export const AppSidebar = React.memo(function AppSidebar({
   return (
     <AppSidebarView
       canManageAccess={capabilities.canManageAccess}
-      isPlatformAdmin={capabilities.isPlatformAdmin}
       initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
       relayConfigured={relayConfigured}
       user={capabilities.user}
@@ -146,7 +145,6 @@ export const AppSidebar = React.memo(function AppSidebar({
 const AppSidebarView = React.memo(function AppSidebarView({
   user,
   canManageAccess,
-  isPlatformAdmin,
   initialSelectedInstanceRouteId,
   relayConfigured,
 }: AppSidebarViewProps) {
@@ -178,11 +176,7 @@ const AppSidebarView = React.memo(function AppSidebarView({
         />
       </SidebarContent>
 
-      <AccountNavigation
-        canManageAccess={canManageAccess}
-        isPlatformAdmin={isPlatformAdmin}
-        user={user}
-      />
+      <AccountNavigation canManageAccess={canManageAccess} user={user} />
     </Sidebar>
   )
 })
@@ -213,11 +207,7 @@ function ServersNavigationItem({
 }) {
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton
-        asChild
-        tooltip="Servers"
-        className="data-active:bg-primary/10 data-active:text-primary"
-      >
+      <SidebarMenuButton asChild tooltip="Servers">
         <Link
           to="/infra/servers"
           activeOptions={{ exact: true, includeSearch: false }}
@@ -589,11 +579,7 @@ const InstanceTabNavigationItem = React.memo(
 
     return (
       <SidebarMenuItem>
-        <SidebarMenuButton
-          asChild
-          tooltip={item.title}
-          className="data-active:bg-primary/10 data-active:text-primary"
-        >
+        <SidebarMenuButton asChild tooltip={item.title}>
           {!instanceRouteId ? (
             <Link
               to="/infra/servers"
@@ -663,11 +649,9 @@ const InstanceTabNavigationItem = React.memo(
 
 function AccountNavigation({
   canManageAccess,
-  isPlatformAdmin,
   user,
 }: {
   canManageAccess: boolean
-  isPlatformAdmin: boolean
   user: AuthenticatedUser
 }) {
   const { isMobile } = useSidebar()
@@ -701,11 +685,9 @@ function AccountNavigation({
         <SidebarMenuItem>
           {canManageAccess ? <AccessNavigationButton /> : null}
         </SidebarMenuItem>
-        {isPlatformAdmin ? (
-          <SidebarMenuItem>
-            <SettingsNavigationButton />
-          </SidebarMenuItem>
-        ) : null}
+        <SidebarMenuItem>
+          <SettingsNavigationButton />
+        </SidebarMenuItem>
         <SidebarMenuItem>
           <div className="flex h-11 items-center gap-2 px-2 group-data-[collapsible=icon]:px-0">
             <Avatar
@@ -814,6 +796,7 @@ function SettingsNavigationButton() {
 async function signOut(isDevelopmentBypass: boolean) {
   if (isDevelopmentBypass) await disableDevelopmentBypass()
   else await authClient.signOut()
+  clearAppearanceCache()
   window.location.assign("/")
 }
 

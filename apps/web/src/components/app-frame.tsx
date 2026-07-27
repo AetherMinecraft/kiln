@@ -13,17 +13,32 @@ import { AppSidebar } from "@/components/app-sidebar"
 import { InfraUpdateDialogProvider } from "@/components/infra-update-dialog-provider"
 import { PanelFooter } from "@/components/panel-footer"
 import { RelayConnectionToastMonitor } from "@/components/relay-connection-toast"
+import { applyAppearance, saveAppearanceCache } from "@/lib/appearance"
+import type { AppearancePreferences } from "@/lib/appearance"
 import { uiPreferencesQueryOptions } from "@/lib/query-options"
+import type { UiPreferences } from "@/lib/query-options"
+
+function selectAppFramePreferences(preferences: UiPreferences) {
+  return {
+    appearance: preferences.appearance,
+    selectedInstanceRouteId: preferences.selectedInstanceRouteId,
+    sidebarOpen: preferences.sidebarOpen,
+  }
+}
 
 export const AppFrame = React.memo(function AppFrame({
   children,
 }: {
   children: React.ReactNode
 }) {
-  const { data: uiPreferences } = useSuspenseQuery(uiPreferencesQueryOptions())
+  const { data: uiPreferences } = useSuspenseQuery({
+    ...uiPreferencesQueryOptions(),
+    select: selectAppFramePreferences,
+  })
 
   return (
     <SidebarProvider defaultOpen={uiPreferences.sidebarOpen}>
+      <AppearanceHydrator appearance={uiPreferences.appearance} />
       <InfraUpdateDialogProvider>
         <RelayConnectionToastMonitor />
         <MobileSidebarNavigationDismiss />
@@ -42,6 +57,24 @@ export const AppFrame = React.memo(function AppFrame({
       </InfraUpdateDialogProvider>
     </SidebarProvider>
   )
+})
+
+const AppearanceHydrator = React.memo(function AppearanceHydrator({
+  appearance,
+}: {
+  appearance: AppearancePreferences
+}) {
+  React.useEffect(() => {
+    saveAppearanceCache(appearance)
+    if (appearance.colorScheme !== "system") return
+
+    const colorScheme = window.matchMedia("(prefers-color-scheme: dark)")
+    const applySystemAppearance = () => applyAppearance(appearance)
+    colorScheme.addEventListener("change", applySystemAppearance)
+    return () =>
+      colorScheme.removeEventListener("change", applySystemAppearance)
+  }, [appearance])
+  return null
 })
 
 function MobileSidebarNavigationDismiss() {
