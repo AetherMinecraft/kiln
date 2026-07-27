@@ -22,31 +22,68 @@ Before editing files for a substantial task:
 ## Work
 
 - Use Vite+ (`vp`) and existing Effect patterns; never edit `.repos/effect`.
-- Keep only critical deterministic tests, and been hesitant or creating new tests. Prefer browser validation during development
-- This project uses Sentry.io for error/traces/session replays and more. SENTRY_TRACES_SAMPLE_RATE is set to 100% in local development. Review the sentry-cli skill when debugging
+- Add only critical deterministic tests; prefer browser validation during
+  development.
+- This project uses Sentry.io for errors, traces, session replays, and more.
+  `SENTRY_TRACES_SAMPLE_RATE` is set to 100% in local development. Review the
+  `sentry-cli` skill when debugging.
 - Avoid patching framework/library internals unless explicitly given permission.
-
-For user-visible or runtime work, use T3 Code's collaborative Preview tools
-against the OrbStack URL printed by `pnpm dev:docker`; avoid using local IP
-(ie. 127.0...) for dev/testing.
-
-When making changes, you should make sure you're on a fresh worktree and not on main. You can push the PR (no need to make it a draft) but never merge the PR.
-
-After a successful merge: switch to `main`, pull with `--ff-only`, delete the
-merged worktree and local branch, run
-`pnpm dev:docker:refresh`, and verify the OrbStack URL in T3 Preview. Reserve
-`pnpm dev:docker:down` for changes that require rebuilding the Compose network or volumes.
+- For user-visible or runtime work, use T3 Code's collaborative Preview against
+  the OrbStack URL printed by `pnpm dev:docker`; never use a local IP for
+  development or validation.
 
 ## Setup
 
-Run the shared development setup once per clone, then start the current
-worktree's isolated stack:
+Run once per clone from `main`:
 
 ```sh
 vp install --frozen-lockfile
 pnpm dev:setup
-pnpm dev:docker
 ```
+
+Name branches as `<type>/<task>`, with a short lowercase kebab-case task:
+
+| Prefix      | Use for                                      |
+| ----------- | -------------------------------------------- |
+| `feat/`     | New capabilities                             |
+| `fix/`      | Bugs and regressions                         |
+| `refactor/` | Behavior-preserving code changes             |
+| `ui/`       | Visual and interaction changes               |
+| `perf/`     | Performance improvements                     |
+| `infra/`    | Docker, deployment, and runtime tooling      |
+| `docs/`     | Documentation only                           |
+| `test/`     | Test-only changes                            |
+| `chore/`    | Dependencies and repository maintenance      |
+| `ci/`       | CI and release automation                    |
+
+For example: `fix/worktree-env-mount`. Do not use personal or agent-name
+prefixes.
+
+For every change:
+
+1. Switch to `main` and run `git pull --ff-only`.
+2. Run `pnpm dev:docker:down` on `main` so its baseline stack is not left
+   running.
+3. In T3 Code, create a correctly named branch and worktree from `main`; never
+   work directly on `main`.
+4. In the new worktree, run `pnpm dev:docker`.
+5. Immediately open the printed OrbStack URL in T3 Preview, leave it available
+   for the user, and confirm Hearth loads before making any changes.
+6. Develop and validate using that T3 Preview.
+7. Commit, push, and open a ready-for-review PR. Never merge the PR yourself.
+
+Do not run a development stack or Preview from `main`. Only active change
+worktrees should have running Docker containers and open Previews.
+
+Before deleting any worktree, run `pnpm dev:docker:destroy` inside it to remove
+its isolated stack and data. Use `pnpm dev:docker:down` only to stop a stack
+temporarily while retaining its data.
+
+After a PR is merged:
+
+1. Run `pnpm dev:docker:destroy` in the merged worktree.
+2. Switch to `main` and run `git pull --ff-only`.
+3. Delete the merged worktree and local branch.
 
 # Reference Repos
 
