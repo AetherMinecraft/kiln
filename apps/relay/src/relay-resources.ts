@@ -10,6 +10,10 @@ export interface RelayResourceNames {
   limboContainer: string
   relayEdgeAlias: string
   relayEdgeNetwork: string
+  tailscaleContainer: string
+  tailscaleStackContainer(stackId: string): string
+  tailscaleStackDnsContainer(stackId: string): string
+  tailscaleStackNetwork(stackId: string): string
   traefikContainer: string
 }
 
@@ -29,6 +33,13 @@ export function relayResourceNames(
     limboContainer: name("kiln-limbo"),
     relayEdgeAlias: "kiln-relay",
     relayEdgeNetwork: name("kiln-relay-edge"),
+    tailscaleContainer: name("kiln-tailscale"),
+    tailscaleStackContainer: (stackId) =>
+      name(`kiln-ts-${stackId.slice(0, 8)}`),
+    tailscaleStackDnsContainer: (stackId) =>
+      name(`kiln-ts-${stackId.slice(0, 8)}-dns`),
+    tailscaleStackNetwork: (stackId) =>
+      name(`kiln-ts-${stackId.slice(0, 8)}-network`),
     traefikContainer: name("kiln-traefik"),
   }
 }

@@ -17,10 +17,19 @@ import {
   relayNetworkingSchema,
   relayProxySettingsSchema,
   relaySaveFileInputSchema,
+  relayTailscaleInstallSchema,
+  relayTailscaleSettingsSchema,
+  relayTailscaleStackApplySchema,
+  relayTailscaleStackDnsSchema,
+  relayTailscaleStackRemoveSchema,
   relayUpdateInstanceStartupSchema,
   relayBootstrapDiscoveryTranscript,
 } from "@workspace/contracts"
-import type { RelayControlRequest, RelayInstance } from "@workspace/contracts"
+import type {
+  RelayControlOperation,
+  RelayControlRequest,
+  RelayInstance,
+} from "@workspace/contracts"
 
 import { BrickCatalog } from "./bricks.js"
 import { attachBrowserSocket } from "./browser-socket.js"
@@ -91,6 +100,7 @@ const startupCore = await runRelayEffect(
 )
 const cliArguments = process.argv.slice(2)
 let relayIdentity = startupCore.identity
+config.nodeId = relayIdentity.fingerprint
 config.nodeName = relayIdentity.name
 const bricks = new BrickCatalog(config.brickCatalogUrl)
 const docker = new DockerDriver(config)
@@ -126,6 +136,27 @@ await lifecycle.initializeProxy(
   await loadStartupWebRoutes(),
   startupProxySettings
 )
+let tailscaleFirewallError: string | null = null
+const reconcileTailscaleFirewalls = async () => {
+  try {
+    await lifecycle.reconcileTailscaleStackFirewalls()
+    if (tailscaleFirewallError) {
+      console.log("Relay restored Tailscale forwarding rules")
+      tailscaleFirewallError = null
+    }
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : "unknown error"
+    if (message !== tailscaleFirewallError) {
+      console.error("Relay could not restore Tailscale forwarding rules", cause)
+      tailscaleFirewallError = message
+    }
+  }
+}
+await reconcileTailscaleFirewalls()
+const tailscaleFirewallTimer = setInterval(() => {
+  void reconcileTailscaleFirewalls()
+}, 10_000)
+tailscaleFirewallTimer.unref()
 const instanceMutations = new Map<string, Promise<unknown>>()
 let webRouteMutation: Promise<unknown> = Promise.resolve()
 const snapshotHub = new RelaySnapshotHub(relaySnapshot)
@@ -603,7 +634,12 @@ async function relaySnapshot() {
 async function executeControlRequest(
   request: RelayControlRequest,
   client: RelayClientGrant,
-  signal: AbortSignal
+  signal: AbortSignal,
+  requestHearth: (
+    operation: RelayControlOperation,
+    payload: unknown,
+    timeoutMs: number
+  ) => Promise<unknown>
 ): Promise<unknown> {
   if (signal.aborted) throw new Error("Relay request was cancelled")
   const payload = payloadRecord(request.payload)
@@ -642,6 +678,47 @@ async function executeControlRequest(
       return lifecycle.configureNetworking(
         relayNetworkingSchema.parse(request.payload)
       )
+    case "relay.tailscale.read":
+      return lifecycle.tailscaleOverview()
+    case "relay.tailscale.write":
+      return lifecycle.configureTailscale(
+        relayTailscaleSettingsSchema.parse(request.payload)
+      )
+    case "relay.tailscale.install":
+      return lifecycle.installTailscale(
+        relayTailscaleInstallSchema.parse(request.payload).authKey
+      )
+    case "relay.tailscale.stack.list":
+      return lifecycle.tailscaleStacks()
+    case "relay.tailscale.stack.apply": {
+      const input = relayTailscaleStackApplySchema.parse(request.payload)
+      const stack = await serializeInstanceMutation(input.id, () =>
+        lifecycle.applyTailscaleStack(input)
+      )
+      await snapshotHub.refresh()
+      return stack
+    }
+    case "relay.tailscale.stack.dns": {
+      const input = relayTailscaleStackDnsSchema.parse(request.payload)
+      return serializeInstanceMutation(input.id, () =>
+        lifecycle.syncTailscaleStackDns(input)
+      )
+    }
+    case "relay.tailscale.stack.remove": {
+      const { controlPlaneDeviceRemoved, id, mode } =
+        relayTailscaleStackRemoveSchema.parse(request.payload)
+      await serializeInstanceMutation(id, () =>
+        lifecycle.removeTailscaleStack(id, mode, controlPlaneDeviceRemoved)
+      )
+      if (mode === "commit") {
+        await runRelayEffect(
+          "relay.tailscale.stack.deleteName",
+          startup.state.deleteInstanceName(id)
+        )
+      }
+      await snapshotHub.refresh()
+      return { mode, removed: mode === "commit" }
+    }
     case "relay.proxy.read": {
       const settings = await lifecycle.proxySettings()
       return {
@@ -829,7 +906,16 @@ async function executeControlRequest(
     case "instance.delete": {
       const instanceId = requiredString(payload, "instanceId")
       await serializeInstanceMutation(instanceId, () =>
-        lifecycle.deleteInstance(instanceId, payload.deleteData === true)
+        lifecycle.deleteInstance(
+          instanceId,
+          payload.deleteData === true,
+          ({ mode, stackIds }) =>
+            requestHearth(
+              "hearth.tailscale.instance.detach",
+              { instanceId, mode, stackIds },
+              60_000
+            ).then(() => undefined)
+        )
       )
       await runRelayEffect(
         "relay.instance.deleteName",
@@ -994,6 +1080,7 @@ async function executeControlRequest(
         )
       )
       config.nodeName = relayIdentity.name
+      config.nodeId = relayIdentity.fingerprint
       await appendRelayAudit("relay.renamed", client.id, request.id, {
         name: relayIdentity.name,
       })

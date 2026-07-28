@@ -50,7 +50,7 @@ export const relayFetchEffect = Effect.fn("relay.fetch")(function* (
   relay: RelayEndpoint,
   path: string,
   init?: RequestInit,
-  timeoutMs = 10_000
+  timeoutMs?: number
 ) {
   const response = yield* Effect.tryPromise({
     try: () =>
@@ -191,6 +191,47 @@ function relayControlRequest(path: string, init?: RequestInit) {
     }
     if (method === "PUT") {
       return { operation: "relay.networking.write" as const, payload: body }
+    }
+  }
+  if (url.pathname === "/v1/tailscale") {
+    if (method === "GET") {
+      return { operation: "relay.tailscale.read" as const, payload: {} }
+    }
+    if (method === "PUT") {
+      return { operation: "relay.tailscale.write" as const, payload: body }
+    }
+  }
+  if (url.pathname === "/v1/tailscale/install" && method === "POST") {
+    return { operation: "relay.tailscale.install" as const, payload: body }
+  }
+  if (url.pathname === "/v1/tailscale/stacks" && method === "GET") {
+    return {
+      operation: "relay.tailscale.stack.list" as const,
+      payload: {},
+    }
+  }
+  const tailscaleStackMatch = url.pathname.match(
+    /^\/v1\/tailscale\/stacks\/([^/]+)(?:\/dns)?$/u
+  )
+  if (tailscaleStackMatch) {
+    const id = decodeURIComponent(tailscaleStackMatch[1])
+    if (url.pathname.endsWith("/dns") && method === "PUT") {
+      return {
+        operation: "relay.tailscale.stack.dns" as const,
+        payload: { ...body, id },
+      }
+    }
+    if (method === "PUT") {
+      return {
+        operation: "relay.tailscale.stack.apply" as const,
+        payload: { ...body, id },
+      }
+    }
+    if (method === "DELETE") {
+      return {
+        operation: "relay.tailscale.stack.remove" as const,
+        payload: { id },
+      }
     }
   }
   if (url.pathname === "/v1/proxy") {

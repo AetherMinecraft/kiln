@@ -47,7 +47,12 @@ export interface ControlSocketOptions {
   readonly execute: (
     request: RelayControlRequest,
     client: RelayClientGrant,
-    signal: AbortSignal
+    signal: AbortSignal,
+    requestHearth: (
+      operation: RelayControlOperation,
+      payload: unknown,
+      timeoutMs: number
+    ) => Promise<unknown>
   ) => Promise<unknown>
   readonly identity: RelayIdentity
   readonly initialSnapshot: () => Promise<unknown>
@@ -384,7 +389,8 @@ function authenticateSocket(
       const payload = await options.execute(
         request,
         currentClient,
-        controller.signal
+        controller.signal,
+        requestClient
       )
       if (isAuditedMutation(request.operation)) {
         void options
@@ -505,14 +511,44 @@ function authenticateSocket(
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        reversePending.delete(id)
-        reject(new Error(`Hearth request timed out after ${duration}ms`))
+        const pending = reversePending.get(id)
+        if (!pending) return
+        send(socket, {
+          id: randomUUID(),
+          replyTo: id,
+          type: "cancel",
+          v: 1,
+        })
+        pending.timer = setTimeout(
+          () => {
+            reversePending.delete(id)
+            reject(
+              new Error(
+                `Hearth request timed out after ${duration}ms and did not confirm cancellation`
+              )
+            )
+          },
+          reverseRequestCancellationGraceMs(operation, duration)
+        )
+        pending.timer.unref()
       }, duration)
       timer.unref()
       reversePending.set(id, { reject, resolve, timer })
       send(socket, request)
     })
   }
+}
+
+function reverseRequestCancellationGraceMs(
+  operation: RelayControlOperation,
+  duration: number
+): number {
+  if (operation === "hearth.tailscale.instance.detach") {
+    // A cancelled prepare may be inside one 60s peer RPC, then needs one
+    // additional peer-RPC window to restore every node already changed.
+    return Math.min(130_000, duration * 2 + 1_000)
+  }
+  return 1_000
 }
 
 function isAuditedMutation(operation: RelayControlOperation): boolean {
@@ -524,6 +560,11 @@ function isAuditedMutation(operation: RelayControlOperation): boolean {
     operation === "relay.clients.update" ||
     operation === "relay.clients.revoke" ||
     operation === "relay.networking.write" ||
+    operation === "relay.tailscale.install" ||
+    operation === "relay.tailscale.stack.apply" ||
+    operation === "relay.tailscale.stack.dns" ||
+    operation === "relay.tailscale.stack.remove" ||
+    operation === "relay.tailscale.write" ||
     operation === "relay.proxy.write" ||
     operation === "instance.create" ||
     operation === "instance.startup.write" ||
@@ -581,6 +622,18 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "instance.network.read"
     case "relay.networking.write":
       return "relay.configure"
+    case "relay.tailscale.read":
+    case "relay.tailscale.stack.list":
+      return "instance.network.read"
+    case "relay.tailscale.install":
+    case "relay.tailscale.write":
+      return "relay.configure"
+    case "relay.tailscale.stack.apply":
+      return "instance.create"
+    case "relay.tailscale.stack.dns":
+      return "instance.network.write"
+    case "relay.tailscale.stack.remove":
+      return "instance.delete"
     case "relay.proxy.read":
       return "relay.read"
     case "relay.proxy.write":
@@ -637,6 +690,8 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "instance.network.read"
     case "instance.network.routes.write":
       return "instance.network.write"
+    case "hearth.tailscale.instance.detach":
+      return null
     case "sftp.authorization.resolve":
       return "instance.sftp.connect"
   }

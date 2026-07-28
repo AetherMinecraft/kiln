@@ -21,10 +21,12 @@ import type {
   RelayObservedState,
 } from "@workspace/contracts"
 import {
+  builtinTailscaleBrickId,
   brickVariableValuesSchema,
   DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
   MINIMUM_INSTANCE_DISK_LIMIT_BYTES,
   relayDiskAllocationAvailableBytes,
+  relayInstanceTailscaleSchema,
 } from "@workspace/contracts"
 
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
@@ -87,6 +89,11 @@ interface DockerRecreateInspect {
 
 interface DiscoveredInstance {
   config: RelayInstanceConfig
+  container: DockerInspect
+}
+
+interface ConsoleTarget {
+  component: "coredns" | "tailscale" | null
   container: DockerInspect
 }
 
@@ -465,21 +472,39 @@ export class DockerDriver {
     limit = 2_000
   ): Promise<RelayConsole> {
     const discovered = await this.#findDiscovered(instance.id)
+    const targets = await this.#consoleTargets(instance, discovered)
     const boundedLimit = Math.min(Math.max(limit, 100), 5_000)
     const startedAt = consoleStartedAt(discovered.container)
-    const result = await command(
-      "docker",
-      [
-        "logs",
-        "--timestamps",
-        ...(startedAt ? ["--since", startedAt] : []),
-        "--tail",
-        String(boundedLimit),
-        discovered.container.Id,
-      ],
-      { timeout: 15_000 }
+    const results = await Promise.all(
+      targets.map(async (target) => {
+        const targetSince = dockerLogSinceArguments(
+          target.container.State.StartedAt
+        )
+        return {
+          target,
+          result: await command(
+            "docker",
+            [
+              "logs",
+              "--timestamps",
+              ...targetSince,
+              "--tail",
+              String(boundedLimit),
+              target.container.Id,
+            ],
+            { timeout: 15_000 }
+          ),
+        }
+      })
     )
-    const rawLines = parseConsoleOutput(result)
+    const rawLines = results
+      .flatMap(({ result, target }) =>
+        parseConsoleOutput(result).map((line) =>
+          prefixConsoleLine(line, target.component)
+        )
+      )
+      .sort(compareConsoleLines)
+      .slice(-boundedLimit)
     const occurrences = new Map<string, number>()
 
     return {
@@ -500,21 +525,34 @@ export class DockerDriver {
 
   async consoleLog(instance: RelayInstanceConfig): Promise<DockerConsoleLog> {
     const discovered = await this.#findDiscovered(instance.id)
+    const targets = await this.#consoleTargets(instance, discovered)
     const startedAt = consoleStartedAt(discovered.container)
-    const result = await command(
-      "docker",
-      [
-        "logs",
-        "--timestamps",
-        ...(startedAt ? ["--since", startedAt] : []),
-        discovered.container.Id,
-      ],
-      {
-        maxBuffer: MAX_SHARED_CONSOLE_BYTES + 1024,
-        timeout: 30_000,
-      }
+    const results = await Promise.all(
+      targets.map(async (target) => {
+        const targetSince = dockerLogSinceArguments(
+          target.container.State.StartedAt
+        )
+        return {
+          target,
+          result: await command(
+            "docker",
+            ["logs", "--timestamps", ...targetSince, target.container.Id],
+            {
+              maxBuffer: MAX_SHARED_CONSOLE_BYTES + 1024,
+              timeout: 30_000,
+            }
+          ),
+        }
+      })
     )
-    const lines = parseConsoleOutput(result).map((line) => line.text)
+    const lines = results
+      .flatMap(({ result, target }) =>
+        parseConsoleOutput(result).map((line) =>
+          prefixConsoleLine(line, target.component)
+        )
+      )
+      .sort(compareConsoleLines)
+      .map((line) => line.text)
     const content = lines.join("\n")
     const size = Buffer.byteLength(content)
     if (size > MAX_SHARED_CONSOLE_BYTES) {
@@ -539,28 +577,13 @@ export class DockerDriver {
     limit = 200
   ): AsyncGenerator<RelayConsoleLine> {
     const discovered = await this.#findDiscovered(instance.id)
+    const targets = await this.#consoleTargets(instance, discovered)
     const boundedLimit = Math.min(Math.max(limit, 100), 5_000)
-    const startedAt = consoleStartedAt(discovered.container)
-    const child = spawn(
-      "docker",
-      [
-        "logs",
-        "--follow",
-        "--timestamps",
-        ...(startedAt ? ["--since", startedAt] : []),
-        "--tail",
-        String(boundedLimit),
-        discovered.container.Id,
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] }
-    )
     const pending: Array<RelayConsoleLine> = []
     const occurrences = new Map<string, number>()
-    let stdoutBuffer = ""
-    let stderrBuffer = ""
     let wake: (() => void) | null = null
-    const streamState: { closed: boolean; failure: Error | null } = {
-      closed: false,
+    const streamState: { open: number; failure: Error | null } = {
+      open: targets.length,
       failure: null,
     }
 
@@ -568,54 +591,87 @@ export class DockerDriver {
       wake?.()
       wake = null
     }
-    const queueLine = (value: string) => {
+    const queueLine = (
+      value: string,
+      component: ConsoleTarget["component"]
+    ) => {
       const parsed = parseConsoleLine(value)
       if (!parsed) return
+      const prefixed = prefixConsoleLine(parsed, component)
       const hash = createHash("sha1")
-        .update(`${parsed.timestamp ?? ""}\u0000${parsed.text}`)
+        .update(`${prefixed.timestamp ?? ""}\u0000${prefixed.text}`)
         .digest("hex")
         .slice(0, 14)
       const occurrence = occurrences.get(hash) ?? 0
       occurrences.set(hash, occurrence + 1)
-      pending.push({ ...parsed, id: `${hash}-${occurrence}` })
+      pending.push({ ...prefixed, id: `${hash}-${occurrence}` })
       notify()
     }
-    const consume = (source: "stdout" | "stderr", chunk: Buffer) => {
-      const current =
-        (source === "stdout" ? stdoutBuffer : stderrBuffer) +
-        chunk.toString("utf8")
-      const lines = current.split("\n")
-      const remainder = lines.pop() ?? ""
-      if (source === "stdout") stdoutBuffer = remainder
-      else stderrBuffer = remainder
-      for (const line of lines) queueLine(line)
-    }
-    const stop = () => {
-      if (!child.killed) child.kill("SIGTERM")
-    }
-
-    child.stdout.on("data", (chunk: Buffer) => consume("stdout", chunk))
-    child.stderr.on("data", (chunk: Buffer) => consume("stderr", chunk))
-    child.on("error", (error) => {
-      streamState.failure = error
-      streamState.closed = true
-      notify()
-    })
-    child.on("close", (code) => {
-      if (stdoutBuffer) queueLine(stdoutBuffer)
-      if (stderrBuffer) queueLine(stderrBuffer)
-      if (!signal.aborted && code && code !== 143) {
-        streamState.failure = new Error(
-          `Docker log stream exited with code ${code}`
-        )
+    const children = targets.map((target) => {
+      let stdoutBuffer = ""
+      let stderrBuffer = ""
+      let settled = false
+      const targetSince = dockerLogSinceArguments(
+        target.container.State.StartedAt
+      )
+      const child = spawn(
+        "docker",
+        [
+          "logs",
+          "--follow",
+          "--timestamps",
+          ...targetSince,
+          "--tail",
+          String(Math.ceil(boundedLimit / targets.length)),
+          target.container.Id,
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] }
+      )
+      const consume = (source: "stdout" | "stderr", chunk: Buffer) => {
+        const current =
+          (source === "stdout" ? stdoutBuffer : stderrBuffer) +
+          chunk.toString("utf8")
+        const lines = current.split("\n")
+        const remainder = lines.pop() ?? ""
+        if (source === "stdout") stdoutBuffer = remainder
+        else stderrBuffer = remainder
+        for (const line of lines) queueLine(line, target.component)
       }
-      streamState.closed = true
-      notify()
+      child.stdout.on("data", (chunk: Buffer) => consume("stdout", chunk))
+      child.stderr.on("data", (chunk: Buffer) => consume("stderr", chunk))
+      child.on("error", (error) => {
+        streamState.failure = error
+        if (!settled) {
+          settled = true
+          streamState.open -= 1
+        }
+        notify()
+      })
+      child.on("close", (code) => {
+        if (stdoutBuffer) queueLine(stdoutBuffer, target.component)
+        if (stderrBuffer) queueLine(stderrBuffer, target.component)
+        if (!signal.aborted && code && code !== 143) {
+          streamState.failure = new Error(
+            `Docker log stream exited with code ${code}`
+          )
+        }
+        if (!settled) {
+          settled = true
+          streamState.open -= 1
+        }
+        notify()
+      })
+      return child
     })
+    const stop = () => {
+      for (const child of children) {
+        if (!child.killed) child.kill("SIGTERM")
+      }
+    }
     signal.addEventListener("abort", stop, { once: true })
 
     try {
-      while (!streamState.closed || pending.length > 0) {
+      while (streamState.open > 0 || pending.length > 0) {
         if (pending.length === 0) {
           await new Promise<void>((resolvePromise) => {
             wake = resolvePromise
@@ -1272,6 +1328,30 @@ export class DockerDriver {
     return found
   }
 
+  async #consoleTargets(
+    instance: RelayInstanceConfig,
+    discovered: DiscoveredInstance
+  ): Promise<Array<ConsoleTarget>> {
+    if (instance.brickId !== builtinTailscaleBrickId) {
+      return [{ component: null, container: discovered.container }]
+    }
+    const companionName = this.#resources.tailscaleStackDnsContainer(
+      instance.id
+    )
+    const inspected = await command("docker", ["inspect", companionName]).catch(
+      () => null
+    )
+    const companion = inspected
+      ? (JSON.parse(inspected.stdout) as Array<DockerInspect>)[0]
+      : null
+    return [
+      { component: "tailscale", container: discovered.container },
+      ...(companion
+        ? [{ component: "coredns" as const, container: companion }]
+        : []),
+    ]
+  }
+
   async #discover(): Promise<Array<DiscoveredInstance>> {
     const idsResult = await command("docker", [
       "container",
@@ -1448,6 +1528,10 @@ export class DockerDriver {
       name,
       shortId: id.slice(0, 8),
       service,
+      tailscale: relayInstanceTailscaleSchema.parse({
+        enabled: labels["kiln.instance.tailscale-enabled"] === "true",
+        subdomain: labels["kiln.instance.tailscale-subdomain"],
+      }),
       variables: parseBrickVariablesLabel(labels["kiln.brick.variables"]),
       limits: {
         diskBytes: diskLimitBytes,
@@ -1511,6 +1595,7 @@ function roundPercent(value: number): number {
 export interface ParsedConsoleLine {
   level: RelayConsoleLevel
   segments?: Array<RelayConsoleSegment>
+  service?: "coredns" | "tailscale"
   text: string
   timestamp: string | null
 }
@@ -1583,6 +1668,26 @@ function parseConsoleOutput(result: {
     .sort((left, right) =>
       (left.timestamp ?? "").localeCompare(right.timestamp ?? "")
     )
+}
+
+function prefixConsoleLine(
+  line: ParsedConsoleLine,
+  component: ConsoleTarget["component"]
+): ParsedConsoleLine {
+  if (!component) return line
+  return {
+    ...line,
+    segments: undefined,
+    service: component,
+    text: `[${component}] ${line.text}`,
+  }
+}
+
+function compareConsoleLines(
+  left: ParsedConsoleLine,
+  right: ParsedConsoleLine
+): number {
+  return (left.timestamp ?? "").localeCompare(right.timestamp ?? "")
 }
 
 interface ConsoleStyle {
@@ -1807,6 +1912,13 @@ function consoleStartedAt(container: DockerInspect): string | null {
   return Number.isFinite(timestamp) && timestamp > 0
     ? container.State.StartedAt
     : null
+}
+
+export function dockerLogSinceArguments(startedAt: string): Array<string> {
+  const timestamp = Date.parse(startedAt)
+  return Number.isFinite(timestamp) && timestamp > 0
+    ? ["--since", startedAt]
+    : []
 }
 
 function parseConsoleCompletion(

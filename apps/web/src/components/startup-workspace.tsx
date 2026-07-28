@@ -258,7 +258,6 @@ const StartupForm = React.memo(function StartupForm({
     }
   }
 
-  const entries = Object.entries(view.variables)
   const configuredMemoryBytes =
     resolvedMemoryBytes(view.memoryTemplate, variables) ??
     initialLimits.memoryBytes
@@ -297,88 +296,25 @@ const StartupForm = React.memo(function StartupForm({
           onSwap={() => setSwapOpen(true)}
         />
 
-        <form className="mt-5 space-y-4" onSubmit={onSubmit}>
-          <ResourceAllocationCard
-            allocation={allocation}
-            configuredMemoryBytes={configuredMemoryBytes}
-            diskLimitGiB={diskLimitGiB}
-            disabled={!canEdit || pending}
-            onDiskLimitChange={setDiskLimitGiB}
-          />
-
-          {entries.length === 0 ? (
-            <div className="rounded-xl border border-border/75 bg-background/45 px-4 py-8 text-center text-xs text-muted-foreground">
-              This Brick has no configurable Startup variables.
-            </div>
-          ) : (
-            <div className="space-y-3 rounded-xl border border-border/75 bg-background/45 p-4">
-              {entries.map(([name, definition]) => (
-                <BrickVariableField
-                  key={name}
-                  name={name}
-                  definition={definition}
-                  value={variables[name]}
-                  onChange={(value) => {
-                    if (!canEdit) return
-                    setVariables((current) =>
-                      updateBrickVariable(current, name, value)
-                    )
-                  }}
-                />
-              ))}
-            </div>
-          )}
-
-          <label className="flex cursor-pointer items-center justify-between rounded-xl border border-border/75 bg-background/45 px-4 py-3 text-xs">
-            <span>
-              <span className="block font-medium">Start after applying</span>
-              <span className="mt-0.5 block text-[9px] text-muted-foreground">
-                Leave off to keep the server stopped after rebuild.
-              </span>
-            </span>
-            <input
-              type="checkbox"
-              checked={startAfterSave}
-              disabled={!canEdit || pending}
-              onChange={(event) => setStartAfterSave(event.target.checked)}
-              className="accent-primary"
-            />
-          </label>
-
-          {error ? (
-            <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 text-xs text-destructive">
-              <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
-              {error}
-            </div>
-          ) : null}
-
-          <div className="flex flex-wrap items-center gap-2">
-            <Button type="submit" disabled={!canEdit || pending}>
-              {pending ? (
-                <LoaderCircle className="animate-spin" />
-              ) : saved ? (
-                <Save />
-              ) : startAfterSave ? (
-                <Play />
-              ) : (
-                <Rocket />
-              )}
-              {pending
-                ? "Applying…"
-                : saved
-                  ? "Applied"
-                  : startAfterSave
-                    ? "Apply & Start"
-                    : "Apply Startup"}
-            </Button>
-            {!canEdit ? (
-              <p className="text-[11px] text-muted-foreground">
-                Connect the Relay and use an account with settings access to
-                change Startup.
-              </p>
-            ) : null}
-          </div>
-        </form>
+        <StartupSettingsForm
+          allocation={allocation}
+          canEdit={canEdit}
+          configuredMemoryBytes={configuredMemoryBytes}
+          diskLimitGiB={diskLimitGiB}
+          error={error}
+          pending={pending}
+          saved={saved}
+          startAfterSave={startAfterSave}
+          variableDefinitions={view.variables}
+          variables={variables}
+          onDiskLimitChange={setDiskLimitGiB}
+          onStartAfterSaveChange={setStartAfterSave}
+          onSubmit={onSubmit}
+          onVariableChange={(name, value) => {
+            if (!canEdit) return
+            setVariables((current) => updateBrickVariable(current, name, value))
+          }}
+        />
       </div>
 
       {canEdit ? (
@@ -395,6 +331,122 @@ const StartupForm = React.memo(function StartupForm({
     </section>
   )
 })
+
+function StartupSettingsForm({
+  allocation,
+  canEdit,
+  configuredMemoryBytes,
+  diskLimitGiB,
+  error,
+  pending,
+  saved,
+  startAfterSave,
+  variableDefinitions,
+  variables,
+  onDiskLimitChange,
+  onStartAfterSaveChange,
+  onSubmit,
+  onVariableChange,
+}: {
+  allocation: StartupResourceAllocation
+  canEdit: boolean
+  configuredMemoryBytes: number
+  diskLimitGiB: string
+  error: string | null
+  pending: boolean
+  saved: boolean
+  startAfterSave: boolean
+  variableDefinitions: Brick["variables"]
+  variables: Record<string, BrickVariableValue>
+  onDiskLimitChange: (value: string) => void
+  onStartAfterSaveChange: (value: boolean) => void
+  onSubmit: React.FormEventHandler<HTMLFormElement>
+  onVariableChange: (
+    name: string,
+    value: BrickVariableValue | undefined
+  ) => void
+}) {
+  const entries = Object.entries(variableDefinitions)
+  return (
+    <form className="mt-5 space-y-4" onSubmit={onSubmit}>
+      <ResourceAllocationCard
+        allocation={allocation}
+        configuredMemoryBytes={configuredMemoryBytes}
+        diskLimitGiB={diskLimitGiB}
+        disabled={!canEdit || pending}
+        onDiskLimitChange={onDiskLimitChange}
+      />
+
+      {entries.length === 0 ? (
+        <div className="rounded-xl border border-border/75 bg-background/45 px-4 py-8 text-center text-xs text-muted-foreground">
+          This Brick has no configurable Startup variables.
+        </div>
+      ) : (
+        <div className="space-y-3 rounded-xl border border-border/75 bg-background/45 p-4">
+          {entries.map(([name, definition]) => (
+            <BrickVariableField
+              key={name}
+              name={name}
+              definition={definition}
+              value={variables[name]}
+              onChange={(value) => onVariableChange(name, value)}
+            />
+          ))}
+        </div>
+      )}
+
+      <label className="flex cursor-pointer items-center justify-between rounded-xl border border-border/75 bg-background/45 px-4 py-3 text-xs">
+        <span>
+          <span className="block font-medium">Start after applying</span>
+          <span className="mt-0.5 block text-[9px] text-muted-foreground">
+            Leave off to keep the server stopped after rebuild.
+          </span>
+        </span>
+        <input
+          type="checkbox"
+          checked={startAfterSave}
+          disabled={!canEdit || pending}
+          onChange={(event) => onStartAfterSaveChange(event.target.checked)}
+          className="accent-primary"
+        />
+      </label>
+
+      {error ? (
+        <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 text-xs text-destructive">
+          <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+          {error}
+        </div>
+      ) : null}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Button type="submit" disabled={!canEdit || pending}>
+          {pending ? (
+            <LoaderCircle className="animate-spin" />
+          ) : saved ? (
+            <Save />
+          ) : startAfterSave ? (
+            <Play />
+          ) : (
+            <Rocket />
+          )}
+          {pending
+            ? "Applying…"
+            : saved
+              ? "Applied"
+              : startAfterSave
+                ? "Apply & Start"
+                : "Apply Startup"}
+        </Button>
+        {!canEdit ? (
+          <p className="text-[11px] text-muted-foreground">
+            Connect the Relay and use an account with settings access to change
+            Startup.
+          </p>
+        ) : null}
+      </div>
+    </form>
+  )
+}
 
 function BrickSummary({
   view,

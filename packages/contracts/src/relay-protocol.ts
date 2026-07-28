@@ -21,6 +21,13 @@ export const relayControlOperations = [
   "relay.audit.list",
   "relay.networking.read",
   "relay.networking.write",
+  "relay.tailscale.install",
+  "relay.tailscale.read",
+  "relay.tailscale.write",
+  "relay.tailscale.stack.apply",
+  "relay.tailscale.stack.dns",
+  "relay.tailscale.stack.list",
+  "relay.tailscale.stack.remove",
   "relay.proxy.read",
   "relay.proxy.write",
   "relay.pairing.create",
@@ -47,6 +54,7 @@ export const relayControlOperations = [
   "instance.logs.latest",
   "instance.network.routes.read",
   "instance.network.routes.write",
+  "hearth.tailscale.instance.detach",
   "sftp.authorization.resolve",
 ] as const
 
@@ -56,6 +64,11 @@ export function relayControlDeadlineMs(
   operation: RelayControlOperation
 ): number {
   if (operation === "relay.update.apply") return 15 * 60_000
+  if (operation === "relay.tailscale.install") return 240_000
+  if (operation === "relay.tailscale.stack.apply") return 240_000
+  if (operation === "relay.tailscale.stack.remove") return 120_000
+  if (operation === "hearth.tailscale.instance.detach") return 60_000
+  if (operation === "instance.delete") return 360_000
   if (operation === "instance.logs.share") return 60_000
   if (
     operation === "instance.create" ||
@@ -154,6 +167,7 @@ export const RelayControlClientMessageSchema = Schema.Union([
 export const RelayControlServerMessageSchema = Schema.Union([
   RelayAuthChallengeSchema,
   RelayAuthReadySchema,
+  RelayControlCancelSchema,
   RelayControlResponseSchema,
   RelayControlErrorSchema,
   RelayControlEventSchema,
