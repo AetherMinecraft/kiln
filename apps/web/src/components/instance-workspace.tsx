@@ -51,6 +51,12 @@ import type {
 } from "@/components/instance-workspace-context"
 import { WorkspaceFrame } from "@/components/workspace-frame"
 import { roleHasPermission } from "@/lib/permissions"
+import {
+  beginPendingPowerAction,
+  finishPendingPowerAction,
+  reconcilePendingPowerInstance,
+  type ServerAction,
+} from "@/lib/instance-power-state"
 import { openRelayResourceStream } from "@/lib/relay-resource-stream"
 import {
   RESOURCE_HISTORY_WINDOW_MS,
@@ -202,6 +208,10 @@ function RelayResourceStreamController({
               event.history,
               event.instance.resources
             )
+            const streamedInstance = reconcilePendingPowerInstance(
+              instance.relayId,
+              event.instance
+            )
             queryClient.setQueryData<RelayFleetSnapshot>(
               queryKeys.relay.snapshot,
               (snapshot) =>
@@ -211,7 +221,7 @@ function RelayResourceStreamController({
                       instances: snapshot.instances.map((current) =>
                         current.id === event.instance.id &&
                         current.relayId === instance.relayId
-                          ? { ...current, ...event.instance }
+                          ? { ...current, ...streamedInstance }
                           : current
                       ),
                     }
@@ -247,8 +257,6 @@ function RelayResourceStreamController({
 
   return null
 }
-
-type ServerAction = "start" | "stop" | "restart" | "kill"
 
 function InstanceWorkspaceHeader() {
   const [error, setError] = React.useState<string | null>(null)
@@ -515,6 +523,12 @@ function ServerPowerControls({
   const isStarting = instance.observedState === "starting"
   const isStopping = instance.observedState === "stopping"
   const powerIsOn = isRunning || isStarting
+  const powerIsTransitioning =
+    action === "start" ||
+    action === "stop" ||
+    action === "restart" ||
+    isStarting ||
+    isStopping
   const startUnavailable =
     !relayConnected || powerIsOn || isStopping || action !== null
   const stopUnavailable =
@@ -533,22 +547,22 @@ function ServerPowerControls({
         size="sm"
         className={
           powerIsOn
-            ? "hidden h-9 gap-1.5 !border-red-500/65 !bg-red-600 px-3 text-xs !text-white shadow-none hover:!border-red-400 hover:!bg-red-500 disabled:!border-red-500/35 disabled:!bg-red-600/45 disabled:!text-white/70 md:inline-flex"
-            : "hidden h-9 gap-1.5 !border-blue-500/65 !bg-blue-600 px-3 text-xs !text-white shadow-none hover:!border-blue-400 hover:!bg-blue-500 md:inline-flex"
+            ? "hidden h-9 w-[6.5rem] justify-center gap-1.5 !border-red-500/65 !bg-red-600 px-3 text-xs !text-white shadow-none hover:!border-red-400 hover:!bg-red-500 disabled:!border-red-500/35 disabled:!bg-red-600/45 disabled:!text-white/70 md:inline-flex"
+            : "hidden h-9 w-[6.5rem] justify-center gap-1.5 !border-blue-500/65 !bg-blue-600 px-3 text-xs !text-white shadow-none hover:!border-blue-400 hover:!bg-blue-500 md:inline-flex"
         }
         disabled={!relayConnected || action !== null || isStopping}
         onClick={() => runAction(powerIsOn ? "stop" : "start")}
       >
-        {action === "start" || action === "stop" || isStopping ? (
+        {powerIsTransitioning ? (
           <LoaderCircle className="animate-spin" />
         ) : powerIsOn ? (
           <CircleStop />
         ) : (
           <Play />
         )}
-        {action === "start"
+        {action === "start" || isStarting
           ? "Starting"
-          : action === "stop" || isStopping
+          : action === "stop" || action === "restart" || isStopping
             ? "Stopping"
             : powerIsOn
               ? "Stop"
@@ -571,11 +585,7 @@ function ServerPowerControls({
                 aria-label="Server actions"
                 disabled={!relayConnected || action !== null}
               >
-                {action !== null ? (
-                  <LoaderCircle className="animate-spin" />
-                ) : (
-                  <EllipsisVertical />
-                )}
+                <EllipsisVertical />
               </Button>
             </PopoverTrigger>
           </TooltipTrigger>
@@ -691,9 +701,13 @@ function InstancePowerControls({
   const relayActionMutation = useMutation({
     mutationFn: performRelayAction,
     onSuccess: (updated) => {
+      const reconciled = reconcilePendingPowerInstance(
+        instance.relayId,
+        updated
+      )
       queryClient.setQueryData<RelayFleetSnapshot>(
         queryKeys.relay.snapshot,
-        (snapshot) => replaceRelaySnapshotInstance(snapshot, updated)
+        (snapshot) => replaceRelaySnapshotInstance(snapshot, reconciled)
       )
     },
   })
@@ -703,13 +717,17 @@ function InstancePowerControls({
   const handleAction = React.useCallback(
     async (nextAction: ServerAction) => {
       if (!relayConnected) return
-      const optimisticState: RelayObservedState =
-        nextAction === "start" ? "starting" : "stopping"
       const previousSnapshot = queryClient.getQueryData<RelayFleetSnapshot>(
         queryKeys.relay.snapshot
       )
       const previousInstance = previousSnapshot?.instances.find(
         (item) => item.id === instance.id && item.relayId === instance.relayId
+      )
+      const pendingPowerAction = beginPendingPowerAction(
+        instance.relayId,
+        instance.id,
+        nextAction,
+        previousInstance?.startedAt ?? null
       )
       queryClient.setQueryData<RelayFleetSnapshot>(
         queryKeys.relay.snapshot,
@@ -718,7 +736,7 @@ function InstancePowerControls({
             snapshot,
             instance.id,
             instance.relayId,
-            optimisticState,
+            pendingPowerAction.phase,
             nextAction === "start" ? null : undefined
           )
       )
@@ -733,6 +751,7 @@ function InstancePowerControls({
           },
         })
       } catch (cause) {
+        finishPendingPowerAction(instance.relayId, instance.id)
         if (previousInstance) {
           queryClient.setQueryData<RelayFleetSnapshot>(
             queryKeys.relay.snapshot,
@@ -1118,7 +1137,7 @@ function formatBrowserLocalTimestamp(value: string | null): string | null {
 function resourceItem(instance: InstanceRuntime, id: ResourceId): ResourceItem {
   const resources = instance.resources
   const unavailable =
-    instance.observedState === "running" ? "Sampling" : "Offline"
+    instance.observedState === "running" ? "Sampling" : "Stopped"
 
   if (id === "cpu") {
     return {

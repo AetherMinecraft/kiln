@@ -56,6 +56,12 @@ import type {
   ConsoleUiStore,
 } from "@/components/console/console-stores"
 import {
+  consoleStateLine,
+  initialConsoleStateLines,
+  isConsoleStateLine,
+  shouldRecordConsoleStateTransition,
+} from "@/components/console/console-lifecycle"
+import {
   openRelayConsoleStream,
   RelayConsoleConnectionError,
 } from "@/lib/relay-console-stream"
@@ -1100,7 +1106,7 @@ function ConsoleLogViewport({
     <div className="relative min-h-0 flex-1 bg-background">
       <div
         ref={parentRef}
-        className={`absolute inset-0 overscroll-contain font-mono text-[11px] selection:bg-primary/25 sm:text-[12px] ${wrapLines ? "overflow-x-hidden overflow-y-auto" : "overflow-auto"}`}
+        className={`[container-type:inline-size] absolute inset-0 overscroll-contain font-mono text-[11px] selection:bg-primary/25 sm:text-[12px] ${wrapLines ? "overflow-x-hidden overflow-y-auto" : "overflow-auto"}`}
         onScroll={(event) => {
           if (programmaticScroll.current) return
           const viewport = event.currentTarget
@@ -1277,6 +1283,7 @@ const ConsoleLogRow = React.memo(function ConsoleLogRow({
     getSelectedSnapshot,
     getSelectedSnapshot
   )
+  const stateLine = isConsoleStateLine(line)
 
   function toggle(shift: boolean) {
     uiStore.toggleLine(line, index, shift)
@@ -1288,7 +1295,7 @@ const ConsoleLogRow = React.memo(function ConsoleLogRow({
       tabIndex={0}
       ref={measureElement}
       data-index={index}
-      className={`absolute left-0 flex min-h-[30px] border-l-2 pr-5 text-left transition-colors ${wrapLines ? "w-full items-start py-1.5 whitespace-pre-wrap" : "h-[30px] min-w-full items-center whitespace-nowrap"} ${lineTone(line.level, selected)}`}
+      className={`absolute left-0 flex min-h-[30px] transition-colors ${stateLine ? "border-l-0 pr-0 text-center" : "border-l-2 pr-5 text-left"} ${wrapLines ? "w-full items-start py-1.5 whitespace-pre-wrap" : "h-[30px] min-w-full items-center whitespace-nowrap"} ${lineTone(line.level, selected, stateLine)}`}
       style={{
         transform: `translateY(${start}px)`,
         width: wrapLines ? "100%" : "max(100%, max-content)",
@@ -1301,11 +1308,19 @@ const ConsoleLogRow = React.memo(function ConsoleLogRow({
         }
       }}
     >
-      {showTimestamps ? <ConsoleTimestamp timestamp={line.timestamp} /> : null}
+      {showTimestamps && !stateLine ? (
+        <ConsoleTimestamp timestamp={line.timestamp} />
+      ) : null}
       <span
-        className={`min-w-0 flex-1 leading-[18px] ${wrapLines ? "break-words" : ""} ${showTimestamps ? "" : "ml-3"} ${lineTextTone(line.level)}`}
+        className={`${stateLine ? "sticky left-0 w-[100cqw] shrink-0 px-3 text-center" : `min-w-0 flex-1 ${showTimestamps ? "" : "ml-3"}`} leading-[18px] ${wrapLines ? "break-words" : ""} ${lineTextTone(line.level)}`}
       >
-        {renderConsoleText(line, query)}
+        {stateLine ? (
+          <span className="mx-auto flex w-[min(76%,44rem)] items-center gap-3 before:min-w-0 before:flex-1 before:border-t before:border-stone-500/20 after:min-w-0 after:flex-1 after:border-t after:border-stone-500/20">
+            <span className="shrink-0">{renderConsoleText(line, query)}</span>
+          </span>
+        ) : (
+          renderConsoleText(line, query)
+        )}
       </span>
     </div>
   )
@@ -1359,7 +1374,7 @@ const ConsoleCommandBar = React.memo(function ConsoleCommandBar({
                   onKeyDown={command.keyDown}
                   placeholder={
                     !command.running
-                      ? "Server is offline"
+                      ? "Server is stopped"
                       : !command.available
                         ? "Relay disconnected — command saved as a draft"
                         : "Send a server command…"
@@ -1851,8 +1866,13 @@ function ConsoleTooltip({
   )
 }
 
-function lineTone(level: RelayConsoleLevel, selected: boolean): string {
+function lineTone(
+  level: RelayConsoleLevel,
+  selected: boolean,
+  stateLine = false
+): string {
   if (selected) return "border-primary bg-primary/10"
+  if (stateLine) return "bg-transparent hover:bg-transparent"
   if (level === "error")
     return "border-red-400/65 bg-red-500/7 hover:bg-red-500/12"
   if (level === "warn")
@@ -2087,7 +2107,7 @@ function useRelayConsoleStream(
   React.useEffect(() => {
     const state = runtime?.observedState
     const previous = previousStateRef.current
-    if (!state || state === previous) return
+    if (!state || !shouldRecordConsoleStateTransition(previous, state)) return
     previousStateRef.current = state
 
     if (state === "starting") {
@@ -2108,7 +2128,14 @@ function useRelayConsoleStream(
     const current = consoleDataRef.current
     if (!current) return
     const line = consoleStateLine(state, new Date().toISOString())
-    if (current.lines.some((existing) => existing.id === line.id)) return
+    if (
+      current.lines.some(
+        (existing) =>
+          isConsoleStateLine(existing) && existing.id.endsWith(`:${state}`)
+      )
+    ) {
+      return
+    }
     commitConsole({
       ...current,
       lines: [...current.lines, line],
@@ -2373,50 +2400,6 @@ function consoleMatchesRuntime(
 ): boolean {
   if (!consoleData || !runtime?.startedAt) return Boolean(consoleData)
   return consoleData.startedAt === runtime.startedAt
-}
-
-function initialConsoleStateLines(
-  startedAt: string | null,
-  state: RelayObservedState | undefined
-): Array<RelayConsoleLine> {
-  if (!startedAt) return state ? [consoleStateLine(state, null)] : []
-  const lines = [consoleStateLine("starting", startedAt)]
-  if (state && state !== "starting" && state !== "provisioning") {
-    lines.push(consoleStateLine("running", startedAt))
-  }
-  if (state === "stopping" || state === "offline" || state === "failed") {
-    lines.push(consoleStateLine(state, null))
-  }
-  return lines
-}
-
-function consoleStateLine(
-  state: RelayObservedState,
-  timestamp: string | null
-): RelayConsoleLine {
-  const labels: Record<RelayObservedState, string> = {
-    failed: "Server failed.",
-    offline: "Server stopped.",
-    provisioning: "Server is provisioning.",
-    running: "Server is running.",
-    starting: "Server is starting.",
-    stopping: "Server is stopping.",
-  }
-  const color =
-    state === "failed"
-      ? "#f87171"
-      : state === "running"
-        ? "#4ade80"
-        : state === "stopping"
-          ? "#fbbf24"
-          : "#60a5fa"
-  return {
-    id: `kiln-state:${timestamp ?? "now"}:${state}`,
-    timestamp,
-    level: state === "failed" ? "error" : "info",
-    text: labels[state],
-    segments: [{ text: labels[state], color, bold: true }],
-  }
 }
 
 function prependConsoleHistory(
