@@ -34,6 +34,8 @@ service on port 2022. Both Relay ports are configurable:
 
 ```env
 KILN_RELAY_HOST=relay.example.com
+KILN_RELAY_GAME_HOST=games.example.com
+KILN_RELAY_GAME_PORT_RANGE=30000-39999
 KILN_RELAY_PORT=4100
 KILN_RELAY_SFTP_PORT=2022
 KILN_RELAY_TLS_MODE=managed
@@ -44,6 +46,15 @@ Set `KILN_RELAY_PUBLIC_PORT` when a reverse proxy maps the listener to a
 different external port. If `KILN_RELAY_HOST` is omitted, Relay makes one
 short, disableable public-DNS attempt and clearly labels the resulting address
 as unverified. Set `KILN_RELAY_DISCOVER_PUBLIC_IP=false` to avoid that lookup.
+
+New game instances advertise `KILN_RELAY_GAME_HOST`, falling back to the
+resolved `KILN_RELAY_HOST` when it is empty. Set
+`KILN_RELAY_GAME_HOST=public-ip` to ignore both configured hostnames and make a
+required two-second public IPv4 discovery attempt at Relay startup. Discovery
+does not configure NAT or firewall rules; the assigned game ports must still be
+reachable at that address. Relay assigns the public side of each primary game
+port from `KILN_RELAY_GAME_PORT_RANGE` when a Brick does not request a fixed
+host port, so forward and allow that range on the Relay host.
 
 Set `KILN_RELAY_PROXY=traefik` to let Relay manage an isolated, pinned Traefik
 edge on public ports 80/443, or `KILN_RELAY_PROXY=coolify` to reuse Coolify's

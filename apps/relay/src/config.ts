@@ -10,6 +10,7 @@ export interface RelayInstanceConfig {
   brickNetworkMode?: "direct" | "minecraft-backend" | "minecraft-proxy"
   brickPrimaryPort?: number
   brickPrimaryPortProtocol?: "tcp" | "udp"
+  brickSupportsSrv?: boolean
   brickSource?: string
   connectAddress: string
   directory: string
@@ -23,6 +24,8 @@ export interface RelayInstanceConfig {
     memoryBytes: number
   }
   name: string
+  publicHost?: string
+  publicPort?: number
   service: string
   tailscale: RelayInstanceTailscale
   variables?: Record<string, boolean | number | string>
@@ -32,6 +35,7 @@ export interface RelayInstanceConfig {
 
 export type RelayTlsMode = "development" | "external" | "managed"
 export type RelayProxyMode = "coolify" | "hearth" | "none" | "traefik"
+export type RelayGameHostSource = "configured" | "public_ip" | "relay"
 
 export interface RelayConfig {
   advertisedHost: string
@@ -46,8 +50,15 @@ export interface RelayConfig {
   connectPort: number
   directBrowserOrigin: string
   directPublicPort: number
+  discoveredPublicIp: string | null
   dockerSocket: string
   dataDirectory: string
+  gameHost: string
+  gamePortRange: {
+    end: number
+    start: number
+  }
+  gameHostSource: RelayGameHostSource
   host: string
   installationId: string | null
   managedLabel: string
@@ -92,6 +103,16 @@ export function loadConfig(
     (coolifyPublicOrigin ? new URL(coolifyPublicOrigin).hostname : null) ||
     hostname() ||
     "localhost"
+  const configuredGameHost = environment.KILN_RELAY_GAME_HOST?.trim()
+  const gameHostSource: RelayGameHostSource = !configuredGameHost
+    ? "relay"
+    : configuredGameHost.toLowerCase() === "public-ip"
+      ? "public_ip"
+      : "configured"
+  const gameHost =
+    configuredGameHost && configuredGameHost.toLowerCase() !== "public-ip"
+      ? configuredGameHost
+      : advertisedHost
   const directPublicPort = parsePort(
     environment,
     "KILN_RELAY_PUBLIC_PORT",
@@ -141,8 +162,12 @@ export function loadConfig(
     connectPort: 25_565,
     directBrowserOrigin,
     directPublicPort,
+    discoveredPublicIp: null,
     dockerSocket: "/var/run/docker.sock",
     dataDirectory,
+    gameHost,
+    gamePortRange: relayGamePortRange(environment),
+    gameHostSource,
     host: environment.KILN_RELAY_BIND_HOST?.trim() || "0.0.0.0",
     installationId,
     managedLabel: "kiln.relay.managed=true",
@@ -283,6 +308,8 @@ export async function discoverRelayAdvertisedHost(
     const address = await withTimeout(discover(), 2_000)
     if (!address) return "hostname"
     config.advertisedHost = address
+    config.discoveredPublicIp = address
+    if (config.gameHostSource === "relay") config.gameHost = address
     config.directBrowserOrigin = relayBrowserOrigin(
       config.tlsMode,
       address,
@@ -297,6 +324,30 @@ export async function discoverRelayAdvertisedHost(
     return "public_ip"
   } catch {
     return "hostname"
+  }
+}
+
+export async function discoverRelayGameHost(
+  config: RelayConfig,
+  discover: () => Promise<string> = discoverPublicIp
+): Promise<RelayGameHostSource> {
+  if (config.gameHostSource === "relay") {
+    config.gameHost = config.advertisedHost
+    return "relay"
+  }
+  if (config.gameHostSource === "configured") return "configured"
+
+  try {
+    const address = await withTimeout(discover(), 2_000)
+    if (!address) throw new Error("Public DNS returned no address")
+    config.discoveredPublicIp = address
+    config.gameHost = address
+    return "public_ip"
+  } catch (cause) {
+    throw new Error(
+      "KILN_RELAY_GAME_HOST=public-ip could not discover a public IPv4 address",
+      { cause }
+    )
   }
 }
 
@@ -364,6 +415,30 @@ function parsePort(
     throw new Error(`${name} must be a valid TCP port`)
   }
   return port
+}
+
+function relayGamePortRange(environment: NodeJS.ProcessEnv): {
+  end: number
+  start: number
+} {
+  const configured =
+    environment.KILN_RELAY_GAME_PORT_RANGE?.trim() || "30000-39999"
+  const match = configured.match(/^(\d{1,5})-(\d{1,5})$/u)
+  const start = Number(match?.[1])
+  const end = Number(match?.[2])
+  if (
+    !match ||
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    start < 1 ||
+    end > 65_535 ||
+    start > end
+  ) {
+    throw new Error(
+      "KILN_RELAY_GAME_PORT_RANGE must be an ascending port range such as 30000-39999"
+    )
+  }
+  return { end, start }
 }
 
 function relayTlsMode(environment: NodeJS.ProcessEnv): RelayTlsMode {

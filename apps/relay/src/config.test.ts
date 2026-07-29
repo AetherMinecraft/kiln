@@ -3,7 +3,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vite-plus/test"
 
-import { discoverRelayAdvertisedHost, loadConfig } from "./config.js"
+import {
+  discoverRelayAdvertisedHost,
+  discoverRelayGameHost,
+  loadConfig,
+} from "./config.js"
 
 describe("loadConfig", () => {
   it("defaults the Relay and SFTP ports", () => {
@@ -12,9 +16,25 @@ describe("loadConfig", () => {
     expect(config.port).toBe(4100)
     expect(config.publicPort).toBe(4100)
     expect(config.sftpPort).toBe(2022)
+    expect(config.gamePortRange).toEqual({ end: 39_999, start: 30_000 })
     expect(config.tlsMode).toBe("development")
     expect(config.sftpDevAuthentication).toBe(true)
     expect(config.mclogsApiUrl).toBe("https://api.mclo.gs/1/log")
+  })
+
+  it("validates the managed game port range", () => {
+    expect(
+      loadConfig({
+        KILN_RELAY_GAME_PORT_RANGE: "42000-42999",
+        NODE_ENV: "development",
+      }).gamePortRange
+    ).toEqual({ end: 42_999, start: 42_000 })
+    expect(() =>
+      loadConfig({
+        KILN_RELAY_GAME_PORT_RANGE: "43000-42000",
+        NODE_ENV: "development",
+      })
+    ).toThrow("must be an ascending port range")
   })
 
   it("uses an independent advertised port", () => {
@@ -28,6 +48,23 @@ describe("loadConfig", () => {
     expect(config.port).toBe(4100)
     expect(config.publicPort).toBe(8443)
     expect(config.browserOrigin).toBe("http://relay.test:8443")
+  })
+
+  it("uses the Relay host for game traffic unless overridden", () => {
+    const fallback = loadConfig({
+      KILN_RELAY_HOST: "relay.test",
+      NODE_ENV: "development",
+    })
+    expect(fallback.gameHost).toBe("relay.test")
+    expect(fallback.gameHostSource).toBe("relay")
+
+    const configured = loadConfig({
+      KILN_RELAY_GAME_HOST: "games.test",
+      KILN_RELAY_HOST: "relay.test",
+      NODE_ENV: "development",
+    })
+    expect(configured.gameHost).toBe("games.test")
+    expect(configured.gameHostSource).toBe("configured")
   })
 
   it("only elides the selected scheme's default port", () => {
@@ -117,6 +154,7 @@ describe("loadConfig", () => {
       discoverRelayAdvertisedHost(inferred, {}, async () => "203.0.113.8")
     ).resolves.toBe("public_ip")
     expect(inferred.advertisedHost).toBe("203.0.113.8")
+    expect(inferred.gameHost).toBe("203.0.113.8")
     expect(inferred.browserOrigin).toBe("http://203.0.113.8:4100")
 
     const configured = loadConfig({
@@ -127,6 +165,36 @@ describe("loadConfig", () => {
       discoverRelayAdvertisedHost(configured, {}, async () => "203.0.113.9")
     ).resolves.toBe("configured")
     expect(configured.advertisedHost).toBe("relay.test")
+  })
+
+  it("can explicitly discover a public game address", async () => {
+    const config = loadConfig({
+      KILN_RELAY_GAME_HOST: " public-ip ",
+      KILN_RELAY_HOST: "relay.test",
+      NODE_ENV: "development",
+    })
+
+    await expect(
+      discoverRelayGameHost(config, async () => "203.0.113.11")
+    ).resolves.toBe("public_ip")
+    expect(config.advertisedHost).toBe("relay.test")
+    expect(config.gameHost).toBe("203.0.113.11")
+  })
+
+  it("fails when explicit public game address discovery is unavailable", async () => {
+    const config = loadConfig({
+      KILN_RELAY_GAME_HOST: "public-ip",
+      KILN_RELAY_HOST: "relay.test",
+      NODE_ENV: "development",
+    })
+
+    await expect(
+      discoverRelayGameHost(config, async () => {
+        throw new Error("offline")
+      })
+    ).rejects.toThrow(
+      "KILN_RELAY_GAME_HOST=public-ip could not discover a public IPv4 address"
+    )
   })
 
   it("accepts a custom SFTP port", () => {

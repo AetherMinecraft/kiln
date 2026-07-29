@@ -13,7 +13,7 @@ import {
 import { totalmem } from "node:os"
 import { join } from "node:path"
 
-import { interpolateTemplate, resolveBrick } from "./bricks.js"
+import { resolveBrick } from "./bricks.js"
 import { command } from "./command.js"
 import { directoryApparentSize } from "./disk-usage.js"
 import type {
@@ -68,6 +68,23 @@ const TAILSCALE_STACK_DISK_BYTES = 128 * 1024 * 1024
 const TAILSCALE_STACK_MEMORY_BYTES = 64 * 1024 * 1024
 const TAILSCALE_STACK_FORWARD_CHAIN = "KILN-TAILSCALE"
 const TAILSCALE_STACK_SUBNET_COUNT = 64 * 256
+
+export function nextManagedGamePort(input: {
+  end: number
+  instanceId: string
+  start: number
+  unavailable: ReadonlySet<number>
+}): number {
+  const size = input.end - input.start + 1
+  const preferred =
+    createHash("sha256").update(input.instanceId).digest().readUInt32BE(0) %
+    size
+  for (let offset = 0; offset < size; offset += 1) {
+    const port = input.start + ((preferred + offset) % size)
+    if (!input.unavailable.has(port)) return port
+  }
+  throw new Error(`No game ports are available in ${input.start}-${input.end}`)
+}
 
 export function tailscaleStackFirewallRules(
   bindings: ReadonlyArray<
@@ -184,6 +201,7 @@ export class LifecycleDriver {
   #edgeReconciliationTimer: NodeJS.Timeout | null = null
   #hostDataDirectoryPromise: Promise<string> | null = null
   #listenerMode: RelayProxySettings["mode"] | null = null
+  readonly #pendingGamePorts = new Set<string>()
   readonly #tailscaleConfigs = new Map<string, RelayTailscaleStackConfig>()
   #tailscaleConfigsDiscovered = false
   readonly #tailscaleFirewallGenerations = new Map<string, string>()
@@ -1294,6 +1312,7 @@ export class LifecycleDriver {
       grandfatheredDiskLimitBytes: 0,
       id,
       prepareDirectory: true,
+      publicPort: undefined,
       recipe: input.recipe,
       start: input.start,
       tailscale: input.tailscale ?? { enabled: false },
@@ -1370,6 +1389,7 @@ export class LifecycleDriver {
         grandfatheredDiskLimitBytes: existing.limits.diskBytes,
         id: existing.id,
         prepareDirectory: false,
+        publicPort: existing.publicPort,
         recipe,
         start: input.start,
         tailscale,
@@ -1388,6 +1408,7 @@ export class LifecycleDriver {
     grandfatheredDiskLimitBytes: number
     id: string
     prepareDirectory: boolean
+    publicPort: number | undefined
     recipe: string
     start: boolean
     tailscale: RelayInstanceTailscale
@@ -1467,38 +1488,25 @@ export class LifecycleDriver {
         "Configure Tailscale infrastructure before connecting this server"
       )
     }
-    const domain =
-      tailscaleSettings?.domain ??
-      networking?.domain ??
-      this.#config.connectDomain
     const hostnamePrefix = input.tailscale.enabled
       ? input.tailscale.subdomain
-      : interpolateTemplate(
-          definition.network.hostname ?? "{{ brick.id }}",
-          definition,
-          resolved.values,
-          input.recipe
-        )
-    if (!hostnamePrefix) {
+      : undefined
+    if (input.tailscale.enabled && !hostnamePrefix) {
       throw new Error("Enter a Tailscale subdomain for this server")
     }
-    const hostname = `${hostnamePrefix.replace(/\.$/u, "")}.${domain}`
+    const hostname = hostnamePrefix
+      ? `${hostnamePrefix.replace(/\.$/u, "")}.${
+          tailscaleSettings?.domain ??
+          networking?.domain ??
+          this.#config.connectDomain
+        }`
+      : null
     const primaryPort = definition.network.ports.find(
       (port) => port.name === definition.network.primaryPort
     )
     if (!primaryPort) {
       throw new Error("Brick primary network port disappeared after validation")
     }
-    const connectPort =
-      definition.network.mode === "minecraft-proxy"
-        ? (tailscaleSettings?.proxyPort ??
-          networking?.proxyPort ??
-          this.#config.connectPort)
-        : definition.network.mode === "direct"
-          ? (primaryPort.host ?? primaryPort.container)
-          : this.#config.connectPort
-    const connectAddress =
-      connectPort === 25_565 ? hostname : `${hostname}:${connectPort}`
     const webRoutes = this.#webRoutes.filter(
       (route) => route.instanceId === input.id
     )
@@ -1535,6 +1543,12 @@ export class LifecycleDriver {
       )
     }
 
+    const generatedPublicPort =
+      input.publicPort === undefined && primaryPort.host === undefined
+    const publicPort =
+      input.publicPort ??
+      primaryPort.host ??
+      (await this.#reserveGamePort(id, primaryPort.protocol, existing))
     const variablesLabel = JSON.stringify(resolved.values)
     const arguments_ = [
       "container",
@@ -1587,6 +1601,8 @@ export class LifecycleDriver {
       "--label",
       `kiln.brick.primary-port-protocol=${primaryPort.protocol}`,
       "--label",
+      `kiln.brick.supports-srv=${definition.network.supportsSrv}`,
+      "--label",
       "kiln.traefik.managed=true",
       "--label",
       `kiln.traefik.service.port=${primaryPort.container}`,
@@ -1599,7 +1615,7 @@ export class LifecycleDriver {
       "--label",
       `kiln.instance.game=${definition.metadata.game}`,
       "--label",
-      `kiln.instance.hostname=${connectAddress}`,
+      `kiln.instance.public-host=${this.#config.gameHost}`,
       "--label",
       `kiln.instance.directory=${id}`,
       "--label",
@@ -1611,6 +1627,22 @@ export class LifecycleDriver {
       "--volume",
       `${hostDirectory}:${definition.runtime.storage.mount}`,
     ]
+    if (hostname) {
+      const privatePort =
+        definition.network.mode === "minecraft-proxy"
+          ? (tailscaleSettings?.proxyPort ??
+            networking?.proxyPort ??
+            this.#config.connectPort)
+          : definition.network.mode === "direct"
+            ? primaryPort.container
+            : this.#config.connectPort
+      arguments_.push(
+        "--label",
+        `kiln.instance.hostname=${
+          privatePort === 25_565 ? hostname : `${hostname}:${privatePort}`
+        }`
+      )
+    }
     arguments_.push(
       "--label",
       `kiln.instance.tailscale-enabled=${input.tailscale.enabled}`
@@ -1642,17 +1674,23 @@ export class LifecycleDriver {
     for (const [name, value] of Object.entries(resolved.environment)) {
       arguments_.push("--env", `${name}=${value}`)
     }
-    if (definition.network.mode === "minecraft-proxy") {
+    // Velocity routing is additive: every game Brick, including a backend,
+    // intentionally remains directly joinable through its assigned host port.
+    if (definition.network.mode !== "direct") {
       arguments_.push(
         "--publish",
-        `${tailscaleSettings?.proxyPort ?? networking?.proxyPort ?? 25_565}:${primaryPort.container}/${primaryPort.protocol}`
+        `${publicPort}:${primaryPort.container}/${primaryPort.protocol}`
       )
     }
     if (definition.network.mode === "direct") {
       for (const port of definition.network.ports) {
         arguments_.push(
           "--publish",
-          `${port.host ?? port.container}:${port.container}/${port.protocol}`
+          `${
+            port.name === definition.network.primaryPort
+              ? publicPort
+              : (port.host ?? 0)
+          }:${port.container}/${port.protocol}`
         )
       }
     }
@@ -1688,6 +1726,10 @@ export class LifecycleDriver {
         await rm(directory, { recursive: true, force: true })
       }
       throw error
+    } finally {
+      if (generatedPublicPort) {
+        this.#pendingGamePorts.delete(`${primaryPort.protocol}:${publicPort}`)
+      }
     }
 
     const created = (await this.#docker.inspectInstances()).find(
@@ -1698,6 +1740,36 @@ export class LifecycleDriver {
         "Docker created the instance but Relay could not discover it"
       )
     return created
+  }
+
+  async #reserveGamePort(
+    instanceId: string,
+    protocol: "tcp" | "udp",
+    existing: ReadonlyArray<RelayInstance>
+  ): Promise<number> {
+    const unavailable = await this.#docker.publishedHostPorts(protocol)
+    const pendingPrefix = `${protocol}:`
+    for (const key of this.#pendingGamePorts) {
+      if (!key.startsWith(pendingPrefix)) continue
+      unavailable.add(Number(key.slice(pendingPrefix.length)))
+    }
+    for (const instance of existing) {
+      if (
+        instance.publicPort &&
+        instance.brickPrimaryPortProtocol === protocol
+      ) {
+        unavailable.add(instance.publicPort)
+      }
+    }
+    const { end, start } = this.#config.gamePortRange
+    const port = nextManagedGamePort({
+      end,
+      instanceId,
+      start,
+      unavailable,
+    })
+    this.#pendingGamePorts.add(`${protocol}:${port}`)
+    return port
   }
 
   async #assertAllocationAvailable(input: {
