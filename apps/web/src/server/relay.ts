@@ -41,7 +41,11 @@ import {
   ResourceNotFoundError,
 } from "@/effect/errors"
 import { runAppEffect } from "@/effect/runtime"
-import { applyManagedDomainAddressesEffect } from "@/server/domains.server"
+import {
+  applyManagedDomainAddressesEffect,
+  deleteInstanceDomainEffect,
+} from "@/server/domains.server"
+import { finalizeInstanceDeletionEffect } from "@/server/instance-deletion-cleanup"
 import {
   cachedRelayFallbackJsonEffect,
   cachedRelayJsonEffect,
@@ -71,6 +75,16 @@ const treeInputSchema = instanceInputSchema.extend({
 
 const instanceNameInputSchema = instanceInputSchema.extend({
   name: relayInstanceNameSchema,
+})
+
+const deleteInstanceInputSchema = instanceInputSchema.extend({
+  confirmation: z.string().max(64),
+  password: z.string().min(1).max(128),
+})
+
+const deleteInstanceResultSchema = z.object({
+  deleted: z.literal(true),
+  instanceId: z.string(),
 })
 
 const filePathSchema = z
@@ -241,6 +255,43 @@ export const updateInstanceName = createServerFn({ method: "POST" })
       invalidateRelayCache(relayCachePolicy.snapshot(relay.id))
     )
     return { ...renamed, relayId: relay.id }
+  })
+
+export const deleteInstance = createServerFn({ method: "POST" })
+  .validator(deleteInstanceInputSchema)
+  .handler(async ({ data }) => {
+    const { relay, user } = await instanceRelayAccess(data.relayId)
+    await requireRelayPermission({
+      user,
+      relayId: relay.id,
+      permission: "instance.delete",
+      instanceId: data.instanceId,
+    })
+    if (data.confirmation !== data.instanceId) {
+      throw AuthenticationError.make({
+        message: "The server ID confirmation did not match.",
+      })
+    }
+    const { requireAccountPassword } = await import("@/lib/auth-password")
+    await requireAccountPassword(user, data.password)
+
+    await runAppEffect(
+      "domains.instance.delete",
+      deleteInstanceDomainEffect(relay.id, data.instanceId)
+    )
+    const deleted = deleteInstanceResultSchema.parse(
+      await relayRequestRaw(
+        relay,
+        `/v1/instances/${encodeURIComponent(data.instanceId)}?deleteData=true`,
+        { method: "DELETE" },
+        relayControlDeadlineMs("instance.delete")
+      )
+    )
+    await runAppEffect(
+      "instances.delete.finalize",
+      finalizeInstanceDeletionEffect(relay.id, data.instanceId)
+    )
+    return { ...deleted, relayId: relay.id }
   })
 
 export const sendRelayConsoleCommand = createServerFn({ method: "POST" })
@@ -615,11 +666,12 @@ async function relayRequest(
 async function relayRequestRaw(
   relay: RelayEndpoint,
   path: string,
-  init?: RequestInit
+  init?: RequestInit,
+  timeoutMs?: number
 ): Promise<unknown> {
   return runAppEffect(
     "relay.json",
-    relayJsonEffect(relay, path, (input) => input, init)
+    relayJsonEffect(relay, path, (input) => input, init, timeoutMs)
   )
 }
 

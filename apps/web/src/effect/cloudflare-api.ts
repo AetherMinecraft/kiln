@@ -25,6 +25,11 @@ const CloudflareDnsRecordBatchSchema = Schema.Struct({
   posts: Schema.Array(CloudflareDnsRecordSchema),
 })
 
+const CloudflareErrorEnvelopeSchema = Schema.Struct({
+  errors: Schema.optionalKey(Schema.Array(CloudflareErrorSchema)),
+  success: Schema.Boolean,
+})
+
 const cloudflareEnvelopeSchema = <TValue>(result: Schema.Decoder<TValue>) =>
   Schema.Struct({
     errors: Schema.optionalKey(Schema.Array(CloudflareErrorSchema)),
@@ -271,7 +276,8 @@ export const deleteCloudflareRecordEffect = Effect.fn("cloudflare.dns.delete")(
       apiToken,
       `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(recordId)}`,
       Schema.Struct({ id: Schema.optionalKey(Schema.String) }),
-      { method: "DELETE" }
+      { method: "DELETE" },
+      { notFoundResult: {} }
     )
   }
 )
@@ -314,7 +320,10 @@ function requestCloudflareResult<TValue>(
   apiToken: string,
   path: string,
   resultSchema: Schema.Decoder<TValue>,
-  init?: RequestInit
+  init?: RequestInit,
+  options?: {
+    notFoundResult: TValue
+  }
 ): Effect.Effect<TValue, ExternalServiceError> {
   return Effect.tryPromise({
     try: async () => {
@@ -329,9 +338,16 @@ function requestCloudflareResult<TValue>(
         signal: AbortSignal.timeout(15_000),
       })
       if (!response.ok) {
-        const payload = Schema.decodeUnknownSync(
-          cloudflareEnvelopeSchema(resultSchema)
-        )(await response.json())
+        const payload = Schema.decodeUnknownSync(CloudflareErrorEnvelopeSchema)(
+          await response.json()
+        )
+        if (
+          options &&
+          (response.status === 404 ||
+            payload.errors?.some((error) => error.code === 81_044))
+        ) {
+          return options.notFoundResult
+        }
         const message = payload.errors?.map((error) => error.message).join("; ")
         throw new Error(
           message || `Cloudflare returned HTTP ${response.status}`
