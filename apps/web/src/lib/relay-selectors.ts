@@ -59,7 +59,7 @@ export type InstanceWorkspaceInstance = Pick<
 
 export type InstanceRuntime = Pick<
   RelayInstance,
-  "id" | "observedState" | "resources" | "startedAt"
+  "id" | "observedState" | "readyAt" | "resources" | "startedAt"
 > & { relayId: string }
 
 export type InstanceSettingsInstance = Pick<
@@ -210,6 +210,7 @@ export function selectInstanceRuntime(instanceId: string, relayId?: string) {
       ? {
           id: instance.id,
           observedState: instance.observedState,
+          readyAt: instance.readyAt,
           relayId: instance.relayId,
           resources: instance.resources,
           startedAt: instance.startedAt,
@@ -261,6 +262,19 @@ export function selectInstanceObservedState(
       (instance) =>
         instance.id === instanceId && (!relayId || instance.relayId === relayId)
     )?.observedState ?? null
+}
+
+export function selectInstanceContainerRunning(
+  instanceId: string,
+  relayId?: string
+) {
+  return (snapshot: RelayFleetSnapshot) =>
+    snapshot.instances.some(
+      (instance) =>
+        instance.id === instanceId &&
+        (!relayId || instance.relayId === relayId) &&
+        instance.startedAt !== null
+    )
 }
 
 export function findRelayInstance<

@@ -59,6 +59,8 @@ import {
   consoleStateLine,
   initialConsoleStateLines,
   isConsoleStateLine,
+  mergeConsoleHistory,
+  mergeConsoleStateLines,
   shouldRecordConsoleStateTransition,
 } from "@/components/console/console-lifecycle"
 import {
@@ -79,7 +81,7 @@ import {
   tailscaleStacksQueryOptions,
 } from "@/lib/query-options"
 import {
-  selectInstanceObservedState,
+  selectInstanceContainerRunning,
   selectInstanceRelayConnected,
 } from "@/lib/relay-selectors"
 import {
@@ -1336,19 +1338,19 @@ const ConsoleCommandBar = React.memo(function ConsoleCommandBar({
   instance: InstanceWorkspaceInstance
 }) {
   const relayConnected = useInstanceRelayConnected()
-  const selectObservedState = React.useMemo(
-    () => selectInstanceObservedState(instance.id, instance.relayId),
+  const selectContainerRunning = React.useMemo(
+    () => selectInstanceContainerRunning(instance.id, instance.relayId),
     [instance.id, instance.relayId]
   )
-  const { data: observedState } = useQuery({
+  const { data: containerRunning = false } = useQuery({
     ...relaySnapshotQueryOptions(),
-    select: selectObservedState,
+    select: selectContainerRunning,
   })
   const command = useConsoleCommand(
     instance.id,
     instance.relayId,
     active,
-    observedState === "running",
+    containerRunning,
     relayConnected
   )
 
@@ -2127,7 +2129,12 @@ function useRelayConsoleStream(
     if (!sessionInitializedRef.current && previous === undefined) return
     const current = consoleDataRef.current
     if (!current) return
-    const line = consoleStateLine(state, new Date().toISOString())
+    const line = consoleStateLine(
+      state,
+      state === "running"
+        ? (runtime?.readyAt ?? new Date().toISOString())
+        : new Date().toISOString()
+    )
     if (
       current.lines.some(
         (existing) =>
@@ -2138,9 +2145,9 @@ function useRelayConsoleStream(
     }
     commitConsole({
       ...current,
-      lines: [...current.lines, line],
+      lines: mergeConsoleHistory(current.lines, [line]),
     })
-  }, [commitConsole, instanceId, runtime?.observedState])
+  }, [commitConsole, instanceId, runtime?.observedState, runtime?.readyAt])
 
   React.useEffect(() => {
     const startedAt = runtime?.startedAt
@@ -2156,11 +2163,21 @@ function useRelayConsoleStream(
     sessionInitializedRef.current = true
     commitConsole({
       instanceId,
-      lines: initialConsoleStateLines(startedAt, runtime.observedState),
+      lines: initialConsoleStateLines(
+        startedAt,
+        runtime.observedState,
+        runtime.readyAt
+      ),
       startedAt,
       truncated: false,
     })
-  }, [commitConsole, instanceId, runtime?.observedState, runtime?.startedAt])
+  }, [
+    commitConsole,
+    instanceId,
+    runtime?.observedState,
+    runtime?.readyAt,
+    runtime?.startedAt,
+  ])
 
   React.useEffect(() => {
     if (!relayConnected) {
@@ -2240,13 +2257,12 @@ function useRelayConsoleStream(
       awaitingNewSessionRef.current = false
       sessionStartedAtRef.current = startedAt
       sessionInitializedRef.current = true
-      const nextLines = [
-        ...initialConsoleStateLines(
-          startedAt,
-          runtimeRef.current?.observedState
-        ),
-        ...lines,
-      ]
+      const nextLines = mergeConsoleStateLines(
+        lines,
+        startedAt,
+        runtimeRef.current?.observedState,
+        runtimeRef.current?.readyAt ?? null
+      )
       seen.clear()
       for (const line of nextLines) seen.add(line.id)
       const nextConsole = {
@@ -2406,15 +2422,7 @@ function prependConsoleHistory(
   current: ReadonlyArray<RelayConsoleLine>,
   history: ReadonlyArray<RelayConsoleLine>
 ): Array<RelayConsoleLine> {
-  const lifecycleEnd = current.findIndex(
-    (line) => !line.id.endsWith(":starting") && !line.id.endsWith(":running")
-  )
-  const split = lifecycleEnd < 0 ? current.length : lifecycleEnd
-  return capConsoleLines([
-    ...current.slice(0, split),
-    ...history,
-    ...current.slice(split),
-  ])
+  return capConsoleLines(mergeConsoleHistory(current, history))
 }
 
 function capConsoleLines(
