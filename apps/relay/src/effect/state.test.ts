@@ -285,6 +285,43 @@ describe("Relay state", () => {
       })
     )
 
+    it.effect("persists pending primary ports until they are applied", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        yield* store.setPendingPrimaryPort("instance-a", {
+          internalPort: 25_565,
+          protocol: "tcp",
+        })
+        assert.deepStrictEqual(
+          yield* store.getPendingPrimaryPort("instance-a"),
+          {
+            id: "primary",
+            instanceId: "instance-a",
+            internalPort: 25_565,
+            name: "Default Server",
+            protocol: "tcp",
+          }
+        )
+
+        yield* store.setPendingPrimaryPort("instance-a", {
+          internalPort: 19_132,
+          protocol: "udp",
+        })
+        assert.deepStrictEqual(yield* store.listPendingPrimaryPorts(), [
+          {
+            id: "primary",
+            instanceId: "instance-a",
+            internalPort: 19_132,
+            name: "Default Server",
+            protocol: "udp",
+          },
+        ])
+
+        yield* store.deletePendingPrimaryPort("instance-a")
+        assert.isNull(yield* store.getPendingPrimaryPort("instance-a"))
+      })
+    )
+
     it.effect(
       "replaces instance web routes and rejects hostname collisions",
       () =>
@@ -293,6 +330,7 @@ describe("Relay state", () => {
           const first = {
             hostname: "map.example.com",
             id: "15c524a6",
+            name: "Live Map",
             path: null,
             stripPrefix: true,
             targetPort: 8080,
