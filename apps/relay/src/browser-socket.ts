@@ -437,7 +437,11 @@ async function auditBrowserConsoleWrite(
     await options.runEffect(
       options.state.appendAudit({
         clientId: capability.issuer,
-        details: { instanceId, subject: capability.subject },
+        details: {
+          instanceId,
+          permission: "instance.console.write",
+          subject: capability.subject,
+        },
         event: "browser.console.write",
         id: randomUUID(),
         occurredAt: Date.now(),
@@ -704,7 +708,12 @@ async function authenticateBrowserRequest(input: {
   request: IncomingMessage
   pendingRequestProofs: Set<string>
   requestProofs: Map<string, number>
-}): Promise<{ capabilityId: string; clientId: string; subject: string }> {
+}): Promise<{
+  capabilityId: string
+  clientId: string
+  instanceId: string
+  subject: string
+}> {
   const authorization = header(input.request, "authorization")
   if (!authorization.startsWith("Kiln ")) throw new Error("Missing capability")
   const parsed = decodeCapability(authorization.slice(5))
@@ -784,6 +793,7 @@ async function authenticateBrowserRequest(input: {
     return {
       capabilityId: parsed.payload.capabilityId,
       clientId: client.id,
+      instanceId: parsed.payload.instanceId,
       subject: parsed.payload.subject,
     }
   } finally {
@@ -796,6 +806,7 @@ async function auditBrowserTransfer(
   authentication: {
     capabilityId: string
     clientId: string
+    instanceId: string
     subject: string
   },
   method: "GET" | "HEAD" | "PUT",
@@ -808,8 +819,13 @@ async function auditBrowserTransfer(
         clientId: authentication.clientId,
         details: {
           bytes,
+          instanceId: authentication.instanceId,
           method,
           outcome,
+          permission:
+            method === "PUT"
+              ? "instance.files.upload"
+              : "instance.files.download",
           subject: authentication.subject,
         },
         event:

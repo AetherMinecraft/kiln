@@ -390,14 +390,15 @@ function authenticateSocket(
         request,
         currentClient,
         controller.signal,
-        requestClient
+        (operation, requestPayload, timeoutMs) =>
+          requestClient(operation, requestPayload, timeoutMs, request.subject)
       )
       if (isAuditedMutation(request.operation)) {
         void options
           .runEffect(
             options.state.appendAudit({
               clientId: currentClient.id,
-              details: { operation: request.operation },
+              details: auditDetailsForRequest(request, payload),
               event: "control.mutation",
               id: randomUUID(),
               occurredAt: Date.now(),
@@ -488,7 +489,8 @@ function authenticateSocket(
   function requestClient(
     operation: RelayControlOperation,
     payload: unknown,
-    timeoutMs: number
+    timeoutMs: number,
+    subject?: string
   ): Promise<unknown> {
     if (!authenticatedClient || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(
@@ -505,6 +507,7 @@ function authenticateSocket(
       id,
       operation,
       payload,
+      ...(subject ? { subject } : {}),
       timeoutMs: duration,
       type: "request",
       v: 1,
@@ -575,6 +578,49 @@ function isAuditedMutation(operation: RelayControlOperation): boolean {
     operation === "instance.console.write" ||
     operation === "instance.network.routes.write"
   )
+}
+
+export function auditDetailsForRequest(
+  request: RelayControlRequest,
+  result: unknown
+): Readonly<Record<string, unknown>> {
+  const details: Record<string, unknown> = { operation: request.operation }
+  const permission = actionForRequest(request)
+  if (permission) {
+    details.permission = permission
+  }
+  if (request.subject) {
+    details.subject = request.subject
+  }
+  if (
+    !request.payload ||
+    typeof request.payload !== "object" ||
+    Array.isArray(request.payload)
+  ) {
+    return details
+  }
+  const payload = Object.fromEntries(Object.entries(request.payload))
+  if (typeof payload.instanceId === "string") {
+    details.instanceId = payload.instanceId
+  }
+  if (
+    request.operation === "instance.action" &&
+    typeof payload.action === "string"
+  ) {
+    details.action = payload.action
+  }
+  if (
+    request.operation === "instance.create" &&
+    result &&
+    typeof result === "object" &&
+    !Array.isArray(result)
+  ) {
+    const response = Object.fromEntries(Object.entries(result))
+    if (typeof response.id === "string") {
+      details.instanceId = response.id
+    }
+  }
+  return details
 }
 
 function closeClientSockets(
