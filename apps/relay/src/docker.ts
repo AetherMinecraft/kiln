@@ -18,6 +18,7 @@ import type {
   RelayConsoleSegment,
   RelayDesiredState,
   RelayInstance,
+  RelayInstancePortProtocol,
   RelayInstanceResources,
 } from "@workspace/contracts"
 import {
@@ -36,6 +37,10 @@ import {
   relayResourceNames,
   type RelayResourceNames,
 } from "./relay-resources.js"
+import {
+  discoverPortAllocations,
+  isManagedPortLabel,
+} from "./port-allocations.js"
 import {
   INSTANCE_STARTUP_READINESS_TIMEOUT_MS,
   INSTANCE_STOP_TIMEOUT_SECONDS,
@@ -155,14 +160,12 @@ export type DockerPortBindings = Record<
 
 export interface DockerPublishedPort {
   port: number
-  protocol: "tcp" | "udp"
+  protocol: RelayInstancePortProtocol
 }
 
-export interface DockerPublishedPortUpgrade {
-  containerPort: number
-  hostPort: number
+export interface DockerPortConfiguration {
+  bindings: DockerPortBindings
   labels: Readonly<Record<string, string>>
-  protocol: "tcp" | "udp"
 }
 
 export function dockerPublishedPort(
@@ -182,15 +185,21 @@ export function dockerPublishedPort(
 export function dockerPublishedPrimaryPort(
   bindings: DockerPortBindings | undefined,
   containerPort: number | undefined,
-  protocol: "tcp" | "udp" | undefined
+  protocol: RelayInstancePortProtocol | undefined
 ): DockerPublishedPort | undefined {
-  const protocols: ReadonlyArray<"tcp" | "udp"> = protocol
-    ? [protocol]
-    : ["tcp", "udp"]
+  const protocols: ReadonlyArray<"tcp" | "udp"> =
+    protocol === "both" || protocol === undefined ? ["tcp", "udp"] : [protocol]
   const matches = protocols.flatMap((candidate) => {
     const port = dockerPublishedPort(bindings, containerPort, candidate)
     return port ? [{ port, protocol: candidate }] : []
   })
+  if (
+    matches.length === 2 &&
+    matches[0]?.port === matches[1]?.port &&
+    (protocol === "both" || protocol === undefined)
+  ) {
+    return { port: matches[0].port, protocol: "both" }
+  }
   return matches.length === 1 ? matches[0] : undefined
 }
 
@@ -249,20 +258,6 @@ export function instanceConnectAddress(input: {
     return publicConnectAddress(publicHost, input.publicPort)
   }
   return "Error: Relay did not report a published game port"
-}
-
-export function managedInstanceRequiresNetworkUpgrade(input: {
-  brickId?: string
-  brickSource?: string
-  managedByRelay: boolean
-  publicPort?: number
-}): boolean {
-  return (
-    input.managedByRelay &&
-    input.brickId !== builtinTailscaleBrickId &&
-    Boolean(input.brickSource) &&
-    input.publicPort === undefined
-  )
 }
 
 interface ResourceCacheEntry {
@@ -513,7 +508,6 @@ export class DockerDriver {
         containerId: container.Id.slice(0, 12),
         desiredState,
         observedState: powerState.observedState,
-        requiresNetworkUpgrade: config.requiresNetworkUpgrade ?? false,
         startedAt: container.State.Running ? container.State.StartedAt : null,
         readyAt:
           currentReadySession?.startedAt === containerStartedAt
@@ -668,8 +662,8 @@ export class DockerDriver {
     instance: RelayInstanceConfig,
     routeLabels: Readonly<Record<string, string>>,
     edgeNetwork: string | null,
-    action: "start" | "restart",
-    publishedPortUpgrade?: DockerPublishedPortUpgrade
+    action: "start" | "restart" | "stop",
+    portConfiguration?: DockerPortConfiguration
   ): Promise<RelayInstance> {
     if (!instance.managedByRelay) {
       throw new Error("Relay can only recreate containers it created")
@@ -694,11 +688,11 @@ export class DockerDriver {
       }
     }
     Object.assign(labels, routeLabels)
-    if (publishedPortUpgrade) {
-      Object.assign(labels, publishedPortUpgrade.labels)
-      if (!instance.tailscale.enabled) {
-        delete labels["kiln.instance.hostname"]
+    if (portConfiguration) {
+      for (const label of Object.keys(labels)) {
+        if (isManagedPortLabel(label)) delete labels[label]
       }
+      Object.assign(labels, portConfiguration.labels)
     }
 
     const primaryNetwork = Object.hasOwn(
@@ -714,26 +708,18 @@ export class DockerDriver {
     }
 
     const exposedPorts =
-      publishedPortUpgrade === undefined
+      portConfiguration === undefined
         ? current.Config.ExposedPorts
-        : {
-            ...current.Config.ExposedPorts,
-            [`${publishedPortUpgrade.containerPort}/${publishedPortUpgrade.protocol}`]:
+        : Object.fromEntries(
+            Object.keys(portConfiguration.bindings).map((binding) => [
+              binding,
               {},
-          }
+            ])
+          )
     const portBindings =
-      publishedPortUpgrade === undefined
+      portConfiguration === undefined
         ? current.HostConfig.PortBindings
-        : {
-            ...current.HostConfig.PortBindings,
-            [`${publishedPortUpgrade.containerPort}/${publishedPortUpgrade.protocol}`]:
-              [
-                {
-                  HostIp: "",
-                  HostPort: String(publishedPortUpgrade.hostPort),
-                },
-              ],
-          }
+        : portConfiguration.bindings
     const transition: InstancePowerTransition = {
       action,
       commandCompleted: false,
@@ -792,7 +778,7 @@ export class DockerDriver {
         }
       )
       replacementCreated = true
-      const secondaryNetworks = publishedPortUpgrade
+      const secondaryNetworks = portConfiguration
         ? Object.keys(current.NetworkSettings?.Networks ?? {}).filter(
             (network) => network !== primaryNetwork
           )
@@ -810,9 +796,11 @@ export class DockerDriver {
         arguments_.push(network, instance.service)
         await command("docker", arguments_)
       }
-      await command("docker", ["start", instance.service], {
-        timeout: 120_000,
-      })
+      if (action !== "stop") {
+        await command("docker", ["start", instance.service], {
+          timeout: 120_000,
+        })
+      }
       if (this.#powerTransitions.get(instance.id) === transition) {
         this.#powerTransitions.set(instance.id, {
           ...transition,
@@ -828,18 +816,16 @@ export class DockerDriver {
       await command("docker", ["rename", backupName, instance.service]).catch(
         () => undefined
       )
-      await command("docker", ["start", instance.service], {
-        timeout: 120_000,
-      }).catch(() => undefined)
+      if (current.State.Running) {
+        await command("docker", ["start", instance.service], {
+          timeout: 120_000,
+        }).catch(() => undefined)
+      }
       if (this.#powerTransitions.get(instance.id) === transition) {
         this.#powerTransitions.delete(instance.id)
       }
       throw new Error(
-        `Kiln could not ${
-          publishedPortUpgrade
-            ? "upgrade networking for"
-            : "apply web routes to"
-        } ${instance.name}; the previous container was restored.`,
+        `Kiln could not ${portConfiguration ? "apply port allocations to" : "apply web routes to"} ${instance.name}; the previous container was restored.`,
         { cause }
       )
     }
@@ -847,11 +833,7 @@ export class DockerDriver {
       timeout: 90_000,
     }).catch((cause: unknown) => {
       console.warn(
-        `Kiln ${
-          publishedPortUpgrade
-            ? "upgraded networking for"
-            : "applied web routes to"
-        } ${instance.name}, but could not remove backup container ${backupName}.`,
+        `Kiln ${portConfiguration ? "applied port allocations to" : "applied web routes to"} ${instance.name}, but could not remove backup container ${backupName}.`,
         cause
       )
     })
@@ -1441,7 +1423,7 @@ export class DockerDriver {
         ? "tcp"
         : undefined)
     const port = instance.brickPrimaryPort
-    if (protocol !== "tcp" || !port) return undefined
+    if ((protocol !== "tcp" && protocol !== "both") || !port) return undefined
 
     const addresses = Object.values(
       container.NetworkSettings?.Networks ?? {}
@@ -1954,31 +1936,19 @@ export class DockerDriver {
       brickNetworkMode === "minecraft-proxy"
         ? brickNetworkMode
         : undefined
-    const primaryPort = Number(labels["kiln.brick.primary-port"])
-    const primaryProtocol =
-      labels["kiln.brick.primary-port-protocol"] === "tcp" ||
-      labels["kiln.brick.primary-port-protocol"] === "udp"
-        ? labels["kiln.brick.primary-port-protocol"]
-        : undefined
-    const validPrimaryPort = Number.isInteger(primaryPort)
-      ? primaryPort
-      : undefined
     const brickReadiness = parseBrickReadinessLabel(
       labels["kiln.brick.readiness"]
     )
-    const publishedPort =
-      dockerPublishedPrimaryPort(
-        container.NetworkSettings?.Ports,
-        validPrimaryPort,
-        primaryProtocol
-      ) ??
-      dockerPublishedPrimaryPort(
-        container.HostConfig?.PortBindings,
-        validPrimaryPort,
-        primaryProtocol
-      )
-    const publicPort = publishedPort?.port
-    const effectivePrimaryProtocol = primaryProtocol ?? publishedPort?.protocol
+    const ports = discoverPortAllocations({
+      bindings: container.HostConfig?.PortBindings,
+      labels,
+    })
+    const primaryAllocation = ports.find(
+      (allocation) => allocation.kind === "primary"
+    )
+    const publicPort = primaryAllocation?.externalPort
+    const effectivePrimaryPort = primaryAllocation?.internalPort
+    const effectivePrimaryProtocol = primaryAllocation?.protocol
     const publicHost = instancePublicHost({
       discoveredPublicIp: this.#config.discoveredPublicIp,
       gameHost: this.#config.gameHost,
@@ -2014,10 +1984,11 @@ export class DockerDriver {
       brickId: validBrickId,
       brickNetworkMode: validNetworkMode,
       brickPrimaryPort:
-        Number.isInteger(primaryPort) &&
-        primaryPort >= 1 &&
-        primaryPort <= 65_535
-          ? primaryPort
+        effectivePrimaryPort &&
+        Number.isInteger(effectivePrimaryPort) &&
+        effectivePrimaryPort >= 1 &&
+        effectivePrimaryPort <= 65_535
+          ? effectivePrimaryPort
           : undefined,
       brickPrimaryPortProtocol: effectivePrimaryProtocol,
       brickReadiness,
@@ -2040,14 +2011,9 @@ export class DockerDriver {
       implementation,
       javaVersion: imageTag,
       name,
+      ports,
       publicHost,
       publicPort,
-      requiresNetworkUpgrade: managedInstanceRequiresNetworkUpgrade({
-        brickId: validBrickId,
-        brickSource: labels["kiln.brick.source"],
-        managedByRelay: owned,
-        publicPort,
-      }),
       shortId: id.slice(0, 8),
       service,
       tailscale,

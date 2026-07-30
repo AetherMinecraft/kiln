@@ -4,6 +4,8 @@ import { hostname } from "node:os"
 
 import type {
   BrickReadiness,
+  RelayInstancePortAllocation,
+  RelayInstancePortProtocol,
   RelayInstanceTailscale,
 } from "@workspace/contracts"
 
@@ -12,7 +14,7 @@ export interface RelayInstanceConfig {
   brickId?: string
   brickNetworkMode?: "direct" | "minecraft-backend" | "minecraft-proxy"
   brickPrimaryPort?: number
-  brickPrimaryPortProtocol?: "tcp" | "udp"
+  brickPrimaryPortProtocol?: RelayInstancePortProtocol
   brickReadiness?: BrickReadiness
   brickSupportsSrv?: boolean
   brickSource?: string
@@ -28,9 +30,9 @@ export interface RelayInstanceConfig {
     memoryBytes: number
   }
   name: string
+  ports: Array<RelayInstancePortAllocation>
   publicHost?: string
   publicPort?: number
-  requiresNetworkUpgrade?: boolean
   service: string
   tailscale: RelayInstanceTailscale
   variables?: Record<string, boolean | number | string>

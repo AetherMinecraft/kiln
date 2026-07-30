@@ -11,7 +11,6 @@ import {
   dockerPublishedPrimaryPort,
   instanceConnectAddress,
   instancePublicHost,
-  managedInstanceRequiresNetworkUpgrade,
   procNetTcpHasListener,
   publicConnectAddress,
 } from "./docker.js"
@@ -66,6 +65,16 @@ describe("Docker public game ports", () => {
         undefined
       )
     ).toBeUndefined()
+    expect(
+      dockerPublishedPrimaryPort(
+        {
+          "19132/tcp": [{ HostPort: "30132" }],
+          "19132/udp": [{ HostPort: "30132" }],
+        },
+        19_132,
+        undefined
+      )
+    ).toEqual({ port: 30_132, protocol: "both" })
   })
 
   it("collects host ports for the requested protocol across all bindings", () => {
@@ -143,37 +152,6 @@ describe("Docker public game ports", () => {
     expect(instanceConnectAddress({ relayHost: "relay.example.com" })).toBe(
       "Error: Relay did not report a published game port"
     )
-  })
-
-  it("only offers migration for recoverable Relay-managed game servers", () => {
-    expect(
-      managedInstanceRequiresNetworkUpgrade({
-        brickId: "fabric",
-        brickSource: "https://example.com/fabric.kiln-brick.json",
-        managedByRelay: true,
-      })
-    ).toBe(true)
-    expect(
-      managedInstanceRequiresNetworkUpgrade({
-        brickId: "fabric",
-        brickSource: "https://example.com/fabric.kiln-brick.json",
-        managedByRelay: true,
-        publicPort: 30_000,
-      })
-    ).toBe(false)
-    expect(
-      managedInstanceRequiresNetworkUpgrade({
-        brickId: "tailscale",
-        brickSource: "builtin:tailscale",
-        managedByRelay: true,
-      })
-    ).toBe(false)
-    expect(
-      managedInstanceRequiresNetworkUpgrade({
-        brickId: "fabric",
-        managedByRelay: true,
-      })
-    ).toBe(false)
   })
 })
 
