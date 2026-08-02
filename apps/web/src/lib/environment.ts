@@ -2,6 +2,7 @@ import { Option, Schema } from "effect"
 
 import { parseSecretKeyring } from "../../keyring.mjs"
 import type { VersionedSecret } from "../../keyring.mjs"
+import { rootDomainForHostname } from "@/lib/domain-name"
 
 export interface EmailDeliveryConfig {
   apiKey: string
@@ -42,6 +43,10 @@ export function kilnPublicUrl(): URL {
     decodeUrl(configured),
     () => new Error("KILN_URL must be an absolute http or https URL")
   )
+}
+
+export function kilnRootDomain(): string {
+  return rootDomainForHostname(kilnPublicUrl().hostname)
 }
 
 export function betterAuthUrl(): URL {
