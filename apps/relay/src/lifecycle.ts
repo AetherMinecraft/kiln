@@ -55,6 +55,13 @@ import type { BrickCatalog } from "./bricks.js"
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
 import type { DockerDriver } from "./docker.js"
 import {
+  INSTALLATION_MARKER_ENV,
+  INSTALLATION_MARKER_LABEL,
+  INSTALLATION_MARKER_PROTOCOL_LABEL,
+  installationMarkerName,
+  supportsInstallationMarkerProtocol,
+} from "./installation-marker.js"
+import {
   dockerPortBindingsForAllocations,
   portAllocationContainerLabels,
   portLabelsRequireRestart,
@@ -1972,6 +1979,14 @@ export class LifecycleDriver {
   }): Promise<RelayInstance> {
     const definition = await this.#bricks.recipe(input.recipe)
     const resolved = resolveBrick(definition, input.variables, input.recipe)
+    const installationMarkerValue =
+      resolved.environment[INSTALLATION_MARKER_ENV]
+    const installationMarker = installationMarkerName(installationMarkerValue)
+    if (installationMarkerValue && !installationMarker) {
+      throw new Error(
+        `${INSTALLATION_MARKER_ENV} must be a .kiln-* filename containing only letters, numbers, dots, underscores, or hyphens`
+      )
+    }
     const existing = await this.#docker.inspectInstances()
     const memoryLimitBytes = dockerMemoryBytes(resolved.memory)
     if (
@@ -2035,6 +2050,9 @@ export class LifecycleDriver {
     const memoryLimit = resolved.memory
     const directory = join(this.#config.rootDirectory, id)
     const hostDirectory = join(await this.#hostDataDirectory(), "instances", id)
+    if (installationMarker) {
+      await rm(join(directory, installationMarker), { force: true })
+    }
     const networking = await this.networking()
     const tailscaleSettings = input.tailscale.enabled
       ? await this.tailscaleSettings()
@@ -2085,18 +2103,48 @@ export class LifecycleDriver {
       await this.#ensureEdgeNetwork()
     }
     if (networking?.enabled) await this.#ensureInfrastructure(networking, false)
-    await runLifecycle(
-      lifecycleOperation(() =>
-        command("docker", ["image", "inspect", image])
-      ).pipe(
-        Effect.catch(() =>
-          lifecycleOperation(() =>
-            command("docker", ["pull", image], { timeout: 300_000 })
-          )
-        ),
-        Effect.asVoid
+    let managedInstallationMarker: string | null = null
+    if (installationMarker) {
+      await runLifecycle(
+        lifecycleOperation(() =>
+          command("docker", ["pull", image], { timeout: 300_000 })
+        ).pipe(
+          Effect.catch(() =>
+            lifecycleOperation(() =>
+              command("docker", ["image", "inspect", image])
+            )
+          ),
+          Effect.asVoid
+        )
       )
-    )
+      const protocol = await runLifecycle(
+        lifecycleOperation(() =>
+          command("docker", [
+            "image",
+            "inspect",
+            "--format",
+            `{{ index .Config.Labels "${INSTALLATION_MARKER_PROTOCOL_LABEL}" }}`,
+            image,
+          ])
+        ).pipe(Effect.map((result) => result.stdout.trim()))
+      )
+      if (supportsInstallationMarkerProtocol(protocol)) {
+        managedInstallationMarker = installationMarker
+      }
+    } else {
+      await runLifecycle(
+        lifecycleOperation(() =>
+          command("docker", ["image", "inspect", image])
+        ).pipe(
+          Effect.catch(() =>
+            lifecycleOperation(() =>
+              command("docker", ["pull", image], { timeout: 300_000 })
+            )
+          ),
+          Effect.asVoid
+        )
+      )
+    }
 
     if (definition.network.mode === "minecraft-proxy") {
       await this.#writeVelocityConfig(
@@ -2158,7 +2206,7 @@ export class LifecycleDriver {
       "--interactive",
       "--tty",
       "--restart",
-      "unless-stopped",
+      managedInstallationMarker ? "no" : "unless-stopped",
       "--read-only",
       "--tmpfs",
       "/tmp:rw,exec,nosuid,nodev,size=128m",
@@ -2217,6 +2265,12 @@ export class LifecycleDriver {
       "--volume",
       `${hostDirectory}:${definition.runtime.storage.mount}`,
     ]
+    if (managedInstallationMarker) {
+      arguments_.push(
+        "--label",
+        `${INSTALLATION_MARKER_LABEL}=${managedInstallationMarker}`
+      )
+    }
     for (const [label, value] of Object.entries(portLabels)) {
       arguments_.push("--label", `${label}=${value}`)
     }
