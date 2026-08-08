@@ -9,6 +9,7 @@ import {
   Check,
   CircleAlert,
   Clock3,
+  Database,
   LoaderCircle,
   MailPlus,
   Server,
@@ -23,7 +24,11 @@ import { Input } from "@workspace/ui/components/input"
 import type { FleetRelayInstance } from "@/lib/relay-fleet"
 import type { AccessRole } from "@/lib/permissions"
 import { accessRoleDetails, accessRoles, isAccessRole } from "@/lib/permissions"
-import { accessOverviewQueryOptions, queryKeys } from "@/lib/query-options"
+import {
+  accessOverviewQueryOptions,
+  managedDatabaseDirectoryQueryOptions,
+  queryKeys,
+} from "@/lib/query-options"
 import {
   createAccessInvitation,
   getAccessOverview,
@@ -31,14 +36,19 @@ import {
   revokeAccessInvitation,
   updateAccessGrant,
 } from "@/server/access"
+import type { getManagedDatabaseDirectory } from "@/server/databases"
 
 type AccessOverview = Awaited<ReturnType<typeof getAccessOverview>>
+type ManagedDatabaseDirectory = Awaited<
+  ReturnType<typeof getManagedDatabaseDirectory>
+>
 type InvitationForm = {
   email: string
   targetKey: string
   role: AccessRole
 }
 type InvitationTarget = {
+  databaseId: string | null
   instanceId: string | null
   key: string
   label: string
@@ -58,6 +68,9 @@ export function AccessPage({
 }) {
   const queryClient = useQueryClient()
   const { data: overview } = useSuspenseQuery(accessOverviewQueryOptions())
+  const { data: databases } = useSuspenseQuery(
+    managedDatabaseDirectoryQueryOptions()
+  )
   const inviteMutation = useMutation({
     mutationFn: createAccessInvitation,
     onSuccess: () =>
@@ -73,6 +86,9 @@ export function AccessPage({
         queryClient.invalidateQueries({
           queryKey: queryKeys.access.capabilities,
         }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.databases.directory,
+        }),
       ]),
   })
   const removeGrantMutation = useMutation({
@@ -84,6 +100,9 @@ export function AccessPage({
         }),
         queryClient.invalidateQueries({
           queryKey: queryKeys.access.capabilities,
+        }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.databases.directory,
         }),
       ]),
   })
@@ -104,6 +123,7 @@ export function AccessPage({
     () =>
       overview.relays.flatMap((relay) => [
         {
+          databaseId: null,
           instanceId: null,
           key: `relay:${relay.id}`,
           label: `Entire Relay · ${relay.name}`,
@@ -114,6 +134,7 @@ export function AccessPage({
           instance.relayId === relay.id
             ? [
                 {
+                  databaseId: null,
                   instanceId: instance.id,
                   key: `instance:${relay.id}:${instance.id}`,
                   label: `Instance · ${instance.name} · ${relay.name}`,
@@ -123,8 +144,22 @@ export function AccessPage({
               ]
             : []
         ),
+        ...databases.flatMap((database) =>
+          database.relayId === relay.id
+            ? [
+                {
+                  databaseId: database.id,
+                  instanceId: null,
+                  key: `database:${relay.id}:${database.id}`,
+                  label: `Database · ${database.name} · ${relay.name}`,
+                  relayId: relay.id,
+                  resourceName: database.name,
+                },
+              ]
+            : []
+        ),
       ]),
-    [instances, overview.relays]
+    [databases, instances, overview.relays]
   )
 
   async function invite(form: InvitationForm) {
@@ -144,6 +179,7 @@ export function AccessPage({
           inviteMutation.mutateAsync({
             data: {
               email: form.email,
+              databaseId: target.databaseId,
               instanceId: target.instanceId,
               relayId: target.relayId,
               resourceName: target.resourceName,
@@ -264,6 +300,7 @@ export function AccessPage({
           <div className="space-y-5">
             <AccessGrantList
               grants={overview.grants}
+              databases={databases}
               instances={instances}
               ownerRelayIds={ownerRelayIds}
               pending={pending}
@@ -273,6 +310,7 @@ export function AccessPage({
 
             <PendingInvitationList
               invitations={overview.invitations}
+              databases={databases}
               instances={instances}
               ownerRelayIds={ownerRelayIds}
               pending={pending}
@@ -404,6 +442,7 @@ function InviteAccessSection({
 }
 
 function AccessGrantList({
+  databases,
   grants,
   instances,
   ownerRelayIds,
@@ -411,6 +450,7 @@ function AccessGrantList({
   onRoleChange,
   onRemove,
 }: {
+  databases: ManagedDatabaseDirectory
   grants: AccessOverview["grants"]
   instances: Array<FleetRelayInstance>
   ownerRelayIds: ReadonlySet<string>
@@ -437,6 +477,10 @@ function AccessGrantList({
               (item) =>
                 item.id === grant.resourceId && item.relayId === grant.relayId
             )
+            const database = databases.find(
+              (item) =>
+                item.id === grant.resourceId && item.relayId === grant.relayId
+            )
             const assignableRoles = rolesForRelay(
               ownerRelayIds,
               grant.relayId,
@@ -452,6 +496,8 @@ function AccessGrantList({
                 <div className="grid size-8 shrink-0 place-items-center rounded-lg border bg-background text-muted-foreground">
                   {grant.resourceType === "relay" ? (
                     <ShieldCheck className="size-3.5" />
+                  ) : grant.resourceType === "database" ? (
+                    <Database className="size-3.5" />
                   ) : (
                     <Server className="size-3.5" />
                   )}
@@ -466,7 +512,7 @@ function AccessGrantList({
                   <p className="mt-1 truncate font-mono text-[9px] text-muted-foreground">
                     {grant.resourceType === "relay"
                       ? `All instances on ${grant.relayName}`
-                      : `${instance?.name ?? grant.resourceId} · ${grant.relayName}`}
+                      : `${database?.name ?? instance?.name ?? grant.resourceId} · ${grant.relayName}`}
                   </p>
                 </div>
                 <select
@@ -516,12 +562,14 @@ function AccessGrantList({
 }
 
 function PendingInvitationList({
+  databases,
   invitations,
   instances,
   ownerRelayIds,
   pending,
   onRevoke,
 }: {
+  databases: ManagedDatabaseDirectory
   invitations: AccessOverview["invitations"]
   instances: Array<FleetRelayInstance>
   ownerRelayIds: ReadonlySet<string>
@@ -543,6 +591,11 @@ function PendingInvitationList({
               item.id === invitation.instanceId &&
               item.relayId === invitation.relayId
           )
+          const database = databases.find(
+            (item) =>
+              item.id === invitation.databaseId &&
+              item.relayId === invitation.relayId
+          )
           return (
             <div
               key={invitation.id}
@@ -554,8 +607,10 @@ function PendingInvitationList({
                   {invitation.email}
                 </p>
                 <p className="mt-1 font-mono text-[9px] text-muted-foreground">
-                  {instance?.name ?? `Entire Relay · ${invitation.relayName}`} ·{" "}
-                  {invitation.role} · expires{" "}
+                  {database?.name ??
+                    instance?.name ??
+                    `Entire Relay · ${invitation.relayName}`}{" "}
+                  · {invitation.role} · expires{" "}
                   <InvitationExpiry value={invitation.expiresAt} />
                 </p>
               </div>

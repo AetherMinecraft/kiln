@@ -21,6 +21,7 @@ import type {
 import {
   attachControlSocket,
   auditDetailsForRequest,
+  isAuditedOperation,
 } from "./control-socket.js"
 import { fingerprint } from "./effect/identity.js"
 import { RelayStateStore } from "./effect/state.js"
@@ -65,6 +66,10 @@ describe("Relay control timeouts", () => {
 })
 
 describe("Relay control audit details", () => {
+  it("audits database dump exports", () => {
+    expect(isAuditedOperation("database.dump.export")).toBe(true)
+  })
+
   it("attributes mutations and scopes created instances from the result", () => {
     const request: RelayControlRequest = {
       deadline: Date.now() + 5_000,
@@ -82,6 +87,27 @@ describe("Relay control audit details", () => {
       instanceId,
       operation: "instance.create",
       permission: "instance.create",
+      subject: "user-123",
+    })
+  })
+
+  it("attributes created databases from the request", () => {
+    const databaseId = "b".repeat(40)
+    const request: RelayControlRequest = {
+      deadline: Date.now() + 5_000,
+      id: "request",
+      operation: "database.create",
+      payload: { id: databaseId, name: "Primary" },
+      subject: "user-123",
+      timeoutMs: 5_000,
+      type: "request",
+      v: 1,
+    }
+
+    expect(auditDetailsForRequest(request, {})).toEqual({
+      databaseId,
+      operation: "database.create",
+      permission: "database.create",
       subject: "user-123",
     })
   })
