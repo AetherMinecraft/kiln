@@ -6,6 +6,7 @@ import { CircleAlert, HardDrive, LoaderCircle, Rocket } from "lucide-react"
 import {
   DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
   type Brick,
+  type BrickVariableValue,
 } from "@workspace/contracts"
 
 import { Button } from "@workspace/ui/components/button"
@@ -23,8 +24,14 @@ import {
 import {
   defaultBrickInstanceName,
   defaultBrickVariables,
+  unavailableMinecraftJavaVersion,
+  withRecommendedMinecraftJava,
 } from "@/lib/brick-variables"
-import { relayInstanceRouteId } from "@/lib/relay-fleet"
+import {
+  addRelayInstanceToSnapshot,
+  relayInstanceRouteId,
+  type RelayFleetSnapshot,
+} from "@/lib/relay-fleet"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import {
   brickCatalogQueryOptions,
@@ -154,13 +161,19 @@ const AddServerForm = React.memo(function AddServerForm({
   const { isPending: pending, mutateAsync: provisionServer } = useMutation({
     mutationFn: createBrickInstance,
     onSuccess: async (instance, variables) => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.bricks }),
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.relay.connection,
-        }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.relay.snapshot }),
-      ])
+      const relay = relays.find((item) => item.id === variables.data.relayId)
+      if (!relay) throw new Error("Provisioning Relay is no longer available")
+
+      const addInstance = (snapshot: RelayFleetSnapshot | undefined) =>
+        addRelayInstanceToSnapshot(snapshot, instance, relay)
+      queryClient.setQueryData(queryKeys.relay.snapshot, addInstance)
+      queryClient.setQueryData<RelayConnection>(
+        queryKeys.relay.connection,
+        (connection) =>
+          connection?.status === "connected"
+            ? { ...connection, snapshot: addInstance(connection.snapshot)! }
+            : connection
+      )
       onClose()
       await navigate({
         to: "/server/$serverId/startup",
@@ -171,6 +184,13 @@ const AddServerForm = React.memo(function AddServerForm({
           ),
         },
       })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.bricks }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.relay.connection,
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.relay.snapshot }),
+      ])
     },
   })
 
@@ -217,7 +237,6 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
   onProvision: (input: CreateBrickInstanceInput) => Promise<unknown>
   pending: boolean
 }) {
-  const queryClient = useQueryClient()
   const selectionName =
     selection?.kind === "catalog"
       ? defaultBrickInstanceName(selection.brick)
@@ -241,19 +260,9 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
   const relayCompatible =
     selectedRelay !== undefined &&
     relaySupportsSelection(selectedRelay, selection)
+  const versionDefinition = minecraftVersionDefinition(selection)
 
-  const selectRelayConnected = React.useCallback(
-    (connection: RelayConnection) =>
-      connection.status === "connected" &&
-      connection.relays.some(
-        (relay) => relay.id === relayId && relay.status === "connected"
-      ),
-    [relayId]
-  )
-  const { data: relayConnected = false } = useQuery({
-    ...relayConnectionQueryOptions(queryClient),
-    select: selectRelayConnected,
-  })
+  const relayConnected = useSelectedRelayConnected(relayId)
 
   const submittingRef = React.useRef(false)
 
@@ -295,6 +304,19 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
       })
       return
     }
+    const submittedVersion = formData.get("version")
+    const configured =
+      selection.kind === "catalog"
+        ? catalogVariablesForVersion(selection.brick, submittedVersion)
+        : { unavailableJavaVersion: null, variables: {}, version: null }
+    if (configured.unavailableJavaVersion && configured.version) {
+      setFailure({
+        selectionIdentity,
+        message: `Minecraft ${configured.version} requires Java ${configured.unavailableJavaVersion}, but that Ember is not published yet.`,
+      })
+      return
+    }
+    const variables = configured.variables
 
     submittingRef.current = true
     await Effect.runPromise(
@@ -307,10 +329,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
               recipe,
               relayId,
               start: false,
-              variables:
-                selection.kind === "catalog"
-                  ? defaultBrickVariables(selection.brick)
-                  : {},
+              variables,
             },
           }),
         catch: (cause) => cause,
@@ -359,6 +378,45 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
           required
         />
       </label>
+      {versionDefinition ? (
+        <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
+          <span className="flex items-center justify-between gap-3">
+            <span>{versionDefinition.label}</span>
+            {versionDefinition.default === undefined ? null : (
+              <span className="font-mono text-[9px] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
+                {String(versionDefinition.default)} default
+              </span>
+            )}
+          </span>
+          <Input
+            key={`${selectionIdentity}:version`}
+            name="version"
+            defaultValue={
+              versionDefinition.default === undefined
+                ? ""
+                : String(versionDefinition.default)
+            }
+            placeholder={
+              selection?.kind === "catalog" &&
+              selection.brick.metadata.id === "velocity"
+                ? "3.5.1"
+                : "1.21.11 or 26.2"
+            }
+            pattern={versionDefinition.rules?.pattern}
+            minLength={versionDefinition.rules?.minLength}
+            maxLength={versionDefinition.rules?.maxLength}
+            disabled={pending}
+            className="font-mono tabular-nums"
+            required={
+              versionDefinition.required &&
+              versionDefinition.default === undefined
+            }
+          />
+          <span className="block text-[9px] leading-relaxed font-normal text-muted-foreground/65">
+            {versionDefinition.description}
+          </span>
+        </label>
+      ) : null}
       <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
         <span className="flex items-center justify-between gap-3">
           <span>Disk quota</span>
@@ -459,6 +517,23 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
   )
 })
 
+function useSelectedRelayConnected(relayId: string): boolean {
+  const queryClient = useQueryClient()
+  const selectRelayConnected = React.useCallback(
+    (connection: RelayConnection) =>
+      connection.status === "connected" &&
+      connection.relays.some(
+        (relay) => relay.id === relayId && relay.status === "connected"
+      ),
+    [relayId]
+  )
+  const { data = false } = useQuery({
+    ...relayConnectionQueryOptions(queryClient),
+    select: selectRelayConnected,
+  })
+  return data
+}
+
 function diskLimitBytesFromFormValue(
   value: FormDataEntryValue | null
 ): number | null {
@@ -467,6 +542,38 @@ function diskLimitBytesFromFormValue(
   if (!Number.isFinite(gibibytes) || gibibytes <= 0) return null
   const bytes = Math.round(gibibytes * GIBIBYTE_BYTES)
   return Number.isSafeInteger(bytes) ? bytes : null
+}
+
+function catalogVariablesForVersion(
+  brick: Brick,
+  value: FormDataEntryValue | null
+): {
+  unavailableJavaVersion: string | null
+  variables: Record<string, BrickVariableValue>
+  version: string | null
+} {
+  const variables = defaultBrickVariables(brick)
+  const version = typeof value === "string" ? value.trim() : ""
+  if (!version) {
+    return { unavailableJavaVersion: null, variables, version: null }
+  }
+  variables.version = version
+  const unavailableJavaVersion = unavailableMinecraftJavaVersion(
+    brick.metadata.id,
+    brick.variables,
+    version
+  )
+  return {
+    unavailableJavaVersion,
+    variables: unavailableJavaVersion
+      ? variables
+      : withRecommendedMinecraftJava(
+          brick.metadata.id,
+          brick.variables,
+          variables
+        ),
+    version,
+  }
 }
 
 function relayDisplayHost(relay: PersistedRelay): string {
@@ -487,6 +594,17 @@ function relaySupportsSelection(
   return architectures.some(
     (architecture) => normalizeArchitecture(architecture) === relayArchitecture
   )
+}
+
+function minecraftVersionDefinition(selection: BrickSelection | null) {
+  if (
+    selection?.kind !== "catalog" ||
+    selection.brick.metadata.game.trim().toLowerCase() !== "minecraft"
+  ) {
+    return null
+  }
+  const definition = selection.brick.variables.version
+  return definition?.type === "string" ? definition : null
 }
 
 function normalizeArchitecture(architecture: string): string {

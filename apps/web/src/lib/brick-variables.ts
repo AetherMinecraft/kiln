@@ -1,7 +1,9 @@
-import type {
-  Brick,
-  BrickVariableValue,
+import {
+  requiredMinecraftJavaVersion,
+  type Brick,
+  type BrickVariableValue,
 } from "@workspace/contracts"
+import { Result } from "effect"
 
 export function updateBrickVariable(
   variables: Readonly<Record<string, BrickVariableValue>>,
@@ -17,11 +19,99 @@ export function updateBrickVariable(
 export function defaultBrickVariables(
   brick: Brick
 ): Record<string, BrickVariableValue> {
-  return Object.fromEntries(
+  const variables = Object.fromEntries(
     Object.entries(brick.variables).flatMap(([name, definition]) =>
       definition.default === undefined ? [] : [[name, definition.default]]
     )
   )
+  return withRecommendedMinecraftJava(
+    brick.metadata.id,
+    brick.variables,
+    variables
+  )
+}
+
+export function hydrateBrickVariables(
+  brick: Brick,
+  stored: Readonly<Record<string, BrickVariableValue>> | null | undefined
+): Record<string, BrickVariableValue> {
+  const variables = {
+    ...defaultBrickVariables(brick),
+    ...stored,
+  }
+  return stored && Object.hasOwn(stored, "java_version")
+    ? variables
+    : withRecommendedMinecraftJava(
+        brick.metadata.id,
+        brick.variables,
+        variables
+      )
+}
+
+export function withRecommendedMinecraftJava(
+  brickId: string,
+  definitions: Brick["variables"],
+  variables: Readonly<Record<string, BrickVariableValue>>
+): Record<string, BrickVariableValue> {
+  const updated = { ...variables }
+  const version = variables.version
+  const javaVersion =
+    typeof version === "string"
+      ? requiredMinecraftJavaVersion(brickId, version)
+      : null
+  const javaDefinition = definitions.java_version
+  if (
+    javaVersion &&
+    javaDefinition &&
+    stringVariableAllows(javaDefinition, javaVersion)
+  ) {
+    updated.java_version = javaVersion
+  }
+  return updated
+}
+
+export function unavailableMinecraftJavaVersion(
+  brickId: string,
+  definitions: Brick["variables"],
+  version: string,
+  selectedJavaVersion?: BrickVariableValue
+): string | null {
+  const javaVersion =
+    typeof selectedJavaVersion === "string"
+      ? selectedJavaVersion
+      : requiredMinecraftJavaVersion(brickId, version)
+  const javaDefinition = definitions.java_version
+  if (!javaVersion || javaDefinition?.type !== "string") return null
+  return stringVariableAllows(javaDefinition, javaVersion) ? null : javaVersion
+}
+
+function stringVariableAllows(
+  definition: Brick["variables"][string],
+  value: string
+): boolean {
+  if (definition.type !== "string") return false
+  if (
+    definition.options &&
+    !definition.options.some((option) => option === value)
+  ) {
+    return false
+  }
+  if (
+    definition.rules?.minLength !== undefined &&
+    value.length < definition.rules.minLength
+  ) {
+    return false
+  }
+  if (
+    definition.rules?.maxLength !== undefined &&
+    value.length > definition.rules.maxLength
+  ) {
+    return false
+  }
+  const patternSource = definition.rules?.pattern
+  if (!patternSource) return true
+  const pattern = Result.try(() => new RegExp(patternSource, "u"))
+  return Result.isSuccess(pattern) && pattern.success.test(value)
 }
 
 export function defaultBrickInstanceName(brick: Brick): string {
@@ -29,4 +119,19 @@ export function defaultBrickInstanceName(brick: Brick): string {
     ? brick.variables.version.default
     : undefined
   return `${brick.metadata.name}${version === undefined ? "" : ` ${String(version)}`}`
+}
+
+export function defaultBrickRuntimeName(brick: Brick): string {
+  const variables = defaultBrickVariables(brick)
+  return brick.runtime.name
+    .replace(
+      /\{\{\s*variables\.([a-z][a-z0-9_]{0,47})\s*\}\}/gu,
+      (template, variable: string) =>
+        Object.hasOwn(variables, variable)
+          ? String(variables[variable])
+          : template
+    )
+    .replace(/\{\{\s*brick\.(id|name)\s*\}\}/gu, (_template, field: string) =>
+      field === "name" ? brick.metadata.name : brick.metadata.id
+    )
 }

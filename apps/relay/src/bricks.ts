@@ -12,6 +12,7 @@ import {
   brickRecipeSchema,
   builtinTailscaleBrick,
   builtinTailscaleBrickSource,
+  requiredMinecraftJavaVersion,
   relayCatalogSchema,
 } from "@workspace/contracts"
 
@@ -115,9 +116,11 @@ interface CachedCatalog {
 
 export interface ResolvedBrick {
   environment: Readonly<Record<string, string>>
+  image: string
   memory: string
   memoryReservation: string
   recipe: BrickRecipe
+  runtimeName: string
   values: Readonly<Record<string, BrickVariableValue>>
 }
 
@@ -250,6 +253,7 @@ export function resolveBrick(
     validateVariable(name, definition, value, source)
     values[name] = value
   }
+  applyRecommendedMinecraftJava(recipe, input, values, source)
 
   const interpolate = (template: string): string =>
     interpolateTemplate(template, recipe, values, source)
@@ -277,11 +281,40 @@ export function resolveBrick(
         interpolate(value),
       ])
     ),
+    image: interpolate(recipe.runtime.image),
     memory,
     memoryReservation,
     recipe,
+    runtimeName: interpolate(recipe.runtime.name),
     values,
   }
+}
+
+function applyRecommendedMinecraftJava(
+  recipe: BrickRecipe,
+  input: Readonly<Record<string, BrickVariableValue>>,
+  values: Record<string, BrickVariableValue>,
+  source: string
+): void {
+  if (Object.hasOwn(input, "java_version")) return
+  const version = values.version
+  const javaDefinition = recipe.variables.java_version
+  const javaVersion =
+    typeof version === "string"
+      ? requiredMinecraftJavaVersion(recipe.metadata.id, version)
+      : null
+  if (!javaVersion || javaDefinition?.type !== "string") return
+  const validation = Result.try(() =>
+    validateVariable("java_version", javaDefinition, javaVersion, source)
+  )
+  if (Result.isFailure(validation)) {
+    throw recipeError(
+      "unsupported_java_version",
+      source,
+      `Minecraft ${version} requires Java ${javaVersion}, but this Brick does not publish that Ember`
+    )
+  }
+  values.java_version = javaVersion
 }
 
 export function interpolateTemplate(
