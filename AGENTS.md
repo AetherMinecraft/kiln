@@ -58,8 +58,30 @@ Name branches as `<type>/<task>`, with a short lowercase kebab-case task:
 | `chore/`    | Dependencies and repository maintenance      |
 | `ci/`       | CI and release automation                    |
 
-For example: `fix/worktree-env-mount`. Do not use personal or agent-name
+For example: `fix/panel-disconnect`. Do not use personal or agent-name
 prefixes.
+
+Use `<type>(<scope>): <short human title>` for PR titles. Scopes are `hearth`, `bricks`,
+`relay`, and `repo` for repo-wide changes. For work spanning multiple scopes,
+list them comma-separated. For example: `fix(hearth): panel disconnect` or
+`feat(hearth,relay): add server events`.
+
+## Pull request descriptions
+
+Keep PR descriptions minimal and human:
+
+```md
+# Why
+What it fixes or implements. Link an issue when one exists.
+
+# Summary
+Brief summary.
+
+# Notes
+Breaking changes, compatibility notes, migration steps, or anything else reviewers need to know.
+```
+
+Do not update the description during review for follow-up commits or fixes unless the overall PR changes.
 
 For every change:
 
