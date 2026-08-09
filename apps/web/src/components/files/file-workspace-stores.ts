@@ -5,6 +5,15 @@ export const fileEditorFontSizes = [10, 11, 12, 14, 16]
 const fileEditorFontSizeStorageKey = "kiln:file-editor-font-size"
 const defaultFileEditorFontSize = 16
 
+export function deletedPathContainsSelection(
+  deletedPath: string,
+  selectedPath: string
+): boolean {
+  return deletedPath.endsWith("/")
+    ? selectedPath === deletedPath || selectedPath.startsWith(deletedPath)
+    : selectedPath === deletedPath
+}
+
 export interface EditorSearchStore {
   getSnapshot: () => string
   setQuery: (query: string) => void

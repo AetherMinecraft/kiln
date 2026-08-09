@@ -1,6 +1,7 @@
 import {
   mkdtemp,
   mkdir,
+  readFile,
   readdir,
   rm,
   symlink,
@@ -21,6 +22,47 @@ import type { RelayInstanceConfig } from "./config.js"
 const describeLinux = process.platform === "linux" ? describe : describe.skip
 
 describeLinux("Relay direct file transfers", () => {
+  it.effect("renames, duplicates, archives, and deletes entries", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        yield* fromPromise(() =>
+          writeFile(resolve(root, "world", "data.txt"), "settings")
+        )
+        yield* driver.mutate(instance, {
+          operation: "rename",
+          path: "world/data.txt",
+          destination: "world/server.txt",
+        })
+        yield* driver.mutate(instance, {
+          operation: "duplicate",
+          paths: ["world/server.txt"],
+        })
+        const archived = yield* driver.mutate(instance, {
+          operation: "archive",
+          paths: ["world/server.txt", "world/server copy.txt"],
+          destination: "world/configs.zip",
+        })
+        assert.include(archived.paths, "world/configs.zip")
+        assert.strictEqual(archived.sizes["world/server.txt"], 8)
+        assert.isAtLeast(archived.sizes["world/"] ?? 0, 16)
+        assert.strictEqual(archived.sizes[""], archived.sizes["world/"])
+        assert.isAbove(archived.modifiedAt["world/server.txt"] ?? 0, 0)
+        assert.isAbove(archived.modifiedAt["world/"] ?? 0, 0)
+        const archive = yield* fromPromise(() =>
+          readFile(resolve(root, "world", "configs.zip"))
+        )
+        assert.strictEqual(archive.subarray(0, 2).toString(), "PK")
+
+        const deleted = yield* driver.mutate(instance, {
+          operation: "delete",
+          paths: ["world/server.txt", "world/server copy.txt"],
+        })
+        assert.notInclude(deleted.paths, "world/server.txt")
+        assert.notInclude(deleted.paths, "world/server copy.txt")
+      })
+    )
+  )
+
   it.effect("atomically uploads and reads through a pinned file handle", () =>
     withSetup(({ driver, instance, root }) =>
       Effect.gen(function* () {
@@ -47,7 +89,89 @@ describeLinux("Relay direct file transfers", () => {
     )
   )
 
-  it.effect("refuses a final symlink for uploads and downloads", () =>
+  it.effect("creates missing parents for concurrent nested uploads", () =>
+    withSetup(({ driver, instance }) =>
+      Effect.gen(function* () {
+        yield* Effect.all(
+          [
+            driver.upload(
+              instance,
+              "packs/example/config/server.yml",
+              chunks("server")
+            ),
+            driver.upload(
+              instance,
+              "packs/example/config/messages.yml",
+              chunks("messages")
+            ),
+          ],
+          { concurrency: "unbounded" }
+        )
+
+        const [server, messages] = yield* Effect.all([
+          driver.withDownload(
+            instance,
+            "packs/example/config/server.yml",
+            (download) => fromPromise(() => download.file.readFile("utf8"))
+          ),
+          driver.withDownload(
+            instance,
+            "packs/example/config/messages.yml",
+            (download) => fromPromise(() => download.file.readFile("utf8"))
+          ),
+        ])
+        assert.strictEqual(server, "server")
+        assert.strictEqual(messages, "messages")
+      })
+    )
+  )
+
+  it.effect(
+    "collects archive downloads without writing into the instance",
+    () =>
+      withSetup(({ driver, instance, root }) =>
+        Effect.gen(function* () {
+          yield* fromPromise(() =>
+            Promise.all([
+              mkdir(resolve(root, "world", "config")),
+              writeFile(resolve(root, "world", "data.txt"), "data"),
+            ])
+          )
+          yield* fromPromise(() =>
+            writeFile(resolve(root, "world", "config", "server.yml"), "server")
+          )
+          const before = yield* fromPromise(() =>
+            readdir(resolve(root, "world"))
+          )
+
+          const entries = yield* driver.withArchiveDownload(
+            instance,
+            ["world/config/", "world/data.txt"],
+            (downloadEntries) =>
+              Effect.succeed(
+                downloadEntries.map((entry) => ({
+                  kind: entry.kind,
+                  name: entry.name,
+                }))
+              )
+          )
+
+          assert.deepInclude(entries, { kind: "directory", name: "config" })
+          assert.deepInclude(entries, {
+            kind: "file",
+            name: "config/server.yml",
+          })
+          assert.deepInclude(entries, { kind: "file", name: "data.txt" })
+          const after = yield* fromPromise(() =>
+            readdir(resolve(root, "world"))
+          )
+          assert.deepEqual(after, before)
+          assert.notInclude(after, "selected-files.zip")
+        })
+      )
+  )
+
+  it.effect("refuses a final symlink for transfers and file actions", () =>
     withSetup(({ directory, driver, instance, root }) =>
       Effect.gen(function* () {
         const outside = resolve(directory, "outside.txt")
@@ -66,6 +190,35 @@ describeLinux("Relay direct file transfers", () => {
           .pipe(Effect.flip)
         assert.instanceOf(uploadFailure, RelayFilesystemError)
         assert.strictEqual(uploadFailure.code, "not_a_file")
+
+        const mutationFailure = yield* driver
+          .mutate(instance, {
+            operation: "duplicate",
+            paths: ["world/escape.txt"],
+          })
+          .pipe(Effect.flip)
+        assert.instanceOf(mutationFailure, RelayFilesystemError)
+        assert.strictEqual(mutationFailure.code, "unsupported_file")
+      })
+    )
+  )
+
+  it.effect("refuses symlinks in newly requested upload parents", () =>
+    withSetup(({ directory, driver, instance, root }) =>
+      Effect.gen(function* () {
+        const outside = resolve(directory, "outside")
+        yield* fromPromise(() => mkdir(outside))
+        yield* fromPromise(() =>
+          symlink(outside, resolve(root, "world", "linked"))
+        )
+
+        const failure = yield* driver
+          .upload(instance, "world/linked/nested.txt", chunks("blocked"))
+          .pipe(Effect.flip)
+        assert.instanceOf(failure, RelayFilesystemError)
+        assert.strictEqual(failure.code, "not_a_directory")
+        const outsideEntries = yield* fromPromise(() => readdir(outside))
+        assert.isEmpty(outsideEntries)
       })
     )
   )
