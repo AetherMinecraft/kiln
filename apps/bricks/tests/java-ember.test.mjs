@@ -42,7 +42,7 @@ while (($#)); do
 done
 echo 'curl: (7) simulated network failure' >&2
 exit 7
-`,
+`
   )
   await chmod(curlPath, 0o755)
 
@@ -50,7 +50,7 @@ exit 7
   const entrypointPath = join(temporaryDirectory, "entrypoint.sh")
   await writeFile(
     entrypointPath,
-    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"'),
+    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"')
   )
   await chmod(entrypointPath, 0o755)
 
@@ -86,14 +86,14 @@ exit 7
   assert.match(result.stderr, /curl: \(7\) simulated network failure/u)
   assert.match(
     result.stderr,
-    /failed to download paper 1\.21\.11 after 3 attempts\. Server startup failed\. Swap to a different Brick in Startup, or contact support if this keeps happening\./u,
+    /failed to download paper 1\.21\.11 after 3 attempts\. Server startup failed\. Swap to a different Brick in Startup, or contact support if this keeps happening\./u
   )
   await assert.rejects(readFile(join(serverDirectory, ".paper.jar.download")), {
     code: "ENOENT",
   })
   await assert.rejects(
     readFile(join(serverDirectory, ".kiln-ember-installed")),
-    { code: "ENOENT" },
+    { code: "ENOENT" }
   )
 
   const curlArguments = (await readFile(argumentsPath, "utf8")).split("\n")
@@ -101,9 +101,9 @@ exit 7
   assert.deepEqual(
     curlArguments.slice(
       curlArguments.indexOf("--retry"),
-      curlArguments.indexOf("--retry") + 2,
+      curlArguments.indexOf("--retry") + 2
     ),
-    ["--retry", "2"],
+    ["--retry", "2"]
   )
 })
 
@@ -131,7 +131,7 @@ while (($#)); do
   shift
 done
 exit 2
-`,
+`
   )
   await chmod(curlPath, 0o755)
 
@@ -146,7 +146,7 @@ if [[ "\${1:-}" == "-version" ]]; then
 fi
 test -f "$KILN_TEST_SERVER_DIRECTORY/.kiln-ember-installed"
 echo 'fake server started'
-`,
+`
   )
   await chmod(javaPath, 0o755)
 
@@ -154,7 +154,7 @@ echo 'fake server started'
   const entrypointPath = join(temporaryDirectory, "entrypoint.sh")
   await writeFile(
     entrypointPath,
-    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"'),
+    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"')
   )
   await chmod(entrypointPath, 0o755)
 
@@ -188,7 +188,15 @@ echo 'fake server started'
   assert.match(result.stdout, /fake server started/u)
   assert.equal(
     await readFile(join(serverDirectory, ".kiln-ember-installed"), "utf8"),
-    "",
+    ""
+  )
+  assert.equal(
+    await readFile(join(serverDirectory, "eula.txt"), "utf8"),
+    "eula=true\n"
+  )
+  assert.doesNotMatch(
+    await readFile(join(serverDirectory, "server.properties"), "utf8"),
+    /^online-mode=/mu
   )
 })
 
@@ -212,7 +220,7 @@ if [[ "\${1:-}" == "-version" ]]; then
   exit 0
 fi
 printf '%s\n' "$@" > "$FAKE_JAVA_ARGUMENTS"
-`,
+`
   )
   await chmod(javaPath, 0o755)
 
@@ -220,7 +228,7 @@ printf '%s\n' "$@" > "$FAKE_JAVA_ARGUMENTS"
   const entrypointPath = join(temporaryDirectory, "entrypoint.sh")
   await writeFile(
     entrypointPath,
-    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"'),
+    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"')
   )
   await chmod(entrypointPath, 0o755)
 
@@ -231,7 +239,7 @@ printf '%s\n' "$@" > "$FAKE_JAVA_ARGUMENTS"
       KILN_ARTIFACT_FILE: "velocity.jar",
       KILN_ARTIFACT_URL: "https://example.invalid/velocity.jar",
       KILN_IMPLEMENTATION: "velocity",
-      KILN_SERVER_KIND: "proxy",
+      KILN_SERVER_KIND: "application",
       KILN_TEST_SERVER_DIRECTORY: temporaryDirectory,
       KILN_VERSION: "3.5.1",
       PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
@@ -268,6 +276,12 @@ printf '%s\n' "$@" > "$FAKE_JAVA_ARGUMENTS"
     "--nogui",
   ])
   assert.deepEqual(await runEmber("empty", ""), baseArguments)
+  await assert.rejects(
+    readFile(join(temporaryDirectory, "server.properties")),
+    {
+      code: "ENOENT",
+    }
+  )
 })
 
 test("the Java Ember rejects marker names outside the reserved namespace", async (context) => {
@@ -282,7 +296,7 @@ test("the Java Ember rejects marker names outside the reserved namespace", async
   const entrypointPath = join(temporaryDirectory, "entrypoint.sh")
   await writeFile(
     entrypointPath,
-    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"'),
+    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"')
   )
   await chmod(entrypointPath, 0o755)
 
@@ -307,5 +321,8 @@ test("the Java Ember rejects marker names outside the reserved namespace", async
 
   assert.equal(result.status, 64)
   assert.match(result.stderr, /must be a reserved \.kiln-\* filename/u)
-  assert.equal(await readFile(join(serverDirectory, "paper.jar"), "utf8"), "keep me")
+  assert.equal(
+    await readFile(join(serverDirectory, "paper.jar"), "utf8"),
+    "keep me"
+  )
 })

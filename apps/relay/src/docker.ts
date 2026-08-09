@@ -1650,19 +1650,14 @@ export class DockerDriver {
   ): Promise<boolean | undefined> {
     const protocol =
       instance.brickPrimaryPortProtocol ??
-      (instance.brickNetworkMode === "minecraft-backend" ||
-      instance.brickNetworkMode === "minecraft-proxy"
-        ? "tcp"
-        : undefined)
+      (instance.brickNetworkMode === "minecraft-backend" ? "tcp" : undefined)
     const port = instance.brickPrimaryPort
     if ((protocol !== "tcp" && protocol !== "both") || !port) return undefined
 
     const addresses = Object.values(
       container.NetworkSettings?.Networks ?? {}
     ).flatMap(({ IPAddress: address }) => (address ? [address] : []))
-    const minecraft =
-      instance.brickNetworkMode === "minecraft-backend" ||
-      instance.brickNetworkMode === "minecraft-proxy"
+    const minecraft = instance.brickNetworkMode === "minecraft-backend"
     const probe = minecraft ? minecraftStatusReady : tcpPortOpen
     const attempts = await Promise.all(
       addresses.map((address) => probe(address, port))
@@ -2184,13 +2179,9 @@ export class DockerDriver {
       brickId && /^[a-z0-9][a-z0-9.-]{0,63}$/u.test(brickId)
         ? brickId
         : undefined
-    const brickNetworkMode = labels["kiln.brick.network-mode"]
-    const validNetworkMode =
-      brickNetworkMode === "direct" ||
-      brickNetworkMode === "minecraft-backend" ||
-      brickNetworkMode === "minecraft-proxy"
-        ? brickNetworkMode
-        : undefined
+    const validNetworkMode = normalizedBrickNetworkMode(
+      labels["kiln.brick.network-mode"]
+    )
     const brickReadiness = parseBrickReadinessLabel(
       labels["kiln.brick.readiness"]
     )
@@ -2299,6 +2290,13 @@ export class DockerDriver {
       this.#config.projectName,
     ]
   }
+}
+
+export function normalizedBrickNetworkMode(
+  mode: string | undefined
+): RelayInstanceConfig["brickNetworkMode"] {
+  if (mode === "minecraft-proxy") return "minecraft-backend"
+  return mode === "direct" || mode === "minecraft-backend" ? mode : undefined
 }
 
 function recreatedNetworkAliases(

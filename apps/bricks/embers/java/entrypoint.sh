@@ -39,7 +39,6 @@ if [[ "${KILN_SERVER_KIND:-minecraft}" == "minecraft" ]]; then
   if [[ ! -f server.properties ]]; then
     printf '%s\n' \
       'server-port=25565' \
-      'online-mode=false' \
       'motd=Kiln managed server' \
       'enable-rcon=false' > server.properties
   fi
