@@ -103,6 +103,7 @@ export async function attachSftpServer(options: {
       const connectionFibers = new Set<Fiber.Fiber<void, never>>()
       let grants: ReadonlyArray<SftpGrant> | null = null
       let authenticatedUsername: string | null = null
+      let authenticatedCredential: string | undefined
 
       const forkConnection = (
         effect: Effect.Effect<void>
@@ -122,20 +123,26 @@ export async function attachSftpServer(options: {
       }
 
       client.on("authentication", (context) => {
-        if (
-          !options.config.sftpDevAuthentication ||
-          context.method !== "password" ||
-          !safeEqual(context.password, DEVELOPMENT_PASSWORD)
-        ) {
+        if (context.method !== "password") {
           context.reject(["password"])
           return
         }
+        const authentication = resolveSftpAuthentication(
+          context.password,
+          options.config.sftpDevAuthentication
+        )
+        if (!authentication) {
+          context.reject(["password"])
+          return
+        }
+        const { credential } = authentication
         forkConnection(
           sftpOperation(() =>
             authorizeUsername(
               options.control,
               context.username,
-              options.clientActions
+              options.clientActions,
+              credential
             )
           ).pipe(
             Effect.match({
@@ -146,6 +153,7 @@ export async function attachSftpServer(options: {
                 }
                 grants = authorized
                 authenticatedUsername = context.username.trim().toLowerCase()
+                authenticatedCredential = credential
                 Sentry.addBreadcrumb({
                   category: "relay.sftp",
                   level: "info",
@@ -178,7 +186,8 @@ export async function attachSftpServer(options: {
                   authorizeUsername(
                     options.control,
                     authenticatedUsername as string,
-                    options.clientActions
+                    options.clientActions,
+                    authenticatedCredential
                   )
                 ).pipe(
                   Effect.match({
@@ -386,11 +395,19 @@ function hostKeyParseError(hostKey: Buffer): Error | null {
 function authorizeUsername(
   control: Pick<ControlSocketServer, "requestClients">,
   username: string,
-  clientActions: (clientId: string) => Promise<ReadonlyArray<string>>
+  clientActions: (clientId: string) => Promise<ReadonlyArray<string>>,
+  credential?: string
 ): Promise<ReadonlyArray<SftpGrant>> {
   return Effect.runPromise(
     sftpOperation(() =>
-      control.requestClients("sftp.authorization.resolve", { username }, 5_000)
+      control.requestClients(
+        "sftp.authorization.resolve",
+        {
+          username,
+          ...(credential === undefined ? {} : { credential }),
+        },
+        5_000
+      )
     ).pipe(
       Effect.flatMap((responses) =>
         Effect.forEach(
@@ -1149,6 +1166,16 @@ function safeEqual(input: string, expected: string): boolean {
   inputBuffer.copy(comparable, 0, 0, expectedBuffer.length)
   const contentsMatch = timingSafeEqual(comparable, expectedBuffer)
   return inputBuffer.length === expectedBuffer.length && contentsMatch
+}
+
+export function resolveSftpAuthentication(
+  password: string,
+  developmentAuthentication: boolean
+): { credential: string | undefined } | null {
+  if (developmentAuthentication && safeEqual(password, DEVELOPMENT_PASSWORD)) {
+    return { credential: undefined }
+  }
+  return password.length === 0 ? null : { credential: password }
 }
 
 function record(value: unknown): Readonly<Record<string, unknown>> | null {

@@ -5,7 +5,11 @@ import ssh2 from "ssh2"
 import { describe, expect, it, onTestFinished } from "vite-plus/test"
 
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
-import { attachSftpServer, generateSftpHostKey } from "./sftp-server.js"
+import {
+  attachSftpServer,
+  generateSftpHostKey,
+  resolveSftpAuthentication,
+} from "./sftp-server.js"
 
 const describeLinux = process.platform === "linux" ? describe : describe.skip
 const malformedLeadingZeroHostKey =
@@ -41,7 +45,96 @@ describe("Relay SFTP host key", () => {
   })
 })
 
+describe("Relay SFTP authentication", () => {
+  it("reserves credential-free authorization for the development password", () => {
+    expect(resolveSftpAuthentication("", false)).toBeNull()
+    expect(resolveSftpAuthentication("", true)).toBeNull()
+    expect(resolveSftpAuthentication("kiln_cli_secret", false)).toEqual({
+      credential: "kiln_cli_secret",
+    })
+    expect(resolveSftpAuthentication("dev123", true)).toEqual({
+      credential: undefined,
+    })
+  })
+})
+
 describeLinux("Relay SFTP server", () => {
+  it("forwards production passwords to Hearth as CLI credentials", async () => {
+    const dataDirectory = await temporaryDirectory()
+    await mkdir(resolve(dataDirectory, "instances"), { recursive: true })
+    const requests: Array<{ operation: string; payload: unknown }> = []
+    const server = await attachSftpServer({
+      clientActions: allowFileAccess,
+      config: {
+        ...testConfig(dataDirectory),
+        sftpDevAuthentication: false,
+      },
+      control: {
+        requestClients: async (operation, payload) => {
+          requests.push({ operation, payload })
+          return [
+            {
+              clientId: "hearth-test",
+              payload: {
+                instances: [
+                  {
+                    actions: ["instance.files.list"],
+                    id: "a".repeat(40),
+                  },
+                ],
+                userId: "user-test",
+                username: "user@example.test",
+              },
+            },
+          ]
+        },
+      },
+      docker: { findInstance: async () => null },
+    })
+
+    const client = await connect(server.port, "kiln_cli_secret")
+    try {
+      expect(requests[0]).toEqual({
+        operation: "sftp.authorization.resolve",
+        payload: {
+          credential: "kiln_cli_secret",
+          username: "user@example.test",
+        },
+      })
+    } finally {
+      client.end()
+      await server.close()
+    }
+  })
+
+  it("rejects empty production passwords without contacting Hearth", async () => {
+    const dataDirectory = await temporaryDirectory()
+    await mkdir(resolve(dataDirectory, "instances"), { recursive: true })
+    const requests: Array<unknown> = []
+    const server = await attachSftpServer({
+      clientActions: allowFileAccess,
+      config: {
+        ...testConfig(dataDirectory),
+        sftpDevAuthentication: false,
+      },
+      control: {
+        requestClients: async (_operation, payload) => {
+          requests.push(payload)
+          return []
+        },
+      },
+      docker: { findInstance: async () => null },
+    })
+    try {
+      await expect(connect(server.port, "")).rejects.toThrow(
+        "All configured authentication methods failed"
+      )
+      expect(requests).toEqual([])
+    } finally {
+      await server.close()
+    }
+  })
+
   it("exposes authorized instances, transfers files, and rejects SSH commands", async () => {
     const dataDirectory = await temporaryDirectory()
     const instanceId = "a".repeat(40)
