@@ -114,6 +114,32 @@ export const createBrickInstance = createServerFn({ method: "POST" })
     return instance
   })
 
+export const getInstanceRecipe = createServerFn({ method: "GET" })
+  .validator(instanceInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const relay = await requiredRelay(data.relayId)
+    await requireRelayPermission({
+      user,
+      relayId: relay.id,
+      permission: "instance.read",
+      instanceId: data.instanceId,
+    })
+    const snapshot = relaySnapshotSchema.parse(
+      await requestRelay(relay, "/v1/snapshot")
+    )
+    const instance = snapshot.instances.find(
+      (candidate) => candidate.id === data.instanceId
+    )
+    if (!instance) throw new Error("Instance not found")
+    const recipe = await loadInstanceRecipe(relay, instance)
+    return {
+      content: JSON.stringify(recipePreview(recipe.brick), null, 2),
+      name: recipe.brick.metadata.name,
+      sourceUrl: externalRecipeUrl(recipe.brickSource),
+    }
+  })
+
 export const getInstanceStartup = createServerFn({ method: "GET" })
   .validator(instanceInputSchema)
   .handler(async ({ data }) => {
@@ -132,24 +158,7 @@ export const getInstanceStartup = createServerFn({ method: "GET" })
       (candidate) => candidate.id === data.instanceId
     )
     if (!instance) throw new Error("Instance not found")
-    let brickSource = instance.brickSource
-    if (!brickSource && instance.brickId) {
-      const catalog = relayCatalogSchema.parse(
-        await requestRelay(relay, "/v1/bricks")
-      )
-      brickSource = catalog.bricks.find(
-        (candidate) => candidate.metadata.id === instance.brickId
-      )?.source
-    }
-    if (!brickSource) {
-      throw new Error("This server has no Brick recipe to configure")
-    }
-    const brick = brickSchema.parse(
-      await requestRelay(
-        relay,
-        `/v1/bricks/recipe?source=${encodeURIComponent(brickSource)}`
-      )
-    )
+    const { brick, brickSource } = await loadInstanceRecipe(relay, instance)
     const variables = hydrateBrickVariables(brick, instance.variables)
     const otherInstances = snapshot.instances.filter(
       (candidate) => candidate.id !== instance.id
@@ -220,6 +229,58 @@ export const updateInstanceStartup = createServerFn({ method: "POST" })
     )
     return instance
   })
+
+async function loadInstanceRecipe(
+  relay: PersistedRelay,
+  instance: z.infer<typeof relayInstanceSchema>
+) {
+  let brickSource = instance.brickSource
+  if (!brickSource && instance.brickId) {
+    const catalog = relayCatalogSchema.parse(
+      await requestRelay(relay, "/v1/bricks")
+    )
+    brickSource = catalog.bricks.find(
+      (candidate) => candidate.metadata.id === instance.brickId
+    )?.source
+  }
+  if (!brickSource) {
+    throw new Error("This server has no Brick recipe")
+  }
+  const brick = brickSchema.parse(
+    await requestRelay(
+      relay,
+      `/v1/bricks/recipe?source=${encodeURIComponent(brickSource)}`
+    )
+  )
+  return { brick, brickSource }
+}
+
+function recipePreview(brick: z.infer<typeof brickSchema>) {
+  return {
+    ...brick,
+    variables: Object.fromEntries(
+      Object.entries(brick.variables).map(([name, variable]) => [
+        name,
+        variable.sensitive
+          ? {
+              ...variable,
+              ...(variable.default === undefined
+                ? {}
+                : { default: "[redacted]" }),
+              ...(variable.options === undefined
+                ? {}
+                : { options: variable.options.map(() => "[redacted]") }),
+            }
+          : variable,
+      ])
+    ),
+  }
+}
+
+function externalRecipeUrl(source: string) {
+  const protocol = new URL(source).protocol
+  return protocol === "http:" || protocol === "https:" ? source : null
+}
 
 export const loadBrickRecipe = createServerFn({ method: "POST" })
   .validator(recipeInputSchema)

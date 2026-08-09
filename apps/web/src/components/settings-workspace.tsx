@@ -1,39 +1,77 @@
 import * as React from "react"
-import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { Link } from "@tanstack/react-router"
 import { Effect } from "effect"
 import {
+  Activity,
+  ArrowRight,
   Box,
   Check,
   Copy,
   Cpu,
+  Crown,
+  FileCode2,
   Fingerprint,
   Globe2,
   HardDrive,
   LoaderCircle,
   Network,
+  Pencil,
   Save,
   Server,
   Tags,
   Trash2,
   TriangleAlert,
+  UserRound,
+  Users,
 } from "lucide-react"
 
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@workspace/ui/components/tooltip"
+import { cn } from "@workspace/ui/lib/utils"
 
+import { ReadOnlyCodeViewer } from "@/components/read-only-code-viewer"
 import { ServerDeleteDialog } from "@/components/server-delete-dialog"
-import { queryKeys, replaceRelaySnapshotInstance } from "@/lib/query-options"
+import { hostPortAddress } from "@/lib/domain-address"
+import { warmSyntaxCodeEditorModule } from "@/lib/syntax-editor-module-preload"
+import {
+  instanceRecipeQueryOptions,
+  instanceUsersQueryOptions,
+  queryKeys,
+  replaceRelaySnapshotInstance,
+} from "@/lib/query-options"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import type {
   InstanceSettingsInstance,
   RelayNodeSummary,
 } from "@/lib/relay-selectors"
-import { updateInstanceName } from "@/server/relay"
+import {
+  removeInstanceAccessGrant,
+  transferInstanceOwnership,
+} from "@/server/access"
+import type { getInstanceUsers } from "@/server/access"
+import { updateInstanceName, uploadToMclogs } from "@/server/relay"
+
+type InstanceUsers = Awaited<ReturnType<typeof getInstanceUsers>>
 
 export function SettingsWorkspace({
   instance,
   node,
+  canShare,
   canDelete,
   canRename,
   onDeleted,
@@ -41,87 +79,100 @@ export function SettingsWorkspace({
 }: {
   instance: InstanceSettingsInstance
   node: RelayNodeSummary
+  canShare: boolean
   canDelete: boolean
   canRename: boolean
   onDeleted: () => Promise<void> | void
   relayConnected: boolean
 }) {
+  const rawAddress =
+    instance.publicHost && instance.publicPort
+      ? hostPortAddress(instance.publicHost, instance.publicPort)
+      : instance.connectAddress
+  const configuredAddress =
+    instance.connectAddress !== rawAddress ? instance.connectAddress : null
+
   return (
     <section className="min-h-0 flex-1 overflow-y-auto bg-card">
       <div className="mx-auto max-w-5xl px-5 py-6 sm:px-8 sm:py-8">
-        <div className="flex flex-col gap-1">
-          <p className="font-mono text-[9px] tracking-[0.18em] text-primary uppercase">
-            Instance info
-          </p>
-          <h2 className="font-heading text-xl font-semibold tracking-[-0.03em]">
-            Server identity & runtime
-          </h2>
-          <p className="max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            Runtime facts are inferred by Relay from the managed container and
-            its writable{" "}
-            <code className="font-mono text-foreground/80">/server</code> mount.
-          </p>
-        </div>
-
-        <div className="mt-7 grid gap-4 lg:grid-cols-[1.15fr_0.85fr]">
-          <div className="overflow-hidden rounded-xl border bg-background/45">
-            <div className="flex items-center justify-between border-b px-4 py-3">
-              <div className="flex items-center gap-2">
-                <Fingerprint className="size-4 text-primary" />
-                <h3 className="text-sm font-semibold">Identity</h3>
-              </div>
-              <Badge variant="outline" className="font-mono text-[9px]">
-                {instance.game}
-              </Badge>
-            </div>
-            <InstanceNameForm
-              instance={instance}
-              canRename={canRename && relayConnected}
-            />
-            <MetaRow
-              icon={Fingerprint}
-              label="Server ID"
-              value={instance.shortId}
-              mono
-            />
-            <MetaRow
-              icon={Box}
-              label="Server type"
-              value={instance.implementation}
-            />
-            <MetaRow
-              icon={Tags}
-              label={instance.game}
-              value={instance.version}
-              mono
-            />
-            <MetaRow
-              icon={Cpu}
-              label="Runtime"
-              value={instance.javaVersion}
-              mono
-            />
-          </div>
-
-          <CopyAddressCard instance={instance} />
-        </div>
-
-        <div className="mt-4 overflow-hidden rounded-xl border bg-background/45">
-          <div className="flex items-center justify-between border-b px-4 py-3">
-            <div className="flex items-center gap-2">
-              <Network className="size-4 text-primary" />
-              <h3 className="text-sm font-semibold">Relay placement</h3>
-            </div>
-            <span
-              className={`flex items-center gap-1.5 font-mono text-[9px] ${relayConnected ? "text-emerald-400" : "text-amber-300"}`}
-            >
-              <span
-                className={`size-1.5 rounded-full ${relayConnected ? "bg-emerald-400" : "bg-amber-300"}`}
+        <div className="grid items-stretch gap-4 lg:grid-cols-2">
+          <div className="flex min-w-0 flex-col gap-4">
+            <InfoCard>
+              <InfoCardHeader
+                icon={<Fingerprint />}
+                title="Identity"
+                action={
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      "font-mono text-[9px]",
+                      instance.game.toLowerCase() === "minecraft" &&
+                        "border-emerald-500/35 bg-emerald-500/12 text-emerald-300"
+                    )}
+                  >
+                    {instance.game}
+                  </Badge>
+                }
               />
-              {relayConnected ? "DISCOVERED" : "LAST KNOWN"}
-            </span>
+              <InstanceNameForm
+                instance={instance}
+                canRename={canRename && relayConnected}
+              />
+              <MetaRow
+                icon={Fingerprint}
+                label="Server full ID"
+                value={instance.id}
+                mono
+                wrap
+              />
+            </InfoCard>
+
+            <InfoCard>
+              <InfoCardHeader
+                icon={<Globe2 />}
+                title="Connection info"
+                action={
+                  <Button asChild size="sm" variant="ghost">
+                    <Link
+                      to="/server/$serverId/network"
+                      params={{ serverId: instance.routeId }}
+                    >
+                      Network
+                      <ArrowRight />
+                    </Link>
+                  </Button>
+                }
+              />
+              <CopyMetaRow label="Raw connection URL" value={rawAddress} />
+              <CopyMetaRow
+                label="Configured URL"
+                value={configuredAddress ?? "Not configured"}
+                copyable={configuredAddress !== null}
+              />
+            </InfoCard>
+
+            <BrickInfoCard canShare={canShare} instance={instance} />
           </div>
-          <div className="grid sm:grid-cols-2">
+
+          <InstanceUsersCard instance={instance} />
+        </div>
+
+        <InfoCard className="mt-4">
+          <InfoCardHeader
+            icon={<Network />}
+            title="Relay placement"
+            action={
+              <span
+                className={`flex items-center gap-1.5 font-mono text-[9px] ${relayConnected ? "text-emerald-400" : "text-amber-300"}`}
+              >
+                <span
+                  className={`size-1.5 rounded-full ${relayConnected ? "bg-emerald-400" : "bg-amber-300"}`}
+                />
+                {relayConnected ? "CONNECTED" : "LAST KNOWN"}
+              </span>
+            }
+          />
+          <div className="grid sm:grid-cols-2 lg:grid-cols-4">
             <MetaRow
               icon={HardDrive}
               label="Node"
@@ -146,20 +197,7 @@ export function SettingsWorkspace({
               mono
             />
           </div>
-        </div>
-
-        <div className="mt-4 flex items-center justify-between rounded-xl border border-dashed bg-muted/10 px-4 py-3">
-          <div>
-            <p className="text-xs font-semibold">Kiln-managed container</p>
-            <p className="mt-0.5 text-[10px] text-muted-foreground">
-              Relay discovered this server from its management and identity
-              labels.
-            </p>
-          </div>
-          <code className="rounded-md border bg-background px-2 py-1.5 font-mono text-[9px] text-primary">
-            kiln.relay.managed=true · kiln.server.id={instance.shortId}…
-          </code>
-        </div>
+        </InfoCard>
 
         {canDelete ? (
           <ServerDangerZone
@@ -170,6 +208,630 @@ export function SettingsWorkspace({
         ) : null}
       </div>
     </section>
+  )
+}
+
+function InfoCard({
+  children,
+  className,
+}: {
+  children: React.ReactNode
+  className?: string
+}) {
+  return (
+    <div
+      className={cn(
+        "min-w-0 overflow-hidden rounded-xl border bg-background/45",
+        className
+      )}
+    >
+      {children}
+    </div>
+  )
+}
+
+function InfoCardHeader({
+  action,
+  icon,
+  title,
+}: {
+  action?: React.ReactNode
+  icon: React.ReactNode
+  title: string
+}) {
+  return (
+    <div className="flex min-h-12 items-center justify-between gap-3 border-b px-4 py-2.5">
+      <div className="flex items-center gap-2 text-primary [&_svg]:size-4">
+        {icon}
+        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+      </div>
+      {action}
+    </div>
+  )
+}
+
+function CopyMetaRow({
+  copyable = true,
+  label,
+  value,
+}: {
+  copyable?: boolean
+  label: string
+  value: string
+}) {
+  const [copied, setCopied] = React.useState(false)
+  const resetTimer = React.useRef<number | null>(null)
+
+  React.useEffect(
+    () => () => {
+      if (resetTimer.current) window.clearTimeout(resetTimer.current)
+    },
+    []
+  )
+
+  async function copyValue() {
+    if (!copyable) return
+    await navigator.clipboard.writeText(value)
+    setCopied(true)
+    if (resetTimer.current) window.clearTimeout(resetTimer.current)
+    resetTimer.current = window.setTimeout(() => setCopied(false), 1800)
+  }
+
+  return (
+    <div className="flex min-h-16 items-center gap-3 border-b px-4 py-3 last:border-b-0">
+      <Globe2 className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="min-w-0 flex-1">
+        <span className="block text-[9px] tracking-wider text-muted-foreground uppercase">
+          {label}
+        </span>
+        <span
+          className={`mt-0.5 block truncate font-mono text-xs ${copyable ? "text-foreground" : "text-muted-foreground"}`}
+          title={value}
+        >
+          {value}
+        </span>
+      </span>
+      <Button
+        type="button"
+        size="icon-sm"
+        variant="ghost"
+        disabled={!copyable}
+        aria-label={`Copy ${label.toLowerCase()}`}
+        onClick={() => void copyValue()}
+      >
+        {copied ? <Check className="text-emerald-400" /> : <Copy />}
+      </Button>
+    </div>
+  )
+}
+
+function BrickInfoCard({
+  canShare,
+  instance,
+}: {
+  canShare: boolean
+  instance: InstanceSettingsInstance
+}) {
+  const [recipeOpen, setRecipeOpen] = React.useState(false)
+  const recipeQuery = useQuery({
+    ...instanceRecipeQueryOptions(instance.relayId, instance.id),
+    enabled: recipeOpen,
+  })
+  const shareRecipe = React.useCallback(
+    async (content: string) => {
+      const result = await uploadToMclogs({
+        data: {
+          content,
+          implementation: instance.implementation,
+          instanceId: instance.id,
+          path: "brick-recipe.json",
+          relayId: instance.relayId,
+          version: instance.version,
+        },
+      })
+      return result.url
+    },
+    [instance.id, instance.implementation, instance.relayId, instance.version]
+  )
+
+  return (
+    <>
+      <InfoCard>
+        <InfoCardHeader
+          icon={<Box />}
+          title="Brick info"
+          action={
+            <Button asChild size="sm" variant="ghost">
+              <Link
+                to="/server/$serverId/startup"
+                params={{ serverId: instance.routeId }}
+              >
+                Startup
+                <ArrowRight />
+              </Link>
+            </Button>
+          }
+        />
+        <MetaRow
+          icon={Box}
+          label="Brick"
+          value={instance.brickId ?? instance.implementation}
+          mono
+          action={
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                warmSyntaxCodeEditorModule()
+                setRecipeOpen(true)
+              }}
+            >
+              <FileCode2 />
+              Recipe
+            </Button>
+          }
+        />
+        <div className="grid grid-cols-2 divide-x">
+          <MetaRow
+            icon={Tags}
+            label="Game version"
+            value={`${instance.game} · ${instance.version}`}
+            className="border-b-0"
+          />
+          <MetaRow
+            icon={Cpu}
+            label="Runtime"
+            value={instance.javaVersion}
+            mono
+            className="border-b-0"
+          />
+        </div>
+      </InfoCard>
+
+      <Dialog open={recipeOpen} onOpenChange={setRecipeOpen}>
+        <DialogContent className="gap-0 overflow-hidden p-0 sm:max-w-4xl">
+          <DialogHeader className="sr-only">
+            <DialogTitle>
+              {recipeQuery.data?.name ?? "Brick recipe"}
+            </DialogTitle>
+            <DialogDescription>
+              Preview this server&apos;s recipe.
+            </DialogDescription>
+          </DialogHeader>
+          {recipeQuery.isPending ? (
+            <div className="grid h-[min(72dvh,42rem)] min-h-80 place-items-center bg-card text-muted-foreground">
+              <LoaderCircle className="size-4 animate-spin" />
+            </div>
+          ) : recipeQuery.isError ? (
+            <div className="grid h-[min(72dvh,42rem)] min-h-80 place-items-center bg-card px-6 text-center text-xs text-destructive">
+              {recipeQuery.error.message || "Could not load the Brick recipe"}
+            </div>
+          ) : recipeQuery.data ? (
+            <ReadOnlyCodeViewer
+              content={recipeQuery.data.content}
+              languagePath="brick-recipe.json"
+              onShare={canShare ? shareRecipe : undefined}
+              sourceUrl={recipeQuery.data.sourceUrl}
+              title={recipeQuery.data.name}
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
+function InstanceUsersCard({
+  instance,
+}: {
+  instance: InstanceSettingsInstance
+}) {
+  const queryClient = useQueryClient()
+  const usersQuery = useQuery(
+    instanceUsersQueryOptions(instance.relayId, instance.id)
+  )
+  const [permissionsUser, setPermissionsUser] = React.useState<string | null>(
+    null
+  )
+  const [removeTarget, setRemoveTarget] = React.useState<
+    InstanceUsers["users"][number] | null
+  >(null)
+  const [transferTarget, setTransferTarget] = React.useState<
+    InstanceUsers["users"][number] | null
+  >(null)
+  const removeMutation = useMutation({
+    mutationFn: removeInstanceAccessGrant,
+    onSuccess: async () => {
+      setRemoveTarget(null)
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.access.instanceUsers(
+            instance.relayId,
+            instance.id
+          ),
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.access.overview }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.access.capabilities,
+        }),
+      ])
+    },
+  })
+  const transferMutation = useMutation({
+    mutationFn: transferInstanceOwnership,
+    onSuccess: async () => {
+      setTransferTarget(null)
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.access.instanceUsers(
+            instance.relayId,
+            instance.id
+          ),
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.access.overview }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.access.capabilities,
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.relay.snapshot }),
+      ])
+    },
+  })
+
+  const closeRemoveDialog = (open: boolean) => {
+    if (open || removeMutation.isPending) return
+    setRemoveTarget(null)
+    removeMutation.reset()
+  }
+
+  const closeTransferDialog = (open: boolean) => {
+    if (open || transferMutation.isPending) return
+    setTransferTarget(null)
+    transferMutation.reset()
+  }
+
+  return (
+    <InfoCard className="flex h-[26rem] flex-col lg:h-full lg:min-h-[32rem]">
+      <InfoCardHeader
+        icon={<Users />}
+        title="Users"
+        action={
+          usersQuery.data?.canOpenAccessPage ? (
+            <Button asChild size="sm" variant="ghost">
+              <Link to="/access">
+                Manage
+                <ArrowRight />
+              </Link>
+            </Button>
+          ) : (
+            <Button size="sm" variant="ghost" disabled>
+              Manage
+              <ArrowRight />
+            </Button>
+          )
+        }
+      />
+
+      {usersQuery.isPending ? (
+        <div className="grid min-h-0 flex-1 place-items-center text-muted-foreground">
+          <LoaderCircle className="size-4 animate-spin" />
+        </div>
+      ) : usersQuery.isError ? (
+        <div className="min-h-0 flex-1 px-4 py-6 text-xs text-destructive">
+          User access could not be loaded.
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <table className="w-full table-fixed text-left">
+            <thead className="sticky top-0 z-10 bg-background/95 backdrop-blur-sm">
+              <tr className="border-b text-[9px] tracking-wider text-muted-foreground uppercase">
+                <th className="px-4 py-2 font-medium">Email</th>
+                <th className="w-40 px-4 py-2 text-right font-medium">
+                  Actions
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <AccessUserRow
+                email={usersQuery.data.owner?.email ?? "Unknown owner"}
+                userId={usersQuery.data.owner?.id ?? null}
+                instanceId={instance.id}
+                canManage={usersQuery.data.canManage}
+                onPermissions={() =>
+                  setPermissionsUser(
+                    usersQuery.data.owner?.email ?? "Unknown owner"
+                  )
+                }
+                owner
+              />
+              {usersQuery.data.users.map((user) => (
+                <AccessUserRow
+                  key={user.id}
+                  email={user.email}
+                  userId={user.userId}
+                  instanceId={instance.id}
+                  canManage={usersQuery.data.canManage}
+                  canTransferOwnership={usersQuery.data.canTransferOwnership}
+                  onPermissions={() => setPermissionsUser(user.email)}
+                  onRemove={() => setRemoveTarget(user)}
+                  onTransferOwnership={() => setTransferTarget(user)}
+                  protectedOwnerGrant={user.role === "owner"}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Dialog
+        open={permissionsUser !== null}
+        onOpenChange={(open) => {
+          if (!open) setPermissionsUser(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Modify permissions</DialogTitle>
+            <DialogDescription>
+              Per-user permission editing for {permissionsUser ?? "this user"}{" "}
+              is coming soon.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-lg border border-dashed bg-muted/15 px-4 py-6 text-center font-mono text-[9px] tracking-[0.14em] text-muted-foreground uppercase">
+            Coming soon
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={removeTarget !== null} onOpenChange={closeRemoveDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove server access?</DialogTitle>
+            <DialogDescription>
+              {removeTarget?.email ?? "This user"} will no longer be able to
+              access {instance.name}.
+            </DialogDescription>
+          </DialogHeader>
+          {removeMutation.error ? (
+            <p className="text-xs text-destructive">
+              {removeMutation.error instanceof Error
+                ? removeMutation.error.message
+                : "Could not remove server access"}
+            </p>
+          ) : null}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={removeMutation.isPending}
+              onClick={() => closeRemoveDialog(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={!removeTarget || removeMutation.isPending}
+              onClick={() => {
+                if (!removeTarget) return
+                removeMutation.mutate({
+                  data: {
+                    id: removeTarget.id,
+                    instanceId: instance.id,
+                    relayId: instance.relayId,
+                  },
+                })
+              }}
+            >
+              {removeMutation.isPending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Trash2 />
+              )}
+              Remove access
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={transferTarget !== null} onOpenChange={closeTransferDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Transfer server ownership?</DialogTitle>
+            <DialogDescription>
+              {transferTarget?.email ?? "This user"} will become the owner of{" "}
+              {instance.name} and receive full server access.
+            </DialogDescription>
+          </DialogHeader>
+          {transferMutation.error ? (
+            <p className="text-xs text-destructive">
+              {transferMutation.error instanceof Error
+                ? transferMutation.error.message
+                : "Could not transfer server ownership"}
+            </p>
+          ) : null}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={transferMutation.isPending}
+              onClick={() => closeTransferDialog(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={!transferTarget || transferMutation.isPending}
+              onClick={() => {
+                if (!transferTarget) return
+                transferMutation.mutate({
+                  data: {
+                    instanceId: instance.id,
+                    relayId: instance.relayId,
+                    userId: transferTarget.userId,
+                  },
+                })
+              }}
+            >
+              {transferMutation.isPending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Crown />
+              )}
+              Transfer ownership
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </InfoCard>
+  )
+}
+
+function AccessUserRow({
+  canManage = false,
+  canTransferOwnership = false,
+  email,
+  instanceId,
+  owner = false,
+  onPermissions,
+  onRemove,
+  onTransferOwnership,
+  protectedOwnerGrant = false,
+  userId,
+}: {
+  canManage?: boolean
+  canTransferOwnership?: boolean
+  email: string
+  instanceId: string
+  owner?: boolean
+  onPermissions?: () => void
+  onRemove?: () => void
+  onTransferOwnership?: () => void
+  protectedOwnerGrant?: boolean
+  userId: string | null
+}) {
+  const removalProtected = owner || protectedOwnerGrant
+
+  return (
+    <tr className="border-b last:border-b-0">
+      <td className="px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <UserRound className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="truncate text-xs" title={email}>
+            {email}
+          </span>
+          {owner ? (
+            <Badge
+              variant="outline"
+              className="border-amber-400/35 bg-amber-400/12 font-mono text-[8px] text-amber-300"
+            >
+              Owner
+            </Badge>
+          ) : null}
+        </div>
+      </td>
+      <td className="px-4 py-2">
+        <div className="flex justify-end gap-0.5">
+          {userId ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button asChild size="icon-sm" variant="ghost">
+                  <Link
+                    to="/activity"
+                    search={{ server: instanceId, user: userId }}
+                    aria-label={`View ${email} activity`}
+                  >
+                    <Activity />
+                  </Link>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">View activity</TooltipContent>
+            </Tooltip>
+          ) : null}
+          {canManage ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label={`Modify ${email} permissions`}
+                  onClick={onPermissions}
+                >
+                  <Pencil />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Modify permissions</TooltipContent>
+            </Tooltip>
+          ) : null}
+          {removalProtected ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    className="text-muted-foreground/35"
+                    aria-label={
+                      owner
+                        ? `${email} cannot be removed while they own the server`
+                        : `${email} cannot be removed while their grant has the owner role`
+                    }
+                    disabled
+                  >
+                    <Trash2 />
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {owner
+                  ? "Transfer ownership before removing"
+                  : "Change the owner role before removing"}
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
+          {!removalProtected && canManage ? (
+            <>
+              {canTransferOwnership ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      size="icon-sm"
+                      variant="ghost"
+                      className="text-muted-foreground hover:text-amber-300"
+                      aria-label={`Transfer ownership to ${email}`}
+                      onClick={onTransferOwnership}
+                    >
+                      <Crown />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">
+                    Transfer ownership
+                  </TooltipContent>
+                </Tooltip>
+              ) : null}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    className="text-muted-foreground hover:text-destructive"
+                    aria-label={`Remove ${email}`}
+                    onClick={onRemove}
+                  >
+                    <Trash2 />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Remove user</TooltipContent>
+              </Tooltip>
+            </>
+          ) : null}
+        </div>
+      </td>
+    </tr>
   )
 }
 
@@ -186,9 +848,9 @@ function ServerDangerZone({
 
   return (
     <>
-      <div className="mt-8 overflow-hidden rounded-xl border border-destructive/25 bg-destructive/4">
-        <div className="flex items-start gap-3 border-b border-destructive/15 px-4 py-3.5">
-          <span className="mt-0.5 grid size-8 shrink-0 place-items-center rounded-lg border border-destructive/20 bg-destructive/10 text-destructive">
+      <div className="mt-4 flex flex-col gap-3 rounded-xl border border-destructive/25 bg-destructive/4 px-4 py-3.5 sm:flex-row sm:items-center">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg border border-destructive/20 bg-destructive/10 text-destructive">
             <TriangleAlert className="size-4" />
           </span>
           <div className="min-w-0">
@@ -196,28 +858,26 @@ function ServerDangerZone({
               Danger zone
             </p>
             <h3 className="mt-1 text-sm font-semibold">Delete this server</h3>
-            <p className="mt-1 max-w-2xl text-[10px] leading-4 text-muted-foreground">
-              {relayConnected
-                ? "Permanently remove the managed container and everything stored in its server directory."
-                : "Reconnect this server's Relay before deleting the server."}
+            <p className="mt-1 font-mono text-[9px] break-all text-muted-foreground">
+              {instance.id}
             </p>
           </div>
         </div>
-        <div className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
-          <p className="font-mono text-[9px] text-muted-foreground">
-            {instance.id}
-          </p>
-          <Button
-            type="button"
-            variant="destructive"
-            className="sm:shrink-0"
-            disabled={!relayConnected}
-            onClick={() => setOpen(true)}
-          >
-            <Trash2 />
-            Delete server
-          </Button>
-        </div>
+        <Button
+          type="button"
+          variant="destructive"
+          className="shrink-0"
+          disabled={!relayConnected}
+          title={
+            relayConnected
+              ? undefined
+              : "Reconnect this server's Relay before deleting"
+          }
+          onClick={() => setOpen(true)}
+        >
+          <Trash2 />
+          Delete server
+        </Button>
       </div>
       {open ? (
         <ServerDeleteDialog
@@ -353,124 +1013,50 @@ function InstanceNameForm({
       >
         {error ??
           (canRename
-            ? "Stored by Relay; the container keeps its stable ID."
-            : "You do not have permission to rename this instance.")}
+            ? "The display name can change without changing the server ID."
+            : "You do not have permission to rename this server.")}
       </p>
     </form>
   )
 }
 
-function CopyAddressCard({ instance }: { instance: InstanceSettingsInstance }) {
-  return (
-    <div className="rounded-xl border bg-background/45 p-4">
-      <div className="flex items-center gap-2">
-        <Globe2 className="size-4 text-primary" />
-        <h3 className="text-sm font-semibold">Connect</h3>
-      </div>
-      <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-        {instance.game === "Palworld"
-          ? "Direct UDP endpoint on the Relay node."
-          : "Dedicated game endpoint published by the Relay node."}
-      </p>
-      <CopyAddressControl address={instance.connectAddress} />
-    </div>
-  )
-}
-
-function CopyAddressControl({ address }: { address: string }) {
-  const [copied, setCopied] = React.useState(false)
-  const resetTimer = React.useRef<number | null>(null)
-  const addressError = address.startsWith("Error:") ? address : null
-  const unavailable = addressError !== null
-  React.useEffect(
-    () => () => {
-      if (resetTimer.current) window.clearTimeout(resetTimer.current)
-    },
-    []
-  )
-
-  async function copyAddress() {
-    if (unavailable) return
-    await navigator.clipboard.writeText(address)
-    setCopied(true)
-    if (resetTimer.current) window.clearTimeout(resetTimer.current)
-    resetTimer.current = window.setTimeout(() => setCopied(false), 1800)
-  }
-
-  return (
-    <>
-      <button
-        type="button"
-        aria-disabled={unavailable}
-        className={`group mt-5 flex w-full items-center justify-between rounded-lg border px-3 py-3 text-left transition-[background-color,border-color,box-shadow] outline-none focus-visible:border-ring/70 focus-visible:ring-2 focus-visible:ring-ring/35 ${
-          addressError
-            ? "border-destructive/25 bg-destructive/5"
-            : "border-primary/25 bg-primary/7 hover:border-primary/40 hover:bg-primary/12"
-        }`}
-        onClick={copyAddress}
-      >
-        <span>
-          <span
-            className={`block font-mono text-[9px] tracking-wider uppercase ${
-              addressError ? "text-destructive" : "text-primary"
-            }`}
-          >
-            Server address
-          </span>
-          <span
-            className={`mt-1 block font-mono text-sm font-semibold ${
-              addressError ? "text-destructive" : ""
-            }`}
-          >
-            {addressError ? "ERROR" : address}
-          </span>
-        </span>
-        <span className="grid size-8 place-items-center rounded-md bg-background/70 text-muted-foreground group-hover:text-foreground">
-          {unavailable ? (
-            <TriangleAlert className="size-4 text-destructive" />
-          ) : copied ? (
-            <Check className="size-4 text-emerald-400" />
-          ) : (
-            <Copy className="size-4" />
-          )}
-        </span>
-      </button>
-      <p
-        className={`mt-3 font-mono text-[9px] ${
-          addressError ? "text-destructive" : "text-muted-foreground/75"
-        }`}
-      >
-        {addressError ??
-          (copied ? "Address copied to clipboard" : "Click to copy")}
-      </p>
-    </>
-  )
-}
-
 function MetaRow({
+  action,
+  className,
   icon: Icon,
   label,
   value,
   mono = false,
+  wrap = false,
 }: {
+  action?: React.ReactNode
+  className?: string
   icon: typeof Server
   label: string
   value: string
   mono?: boolean
+  wrap?: boolean
 }) {
   return (
-    <div className="flex min-h-14 items-center gap-3 border-b px-4 py-3 last:border-b-0 sm:[&:nth-last-child(-n+2)]:border-b-0">
+    <div
+      className={cn(
+        "flex min-h-14 items-center gap-3 border-b px-4 py-3 last:border-b-0",
+        className
+      )}
+    >
       <Icon className="size-3.5 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1">
         <span className="block text-[9px] tracking-wider text-muted-foreground uppercase">
           {label}
         </span>
         <span
-          className={`mt-0.5 block truncate text-xs ${mono ? "font-mono" : "font-medium"}`}
+          className={`mt-0.5 block text-xs ${mono ? "font-mono" : "font-medium"} ${wrap ? "break-all" : "truncate"}`}
+          title={value}
         >
           {value}
         </span>
       </span>
+      {action}
     </div>
   )
 }

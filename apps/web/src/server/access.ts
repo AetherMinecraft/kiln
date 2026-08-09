@@ -1,25 +1,29 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
-import { relayIdSchema } from "@workspace/contracts"
+import { relayAuditRecordSchema, relayIdSchema } from "@workspace/contracts"
 import { Effect } from "effect"
 import type { RowDataPacket } from "mysql2/promise"
 import { Resend } from "resend"
 import { z } from "zod"
 
 import { AccessInvitationEmail } from "@/emails/access-invitation-email"
-import { Database } from "@/effect/database"
+import { Database, type DatabaseTransaction } from "@/effect/database"
 import { runAppEffect } from "@/effect/runtime"
 import {
   hasRelayPermission,
+  isBlockedInstanceOwnerRoleChange,
+  isCurrentInstanceOwnerGrant,
+  isProtectedInstanceOwnerGrant,
   isPlatformAdmin,
   listUserGrants,
   requireRelayPermission,
 } from "@/lib/access-control"
+import { auditInstanceCreatorId } from "@/lib/activity"
 import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import { emailDeliveryConfig, kilnPublicUrl } from "@/lib/environment"
-import { accessRoles, roleHasPermission } from "@/lib/permissions"
+import { accessRoles, isAccessRole, roleHasPermission } from "@/lib/permissions"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { requireAuthenticatedUser } from "@/server/auth"
@@ -28,6 +32,14 @@ const tokenSchema = z.object({ token: z.string().min(32).max(256) })
 const relayResourceIdSchema = z.object({
   id: z.uuid(),
   relayId: relayIdSchema,
+})
+const instanceScopeSchema = z.object({
+  instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+  relayId: relayIdSchema,
+})
+const instanceGrantSchema = instanceScopeSchema.extend({ id: z.uuid() })
+const transferInstanceOwnershipSchema = instanceScopeSchema.extend({
+  userId: z.string().min(1).max(36),
 })
 const invitationSchema = z
   .object({
@@ -84,6 +96,36 @@ interface PendingInvitationRow extends RowDataPacket {
 
 interface DatabaseResourceRow extends RowDataPacket {
   database_id: string
+}
+
+interface InstanceGrantRow extends RowDataPacket {
+  created_at: Date
+  email: string
+  id: string
+  role: string
+  user_id: string
+}
+
+interface InstanceUserRow extends RowDataPacket {
+  email: string
+  id: string
+}
+
+interface InstanceOwnerRow extends RowDataPacket {
+  owner_id: string | null
+}
+
+interface InstanceOwnerGrantRow extends RowDataPacket {
+  user_id: string
+}
+
+interface InstanceScopedGrantRow extends InstanceOwnerGrantRow {
+  role: string
+}
+
+interface AccessGrantMutationRow extends InstanceScopedGrantRow {
+  resource_id: string
+  resource_type: "database" | "instance" | "relay"
 }
 
 export const getAccessCapabilities = createServerFn({ method: "GET" }).handler(
@@ -151,6 +193,78 @@ export const getAccessOverview = createServerFn({ method: "GET" }).handler(
   }
 )
 
+export const getInstanceUsers = createServerFn({ method: "GET" })
+  .validator(instanceScopeSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const relay = await requiredRelay(data.relayId)
+    await requireRelayPermission({
+      user,
+      relayId: relay.id,
+      permission: "instance.read",
+      instanceId: data.instanceId,
+    })
+
+    const ownerId = await instanceOwnerId(relay, data.instanceId)
+    const platformAdmin = isPlatformAdmin(user)
+    const userGrants = platformAdmin
+      ? []
+      : await listUserGrants(user.id, relay.id)
+    const canManage =
+      platformAdmin ||
+      ownerId === user.id ||
+      userGrants.some(
+        (grant) =>
+          roleHasPermission(grant.role, "access.manage") &&
+          (grant.resourceType === "relay" ||
+            (grant.resourceType === "instance" &&
+              grant.resourceId === data.instanceId))
+      )
+    const canOpenAccessPage =
+      platformAdmin ||
+      userGrants.some(
+        (grant) =>
+          grant.resourceType === "relay" &&
+          roleHasPermission(grant.role, "access.manage")
+      )
+
+    const [grantRows, owner] = await Promise.all([
+      databasePool.query<Array<InstanceGrantRow>>(
+        `SELECT grant_row.id, grant_row.user_id, grant_row.role,
+                grant_row.created_at, auth_user.email
+           FROM ${databaseTable("access_grant")} AS grant_row
+           JOIN ${databaseTable("user")} AS auth_user
+             ON auth_user.id = grant_row.user_id
+          WHERE grant_row.relay_id = ?
+            AND grant_row.resource_type = 'instance'
+            AND grant_row.resource_id = ?
+          ORDER BY grant_row.created_at ASC`,
+        [relay.id, data.instanceId]
+      ),
+      ownerId ? instanceOwnerUser(ownerId, user) : null,
+    ])
+    const grants = grantRows[0].flatMap((grant) =>
+      isAccessRole(grant.role)
+        ? [
+            {
+              createdAt: grant.created_at.toISOString(),
+              email: grant.email,
+              id: grant.id,
+              role: grant.role,
+              userId: grant.user_id,
+            },
+          ]
+        : []
+    )
+    return {
+      canManage,
+      canOpenAccessPage,
+      canTransferOwnership: platformAdmin || owner?.id === user.id,
+      owner,
+      users: grants.filter((grant) => grant.userId !== owner?.id),
+    }
+  })
+
 async function relayAccessOverview(
   user: Awaited<ReturnType<typeof requireAuthenticatedUser>>,
   relay: PersistedRelay
@@ -178,21 +292,57 @@ async function relayAccessOverview(
     ),
     canManageOwners(user, relay.id),
   ])
+  const instanceIds = [
+    ...new Set(
+      grants[0].flatMap((grant) =>
+        grant.resource_type === "instance" ? [grant.resource_id] : []
+      )
+    ),
+  ]
+  const ownerEntries = await Promise.all(
+    instanceIds.map(async (instanceId) => ({
+      instanceId,
+      ownerId: await instanceOwnerId(relay, instanceId),
+    }))
+  )
+  const instanceOwners = new Map<string, string | null>()
+  for (const entry of ownerEntries) {
+    instanceOwners.set(entry.instanceId, entry.ownerId)
+  }
 
   return {
     canManageOwners: ownerAccess,
-    grants: grants[0].map((grant) => ({
-      createdAt: grant.created_at.toISOString(),
-      email: grant.email,
-      id: grant.id,
-      name: grant.name,
-      relayId: relay.id,
-      relayName: relay.name,
-      resourceId: grant.resource_id,
-      resourceType: grant.resource_type,
-      role: grant.role,
-      userId: grant.user_id,
-    })),
+    grants: grants[0].map((grant) => {
+      const ownerId =
+        grant.resource_type === "instance"
+          ? (instanceOwners.get(grant.resource_id) ?? null)
+          : null
+      return {
+        createdAt: grant.created_at.toISOString(),
+        email: grant.email,
+        id: grant.id,
+        name: grant.name,
+        instanceOwner:
+          grant.resource_type === "instance" &&
+          isCurrentInstanceOwnerGrant({
+            grantUserId: grant.user_id,
+            ownerId,
+          }),
+        protectedInstanceOwnerGrant:
+          grant.resource_type === "instance" &&
+          isProtectedInstanceOwnerGrant({
+            grantRole: grant.role,
+            grantUserId: grant.user_id,
+            ownerId,
+          }),
+        relayId: relay.id,
+        relayName: relay.name,
+        resourceId: grant.resource_id,
+        resourceType: grant.resource_type,
+        role: grant.role,
+        userId: grant.user_id,
+      }
+    }),
     invitations: invitations[0].map((invitation) => ({
       createdAt: invitation.created_at.toISOString(),
       email: invitation.email,
@@ -407,20 +557,53 @@ export const updateAccessGrant = createServerFn({ method: "POST" })
       relayId: relay.id,
       permission: "access.manage",
     })
-    const currentRole = await grantRole(data.id, relay.id)
-    if (
-      (currentRole === "owner" || data.role === "owner") &&
-      !(await canManageOwners(user, relay.id))
-    ) {
-      throw new Error(
-        "Only a Relay owner or platform admin can change owner access"
-      )
-    }
-    await databasePool.execute(
-      `UPDATE ${databaseTable("access_grant")} SET role = ? WHERE id = ? AND relay_id = ?`,
-      [data.role, data.id, relay.id]
+    const initialGrant = await accessGrantMutationTarget(data.id, relay.id)
+    if (!initialGrant) return { updated: true }
+    await ensureInstanceGrantOwner(relay, initialGrant)
+    const ownerAccess = await canManageOwners(user, relay.id)
+    return runAppEffect(
+      "access.updateGrant",
+      withLockedAccessGrant({
+        grantId: data.id,
+        initialGrant,
+        missingResult: { updated: true },
+        operation: "access.updateGrant",
+        relayId: relay.id,
+        use: ({ grant, ownerId, transaction }) =>
+          Effect.gen(function* () {
+            if (
+              (grant.role === "owner" || data.role === "owner") &&
+              !ownerAccess
+            ) {
+              return yield* Effect.fail(
+                new Error(
+                  "Only a Relay owner or platform admin can change owner access"
+                )
+              )
+            }
+            if (
+              grant.resource_type === "instance" &&
+              isBlockedInstanceOwnerRoleChange({
+                grantRole: grant.role,
+                grantUserId: grant.user_id,
+                nextRole: data.role,
+                ownerId,
+              })
+            ) {
+              return yield* Effect.fail(
+                new Error(
+                  "Transfer ownership before changing the server owner's role"
+                )
+              )
+            }
+            yield* transaction.execute(
+              `UPDATE ${databaseTable("access_grant")} SET role = ? WHERE id = ? AND relay_id = ?`,
+              [data.role, data.id, relay.id]
+            )
+            return { updated: true }
+          }),
+      })
     )
-    return { updated: true }
   })
 
 export const removeAccessGrant = createServerFn({ method: "POST" })
@@ -433,19 +616,188 @@ export const removeAccessGrant = createServerFn({ method: "POST" })
       relayId: relay.id,
       permission: "access.manage",
     })
-    if (
-      (await grantRole(data.id, relay.id)) === "owner" &&
-      !(await canManageOwners(user, relay.id))
-    ) {
-      throw new Error(
-        "Only a Relay owner or platform admin can remove owner access"
-      )
-    }
-    await databasePool.execute(
-      `DELETE FROM ${databaseTable("access_grant")} WHERE id = ? AND relay_id = ?`,
-      [data.id, relay.id]
+    const initialGrant = await accessGrantMutationTarget(data.id, relay.id)
+    if (!initialGrant) return { removed: true }
+    await ensureInstanceGrantOwner(relay, initialGrant)
+    const ownerAccess = await canManageOwners(user, relay.id)
+    return runAppEffect(
+      "access.removeGrant",
+      withLockedAccessGrant({
+        grantId: data.id,
+        initialGrant,
+        missingResult: { removed: true },
+        operation: "access.removeGrant",
+        relayId: relay.id,
+        use: ({ grant, ownerId, transaction }) =>
+          Effect.gen(function* () {
+            if (
+              grant.resource_type === "instance" &&
+              isProtectedInstanceOwnerGrant({
+                grantRole: grant.role,
+                grantUserId: grant.user_id,
+                ownerId,
+              })
+            ) {
+              return yield* Effect.fail(
+                new Error(
+                  "Transfer ownership before removing the server owner's access"
+                )
+              )
+            }
+            if (grant.role === "owner" && !ownerAccess) {
+              return yield* Effect.fail(
+                new Error(
+                  "Only a Relay owner or platform admin can remove owner access"
+                )
+              )
+            }
+            yield* transaction.execute(
+              `DELETE FROM ${databaseTable("access_grant")} WHERE id = ? AND relay_id = ?`,
+              [data.id, relay.id]
+            )
+            return { removed: true }
+          }),
+      })
     )
-    return { removed: true }
+  })
+
+export const removeInstanceAccessGrant = createServerFn({ method: "POST" })
+  .validator(instanceGrantSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const relay = await requiredRelay(data.relayId)
+    const ownerId = await instanceOwnerId(relay, data.instanceId)
+    if (!isPlatformAdmin(user) && ownerId !== user.id) {
+      await requireRelayPermission({
+        user,
+        relayId: relay.id,
+        permission: "access.manage",
+        instanceId: data.instanceId,
+      })
+    }
+    return runAppEffect(
+      "access.instance.removeGrant",
+      Effect.gen(function* () {
+        const database = yield* Database
+        return yield* database.transaction(
+          "access.instance.removeGrant",
+          (transaction) =>
+            Effect.gen(function* () {
+              const ownerRows = yield* transaction.queryRows<InstanceOwnerRow>(
+                `SELECT owner_id FROM ${databaseTable("instance")}
+                    WHERE relay_id = ? AND instance_id = ? LIMIT 1 FOR UPDATE`,
+                [relay.id, data.instanceId]
+              )
+              const grantRows =
+                yield* transaction.queryRows<InstanceScopedGrantRow>(
+                  `SELECT user_id, role FROM ${databaseTable("access_grant")}
+                    WHERE id = ? AND relay_id = ?
+                      AND resource_type = 'instance' AND resource_id = ?
+                    LIMIT 1 FOR UPDATE`,
+                  [data.id, relay.id, data.instanceId]
+                )
+              const grant = grantRows.at(0)
+              if (
+                isProtectedInstanceOwnerGrant({
+                  grantRole: grant?.role ?? null,
+                  grantUserId: grant?.user_id ?? null,
+                  ownerId: ownerRows.at(0)?.owner_id ?? null,
+                })
+              ) {
+                return yield* Effect.fail(
+                  new Error(
+                    "Transfer ownership before removing the server owner's access"
+                  )
+                )
+              }
+              yield* transaction.execute(
+                `DELETE FROM ${databaseTable("access_grant")}
+                  WHERE id = ? AND relay_id = ?
+                    AND resource_type = 'instance' AND resource_id = ?`,
+                [data.id, relay.id, data.instanceId]
+              )
+              return { removed: true }
+            })
+        )
+      })
+    )
+  })
+
+export const transferInstanceOwnership = createServerFn({ method: "POST" })
+  .validator(transferInstanceOwnershipSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const relay = await requiredRelay(data.relayId)
+    await instanceOwnerId(relay, data.instanceId)
+    const platformAdmin = isPlatformAdmin(user)
+
+    return runAppEffect(
+      "access.instance.transferOwnership",
+      Effect.gen(function* () {
+        const database = yield* Database
+        return yield* database.transaction(
+          "access.instance.transferOwnership",
+          (transaction) =>
+            Effect.gen(function* () {
+              const ownerRows = yield* transaction.queryRows<InstanceOwnerRow>(
+                `SELECT owner_id FROM ${databaseTable("instance")}
+                    WHERE relay_id = ? AND instance_id = ? LIMIT 1 FOR UPDATE`,
+                [relay.id, data.instanceId]
+              )
+              const ownerId = ownerRows.at(0)?.owner_id ?? null
+              if (!platformAdmin && ownerId !== user.id) {
+                return yield* Effect.fail(
+                  new Error("Only the server owner can transfer ownership")
+                )
+              }
+              if (ownerId === data.userId) {
+                return yield* Effect.fail(
+                  new Error("This user already owns the server")
+                )
+              }
+
+              const targetGrants =
+                yield* transaction.queryRows<InstanceOwnerGrantRow>(
+                  `SELECT user_id FROM ${databaseTable("access_grant")}
+                  WHERE user_id = ? AND relay_id = ?
+                    AND resource_type = 'instance' AND resource_id = ?
+                  LIMIT 1 FOR UPDATE`,
+                  [data.userId, relay.id, data.instanceId]
+                )
+              if (!targetGrants.at(0)) {
+                return yield* Effect.fail(
+                  new Error(
+                    "Give this user direct server access before transferring ownership"
+                  )
+                )
+              }
+
+              yield* transaction.execute(
+                `INSERT INTO ${databaseTable("instance")}
+                   (relay_id, instance_id, display_name, owner_id)
+                 VALUES (?, ?, NULL, ?)
+                 ON DUPLICATE KEY UPDATE owner_id = VALUES(owner_id)`,
+                [relay.id, data.instanceId, data.userId]
+              )
+              yield* transaction.execute(
+                `UPDATE ${databaseTable("access_grant")}
+                    SET role = 'admin'
+                  WHERE relay_id = ? AND resource_type = 'instance'
+                    AND resource_id = ? AND role = 'owner' AND user_id <> ?`,
+                [relay.id, data.instanceId, data.userId]
+              )
+              yield* transaction.execute(
+                `UPDATE ${databaseTable("access_grant")}
+                    SET role = 'owner', granted_by = ?
+                  WHERE user_id = ? AND relay_id = ?
+                    AND resource_type = 'instance' AND resource_id = ?`,
+                [user.id, data.userId, relay.id, data.instanceId]
+              )
+              return { transferred: true }
+            })
+        )
+      })
+    )
   })
 
 export const revokeAccessInvitation = createServerFn({ method: "POST" })
@@ -526,12 +878,165 @@ async function canManageOwners(
   )
 }
 
-async function grantRole(id: string, relayId: string): Promise<string | null> {
-  const [rows] = await databasePool.query<
-    Array<{ role: string } & RowDataPacket>
-  >(
-    `SELECT role FROM ${databaseTable("access_grant")} WHERE id = ? AND relay_id = ? LIMIT 1`,
+async function accessGrantMutationTarget(
+  id: string,
+  relayId: string
+): Promise<AccessGrantMutationRow | null> {
+  const [rows] = await databasePool.query<Array<AccessGrantMutationRow>>(
+    `SELECT user_id, role, resource_type, resource_id
+       FROM ${databaseTable("access_grant")}
+      WHERE id = ? AND relay_id = ? LIMIT 1`,
     [id, relayId]
   )
-  return rows[0]?.role ?? null
+  return rows[0] ?? null
+}
+
+async function ensureInstanceGrantOwner(
+  relay: PersistedRelay,
+  grant: AccessGrantMutationRow
+): Promise<void> {
+  if (grant.resource_type === "instance") {
+    await instanceOwnerId(relay, grant.resource_id)
+  }
+}
+
+function withLockedAccessGrant<TResult, TError, TRequirements>(input: {
+  grantId: string
+  initialGrant: AccessGrantMutationRow
+  missingResult: TResult
+  operation: string
+  relayId: string
+  use: (locked: {
+    grant: AccessGrantMutationRow
+    ownerId: string | null
+    transaction: DatabaseTransaction
+  }) => Effect.Effect<TResult, TError, TRequirements>
+}) {
+  return Effect.gen(function* () {
+    const database = yield* Database
+    return yield* database.transaction(input.operation, (transaction) =>
+      Effect.gen(function* () {
+        const ownerRows =
+          input.initialGrant.resource_type === "instance"
+            ? yield* transaction.queryRows<InstanceOwnerRow>(
+                `SELECT owner_id FROM ${databaseTable("instance")}
+                  WHERE relay_id = ? AND instance_id = ? LIMIT 1 FOR UPDATE`,
+                [input.relayId, input.initialGrant.resource_id]
+              )
+            : []
+        const grantRows = yield* transaction.queryRows<AccessGrantMutationRow>(
+          `SELECT user_id, role, resource_type, resource_id
+               FROM ${databaseTable("access_grant")}
+              WHERE id = ? AND relay_id = ? LIMIT 1 FOR UPDATE`,
+          [input.grantId, input.relayId]
+        )
+        const grant = grantRows.at(0)
+        if (!grant) return input.missingResult
+        if (
+          grant.resource_type !== input.initialGrant.resource_type ||
+          grant.resource_id !== input.initialGrant.resource_id
+        ) {
+          return yield* Effect.fail(
+            new Error("Access grant changed while it was being modified")
+          )
+        }
+        return yield* input.use({
+          grant,
+          ownerId: ownerRows.at(0)?.owner_id ?? null,
+          transaction,
+        })
+      })
+    )
+  })
+}
+
+async function instanceOwnerId(
+  relay: PersistedRelay,
+  instanceId: string
+): Promise<string | null> {
+  const [persistedRows] = await databasePool.query<Array<InstanceOwnerRow>>(
+    `SELECT owner_id FROM ${databaseTable("instance")}
+      WHERE relay_id = ? AND instance_id = ? LIMIT 1`,
+    [relay.id, instanceId]
+  )
+  const persistedOwnerId = persistedRows[0]?.owner_id
+  if (persistedOwnerId) return persistedOwnerId
+
+  const initialOwnerId =
+    (await instanceOwnerGrantId(relay.id, instanceId)) ??
+    (await instanceInitialOwnerId(relay, instanceId))
+  if (!initialOwnerId) return null
+
+  await databasePool.execute(
+    `INSERT INTO ${databaseTable("instance")}
+       (relay_id, instance_id, display_name, owner_id)
+     VALUES (?, ?, NULL, ?)
+     ON DUPLICATE KEY UPDATE owner_id = COALESCE(owner_id, VALUES(owner_id))`,
+    [relay.id, instanceId, initialOwnerId]
+  )
+  const [resolvedRows] = await databasePool.query<Array<InstanceOwnerRow>>(
+    `SELECT owner_id FROM ${databaseTable("instance")}
+      WHERE relay_id = ? AND instance_id = ? LIMIT 1`,
+    [relay.id, instanceId]
+  )
+  return resolvedRows[0]?.owner_id ?? initialOwnerId
+}
+
+async function instanceInitialOwnerId(
+  relay: PersistedRelay,
+  instanceId: string
+): Promise<string | null> {
+  return Effect.runPromise(
+    Effect.tryPromise({
+      try: async () => {
+        const { relayRpc } = await import("@/lib/relay-connection")
+        const records = z.array(relayAuditRecordSchema).parse(
+          await relayRpc(relay, "relay.audit.list", {
+            instanceIds: [instanceId],
+            limit: 2_000,
+          })
+        )
+        for (let index = records.length - 1; index >= 0; index -= 1) {
+          const record = records[index]
+          const creatorId = record
+            ? auditInstanceCreatorId(record, instanceId)
+            : null
+          if (creatorId) return creatorId
+        }
+        return null
+      },
+      catch: (cause) => cause,
+    }).pipe(Effect.catch(() => Effect.succeed(null)))
+  )
+}
+
+async function instanceOwnerGrantId(
+  relayId: string,
+  instanceId: string
+): Promise<string | null> {
+  const [rows] = await databasePool.query<Array<InstanceOwnerGrantRow>>(
+    `SELECT user_id FROM ${databaseTable("access_grant")}
+      WHERE relay_id = ? AND resource_type = 'instance'
+        AND resource_id = ? AND role = 'owner'
+      ORDER BY created_at ASC LIMIT 1`,
+    [relayId, instanceId]
+  )
+  return rows[0]?.user_id ?? null
+}
+
+async function instanceOwnerUser(
+  ownerId: string,
+  currentUser: Awaited<ReturnType<typeof requireAuthenticatedUser>>
+) {
+  if (ownerId === currentUser.id) {
+    return { email: currentUser.email, id: currentUser.id }
+  }
+  const [rows] = await databasePool.query<Array<InstanceUserRow>>(
+    `SELECT id, email FROM ${databaseTable("user")} WHERE id = ? LIMIT 1`,
+    [ownerId]
+  )
+  const owner = rows[0]
+  return owner
+    ? { email: owner.email, id: owner.id }
+    : { email: "Former user", id: ownerId }
 }

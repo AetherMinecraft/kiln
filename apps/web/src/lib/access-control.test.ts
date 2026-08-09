@@ -3,7 +3,12 @@ import { Effect, Layer } from "effect"
 import type { ResultSetHeader } from "mysql2/promise"
 
 import { Database } from "@/effect/database"
-import { deleteInstanceAccessEffect } from "@/lib/access-control"
+import {
+  deleteInstanceAccessEffect,
+  isBlockedInstanceOwnerRoleChange,
+  isCurrentInstanceOwnerGrant,
+  isProtectedInstanceOwnerGrant,
+} from "@/lib/access-control"
 
 const emptyResult: ResultSetHeader = {
   affectedRows: 0,
@@ -17,6 +22,71 @@ const emptyResult: ResultSetHeader = {
 }
 
 describe("instance access cleanup", () => {
+  it("protects the current owner and any remaining owner-role grant", () => {
+    assert.isTrue(
+      isCurrentInstanceOwnerGrant({
+        grantUserId: "owner-one",
+        ownerId: "owner-one",
+      })
+    )
+    assert.isTrue(
+      isProtectedInstanceOwnerGrant({
+        grantRole: "admin",
+        grantUserId: "owner-one",
+        ownerId: "owner-one",
+      })
+    )
+    assert.isTrue(
+      isProtectedInstanceOwnerGrant({
+        grantRole: "owner",
+        grantUserId: "owner-two",
+        ownerId: null,
+      })
+    )
+    assert.isFalse(
+      isProtectedInstanceOwnerGrant({
+        grantRole: "admin",
+        grantUserId: "member-one",
+        ownerId: "owner-one",
+      })
+    )
+  })
+
+  it("only allows the persisted owner's grant to retain or regain owner", () => {
+    assert.isTrue(
+      isBlockedInstanceOwnerRoleChange({
+        grantRole: "admin",
+        grantUserId: "owner-one",
+        nextRole: "viewer",
+        ownerId: "owner-one",
+      })
+    )
+    assert.isFalse(
+      isBlockedInstanceOwnerRoleChange({
+        grantRole: "admin",
+        grantUserId: "owner-one",
+        nextRole: "owner",
+        ownerId: "owner-one",
+      })
+    )
+    assert.isFalse(
+      isBlockedInstanceOwnerRoleChange({
+        grantRole: "owner",
+        grantUserId: "former-owner",
+        nextRole: "admin",
+        ownerId: "owner-one",
+      })
+    )
+    assert.isFalse(
+      isBlockedInstanceOwnerRoleChange({
+        grantRole: "admin",
+        grantUserId: "owner-one",
+        nextRole: "admin",
+        ownerId: "owner-one",
+      })
+    )
+  })
+
   it.effect("removes grants and pending invitations in one transaction", () => {
     const statements: Array<{
       sql: string
