@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, assert, describe, layer } from "@effect/vitest"
 import { Effect } from "effect"
+import type { BackupTaskInput } from "@workspace/contracts"
 
 import { makeRelayStateLayer, RelayStateStore } from "./state.js"
 
@@ -359,6 +360,162 @@ describe("Relay state", () => {
           yield* store.replaceInstanceRoutes("instance-a", [])
           assert.isEmpty(yield* store.listWebRoutes())
         })
+    )
+
+    it.effect("journals backup tasks idempotently and in queue order", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const first: BackupTaskInput = {
+          artifactKind: "archive",
+          backupId: "00000000-0000-4000-8000-000000000001",
+          destination: { kind: "local" },
+          exclude: ["logs/**", "session.lock"],
+          kind: "create",
+          maxBytes: 1_000_000,
+          mode: "full",
+          reason: "manual",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "00000000-0000-4000-8000-000000000011",
+        }
+        const second = {
+          ...first,
+          backupId: "00000000-0000-4000-8000-000000000002",
+          destination: {
+            headers: {},
+            kind: "s3" as const,
+            objectKey: "backups/second.zip",
+            uploadUrl: "https://s3.example.test/expired-upload",
+          },
+          taskId: "00000000-0000-4000-8000-000000000012",
+        }
+
+        const enqueued = yield* store.enqueueBackupTask(first, 100)
+        assert.isFalse(enqueued.inputRefreshRequired)
+        const repeated = yield* store.enqueueBackupTask(first, 200)
+        assert.deepStrictEqual(repeated, enqueued)
+        yield* store.enqueueBackupTask(second, 101)
+
+        const claimed = yield* store.claimNextBackupTask(110)
+        assert.strictEqual(claimed?.taskId, first.taskId)
+        assert.strictEqual(claimed?.status, "running")
+        assert.isTrue(
+          yield* store.updateBackupTaskProgress(first.taskId, 50, 100, 120)
+        )
+        assert.isTrue(
+          yield* store.completeBackupTask(
+            first.taskId,
+            {
+              bytes: 100,
+              checksumSha256: "a".repeat(64),
+              filename: `${first.backupId}.zip`,
+              warnings: [],
+            },
+            130
+          )
+        )
+
+        const completed = yield* store.getBackupTask(first.taskId)
+        assert.strictEqual(completed?.status, "succeeded")
+        assert.strictEqual(completed?.bytesCompleted, 100)
+        assert.strictEqual(completed?.finishedAt, 130)
+        assert.deepStrictEqual(
+          (yield* store.listBackupTasks(120)).map((task) => task.taskId),
+          [first.taskId]
+        )
+
+        const next = yield* store.claimNextBackupTask(140)
+        assert.strictEqual(next?.taskId, second.taskId)
+        assert.isTrue(
+          yield* store.updateBackupTaskProgress(second.taskId, 50, 100, 145)
+        )
+        assert.strictEqual(yield* store.requeueInterruptedBackupTasks(150), 1)
+        const requeued = yield* store.getBackupTask(second.taskId)
+        assert.strictEqual(requeued?.status, "queued")
+        assert.isNull(requeued?.startedAt)
+        assert.strictEqual(requeued?.bytesCompleted, 0)
+        assert.isNull(requeued?.bytesTotal)
+        assert.isNull(requeued?.result)
+        assert.isTrue(requeued?.inputRefreshRequired)
+
+        assert.isNull(yield* store.claimNextBackupTask(160))
+        const refreshed = yield* store.enqueueBackupTask(
+          {
+            ...second,
+            destination: {
+              ...second.destination,
+              uploadUrl: "https://s3.example.test/fresh-upload",
+            },
+          },
+          170
+        )
+        assert.strictEqual(
+          refreshed.input.kind === "create" &&
+            refreshed.input.destination.kind === "s3"
+            ? refreshed.input.destination.uploadUrl
+            : null,
+          "https://s3.example.test/fresh-upload"
+        )
+        assert.isFalse(refreshed.inputRefreshRequired)
+
+        assert.strictEqual(
+          (yield* store.claimNextBackupTask(180))?.taskId,
+          second.taskId
+        )
+        assert.isTrue(yield* store.failBackupTask(second.taskId, "test", 190))
+
+        const restore: BackupTaskInput = {
+          backupId: first.backupId,
+          kind: "restore",
+          source: { kind: "local" },
+          target: first.target,
+          taskId: "00000000-0000-4000-8000-000000000013",
+        }
+        yield* store.enqueueBackupTask(restore, 200)
+        assert.strictEqual(
+          (yield* store.claimNextBackupTask(210))?.taskId,
+          restore.taskId
+        )
+        assert.strictEqual(yield* store.requeueInterruptedBackupTasks(220), 1)
+        const interruptedRestore = yield* store.getBackupTask(restore.taskId)
+        assert.strictEqual(interruptedRestore?.status, "failed")
+        assert.strictEqual(interruptedRestore?.finishedAt, 220)
+      })
+    )
+
+    it.effect("reclaims interrupted local creates without Hearth", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const local: BackupTaskInput = {
+          artifactKind: "archive",
+          backupId: "00000000-0000-4000-8000-000000000004",
+          destination: { kind: "local" },
+          exclude: [],
+          kind: "create",
+          maxBytes: null,
+          mode: "full",
+          reason: "manual",
+          target: { id: "instance-b", kind: "instance" },
+          taskId: "00000000-0000-4000-8000-000000000014",
+        }
+        yield* store.enqueueBackupTask(local, 300)
+        assert.strictEqual(
+          (yield* store.claimNextBackupTask(310))?.taskId,
+          local.taskId
+        )
+        assert.isTrue(
+          yield* store.updateBackupTaskProgress(local.taskId, 25, 50, 320)
+        )
+
+        assert.strictEqual(yield* store.requeueInterruptedBackupTasks(330), 1)
+        const requeued = yield* store.getBackupTask(local.taskId)
+        assert.strictEqual(requeued?.bytesCompleted, 0)
+        assert.isNull(requeued?.bytesTotal)
+        assert.isFalse(requeued?.inputRefreshRequired)
+        assert.strictEqual(
+          (yield* store.claimNextBackupTask(340))?.taskId,
+          local.taskId
+        )
+      })
     )
   })
 })
