@@ -1,7 +1,11 @@
+import * as React from "react"
 import { createFileRoute } from "@tanstack/react-router"
 import { z } from "zod"
 
-import { ActivityPage } from "@/components/activity-page"
+import {
+  ActivityPage,
+  createActivityFiltersStore,
+} from "@/components/activity-page"
 import type { ActivityFilters } from "@/components/activity-page"
 import {
   activityInstantSchema,
@@ -43,12 +47,54 @@ export const Route = createFileRoute("/_app/activity")({
 
 function ActivityRoute() {
   const filters = Route.useSearch()
-  const navigate = Route.useNavigate()
-  const updateFilters = (change: Partial<ActivityFilters>) => {
-    void navigate({
-      replace: true,
-      search: (previous) => ({ ...previous, ...change }),
-    })
-  }
-  return <ActivityPage filters={filters} onFiltersChange={updateFilters} />
+  const initialData = Route.useLoaderData()
+  const [filterStore] = React.useState(() =>
+    createActivityFiltersStore(filters)
+  )
+  React.useLayoutEffect(
+    () => filterStore.setFilters(filters),
+    [filterStore, filters]
+  )
+  const updateFilters = React.useCallback(
+    (change: Partial<ActivityFilters>) => {
+      const nextFilters = { ...filterStore.getSnapshot(), ...change }
+      filterStore.setFilters(nextFilters)
+      replaceActivityFilterSearch(nextFilters)
+    },
+    [filterStore]
+  )
+  return (
+    <ActivityPage
+      initialData={initialData}
+      filterStore={filterStore}
+      onFiltersChange={updateFilters}
+    />
+  )
+}
+
+function replaceActivityFilterSearch(filters: ActivityFilters): void {
+  const url = new URL(window.location.href)
+  setActivitySearchParam(url, "from", filters.from)
+  setActivitySearchParam(url, "q", filters.q)
+  setActivitySearchParam(url, "relay", filters.relay)
+  setActivitySearchParam(url, "server", filters.server)
+  setActivitySearchParam(url, "source", filters.source)
+  setActivitySearchParam(url, "to", filters.to)
+  setActivitySearchParam(url, "type", filters.type)
+  setActivitySearchParam(url, "user", filters.user)
+  History.prototype.replaceState.call(
+    window.history,
+    window.history.state,
+    "",
+    `${url.pathname}${url.search}${url.hash}`
+  )
+}
+
+function setActivitySearchParam(
+  url: URL,
+  key: keyof ActivityFilters,
+  value: string | undefined
+): void {
+  if (value) url.searchParams.set(key, value)
+  else url.searchParams.delete(key)
 }
