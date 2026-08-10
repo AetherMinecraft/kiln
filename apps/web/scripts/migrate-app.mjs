@@ -24,9 +24,29 @@ try {
   await ensureInstanceOwnershipSchema(connection)
   await ensureTailscaleNetworkSchema(connection)
   await ensureDatabaseAccessSchema(connection)
+  await ensureBackupSchema(connection)
   console.log("Kiln application tables are up to date")
 } finally {
   await connection.end()
+}
+
+async function ensureBackupSchema(database) {
+  const [taskColumns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("backup_task")}`
+  )
+  const taskColumnNames = new Set(taskColumns.map((column) => column.Field))
+  if (!taskColumnNames.has("reserved_bytes")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_task")}
+       ADD COLUMN reserved_bytes BIGINT UNSIGNED NULL AFTER bytes_total`
+    )
+  }
+  if (!taskColumnNames.has("relay_updated_at_ms")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_task")}
+       ADD COLUMN relay_updated_at_ms BIGINT UNSIGNED NULL AFTER reserved_bytes`
+    )
+  }
 }
 
 async function ensureInstanceOwnershipSchema(database) {
