@@ -381,6 +381,7 @@ describe("Relay state", () => {
           ...first,
           backupId: "00000000-0000-4000-8000-000000000002",
           destination: {
+            allowPrivateNetwork: false,
             headers: {},
             kind: "s3" as const,
             objectKey: "backups/second.zip",
@@ -479,6 +480,37 @@ describe("Relay state", () => {
         const interruptedRestore = yield* store.getBackupTask(restore.taskId)
         assert.strictEqual(interruptedRestore?.status, "failed")
         assert.strictEqual(interruptedRestore?.finishedAt, 220)
+
+        const deletion: BackupTaskInput = {
+          backupId: first.backupId,
+          destination: { kind: "local" },
+          kind: "delete",
+          target: first.target,
+          taskId: "00000000-0000-4000-8000-000000000015",
+        }
+        yield* store.enqueueBackupTask(deletion, 230)
+        assert.strictEqual(
+          (yield* store.claimNextBackupTask(240))?.taskId,
+          deletion.taskId
+        )
+        assert.strictEqual(yield* store.requeueInterruptedBackupTasks(250), 1)
+        const requeuedDeletion = yield* store.getBackupTask(deletion.taskId)
+        assert.strictEqual(requeuedDeletion?.status, "queued")
+        assert.isFalse(requeuedDeletion?.inputRefreshRequired)
+        assert.strictEqual(
+          (yield* store.claimNextBackupTask(260))?.taskId,
+          deletion.taskId
+        )
+        assert.isTrue(
+          yield* store.completeBackupTask(
+            deletion.taskId,
+            { warnings: [] },
+            270
+          )
+        )
+        const completedDeletion = yield* store.getBackupTask(deletion.taskId)
+        assert.strictEqual(completedDeletion?.bytesCompleted, 0)
+        assert.strictEqual(completedDeletion?.status, "succeeded")
       })
     )
 
