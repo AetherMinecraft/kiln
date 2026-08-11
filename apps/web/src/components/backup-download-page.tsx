@@ -65,7 +65,7 @@ export const BackupDownloadPage = React.memo(function BackupDownloadPage({
   const downloadTarget = `kiln-backup-download-${downloadId}`
 
   return (
-    <main className="relative grid min-h-dvh place-items-center overflow-y-auto bg-background px-4 py-8 text-foreground sm:px-6">
+    <main className="relative grid h-dvh place-items-center overflow-y-auto bg-background px-4 py-8 text-foreground sm:px-6">
       <div className="pointer-events-none fixed inset-0 bg-[image:var(--ambient-grid)] [mask-image:radial-gradient(ellipse_75%_70%_at_50%_42%,black,transparent)] bg-[size:56px_56px] opacity-70" />
       <div className="pointer-events-none fixed top-[8%] left-1/2 size-[32rem] -translate-x-1/2 rounded-full bg-primary/5 blur-[150px]" />
 
