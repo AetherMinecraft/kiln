@@ -93,10 +93,15 @@ describe("CLI output", () => {
       )
     )
 
-    expect(report.output).toContain(
-      "Cause: instance.state: Invalid input: expected string, received undefined"
-    )
-    expect(report.output).not.toContain('{"instance":{}}')
+    expect(report).toEqual({
+      exitCode: 1,
+      output: [
+        "Error: Hearth returned a response the CLI does not understand.",
+        "Code: invalid_response",
+        "Cause: instance.state: Invalid input: expected string, received undefined",
+        "",
+      ].join("\n"),
+    })
   })
 
   it("reports the message from unexpected defects", () => {
@@ -109,6 +114,13 @@ describe("CLI output", () => {
         "Code: unexpected_error",
         "",
       ].join("\n"),
+    })
+  })
+
+  it("does not report interruptions as unexpected failures", () => {
+    expect(renderErrorCause(Cause.interrupt(1))).toEqual({
+      exitCode: 130,
+      output: "",
     })
   })
 })

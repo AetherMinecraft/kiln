@@ -18,6 +18,7 @@ export interface RenderedCliError {
 export function renderErrorCause(
   cause: Cause.Cause<CliCommandError>
 ): RenderedCliError {
+  if (Cause.hasInterruptsOnly(cause)) return { exitCode: 130, output: "" }
   const squashed = Cause.squash(cause)
   const error =
     squashed instanceof CliCommandError
@@ -28,10 +29,9 @@ export function renderErrorCause(
           message:
             describeCause(squashed)[0] ?? "An unknown CLI error occurred.",
         })
-  const details = uniqueDetails([
-    ...describeCause(error.cause),
-    ...Cause.prettyErrors(cause).flatMap((failure) => describeCause(failure)),
-  ]).filter((detail) => detail !== error.message)
+  const details = describeCause(error.cause).filter(
+    (detail) => detail !== error.message
+  )
   const lines = [`Error: ${error.message}`, `Code: ${error.code}`]
   details.forEach((detail, index) => {
     lines.push(`${index === 0 ? "Cause" : "Caused by"}: ${detail}`)
