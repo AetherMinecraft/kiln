@@ -1,4 +1,5 @@
 import * as React from "react"
+import { Effect } from "effect"
 import {
   Archive,
   ArrowDownToLine,
@@ -140,6 +141,7 @@ export const BackupDownloadPage = React.memo(function BackupDownloadPage({
             <iframe
               className="hidden"
               name={downloadTarget}
+              sandbox="allow-downloads"
               title="Backup download target"
             />
           </footer>
@@ -158,18 +160,28 @@ const CopyDirectDownloadButton = React.memo(function CopyDirectDownloadButton({
 
   const copyRawUrl = React.useCallback(
     () =>
-      navigator.clipboard.writeText(downloadUrl).then(
-        () => {
-          setCopied(true)
-          showToast({
-            message: "Direct download URL copied",
-            type: "success",
+      Effect.runPromise(
+        Effect.tryPromise({
+          try: () => navigator.clipboard.writeText(downloadUrl),
+          catch: (cause) => cause,
+        }).pipe(
+          Effect.match({
+            onFailure: () => {
+              showToast({
+                message: "Could not copy the direct URL",
+                type: "error",
+              })
+            },
+            onSuccess: () => {
+              setCopied(true)
+              showToast({
+                message: "Direct download URL copied",
+                type: "success",
+              })
+              window.setTimeout(() => setCopied(false), 1_500)
+            },
           })
-          window.setTimeout(() => setCopied(false), 1_500)
-        },
-        () => {
-          showToast({ message: "Could not copy the direct URL", type: "error" })
-        }
+        )
       ),
     [downloadUrl]
   )

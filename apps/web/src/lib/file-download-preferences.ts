@@ -58,6 +58,13 @@ export function defaultFileDownloadPreferencesSnapshot(): string {
   return defaultPreferencesSnapshot
 }
 
+export function shouldPreviewBackupDownload(
+  mode: "download" | "link",
+  previewSharedLinks: boolean
+): boolean {
+  return mode === "link" && previewSharedLinks
+}
+
 export function fileDownloadPreferencesFromSnapshot(
   snapshot: string
 ): FileDownloadPreferences {

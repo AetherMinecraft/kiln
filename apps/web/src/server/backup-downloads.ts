@@ -13,13 +13,14 @@ export const getBackupDownloadShare = createServerFn({ method: "GET" })
       { loadBackupDownloadShareEffect },
       { runAppEffect },
       { kilnPublicUrl },
+      { setResponseHeader },
     ] = await Promise.all([
       import("node:crypto"),
       import("@/effect/backup-download-shares"),
       import("@/effect/runtime"),
       import("@/lib/environment"),
+      import("@tanstack/react-start/server"),
     ])
-    const { setResponseHeader } = await import("@tanstack/react-start/server")
     setResponseHeader("Cache-Control", "private, no-store")
     setResponseHeader("Referrer-Policy", "no-referrer")
     const share = await runAppEffect(
