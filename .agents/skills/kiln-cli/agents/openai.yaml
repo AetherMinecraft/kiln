@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kiln CLI"
+  short_description: "Manage Kiln and Hearth servers"
+  default_prompt: "Use $kiln-cli to inspect and manage my Kiln or self-hosted Hearth servers."

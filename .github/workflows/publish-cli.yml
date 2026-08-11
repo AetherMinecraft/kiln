@@ -95,7 +95,11 @@ jobs:
         run: vp run -F kiln-cli build:npm
 
       - name: Verify package contents
-        run: npm pack --dry-run ./apps/cli/dist/npm
+        run: |
+          diff -ru \
+            .agents/skills/kiln-cli \
+            apps/cli/dist/npm/skills/kiln-cli
+          npm pack --dry-run ./apps/cli/dist/npm
 
       - name: Check whether the version already exists
         id: published
