@@ -1,5 +1,6 @@
 import {
   chmod,
+  cp,
   copyFile,
   mkdir,
   readFile,
@@ -75,7 +76,13 @@ async function buildNpmPackage() {
   )
   await chmod(executable, 0o755)
 
+  await mkdir(join(npmDist, "skills"), { recursive: true })
   await Promise.all([
+    cp(
+      join(repositoryRoot, ".agents", "skills", "kiln-cli"),
+      join(npmDist, "skills", "kiln-cli"),
+      { recursive: true }
+    ),
     copyFile(join(root, "README.md"), join(npmDist, "README.md")),
     copyFile(join(repositoryRoot, "LICENSE"), join(npmDist, "LICENSE")),
     copyFile(

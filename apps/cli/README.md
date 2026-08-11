@@ -20,6 +20,19 @@ npm install --global kiln-cli
 kiln login
 ```
 
+## Install the agent skill
+
+Install the Kiln skill globally so supported coding agents can discover and use
+the CLI across projects:
+
+```sh
+npx skills@latest add kiln-site/hearth --skill kiln-cli --global
+```
+
+The installer detects supported agents and places the standard Agent Skill in
+their user-level skill directories. Omit `--global` to install it only in the
+current project.
+
 ## Build locally
 
 ```sh

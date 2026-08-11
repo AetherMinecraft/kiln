@@ -1,10 +1,6 @@
 ---
 name: kiln-cli
 description: Use the Kiln CLI to authenticate, select profiles, inspect Relays, activity, backups, and server metadata, create or delete servers, create, restore, download, or delete backups, change Bricks and startup settings, inspect logs, send console or power commands, and manage server files including Relay-side HTTPS downloads. Use when a user asks to run, test, or troubleshoot `kiln` commands or mentions Kiln CLI Relay/server references, backups, startup settings, remote paths, or file transfers.
-version: "1.2.0"
-requires:
-  bins: ["kiln"]
-  auth: true
 ---
 
 # Kiln CLI
