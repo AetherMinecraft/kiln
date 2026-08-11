@@ -28,6 +28,7 @@ import {
   cliServersResponseSchema,
   cliSftpResponseSchema,
   DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
+  formatRelayInstanceStateReason,
   relayIdSchema,
   relayFileContentSchema,
   relayFileTreeSchema,
@@ -907,6 +908,9 @@ function writeServerInfo(
   writeLine(`ID: ${result.relay.id}:${server.id}`)
   writeLine(`Relay: ${result.relay.name}`)
   writeLine(`State: ${server.observedState} (desired ${server.desiredState})`)
+  if (server.stateReason) {
+    writeLine(`Reason: ${formatRelayInstanceStateReason(server.stateReason)}`)
+  }
   writeLine(`Game: ${server.game}`)
   writeLine(`Implementation: ${server.implementation} ${server.version}`)
   writeLine(`Java: ${server.javaVersion}`)
