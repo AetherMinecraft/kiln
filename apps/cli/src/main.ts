@@ -62,7 +62,7 @@ import {
 } from "./inputs.js"
 import {
   formatBytes,
-  reportErrorEffect,
+  reportErrorCauseEffect,
   writeLine,
   writeTable,
   writeText,
@@ -99,17 +99,6 @@ const program = Effect.try({
         }),
 }).pipe(
   Effect.flatMap((args) => runCommandEffect(args)),
-  Effect.catch((cause) =>
-    reportErrorEffect(
-      cause instanceof CliCommandError
-        ? cause
-        : commandError({
-            cause,
-            code: "unexpected_error",
-            message: "The CLI stopped unexpectedly.",
-          })
-    )
-  ),
   Effect.withSpan("kiln.cli")
 )
 
@@ -1194,13 +1183,4 @@ Environment:
 `)
 }
 
-Effect.runFork(
-  program.pipe(
-    Effect.catchCause(() =>
-      Effect.sync(() => {
-        process.stderr.write("Error: The CLI stopped unexpectedly.\n")
-        process.exitCode = 1
-      })
-    )
-  )
-)
+Effect.runFork(program.pipe(Effect.catchCause(reportErrorCauseEffect)))
