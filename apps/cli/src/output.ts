@@ -1,6 +1,6 @@
-import { Effect } from "effect"
+import { Cause, Effect } from "effect"
 
-import type { CliCommandError } from "./errors.js"
+import { CliCommandError, commandError } from "./errors.js"
 
 export function writeLine(value = ""): void {
   process.stdout.write(`${value}\n`)
@@ -10,14 +10,94 @@ export function writeText(value: string): void {
   process.stdout.write(value)
 }
 
-export const reportErrorEffect = Effect.fn("cli.output.error")(function* (
-  cause: CliCommandError
+export interface RenderedCliError {
+  exitCode: number
+  output: string
+}
+
+export function renderErrorCause(
+  cause: Cause.Cause<CliCommandError>
+): RenderedCliError {
+  const squashed = Cause.squash(cause)
+  const error =
+    squashed instanceof CliCommandError
+      ? squashed
+      : commandError({
+          cause: squashed,
+          code: "unexpected_error",
+          message:
+            describeCause(squashed)[0] ?? "An unknown CLI error occurred.",
+        })
+  const details = uniqueDetails([
+    ...describeCause(error.cause),
+    ...Cause.prettyErrors(cause).flatMap((failure) => describeCause(failure)),
+  ]).filter((detail) => detail !== error.message)
+  const lines = [`Error: ${error.message}`, `Code: ${error.code}`]
+  details.forEach((detail, index) => {
+    lines.push(`${index === 0 ? "Cause" : "Caused by"}: ${detail}`)
+  })
+  if (error.retryable)
+    lines.push("Hint: This operation may succeed if retried.")
+  return { exitCode: error.exitCode, output: `${lines.join("\n")}\n` }
+}
+
+export const reportErrorCauseEffect = Effect.fn("cli.output.error")(function* (
+  cause: Cause.Cause<CliCommandError>
 ) {
+  const report = renderErrorCause(cause)
   yield* Effect.sync(() => {
-    process.stderr.write(`Error: ${cause.message}\n`)
-    process.exitCode = cause.exitCode
+    process.stderr.write(report.output)
+    process.exitCode = report.exitCode
   })
 })
+
+function describeCause(cause: unknown, depth = 0): Array<string> {
+  if (cause === undefined || cause === null || depth >= 5) return []
+  if (typeof cause === "object" && "issues" in cause) {
+    const issues = describeIssues(cause.issues)
+    if (issues.length > 0) return issues
+  }
+  if (cause instanceof Error) {
+    return uniqueDetails([
+      normalizeDetail(cause.message || cause.name),
+      ...describeCause(cause.cause, depth + 1),
+    ])
+  }
+  if (typeof cause === "object") {
+    const message =
+      "message" in cause && typeof cause.message === "string"
+        ? normalizeDetail(cause.message)
+        : ""
+    const nested = "cause" in cause ? cause.cause : undefined
+    return uniqueDetails([message, ...describeCause(nested, depth + 1)])
+  }
+  return [normalizeDetail(String(cause))].filter(Boolean)
+}
+
+function describeIssues(issues: unknown): Array<string> {
+  if (!Array.isArray(issues)) return []
+  return issues.flatMap((issue) => {
+    if (typeof issue !== "object" || issue === null) return []
+    const message =
+      "message" in issue && typeof issue.message === "string"
+        ? normalizeDetail(issue.message)
+        : ""
+    if (!message) return []
+    const path =
+      "path" in issue && Array.isArray(issue.path)
+        ? issue.path.map(String).join(".")
+        : ""
+    return [path ? `${path}: ${message}` : message]
+  })
+}
+
+function normalizeDetail(value: string): string {
+  return value.trim().replace(/\s+/gu, " ")
+}
+
+function uniqueDetails(details: Array<string>): Array<string> {
+  return [...new Set(details.filter(Boolean))]
+}
 
 export function renderTable(
   headings: ReadonlyArray<string>,

@@ -336,7 +336,7 @@ that cannot stop normally.
 ## Diagnose failures
 
 Preserve the exact failing command, CLI version, active Hearth URL, server
-reference, and error message. Never include the token.
+reference, error code, cause details, and message. Never include the token.
 
 Use this sequence to isolate the layer:
 
