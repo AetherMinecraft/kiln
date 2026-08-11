@@ -1,9 +1,14 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
 import { afterEach, vi } from "vite-plus/test"
+import { z } from "zod"
 
 import type { KilnSession } from "./config.js"
-import { apiResponseEffect, CLI_LONG_OPERATION_TIMEOUT_MS } from "./http.js"
+import {
+  apiJsonEffect,
+  apiResponseEffect,
+  CLI_LONG_OPERATION_TIMEOUT_MS,
+} from "./http.js"
 
 const session: KilnSession = {
   profile: "test",
@@ -17,37 +22,150 @@ describe("CLI HTTP requests", () => {
     vi.unstubAllGlobals()
   })
 
-  it.effect("keeps followed log streams free of a client deadline", () => {
+  it.effect("keeps followed log streams free of an operation deadline", () => {
     const fetchMock = vi.fn(
       async (_input: RequestInfo | URL, _init?: RequestInit) => new Response()
     )
     vi.stubGlobal("fetch", fetchMock)
 
     return Effect.gen(function* () {
-      yield* apiResponseEffect(session, "/api/cli/v1/logs", {
-        timeoutMs: null,
-      })
+      yield* apiResponseEffect(
+        session,
+        "/api/cli/v1/logs",
+        {
+          timeoutMs: null,
+        },
+        (response) => Effect.succeed(response)
+      )
 
       const [, init] = fetchMock.mock.calls[0] ?? []
-      assert.isUndefined(init?.signal)
+      assert.instanceOf(init?.signal, AbortSignal)
+      assert.isFalse(init?.signal?.aborted ?? true)
     })
   })
 
-  it.effect("uses the requested deadline for long-running operations", () => {
-    const signal = new AbortController().signal
-    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(signal)
+  it.effect("combines caller cancellation with the operation deadline", () => {
+    const caller = new AbortController()
+    const addEventListener = vi.spyOn(caller.signal, "addEventListener")
+    const removeEventListener = vi.spyOn(caller.signal, "removeEventListener")
+    const scheduleTimeout = vi.spyOn(globalThis, "setTimeout")
+    const cancelTimeout = vi.spyOn(globalThis, "clearTimeout")
+    let requestSignal: AbortSignal | undefined
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => new Response())
+      vi.fn(
+        async (_input: RequestInfo | URL, init?: RequestInit) =>
+          await new Promise<Response>((_resolve, reject) => {
+            requestSignal = init?.signal ?? undefined
+            if (requestSignal?.aborted) {
+              reject(requestSignal.reason)
+              return
+            }
+            requestSignal?.addEventListener(
+              "abort",
+              () => reject(requestSignal?.reason),
+              { once: true }
+            )
+          })
+      )
     )
 
     return Effect.gen(function* () {
-      yield* apiResponseEffect(session, "/api/cli/v1/power", {
-        timeoutMs: CLI_LONG_OPERATION_TIMEOUT_MS,
-      })
+      const fiber = yield* Effect.forkChild(
+        apiResponseEffect(
+          session,
+          "/api/cli/v1/power",
+          {
+            signal: caller.signal,
+            timeoutMs: CLI_LONG_OPERATION_TIMEOUT_MS,
+          },
+          (response) => Effect.succeed(response)
+        ).pipe(Effect.exit)
+      )
+      yield* Effect.yieldNow
 
-      assert.deepEqual(timeout.mock.calls, [[CLI_LONG_OPERATION_TIMEOUT_MS]])
+      assert.notStrictEqual(requestSignal, caller.signal)
+      assert.isTrue(
+        scheduleTimeout.mock.calls.some(
+          ([, delay]) => delay === CLI_LONG_OPERATION_TIMEOUT_MS
+        )
+      )
+      caller.abort(new DOMException("caller stopped", "AbortError"))
+      yield* Fiber.join(fiber)
+
+      assert.isTrue(requestSignal?.aborted ?? false)
+      assert.isAbove(addEventListener.mock.calls.length, 0)
+      assert.isAbove(removeEventListener.mock.calls.length, 0)
+      assert.isAbove(cancelTimeout.mock.calls.length, 0)
       assert.isAbove(CLI_LONG_OPERATION_TIMEOUT_MS, 180_000)
+    })
+  })
+
+  it.effect("aborts fetch when the Effect is interrupted", () => {
+    let requestSignal: AbortSignal | undefined
+
+    return Effect.gen(function* () {
+      const started = yield* Deferred.make<void>()
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async (_input: RequestInfo | URL, init?: RequestInit) =>
+            await new Promise<Response>((_resolve, reject) => {
+              requestSignal = init?.signal ?? undefined
+              Effect.runFork(Deferred.succeed(started, undefined))
+              requestSignal?.addEventListener(
+                "abort",
+                () => reject(requestSignal?.reason),
+                { once: true }
+              )
+            })
+        )
+      )
+      const fiber = yield* Effect.forkChild(
+        apiResponseEffect(
+          session,
+          "/api/cli/v1/logs",
+          {
+            timeoutMs: null,
+          },
+          (response) => Effect.succeed(response)
+        )
+      )
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(fiber)
+
+      assert.isTrue(requestSignal?.aborted ?? false)
+    })
+  })
+
+  it.effect("keeps the deadline active while decoding a response body", () => {
+    let requestSignal: AbortSignal | undefined
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        requestSignal = init?.signal ?? undefined
+        const body = new ReadableStream<Uint8Array>({
+          start() {
+            // Hold the headers open while the JSON body remains stalled.
+          },
+        })
+        return new Response(body, {
+          headers: { "Content-Type": "application/json" },
+        })
+      })
+    )
+
+    return Effect.gen(function* () {
+      const fiber = yield* Effect.forkChild(
+        apiJsonEffect(
+          session,
+          "/api/cli/v1/stalled",
+          z.object({ ok: z.boolean() })
+        )
+      )
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(fiber)
+      assert.isTrue(requestSignal?.aborted ?? false)
     })
   })
 })

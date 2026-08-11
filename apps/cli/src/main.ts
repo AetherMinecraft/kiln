@@ -62,15 +62,10 @@ import {
   parseVariableAssignments,
   remoteFileBasename,
 } from "./inputs.js"
-import {
-  formatBytes,
-  reportErrorCauseEffect,
-  writeLine,
-  writeTable,
-  writeText,
-} from "./output.js"
+import { formatBytes, writeLine, writeTable, writeText } from "./output.js"
 import { formatPowerResponse } from "./power.js"
 import { downloadSftpFileEffect, uploadSftpFileEffect } from "./sftp.js"
+import { runCliProgram } from "./runtime.js"
 import release from "../../../release.json" with { type: "json" }
 
 const VERSION = process.env.KILN_VERSION?.trim() || release.releaseLine
@@ -635,54 +630,56 @@ const logsEffect = Effect.fn("cli.logs")(function* (
     return
   }
   query.set("follow", "true")
-  const response = yield* apiResponseEffect(
+  return yield* apiResponseEffect(
     session,
     `/api/cli/v1/logs?${query}`,
-    { headers: { Accept: "application/x-ndjson" }, timeoutMs: null }
-  )
-  if (!response.body) {
-    return yield* commandError({
-      code: "invalid_response",
-      message: "Hearth did not return a log stream.",
-    })
-  }
-  return yield* withFollowLogReader(response.body, (reader) =>
-    Effect.gen(function* () {
-      const historyQuery = targetQuery(target)
-      historyQuery.set("limit", String(args.limit))
-      const history = yield* apiJsonEffect(
-        session,
-        `/api/cli/v1/logs?${historyQuery}`,
-        relayConsoleSchema
-      )
-      const output = prepareFollowLogOutput(history.lines, args.limit)
-      for (const line of output.initialLines) writeLine(line.text)
-
-      const decoder = new TextDecoder()
-      let buffered = ""
-      for (;;) {
-        const chunk = yield* Effect.tryPromise({
-          try: () => reader.read(),
-          catch: (cause) =>
-            commandError({
-              cause,
-              code: "stream_interrupted",
-              message: "The server log stream was interrupted.",
-              retryable: true,
-            }),
+    { headers: { Accept: "application/x-ndjson" }, timeoutMs: null },
+    (response) => {
+      if (!response.body) {
+        return commandError({
+          code: "invalid_response",
+          message: "Hearth did not return a log stream.",
         })
-        buffered += decoder.decode(chunk.value, { stream: !chunk.done })
-        const records = buffered.split("\n")
-        buffered = records.pop() ?? ""
-        for (const record of records) {
-          if (!record) continue
-          const event = yield* parseConsoleEventEffect(record)
-          const line = output.liveLine(event)
-          if (line) writeLine(line.text)
-        }
-        if (chunk.done) break
       }
-    })
+      return withFollowLogReader(response.body, (reader) =>
+        Effect.gen(function* () {
+          const historyQuery = targetQuery(target)
+          historyQuery.set("limit", String(args.limit))
+          const history = yield* apiJsonEffect(
+            session,
+            `/api/cli/v1/logs?${historyQuery}`,
+            relayConsoleSchema
+          )
+          const output = prepareFollowLogOutput(history.lines, args.limit)
+          for (const line of output.initialLines) writeLine(line.text)
+
+          const decoder = new TextDecoder()
+          let buffered = ""
+          for (;;) {
+            const chunk = yield* Effect.tryPromise({
+              try: () => reader.read(),
+              catch: (cause) =>
+                commandError({
+                  cause,
+                  code: "stream_interrupted",
+                  message: "The server log stream was interrupted.",
+                  retryable: true,
+                }),
+            })
+            buffered += decoder.decode(chunk.value, { stream: !chunk.done })
+            const records = buffered.split("\n")
+            buffered = records.pop() ?? ""
+            for (const record of records) {
+              if (!record) continue
+              const event = yield* parseConsoleEventEffect(record)
+              const line = output.liveLine(event)
+              if (line) writeLine(line.text)
+            }
+            if (chunk.done) break
+          }
+        })
+      )
+    }
   )
 })
 
@@ -1178,4 +1175,4 @@ Environment:
 `)
 }
 
-Effect.runFork(program.pipe(Effect.catchCause(reportErrorCauseEffect)))
+runCliProgram(program)
