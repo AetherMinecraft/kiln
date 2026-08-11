@@ -7,6 +7,7 @@ import {
   fileDownloadName,
   fileDownloadPreferencesFromSnapshot,
   normalizeFileDownloadPreferences,
+  shouldPreviewBackupDownload,
 } from "./file-download-preferences"
 
 describe("file download preferences", () => {
@@ -18,6 +19,7 @@ describe("file download preferences", () => {
       archiveFormat: "zip",
       compressByDefault: true,
       confirmBeforeDownload: true,
+      previewBackupDownloads: true,
     })
   })
 
@@ -27,11 +29,13 @@ describe("file download preferences", () => {
         archiveFormat: "gzip",
         compressByDefault: false,
         confirmBeforeDownload: false,
+        previewBackupDownloads: false,
       })
     ).toEqual({
       archiveFormat: "gzip",
       compressByDefault: false,
       confirmBeforeDownload: false,
+      previewBackupDownloads: false,
     })
     expect(
       normalizeFileDownloadPreferences({
@@ -49,6 +53,12 @@ describe("file download preferences", () => {
     expect(fileDownloadPreferencesFromSnapshot("not json")).toEqual(
       defaultFileDownloadPreferences
     )
+  })
+
+  it("only previews links intended for sharing", () => {
+    expect(shouldPreviewBackupDownload("download", true)).toBe(false)
+    expect(shouldPreviewBackupDownload("link", true)).toBe(true)
+    expect(shouldPreviewBackupDownload("link", false)).toBe(false)
   })
 
   it("keeps the source basename intact when compression changes", () => {

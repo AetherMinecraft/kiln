@@ -361,3 +361,22 @@ CREATE TABLE IF NOT EXISTS kiln_backup_final_database_delete (
   CONSTRAINT kiln_backup_final_database_delete_backup_fk
     FOREIGN KEY (backup_id) REFERENCES kiln_backup (id) ON DELETE RESTRICT
 );
+
+CREATE TABLE IF NOT EXISTS kiln_backup_download_share (
+  token_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+  download_url_ciphertext TEXT NOT NULL,
+  backup_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  backup_name VARCHAR(120) NOT NULL,
+  filename VARCHAR(255) NOT NULL,
+  bytes BIGINT UNSIGNED NULL,
+  checksum_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  artifact_kind ENUM('archive', 'database_dump', 'platform_bundle') NOT NULL,
+  target_kind ENUM('instance', 'database', 'platform') NOT NULL,
+  target_id VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  source_name VARCHAR(120) NOT NULL,
+  shared_by VARCHAR(120) NOT NULL,
+  backup_created_at TIMESTAMP(3) NOT NULL,
+  expires_at TIMESTAMP(3) NOT NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY kiln_backup_download_share_expiry_idx (expires_at)
+);

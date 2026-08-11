@@ -34,6 +34,7 @@ import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as ApiHealthRouteImport } from './routes/api.health'
 import { Route as ApiSentryCheckRouteImport } from './routes/api.sentry-check'
 import { Route as CliAuthorizeRouteImport } from './routes/cli.authorize'
+import { Route as DownloadsIdRouteImport } from './routes/downloads.$id'
 import { Route as AppInfraIndexRouteImport } from './routes/_app.infra.index'
 import { Route as AppInfraDatabasesRouteImport } from './routes/_app.infra.databases'
 import { Route as AppInfraDomainsRouteImport } from './routes/_app.infra.domains'
@@ -184,6 +185,11 @@ const ApiSentryCheckRoute = ApiSentryCheckRouteImport.update({
 const CliAuthorizeRoute = CliAuthorizeRouteImport.update({
   id: '/cli/authorize',
   path: '/cli/authorize',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DownloadsIdRoute = DownloadsIdRouteImport.update({
+  id: '/downloads/$id',
+  path: '/downloads/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AppInfraIndexRoute = AppInfraIndexRouteImport.update({
@@ -351,6 +357,7 @@ export interface FileRoutesByFullPath {
   '/api/health': typeof ApiHealthRoute
   '/api/sentry-check': typeof ApiSentryCheckRoute
   '/cli/authorize': typeof CliAuthorizeRoute
+  '/downloads/$id': typeof DownloadsIdRoute
   '/infra/databases': typeof AppInfraDatabasesRoute
   '/infra/domains': typeof AppInfraDomainsRoute
   '/infra/relays': typeof AppInfraRelaysRoute
@@ -402,6 +409,7 @@ export interface FileRoutesByTo {
   '/api/health': typeof ApiHealthRoute
   '/api/sentry-check': typeof ApiSentryCheckRoute
   '/cli/authorize': typeof CliAuthorizeRoute
+  '/downloads/$id': typeof DownloadsIdRoute
   '/infra/databases': typeof AppInfraDatabasesRoute
   '/infra/domains': typeof AppInfraDomainsRoute
   '/infra/relays': typeof AppInfraRelaysRoute
@@ -456,6 +464,7 @@ export interface FileRoutesById {
   '/api/health': typeof ApiHealthRoute
   '/api/sentry-check': typeof ApiSentryCheckRoute
   '/cli/authorize': typeof CliAuthorizeRoute
+  '/downloads/$id': typeof DownloadsIdRoute
   '/_app/infra/databases': typeof AppInfraDatabasesRoute
   '/_app/infra/domains': typeof AppInfraDomainsRoute
   '/_app/infra/relays': typeof AppInfraRelaysRoute
@@ -511,6 +520,7 @@ export interface FileRouteTypes {
     | '/api/health'
     | '/api/sentry-check'
     | '/cli/authorize'
+    | '/downloads/$id'
     | '/infra/databases'
     | '/infra/domains'
     | '/infra/relays'
@@ -562,6 +572,7 @@ export interface FileRouteTypes {
     | '/api/health'
     | '/api/sentry-check'
     | '/cli/authorize'
+    | '/downloads/$id'
     | '/infra/databases'
     | '/infra/domains'
     | '/infra/relays'
@@ -615,6 +626,7 @@ export interface FileRouteTypes {
     | '/api/health'
     | '/api/sentry-check'
     | '/cli/authorize'
+    | '/downloads/$id'
     | '/_app/infra/databases'
     | '/_app/infra/domains'
     | '/_app/infra/relays'
@@ -662,6 +674,7 @@ export interface RootRouteChildren {
   ApiHealthRoute: typeof ApiHealthRoute
   ApiSentryCheckRoute: typeof ApiSentryCheckRoute
   CliAuthorizeRoute: typeof CliAuthorizeRoute
+  DownloadsIdRoute: typeof DownloadsIdRoute
   ApiAuthSplatRoute: typeof ApiAuthSplatRoute
   ApiConsoleInstanceIdRoute: typeof ApiConsoleInstanceIdRoute
   ApiCliAuthDeviceRoute: typeof ApiCliAuthDeviceRoute
@@ -844,6 +857,13 @@ declare module '@tanstack/react-router' {
       path: '/cli/authorize'
       fullPath: '/cli/authorize'
       preLoaderRoute: typeof CliAuthorizeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/downloads/$id': {
+      id: '/downloads/$id'
+      path: '/downloads/$id'
+      fullPath: '/downloads/$id'
+      preLoaderRoute: typeof DownloadsIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/_app/infra/': {
@@ -1165,6 +1185,7 @@ const rootRouteChildren: RootRouteChildren = {
   ApiHealthRoute: ApiHealthRoute,
   ApiSentryCheckRoute: ApiSentryCheckRoute,
   CliAuthorizeRoute: CliAuthorizeRoute,
+  DownloadsIdRoute: DownloadsIdRoute,
   ApiAuthSplatRoute: ApiAuthSplatRoute,
   ApiConsoleInstanceIdRoute: ApiConsoleInstanceIdRoute,
   ApiCliAuthDeviceRoute: ApiCliAuthDeviceRoute,
