@@ -16,6 +16,7 @@ import {
   cliFileTargetSchema,
   cliFileWriteRequestSchema,
   cliPowerRequestSchema,
+  cliPowerResponseSchema,
   cliRelayInfoResponseSchema,
   cliRelaySchema,
   cliRelaysResponseSchema,
@@ -800,6 +801,26 @@ export function relayRemoteUploadInput(
   })
 }
 
+export function cliPowerResponse(
+  action: z.infer<typeof cliPowerRequestSchema>["action"],
+  instance: Pick<
+    z.infer<typeof relayInstanceSchema>,
+    "desiredState" | "id" | "name" | "observedState"
+  >,
+  relayId: string
+) {
+  return cliPowerResponseSchema.parse({
+    action,
+    instance: {
+      desiredState: instance.desiredState,
+      id: instance.id,
+      name: instance.name,
+      observedState: instance.observedState,
+    },
+    relayId,
+  })
+}
+
 export const performCliPowerActionEffect = Effect.fn("cli.api.power")(
   function* (principal: CliPrincipal, unknownInput: unknown) {
     yield* requireCliWrite(principal)
@@ -812,10 +833,11 @@ export const performCliPowerActionEffect = Effect.fn("cli.api.power")(
       principal,
       CLI_RELAY_LONG_OPERATION_TIMEOUT_MS
     )
-    return {
-      instance: relayInstanceSchema.parse(result),
-      relayId: relay.id,
-    }
+    return cliPowerResponse(
+      input.action,
+      relayInstanceSchema.parse(result),
+      relay.id
+    )
   }
 )
 

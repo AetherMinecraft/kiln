@@ -5,8 +5,10 @@ import {
   cliBrickReferenceSchema,
   cliBackupDownloadResponseSchema,
   cliCreateBackupRequestSchema,
+  cliPowerResponseSchema,
   cliRemoteFileUploadRequestSchema,
   cliServerInfoResponseSchema,
+  relayInstanceSchema,
 } from "@workspace/contracts"
 
 vi.hoisted(() => {
@@ -19,6 +21,7 @@ vi.hoisted(() => {
 import {
   cliActivityResponse,
   cliDatabaseSupportsLogicalBackups,
+  cliPowerResponse,
   cliSftpConnectionResponse,
   collectAvailableCliRelaySnapshotsEffect,
   relayRemoteUploadInput,
@@ -77,6 +80,39 @@ describe("CLI SFTP connection", () => {
 })
 
 describe("CLI response and URL boundaries", () => {
+  it("serializes power actions through the shared CLI response contract", () => {
+    const relayInstance = relayInstanceSchema.parse({
+      connectAddress: "play.example.com:25565",
+      containerId: "container-id",
+      desiredState: "running",
+      directory: "/srv/kiln/instances/survival",
+      game: "Minecraft",
+      id: "a".repeat(40),
+      implementation: "paper",
+      javaVersion: "21",
+      name: "Survival",
+      observedState: "starting",
+      service: "kiln-survival",
+      shortId: "a".repeat(8),
+      status: "starting",
+      version: "1.21.11",
+    })
+    const webResponse = cliPowerResponse("start", relayInstance, "r".repeat(43))
+    const serializedResponse: unknown = JSON.parse(JSON.stringify(webResponse))
+    const cliResponse = cliPowerResponseSchema.parse(serializedResponse)
+
+    assert.deepEqual(cliResponse, {
+      action: "start",
+      instance: {
+        desiredState: "running",
+        id: "a".repeat(40),
+        name: "Survival",
+        observedState: "starting",
+      },
+      relayId: "r".repeat(43),
+    })
+  })
+
   it("only offers databases with logical backup support", () => {
     assert.isTrue(cliDatabaseSupportsLogicalBackups({ engine: "postgres" }))
     assert.isFalse(cliDatabaseSupportsLogicalBackups({ engine: "redis" }))
