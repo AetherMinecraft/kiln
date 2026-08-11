@@ -23,6 +23,7 @@ import {
   auditDetailsForRequest,
   isAuditedOperation,
   relayControlErrorMessage,
+  relayControlFailureTags,
 } from "./control-socket.js"
 import { fingerprint } from "./effect/identity.js"
 import { RelayStateStore } from "./effect/state.js"
@@ -68,6 +69,19 @@ describe("Relay control timeouts", () => {
 })
 
 describe("Relay control errors", () => {
+  it("correlates application failure telemetry with the request", () => {
+    expect(
+      relayControlFailureTags({
+        id: "3df56ba5-b2c1-45ee-bab7-386fbb9223c7",
+        operation: "instance.console.write",
+      })
+    ).toEqual({
+      "kiln.operation": "instance.console.write",
+      "kiln.request_id": "3df56ba5-b2c1-45ee-bab7-386fbb9223c7",
+      "kiln.transport": "control-socket",
+    })
+  })
+
   it("returns a safe final command detail when the full message is too long", () => {
     const command = `docker network create ${"hearth-feature-".repeat(16)}`
     expect(
@@ -193,7 +207,11 @@ describe("Relay control socket", () => {
       publicKeyEncoding: { format: "pem", type: "spki" },
     })
     const client: RelayClientRecord = {
-      actions: ["instance.network.write", "relay.read"],
+      actions: [
+        "instance.console.write",
+        "instance.network.write",
+        "relay.read",
+      ],
       createdAt: Date.now(),
       id: fingerprint(hearthKeys.publicKey),
       invitationId: "test-invitation",
@@ -264,6 +282,9 @@ describe("Relay control socket", () => {
     let pushSnapshot: ((snapshot: unknown) => void) | undefined
     const control = attachControlSocket({
       execute: async (request, _client, signal) => {
+        if (request.operation === "instance.console.write") {
+          throw new Error("Survival is not running")
+        }
         if (
           request.payload === "finish-at-timeout" ||
           request.payload === "wait-for-timeout"
@@ -331,6 +352,29 @@ describe("Relay control socket", () => {
       )
       expect((await inbox.next()).type).toBe("auth.ready")
       expect((await inbox.next()).type).toBe("event")
+
+      const consoleRequestId = randomBytes(12).toString("hex")
+      socket.send(
+        JSON.stringify({
+          deadline: Date.now() + 5_000,
+          id: consoleRequestId,
+          operation: "instance.console.write",
+          payload: {
+            command: "stop",
+            instanceId: "a".repeat(40),
+          },
+          type: "request",
+          v: 1,
+        })
+      )
+      const consoleFailure = await inbox.next()
+      expect(consoleFailure.type).toBe("error")
+      if (consoleFailure.type === "error") {
+        expect(consoleFailure.code).toBe("operation_failed")
+        expect(consoleFailure.message).toBe("Survival is not running")
+        expect(consoleFailure.replyTo).toBe(consoleRequestId)
+        expect(consoleFailure.retryable).toBe(false)
+      }
 
       const reverseResult = control.requestClients(
         "sftp.authorization.resolve",
@@ -487,6 +531,8 @@ describe("Relay control socket", () => {
       if (relayNetworking.type === "error") {
         expect(relayNetworking.code).toBe("forbidden")
       }
+
+      expect(audits).toHaveLength(0)
 
       socket.send(
         JSON.stringify({
