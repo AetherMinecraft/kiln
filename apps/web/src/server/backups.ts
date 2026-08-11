@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomBytes, randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
 import { z } from "zod"
@@ -9,6 +9,7 @@ import {
   relaySnapshotSchema,
 } from "@workspace/contracts"
 
+import { createBackupDownloadShareEffect } from "@/effect/backup-download-shares"
 import {
   listBackupCatalogEffect,
   getInstanceBackupPolicyEffect,
@@ -36,7 +37,7 @@ import { hasBackupPermission } from "@/lib/backup-access"
 import { signLocalBackupDownload } from "@/lib/backup-download"
 import { relayRpc } from "@/lib/relay-connection"
 import { signS3BackupDownload } from "@/lib/backup-storage-s3"
-import { kilnInstallationId } from "@/lib/environment"
+import { kilnInstallationId, kilnPublicUrl } from "@/lib/environment"
 import {
   dispatchBackupTask,
   reconcileRelayBackups,
@@ -100,6 +101,7 @@ const backupDownloadInputSchema = z.strictObject({
     .min(60)
     .max(7 * 24 * 60 * 60)
     .default(300),
+  preview: z.boolean().default(true),
 })
 
 const backupRestoreInputSchema = z.strictObject({
@@ -396,33 +398,63 @@ export const getBackupDownloadUrl = createServerFn({ method: "POST" })
     }
     const filename = artifact.filename ?? backup.filename
     if (!filename) throw new Error("Backup filename is unavailable")
+    let download: { expiresAt: string; url: string }
+    let sourceName: string
     if (!artifact.storageId) {
       if (artifact.objectKey)
         throw new Error("Local backup metadata is invalid")
       const relay = await requireBackupRelay(backup.relayId)
-      return signLocalBackupDownload(
+      download = await signLocalBackupDownload(
         relay,
         backup,
         filename,
         user.id,
         data.expiresInSeconds
       )
-    }
-    if (!artifact.objectKey) throw new Error("Backup object key is unavailable")
-    const storage = await runAppEffect(
-      "backups.loadDownloadStorage",
-      loadBackupStorageCredentialEffect(artifact.storageId)
-    )
-    if (!storage) throw new Error("Backup destination is unavailable")
-    return runAppEffect(
-      "backups.signDownload",
-      signS3BackupDownload(
-        storage,
-        artifact.objectKey,
-        filename,
-        data.expiresInSeconds
+      sourceName = relay.name
+    } else {
+      if (!artifact.objectKey)
+        throw new Error("Backup object key is unavailable")
+      const storage = await runAppEffect(
+        "backups.loadDownloadStorage",
+        loadBackupStorageCredentialEffect(artifact.storageId)
       )
+      if (!storage) throw new Error("Backup destination is unavailable")
+      download = await runAppEffect(
+        "backups.signDownload",
+        signS3BackupDownload(
+          storage,
+          artifact.objectKey,
+          filename,
+          data.expiresInSeconds
+        )
+      )
+      sourceName = storage.name
+    }
+    if (!data.preview) return download
+
+    const id = randomBytes(12).toString("base64url")
+    await runAppEffect(
+      "backups.downloadShares.create",
+      createBackupDownloadShareEffect({
+        artifactKind: backup.artifactKind,
+        backupId: backup.id,
+        backupName: backup.name,
+        bytes: artifact.bytes ?? backup.bytes,
+        checksumSha256: artifact.checksumSha256 ?? backup.checksumSha256,
+        createdAt: backup.createdAt,
+        downloadUrl: download.url,
+        expiresAt: download.expiresAt,
+        filename,
+        sharedBy: user.name,
+        sourceName,
+        targetId: backup.targetId,
+        targetKind: backup.targetKind,
+        tokenHash: createHash("sha256").update(id).digest("hex"),
+      })
     )
+    const shareUrl = new URL(`/downloads/${id}`, kilnPublicUrl())
+    return { expiresAt: download.expiresAt, url: shareUrl.toString() }
   })
 
 export const restoreInstanceBackup = createServerFn({ method: "POST" })

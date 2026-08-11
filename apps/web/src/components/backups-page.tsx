@@ -55,6 +55,7 @@ import {
 
 import { ServerScopePicker } from "@/components/server-scope-picker"
 import type { ServerPickerOption } from "@/components/server-picker-list"
+import { readFileDownloadPreferences } from "@/lib/file-download-preferences"
 import {
   WorkspaceDataTable,
   WorkspaceTableCell,
@@ -919,6 +920,7 @@ function DownloadBackupDialog({
           artifactId,
           backupId: backup.id,
           expiresInSeconds: mode === "download" ? 300 : expiresInSeconds,
+          preview: readFileDownloadPreferences().previewBackupDownloads,
         },
       }),
     onSuccess: (result, mode) => {

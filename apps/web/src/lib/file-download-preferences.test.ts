@@ -18,6 +18,7 @@ describe("file download preferences", () => {
       archiveFormat: "zip",
       compressByDefault: true,
       confirmBeforeDownload: true,
+      previewBackupDownloads: true,
     })
   })
 
@@ -27,11 +28,13 @@ describe("file download preferences", () => {
         archiveFormat: "gzip",
         compressByDefault: false,
         confirmBeforeDownload: false,
+        previewBackupDownloads: false,
       })
     ).toEqual({
       archiveFormat: "gzip",
       compressByDefault: false,
       confirmBeforeDownload: false,
+      previewBackupDownloads: false,
     })
     expect(
       normalizeFileDownloadPreferences({

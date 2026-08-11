@@ -6,12 +6,14 @@ export interface FileDownloadPreferences {
   archiveFormat: FileArchiveFormat
   compressByDefault: boolean
   confirmBeforeDownload: boolean
+  previewBackupDownloads: boolean
 }
 
 export const defaultFileDownloadPreferences: FileDownloadPreferences = {
   archiveFormat: "zip",
   compressByDefault: true,
   confirmBeforeDownload: true,
+  previewBackupDownloads: true,
 }
 
 const storageKey = "kiln:file-download-preferences:v1"
@@ -101,6 +103,11 @@ export function normalizeFileDownloadPreferences(
       typeof value.confirmBeforeDownload === "boolean"
         ? value.confirmBeforeDownload
         : defaultFileDownloadPreferences.confirmBeforeDownload,
+    previewBackupDownloads:
+      "previewBackupDownloads" in value &&
+      typeof value.previewBackupDownloads === "boolean"
+        ? value.previewBackupDownloads
+        : defaultFileDownloadPreferences.previewBackupDownloads,
   }
 }
 

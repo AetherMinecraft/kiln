@@ -48,6 +48,19 @@ export const FilesSettingsPage = React.memo(function FilesSettingsPage() {
         </SettingRow>
 
         <SettingRow
+          label="Backup link preview"
+          description="Open shared backup links on a Hearth preview page before downloading."
+        >
+          <Switch
+            aria-label="Show backup link preview"
+            checked={preferences.previewBackupDownloads}
+            onCheckedChange={(previewBackupDownloads) =>
+              update({ previewBackupDownloads })
+            }
+          />
+        </SettingRow>
+
+        <SettingRow
           label="Compress by default"
           description="Package files before downloading to reduce transfer size."
         >
