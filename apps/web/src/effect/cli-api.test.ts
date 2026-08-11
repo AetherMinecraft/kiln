@@ -3,6 +3,8 @@ import { Effect } from "effect"
 import { vi } from "vite-plus/test"
 import {
   cliBrickReferenceSchema,
+  cliBackupDownloadResponseSchema,
+  cliCreateBackupRequestSchema,
   cliRemoteFileUploadRequestSchema,
   cliServerInfoResponseSchema,
 } from "@workspace/contracts"
@@ -16,6 +18,7 @@ vi.hoisted(() => {
 
 import {
   cliActivityResponse,
+  cliDatabaseSupportsLogicalBackups,
   cliSftpConnectionResponse,
   collectAvailableCliRelaySnapshotsEffect,
   relayRemoteUploadInput,
@@ -74,6 +77,12 @@ describe("CLI SFTP connection", () => {
 })
 
 describe("CLI response and URL boundaries", () => {
+  it("only offers databases with logical backup support", () => {
+    assert.isTrue(cliDatabaseSupportsLogicalBackups({ engine: "postgres" }))
+    assert.isFalse(cliDatabaseSupportsLogicalBackups({ engine: "redis" }))
+    assert.isFalse(cliDatabaseSupportsLogicalBackups({ engine: "valkey" }))
+  })
+
   it("removes Hearth-only fields before returning activity", () => {
     const response = cliActivityResponse(
       [
@@ -141,6 +150,30 @@ describe("CLI response and URL boundaries", () => {
       cliBrickReferenceSchema.safeParse(
         "https://user:password@example.com/paper.yml"
       ).success
+    )
+  })
+
+  it("keeps backup targets typed and signed downloads HTTPS-only", () => {
+    assert.isTrue(
+      cliCreateBackupRequestSchema.safeParse({
+        name: "Platform backup",
+        relayId: "r".repeat(43),
+        targetKind: "platform",
+      }).success
+    )
+    assert.isFalse(
+      cliCreateBackupRequestSchema.safeParse({
+        name: "Server backup",
+        relayId: "r".repeat(43),
+        targetKind: "instance",
+      }).success
+    )
+    assert.isFalse(
+      cliBackupDownloadResponseSchema.safeParse({
+        expiresAt: "2026-08-10T00:00:00.000Z",
+        filename: "backup.zip",
+        url: "http://relay.example.com/backup.zip",
+      }).success
     )
   })
 
