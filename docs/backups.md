@@ -139,8 +139,9 @@ consistency. Filesystem snapshot adapters (ZFS/Btrfs/LVM) can be added later.
 Managed MySQL, MariaDB, and PostgreSQL databases stay running. Relay executes
 the engine's logical dump tool into a `.dmp` stream and compresses it as
 `.dmp.gz`; restore feeds the decompressed dump to the matching engine client.
-Redis and Valkey require an engine snapshot followed by compression and are
-reported as database dump artifacts even though their inner payload is RDB.
+Redis and Valkey backups are deferred until Kiln supports engine snapshots and
+compression. Their deletion therefore proceeds without a final backup instead
+of reserving a logical dump that Relay cannot create.
 
 A platform bundle contains a logical Hearth database dump plus a versioned
 manifest describing the installation and Relay registrations. Secret-bearing
@@ -235,12 +236,15 @@ and should be an optional Relay snapshot adapter rather than the default.
    downloads.
 4. `feat/backup-restore`: safe instance restore, optional pre-restore backup,
    final-backup-before-delete, and local download tokens.
-5. `feat/backup-databases-platform`: compressed logical database dumps,
-   database restore, Redis/Valkey snapshots, and encrypted Kiln bundles.
-6. `ui/backups`: Operations table, server Backups tab, filters, dialogs,
+5. `feat/backup-databases`: compressed logical MySQL, MariaDB, and PostgreSQL
+   dumps, database restore, and final-backup-before-delete.
+6. `feat/backup-platform`: encrypted Kiln bundles and offline disaster-recovery
+   restore tooling. Redis/Valkey snapshots follow once their consistency hook
+   and ACL-safe snapshot path are defined.
+7. `ui/backups`: Operations table, server Backups tab, filters, dialogs,
    progress/reconciliation, storage settings, accessibility, and responsive
    browser validation.
-7. `feat/backup-cli`: list/create/status/download/restore/delete/storage CLI,
+8. `feat/backup-cli`: list/create/status/download/restore/delete/storage CLI,
    help, README, and synchronized CLI skill documentation.
 
 Each layer receives targeted deterministic tests, full typecheck/lint, and a
