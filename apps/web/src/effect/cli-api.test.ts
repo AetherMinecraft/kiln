@@ -23,6 +23,7 @@ import {
   cliDatabaseSupportsLogicalBackups,
   cliPowerResponse,
   cliSftpConnectionResponse,
+  cliSftpUnavailableMessage,
   collectAvailableCliRelaySnapshotsEffect,
   relayRemoteUploadInput,
   safeCliBrickSource,
@@ -64,6 +65,7 @@ describe("CLI SFTP connection", () => {
         host: "relay.example.com",
         hostKeyFingerprint: "SHA256:relay-fingerprint",
         port: 2022,
+        publication: "published",
       },
       "bedf06fe944ceb0a573a14da5a38703068a00e5a",
       "operator@example.com"
@@ -76,6 +78,61 @@ describe("CLI SFTP connection", () => {
       root: "/bedf06fe944ceb0a573a14da5a38703068a00e5a",
       username: "operator@example.com",
     })
+  })
+
+  it("explains a proven missing Docker publication concisely", () => {
+    assert.strictEqual(
+      cliSftpUnavailableMessage({
+        developmentAuthentication: false,
+        host: "relay.example.com",
+        hostKeyFingerprint: "SHA256:relay-fingerprint",
+        port: 2022,
+        publication: "not_published",
+      }),
+      "Relay SFTP port 2022/tcp is not published by Docker. Publish the port and retry."
+    )
+  })
+
+  it("keeps a loopback-only publication connectable for a local CLI", () => {
+    assert.isNull(
+      cliSftpUnavailableMessage({
+        developmentAuthentication: false,
+        host: "127.0.0.1",
+        hostKeyFingerprint: "SHA256:relay-fingerprint",
+        port: 32_022,
+        publication: "loopback_only",
+      })
+    )
+    const response = cliSftpConnectionResponse(
+      {
+        developmentAuthentication: false,
+        host: "127.0.0.1",
+        hostKeyFingerprint: "SHA256:relay-fingerprint",
+        port: 32_022,
+        publication: "loopback_only",
+      },
+      "bedf06fe944ceb0a573a14da5a38703068a00e5a",
+      "operator@example.com"
+    )
+    assert.deepEqual(response, {
+      host: "127.0.0.1",
+      hostKeyFingerprint: "SHA256:relay-fingerprint",
+      port: 32_022,
+      root: "/bedf06fe944ceb0a573a14da5a38703068a00e5a",
+      username: "operator@example.com",
+    })
+  })
+
+  it("keeps standalone and rootless Relay SFTP usable when publication is unknown", () => {
+    assert.isNull(
+      cliSftpUnavailableMessage({
+        developmentAuthentication: false,
+        host: "relay.example.com",
+        hostKeyFingerprint: "SHA256:relay-fingerprint",
+        port: 2022,
+        publication: "unknown",
+      })
+    )
   })
 })
 
