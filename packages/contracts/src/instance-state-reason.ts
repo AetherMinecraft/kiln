@@ -8,6 +8,7 @@ const stateReasonWithoutDetailsSchema = z
       "health_check_failed",
       "container_restarting",
       "out_of_memory",
+      "out_of_memory_while_stopping",
       "unknown",
     ]),
   })
@@ -58,6 +59,8 @@ export function formatRelayInstanceStateReason(
       return "Docker is restarting the server container."
     case "out_of_memory":
       return "The server was stopped by an out-of-memory kill."
+    case "out_of_memory_while_stopping":
+      return "Stopping triggered an out-of-memory kill. The server is stopped, but shutdown was not graceful; increase memory or use its console stop command."
     case "process_exit":
       return `The server process exited with code ${reason.exitCode}.`
     case "automatic_recovery":

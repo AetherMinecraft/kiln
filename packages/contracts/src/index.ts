@@ -305,7 +305,6 @@ const relayRequestedDiskLimitBytesSchema = z
   .number()
   .int()
   .min(MINIMUM_INSTANCE_DISK_LIMIT_BYTES)
-  .default(DEFAULT_INSTANCE_DISK_LIMIT_BYTES)
 
 export function relayDiskAllocationAvailableBytes(
   nodeTotalBytes: number,
@@ -425,7 +424,9 @@ export const relayInstanceTailscaleSchema = z
   })
 
 export const relayCreateInstanceSchema = z.object({
-  diskLimitBytes: relayRequestedDiskLimitBytesSchema,
+  diskLimitBytes: relayRequestedDiskLimitBytesSchema.default(
+    DEFAULT_INSTANCE_DISK_LIMIT_BYTES
+  ),
   name: relayInstanceNameSchema.optional(),
   recipe: brickSourceSchema,
   tailscale: relayInstanceTailscaleSchema

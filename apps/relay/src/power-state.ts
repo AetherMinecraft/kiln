@@ -1,6 +1,7 @@
 import type {
   RelayInstanceRecovery,
   RelayInstanceStateReason,
+  RelayDesiredState,
   RelayObservedState,
 } from "@workspace/contracts"
 
@@ -106,7 +107,8 @@ export function instanceStateReason(
   state: ContainerPowerState,
   observedState: RelayObservedState,
   ready?: boolean,
-  recovery?: RelayInstanceRecovery | null
+  recovery?: RelayInstanceRecovery | null,
+  desiredState?: RelayDesiredState
 ): RelayInstanceStateReason | null {
   if (recovery) {
     return {
@@ -129,7 +131,14 @@ export function instanceStateReason(
     return { code: "waiting_for_readiness" }
   }
   if (observedState !== "failed") return null
-  if (state.OOMKilled) return { code: "out_of_memory" }
+  if (state.OOMKilled) {
+    return {
+      code:
+        desiredState === "stopped"
+          ? "out_of_memory_while_stopping"
+          : "out_of_memory",
+    }
+  }
   if (state.ExitCode !== 0 && state.ExitCode !== 143) {
     return { code: "process_exit", exitCode: state.ExitCode }
   }
