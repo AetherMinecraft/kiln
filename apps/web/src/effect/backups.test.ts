@@ -4,11 +4,12 @@ import type { ResultSetHeader, RowDataPacket } from "mysql2/promise"
 import type { RelayBackupTask } from "@workspace/contracts"
 
 import { Database } from "@/effect/database"
-import { BackupLimitError } from "@/effect/errors"
+import { BackupLimitError, BackupStorageError } from "@/effect/errors"
 import {
   backupReservation,
   effectiveBackupLimit,
   renameBackupEffect,
+  reserveBackupCopyEffect,
   reserveInstanceBackupEffect,
   reconcileBackupTaskEffect,
   shouldApplyRelayBackupTaskSnapshot,
@@ -308,8 +309,7 @@ describe("backup reconciliation", () => {
 
 describe("backup rename", () => {
   it("updates the backup name", async () => {
-    const executed: Array<{ sql: string; values?: ReadonlyArray<unknown> }> =
-      []
+    const executed: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
     const databaseLayer = Layer.succeed(Database)({
       execute: (_operation, sql, values) =>
         Effect.sync(() => {
@@ -333,6 +333,94 @@ describe("backup rename", () => {
     expect(executed[0]?.values).toEqual([
       "Weekly world",
       "11111111-1111-1111-1111-111111111111",
+    ])
+  })
+})
+
+describe("backup copy reservation", () => {
+  const input = {
+    artifactKind: "archive" as const,
+    backupId: "11111111-1111-4111-8111-111111111111",
+    filename: "backup.zip",
+    relayId: "relay-one",
+    requestedBy: "user-one",
+    sourceArtifactId: "22222222-2222-4222-8222-222222222222",
+    storageId: "33333333-3333-4333-8333-333333333333",
+    targetId: "instance-one",
+    targetKind: "instance" as const,
+  }
+
+  it("rejects a destination owned by another user", async () => {
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: () => Effect.die("Unexpected transaction write"),
+          queryRows: <TRow extends RowDataPacket>() =>
+            Effect.succeed([
+              {
+                id: input.storageId,
+                object_prefix: "backups",
+                owner_user_id: "user-two",
+              },
+            ] as unknown as ReadonlyArray<TRow>),
+        }),
+    })
+
+    await expect(
+      Effect.runPromise(
+        reserveBackupCopyEffect(input).pipe(Effect.provide(databaseLayer))
+      )
+    ).rejects.toBeInstanceOf(BackupStorageError)
+  })
+
+  it("queues the artifact and durable copy task", async () => {
+    const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
+    let queryCount = 0
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: (sql, values) =>
+            Effect.sync(() => {
+              writes.push({ sql, values })
+              return emptyResult
+            }),
+          queryRows: <TRow extends RowDataPacket>() =>
+            Effect.sync(() => {
+              queryCount += 1
+              return (queryCount === 1
+                ? [
+                    {
+                      id: input.storageId,
+                      object_prefix: "backups",
+                      owner_user_id: "user-one",
+                    },
+                  ]
+                : []) as unknown as ReadonlyArray<TRow>
+            }),
+        }),
+    })
+
+    const reserved = await Effect.runPromise(
+      reserveBackupCopyEffect(input).pipe(Effect.provide(databaseLayer))
+    )
+
+    expect(reserved.artifactId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+    )
+    expect(reserved.taskId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+    )
+    expect(writes[0]?.sql).toContain("'queued'")
+    expect(writes[1]?.sql).toContain("backup_copy_task")
+    expect(writes[1]?.values?.slice(1)).toEqual([
+      input.backupId,
+      input.sourceArtifactId,
+      reserved.artifactId,
+      input.requestedBy,
     ])
   })
 })

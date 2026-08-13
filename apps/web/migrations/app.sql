@@ -307,6 +307,28 @@ CREATE TABLE IF NOT EXISTS kiln_backup_artifact (
     FOREIGN KEY (storage_id) REFERENCES kiln_backup_storage (id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS kiln_backup_copy_task (
+  id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+  backup_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  source_artifact_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  destination_artifact_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  status ENUM('queued', 'running', 'succeeded', 'failed') NOT NULL,
+  requested_by VARCHAR(36) NOT NULL,
+  error TEXT NULL,
+  started_at TIMESTAMP(3) NULL,
+  finished_at TIMESTAMP(3) NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY kiln_backup_copy_task_destination_unique (destination_artifact_id),
+  KEY kiln_backup_copy_task_status_updated_idx (status, updated_at),
+  CONSTRAINT kiln_backup_copy_task_backup_fk
+    FOREIGN KEY (backup_id) REFERENCES kiln_backup (id) ON DELETE CASCADE,
+  CONSTRAINT kiln_backup_copy_task_source_artifact_fk
+    FOREIGN KEY (source_artifact_id) REFERENCES kiln_backup_artifact (id) ON DELETE CASCADE,
+  CONSTRAINT kiln_backup_copy_task_destination_artifact_fk
+    FOREIGN KEY (destination_artifact_id) REFERENCES kiln_backup_artifact (id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS kiln_backup_task (
   id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
   backup_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
