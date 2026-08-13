@@ -13,6 +13,8 @@ import { createBackupDownloadShareEffect } from "@/effect/backup-download-shares
 import {
   listBackupCatalogEffect,
   getInstanceBackupPolicyEffect,
+  renameBackupEffect,
+  reserveBackupCopyEffect,
   reserveBackupDeleteEffect,
   reserveBackupRestoreEffect,
   reserveDatabaseBackupEffect,
@@ -34,6 +36,8 @@ import {
   requireRelayPermission,
 } from "@/lib/access-control"
 import { hasBackupPermission } from "@/lib/backup-access"
+import { scheduleBackupCopyProcessing } from "@/lib/backup-copy"
+import { selectBackupCopySource } from "@/lib/backup-copy-source"
 import { signLocalBackupDownload } from "@/lib/backup-download"
 import { relayRpc } from "@/lib/relay-connection"
 import { signS3BackupDownload } from "@/lib/backup-storage-s3"
@@ -91,6 +95,16 @@ const platformBackupInputSchema = z.strictObject({
 })
 
 const backupIdInputSchema = z.strictObject({ backupId: z.uuid() })
+
+const renameBackupInputSchema = z.strictObject({
+  backupId: z.uuid(),
+  name: z.string().trim().min(1).max(120),
+})
+
+const copyBackupInputSchema = z.strictObject({
+  backupId: z.uuid(),
+  storageId: z.uuid(),
+})
 
 const backupDownloadInputSchema = z.strictObject({
   artifactId: z.uuid().optional(),
@@ -286,6 +300,7 @@ export const createPlatformBackup = createServerFn({ method: "POST" })
 export const getBackups = createServerFn({ method: "GET" }).handler(
   async () => {
     const user = await requireAuthenticatedUser()
+    scheduleBackupCopyProcessing()
     const relays = (await listPersistedRelays()).filter(
       (relay) => relay.enabled
     )
@@ -301,11 +316,20 @@ export const getBackups = createServerFn({ method: "GET" }).handler(
         )
         .map((backup) => backup.relayId)
     )
-    await Promise.allSettled(
-      relays
-        .filter((relay) => visibleRelayIds.has(relay.id))
-        .map((relay) => reconcileRelayBackups(relay, user.id))
+    const hasActiveRelayTasks = catalog.some(
+      (backup) =>
+        visibleRelayIds.has(backup.relayId) &&
+        (["queued", "running", "deleting"].includes(backup.status) ||
+          backup.taskStatus === "queued" ||
+          backup.taskStatus === "running")
     )
+    if (hasActiveRelayTasks) {
+      await Promise.allSettled(
+        relays
+          .filter((relay) => visibleRelayIds.has(relay.id))
+          .map((relay) => reconcileRelayBackups(relay, user.id))
+      )
+    }
     const reconciled = await runAppEffect(
       "backups.listReconciled",
       listBackupCatalogEffect()
@@ -366,6 +390,74 @@ export const deleteBackup = createServerFn({ method: "POST" })
       dispatchBackupTask(relay, input, user.id),
     ])
     return { relayAccepted: dispatched[0]?.status === "fulfilled" }
+  })
+
+export const renameBackup = createServerFn({ method: "POST" })
+  .validator(renameBackupInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const catalog = await runAppEffect(
+      "backups.listForRename",
+      listBackupCatalogEffect()
+    )
+    const backup = catalog.find((candidate) => candidate.id === data.backupId)
+    if (!backup) throw new Error("Backup not found")
+    const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+    if (!hasBackupPermission(user, grants, backup, "backup.create")) {
+      throw new Error("You do not have permission to rename this backup")
+    }
+    const renamed = await runAppEffect(
+      "backups.rename",
+      renameBackupEffect({
+        backupId: backup.id,
+        name: data.name,
+      })
+    )
+    if (!renamed) throw new Error("Backup not found")
+    return { name: data.name }
+  })
+
+export const copyBackupToDestination = createServerFn({ method: "POST" })
+  .validator(copyBackupInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const catalog = await runAppEffect(
+      "backups.listForCopy",
+      listBackupCatalogEffect()
+    )
+    const backup = catalog.find((candidate) => candidate.id === data.backupId)
+    if (!backup) throw new Error("Backup not found")
+    const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+    if (!hasBackupPermission(user, grants, backup, "backup.create")) {
+      throw new Error("You do not have permission to copy this backup")
+    }
+    await validateRequestedStorage(
+      { storageId: data.storageId },
+      user.id,
+      backup.targetKind === "platform"
+    )
+    const source = selectBackupCopySource(backup.artifacts)
+    if (!source) {
+      throw new Error("A successful backup file is required before copying")
+    }
+    const filename = source.filename ?? backup.filename
+    if (!filename) throw new Error("Backup filename is unavailable")
+    const reserved = await runAppEffect(
+      "backups.reserveCopy",
+      reserveBackupCopyEffect({
+        artifactKind: backup.artifactKind,
+        backupId: backup.id,
+        filename,
+        relayId: backup.relayId,
+        requestedBy: user.id,
+        sourceArtifactId: source.id,
+        storageId: data.storageId,
+        targetId: backup.targetId,
+        targetKind: backup.targetKind,
+      })
+    )
+    scheduleBackupCopyProcessing()
+    return { copied: false, queued: true, taskId: reserved.taskId }
   })
 
 export const getBackupDownloadUrl = createServerFn({ method: "POST" })

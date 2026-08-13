@@ -60,12 +60,16 @@ export const ServerPickerList = React.memo(function ServerPickerList({
     () =>
       normalizedQuery
         ? servers.filter((server) =>
-            `${server.name} ${server.id} ${server.relayName}`
+            `${server.name} ${server.id} ${server.relayName} ${server.kind ?? ""}`
               .toLocaleLowerCase()
               .includes(normalizedQuery)
           )
         : servers,
     [normalizedQuery, servers]
+  )
+  const groups = React.useMemo(
+    () => groupServerPickerOptions(visibleServers),
+    [visibleServers]
   )
 
   return (
@@ -96,23 +100,32 @@ export const ServerPickerList = React.memo(function ServerPickerList({
           />
         ) : null}
 
-        {visibleServers.map((server) => {
-          const key = serverPickerOptionKey(server)
-          return (
-            <ServerPickerRow
-              key={key}
-              description={
-                server.description ?? `${server.relayName} · ${server.id}`
-              }
-              disabled={server.disabled || pendingKey !== undefined}
-              kind={server.kind}
-              name={server.name}
-              pending={pendingKey === key}
-              selected={selectedKeys.has(key)}
-              onSelect={() => onSelect(server)}
-            />
-          )
-        })}
+        {groups.map((group) => (
+          <React.Fragment key={group.label ?? "items"}>
+            {group.label ? (
+              <p className="px-2.5 pt-2 pb-1 text-[0.625rem] font-semibold tracking-wide text-muted-foreground uppercase">
+                {group.label}
+              </p>
+            ) : null}
+            {group.items.map((server) => {
+              const key = serverPickerOptionKey(server)
+              return (
+                <ServerPickerRow
+                  key={key}
+                  description={
+                    server.description ?? `${server.relayName} · ${server.id}`
+                  }
+                  disabled={server.disabled || pendingKey !== undefined}
+                  kind={server.kind}
+                  name={server.name}
+                  pending={pendingKey === key}
+                  selected={selectedKeys.has(key)}
+                  onSelect={() => onSelect(server)}
+                />
+              )
+            })}
+          </React.Fragment>
+        ))}
 
         {visibleServers.length === 0 ? (
           <p className="px-3 py-6 text-center text-xs text-muted-foreground">
@@ -179,3 +192,33 @@ const ServerPickerRow = React.memo(function ServerPickerRow({
     </button>
   )
 })
+
+function groupServerPickerOptions(
+  servers: ReadonlyArray<ServerPickerOption>
+): Array<{ items: ReadonlyArray<ServerPickerOption>; label: string | null }> {
+  const grouped = {
+    database: [] as Array<ServerPickerOption>,
+    relay: [] as Array<ServerPickerOption>,
+    server: [] as Array<ServerPickerOption>,
+  }
+  for (const server of servers) {
+    grouped[server.kind ?? "server"].push(server)
+  }
+  if (grouped.database.length === 0 && grouped.relay.length === 0) {
+    return [{ items: servers, label: null }]
+  }
+  return [
+    grouped.server.length
+      ? { items: grouped.server, label: "Servers" }
+      : null,
+    grouped.database.length
+      ? { items: grouped.database, label: "Databases" }
+      : null,
+    grouped.relay.length ? { items: grouped.relay, label: "Relays" } : null,
+  ].filter(
+    (
+      group
+    ): group is { items: Array<ServerPickerOption>; label: string } =>
+      group !== null
+  )
+}

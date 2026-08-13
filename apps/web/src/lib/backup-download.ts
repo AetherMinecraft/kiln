@@ -7,7 +7,7 @@ import { loadRelayCredentials, type PersistedRelay } from "@/lib/relay-registry"
 
 export async function signLocalBackupDownload(
   relay: PersistedRelay,
-  backup: BackupCatalogRecord,
+  backup: Pick<BackupCatalogRecord, "id">,
   filename: string,
   subject: string,
   expiresInSeconds: number

@@ -43,6 +43,27 @@ interface BackupArtifactRow extends RowDataPacket {
   storage_id: string | null
 }
 
+interface BackupCopyTaskRow extends RowDataPacket {
+  artifact_kind: BackupRow["artifact_kind"]
+  backup_id: string
+  backup_bytes: number | string | null
+  backup_checksum_sha256: string | null
+  destination_artifact_id: string
+  destination_object_key: string
+  destination_storage_id: string
+  filename: string
+  relay_id: string
+  requested_by: string
+  source_artifact_id: string
+  source_bytes: number | string | null
+  source_checksum_sha256: string | null
+  source_object_key: string | null
+  source_storage_id: string | null
+  target_id: string
+  target_kind: BackupRow["target_kind"]
+  task_id: string
+}
+
 interface BackupUsageRow extends RowDataPacket {
   quantity_used: number | string
   size_used: number | string
@@ -162,6 +183,25 @@ export interface BackupArtifactRecord {
   objectKey: string | null
   status: BackupArtifactRow["status"]
   storageId: string | null
+}
+
+export interface ClaimedBackupCopyTask {
+  artifactKind: BackupRow["artifact_kind"]
+  backupId: string
+  bytes: number | null
+  checksumSha256: string | null
+  destinationArtifactId: string
+  destinationObjectKey: string
+  destinationStorageId: string
+  filename: string
+  relayId: string
+  requestedBy: string
+  sourceArtifactId: string
+  sourceObjectKey: string | null
+  sourceStorageId: string | null
+  targetId: string
+  targetKind: BackupRow["target_kind"]
+  taskId: string
 }
 
 export interface BackupDispatchArtifact {
@@ -1134,6 +1174,12 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
                    AND active_task.task_kind = 'restore'
                    AND active_task.status IN ('queued', 'running')
               )
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM ${databaseTable("backup_copy_task")} active_copy
+                 WHERE active_copy.backup_id = backup.id
+                   AND active_copy.status IN ('queued', 'running')
+              )
             FOR UPDATE`,
           [input.backupId]
         )
@@ -1174,6 +1220,298 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
         } satisfies BackupDeleteDispatch
       })
     )
+  }
+)
+
+export const reserveBackupCopyEffect = Effect.fn("backups.reserveCopy")(
+  function* (input: {
+    artifactKind: BackupRow["artifact_kind"]
+    backupId: string
+    filename: string | null
+    relayId: string
+    requestedBy: string
+    sourceArtifactId: string
+    storageId: string
+    targetId: string
+    targetKind: BackupRow["target_kind"]
+  }) {
+    const database = yield* Database
+    return yield* database.transaction("backup_copy_reserve", (transaction) =>
+      Effect.gen(function* () {
+        const source = (yield* transaction.queryRows<
+          { id: string } & RowDataPacket
+        >(
+          `SELECT artifact.id
+             FROM ${databaseTable("backup")} backup
+             JOIN ${databaseTable("backup_artifact")} artifact
+               ON artifact.backup_id = backup.id
+            WHERE backup.id = ? AND backup.status = 'available'
+              AND artifact.id = ? AND artifact.status = 'available'
+            LIMIT 1
+            FOR UPDATE`,
+          [input.backupId, input.sourceArtifactId]
+        ))[0]
+        if (!source) {
+          return yield* BackupStorageError.make({
+            code: "backup_unavailable",
+            operation: "backup.copy",
+            reason: "A successful backup file is required before copying",
+          })
+        }
+        const storage = (yield* transaction.queryRows<BackupStorageKeyRow>(
+          `SELECT id, object_prefix, owner_user_id
+               FROM ${databaseTable("backup_storage")}
+              WHERE id = ? AND enabled = TRUE
+              LIMIT 1`,
+          [input.storageId]
+        ))[0]
+        if (!storage) {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "backup.copy",
+            reason: "The backup destination is unavailable",
+          })
+        }
+        if (
+          input.targetKind === "platform"
+            ? storage.owner_user_id !== null
+            : storage.owner_user_id !== null &&
+              storage.owner_user_id !== input.requestedBy
+        ) {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "backup.copy",
+            reason:
+              input.targetKind === "platform"
+                ? "Kiln platform backups require platform-owned destinations"
+                : "The backup destination is unavailable",
+          })
+        }
+        const existing = (yield* transaction.queryRows<BackupArtifactRow>(
+          `SELECT artifact.id, artifact.backup_id, artifact.storage_id,
+                    artifact.status, artifact.filename, artifact.object_key,
+                    artifact.bytes, artifact.checksum_sha256, artifact.error
+               FROM ${databaseTable("backup_artifact")} artifact
+              WHERE artifact.backup_id = ? AND artifact.destination_key = ?
+              LIMIT 1`,
+          [input.backupId, input.storageId]
+        ))[0]
+        if (
+          existing &&
+          (existing.status === "available" ||
+            existing.status === "queued" ||
+            existing.status === "running")
+        ) {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "backup.copy",
+            reason:
+              existing.status === "available"
+                ? "This backup is already stored on that destination"
+                : "This backup is already copying to that destination",
+          })
+        }
+        const objectKey = backupObjectKey({
+          artifactKind: input.artifactKind,
+          backupId: input.backupId,
+          installationId: kilnInstallationId(),
+          objectPrefix: storage.object_prefix,
+          relayId: input.relayId,
+          targetId: input.targetId,
+          targetKind: input.targetKind,
+        })
+        const artifactId = existing?.id ?? randomUUID()
+        if (existing) {
+          yield* transaction.execute(
+            `UPDATE ${databaseTable("backup_artifact")}
+                SET status = 'queued', object_key = ?, filename = ?,
+                    error = NULL, completed_at = NULL, deleted_at = NULL
+              WHERE id = ?`,
+            [objectKey, input.filename, artifactId]
+          )
+        } else {
+          yield* transaction.execute(
+            `INSERT INTO ${databaseTable("backup_artifact")}
+              (id, backup_id, destination_key, storage_id, status, filename,
+               object_key)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?)`,
+            [
+              artifactId,
+              input.backupId,
+              input.storageId,
+              input.storageId,
+              input.filename,
+              objectKey,
+            ]
+          )
+        }
+        const taskId = randomUUID()
+        yield* transaction.execute(
+          `INSERT INTO ${databaseTable("backup_copy_task")}
+            (id, backup_id, source_artifact_id, destination_artifact_id,
+             status, requested_by)
+           VALUES (?, ?, ?, ?, 'queued', ?)
+           ON DUPLICATE KEY UPDATE
+             id = VALUES(id), source_artifact_id = VALUES(source_artifact_id),
+             status = 'queued', requested_by = VALUES(requested_by),
+             error = NULL, started_at = NULL, finished_at = NULL`,
+          [
+            taskId,
+            input.backupId,
+            input.sourceArtifactId,
+            artifactId,
+            input.requestedBy,
+          ]
+        )
+        return { artifactId, objectKey, taskId }
+      })
+    )
+  }
+)
+
+export const listRunnableBackupCopyTaskIdsEffect = Effect.fn(
+  "backups.listRunnableCopies"
+)(function* () {
+  const database = yield* Database
+  const rows = yield* database.queryRows<{ id: string } & RowDataPacket>(
+    "backup_copy_runnable_list",
+    `SELECT id
+       FROM ${databaseTable("backup_copy_task")}
+      WHERE status = 'queued'
+         OR (status = 'running' AND updated_at < CURRENT_TIMESTAMP(3) - INTERVAL 15 MINUTE)
+      ORDER BY created_at ASC, id ASC`
+  )
+  return rows.map((row) => row.id)
+})
+
+export const claimBackupCopyTaskEffect = Effect.fn("backups.claimCopy")(
+  function* (taskId: string) {
+    const database = yield* Database
+    return yield* database.transaction("backup_copy_claim", (transaction) =>
+      Effect.gen(function* () {
+        const task = (yield* transaction.queryRows<BackupCopyTaskRow>(
+          `SELECT task.id AS task_id, task.backup_id, task.requested_by,
+                    task.source_artifact_id, task.destination_artifact_id,
+                    backup.relay_id, backup.target_kind, backup.target_id,
+                    backup.artifact_kind, backup.bytes AS backup_bytes,
+                    backup.checksum_sha256 AS backup_checksum_sha256,
+                    source.storage_id AS source_storage_id,
+                    source.object_key AS source_object_key,
+                    source.bytes AS source_bytes,
+                    source.checksum_sha256 AS source_checksum_sha256,
+                    destination.storage_id AS destination_storage_id,
+                    destination.object_key AS destination_object_key,
+                    COALESCE(source.filename, backup.filename) AS filename
+               FROM ${databaseTable("backup_copy_task")} task
+               JOIN ${databaseTable("backup")} backup ON backup.id = task.backup_id
+               JOIN ${databaseTable("backup_artifact")} source
+                 ON source.id = task.source_artifact_id
+               JOIN ${databaseTable("backup_artifact")} destination
+                 ON destination.id = task.destination_artifact_id
+              WHERE task.id = ?
+                AND (task.status = 'queued'
+                  OR (task.status = 'running'
+                    AND task.updated_at < CURRENT_TIMESTAMP(3) - INTERVAL 15 MINUTE))
+                AND source.status = 'available'
+                AND destination.storage_id IS NOT NULL
+                AND destination.object_key IS NOT NULL
+              LIMIT 1
+              FOR UPDATE`,
+          [taskId]
+        ))[0]
+        if (!task) return null
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("backup_copy_task")}
+              SET status = 'running', error = NULL,
+                  started_at = CURRENT_TIMESTAMP(3), finished_at = NULL
+            WHERE id = ?`,
+          [task.task_id]
+        )
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("backup_artifact")}
+              SET status = 'running', error = NULL
+            WHERE id = ?`,
+          [task.destination_artifact_id]
+        )
+        return {
+          artifactKind: task.artifact_kind,
+          backupId: task.backup_id,
+          bytes: nullableDatabaseNumber(
+            task.source_bytes ?? task.backup_bytes,
+            "backup copy bytes"
+          ),
+          checksumSha256:
+            task.source_checksum_sha256 ?? task.backup_checksum_sha256,
+          destinationArtifactId: task.destination_artifact_id,
+          destinationObjectKey: task.destination_object_key,
+          destinationStorageId: task.destination_storage_id,
+          filename: task.filename,
+          relayId: task.relay_id,
+          requestedBy: task.requested_by,
+          sourceArtifactId: task.source_artifact_id,
+          sourceObjectKey: task.source_object_key,
+          sourceStorageId: task.source_storage_id,
+          targetId: task.target_id,
+          targetKind: task.target_kind,
+          taskId: task.task_id,
+        } satisfies ClaimedBackupCopyTask
+      })
+    )
+  }
+)
+
+export const completeBackupCopyTaskEffect = Effect.fn("backups.completeCopy")(
+  function* (input: {
+    artifactId: string
+    backupId: string
+    bytes: number | null
+    checksumSha256: string | null
+    error: string | null
+    filename: string | null
+    ok: boolean
+    taskId: string
+  }) {
+    const database = yield* Database
+    yield* database.transaction("backup_copy_complete", (transaction) =>
+      Effect.gen(function* () {
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("backup_artifact")}
+              SET status = ?, filename = ?, bytes = ?, checksum_sha256 = ?,
+                  error = ?, completed_at = FROM_UNIXTIME(? / 1000)
+            WHERE id = ? AND backup_id = ?`,
+          [
+            input.ok ? "available" : "failed",
+            input.filename,
+            input.ok ? input.bytes : null,
+            input.ok ? input.checksumSha256 : null,
+            input.error,
+            Date.now(),
+            input.artifactId,
+            input.backupId,
+          ]
+        )
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("backup_copy_task")}
+              SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP(3)
+            WHERE id = ?`,
+          [input.ok ? "succeeded" : "failed", input.error, input.taskId]
+        )
+      })
+    )
+  }
+)
+
+export const renameBackupEffect = Effect.fn("backups.rename")(
+  function* (input: { backupId: string; name: string }) {
+    const database = yield* Database
+    const result = yield* database.execute(
+      "backup_rename",
+      `UPDATE ${databaseTable("backup")}
+        SET name = ?
+      WHERE id = ? AND status <> 'deleted'`,
+      [input.name, input.backupId]
+    )
+    return result.affectedRows > 0
   }
 )
 

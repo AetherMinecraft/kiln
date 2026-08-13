@@ -3,6 +3,7 @@ import { lookup } from "node:dns"
 import { Agent } from "node:https"
 import { BlockList, isIP } from "node:net"
 import type { LookupFunction } from "node:net"
+import { Readable } from "node:stream"
 
 import {
   DeleteObjectCommand,
@@ -24,6 +25,8 @@ import { BackupStorageError } from "@/effect/errors"
 
 const CONNECTION_TEST_PREFIX = "kiln/connection-tests"
 const PRESIGNED_UPLOAD_SECONDS = 7 * 24 * 60 * 60
+const DEFAULT_S3_REQUEST_TIMEOUT_MS = 30_000
+const BACKUP_TRANSFER_IDLE_TIMEOUT_MS = 60_000
 const BLOCKED_ADDRESSES = new BlockList()
 const BLOCKED_IPV4: ReadonlyArray<readonly [string, number]> = [
   ["0.0.0.0", 8],
@@ -161,35 +164,112 @@ export function verifyS3BackupCredential(credential: S3BackupCredential) {
     .join("/")
   return withS3Client(credential, (client) =>
     Effect.acquireUseRelease(
-      s3Request("storage.verify.put", () =>
+      s3Request("storage.verify.put", (signal) =>
         client.send(
           new PutObjectCommand({
             Body: new Uint8Array(),
             Bucket: credential.bucket,
             ContentType: "application/octet-stream",
             Key: objectKey,
-          })
+          }),
+          { abortSignal: signal }
         )
       ),
       () =>
-        s3Request("storage.verify.head", () =>
+        s3Request("storage.verify.head", (signal) =>
           client.send(
             new HeadObjectCommand({
               Bucket: credential.bucket,
               Key: objectKey,
-            })
+            }),
+            { abortSignal: signal }
           )
         ),
       () =>
-        s3Request("storage.verify.delete", () =>
+        s3Request("storage.verify.delete", (signal) =>
           client.send(
             new DeleteObjectCommand({
               Bucket: credential.bucket,
               Key: objectKey,
-            })
+            }),
+            { abortSignal: signal }
           )
         ).pipe(Effect.ignore)
     ).pipe(Effect.asVoid)
+  )
+}
+
+export function putS3BackupObject(
+  credential: S3BackupCredential,
+  input: {
+    body: Readable | Uint8Array
+    contentLength?: number
+    contentType?: string
+    objectKey: string
+  }
+) {
+  return withS3Client(
+    credential,
+    (client) =>
+      s3Request("storage.putObject", (signal) =>
+        client.send(
+          new PutObjectCommand({
+            Body: input.body,
+            Bucket: credential.bucket,
+            ContentLength: input.contentLength,
+            ContentType: input.contentType ?? "application/zip",
+            Key: input.objectKey,
+          }),
+          { abortSignal: signal }
+        )
+      ).pipe(Effect.asVoid),
+    BACKUP_TRANSFER_IDLE_TIMEOUT_MS
+  )
+}
+
+export function withS3BackupObject<TResult, TError, TRequirements>(
+  credential: S3BackupCredential,
+  objectKey: string,
+  use: (input: {
+    body: Readable
+    contentLength: number | undefined
+  }) => Effect.Effect<TResult, TError, TRequirements>
+) {
+  return withS3Client(
+    credential,
+    (client) =>
+      Effect.gen(function* () {
+        const output = yield* s3Request("storage.getObject", (signal) =>
+          client.send(
+            new GetObjectCommand({
+              Bucket: credential.bucket,
+              Key: objectKey,
+            }),
+            { abortSignal: signal }
+          )
+        )
+        if (!(output.Body instanceof Readable)) {
+          return yield* Effect.fail(
+            backupStorageError(
+              "invalid_s3_body",
+              "storage.getObject",
+              "The S3-compatible storage response could not be streamed"
+            )
+          )
+        }
+        const body = output.Body
+        return yield* use({
+          body,
+          contentLength: output.ContentLength,
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              body.destroy()
+            })
+          )
+        )
+      }),
+    BACKUP_TRANSFER_IDLE_TIMEOUT_MS
   )
 }
 
@@ -301,11 +381,12 @@ export function signS3BackupRestore(
 
 function withS3Client<TResult, TError, TRequirements>(
   credential: S3BackupCredential,
-  use: (client: S3Client) => Effect.Effect<TResult, TError, TRequirements>
+  use: (client: S3Client) => Effect.Effect<TResult, TError, TRequirements>,
+  requestTimeout = DEFAULT_S3_REQUEST_TIMEOUT_MS
 ) {
   return Effect.acquireUseRelease(
     Effect.try({
-      try: () => makeS3Client(credential),
+      try: () => makeS3Client(credential, requestTimeout),
       catch: (cause) =>
         backupStorageError(
           "invalid_s3_client",
@@ -322,7 +403,10 @@ function withS3Client<TResult, TError, TRequirements>(
   )
 }
 
-function makeS3Client(credential: S3BackupCredential): S3Client {
+function makeS3Client(
+  credential: S3BackupCredential,
+  socketTimeout: number
+): S3Client {
   const endpoint = normalizeS3Endpoint(credential.endpoint)
   const endpointHost = new URL(endpoint).hostname.replace(/^\[|\]$/gu, "")
   if (
@@ -336,13 +420,13 @@ function makeS3Client(credential: S3BackupCredential): S3Client {
       "The S3 endpoint resolves to a private or reserved network address"
     )
   }
-  const requestHandler = credential.allowPrivateNetwork
-    ? undefined
-    : new NodeHttpHandler({
-        connectionTimeout: 10_000,
-        httpsAgent: new Agent({ lookup: publicS3Lookup }),
-        requestTimeout: 30_000,
-      })
+  const requestHandler = new NodeHttpHandler({
+    connectionTimeout: 10_000,
+    ...(credential.allowPrivateNetwork
+      ? {}
+      : { httpsAgent: new Agent({ lookup: publicS3Lookup }) }),
+    socketTimeout,
+  })
   return new S3Client({
     credentials: {
       accessKeyId: credential.accessKeyId,
@@ -351,7 +435,7 @@ function makeS3Client(credential: S3BackupCredential): S3Client {
     endpoint,
     forcePathStyle: credential.forcePathStyle,
     region: credential.region,
-    ...(requestHandler === undefined ? {} : { requestHandler }),
+    requestHandler,
   })
 }
 
@@ -426,7 +510,7 @@ function normalizePeerAddress(value: string): string {
 
 function s3Request<TResult>(
   operation: string,
-  request: () => Promise<TResult>
+  request: (signal: AbortSignal) => Promise<TResult>
 ) {
   return Effect.tryPromise({
     try: request,

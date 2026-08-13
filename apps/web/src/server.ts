@@ -6,6 +6,7 @@ import { Effect } from "effect"
 
 import { hearthStreamHandler } from "./app-server-handler"
 import { disposeAppRuntime } from "./effect/runtime"
+import { scheduleBackupCopyProcessing } from "./lib/backup-copy"
 import {
   initializeRelayFromEnvironment,
   maintainPersistedRelayConnections,
@@ -46,6 +47,8 @@ await Effect.runPromise(
     )
   )
 )
+
+scheduleBackupCopyProcessing()
 
 const handleStartRequest = createStartHandler(hearthStreamHandler)
 
