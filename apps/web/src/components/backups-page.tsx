@@ -646,11 +646,11 @@ const BackupTableHead = React.memo(function BackupTableHead() {
       <WorkspaceTableHeading className="w-auto sm:w-[26%]">
         Backup
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[18%] sm:table-cell">
-        File
-      </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[22%] md:table-cell">
         Target
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[18%] sm:table-cell">
+        File
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-24 lg:table-cell">
         Size
@@ -719,17 +719,17 @@ const BackupTableRow = React.memo(function BackupTableRow({
           />
         </div>
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground sm:table-cell">
-        <span className="block truncate" title={backup.filename ?? backup.id}>
-          {backup.filename ?? backup.id}
-        </span>
-      </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 md:table-cell">
         <BackupTargetLink
           available={targetAvailable}
           backup={backup}
           target={target}
         />
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground sm:table-cell">
+        <span className="block truncate" title={backup.filename ?? backup.id}>
+          {backup.filename ?? backup.id}
+        </span>
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground lg:table-cell">
         {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
