@@ -263,10 +263,15 @@ describe("instance power state", () => {
     ).toEqual({ code: "process_exit", exitCode: 42 })
   })
 
-  it("distinguishes an OOM kill during an intentional stop", () => {
+  it("does not infer whether stopped intent preceded an OOM kill", () => {
+    const oomKilled = containerState({ OOMKilled: true, Running: false })
+
+    expect(
+      instanceStateReason(oomKilled, "failed", undefined, null, "running")
+    ).toEqual({ code: "out_of_memory" })
     expect(
       instanceStateReason(
-        containerState({ OOMKilled: true, Running: false }),
+        oomKilled,
         "failed",
         undefined,
         null,

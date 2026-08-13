@@ -21,13 +21,13 @@ describe("server state reasons", () => {
     )
   })
 
-  it("explains an OOM kill during a requested stop", () => {
+  it("does not claim stopped intent caused an OOM kill", () => {
     expect(
       formatRelayInstanceStateReason({
         code: "out_of_memory_while_stopping",
       })
     ).toBe(
-      "Stopping triggered an out-of-memory kill. The server is stopped, but shutdown was not graceful; increase memory or use its console stop command."
+      "The server is stopped after an out-of-memory kill. The process may not have shut down gracefully; increase memory or use its console stop command."
     )
   })
 })
