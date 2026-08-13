@@ -162,7 +162,7 @@ const AppSidebarView = React.memo(function AppSidebarView({
               tooltip="Kiln"
             >
               <HearthMark />
-              <span className="min-w-0 flex-1 truncate font-heading text-[15px] font-semibold tracking-[-0.02em]">
+              <span className="min-w-0 flex-1 truncate font-heading text-[0.9375rem] font-semibold tracking-[-0.02em]">
                 Kiln
               </span>
             </SidebarMenuButton>
@@ -191,7 +191,7 @@ function InfrastructureNavigation({
 }) {
   return (
     <SidebarGroup className="pt-2">
-      <SidebarGroupLabel className="text-[10px] tracking-[0.12em] uppercase">
+      <SidebarGroupLabel className="text-[0.625rem] tracking-[0.12em] uppercase">
         Infrastructure
       </SidebarGroupLabel>
       <SidebarGroupContent>
@@ -405,7 +405,7 @@ const InstanceNavigation = React.memo(function InstanceNavigation({
 
   return (
     <SidebarGroup>
-      <SidebarGroupLabel className="text-[10px] tracking-[0.12em] uppercase">
+      <SidebarGroupLabel className="text-[0.625rem] tracking-[0.12em] uppercase">
         Selected server
       </SidebarGroupLabel>
       <SidebarGroupContent>
@@ -494,7 +494,7 @@ const ServerSelector = React.memo(function ServerSelector({
               <span className="w-full truncate text-xs font-semibold">
                 {instance?.name ?? "Choose a server"}
               </span>
-              <span className="mt-1 truncate font-mono text-[9px] text-sidebar-foreground/60">
+              <span className="mt-1 truncate font-mono text-[0.5625rem] text-sidebar-foreground/60">
                 {instance
                   ? `${instance.implementation} ${instance.version} · ${instance.shortId}`
                   : instances.length === 0
@@ -513,7 +513,7 @@ const ServerSelector = React.memo(function ServerSelector({
         >
           <div className="flex items-center justify-between px-2 py-1.5 text-sm font-semibold">
             <span>Managed servers</span>
-            <span className="font-mono text-[10px] font-normal text-muted-foreground">
+            <span className="font-mono text-[0.625rem] font-normal text-muted-foreground">
               {instances.length} discovered
             </span>
           </div>
@@ -535,12 +535,12 @@ const ServerSelector = React.memo(function ServerSelector({
           ) : (
             <div className="px-2 py-3">
               <p className="text-xs font-medium">No managed servers</p>
-              <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
+              <p className="mt-1 text-[0.625rem] leading-4 text-muted-foreground">
                 Open the server workspace to provision or discover a server.
               </p>
               <Link
                 to="/infra/servers"
-                className="mt-2 inline-flex text-[10px] font-medium text-primary hover:underline"
+                className="mt-2 inline-flex text-[0.625rem] font-medium text-primary hover:underline"
               >
                 View servers
               </Link>
@@ -576,12 +576,12 @@ const ServerSelectorItem = React.memo(function ServerSelectorItem({
       />
       <span className="min-w-0 flex-1">
         <span className="block truncate text-xs font-medium">{item.name}</span>
-        <span className="block truncate font-mono text-[9px] text-muted-foreground">
+        <span className="block truncate font-mono text-[0.5625rem] text-muted-foreground">
           {item.implementation} {item.version} · {item.shortId}
         </span>
       </span>
       {active ? (
-        <span className="font-mono text-[9px] text-primary">ACTIVE</span>
+        <span className="font-mono text-[0.5625rem] text-primary">ACTIVE</span>
       ) : null}
     </button>
   )
@@ -747,7 +747,7 @@ function AccountNavigation({
               size="sm"
               className="rounded-none group-data-[collapsible=icon]:hidden"
             >
-              <AvatarFallback className="rounded-none bg-primary/12 text-[10px] font-bold text-primary">
+              <AvatarFallback className="rounded-none bg-primary/12 text-[0.625rem] font-bold text-primary">
                 {initials(user.name)}
               </AvatarFallback>
             </Avatar>
@@ -755,7 +755,7 @@ function AccountNavigation({
               <span className="w-full truncate text-xs font-semibold">
                 {user.name}
               </span>
-              <span className="mt-1 w-full truncate text-[10px] text-sidebar-foreground/60">
+              <span className="mt-1 w-full truncate text-[0.625rem] text-sidebar-foreground/60">
                 {user.isDevelopmentBypass ? "Development bypass" : user.email}
               </span>
             </span>

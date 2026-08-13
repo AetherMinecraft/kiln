@@ -634,7 +634,7 @@ const RelayTableRow = React.memo(function RelayTableRow({
         version={version}
         onOpenUpdates={onOpenUpdates}
       />
-      <WorkspaceTableCell className="hidden font-mono text-[9px] whitespace-nowrap text-foreground sm:table-cell">
+      <WorkspaceTableCell className="hidden font-mono text-[0.5625rem] whitespace-nowrap text-foreground sm:table-cell">
         <RelayUptime relayId={relayId} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="px-1 sm:px-3 sm:pr-3">
@@ -691,7 +691,7 @@ const RelayStaticCells = React.memo(function RelayStaticCells({
           <p className="truncate text-xs font-semibold text-foreground">
             {relay.name}
           </p>
-          <p className="truncate font-mono text-[8px] text-foreground lg:hidden">
+          <p className="truncate font-mono text-[0.5rem] text-foreground lg:hidden">
             {relay.hostname}
           </p>
           <div className="mt-0.5 lg:hidden">
@@ -711,7 +711,7 @@ const RelayStaticCells = React.memo(function RelayStaticCells({
           <TooltipTrigger asChild>
             <span
               tabIndex={0}
-              className="inline-block cursor-default font-mono text-[9px] text-foreground outline-none"
+              className="inline-block cursor-default font-mono text-[0.5625rem] text-foreground outline-none"
             >
               {shortRelayId(relayId)}
             </span>
@@ -726,7 +726,7 @@ const RelayStaticCells = React.memo(function RelayStaticCells({
           <TooltipTrigger asChild>
             <span
               tabIndex={0}
-              className="block min-w-0 cursor-default truncate font-mono text-[9px] text-foreground outline-none"
+              className="block min-w-0 cursor-default truncate font-mono text-[0.5625rem] text-foreground outline-none"
             >
               {relay.hostname}
             </span>
@@ -747,7 +747,7 @@ const RelayStaticCells = React.memo(function RelayStaticCells({
         />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden xl:table-cell">
-        <span className="font-mono text-[9px] text-foreground">
+        <span className="font-mono text-[0.5625rem] text-foreground">
           {relay.nodeArch ?? "—"}
         </span>
       </WorkspaceTableCell>
@@ -1009,7 +1009,7 @@ const RelayStatus = React.memo(function RelayStatus({
   const indicator = (
     <span
       aria-label={status.label}
-      className={`inline-flex items-center gap-1.5 text-[10px] font-medium ${status.text}`}
+      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium ${status.text}`}
     >
       <span className={`size-1.5 shrink-0 rounded-full ${status.dot}`} />
       <span className="hidden sm:inline">{status.label}</span>
@@ -1123,10 +1123,10 @@ const RelayUptimeDetails = React.memo(function RelayUptimeDetails({
 function TooltipDetail({ label, value }: { label: string; value: string }) {
   return (
     <span className="grid gap-0.5">
-      <span className="font-mono text-[8px] tracking-[0.12em] text-primary uppercase">
+      <span className="font-mono text-[0.5rem] tracking-[0.12em] text-primary uppercase">
         {label}
       </span>
-      <span className="text-[10px] text-foreground">{value}</span>
+      <span className="text-[0.625rem] text-foreground">{value}</span>
     </span>
   )
 }
@@ -1144,7 +1144,7 @@ function EmptyRelayTable({
       <p className="mt-3 text-sm font-semibold">
         {searchActive ? "No relays match your search" : "No saved Relays"}
       </p>
-      <p className="mt-1 max-w-sm text-[10px] leading-4 text-muted-foreground">
+      <p className="mt-1 max-w-sm text-[0.625rem] leading-4 text-muted-foreground">
         {searchActive
           ? "Try a relay name, ID, hostname, architecture, or version."
           : "Pair the first Relay to start managing game servers from Hearth."}
@@ -1255,7 +1255,7 @@ function AddRelayDialog({
     <Dialog open={open} onOpenChange={changeOpen}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
-          <p className="font-mono text-[9px] tracking-[0.16em] text-primary uppercase">
+          <p className="font-mono text-[0.5625rem] tracking-[0.16em] text-primary uppercase">
             {reviewedPairing?.preview.mode === "repair"
               ? "Existing connection"
               : "New connection"}
@@ -1294,10 +1294,10 @@ function AddRelayDialog({
                 <Input
                   id="relay-pairing-command"
                   value="docker exec <container-id> kiln-relay pair create"
-                  className="font-mono text-[9px]"
+                  className="font-mono text-[0.5625rem]"
                   readOnly
                 />
-                <p className="text-[9px] leading-4 text-muted-foreground">
+                <p className="text-[0.5625rem] leading-4 text-muted-foreground">
                   Run this against your Relay container, then paste the returned
                   URI below.
                 </p>
@@ -1307,7 +1307,7 @@ function AddRelayDialog({
                 <textarea
                   id="relay-pairing-uri"
                   name="pairingUri"
-                  className="min-h-32 w-full resize-y rounded-md border border-input bg-background/35 px-3 py-2 font-mono text-[10px] leading-5 shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
+                  className="min-h-32 w-full resize-y rounded-md border border-input bg-background/35 px-3 py-2 font-mono text-[0.625rem] leading-5 shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
                   placeholder="kiln-relay://pair/v1?payload=…"
                   autoCapitalize="none"
                   autoComplete="off"
@@ -1372,7 +1372,7 @@ function PairingReview({
             <Fingerprint className="size-4" />
           </span>
           <div className="min-w-0">
-            <p className="font-mono text-[9px] tracking-[0.12em] text-primary uppercase">
+            <p className="font-mono text-[0.5625rem] tracking-[0.12em] text-primary uppercase">
               Verify identity
             </p>
             <p className="mt-0.5 truncate text-sm font-semibold">
@@ -1388,10 +1388,10 @@ function PairingReview({
         <div className="mt-4 flex gap-2.5 rounded-md border border-primary/20 bg-background/55 p-3">
           <RefreshCw className="mt-0.5 size-3.5 shrink-0 text-primary" />
           <div>
-            <p className="text-[10px] font-medium text-foreground">
+            <p className="text-[0.625rem] font-medium text-foreground">
               Existing Relay identity found
             </p>
-            <p className="mt-1 text-[9px] leading-4 text-muted-foreground">
+            <p className="mt-1 text-[0.5625rem] leading-4 text-muted-foreground">
               Hearth will repair{" "}
               <span className="font-medium text-foreground">
                 {pairing.existingRelayName ?? pairing.relayName}
@@ -1402,7 +1402,7 @@ function PairingReview({
           </div>
         </div>
       ) : null}
-      <dl className="mt-4 grid gap-3 text-[10px] sm:grid-cols-2">
+      <dl className="mt-4 grid gap-3 text-[0.625rem] sm:grid-cols-2">
         <div className="sm:col-span-2">
           <dt className="text-muted-foreground">Relay fingerprint</dt>
           <dd className="mt-1 font-mono break-all text-foreground">
@@ -1563,7 +1563,7 @@ function EditRelayDialog({
     >
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
-          <p className="font-mono text-[9px] tracking-[0.16em] text-primary uppercase">
+          <p className="font-mono text-[0.5625rem] tracking-[0.16em] text-primary uppercase">
             Edit connection
           </p>
           <DialogTitle>{relay.name}</DialogTitle>
@@ -1574,7 +1574,7 @@ function EditRelayDialog({
         </DialogHeader>
 
         <form className="space-y-4" onSubmit={(event) => void submit(event)}>
-          <div className="rounded-md border border-border/70 bg-background/35 px-3 py-2 font-mono text-[9px] text-muted-foreground">
+          <div className="rounded-md border border-border/70 bg-background/35 px-3 py-2 font-mono text-[0.5625rem] text-muted-foreground">
             Relay ID <span className="ml-1 text-foreground/85">{relay.id}</span>
           </div>
 
@@ -1614,7 +1614,7 @@ function EditRelayDialog({
           </div>
 
           <div className="border-t border-border/70 pt-4">
-            <p className="mb-3 font-mono text-[9px] tracking-[0.14em] text-primary uppercase">
+            <p className="mb-3 font-mono text-[0.5625rem] tracking-[0.14em] text-primary uppercase">
               Proxy
             </p>
             <RelayProxyFields relayEnabled={relay.enabled} relayId={relay.id} />
@@ -1657,7 +1657,7 @@ const RelayProxyFields = React.memo(function RelayProxyFields({
 
   if (relayEnabled && proxy.isPending) {
     return (
-      <div className="flex h-20 items-center justify-center gap-2 rounded-md border border-border/70 bg-background/25 text-[10px] text-muted-foreground">
+      <div className="flex h-20 items-center justify-center gap-2 rounded-md border border-border/70 bg-background/25 text-[0.625rem] text-muted-foreground">
         <LoaderCircle className="size-3.5 animate-spin" /> Reading proxy
         configuration…
       </div>
@@ -1680,7 +1680,7 @@ const RelayProxyFields = React.memo(function RelayProxyFields({
             name="mode"
             defaultValue={proxy.data?.settings.mode ?? "none"}
             disabled={!relayEnabled}
-            className="h-8 w-full rounded-md border border-input bg-background/35 px-2 text-[10px] outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40 disabled:opacity-50"
+            className="h-8 w-full rounded-md border border-input bg-background/35 px-2 text-[0.625rem] outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40 disabled:opacity-50"
           >
             <option value="none">None / existing Traefik</option>
             <option value="hearth">Hearth proxy</option>
@@ -1700,7 +1700,7 @@ const RelayProxyFields = React.memo(function RelayProxyFields({
         </Field>
       </div>
       {!relayEnabled ? (
-        <p className="mt-2 text-[10px] text-sky-300/80">
+        <p className="mt-2 text-[0.625rem] text-sky-300/80">
           Resume this Relay to edit its proxy configuration.
         </p>
       ) : null}
@@ -1746,7 +1746,7 @@ function DialogFeedback({
   return (
     <div
       role="status"
-      className="flex items-start gap-2 rounded-md border border-destructive/25 bg-destructive/[0.06] px-3 py-2 text-[10px] leading-4 text-destructive"
+      className="flex items-start gap-2 rounded-md border border-destructive/25 bg-destructive/[0.06] px-3 py-2 text-[0.625rem] leading-4 text-destructive"
     >
       <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
       <div className="min-w-0 space-y-1">
@@ -1779,7 +1779,7 @@ function Field({
     <div className="space-y-1.5">
       <label
         htmlFor={htmlFor}
-        className="block text-[10px] font-medium text-muted-foreground"
+        className="block text-[0.625rem] font-medium text-muted-foreground"
       >
         {label}
       </label>
@@ -1880,7 +1880,7 @@ function RelayVersion({
 }) {
   const release = findKilnRelease(releases, version)
   const versionLabel = !version ? (
-    <span className="truncate font-mono text-[9px] text-foreground">—</span>
+    <span className="truncate font-mono text-[0.5625rem] text-foreground">—</span>
   ) : release ? (
     <a
       href={release.url}
@@ -1888,7 +1888,7 @@ function RelayVersion({
       rel="noreferrer"
       aria-label={`View ${release.name} on GitHub`}
       title={`${release.name} (${release.tag})`}
-      className="truncate text-[10px] font-medium text-primary/90 transition-colors hover:text-primary focus-visible:text-primary focus-visible:outline-none"
+      className="truncate text-[0.625rem] font-medium text-primary/90 transition-colors hover:text-primary focus-visible:text-primary focus-visible:outline-none"
     >
       {release.name}
     </a>
@@ -1898,12 +1898,12 @@ function RelayVersion({
       target="_blank"
       rel="noreferrer"
       aria-label={`View Relay commit ${version}`}
-      className="truncate font-mono text-[9px] text-primary/90 transition-colors hover:text-primary focus-visible:text-primary focus-visible:outline-none"
+      className="truncate font-mono text-[0.5625rem] text-primary/90 transition-colors hover:text-primary focus-visible:text-primary focus-visible:outline-none"
     >
       {version.slice(0, 7)}
     </a>
   ) : (
-    <span className="truncate font-mono text-[9px] text-foreground">
+    <span className="truncate font-mono text-[0.5625rem] text-foreground">
       {version}
     </span>
   )

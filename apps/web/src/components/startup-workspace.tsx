@@ -96,7 +96,7 @@ export function StartupWorkspace() {
         <div className="max-w-sm">
           <CircleAlert className="mx-auto size-5 text-amber-300" />
           <p className="mt-3 text-sm font-semibold">Startup unavailable</p>
-          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+          <p className="mt-1 text-[0.6875rem] leading-5 text-muted-foreground">
             {startupQuery.error?.message ??
               "This server does not expose Brick startup variables yet."}
           </p>
@@ -307,7 +307,7 @@ const StartupForm = React.memo(function StartupForm({
     <section className="min-h-0 flex-1 overflow-y-auto bg-card">
       <div className="mx-auto max-w-3xl px-5 py-6 sm:px-8 sm:py-8">
         <div className="flex flex-col gap-1">
-          <p className="font-mono text-[9px] tracking-[0.18em] text-primary uppercase">
+          <p className="font-mono text-[0.5625rem] tracking-[0.18em] text-primary uppercase">
             Startup
           </p>
           <h2 className="font-heading text-xl font-semibold tracking-[-0.03em]">
@@ -434,7 +434,7 @@ function StartupSettingsForm({
       <label className="flex cursor-pointer items-center justify-between rounded-xl border border-border/75 bg-background/45 px-4 py-3 text-xs">
         <span>
           <span className="block font-medium">Start after applying</span>
-          <span className="mt-0.5 block text-[9px] text-muted-foreground">
+          <span className="mt-0.5 block text-[0.5625rem] text-muted-foreground">
             Leave off to keep the server stopped after rebuild.
           </span>
         </span>
@@ -474,7 +474,7 @@ function StartupSettingsForm({
                 : "Apply Startup"}
         </Button>
         {!canEdit ? (
-          <p className="text-[11px] text-muted-foreground">
+          <p className="text-[0.6875rem] text-muted-foreground">
             Connect the Relay and use an account with settings access to change
             Startup.
           </p>
@@ -516,15 +516,15 @@ function BrickSummary({
       icon={<ServerTypeIcon implementation={view.id} className="size-5" />}
       title={view.name}
       titleAccessory={
-        <Badge variant="outline" className="font-mono text-[9px]">
+        <Badge variant="outline" className="font-mono text-[0.5625rem]">
           {view.game}
         </Badge>
       }
     >
-      <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
+      <p className="mt-0.5 truncate text-[0.625rem] text-muted-foreground">
         {view.description}
       </p>
-      <p className="mt-1 truncate font-mono text-[9px] text-muted-foreground/70">
+      <p className="mt-1 truncate font-mono text-[0.5625rem] text-muted-foreground/70">
         {view.source}
       </p>
     </WorkspaceSummaryCard>

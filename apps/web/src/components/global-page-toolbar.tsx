@@ -24,7 +24,7 @@ export const GlobalPageToolbar = React.memo(function GlobalPageToolbar({
           <SectionIdentity section={identity} />
         ) : (
           <div className="min-w-0">
-            <p className="font-mono text-[9px] tracking-[0.16em] text-primary uppercase">
+            <p className="font-mono text-[0.5625rem] tracking-[0.16em] text-primary uppercase">
               {sectionFromLabel(label)}
             </p>
             <h1 className="mt-0.5 truncate font-heading text-xl font-semibold tracking-[-0.035em]">
@@ -91,7 +91,7 @@ const HearthBuildMetadata = React.memo(function HearthBuildMetadata() {
   const shortCommit = commit ? commit.slice(0, 8) : "Development"
 
   return (
-    <div className="mt-0.5 flex min-w-0 items-center gap-1.5 overflow-hidden text-[10px] whitespace-nowrap text-muted-foreground sm:text-xs">
+    <div className="mt-0.5 flex min-w-0 items-center gap-1.5 overflow-hidden text-[0.625rem] whitespace-nowrap text-muted-foreground sm:text-xs">
       <span className="shrink-0">Hearth {version}</span>
       <span className="text-border" aria-hidden="true">
         /

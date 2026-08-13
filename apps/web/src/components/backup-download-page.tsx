@@ -110,18 +110,18 @@ export const BackupDownloadPage = React.memo(function BackupDownloadPage({
             </dl>
 
             <div className="mt-4 flex items-center gap-3 px-1">
-              <div className="grid size-8 shrink-0 place-items-center rounded-full bg-primary/10 font-heading text-[9px] font-bold text-primary">
+              <div className="grid size-8 shrink-0 place-items-center rounded-full bg-primary/10 font-heading text-[0.5625rem] font-bold text-primary">
                 {initials(share.sharedBy)}
               </div>
               <div className="min-w-0">
-                <p className="font-mono text-[8px] tracking-[0.12em] text-muted-foreground uppercase">
+                <p className="font-mono text-[0.5rem] tracking-[0.12em] text-muted-foreground uppercase">
                   Shared by
                 </p>
-                <p className="truncate text-[11px] font-semibold">
+                <p className="truncate text-[0.6875rem] font-semibold">
                   {share.sharedBy}
                 </p>
               </div>
-              <div className="ml-auto flex items-center gap-1.5 text-right text-[9px] text-muted-foreground">
+              <div className="ml-auto flex items-center gap-1.5 text-right text-[0.5625rem] text-muted-foreground">
                 <Clock3 className="size-3 shrink-0" />
                 Expires: {dateFormatter.format(new Date(share.expiresAt))}
               </div>
@@ -222,7 +222,7 @@ function UnavailableDownload() {
 function DownloadFact({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0 border-border/75 p-3 not-first:border-l">
-      <dt className="font-mono text-[9px] tracking-[0.13em] text-muted-foreground uppercase">
+      <dt className="font-mono text-[0.5625rem] tracking-[0.13em] text-muted-foreground uppercase">
         {label}
       </dt>
       <dd className="mt-1.5 truncate text-xs font-semibold" title={value}>

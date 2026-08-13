@@ -167,7 +167,7 @@ const ServerPickerRow = React.memo(function ServerPickerRow({
         <span className="block truncate text-sm font-semibold tracking-tight">
           {name}
         </span>
-        <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
+        <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
           {description}
         </span>
       </span>

@@ -200,7 +200,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
       )}
     >
       <aside className="flex min-h-0 flex-col border-b border-border/60 md:border-r md:border-b-0">
-        <p className="px-3 pt-3 pb-2 font-mono text-[10px] tracking-[0.14em] text-muted-foreground uppercase">
+        <p className="px-3 pt-3 pb-2 font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
           Categories
         </p>
         <nav className="flex gap-1 overflow-x-auto px-2 pb-2 md:flex-col md:overflow-y-auto md:pb-3">
@@ -363,14 +363,14 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
                         <span className="block truncate text-sm font-semibold tracking-tight">
                           {brick.metadata.name}
                         </span>
-                        <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
+                        <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
                           {sourceLabel(brick)} · {formatGameLabel(brick)}
                         </span>
                       </span>
                       {official ? (
                         <Badge
                           variant="outline"
-                          className="h-5 shrink-0 border-primary/35 bg-primary/10 px-1.5 font-mono text-[10px] text-primary"
+                          className="h-5 shrink-0 border-primary/35 bg-primary/10 px-1.5 font-mono text-[0.625rem] text-primary"
                         >
                           Official
                         </Badge>
@@ -409,7 +409,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
     return (
       <aside className="flex min-h-96 flex-col md:min-h-0">
         <div className="min-h-0 flex-1 overflow-y-auto p-4 pr-11">
-          <p className="font-mono text-[10px] tracking-[0.14em] text-muted-foreground uppercase">
+          <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
             Custom recipe
           </p>
           <h3 className="mt-2 font-heading text-lg font-semibold tracking-[-0.03em]">
@@ -484,24 +484,24 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
               {official ? (
                 <Badge
                   variant="outline"
-                  className="h-5 gap-1 border-primary/35 bg-primary/10 px-1.5 text-[10px] text-primary"
+                  className="h-5 gap-1 border-primary/35 bg-primary/10 px-1.5 text-[0.625rem] text-primary"
                 >
                   <BadgeCheck className="size-3" />
                   Official
                 </Badge>
               ) : (
-                <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                <Badge variant="outline" className="h-5 px-1.5 text-[0.625rem]">
                   Community
                 </Badge>
               )}
             </div>
-            <p className="mt-0.5 text-[11px] text-muted-foreground">
+            <p className="mt-0.5 text-[0.6875rem] text-muted-foreground">
               {formatGameLabel(brick)} · {brick.metadata.author}
             </p>
           </div>
         </div>
 
-        <p className="mt-4 text-[13px] leading-relaxed text-foreground/90">
+        <p className="mt-4 text-[0.8125rem] leading-relaxed text-foreground/90">
           {brick.metadata.description}
         </p>
 
@@ -520,7 +520,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
           </div>
           <div className="flex items-start justify-between gap-3">
             <dt className="text-muted-foreground">Architectures</dt>
-            <dd className="truncate text-right font-mono text-[11px]">
+            <dd className="truncate text-right font-mono text-[0.6875rem]">
               {(brick.constraints.architectures ?? ["any"]).join(", ")}
             </dd>
           </div>
@@ -532,7 +532,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
               <Badge
                 key={tag}
                 variant="outline"
-                className="h-5 px-1.5 font-mono text-[10px] text-muted-foreground"
+                className="h-5 px-1.5 font-mono text-[0.625rem] text-muted-foreground"
               >
                 {tag}
               </Badge>

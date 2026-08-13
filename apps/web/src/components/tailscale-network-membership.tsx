@@ -203,10 +203,10 @@ const TailscaleOAuthSetup = React.memo(function TailscaleOAuthSetup({
             <span
               className={
                 needsAttention
-                  ? "font-mono text-[9px] text-amber-400 uppercase"
+                  ? "font-mono text-[0.5625rem] text-amber-400 uppercase"
                   : integration
-                    ? "font-mono text-[9px] text-emerald-400 uppercase"
-                    : "font-mono text-[9px] text-muted-foreground uppercase"
+                    ? "font-mono text-[0.5625rem] text-emerald-400 uppercase"
+                    : "font-mono text-[0.5625rem] text-muted-foreground uppercase"
               }
             >
               {needsAttention
@@ -216,7 +216,7 @@ const TailscaleOAuthSetup = React.memo(function TailscaleOAuthSetup({
                   : "Not configured"}
             </span>
           </div>
-          <p className="truncate font-mono text-[9px] text-muted-foreground">
+          <p className="truncate font-mono text-[0.5625rem] text-muted-foreground">
             {integration
               ? `${integration.clientId} · ${integration.tags.join(", ")}`
               : `*.${stack.domain}`}
@@ -572,14 +572,14 @@ function SetupStepRail({
               {finished ? (
                 <Check className="size-3" />
               ) : (
-                <span className="font-mono text-[9px]">{index + 1}</span>
+                <span className="font-mono text-[0.5625rem]">{index + 1}</span>
               )}
             </span>
             <span
               className={
                 active || finished
-                  ? "truncate text-[9px] font-medium"
-                  : "truncate text-[9px] text-muted-foreground"
+                  ? "truncate text-[0.5625rem] font-medium"
+                  : "truncate text-[0.5625rem] text-muted-foreground"
               }
             >
               {label}
@@ -695,7 +695,7 @@ function SetupCredentialsStep({
               value={errorMessage(error)}
             />
           ) : (
-            <p className="font-mono text-[9px] text-muted-foreground">
+            <p className="font-mono text-[0.5625rem] text-muted-foreground">
               auth_keys · devices:core · devices:routes · dns
             </p>
           )}
@@ -749,7 +749,7 @@ function SetupDomainStep({
         />
       </SetupField>
       <div className="border border-border/70 bg-background/35 p-4">
-        <span className="font-mono text-[9px] text-muted-foreground uppercase">
+        <span className="font-mono text-[0.5625rem] text-muted-foreground uppercase">
           Server address
         </span>
         <p className="mt-2 truncate font-mono text-sm">
@@ -846,11 +846,11 @@ function SetupRoutesStep({
             />
             <div className="min-w-0 flex-1">
               <p className="truncate text-xs font-medium">{route.hostname}</p>
-              <p className="font-mono text-[9px] text-muted-foreground">
+              <p className="font-mono text-[0.5625rem] text-muted-foreground">
                 {route.subnet}
               </p>
             </div>
-            <span className="font-mono text-[9px] text-muted-foreground uppercase">
+            <span className="font-mono text-[0.5625rem] text-muted-foreground uppercase">
               {route.approved
                 ? "Approved"
                 : route.advertised
@@ -949,7 +949,7 @@ function SetupField({
 }) {
   return (
     <label className="block min-w-0" htmlFor={fieldId}>
-      <span className="mb-1.5 block text-[10px] font-medium">{label}</span>
+      <span className="mb-1.5 block text-[0.625rem] font-medium">{label}</span>
       {children}
     </label>
   )
@@ -978,7 +978,7 @@ function SetupResult({
       }
     >
       <p className="text-xs font-semibold">{title}</p>
-      <p className="mt-1 text-[10px] leading-4 opacity-80">{value}</p>
+      <p className="mt-1 text-[0.625rem] leading-4 opacity-80">{value}</p>
     </div>
   )
 }
@@ -1021,14 +1021,14 @@ function SetupChangeRow({
       <span
         className={
           tone === "warning"
-            ? "truncate font-mono text-[10px] text-amber-300"
-            : "truncate font-mono text-[10px] text-muted-foreground"
+            ? "truncate font-mono text-[0.625rem] text-amber-300"
+            : "truncate font-mono text-[0.625rem] text-muted-foreground"
         }
       >
         {before}
       </span>
       <ChevronRight className="hidden size-3 text-muted-foreground sm:block" />
-      <span className="truncate font-mono text-[10px] text-foreground">
+      <span className="truncate font-mono text-[0.625rem] text-foreground">
         {after}
       </span>
     </div>
@@ -1039,7 +1039,7 @@ function SetupSummaryRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-4 px-3 py-3">
       <span className="text-xs text-muted-foreground">{label}</span>
-      <span className="truncate font-mono text-[10px]">{value}</span>
+      <span className="truncate font-mono text-[0.625rem]">{value}</span>
     </div>
   )
 }
@@ -1377,7 +1377,7 @@ const TailscaleMembershipRow = React.memo(function TailscaleMembershipRow({
                 ) : null}
               </span>
             </div>
-            <p className="truncate font-mono text-[9px] text-muted-foreground">
+            <p className="truncate font-mono text-[0.5625rem] text-muted-foreground">
               {server.shortId}
             </p>
           </div>
@@ -1404,7 +1404,7 @@ const TailscaleMembershipRow = React.memo(function TailscaleMembershipRow({
               aria-label={`Hostname for ${server.name}`}
               className="h-8 min-w-0 font-mono text-xs"
             />
-            <span className="hidden shrink-0 font-mono text-[9px] text-muted-foreground lg:inline">
+            <span className="hidden shrink-0 font-mono text-[0.5625rem] text-muted-foreground lg:inline">
               .{stack.domain}
             </span>
             {dirty ? (
@@ -1497,11 +1497,11 @@ const GameServerMembershipRow = React.memo(function GameServerMembershipRow({
     <div className="grid items-center gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
       <div className="min-w-0">
         <p className="truncate text-xs font-semibold">{stack.name}</p>
-        <p className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground">
+        <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
           {binding ? binding.address : `*.${stack.domain}`}
         </p>
       </div>
-      <p className="min-w-0 truncate font-mono text-[10px] text-muted-foreground">
+      <p className="min-w-0 truncate font-mono text-[0.625rem] text-muted-foreground">
         {binding ? `${binding.hostname}.${stack.domain}` : "Not connected"}
       </p>
       <div className="flex items-center justify-end gap-1">

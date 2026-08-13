@@ -280,7 +280,7 @@ export const FileDownloadDialog = React.memo(function FileDownloadDialog({
             <div>
               <LoaderCircle className="mx-auto size-5 animate-spin text-primary" />
               <p className="mt-3 text-xs font-medium">Inspecting file</p>
-              <p className="mt-1 text-[10px] text-muted-foreground">
+              <p className="mt-1 text-[0.625rem] text-muted-foreground">
                 Estimating transfer size at the Relay.
               </p>
             </div>
@@ -290,7 +290,7 @@ export const FileDownloadDialog = React.memo(function FileDownloadDialog({
             <div className="max-w-sm">
               <TriangleAlert className="mx-auto size-5 text-destructive" />
               <p className="mt-3 text-xs font-semibold">Download unavailable</p>
-              <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+              <p className="mt-1 text-[0.6875rem] leading-5 text-muted-foreground">
                 {previewState.message}
               </p>
             </div>
@@ -417,7 +417,7 @@ const DownloadOptions = React.memo(function DownloadOptions({
           ) : null}
         </InputGroup>
         {invalidName ? (
-          <span className="text-[10px] text-destructive">
+          <span className="text-[0.625rem] text-destructive">
             Use a file name without slashes or control characters.
           </span>
         ) : null}
@@ -431,7 +431,7 @@ const DownloadOptions = React.memo(function DownloadOptions({
           >
             Compress download
           </label>
-          <p className="mt-0.5 text-[10px] text-muted-foreground">
+          <p className="mt-0.5 text-[0.625rem] text-muted-foreground">
             {preview.recommendedCompression
               ? "This file should compress well."
               : "This file may not shrink much."}
@@ -459,7 +459,7 @@ const DownloadOptions = React.memo(function DownloadOptions({
 
       <label
         htmlFor={skipDialogId}
-        className="flex cursor-pointer items-center gap-2 text-[11px] text-muted-foreground"
+        className="flex cursor-pointer items-center gap-2 text-[0.6875rem] text-muted-foreground"
       >
         <input
           id={skipDialogId}
@@ -554,14 +554,14 @@ function DownloadMetric({
         {icon}
       </span>
       <span className="min-w-0">
-        <span className="block font-mono text-[9px] tracking-wider text-muted-foreground uppercase">
+        <span className="block font-mono text-[0.5625rem] tracking-wider text-muted-foreground uppercase">
           {label}
         </span>
         <span className="block truncate text-xs font-semibold text-foreground">
           {value}
         </span>
         {detail ? (
-          <span className="block text-[9px] text-primary">{detail}</span>
+          <span className="block text-[0.5625rem] text-primary">{detail}</span>
         ) : null}
       </span>
     </div>

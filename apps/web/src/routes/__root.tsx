@@ -1,5 +1,5 @@
 import { Outlet, createRootRouteWithContext } from "@tanstack/react-router"
-import { archivoLatin, jetBrainsMonoLatin } from "@workspace/ui/lib/font-assets"
+import { geistLatin, jetBrainsMonoLatin } from "@workspace/ui/lib/font-assets"
 
 import appCss from "@workspace/ui/globals.css?url"
 
@@ -31,7 +31,7 @@ export const Route = createRootRouteWithContext<AppRouterContext>()({
     links: [
       {
         rel: "preload",
-        href: archivoLatin,
+        href: geistLatin,
         as: "font",
         type: "font/woff2",
         crossOrigin: "anonymous",

@@ -235,7 +235,7 @@ function UploadProgressDescription({
   const progress = total ? Math.round((completed / total) * 100) : 0
   return (
     <div className="mt-1.5 space-y-2">
-      <div className="flex items-center justify-between gap-4 font-mono text-[10px] text-muted-foreground">
+      <div className="flex items-center justify-between gap-4 font-mono text-[0.625rem] text-muted-foreground">
         <span className="truncate">
           /data/{normalizeDirectoryPath(directory)}
         </span>
@@ -420,7 +420,7 @@ function FileDropOverlay({ directory }: { directory: string }) {
           <Upload className="size-5" />
         </div>
         <p className="mt-3 text-sm font-semibold">Drop files to upload</p>
-        <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+        <p className="mt-1 font-mono text-[0.625rem] text-muted-foreground">
           /data/{normalizeDirectoryPath(directory)}
         </p>
       </div>
@@ -654,7 +654,7 @@ function FilePathCopyButton({ path }: { path: string }) {
     >
       <button
         type="button"
-        className="group/path flex max-w-full items-center gap-1 font-mono text-[10px] text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring/50 focus-visible:outline-none sm:text-[11px]"
+        className="group/path flex max-w-full items-center gap-1 font-mono text-[0.625rem] text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring/50 focus-visible:outline-none sm:text-[0.6875rem]"
         aria-label={
           copyState === "copied"
             ? `Copied ${fullFilePath}`
@@ -697,7 +697,7 @@ function FileToolbarIdentity({
             {formatName(path)}
           </p>
           {readOnly ? (
-            <span className="hidden shrink-0 border border-primary/20 bg-primary/8 px-2 py-0.5 font-mono text-[9px] tracking-wider text-primary sm:inline-flex">
+            <span className="hidden shrink-0 border border-primary/20 bg-primary/8 px-2 py-0.5 font-mono text-[0.5625rem] tracking-wider text-primary sm:inline-flex">
               READ ONLY
             </span>
           ) : null}
@@ -705,7 +705,7 @@ function FileToolbarIdentity({
         {pathIsCopyable ? (
           <FilePathCopyButton key={path} path={path} />
         ) : (
-          <p className="truncate font-mono text-[10px] text-muted-foreground sm:text-[11px]">
+          <p className="truncate font-mono text-[0.625rem] text-muted-foreground sm:text-[0.6875rem]">
             /data/{path}
           </p>
         )}
@@ -945,7 +945,7 @@ function EditorDiskConflictNotice({
           <p className="text-xs font-medium text-destructive">
             File changed on disk
           </p>
-          <p className="text-[10px] leading-4 text-muted-foreground">
+          <p className="text-[0.625rem] leading-4 text-muted-foreground">
             Reload the latest version or explicitly overwrite it with your
             changes.
           </p>
@@ -1434,7 +1434,7 @@ function EditorOverflowMenu({
         collisionPadding={8}
         className="w-[min(17rem,calc(100vw-1rem))] p-1"
       >
-        <p className="border-b px-2 py-2 text-[10px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+        <p className="border-b px-2 py-2 text-[0.625rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
           File actions
         </p>
         <FilePinActionMenuItem
@@ -1476,7 +1476,7 @@ function EditorMobileFontSizeSection({
         <span className="flex items-center gap-2 text-xs font-medium text-foreground">
           <ALargeSmall className="size-4 text-muted-foreground" /> Text size
         </span>
-        <span className="font-mono text-[10px] text-muted-foreground">
+        <span className="font-mono text-[0.625rem] text-muted-foreground">
           {fontSize}px
         </span>
       </div>
@@ -1678,7 +1678,7 @@ function EditorMobileOverflowMenu({
         collisionPadding={8}
         className="w-[min(18rem,calc(100vw-1rem))] p-1.5"
       >
-        <p className="px-2 pt-1 pb-1.5 font-mono text-[9px] tracking-[0.12em] text-muted-foreground uppercase">
+        <p className="px-2 pt-1 pb-1.5 font-mono text-[0.5625rem] tracking-[0.12em] text-muted-foreground uppercase">
           File actions
         </p>
         <EditorMobileFontSizeSection preferencesStore={preferencesStore} />
@@ -1737,7 +1737,7 @@ function EditorFooter({
     sessionStore.getSaveErrorSnapshot
   )
   return (
-    <div className="flex h-7 shrink-0 items-center justify-between border-t bg-muted/10 px-3 font-mono text-[9px] text-muted-foreground">
+    <div className="flex h-7 shrink-0 items-center justify-between border-t bg-muted/10 px-3 font-mono text-[0.5625rem] text-muted-foreground">
       <span className={error || saveError ? "text-destructive" : undefined}>
         {error ||
           saveError ||
@@ -2178,7 +2178,7 @@ function EditorFontSizeControl({
 
   return (
     <div className="flex items-center gap-2.5">
-      <span className="w-3 shrink-0 text-left font-mono text-[9px] text-muted-foreground">
+      <span className="w-3 shrink-0 text-left font-mono text-[0.5625rem] text-muted-foreground">
         A
       </span>
       <div className="relative min-w-0 flex-1 py-1.5">
@@ -2243,7 +2243,7 @@ function FileActionMenuItem({
         <span className="block text-xs font-medium text-foreground">
           {label}
         </span>
-        <span className="block truncate text-[10px] text-muted-foreground">
+        <span className="block truncate text-[0.625rem] text-muted-foreground">
           {detail}
         </span>
       </span>
@@ -3153,7 +3153,7 @@ function FileTreePanel({
           <FolderTree className="size-[18px] shrink-0 text-primary" />
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold">Browse files</p>
-            <p className="truncate font-mono text-[10px] text-muted-foreground">
+            <p className="truncate font-mono text-[0.625rem] text-muted-foreground">
               /data
             </p>
           </div>
@@ -3210,7 +3210,7 @@ function FileTreePanel({
               sideOffset={6}
               className="w-56 p-1"
             >
-              <p className="border-b px-2 py-2 text-[10px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+              <p className="border-b px-2 py-2 text-[0.625rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
                 Add to instance
               </p>
               <FileActionPreview icon={<FolderPlus />} label="New directory" />
@@ -3327,8 +3327,8 @@ function FileTreePanel({
               "--trees-search-fg-override": "var(--foreground)",
               "--trees-border-color-override": "var(--border)",
               "--trees-border-radius-override": "0px",
-              "--trees-font-family-override": "'Archivo Variable', sans-serif",
-              "--trees-font-size-override": "12px",
+              "--trees-font-family-override": "var(--font-sans)",
+              "--trees-font-size-override": "0.75rem",
               "--trees-padding-inline-override": "0px",
               "--trees-item-padding-x-override": "5px",
               "--trees-item-margin-x-override": "0px",
@@ -3428,7 +3428,7 @@ function FileTreePanel({
         <span className="min-w-0 flex-1 truncate">Upload to</span>
         <span
           ref={dropPathLabelRef}
-          className="max-w-[65%] truncate font-mono text-[10px] text-primary"
+          className="max-w-[65%] truncate font-mono text-[0.625rem] text-primary"
         >
           /data/
         </span>
@@ -3591,7 +3591,7 @@ function FileActionPreview({
         {icon}
       </span>
       <span className="min-w-0 flex-1 text-foreground/75">{label}</span>
-      <span className="font-mono text-[8px] tracking-wider text-muted-foreground/60 uppercase">
+      <span className="font-mono text-[0.5rem] tracking-wider text-muted-foreground/60 uppercase">
         Soon
       </span>
     </button>
@@ -3624,7 +3624,7 @@ function FileUploadPickerAction({
       <span className="min-w-0 flex-1 text-foreground">
         {uploading ? "Uploading…" : label}
       </span>
-      <span className="font-mono text-[8px] tracking-wider text-primary uppercase">
+      <span className="font-mono text-[0.5rem] tracking-wider text-primary uppercase">
         Direct
       </span>
     </button>
@@ -3681,11 +3681,11 @@ function FileActivityRow({
         <span className="block truncate text-sm font-medium text-foreground">
           {formatName(entry.path)}
         </span>
-        <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
+        <span className="mt-0.5 block truncate font-mono text-[0.625rem] text-muted-foreground">
           /data/{entry.path}
         </span>
       </span>
-      <span className="flex shrink-0 items-center gap-2 pl-2 text-[10px] text-muted-foreground">
+      <span className="flex shrink-0 items-center gap-2 pl-2 text-[0.625rem] text-muted-foreground">
         <span>
           {kind}{" "}
           <time
@@ -3795,7 +3795,7 @@ function FilesHome({
             <div className="mb-7">
               <div className="mb-2 flex items-center gap-2 px-1">
                 <Pin className="size-3.5 text-primary" />
-                <h2 className="font-mono text-[10px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+                <h2 className="font-mono text-[0.625rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
                   Pinned
                 </h2>
               </div>
@@ -3815,7 +3815,7 @@ function FilesHome({
             <div>
               <div className="mb-2 flex items-center gap-2 px-1">
                 <Clock3 className="size-3.5 text-primary" />
-                <h2 className="font-mono text-[10px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+                <h2 className="font-mono text-[0.625rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
                   Recent
                 </h2>
               </div>
@@ -3985,7 +3985,7 @@ function formatFileModifiedAt(modifiedAt: number): string {
 function FileModifiedAtTime({ modifiedAt }: { modifiedAt: number }) {
   if (modifiedAt <= 0) {
     return (
-      <span className="truncate pr-2 font-mono text-[10px] text-muted-foreground">
+      <span className="truncate pr-2 font-mono text-[0.625rem] text-muted-foreground">
         —
       </span>
     )
@@ -3995,7 +3995,7 @@ function FileModifiedAtTime({ modifiedAt }: { modifiedAt: number }) {
     <Tooltip>
       <TooltipTrigger asChild>
         <time
-          className="cursor-help truncate pr-2 font-mono text-[10px] text-muted-foreground"
+          className="cursor-help truncate pr-2 font-mono text-[0.625rem] text-muted-foreground"
           dateTime={new Date(modifiedAt).toISOString()}
           suppressHydrationWarning
         >
@@ -4147,11 +4147,11 @@ function RootDirectoryList({
     <div className="mt-8">
       <div className="mb-2 flex min-h-8 items-center gap-2 px-1">
         <Folder className="size-3.5 text-primary" />
-        <h2 className="font-mono text-[10px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+        <h2 className="font-mono text-[0.625rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
           Root · /data
         </h2>
         {selectedPaths.length ? (
-          <span className="ml-auto font-mono text-[10px] text-muted-foreground">
+          <span className="ml-auto font-mono text-[0.625rem] text-muted-foreground">
             {selectedPaths.length} selected
           </span>
         ) : (
@@ -4160,7 +4160,7 @@ function RootDirectoryList({
         <FileActionsDropdown controller={actions} paths={selectedPaths} />
       </div>
       <div className="overflow-hidden border border-border/75 bg-muted/[0.025]">
-        <div className="grid h-9 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/75 bg-muted/10 px-2 font-mono text-[9px] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
+        <div className="grid h-9 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/75 bg-muted/10 px-2 font-mono text-[0.5625rem] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
           <label className="grid size-7 place-items-center">
             <input
               type="checkbox"
@@ -4222,7 +4222,7 @@ function RootDirectoryList({
               )}
               <span className="truncate">{entry.name}</span>
             </button>
-            <span className="font-mono text-[10px] text-muted-foreground">
+            <span className="font-mono text-[0.625rem] text-muted-foreground">
               {formatFileSize(entry.size)}
             </span>
             <FileModifiedAtTime modifiedAt={entry.modifiedAt} />
@@ -4319,7 +4319,7 @@ function DirectoryView({
           <StableFileToolbarIdentity path={path} directory />
           <div className="ml-auto flex shrink-0 items-center gap-1">
             {selectedPaths.length ? (
-              <span className="mr-1 hidden font-mono text-[10px] text-muted-foreground sm:inline">
+              <span className="mr-1 hidden font-mono text-[0.625rem] text-muted-foreground sm:inline">
                 {selectedPaths.length} selected
               </span>
             ) : null}
@@ -4377,7 +4377,7 @@ function DirectoryView({
 
       <div className="min-h-0 flex-1 overflow-auto px-3 py-4 sm:px-5 lg:px-7">
         <div className="mx-auto w-full max-w-5xl overflow-hidden border border-border/75 bg-muted/[0.025]">
-          <div className="grid h-9 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/75 bg-muted/10 px-2 font-mono text-[9px] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
+          <div className="grid h-9 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/75 bg-muted/10 px-2 font-mono text-[0.5625rem] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
             <label className="grid size-7 place-items-center">
               <input
                 type="checkbox"
@@ -4427,10 +4427,10 @@ function DirectoryView({
               <Folder className="size-4 shrink-0 text-primary/80" />
               <span className="truncate">...</span>
             </span>
-            <span className="font-mono text-[10px] text-muted-foreground">
+            <span className="font-mono text-[0.625rem] text-muted-foreground">
               —
             </span>
-            <span className="font-mono text-[10px] text-muted-foreground">
+            <span className="font-mono text-[0.625rem] text-muted-foreground">
               —
             </span>
             <span />
@@ -4462,7 +4462,7 @@ function DirectoryView({
                 )}
                 <span className="truncate">{entry.name}</span>
               </button>
-              <span className="font-mono text-[10px] text-muted-foreground">
+              <span className="font-mono text-[0.625rem] text-muted-foreground">
                 {formatFileSize(entry.size)}
               </span>
               <FileModifiedAtTime modifiedAt={entry.modifiedAt} />

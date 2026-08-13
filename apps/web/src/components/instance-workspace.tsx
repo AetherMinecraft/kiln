@@ -480,7 +480,7 @@ function InstanceIdentity({
           <InstanceRouteTitle />
         </span>
       </h1>
-      <div className="mt-0.5 flex min-w-0 items-center gap-1.5 overflow-hidden text-[10px] whitespace-nowrap text-muted-foreground sm:text-xs">
+      <div className="mt-0.5 flex min-w-0 items-center gap-1.5 overflow-hidden text-[0.625rem] whitespace-nowrap text-muted-foreground sm:text-xs">
         <span className="hidden shrink-0 items-center gap-1.5 @[30rem]:inline-flex">
           <span>
             {instance.implementation} {instance.version}
@@ -494,7 +494,7 @@ function InstanceIdentity({
         <InstanceAddressControl address={instance.connectAddress} />
       </div>
       {error ? (
-        <p className="mt-0.5 truncate text-[9px] text-destructive">{error}</p>
+        <p className="mt-0.5 truncate text-[0.5625rem] text-destructive">{error}</p>
       ) : null}
     </div>
   )
@@ -628,7 +628,7 @@ function ServerPowerControls({
                 <p className="text-xs font-semibold text-foreground">
                   Kill {instance.name}?
                 </p>
-                <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                <p className="mt-1 text-[0.6875rem] leading-relaxed text-muted-foreground">
                   This immediately terminates the container. Unsaved world data
                   may be lost.
                 </p>
@@ -655,7 +655,7 @@ function ServerPowerControls({
             </>
           ) : (
             <div className="p-1">
-              <p className="border-b px-2 py-2 text-[10px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+              <p className="border-b px-2 py-2 text-[0.625rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
                 Server actions
               </p>
               <PowerActionButton
@@ -915,7 +915,7 @@ function PowerActionButton({
       </span>
       <span>
         <span className="block font-medium">{label}</span>
-        <span className="block text-[10px] text-muted-foreground">
+        <span className="block text-[0.625rem] text-muted-foreground">
           {description}
         </span>
       </span>
@@ -1014,7 +1014,7 @@ function LiveResourceMeter({
         type="button"
         className={`group min-w-0 text-left outline-none first:pl-1.5 focus-visible:bg-muted/25 ${resource.id === "network" ? "px-1.5" : "px-2.5"}`}
       >
-        <div className="flex items-center justify-between gap-1.5 font-mono text-[11px] leading-none tracking-[0.065em] xl:text-xs">
+        <div className="flex items-center justify-between gap-1.5 font-mono text-[0.6875rem] leading-none tracking-[0.065em] xl:text-xs">
           <span className="shrink-0 font-medium text-muted-foreground/85 transition-colors group-hover:text-foreground/85">
             {resource.label}
           </span>
@@ -1077,7 +1077,7 @@ function InstanceUptimeMeter({
     <HoverCard openDelay={160} closeDelay={100}>
       <HoverCardTrigger asChild>
         <div
-          className="min-w-0 px-1.5 font-mono text-[11px] leading-none outline-none focus-visible:bg-muted/25 xl:px-2 xl:text-xs"
+          className="min-w-0 px-1.5 font-mono text-[0.6875rem] leading-none outline-none focus-visible:bg-muted/25 xl:px-2 xl:text-xs"
           aria-label={`Instance uptime ${uptime ?? "unavailable"}`}
           tabIndex={startedAt ? 0 : undefined}
         >
@@ -1085,7 +1085,7 @@ function InstanceUptimeMeter({
             UPTIME
           </span>
           <div className="mt-2.5 flex h-2 items-center justify-center">
-            <span className="font-medium tracking-[-0.045em] whitespace-nowrap text-foreground/85 tabular-nums xl:text-[13px]">
+            <span className="font-medium tracking-[-0.045em] whitespace-nowrap text-foreground/85 tabular-nums xl:text-[0.8125rem]">
               {uptime ?? "—"}
             </span>
           </div>
@@ -1100,7 +1100,7 @@ function InstanceUptimeMeter({
           className="w-max max-w-[calc(100vw-1.5rem)] rounded-none border-border/90 bg-popover px-3 py-2 shadow-xl"
         >
           <div className="text-left">
-            <p className="font-mono text-[8px] font-medium tracking-[0.1em] text-muted-foreground/70 uppercase">
+            <p className="font-mono text-[0.5rem] font-medium tracking-[0.1em] text-muted-foreground/70 uppercase">
               Started on
             </p>
             <time
@@ -1443,7 +1443,7 @@ function ResourceHistoryCard({
       <div className="px-1.5 pt-2.5">
         <React.Suspense
           fallback={
-            <div className="grid h-32 place-items-center border-y border-border/40 font-mono text-[9px] tracking-[0.08em] text-muted-foreground uppercase">
+            <div className="grid h-32 place-items-center border-y border-border/40 font-mono text-[0.5625rem] tracking-[0.08em] text-muted-foreground uppercase">
               Loading history
             </div>
           }
@@ -1485,10 +1485,10 @@ function ResourceHistoryHeader({
   return (
     <div className="h-[61px] border-b border-border/70 bg-muted/[0.08]">
       <div className="flex h-6 items-center justify-between border-b border-border/45 px-3">
-        <span className="font-mono text-[11px] font-semibold tracking-[0.1em] text-foreground/85 uppercase">
+        <span className="font-mono text-[0.6875rem] font-semibold tracking-[0.1em] text-foreground/85 uppercase">
           {resource.label}
         </span>
-        <span className="font-mono text-[9px] tracking-[0.08em] text-muted-foreground/70">
+        <span className="font-mono text-[0.5625rem] tracking-[0.08em] text-muted-foreground/70">
           6m window
         </span>
       </div>
@@ -1525,11 +1525,11 @@ function ResourceHistoryHeader({
         <div className="grid h-9 grid-cols-[1fr_4.5rem_4.5rem] divide-x divide-border/55">
           <div className="flex min-w-0 items-center gap-2 px-3">
             <span
-              className={`truncate font-mono font-semibold tracking-[-0.04em] tabular-nums ${resource.id === "memory" ? "text-[13px]" : "text-xl"} ${resource.valueClassName}`}
+              className={`truncate font-mono font-semibold tracking-[-0.04em] tabular-nums ${resource.id === "memory" ? "text-[0.8125rem]" : "text-xl"} ${resource.valueClassName}`}
             >
               {resource.historyDisplayValue ?? resource.displayValue}
             </span>
-            <span className="font-mono text-[9px] tracking-[0.06em] text-muted-foreground/60 uppercase">
+            <span className="font-mono text-[0.5625rem] tracking-[0.06em] text-muted-foreground/60 uppercase">
               Now
             </span>
           </div>
@@ -1560,11 +1560,11 @@ function DiskHistoryValue({
 }) {
   return (
     <div className="flex min-w-0 flex-col justify-center px-3">
-      <span className="font-mono text-[8px] leading-none tracking-[0.08em] text-muted-foreground/65 uppercase">
+      <span className="font-mono text-[0.5rem] leading-none tracking-[0.08em] text-muted-foreground/65 uppercase">
         {label}
       </span>
       <span
-        className={`mt-1 truncate font-mono text-[12px] leading-none font-semibold tracking-[-0.035em] tabular-nums ${valueClassName}`}
+        className={`mt-1 truncate font-mono text-xs leading-none font-semibold tracking-[-0.035em] tabular-nums ${valueClassName}`}
       >
         {value}
       </span>
@@ -1575,7 +1575,7 @@ function DiskHistoryValue({
 function HistoryStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex min-w-0 flex-col justify-center px-2 text-right">
-      <span className="font-mono text-[9px] leading-none tracking-[0.06em] text-muted-foreground/65 uppercase">
+      <span className="font-mono text-[0.5625rem] leading-none tracking-[0.06em] text-muted-foreground/65 uppercase">
         {label}
       </span>
       <span className="mt-1 truncate font-mono text-xs leading-none font-medium text-foreground/85 tabular-nums">
@@ -1599,16 +1599,16 @@ function NetworkHistoryValue({
   return (
     <div className="min-w-0 px-3 py-1.5">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="font-mono text-[9px] tracking-[0.06em] text-muted-foreground/70 uppercase">
+        <span className="font-mono text-[0.5625rem] tracking-[0.06em] text-muted-foreground/70 uppercase">
           {direction === "down" ? "↓ In" : "↑ Out"}
         </span>
         <span
-          className={`truncate font-mono text-[13px] leading-none font-semibold tracking-[-0.03em] tabular-nums ${direction === "down" ? "text-cyan-200/95" : "text-primary"}`}
+          className={`truncate font-mono text-[0.8125rem] leading-none font-semibold tracking-[-0.03em] tabular-nums ${direction === "down" ? "text-cyan-200/95" : "text-primary"}`}
         >
           {value === null ? "—" : formatBytesPerSecond(value)}
         </span>
       </div>
-      <div className="mt-1 flex items-center justify-between gap-2 font-mono text-[7px] leading-none tracking-[0.02em] text-muted-foreground/60 uppercase tabular-nums">
+      <div className="mt-1 flex items-center justify-between gap-2 font-mono text-[0.4375rem] leading-none tracking-[0.02em] text-muted-foreground/60 uppercase tabular-nums">
         <span>
           Avg {average === null ? "—" : formatBytesPerSecond(average)}
         </span>

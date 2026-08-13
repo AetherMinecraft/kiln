@@ -78,7 +78,7 @@ function Calendar({
           defaultClassNames.dropdown
         ),
         caption_label: cn(
-          "font-mono text-[11px] font-semibold tracking-[0.04em] text-foreground select-none",
+          "font-mono text-[0.6875rem] font-semibold tracking-[0.04em] text-foreground select-none",
           captionLayout === "label"
             ? ""
             : "flex items-center gap-1 [&>svg]:size-3.5 [&>svg]:text-muted-foreground",
@@ -87,7 +87,7 @@ function Calendar({
         month_grid: cn("w-full border-collapse", defaultClassNames.month_grid),
         weekdays: cn("flex", defaultClassNames.weekdays),
         weekday: cn(
-          "flex-1 font-mono text-[9px] font-medium tracking-[0.08em] text-muted-foreground uppercase select-none",
+          "flex-1 font-mono text-[0.5625rem] font-medium tracking-[0.08em] text-muted-foreground uppercase select-none",
           defaultClassNames.weekday
         ),
         week: cn("mt-1 flex w-full", defaultClassNames.week),
@@ -200,7 +200,7 @@ function CalendarDayButton({
       data-range-end={modifiers.range_end}
       data-range-middle={modifiers.range_middle}
       className={cn(
-        "relative isolate z-10 flex aspect-square size-auto w-full min-w-(--cell-size) flex-col gap-1 border-0 font-mono text-[10px] leading-none font-medium group-data-[focused=true]/day:z-20 group-data-[focused=true]/day:ring-2 group-data-[focused=true]/day:ring-ring/50 data-[range-end=true]:bg-primary data-[range-end=true]:text-primary-foreground data-[range-middle=true]:bg-muted data-[range-middle=true]:text-foreground data-[range-start=true]:bg-primary data-[range-start=true]:text-primary-foreground data-[selected-single=true]:bg-primary data-[selected-single=true]:text-primary-foreground",
+        "relative isolate z-10 flex aspect-square size-auto w-full min-w-(--cell-size) flex-col gap-1 border-0 font-mono text-[0.625rem] leading-none font-medium group-data-[focused=true]/day:z-20 group-data-[focused=true]/day:ring-2 group-data-[focused=true]/day:ring-ring/50 data-[range-end=true]:bg-primary data-[range-end=true]:text-primary-foreground data-[range-middle=true]:bg-muted data-[range-middle=true]:text-foreground data-[range-start=true]:bg-primary data-[range-start=true]:text-primary-foreground data-[selected-single=true]:bg-primary data-[selected-single=true]:text-primary-foreground",
         className
       )}
       {...props}

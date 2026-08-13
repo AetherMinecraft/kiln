@@ -452,7 +452,7 @@ const AccessToolbar = React.memo(function AccessToolbar({
               <span className="hidden sm:inline">Pending</span>
               <Badge
                 variant="outline"
-                className="h-4 min-w-4 justify-center border-border/80 px-1 font-mono text-[8px]"
+                className="h-4 min-w-4 justify-center border-border/80 px-1 font-mono text-[0.5rem]"
               >
                 {invitationCount}
               </Badge>
@@ -582,7 +582,7 @@ const AccessDirectoryTable = React.memo(function AccessDirectoryTable({
               ? "No matching access"
               : "No scoped users yet"}
           </p>
-          <p className="mt-1 text-[11px] text-muted-foreground">
+          <p className="mt-1 text-[0.6875rem] text-muted-foreground">
             {searchActive || filtersActive
               ? "Try another email, scope, Relay, or role."
               : "Add a user to grant access to a Relay, server, or database."}
@@ -669,7 +669,7 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
   const roleSelect = (
     <select
       aria-label={`Role for ${row.email} on ${row.resourceName}`}
-      className="h-8 w-full rounded-md border border-input bg-background px-2 text-[10px] outline-none focus:border-ring disabled:cursor-not-allowed disabled:opacity-65"
+      className="h-8 w-full rounded-md border border-input bg-background px-2 text-[0.625rem] outline-none focus:border-ring disabled:cursor-not-allowed disabled:opacity-65"
       disabled={pending || !roleChangeAllowed}
       value={row.role}
       onChange={(event) =>
@@ -696,7 +696,7 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
             {row.platformAdministrator ? (
               <Badge
                 variant="outline"
-                className="hidden border-primary/30 bg-primary/8 font-mono text-[7px] text-primary sm:inline-flex"
+                className="hidden border-primary/30 bg-primary/8 font-mono text-[0.4375rem] text-primary sm:inline-flex"
               >
                 Platform admin
               </Badge>
@@ -708,10 +708,10 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
         <div className="flex min-w-0 items-center gap-2">
           <ScopeIcon resourceType={row.resourceType} />
           <div className="min-w-0">
-            <p className="truncate text-[10px] font-medium text-foreground">
+            <p className="truncate text-[0.625rem] font-medium text-foreground">
               {row.resourceName}
             </p>
-            <p className="truncate font-mono text-[8px] text-muted-foreground uppercase">
+            <p className="truncate font-mono text-[0.5rem] text-muted-foreground uppercase">
               {row.resourceType === "instance" ? "Server" : row.resourceType}
               {row.instanceOwner ? " · owner" : ""}
             </p>
@@ -719,8 +719,8 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
         </div>
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden lg:table-cell">
-        <p className="truncate text-[10px] text-foreground">{row.relayName}</p>
-        <p className="truncate font-mono text-[8px] text-muted-foreground">
+        <p className="truncate text-[0.625rem] text-foreground">{row.relayName}</p>
+        <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
           {row.relayId}
         </p>
       </WorkspaceTableCell>
@@ -744,7 +744,7 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
           roleSelect
         )}
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden font-mono text-[9px] text-muted-foreground xl:table-cell">
+      <WorkspaceTableCell className="hidden font-mono text-[0.5625rem] text-muted-foreground xl:table-cell">
         <HydratedDate value={row.createdAt} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="px-1 sm:px-3">
@@ -912,7 +912,7 @@ function AddUserDialog({
                         <span className="block truncate text-xs font-semibold">
                           {selectedTarget.name}
                         </span>
-                        <span className="block truncate font-mono text-[8px] text-muted-foreground">
+                        <span className="block truncate font-mono text-[0.5rem] text-muted-foreground">
                           {selectedTarget.description}
                         </span>
                       </span>
@@ -968,7 +968,7 @@ function AddUserDialog({
                 </option>
               ))}
             </select>
-            <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
+            <p className="mt-2 text-[0.625rem] leading-4 text-muted-foreground">
               {accessRoleDetails[role].description}
             </p>
           </Field>
@@ -1154,8 +1154,8 @@ function PendingInvitationsDialog({
                         </p>
                       </WorkspaceTableCell>
                       <WorkspaceTableCell>
-                        <p className="truncate text-[10px]">{resourceName}</p>
-                        <p className="font-mono text-[8px] text-muted-foreground uppercase">
+                        <p className="truncate text-[0.625rem]">{resourceName}</p>
+                        <p className="font-mono text-[0.5rem] text-muted-foreground uppercase">
                           {databaseName
                             ? "Database"
                             : instanceName
@@ -1166,12 +1166,12 @@ function PendingInvitationsDialog({
                       <WorkspaceTableCell>
                         <Badge
                           variant="outline"
-                          className="font-mono text-[8px] capitalize"
+                          className="font-mono text-[0.5rem] capitalize"
                         >
                           {invitation.role}
                         </Badge>
                       </WorkspaceTableCell>
-                      <WorkspaceTableCell className="font-mono text-[9px] text-muted-foreground">
+                      <WorkspaceTableCell className="font-mono text-[0.5625rem] text-muted-foreground">
                         <HydratedDate value={invitation.expiresAt} />
                       </WorkspaceTableCell>
                       <WorkspaceTableCell>
@@ -1223,7 +1223,7 @@ function PendingInvitationsDialog({
               <p className="mt-3 text-sm font-semibold">
                 No pending invitations
               </p>
-              <p className="mt-1 text-[11px] text-muted-foreground">
+              <p className="mt-1 text-[0.6875rem] text-muted-foreground">
                 New invitations will appear here until they are accepted or
                 revoked.
               </p>
@@ -1261,7 +1261,7 @@ function Field({
   children: React.ReactNode
 }) {
   return (
-    <label className="block text-[10px] font-medium text-muted-foreground">
+    <label className="block text-[0.625rem] font-medium text-muted-foreground">
       <span className="mb-1.5 block">{label}</span>
       {children}
     </label>
