@@ -748,7 +748,8 @@ export class DockerDriver {
           container.State,
           powerState.observedState,
           readiness.get(config.id),
-          recoveryState?.recovery
+          recoveryState?.recovery,
+          desiredState
         ),
         recovery: recoveryState?.recovery ?? null,
         startedAt: container.State.Running ? container.State.StartedAt : null,

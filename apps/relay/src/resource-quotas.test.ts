@@ -4,6 +4,7 @@ import {
   relayCreateInstanceSchema,
   relayDiskAllocationAvailableBytes,
   relayInstanceLimitsSchema,
+  relayUpdateInstanceStartupSchema,
 } from "@workspace/contracts"
 import { describe, expect, it } from "vite-plus/test"
 
@@ -66,6 +67,14 @@ describe("Relay disk quotas", () => {
         diskLimitBytes: MINIMUM_INSTANCE_DISK_LIMIT_BYTES,
       }).success
     ).toBe(true)
+  })
+
+  it("does not apply the creation default to startup patches", () => {
+    const parsed = relayUpdateInstanceStartupSchema.parse({
+      variables: { memory: "4G" },
+    })
+
+    expect(parsed.diskLimitBytes).toBeUndefined()
   })
 
   it("treats a configured zero label as a missing legacy quota", () => {

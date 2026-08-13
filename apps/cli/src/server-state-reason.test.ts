@@ -20,4 +20,14 @@ describe("server state reasons", () => {
       "Automatic recovery is restarting the server after process exit code 137."
     )
   })
+
+  it("does not claim stopped intent caused an OOM kill", () => {
+    expect(
+      formatRelayInstanceStateReason({
+        code: "out_of_memory_while_stopping",
+      })
+    ).toBe(
+      "The server is stopped after an out-of-memory kill. The process may not have shut down gracefully; increase memory or use its console stop command."
+    )
+  })
 })
