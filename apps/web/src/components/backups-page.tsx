@@ -10,27 +10,25 @@ import {
   Archive,
   ArrowLeft,
   Check,
-  CircleCheck,
-  CircleX,
   Cloud,
   CloudCog,
   Copy,
   Database,
   Download,
+  ExternalLink,
   HardDrive,
   History as RotateCcwClock,
   LoaderCircle,
   Link2,
   Pencil,
   Plus,
+  RadioTower,
   RefreshCw,
   RotateCcw,
   Search,
   Server,
-  ShieldCheck,
   SlidersHorizontal,
   Trash2,
-  TriangleAlert,
   X,
 } from "lucide-react"
 
@@ -114,6 +112,14 @@ type BackupDialog =
 type BackupAvailabilityDestination = {
   id: string | null
   name: string
+}
+type BackupAvailabilityTagView = {
+  error: string | null
+  key: string
+  label: string
+  name: string
+  state: BackupAvailabilityState
+  tooltip?: string
 }
 type BackupAvailabilityState = "available" | "failed" | "missing" | "working"
 type BackupTargetPresentation = {
@@ -622,28 +628,72 @@ const BackupTable = React.memo(function BackupTable({
   )
 
   return (
-    <WorkspaceDataTable
-      getRowKey={backupRowKey}
-      getSearchText={backupSearchText}
-      head={<BackupTableHead />}
-      items={backups}
-      renderEmpty={renderEmpty}
-      renderRow={renderRow}
-      searchStore={searchStore}
-    />
+    <div id="backup-table-root">
+      <WorkspaceDataTable
+        getRowKey={backupRowKey}
+        getSearchText={backupSearchText}
+        head={<BackupTableHead searchStore={searchStore} />}
+        items={backups}
+        renderEmpty={renderEmpty}
+        renderRow={renderRow}
+        searchStore={searchStore}
+      />
+    </div>
   )
 })
 
-const BackupTableHead = React.memo(function BackupTableHead() {
+const BackupTableHead = React.memo(function BackupTableHead({
+  searchStore,
+}: {
+  searchStore: BackupSearchStore
+}) {
+  const headerRef = React.useRef<HTMLInputElement>(null)
+  const search = React.useSyncExternalStore(
+    searchStore.subscribe,
+    searchStore.getSnapshot,
+    searchStore.getServerSnapshot
+  )
+
+  const syncHeader = React.useCallback(() => {
+    const header = headerRef.current
+    if (!header) return
+    const boxes = visibleBackupSelection()
+    if (boxes.length === 0) {
+      header.checked = false
+      header.indeterminate = false
+      return
+    }
+    const checkedCount = boxes.filter((box) => box.checked).length
+    header.checked = checkedCount === boxes.length
+    header.indeterminate = checkedCount > 0 && checkedCount < boxes.length
+  }, [])
+
+  React.useLayoutEffect(() => {
+    syncHeader()
+    const root = document.getElementById("backup-table-root")
+    if (!root) return
+    root.addEventListener("change", syncHeader)
+    return () => root.removeEventListener("change", syncHeader)
+  }, [search, syncHeader])
+
   return (
     <WorkspaceTableHead className="sticky top-0 z-20 bg-background/95 shadow-[0_1px_0_var(--border)] backdrop-blur">
       <WorkspaceTableHeading className="w-10 px-2">
-        <span className="sr-only">Select</span>
+        <label className="grid size-7 place-items-center">
+          <input
+            ref={headerRef}
+            aria-label="Select all visible backups"
+            className="size-4 rounded-[3px] border-input accent-primary"
+            type="checkbox"
+            onChange={(event) => {
+              const checked = event.currentTarget.checked
+              for (const box of visibleBackupSelection()) box.checked = checked
+              event.currentTarget.indeterminate = false
+            }}
+          />
+        </label>
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-14">
-        <span className="sr-only">Status</span>
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-auto sm:w-[26%]">
+      <WorkspaceTableHeading className="w-auto sm:w-[30%]">
         Backup
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[22%] md:table-cell">
@@ -698,16 +748,38 @@ const BackupTableRow = React.memo(function BackupTableRow({
           <input
             aria-label={`Select ${backup.name}`}
             className="size-4 rounded-[3px] border-input accent-primary"
+            data-backup-select=""
             type="checkbox"
           />
         </label>
       </WorkspaceTableCell>
       <WorkspaceTableCell className="h-auto py-2.5">
-        <BackupStatusBadge backup={backup} />
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="h-auto py-2.5">
         <div className="min-w-0">
-          <p className="truncate text-sm font-semibold">{backup.name}</p>
+          <div className="flex min-w-0 items-center gap-1">
+            <p className="truncate text-sm font-semibold">{backup.name}</p>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label={`Edit filename for ${backup.name}`}
+                  className="shrink-0"
+                  size="icon-xs"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    const input = document.getElementById(
+                      backupFilenameInputId(backup.id)
+                    )
+                    if (!(input instanceof HTMLInputElement)) return
+                    input.focus()
+                    input.select()
+                  }}
+                >
+                  <Pencil />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Edit filename</TooltipContent>
+            </Tooltip>
+          </div>
           {backup.taskError ? (
             <p className="mt-1 line-clamp-1 text-[0.625rem] text-destructive">
               {backup.taskError}
@@ -726,10 +798,14 @@ const BackupTableRow = React.memo(function BackupTableRow({
           target={target}
         />
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground sm:table-cell">
-        <span className="block truncate" title={backup.filename ?? backup.id}>
-          {backup.filename ?? backup.id}
-        </span>
+      <WorkspaceTableCell className="hidden h-auto py-2.5 sm:table-cell">
+        <input
+          id={backupFilenameInputId(backup.id)}
+          aria-label={`Filename for ${backup.name}`}
+          className="h-7 w-full min-w-0 truncate rounded-sm border-0 bg-transparent px-0 font-mono text-[0.625rem] text-muted-foreground shadow-none outline-none focus-visible:text-foreground"
+          defaultValue={backup.filename ?? backup.id}
+          spellCheck={false}
+        />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground lg:table-cell">
         {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
@@ -794,33 +870,6 @@ const BackupTableRow = React.memo(function BackupTableRow({
   )
 })
 
-function BackupStatusBadge({ backup }: { backup: Backup }) {
-  const details = backupStatusDetails(backup)
-  const Icon = backupIsActive(backup)
-    ? LoaderCircle
-    : backup.status === "available"
-      ? CircleCheck
-      : backup.status === "failed"
-        ? TriangleAlert
-        : CircleX
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span
-          aria-label={details.label}
-          className={`grid size-7 place-items-center rounded-full border ${details.className}`}
-          role="img"
-        >
-          <Icon
-            className={`size-4 ${backupIsActive(backup) ? "animate-spin" : ""}`}
-          />
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="right">{details.label}</TooltipContent>
-    </Tooltip>
-  )
-}
-
 function BackupAvailabilityTags({
   backup,
   destinations,
@@ -844,20 +893,14 @@ function BackupAvailabilityTags({
 function BackupAvailabilityTag({
   tag,
 }: {
-  tag: {
-    error: string | null
-    key: string
-    label: string
-    name: string
-    state: BackupAvailabilityState
-  }
+  tag: BackupAvailabilityTagView
 }) {
   const working = tag.state === "working"
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <span
-          className={`inline-flex h-6 max-w-36 items-center gap-1 rounded-md border px-2 font-mono text-[0.5625rem] font-semibold ${tag.key === "local" ? "uppercase" : ""} ${availabilityTagClassName(tag.state)}`}
+          className={`inline-flex h-6 max-w-36 items-center gap-1 rounded-md border px-2 font-mono text-[0.5625rem] font-semibold ${tag.key === "local" || tag.key === "s3" ? "uppercase" : ""} ${availabilityTagClassName(tag.state)}`}
         >
           {working ? (
             <LoaderCircle className="size-2.5 shrink-0 animate-spin" />
@@ -868,8 +911,10 @@ function BackupAvailabilityTag({
         </span>
       </TooltipTrigger>
       <TooltipContent side="top">
-        {tag.name} · {availabilityStateLabel(tag.state)}
-        {tag.error ? ` · ${tag.error}` : ""}
+        {tag.tooltip ??
+          `${tag.name} · ${availabilityStateLabel(tag.state)}${
+            tag.error ? ` · ${tag.error}` : ""
+          }`}
       </TooltipContent>
     </Tooltip>
   )
@@ -902,24 +947,40 @@ function BackupTargetLink({
   backup: Backup
   target: BackupTargetPresentation
 }) {
-  const content = (
-    <span className="flex min-w-0 items-center gap-2">
-      <BackupTargetIcon available={available} kind={backup.targetKind} />
-      <span className="min-w-0">
-        <span className="block truncate text-xs font-medium">
-          <span className="text-muted-foreground">{target.kindLabel}:</span>{" "}
-          <span className={available ? "text-primary" : "text-muted-foreground"}>
-            {target.name}
-          </span>
-        </span>
-        <span className="mt-0.5 block truncate font-mono text-[0.5625rem] text-muted-foreground">
-          {target.id}
+  const copyId = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    void navigator.clipboard.writeText(target.id).then(() =>
+      showToast({
+        message: "ID copied",
+        type: "success",
+      })
+    )
+  }
+  const name = (
+    <span className="flex min-w-0 items-center gap-1 text-xs font-medium">
+      <span className="truncate">
+        <span className="text-muted-foreground">{target.kindLabel}:</span>{" "}
+        <span className={available ? "text-primary" : "text-muted-foreground"}>
+          {target.name}
         </span>
       </span>
+      {available ? (
+        <ExternalLink className="size-3 shrink-0 text-primary/75" />
+      ) : null}
     </span>
   )
-  const className =
-    "-mx-3 -my-2.5 block min-w-0 px-3 py-2.5 outline-none transition-colors hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring/40"
+  const copyButton = (
+    <button
+      type="button"
+      aria-label={`Copy ${target.kindLabel} ID`}
+      className="mt-0.5 inline-flex items-center gap-1 font-mono text-[0.5625rem] text-muted-foreground transition-colors hover:text-foreground"
+      onClick={copyId}
+    >
+      Copy ID
+      <Copy className="size-3" />
+    </button>
+  )
 
   if (!available) {
     return (
@@ -928,54 +989,79 @@ function BackupTargetLink({
           aria-label={missingTargetMessage(backup.targetKind)}
           className="-mx-3 -my-2.5 cursor-help px-3 py-2.5"
         >
-          {content}
+          <span className="flex min-w-0 items-center gap-2">
+            <BackupTargetIcon available={false} kind={backup.targetKind} />
+            {name}
+          </span>
+          <div className="pl-9">{copyButton}</div>
         </div>
       </BackupMissingTargetTooltip>
     )
   }
 
+  const className =
+    "min-w-0 outline-none transition-colors hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring/40"
+
   if (backup.targetKind === "instance") {
     return (
-      <Link
-        aria-label={`Open ${target.name}`}
-        className={className}
-        params={{
-          serverId: relayInstanceRouteId(
-            backup.relayId,
-            backup.targetId.slice(0, 8)
-          ),
-        }}
-        preload="intent"
-        to="/server/$serverId/console"
-      >
-        {content}
-      </Link>
+      <div className="-mx-3 -my-2.5 px-3 py-2.5">
+        <Link
+          aria-label={`Open ${target.name}`}
+          className={className}
+          params={{
+            serverId: relayInstanceRouteId(
+              backup.relayId,
+              backup.targetId.slice(0, 8)
+            ),
+          }}
+          preload="intent"
+          to="/server/$serverId/console"
+        >
+          <span className="flex min-w-0 items-center gap-2">
+            <BackupTargetIcon available kind={backup.targetKind} />
+            {name}
+          </span>
+        </Link>
+        <div className="pl-9">{copyButton}</div>
+      </div>
     )
   }
 
   if (backup.targetKind === "database") {
     return (
-      <Link
-        aria-label={`Open ${target.name}`}
-        className={className}
-        preload="intent"
-        search={{ search: target.id }}
-        to="/infra/databases"
-      >
-        {content}
-      </Link>
+      <div className="-mx-3 -my-2.5 px-3 py-2.5">
+        <Link
+          aria-label={`Open ${target.name}`}
+          className={className}
+          preload="intent"
+          search={{ search: target.id }}
+          to="/infra/databases"
+        >
+          <span className="flex min-w-0 items-center gap-2">
+            <BackupTargetIcon available kind={backup.targetKind} />
+            {name}
+          </span>
+        </Link>
+        <div className="pl-9">{copyButton}</div>
+      </div>
     )
   }
 
   return (
-    <Link
-      aria-label={`View ${target.name}`}
-      className={className}
-      preload="intent"
-      to="/infra/relays"
-    >
-      {content}
-    </Link>
+    <div className="-mx-3 -my-2.5 px-3 py-2.5">
+      <Link
+        aria-label={`View ${target.name}`}
+        className={className}
+        preload="intent"
+        to="/infra/relays"
+      >
+          <span className="flex min-w-0 items-center gap-2">
+            <BackupTargetIcon available kind={backup.targetKind} />
+            {name}
+          </span>
+        </Link>
+        <div className="pl-9">{copyButton}</div>
+    </div>
   )
 }
 
@@ -1008,7 +1094,7 @@ function BackupTargetIcon({
   kind: Backup["targetKind"]
 }) {
   const Icon =
-    kind === "database" ? Database : kind === "platform" ? ShieldCheck : Server
+    kind === "database" ? Database : kind === "platform" ? RadioTower : Server
   return (
     <span
       className={`grid size-7 shrink-0 place-items-center rounded-md border bg-background/60 ${
@@ -2471,48 +2557,6 @@ function canCreateForResource(
   )
 }
 
-function backupStatusDetails(backup: Backup): {
-  className: string
-  label: string
-} {
-  const { status } = backup
-  if (
-    status === "available" &&
-    (backup.taskStatus === "queued" || backup.taskStatus === "running")
-  ) {
-    return {
-      className:
-        "border-violet-500/35 bg-violet-500/10 text-violet-700 dark:text-violet-300",
-      label: "Restoring",
-    }
-  }
-  if (status === "available") {
-    return {
-      className:
-        "border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-      label: "Available",
-    }
-  }
-  if (status === "failed") {
-    return {
-      className: "border-destructive/40 bg-destructive/10 text-destructive",
-      label: "Failed",
-    }
-  }
-  if (status === "deleting") {
-    return {
-      className:
-        "border-rose-500/35 bg-rose-500/10 text-rose-700 dark:text-rose-300",
-      label: "Deleting",
-    }
-  }
-  return {
-    className:
-      "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300",
-    label: status === "queued" ? "Queued" : "Running",
-  }
-}
-
 function backupIsActive(backup: Backup): boolean {
   return (
     activeStatuses.has(backup.status) ||
@@ -2562,28 +2606,24 @@ function missingTargetMessage(kind: Backup["targetKind"]): string {
 function backupAvailabilityTags(
   backup: Backup,
   destinations: ReadonlyArray<BackupAvailabilityDestination>
-): Array<{
-  error: string | null
-  key: string
-  label: string
-  name: string
-  state: BackupAvailabilityState
-}> {
+): Array<BackupAvailabilityTagView> {
   const artifactsByStorage = new Map<string, Backup["artifacts"][number]>()
   for (const artifact of backup.artifacts) {
     artifactsByStorage.set(artifact.storageId ?? "local", artifact)
   }
-  const tags = destinations.map((destination) => {
-    const key = destination.id ?? "local"
-    const artifact = artifactsByStorage.get(key)
-    return {
-      error: artifact?.error ?? null,
-      key,
-      label: destination.id ? destination.name : "Local",
-      name: destination.id ? destination.name : "Local Relay",
-      state: artifactAvailabilityState(artifact?.status),
+  const tags: Array<BackupAvailabilityTagView> = destinations.map(
+    (destination) => {
+      const key = destination.id ?? "local"
+      const artifact = artifactsByStorage.get(key)
+      return {
+        error: artifact?.error ?? null,
+        key,
+        label: destination.id ? destination.name : "Local",
+        name: destination.id ? destination.name : "Local Relay",
+        state: artifactAvailabilityState(artifact?.status),
+      }
     }
-  })
+  )
   const seen = new Set(tags.map((tag) => tag.key))
   for (const artifact of backup.artifacts) {
     const key = artifact.storageId ?? "local"
@@ -2594,6 +2634,19 @@ function backupAvailabilityTags(
       label: artifact.storageId ? "S3" : "Local",
       name: artifact.storageId ? "S3 destination" : "Local Relay",
       state: artifactAvailabilityState(artifact.status),
+    })
+  }
+  const s3Enabled =
+    destinations.some((destination) => destination.id !== null) ||
+    backup.artifacts.some((artifact) => artifact.storageId !== null)
+  if (!s3Enabled) {
+    tags.push({
+      error: null,
+      key: "s3",
+      label: "S3",
+      name: "S3",
+      state: "missing",
+      tooltip: "S3 not enabled",
     })
   }
   return tags
@@ -2646,6 +2699,18 @@ function targetKindLabel(kind: CreateTarget["kind"]): string {
 
 function backupRowKey(backup: Backup) {
   return backup.id
+}
+
+function backupFilenameInputId(backupId: string) {
+  return `backup-filename-${backupId}`
+}
+
+function visibleBackupSelection(): Array<HTMLInputElement> {
+  return [
+    ...document.querySelectorAll<HTMLInputElement>(
+      "#backup-table-root tbody input[data-backup-select]"
+    ),
+  ]
 }
 
 function backupSearchText(backup: Backup): string {
