@@ -152,7 +152,7 @@ const kilnEditorTheme = EditorView.theme(
       borderLeftColor: "var(--primary)",
     },
     ".cm-scroller": {
-      fontFamily: "'JetBrains Mono Variable', 'JetBrains Mono', monospace",
+      fontFamily: "var(--font-mono)",
       minWidth: "0",
       maxWidth: "100%",
       overflow: "auto",
