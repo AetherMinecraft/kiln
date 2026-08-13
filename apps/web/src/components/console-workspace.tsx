@@ -490,7 +490,7 @@ function ConsoleRuntimeReasonContent({
     <ConsoleTooltip content={message}>
       <span
         aria-label={`Server state reason: ${message}`}
-        className="flex max-w-64 min-w-0 shrink items-center gap-1.5 text-[10px] font-medium text-amber-300 outline-none sm:text-xs"
+        className="flex max-w-64 min-w-0 shrink items-center gap-1.5 text-[0.625rem] font-medium text-amber-300 outline-none sm:text-xs"
         role="status"
         tabIndex={0}
       >
@@ -608,10 +608,10 @@ function ConsoleLevelMenuSummary({ uiStore }: { uiStore: ConsoleUiStore }) {
 
   return (
     <div className="flex items-center justify-between border-b px-2 py-2">
-      <p className="text-[10px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+      <p className="text-[0.625rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
         Console levels
       </p>
-      <span className="font-mono text-[9px] text-muted-foreground/75 tabular-nums">
+      <span className="font-mono text-[0.5625rem] text-muted-foreground/75 tabular-nums">
         {levelCount}/{consoleLevels.length}
       </span>
     </div>
@@ -821,10 +821,10 @@ function ConsoleFilterMenuSummary({
 }) {
   return (
     <div className="flex items-center justify-between border-b px-2 py-2">
-      <p className="text-[10px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+      <p className="text-[0.625rem] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
         {label}
       </p>
-      <span className="font-mono text-[9px] text-muted-foreground/75 tabular-nums">
+      <span className="font-mono text-[0.5625rem] text-muted-foreground/75 tabular-nums">
         {active}/{total}
       </span>
     </div>
@@ -899,7 +899,7 @@ function ConsoleShareButton({
               : "ghost"
         }
         size="sm"
-        className="h-8 gap-1.5 px-2.5 text-[11px]"
+        className="h-8 gap-1.5 px-2.5 text-[0.6875rem]"
         disabled={state === "uploading" || !hasLines}
         onClick={handleShare}
       >
@@ -992,7 +992,7 @@ function ConsoleSelectionControl({
         onEscapeKeyDown={uiStore.clearSelection}
       >
         <span
-          className="font-mono text-[10px] whitespace-nowrap text-muted-foreground"
+          className="font-mono text-[0.625rem] whitespace-nowrap text-muted-foreground"
           aria-live="polite"
         >
           {copied
@@ -1164,7 +1164,7 @@ function ConsoleLogViewport({
     <div className="relative min-h-0 flex-1 bg-background">
       <div
         ref={parentRef}
-        className={`[container-type:inline-size] absolute inset-0 overscroll-contain font-mono text-[11px] selection:bg-primary/25 sm:text-[12px] ${wrapLines ? "overflow-x-hidden overflow-y-auto" : "overflow-auto"}`}
+        className={`[container-type:inline-size] absolute inset-0 overscroll-contain font-mono text-[0.6875rem] selection:bg-primary/25 sm:text-xs ${wrapLines ? "overflow-x-hidden overflow-y-auto" : "overflow-auto"}`}
         onScroll={(event) => {
           if (programmaticScroll.current) return
           const viewport = event.currentTarget
@@ -1301,7 +1301,7 @@ function ConsoleConnectionNoticeContent({
 }) {
   return (
     <div className="pointer-events-none absolute top-3 left-1/2 z-20 -translate-x-1/2">
-      <div className="flex items-center gap-1.5 border border-amber-400/20 bg-stone-950/90 px-2.5 py-1.5 font-mono text-[9px] text-amber-200 shadow-lg shadow-black/35 backdrop-blur-sm">
+      <div className="flex items-center gap-1.5 border border-amber-400/20 bg-stone-950/90 px-2.5 py-1.5 font-mono text-[0.5625rem] text-amber-200 shadow-lg shadow-black/35 backdrop-blur-sm">
         {loading ? (
           <LoaderCircle className="size-3 animate-spin" />
         ) : (
@@ -1540,7 +1540,7 @@ const ConsoleCommandBar = React.memo(function ConsoleCommandBar({
           </Button>
         </form>
       ) : (
-        <div className="flex h-10 items-center gap-2 font-mono text-[10px] text-muted-foreground">
+        <div className="flex h-10 items-center gap-2 font-mono text-[0.625rem] text-muted-foreground">
           <EyeOff className="size-3.5" /> Read-only console access
         </div>
       )}
@@ -1973,7 +1973,7 @@ function ConsoleTimestamp({ timestamp }: { timestamp: string | null }) {
   )
 
   return (
-    <span className="mr-2 ml-3 w-[3.25rem] shrink-0 text-[9px] text-muted-foreground/65 tabular-nums">
+    <span className="mr-2 ml-3 w-[3.25rem] shrink-0 text-[0.5625rem] text-muted-foreground/65 tabular-nums">
       {formattedTimestamp}
     </span>
   )

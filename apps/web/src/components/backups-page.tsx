@@ -669,11 +669,11 @@ const BackupTableRow = React.memo(function BackupTableRow({
       <WorkspaceTableCell>
         <div className="min-w-0">
           <p className="truncate text-sm font-semibold">{backup.name}</p>
-          <p className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground">
+          <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
             {backup.filename ?? backup.id}
           </p>
           {backup.taskError ? (
-            <p className="mt-1 line-clamp-1 text-[10px] text-destructive">
+            <p className="mt-1 line-clamp-1 text-[0.625rem] text-destructive">
               {backup.taskError}
             </p>
           ) : null}
@@ -686,7 +686,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
             <span className="block truncate text-xs font-medium">
               {targetName}
             </span>
-            <span className="block truncate text-[10px] text-muted-foreground">
+            <span className="block truncate text-[0.625rem] text-muted-foreground">
               {relayName}
             </span>
           </span>
@@ -707,10 +707,10 @@ const BackupTableRow = React.memo(function BackupTableRow({
           ))}
         </div>
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden font-mono text-[10px] text-muted-foreground xl:table-cell">
+      <WorkspaceTableCell className="hidden font-mono text-[0.625rem] text-muted-foreground xl:table-cell">
         {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden text-[10px] whitespace-nowrap text-muted-foreground sm:table-cell">
+      <WorkspaceTableCell className="hidden text-[0.625rem] whitespace-nowrap text-muted-foreground sm:table-cell">
         <BackupCreatedTime createdAt={backup.createdAt} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="text-right">
@@ -787,7 +787,7 @@ function BackupDestinationTag({
     <Tooltip>
       <TooltipTrigger asChild>
         <span
-          className={`inline-flex h-6 items-center gap-1 rounded-md border px-2 font-mono text-[9px] font-semibold uppercase ${
+          className={`inline-flex h-6 items-center gap-1 rounded-md border px-2 font-mono text-[0.5625rem] font-semibold uppercase ${
             available
               ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
               : active
@@ -818,7 +818,7 @@ function BackupCreatedTime({ createdAt }: { createdAt: string }) {
     <Tooltip>
       <TooltipTrigger asChild>
         <time
-          className="block cursor-help truncate font-mono text-[10px]"
+          className="block cursor-help truncate font-mono text-[0.625rem]"
           dateTime={createdAt}
           suppressHydrationWarning
         >
@@ -983,7 +983,7 @@ function DownloadBackupDialog({
 
           <div className="grid grid-cols-2 gap-3 rounded-lg border bg-muted/15 p-3">
             <div>
-              <p className="font-mono text-[9px] tracking-wider text-muted-foreground uppercase">
+              <p className="font-mono text-[0.5625rem] tracking-wider text-muted-foreground uppercase">
                 Destination
               </p>
               <p className="mt-1 truncate text-sm font-medium">
@@ -993,7 +993,7 @@ function DownloadBackupDialog({
               </p>
             </div>
             <div>
-              <p className="font-mono text-[9px] tracking-wider text-muted-foreground uppercase">
+              <p className="font-mono text-[0.5625rem] tracking-wider text-muted-foreground uppercase">
                 Size
               </p>
               <p className="mt-1 font-mono text-sm font-medium">
@@ -1049,14 +1049,14 @@ function DownloadBackupDialog({
                 Get URL
               </Button>
             </div>
-            <p className="mt-2 text-[10px] text-muted-foreground">
+            <p className="mt-2 text-[0.625rem] text-muted-foreground">
               Links can remain valid from 1 minute up to 7 days.
             </p>
             {shared ? (
               <div className="mt-3 flex gap-2">
                 <Input
                   aria-label="Generated temporary backup URL"
-                  className="font-mono text-[10px]"
+                  className="font-mono text-[0.625rem]"
                   readOnly
                   value={shared.url}
                 />
@@ -1144,7 +1144,7 @@ function BackupDestinationChoice({
       </span>
       <span className="min-w-0 flex-1">
         <span className="block text-xs font-semibold">{label}</span>
-        <span className="block truncate text-[10px] text-muted-foreground">
+        <span className="block truncate text-[0.625rem] text-muted-foreground">
           {description}
         </span>
       </span>
@@ -1334,7 +1334,7 @@ function CreateBackupDialog({
                 />
               ))}
             </div>
-            <span className="mt-1.5 block text-[10px] text-muted-foreground">
+            <span className="mt-1.5 block text-[0.625rem] text-muted-foreground">
               {target?.kind === "platform"
                 ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
                 : target?.kind === "instance"
@@ -1556,7 +1556,7 @@ function InstanceBackupSettingsEditor({
         {!isPlatformAdmin &&
         (policy.adminQuantityLimit !== null ||
           policy.adminSizeLimitBytes !== null) ? (
-          <div className="rounded-lg border border-amber-500/25 bg-amber-500/8 p-3 text-[10px] leading-4 text-muted-foreground sm:col-span-2">
+          <div className="rounded-lg border border-amber-500/25 bg-amber-500/8 p-3 text-[0.625rem] leading-4 text-muted-foreground sm:col-span-2">
             Platform ceiling: {policy.adminQuantityLimit ?? "unlimited"} backups
             ·{" "}
             {policy.adminSizeLimitBytes === null
@@ -1593,7 +1593,7 @@ function InstanceBackupSettingsEditor({
             value={exclude}
             onChange={(event) => setExclude(event.currentTarget.value)}
           />
-          <span className="mt-1.5 block text-[10px] text-muted-foreground">
+          <span className="mt-1.5 block text-[0.625rem] text-muted-foreground">
             One relative glob per line. Absolute paths and parent traversal are
             rejected by Relay.
           </span>
@@ -1668,7 +1668,7 @@ function BackupStorageDialog({
                     <span className="block text-xs font-semibold">
                       Local Relay storage
                     </span>
-                    <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                    <span className="mt-0.5 block text-[0.625rem] text-muted-foreground">
                       Stored on the Relay that owns the resource
                     </span>
                   </span>
@@ -1699,7 +1699,7 @@ function BackupStorageDialog({
                             <Badge variant="outline">Disabled</Badge>
                           ) : null}
                         </span>
-                        <span className="mt-1 block truncate font-mono text-[9px] text-muted-foreground">
+                        <span className="mt-1 block truncate font-mono text-[0.5625rem] text-muted-foreground">
                           {destination.endpoint} / {destination.bucket}
                           {destination.objectPrefix
                             ? ` / ${destination.objectPrefix}`
@@ -1988,7 +1988,7 @@ function StorageSwitch({
     <label className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-background/35 p-3">
       <span>
         <span className="block text-xs font-semibold">{label}</span>
-        <span className="mt-0.5 block text-[10px] leading-4 text-muted-foreground">
+        <span className="mt-0.5 block text-[0.625rem] leading-4 text-muted-foreground">
           {description}
         </span>
       </span>
@@ -2111,7 +2111,7 @@ function RestoreBackupDialog({
         <label className="flex items-center justify-between gap-4 rounded-lg border border-border/70 bg-background/35 p-3">
           <span>
             <span className="block text-xs font-semibold">Safety backup</span>
-            <span className="mt-1 block text-[10px] leading-4 text-muted-foreground">
+            <span className="mt-1 block text-[0.625rem] leading-4 text-muted-foreground">
               Take a new full backup immediately before restoring.
             </span>
           </span>

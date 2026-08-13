@@ -731,7 +731,7 @@ const ConfiguredRoutesSection = React.memo(function ConfiguredRoutesSection({
       </div>
 
       {!relayConnected ? (
-        <p className="border-t border-amber-400/20 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-100/75">
+        <p className="border-t border-amber-400/20 bg-amber-400/5 px-4 py-2 text-[0.6875rem] text-amber-100/75">
           Port changes are unavailable while this Relay is disconnected.
         </p>
       ) : (update.error || routeError) && dialog === null ? (
@@ -955,13 +955,13 @@ const ConfiguredRoutesTable = React.memo(function ConfiguredRoutesTable({
                 <span className="block truncate text-xs font-medium">
                   Default Server
                 </span>
-                <span className="mt-0.5 block font-mono text-[9px] text-muted-foreground uppercase">
+                <span className="mt-0.5 block font-mono text-[0.5625rem] text-muted-foreground uppercase">
                   {displayedPrimaryPort
                     ? formatPortProtocol(displayedPrimaryPort.protocol)
                     : "Not configured"}
                 </span>
               </div>
-              <span className="shrink-0 self-center border border-primary/30 bg-primary/8 px-2 py-1 font-mono text-[9px] leading-none tracking-[0.1em] text-primary uppercase">
+              <span className="shrink-0 self-center border border-primary/30 bg-primary/8 px-2 py-1 font-mono text-[0.5625rem] leading-none tracking-[0.1em] text-primary uppercase">
                 Primary
               </span>
             </div>
@@ -1620,7 +1620,7 @@ function RouteName({ name, secondary }: { name: string; secondary: string }) {
   return (
     <div className="min-w-0">
       <span className="block truncate text-xs font-medium">{name}</span>
-      <span className="mt-0.5 block truncate font-mono text-[9px] text-muted-foreground uppercase">
+      <span className="mt-0.5 block truncate font-mono text-[0.5625rem] text-muted-foreground uppercase">
         {secondary}
       </span>
     </div>
@@ -1754,7 +1754,7 @@ const PublicAddressCopy = React.memo(function PublicAddressCopy({
 
   if (!address) {
     return (
-      <span className="block truncate font-mono text-[10px] text-muted-foreground">
+      <span className="block truncate font-mono text-[0.625rem] text-muted-foreground">
         Unavailable
       </span>
     )
@@ -1766,7 +1766,7 @@ const PublicAddressCopy = React.memo(function PublicAddressCopy({
         <button
           aria-label={`Copy ${label}`}
           className={`flex max-w-full items-center gap-1 font-mono transition-colors ${
-            prominent ? "text-sm font-medium" : "text-[10px]"
+            prominent ? "text-sm font-medium" : "text-[0.625rem]"
           } ${
             copied ? "text-emerald-400" : "text-primary/75 hover:text-primary"
           }`}
@@ -2184,7 +2184,7 @@ function AddNetworkRouteDialog({
     >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <p className="font-mono text-[9px] tracking-[0.16em] text-primary uppercase">
+          <p className="font-mono text-[0.5625rem] tracking-[0.16em] text-primary uppercase">
             {webRoute ? "Web route" : "New route"}
           </p>
           <DialogTitle>
@@ -2214,7 +2214,7 @@ function AddNetworkRouteDialog({
               <Cable className="mt-0.5" />
               <span>
                 <span className="block text-xs">Port</span>
-                <span className="mt-0.5 block text-[9px] opacity-70">
+                <span className="mt-0.5 block text-[0.5625rem] opacity-70">
                   TCP or UDP
                 </span>
               </span>
@@ -2234,7 +2234,7 @@ function AddNetworkRouteDialog({
               <Globe2 className="mt-0.5" />
               <span>
                 <span className="block text-xs">Web route</span>
-                <span className="mt-0.5 block text-[9px] opacity-70">
+                <span className="mt-0.5 block text-[0.5625rem] opacity-70">
                   HTTPS hostname
                 </span>
               </span>
@@ -2356,7 +2356,7 @@ function AddNetworkRouteDialog({
         >
           {routeType === "port" ? (
             <>
-              <label className="block space-y-1.5 text-[11px] font-medium">
+              <label className="block space-y-1.5 text-[0.6875rem] font-medium">
                 Name
                 <Input
                   autoComplete="off"
@@ -2367,7 +2367,7 @@ function AddNetworkRouteDialog({
                 />
               </label>
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-[7.5rem_7.5rem_minmax(0,1fr)]">
-                <label className="block space-y-1.5 text-[11px] font-medium">
+                <label className="block space-y-1.5 text-[0.6875rem] font-medium">
                   Internal Port
                   <Input
                     max={65_535}
@@ -2380,7 +2380,7 @@ function AddNetworkRouteDialog({
                     onChange={(event) => setInternalPort(event.target.value)}
                   />
                 </label>
-                <label className="block space-y-1.5 text-[11px] font-medium">
+                <label className="block space-y-1.5 text-[0.6875rem] font-medium">
                   Public Port
                   <Input
                     aria-label="Public Port"
@@ -2401,7 +2401,7 @@ function AddNetworkRouteDialog({
                     }
                   />
                 </label>
-                <label className="col-span-2 block space-y-1.5 text-[11px] font-medium sm:col-span-1">
+                <label className="col-span-2 block space-y-1.5 text-[0.6875rem] font-medium sm:col-span-1">
                   Protocol
                   <ProtocolSelect value={protocol} onChange={setProtocol} />
                 </label>
@@ -2409,7 +2409,7 @@ function AddNetworkRouteDialog({
             </>
           ) : (
             <>
-              <label className="block space-y-1.5 text-[11px] font-medium">
+              <label className="block space-y-1.5 text-[0.6875rem] font-medium">
                 Name
                 <Input
                   autoComplete="off"
@@ -2420,7 +2420,7 @@ function AddNetworkRouteDialog({
                   required
                 />
               </label>
-              <label className="block space-y-1.5 text-[11px] font-medium">
+              <label className="block space-y-1.5 text-[0.6875rem] font-medium">
                 Hostname
                 <Input
                   autoCapitalize="none"
@@ -2432,7 +2432,7 @@ function AddNetworkRouteDialog({
                 />
               </label>
               <div className="grid grid-cols-[minmax(0,1fr)_8rem] gap-3">
-                <label className="block space-y-1.5 text-[11px] font-medium">
+                <label className="block space-y-1.5 text-[0.6875rem] font-medium">
                   Path (optional)
                   <Input
                     defaultValue={webRoute?.path ?? ""}
@@ -2440,7 +2440,7 @@ function AddNetworkRouteDialog({
                     placeholder="/map"
                   />
                 </label>
-                <label className="block space-y-1.5 text-[11px] font-medium">
+                <label className="block space-y-1.5 text-[0.6875rem] font-medium">
                   Internal Port
                   <Input
                     defaultValue={webRoute?.targetPort}
@@ -2453,7 +2453,7 @@ function AddNetworkRouteDialog({
                   />
                 </label>
               </div>
-              <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              <label className="flex items-center gap-2 text-[0.6875rem] text-muted-foreground">
                 <input
                   className="accent-primary"
                   defaultChecked={webRoute?.stripPrefix ?? true}
@@ -2462,7 +2462,7 @@ function AddNetworkRouteDialog({
                 />
                 Strip the configured path before forwarding
               </label>
-              <div className="flex gap-2 border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-[10px] leading-relaxed text-amber-100/75">
+              <div className="flex gap-2 border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-[0.625rem] leading-relaxed text-amber-100/75">
                 <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-300" />
                 Point this hostname at the Relay before applying the route.
               </div>
@@ -2541,7 +2541,7 @@ function PortAllocationDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <p className="font-mono text-[9px] tracking-[0.16em] text-primary uppercase">
+          <p className="font-mono text-[0.5625rem] tracking-[0.16em] text-primary uppercase">
             {isDefaultServer
               ? "Default Server"
               : editing
@@ -2594,7 +2594,7 @@ function PortAllocationDialog({
           className="space-y-4"
         >
           {isDefaultServer ? null : (
-            <label className="block space-y-1.5 text-[11px] font-medium">
+            <label className="block space-y-1.5 text-[0.6875rem] font-medium">
               Name
               <Input
                 autoComplete="off"
@@ -2613,7 +2613,7 @@ function PortAllocationDialog({
                 : "grid grid-cols-2 gap-3 sm:grid-cols-[7.5rem_7.5rem_minmax(0,1fr)]"
             }
           >
-            <label className="block space-y-1.5 text-[11px] font-medium">
+            <label className="block space-y-1.5 text-[0.6875rem] font-medium">
               Internal Port
               <Input
                 defaultValue={allocation?.internalPort}
@@ -2632,7 +2632,7 @@ function PortAllocationDialog({
               />
             </label>
             {recoveringPrimary ? null : (
-              <label className="block space-y-1.5 text-[11px] font-medium">
+              <label className="block space-y-1.5 text-[0.6875rem] font-medium">
                 Public Port
                 <Input
                   aria-label="Public Port"
@@ -2646,8 +2646,8 @@ function PortAllocationDialog({
             <label
               className={
                 recoveringPrimary
-                  ? "block space-y-1.5 text-[11px] font-medium"
-                  : "col-span-2 block space-y-1.5 text-[11px] font-medium sm:col-span-1"
+                  ? "block space-y-1.5 text-[0.6875rem] font-medium"
+                  : "col-span-2 block space-y-1.5 text-[0.6875rem] font-medium sm:col-span-1"
               }
             >
               Protocol

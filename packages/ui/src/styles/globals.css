@@ -204,6 +204,11 @@
   --sidebar-ring: var(--ring);
 }
 
+/*
+ * Large displays scale the root rem. That grows type and rem-based chrome
+ * together, the same way browser zoom does, so rows and the sidebar stay
+ * in proportion with the text. Mobile stays at 16px.
+ */
 html {
   --type-viewport-scale: 1;
   font-family: var(--font-sans);

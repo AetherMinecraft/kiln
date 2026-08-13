@@ -670,7 +670,7 @@ const UpdaterCheckControl = React.memo(function UpdaterCheckControl({
         <RefreshCw className={checking ? "animate-spin" : ""} />
         <span className="hidden sm:inline">Check for updates</span>
       </Button>
-      <p className="hidden text-[9px] text-muted-foreground sm:block">
+      <p className="hidden text-[0.5625rem] text-muted-foreground sm:block">
         Last Checked: {lastCheckedAt}
       </p>
     </div>
@@ -778,7 +778,7 @@ const UpdateOverviewView = React.memo(function UpdateOverviewView({
             <p className="text-xs font-semibold text-foreground">
               Game servers stay online
             </p>
-            <p className="mt-0.5 max-w-2xl text-[10px] leading-4 text-muted-foreground">
+            <p className="mt-0.5 max-w-2xl text-[0.625rem] leading-4 text-muted-foreground">
               Updates do not restart running game servers or disconnect players.
               Only the Panel may be briefly unavailable.
             </p>
@@ -867,7 +867,7 @@ const UpdateSectionLabel = React.memo(function UpdateSectionLabel({
           component === "hearth" ? "text-primary" : "text-muted-foreground"
         }`}
       />
-      <p className="font-mono text-[9px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">
+      <p className="font-mono text-[0.5625rem] font-semibold tracking-[0.16em] text-muted-foreground uppercase">
         {component === "hearth" ? "Hearth" : "Relays"}
       </p>
     </div>
@@ -900,7 +900,7 @@ const UpdateStatusCallout = React.memo(function UpdateStatusCallout({
 }) {
   return (
     <span
-      className={`inline-flex h-5 items-center rounded-[3px] border px-2 font-mono text-[8px] font-semibold tracking-[0.08em] uppercase ${status.tone}`}
+      className={`inline-flex h-5 items-center rounded-[3px] border px-2 font-mono text-[0.5rem] font-semibold tracking-[0.08em] uppercase ${status.tone}`}
     >
       {status.label}
     </span>
@@ -984,7 +984,7 @@ const UpdateTargetRow = React.memo(function UpdateTargetRow({
             />
           </div>
           {!target.eligible && target.reason ? (
-            <p className="mt-1.5 flex max-w-2xl gap-1.5 text-[10px] leading-4 text-muted-foreground">
+            <p className="mt-1.5 flex max-w-2xl gap-1.5 text-[0.625rem] leading-4 text-muted-foreground">
               <WifiOff className="mt-px size-3 shrink-0" />
               {target.reason}
             </p>
@@ -1050,7 +1050,7 @@ const OverviewVersionLink = React.memo(function OverviewVersionLink({
   if (currentRelease) {
     return (
       <GitHubVersionLink href={currentRelease.url}>
-        <span className="block font-mono text-[9px] text-muted-foreground">
+        <span className="block font-mono text-[0.5625rem] text-muted-foreground">
           {currentRelease.tag}
         </span>
       </GitHubVersionLink>
@@ -1060,7 +1060,7 @@ const OverviewVersionLink = React.memo(function OverviewVersionLink({
   if (isKilnReleaseVersion(currentVersion)) {
     return (
       <GitHubVersionLink href={githubReleaseUrl(currentVersion)}>
-        <span className="block font-mono text-[9px] text-muted-foreground">
+        <span className="block font-mono text-[0.5625rem] text-muted-foreground">
           v{currentVersion}
         </span>
       </GitHubVersionLink>
@@ -1069,12 +1069,12 @@ const OverviewVersionLink = React.memo(function OverviewVersionLink({
 
   const latestRelease = findKilnRelease(releases, latestVersion)
   return (
-    <div className="text-[10px] text-muted-foreground">
+    <div className="text-[0.625rem] text-muted-foreground">
       <span className="block">{displayVersion(currentVersion)}</span>
       <GitHubVersionLink
         href={latestRelease?.url ?? githubReleaseUrl(latestVersion)}
       >
-        <span className="mt-0.5 block font-mono text-[9px]">
+        <span className="mt-0.5 block font-mono text-[0.5625rem]">
           Latest: v{latestVersion}
         </span>
       </GitHubVersionLink>
@@ -1200,7 +1200,7 @@ const ChangelogTargetButton = React.memo(function ChangelogTargetButton({
       )}
       <span>
         <span className="block text-xs font-semibold">{target.name}</span>
-        <span className="block font-mono text-[8px]">
+        <span className="block font-mono text-[0.5rem]">
           {displayVersion(target.currentVersion)}
         </span>
       </span>
@@ -1233,7 +1233,7 @@ const ChangelogSelectionHeader = React.memo(function ChangelogSelectionHeader({
     <div className="mb-5 flex flex-wrap items-center justify-between gap-2 border-b pb-4">
       <div>
         <p className="text-sm font-semibold">{selectedTarget?.name}</p>
-        <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+        <p className="mt-1 font-mono text-[0.625rem] text-muted-foreground">
           {selection.alreadyLatest ? (
             <>Current v{latestVersion}</>
           ) : (
@@ -1246,7 +1246,7 @@ const ChangelogSelectionHeader = React.memo(function ChangelogSelectionHeader({
       </div>
       <div className="flex items-center gap-2">
         <a
-          className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[0.625rem] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           href={githubReleasesUrl}
           rel="noreferrer"
           target="_blank"
@@ -1357,12 +1357,12 @@ const ChangelogRelease = React.memo(function ChangelogRelease({
             {current ? <Badge variant="outline">Current</Badge> : null}
             {previous ? <Badge variant="outline">Previous</Badge> : null}
           </div>
-          <p className="mt-1 font-mono text-[9px] text-muted-foreground">
+          <p className="mt-1 font-mono text-[0.5625rem] text-muted-foreground">
             {formatReleaseDate(release.publishedAt)}
           </p>
         </div>
         <a
-          className="inline-flex items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-primary"
+          className="inline-flex items-center gap-1 text-[0.625rem] text-muted-foreground transition-colors hover:text-primary"
           href={release.url}
           rel="noreferrer"
           target="_blank"
@@ -1383,7 +1383,7 @@ const PlainReleaseNotes = React.memo(function PlainReleaseNotes({
   const lines = React.useMemo(() => markdownTextLines(notes), [notes])
 
   return (
-    <div className="mt-3 max-w-3xl space-y-1.5 text-[11px] leading-5 text-muted-foreground">
+    <div className="mt-3 max-w-3xl space-y-1.5 text-[0.6875rem] leading-5 text-muted-foreground">
       {lines.map((line) => (
         <p key={line.id}>{linkedMarkdownText(line.text)}</p>
       ))}

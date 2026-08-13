@@ -1120,7 +1120,7 @@ const ActivityDateBoundaryButton = React.memo(
         className="relative min-w-0 border-l border-border/65 px-3 py-2.5 text-left first:border-l-0 hover:bg-accent/35"
         onClick={() => store.setBoundary(boundary)}
       >
-        <span className="block font-mono text-[8px] tracking-[0.08em] text-muted-foreground uppercase">
+        <span className="block font-mono text-[0.5rem] tracking-[0.08em] text-muted-foreground uppercase">
           {label}
         </span>
         <span className="mt-1 block truncate text-xs font-medium text-foreground">
@@ -1165,7 +1165,7 @@ const ActivityDatePresetButton = React.memo(function ActivityDatePresetButton({
       variant="outline"
       size="xs"
       aria-pressed={pressed}
-      className="font-mono text-[9px] tracking-[0.04em] aria-pressed:border-primary/30 aria-pressed:bg-primary/10 aria-pressed:text-primary"
+      className="font-mono text-[0.5625rem] tracking-[0.04em] aria-pressed:border-primary/30 aria-pressed:bg-primary/10 aria-pressed:text-primary"
       onClick={() => store.selectRecentRange(days)}
     >
       {days} days
@@ -1239,7 +1239,7 @@ const ActivityWeekCalendar = React.memo(function ActivityWeekCalendar({
         <span
           role="status"
           aria-live="polite"
-          className="font-mono text-[11px] font-semibold tracking-[0.04em]"
+          className="font-mono text-[0.6875rem] font-semibold tracking-[0.04em]"
         >
           {activityCalendarMonth.format(displayMonth)}
         </span>
@@ -1262,7 +1262,7 @@ const ActivityWeekCalendar = React.memo(function ActivityWeekCalendar({
         {activityCalendarWeekdays.map((weekday) => (
           <span
             key={weekday}
-            className="font-mono text-[9px] font-medium tracking-[0.08em] text-muted-foreground"
+            className="font-mono text-[0.5625rem] font-medium tracking-[0.08em] text-muted-foreground"
           >
             {weekday}
           </span>
@@ -1378,7 +1378,7 @@ const ActivityCalendarDay = React.memo(function ActivityCalendarDay({
       disabled={disabled}
       tabIndex={tabbable ? 0 : -1}
       className={cn(
-        "relative isolate grid h-7 min-w-0 place-items-center border border-transparent font-mono text-[10px] font-medium transition-colors outline-none focus-visible:z-10 focus-visible:border-ring/75 focus-visible:ring-2 focus-visible:ring-ring/40 sm:h-8",
+        "relative isolate grid h-7 min-w-0 place-items-center border border-transparent font-mono text-[0.625rem] font-medium transition-colors outline-none focus-visible:z-10 focus-visible:border-ring/75 focus-visible:ring-2 focus-visible:ring-ring/40 sm:h-8",
         "hover:bg-accent/70 hover:text-foreground",
         outside && "text-muted-foreground/35",
         isToday && "border-primary/45",
@@ -1431,7 +1431,7 @@ const ActivityStatus = React.memo(function ActivityStatus({
   return (
     <div
       role="status"
-      className="border-b border-primary/15 bg-primary/6 px-3 py-2 font-mono text-[9px] leading-relaxed text-muted-foreground"
+      className="border-b border-primary/15 bg-primary/6 px-3 py-2 font-mono text-[0.5625rem] leading-relaxed text-muted-foreground"
     >
       {unavailable.length > 0
         ? `Could not reach ${unavailable.map((relay) => relay.name).join(", ")}. `
@@ -1501,7 +1501,7 @@ const ActivityResults = React.memo(function ActivityResults({
     <div className="relative min-h-0 flex-1">
       <div
         aria-hidden="true"
-        className="absolute inset-x-0 top-0 z-10 grid h-8 grid-cols-[5.5rem_minmax(0,1fr)] items-center border-b bg-card/95 px-3 font-mono text-[8px] tracking-[0.12em] text-muted-foreground uppercase backdrop-blur md:grid-cols-[7rem_minmax(8rem,11rem)_minmax(8rem,10rem)_minmax(12rem,1fr)] lg:grid-cols-[8rem_minmax(10rem,14rem)_minmax(9rem,12rem)_minmax(15rem,1fr)]"
+        className="absolute inset-x-0 top-0 z-10 grid h-8 grid-cols-[5.5rem_minmax(0,1fr)] items-center border-b bg-card/95 px-3 font-mono text-[0.5rem] tracking-[0.12em] text-muted-foreground uppercase backdrop-blur md:grid-cols-[7rem_minmax(8rem,11rem)_minmax(8rem,10rem)_minmax(12rem,1fr)] lg:grid-cols-[8rem_minmax(10rem,14rem)_minmax(9rem,12rem)_minmax(15rem,1fr)]"
       >
         <span>Time</span>
         <span className="hidden md:block">Where</span>
@@ -1601,7 +1601,7 @@ const ActivityRow = React.memo(function ActivityRow({
     >
       <time
         dateTime={date.toISOString()}
-        className="pr-2 font-mono text-[9px] leading-4 text-muted-foreground"
+        className="pr-2 font-mono text-[0.5625rem] leading-4 text-muted-foreground"
       >
         <span className="block md:hidden" suppressHydrationWarning>
           {activityDay.format(date)}
@@ -1614,14 +1614,14 @@ const ActivityRow = React.memo(function ActivityRow({
 
       <div className="hidden min-w-0 pr-3 md:block">
         <ActivityWhereLink entry={entry} />
-        <p className="truncate font-mono text-[8px] text-muted-foreground">
+        <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
           {entry.server ? entry.relay.name : "Relay-wide"}
         </p>
       </div>
 
       <div className="hidden min-w-0 pr-3 md:block">
-        <p className="truncate text-[11px] font-medium">{entry.actor.name}</p>
-        <p className="truncate font-mono text-[8px] text-muted-foreground">
+        <p className="truncate text-[0.6875rem] font-medium">{entry.actor.name}</p>
+        <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
           {entry.source === "cli" ? "CLI · " : ""}
           {entry.actor.email ?? "service activity"}
         </p>
@@ -1635,7 +1635,7 @@ const ActivityRow = React.memo(function ActivityRow({
           <p className="truncate text-xs font-medium text-foreground/95">
             {entry.label}
           </p>
-          <p className="mt-1 truncate font-mono text-[8px] text-primary/80">
+          <p className="mt-1 truncate font-mono text-[0.5rem] text-primary/80">
             <span className="tracking-[0.06em] uppercase">{details.label}</span>
             {entry.permission ? (
               <>
@@ -1648,7 +1648,7 @@ const ActivityRow = React.memo(function ActivityRow({
               </>
             ) : null}
           </p>
-          <div className="mt-0.5 flex min-w-0 items-center gap-1.5 font-mono text-[8px] tracking-[0.05em] text-muted-foreground uppercase md:hidden">
+          <div className="mt-0.5 flex min-w-0 items-center gap-1.5 font-mono text-[0.5rem] tracking-[0.05em] text-muted-foreground uppercase md:hidden">
             <ActivityWhereLink entry={entry} compact />
             <span aria-hidden="true">·</span>
             <span className="truncate">{entry.actor.name}</span>
@@ -1668,7 +1668,7 @@ function ActivityWhereLink({
 }) {
   const className = compact
     ? "min-w-0 truncate text-muted-foreground hover:text-primary"
-    : "block truncate text-[11px] font-medium hover:text-primary"
+    : "block truncate text-[0.6875rem] font-medium hover:text-primary"
 
   if (entry.server) {
     return (

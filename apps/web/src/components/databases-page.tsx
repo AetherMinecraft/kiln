@@ -415,7 +415,7 @@ const DatabaseTableRow = React.memo(function DatabaseTableRow({
             <p className="truncate text-xs font-semibold text-foreground">
               {database.name}
             </p>
-            <p className="truncate font-mono text-[8px] text-muted-foreground">
+            <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
               {database.shortId} · {database.databaseName}
             </p>
           </div>
@@ -424,16 +424,16 @@ const DatabaseTableRow = React.memo(function DatabaseTableRow({
       <WorkspaceTableCell className="hidden md:table-cell">
         <Badge
           variant="outline"
-          className={`font-mono text-[9px] uppercase ${engineBadgeClasses[database.engine]}`}
+          className={`font-mono text-[0.5625rem] uppercase ${engineBadgeClasses[database.engine]}`}
         >
           {engineLabel(database.engine)}
         </Badge>
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden lg:table-cell">
-        <p className="truncate text-[10px] text-foreground">
+        <p className="truncate text-[0.625rem] text-foreground">
           {database.relayName}
         </p>
-        <p className="font-mono text-[8px] text-muted-foreground">
+        <p className="font-mono text-[0.5rem] text-muted-foreground">
           {database.inventoryStatus === "available"
             ? `${database.connectedInstanceIds.length} connected`
             : database.inventoryStatus === "missing"
@@ -444,15 +444,15 @@ const DatabaseTableRow = React.memo(function DatabaseTableRow({
       <WorkspaceTableCell className="hidden xl:table-cell">
         {database.inventoryStatus === "available" ? (
           <>
-            <p className="truncate font-mono text-[9px] text-foreground">
+            <p className="truncate font-mono text-[0.5625rem] text-foreground">
               {database.hostname}:{database.internalPort}
             </p>
-            <p className="text-[8px] text-muted-foreground">
+            <p className="text-[0.5rem] text-muted-foreground">
               private network only
             </p>
           </>
         ) : (
-          <p className="text-[9px] text-muted-foreground">
+          <p className="text-[0.5625rem] text-muted-foreground">
             {database.inventoryStatus === "missing"
               ? "Container missing"
               : "Relay unavailable"}
@@ -707,10 +707,10 @@ function CreateDatabaseDialog({
                   type="button"
                   onClick={() => setEngine(option.value)}
                 >
-                  <span className="block text-[11px] font-semibold">
+                  <span className="block text-[0.6875rem] font-semibold">
                     {option.label}
                   </span>
-                  <span className="mt-0.5 block font-mono text-[8px] opacity-70">
+                  <span className="mt-0.5 block font-mono text-[0.5rem] opacity-70">
                     {option.description}
                   </span>
                 </button>
@@ -891,7 +891,7 @@ function CredentialField({
   const [revealed, setRevealed] = React.useState(!secret)
   return (
     <label className="block">
-      <span className="mb-1.5 block text-[10px] font-medium text-muted-foreground uppercase">
+      <span className="mb-1.5 block text-[0.625rem] font-medium text-muted-foreground uppercase">
         {label}
       </span>
       <div className="flex gap-1.5">
@@ -1104,7 +1104,7 @@ function ImportDatabaseDialog({
           <span className="mt-2 block text-xs font-medium">
             {file?.name ?? "Choose a .sql file"}
           </span>
-          <span className="mt-1 block text-[9px] text-muted-foreground">
+          <span className="mt-1 block text-[0.5625rem] text-muted-foreground">
             MySQL, MariaDB, and PostgreSQL text dumps
           </span>
           <input
@@ -1263,7 +1263,7 @@ function DatabaseStatus({
   return (
     <span
       aria-label={status.label}
-      className={`inline-flex items-center gap-1.5 text-[10px] font-medium ${status.text}`}
+      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium ${status.text}`}
     >
       <span className={`size-1.5 rounded-full ${status.dot}`} />
       <span className="hidden sm:inline">{status.label}</span>
@@ -1288,7 +1288,7 @@ function EmptyDatabaseTable({
           ? "No databases match your search"
           : "No managed databases"}
       </p>
-      <p className="mt-1 max-w-sm text-[10px] leading-4 text-muted-foreground">
+      <p className="mt-1 max-w-sm text-[0.625rem] leading-4 text-muted-foreground">
         {searchActive
           ? "Try a database name, engine, ID, Relay, or internal hostname."
           : canCreate

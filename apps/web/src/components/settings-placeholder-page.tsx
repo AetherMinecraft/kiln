@@ -18,7 +18,7 @@ export function SettingsPlaceholderPage({
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
             {description}
           </p>
-          <p className="mt-4 font-mono text-[9px] tracking-[0.14em] text-muted-foreground uppercase">
+          <p className="mt-4 font-mono text-[0.5625rem] tracking-[0.14em] text-muted-foreground uppercase">
             Coming soon
           </p>
         </div>

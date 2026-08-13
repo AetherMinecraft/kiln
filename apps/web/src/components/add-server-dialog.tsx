@@ -123,7 +123,7 @@ const AddServerDialog = React.memo(function AddServerDialog({
                 <p className="mt-2 text-sm font-semibold">
                   Brick catalog unavailable
                 </p>
-                <p className="mt-1 text-[11px] text-muted-foreground">
+                <p className="mt-1 text-[0.6875rem] text-muted-foreground">
                   {catalogQuery.error?.message ??
                     "Connect a Relay to load official Bricks."}
                 </p>
@@ -363,7 +363,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
 
   return (
     <form className="space-y-3" onSubmit={provision}>
-      <p className="font-mono text-[10px] tracking-[0.14em] text-muted-foreground uppercase">
+      <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
         Server details
       </p>
       <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
@@ -383,7 +383,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
           <span className="flex items-center justify-between gap-3">
             <span>{versionDefinition.label}</span>
             {versionDefinition.default === undefined ? null : (
-              <span className="font-mono text-[9px] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
+              <span className="font-mono text-[0.5625rem] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
                 {String(versionDefinition.default)} default
               </span>
             )}
@@ -407,7 +407,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
               versionDefinition.default === undefined
             }
           />
-          <span className="block text-[9px] leading-relaxed font-normal text-muted-foreground/65">
+          <span className="block text-[0.5625rem] leading-relaxed font-normal text-muted-foreground/65">
             {versionDefinition.description}
           </span>
         </label>
@@ -415,7 +415,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
       <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
         <span className="flex items-center justify-between gap-3">
           <span>Disk quota</span>
-          <span className="font-mono text-[9px] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
+          <span className="font-mono text-[0.5625rem] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
             25 GiB default
           </span>
         </span>
@@ -431,11 +431,11 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
             className="pr-11 pl-8 font-mono tabular-nums"
             required
           />
-          <span className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 font-mono text-[9px] text-muted-foreground/65">
+          <span className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 font-mono text-[0.5625rem] text-muted-foreground/65">
             GiB
           </span>
         </span>
-        <span className="block text-[9px] leading-relaxed font-normal text-muted-foreground/65">
+        <span className="block text-[0.5625rem] leading-relaxed font-normal text-muted-foreground/65">
           Counts server files only; backups remain outside this allocation.
         </span>
       </label>

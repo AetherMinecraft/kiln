@@ -32,14 +32,14 @@ export const ResourceAllocationCard = React.memo(
       <div className="overflow-hidden rounded-xl border border-border/75 bg-background/45">
         <div className="flex items-center justify-between border-b border-border/65 px-4 py-2.5">
           <div>
-            <p className="font-mono text-[9px] tracking-[0.14em] text-primary uppercase">
+            <p className="font-mono text-[0.5625rem] tracking-[0.14em] text-primary uppercase">
               Resource allocation
             </p>
-            <p className="mt-0.5 text-[10px] text-muted-foreground">
+            <p className="mt-0.5 text-[0.625rem] text-muted-foreground">
               Limits are validated against every server on this node.
             </p>
           </div>
-          <span className="font-mono text-[8px] tracking-[0.08em] text-muted-foreground/60 uppercase">
+          <span className="font-mono text-[0.5rem] tracking-[0.08em] text-muted-foreground/60 uppercase">
             Node capacity
           </span>
         </div>
@@ -57,11 +57,11 @@ export const ResourceAllocationCard = React.memo(
           />
           <div className="p-4">
             <div className="flex items-center justify-between gap-3">
-              <span className="flex items-center gap-2 font-mono text-[9px] tracking-[0.08em] text-muted-foreground uppercase">
+              <span className="flex items-center gap-2 font-mono text-[0.5625rem] tracking-[0.08em] text-muted-foreground uppercase">
                 <HardDrive className="size-3.5" />
                 Disk quota
               </span>
-              <span className="font-mono text-[8px] text-muted-foreground/60">
+              <span className="font-mono text-[0.5rem] text-muted-foreground/60">
                 {formatResourceBytes(allocation.storage.availableBytes)}{" "}
                 assignable
               </span>
@@ -78,7 +78,7 @@ export const ResourceAllocationCard = React.memo(
                 onChange={(event) => onDiskLimitChange(event.target.value)}
                 className="font-mono tabular-nums"
               />
-              <span className="font-mono text-[10px] text-muted-foreground">
+              <span className="font-mono text-[0.625rem] text-muted-foreground">
                 GiB
               </span>
             </div>
@@ -86,7 +86,7 @@ export const ResourceAllocationCard = React.memo(
               usedBytes={allocation.storage.nodeUsedBytes}
               totalBytes={allocation.storage.nodeTotalBytes}
             />
-            <p className="mt-2 text-[8px] leading-3 text-muted-foreground/65">
+            <p className="mt-2 text-[0.5rem] leading-3 text-muted-foreground/65">
               25 GiB by default. Relay keeps 10 GiB free for node overhead.
             </p>
           </div>
@@ -118,11 +118,11 @@ function ResourceAllocationPanel({
   return (
     <div className="p-4">
       <div className="flex items-center justify-between gap-3">
-        <span className="flex items-center gap-2 font-mono text-[9px] tracking-[0.08em] text-muted-foreground uppercase">
+        <span className="flex items-center gap-2 font-mono text-[0.5625rem] tracking-[0.08em] text-muted-foreground uppercase">
           {icon}
           {label}
         </span>
-        <span className="font-mono text-[8px] text-muted-foreground/60">
+        <span className="font-mono text-[0.5rem] text-muted-foreground/60">
           {formatResourceBytes(availableBytes)} assignable
         </span>
       </div>
@@ -132,7 +132,7 @@ function ResourceAllocationPanel({
         {value}
       </p>
       <NodeCapacityBar usedBytes={nodeUsedBytes} totalBytes={nodeTotalBytes} />
-      <p className="mt-2 text-[8px] leading-3 text-muted-foreground/65">
+      <p className="mt-2 text-[0.5rem] leading-3 text-muted-foreground/65">
         {footer}
       </p>
     </div>
@@ -156,7 +156,7 @@ function NodeCapacityBar({
           style={{ width: `${percent}%` }}
         />
       </div>
-      <div className="mt-1 flex justify-between font-mono text-[7px] text-muted-foreground/50 tabular-nums">
+      <div className="mt-1 flex justify-between font-mono text-[0.4375rem] text-muted-foreground/50 tabular-nums">
         <span>{formatResourceBytes(usedBytes)} node used</span>
         <span>{formatResourceBytes(totalBytes)} total</span>
       </div>

@@ -43,7 +43,7 @@ export function TwoFactorPage() {
             <HearthMark />
             <span className="font-heading text-sm font-semibold">Kiln</span>
           </div>
-          <span className="border border-primary/20 bg-primary/8 px-2 py-1 font-mono text-[8px] tracking-widest text-primary uppercase">
+          <span className="border border-primary/20 bg-primary/8 px-2 py-1 font-mono text-[0.5rem] tracking-widest text-primary uppercase">
             Step 2 of 2
           </span>
         </div>
@@ -71,7 +71,7 @@ export function TwoFactorPage() {
 
         <form className="mt-5 grid gap-4" onSubmit={verify}>
           <label className="grid gap-1.5" htmlFor="two-factor-code">
-            <span className="text-[11px] font-medium">
+            <span className="text-[0.6875rem] font-medium">
               {method === "totp" ? "Authenticator code" : "Recovery code"}
             </span>
             <Input
@@ -87,7 +87,7 @@ export function TwoFactorPage() {
             />
           </label>
 
-          <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+          <label className="flex items-center gap-2 text-[0.6875rem] text-muted-foreground">
             <input
               type="checkbox"
               checked={trustDevice}
@@ -119,7 +119,7 @@ export function TwoFactorPage() {
 
         <a
           href="/"
-          className="mt-7 flex items-center justify-center gap-1.5 border-t pt-5 text-[10px] text-muted-foreground hover:text-foreground"
+          className="mt-7 flex items-center justify-center gap-1.5 border-t pt-5 text-[0.625rem] text-muted-foreground hover:text-foreground"
           onClick={() => sessionStorage.removeItem("kiln:auth:return")}
         >
           <ArrowLeft className="size-3" /> Cancel and return to login
