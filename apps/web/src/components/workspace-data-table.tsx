@@ -106,10 +106,10 @@ export function WorkspaceDataTable<T>({
   }
 
   return (
-    <div className="min-w-0 overflow-clip">
+    <div className="min-w-0 overflow-clip pb-px">
       <table className="w-full table-fixed border-collapse text-left">
         {head}
-        <tbody className="divide-y divide-border/70">
+        <tbody className="divide-y divide-border/70 border-b border-border/70">
           {searchableItems.map(({ item, searchText }) => (
             <SearchableWorkspaceTableRow
               key={getRowKey(item)}

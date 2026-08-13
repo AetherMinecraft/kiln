@@ -1177,6 +1177,147 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
   }
 )
 
+export const reserveBackupCopyEffect = Effect.fn("backups.reserveCopy")(
+  function* (input: {
+    artifactKind: BackupRow["artifact_kind"]
+    backupId: string
+    filename: string | null
+    relayId: string
+    storageId: string
+    targetId: string
+    targetKind: BackupRow["target_kind"]
+  }) {
+    const database = yield* Database
+    return yield* database.transaction("backup_copy_reserve", (transaction) =>
+      Effect.gen(function* () {
+        const storage = (
+          yield* transaction.queryRows<BackupStorageKeyRow>(
+            `SELECT id, object_prefix, owner_user_id
+               FROM ${databaseTable("backup_storage")}
+              WHERE id = ? AND enabled = TRUE
+              LIMIT 1`,
+            [input.storageId]
+          )
+        )[0]
+        if (!storage) {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "backup.copy",
+            reason: "The backup destination is unavailable",
+          })
+        }
+        const existing = (
+          yield* transaction.queryRows<BackupArtifactRow>(
+            `SELECT artifact.id, artifact.backup_id, artifact.storage_id,
+                    artifact.status, artifact.filename, artifact.object_key,
+                    artifact.bytes, artifact.checksum_sha256, artifact.error
+               FROM ${databaseTable("backup_artifact")} artifact
+              WHERE artifact.backup_id = ? AND artifact.destination_key = ?
+              LIMIT 1`,
+            [input.backupId, input.storageId]
+          )
+        )[0]
+        if (
+          existing &&
+          (existing.status === "available" ||
+            existing.status === "queued" ||
+            existing.status === "running")
+        ) {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "backup.copy",
+            reason:
+              existing.status === "available"
+                ? "This backup is already stored on that destination"
+                : "This backup is already copying to that destination",
+          })
+        }
+        const objectKey = backupObjectKey({
+          artifactKind: input.artifactKind,
+          backupId: input.backupId,
+          installationId: kilnInstallationId(),
+          objectPrefix: storage.object_prefix,
+          relayId: input.relayId,
+          targetId: input.targetId,
+          targetKind: input.targetKind,
+        })
+        const artifactId = existing?.id ?? randomUUID()
+        if (existing) {
+          yield* transaction.execute(
+            `UPDATE ${databaseTable("backup_artifact")}
+                SET status = 'running', object_key = ?, filename = ?,
+                    error = NULL, completed_at = NULL, deleted_at = NULL
+              WHERE id = ?`,
+            [objectKey, input.filename, artifactId]
+          )
+        } else {
+          yield* transaction.execute(
+            `INSERT INTO ${databaseTable("backup_artifact")}
+              (id, backup_id, destination_key, storage_id, status, filename,
+               object_key)
+             VALUES (?, ?, ?, ?, 'running', ?, ?)`,
+            [
+              artifactId,
+              input.backupId,
+              input.storageId,
+              input.storageId,
+              input.filename,
+              objectKey,
+            ]
+          )
+        }
+        return { artifactId, objectKey }
+      })
+    )
+  }
+)
+
+export const completeBackupCopyEffect = Effect.fn("backups.completeCopy")(
+  function* (input: {
+    artifactId: string
+    backupId: string
+    bytes: number | null
+    checksumSha256: string | null
+    error: string | null
+    filename: string | null
+    ok: boolean
+  }) {
+    const database = yield* Database
+    yield* database.execute(
+      "backup_copy_complete",
+      `UPDATE ${databaseTable("backup_artifact")}
+          SET status = ?, filename = ?, bytes = ?, checksum_sha256 = ?,
+              error = ?, completed_at = FROM_UNIXTIME(? / 1000)
+        WHERE id = ? AND backup_id = ?`,
+      [
+        input.ok ? "available" : "failed",
+        input.filename,
+        input.ok ? input.bytes : null,
+        input.ok ? input.checksumSha256 : null,
+        input.error,
+        Date.now(),
+        input.artifactId,
+        input.backupId,
+      ]
+    )
+  }
+)
+
+export const renameBackupEffect = Effect.fn("backups.rename")(function* (input: {
+  backupId: string
+  name: string
+}) {
+  const database = yield* Database
+  const result = yield* database.execute(
+    "backup_rename",
+    `UPDATE ${databaseTable("backup")}
+        SET name = ?
+      WHERE id = ? AND status <> 'deleted'`,
+    [input.name, input.backupId]
+  )
+  return result.affectedRows > 0
+})
+
 export const updateBackupLimitsEffect = Effect.fn("backups.updateLimits")(
   function* (input: {
     admin: boolean

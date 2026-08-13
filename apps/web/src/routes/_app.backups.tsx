@@ -16,6 +16,7 @@ import {
 import { pageTitle } from "@/lib/page-title"
 
 const backupSearchSchema = z.object({
+  kind: z.enum(["database", "relay", "server"]).optional(),
   relay: z.string().max(120).optional(),
   search: z.string().max(160).optional(),
   server: z.string().max(120).optional(),

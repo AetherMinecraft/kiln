@@ -1,3 +1,5 @@
+import { Readable } from "node:stream"
+
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
@@ -11,8 +13,11 @@ import {
 
 import { createBackupDownloadShareEffect } from "@/effect/backup-download-shares"
 import {
+  completeBackupCopyEffect,
   listBackupCatalogEffect,
   getInstanceBackupPolicyEffect,
+  renameBackupEffect,
+  reserveBackupCopyEffect,
   reserveBackupDeleteEffect,
   reserveBackupRestoreEffect,
   reserveDatabaseBackupEffect,
@@ -36,7 +41,10 @@ import {
 import { hasBackupPermission } from "@/lib/backup-access"
 import { signLocalBackupDownload } from "@/lib/backup-download"
 import { relayRpc } from "@/lib/relay-connection"
-import { signS3BackupDownload } from "@/lib/backup-storage-s3"
+import {
+  putS3BackupObject,
+  signS3BackupDownload,
+} from "@/lib/backup-storage-s3"
 import { kilnInstallationId, kilnPublicUrl } from "@/lib/environment"
 import {
   dispatchBackupTask,
@@ -91,6 +99,16 @@ const platformBackupInputSchema = z.strictObject({
 })
 
 const backupIdInputSchema = z.strictObject({ backupId: z.uuid() })
+
+const renameBackupInputSchema = z.strictObject({
+  backupId: z.uuid(),
+  name: z.string().trim().min(1).max(120),
+})
+
+const copyBackupInputSchema = z.strictObject({
+  backupId: z.uuid(),
+  storageId: z.uuid(),
+})
 
 const backupDownloadInputSchema = z.strictObject({
   artifactId: z.uuid().optional(),
@@ -366,6 +384,157 @@ export const deleteBackup = createServerFn({ method: "POST" })
       dispatchBackupTask(relay, input, user.id),
     ])
     return { relayAccepted: dispatched[0]?.status === "fulfilled" }
+  })
+
+export const renameBackup = createServerFn({ method: "POST" })
+  .validator(renameBackupInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const catalog = await runAppEffect(
+      "backups.listForRename",
+      listBackupCatalogEffect()
+    )
+    const backup = catalog.find((candidate) => candidate.id === data.backupId)
+    if (!backup) throw new Error("Backup not found")
+    const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+    if (!hasBackupPermission(user, grants, backup, "backup.create")) {
+      throw new Error("You do not have permission to rename this backup")
+    }
+    const renamed = await runAppEffect(
+      "backups.rename",
+      renameBackupEffect({
+        backupId: backup.id,
+        name: data.name,
+      })
+    )
+    if (!renamed) throw new Error("Backup not found")
+    return { name: data.name }
+  })
+
+export const copyBackupToDestination = createServerFn({ method: "POST" })
+  .validator(copyBackupInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const catalog = await runAppEffect(
+      "backups.listForCopy",
+      listBackupCatalogEffect()
+    )
+    const backup = catalog.find((candidate) => candidate.id === data.backupId)
+    if (!backup) throw new Error("Backup not found")
+    const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+    if (!hasBackupPermission(user, grants, backup, "backup.create")) {
+      throw new Error("You do not have permission to copy this backup")
+    }
+    const source =
+      backup.artifacts.find(
+        (artifact) =>
+          artifact.status === "available" && artifact.storageId === null
+      ) ??
+      backup.artifacts.find((artifact) => artifact.status === "available")
+    if (!source) {
+      throw new Error("A successful backup file is required before copying")
+    }
+    const filename = source.filename ?? backup.filename
+    if (!filename) throw new Error("Backup filename is unavailable")
+    const reserved = await runAppEffect(
+      "backups.reserveCopy",
+      reserveBackupCopyEffect({
+        artifactKind: backup.artifactKind,
+        backupId: backup.id,
+        filename,
+        relayId: backup.relayId,
+        storageId: data.storageId,
+        targetId: backup.targetId,
+        targetKind: backup.targetKind,
+      })
+    )
+    try {
+      let downloadUrl: string
+      if (!source.storageId) {
+        if (source.objectKey) {
+          throw new Error("Local backup metadata is invalid")
+        }
+        const relay = await requireBackupRelay(backup.relayId)
+        downloadUrl = (
+          await signLocalBackupDownload(relay, backup, filename, user.id, 300)
+        ).url
+      } else {
+        if (!source.objectKey) {
+          throw new Error("Backup object key is unavailable")
+        }
+        const sourceStorage = await runAppEffect(
+          "backups.loadCopySourceStorage",
+          loadBackupStorageCredentialEffect(source.storageId)
+        )
+        if (!sourceStorage) {
+          throw new Error("Backup source destination is unavailable")
+        }
+        downloadUrl = (
+          await runAppEffect(
+            "backups.signCopyDownload",
+            signS3BackupDownload(sourceStorage, source.objectKey, filename, 300)
+          )
+        ).url
+      }
+      const destination = await runAppEffect(
+        "backups.loadCopyDestination",
+        loadBackupStorageCredentialEffect(data.storageId)
+      )
+      if (!destination) throw new Error("Backup destination is unavailable")
+      const response = await fetch(downloadUrl)
+      if (!response.ok || !response.body) {
+        throw new Error("The backup file could not be read for copying")
+      }
+      const contentLength = Number(response.headers.get("content-length"))
+      await runAppEffect(
+        "backups.putCopy",
+        putS3BackupObject(destination, {
+          body: Readable.fromWeb(
+            response.body as import("node:stream/web").ReadableStream
+          ),
+          ...(Number.isFinite(contentLength) && contentLength > 0
+            ? { contentLength }
+            : source.bytes !== null
+              ? { contentLength: source.bytes }
+              : backup.bytes !== null
+                ? { contentLength: backup.bytes }
+                : {}),
+          objectKey: reserved.objectKey,
+        })
+      )
+      await runAppEffect(
+        "backups.completeCopy",
+        completeBackupCopyEffect({
+          artifactId: reserved.artifactId,
+          backupId: backup.id,
+          bytes: source.bytes ?? backup.bytes,
+          checksumSha256: source.checksumSha256 ?? backup.checksumSha256,
+          error: null,
+          filename,
+          ok: true,
+        })
+      )
+      return { copied: true }
+    } catch (cause) {
+      await runAppEffect(
+        "backups.failCopy",
+        completeBackupCopyEffect({
+          artifactId: reserved.artifactId,
+          backupId: backup.id,
+          bytes: null,
+          checksumSha256: null,
+          error:
+            cause instanceof Error
+              ? cause.message
+              : "The backup could not be copied to that destination",
+          filename,
+          ok: false,
+        })
+      )
+      throw cause instanceof Error
+        ? cause
+        : new Error("The backup could not be copied to that destination")
+    }
   })
 
 export const getBackupDownloadUrl = createServerFn({ method: "POST" })

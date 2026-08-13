@@ -1,5 +1,11 @@
 import * as React from "react"
-import { ArrowLeftRight, Server } from "lucide-react"
+import {
+  ArrowLeftRight,
+  Database,
+  Network,
+  Server,
+  SlidersHorizontal,
+} from "lucide-react"
 
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
@@ -8,6 +14,11 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@workspace/ui/components/popover"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@workspace/ui/components/tooltip"
 
 import {
   ServerPickerList,
@@ -19,6 +30,12 @@ import { WorkspaceSummaryCard } from "@/components/workspace-summary-card"
 export const ServerScopePicker = React.memo(function ServerScopePicker({
   allDescription = "Every accessible instance",
   allLabel = "All servers",
+  ariaLabel = "Accessible servers",
+  canManageSettings = false,
+  changeLabel = "Change server",
+  chooseLabel = "Choose server",
+  emptyMessage = "No accessible servers found.",
+  onManageSettings,
   onSelect,
   selectedRelayName,
   selectedServer,
@@ -26,6 +43,12 @@ export const ServerScopePicker = React.memo(function ServerScopePicker({
 }: {
   allDescription?: string
   allLabel?: string
+  ariaLabel?: string
+  canManageSettings?: boolean
+  changeLabel?: string
+  chooseLabel?: string
+  emptyMessage?: string
+  onManageSettings?: () => void
   onSelect: (server: ServerPickerOption | null) => void
   selectedRelayName?: string
   selectedServer: ServerPickerOption | null
@@ -47,29 +70,64 @@ export const ServerScopePicker = React.memo(function ServerScopePicker({
   const selectionMetadata = selectedServer
     ? selectedServer.id
     : `${servers.length} accessible ${servers.length === 1 ? "instance" : "instances"}`
+  const ScopeIcon =
+    selectedServer?.kind === "database"
+      ? Database
+      : selectedServer?.kind === "relay"
+        ? Network
+        : Server
 
   return (
     <div className="mb-3">
       <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
         <WorkspaceSummaryCard
           action={
-            <PopoverTrigger asChild>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="shrink-0"
-              >
-                <ArrowLeftRight />
-                {selectedServer ? "Change server" : "Choose server"}
-              </Button>
-            </PopoverTrigger>
+            <div className="flex shrink-0 items-center gap-2">
+              {onManageSettings ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="inline-flex">
+                      <Button
+                        aria-label="Manage selected server backup settings"
+                        disabled={!canManageSettings}
+                        size="icon-sm"
+                        type="button"
+                        variant="outline"
+                        onClick={onManageSettings}
+                      >
+                        <SlidersHorizontal />
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">
+                    {canManageSettings
+                      ? "Server backup settings"
+                      : "Choose a server to manage its backup settings"}
+                  </TooltipContent>
+                </Tooltip>
+              ) : null}
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                >
+                  <ArrowLeftRight />
+                  {selectedServer ? changeLabel : chooseLabel}
+                </Button>
+              </PopoverTrigger>
+            </div>
           }
-          icon={<Server className="size-5" />}
+          icon={<ScopeIcon className="size-5" />}
           title={selectedServer?.name ?? allLabel}
           titleAccessory={
             <Badge variant="outline" className="font-mono text-[0.5625rem]">
-              {selectedServer?.relayName ?? selectedRelayName ?? "All Relays"}
+              {selectedServer?.kind === "relay"
+                ? "Relay"
+                : (selectedServer?.relayName ??
+                  selectedRelayName ??
+                  "All Relays")}
             </Badge>
           }
         >
@@ -91,6 +149,8 @@ export const ServerScopePicker = React.memo(function ServerScopePicker({
                 setPickerOpen(false)
               },
             }}
+            ariaLabel={ariaLabel}
+            emptyMessage={emptyMessage}
             selectedKeys={selectedKeys}
             servers={servers}
             onSelect={selectServer}

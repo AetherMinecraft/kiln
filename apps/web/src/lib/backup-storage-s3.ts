@@ -3,6 +3,7 @@ import { lookup } from "node:dns"
 import { Agent } from "node:https"
 import { BlockList, isIP } from "node:net"
 import type { LookupFunction } from "node:net"
+import type { Readable } from "node:stream"
 
 import {
   DeleteObjectCommand,
@@ -189,6 +190,30 @@ export function verifyS3BackupCredential(credential: S3BackupCredential) {
             })
           )
         ).pipe(Effect.ignore)
+    ).pipe(Effect.asVoid)
+  )
+}
+
+export function putS3BackupObject(
+  credential: S3BackupCredential,
+  input: {
+    body: Readable | Uint8Array
+    contentLength?: number
+    contentType?: string
+    objectKey: string
+  }
+) {
+  return withS3Client(credential, (client) =>
+    s3Request("storage.putObject", () =>
+      client.send(
+        new PutObjectCommand({
+          Body: input.body,
+          Bucket: credential.bucket,
+          ContentLength: input.contentLength,
+          ContentType: input.contentType ?? "application/zip",
+          Key: input.objectKey,
+        })
+      )
     ).pipe(Effect.asVoid)
   )
 }
