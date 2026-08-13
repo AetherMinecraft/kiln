@@ -5,6 +5,7 @@ import {
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query"
+import { Link } from "@tanstack/react-router"
 import {
   Archive,
   ArrowLeft,
@@ -55,6 +56,7 @@ import {
 
 import { ServerScopePicker } from "@/components/server-scope-picker"
 import type { ServerPickerOption } from "@/components/server-picker-list"
+import { relayInstanceRouteId } from "@/lib/relay-fleet"
 import {
   readFileDownloadPreferences,
   shouldPreviewBackupDownload,
@@ -109,6 +111,16 @@ type BackupDialog =
   | { backup: Backup; kind: "download" }
   | { backup: Backup; kind: "restore" }
   | null
+type BackupAvailabilityDestination = {
+  id: string | null
+  name: string
+}
+type BackupAvailabilityState = "available" | "failed" | "missing" | "working"
+type BackupTargetPresentation = {
+  id: string
+  kindLabel: "Database" | "Relay" | "Server"
+  name: string
+}
 
 export interface BackupFilters {
   relay?: string
@@ -234,6 +246,16 @@ export const BackupsPage = React.memo(function BackupsPage({
       new Map(storage.map((destination) => [destination.id, destination.name])),
     [storage]
   )
+  const availabilityDestinations = React.useMemo(
+    (): Array<BackupAvailabilityDestination> => [
+      { id: null, name: "Local" },
+      ...storage.map((destination) => ({
+        id: destination.id,
+        name: destination.name,
+      })),
+    ],
+    [storage]
+  )
   const filteredBackups = React.useMemo(
     () =>
       backups.filter((backup) => {
@@ -300,10 +322,10 @@ export const BackupsPage = React.memo(function BackupsPage({
         <div className="min-h-0 flex-1 overflow-auto">
           <BackupTable
             backups={filteredBackups}
+            destinations={availabilityDestinations}
             filtered={Boolean(selectedServer || filters.status)}
             relayNames={relayNames}
             searchStore={searchStore}
-            storageNames={storageNames}
             targetNames={targetNames}
             onDialog={openDialog}
           />
@@ -528,7 +550,7 @@ const BackupToolbar = React.memo(function BackupToolbar({
         <TooltipTrigger asChild>
           <Button
             aria-label="New backup"
-            className={`${mobileSearchOpen ? "hidden sm:inline-flex" : "inline-flex"} shrink-0`}
+            className={`${mobileSearchOpen ? "hidden sm:inline-flex" : "inline-flex"} ml-auto shrink-0`}
             disabled={!canCreate}
             type="button"
             onClick={onCreate}
@@ -544,38 +566,39 @@ const BackupToolbar = React.memo(function BackupToolbar({
 
 const BackupTable = React.memo(function BackupTable({
   backups,
+  destinations,
   filtered,
   onDialog,
   relayNames,
   searchStore,
-  storageNames,
   targetNames,
 }: {
   backups: Array<Backup>
+  destinations: ReadonlyArray<BackupAvailabilityDestination>
   filtered: boolean
   onDialog: (dialog: BackupDialog) => void
   relayNames: ReadonlyMap<string, string>
   searchStore: BackupSearchStore
-  storageNames: ReadonlyMap<string, string>
   targetNames: ReadonlyMap<string, string>
 }) {
   const renderRow = React.useCallback(
     (backup: Backup) => (
       <BackupTableRow
         backup={backup}
+        destinations={destinations}
         relayName={relayNames.get(backup.relayId) ?? backup.relayId}
-        storageNames={storageNames}
         targetAvailable={
-          backup.targetKind === "platform" ||
-          targetNames.has(
-            targetKey(backup.targetKind, backup.relayId, backup.targetId)
-          )
+          backup.targetKind === "platform"
+            ? relayNames.has(backup.relayId)
+            : targetNames.has(
+                targetKey(backup.targetKind, backup.relayId, backup.targetId)
+              )
         }
         targetName={backupTargetName(backup, targetNames)}
         onDialog={onDialog}
       />
     ),
-    [onDialog, relayNames, storageNames, targetNames]
+    [destinations, onDialog, relayNames, targetNames]
   )
   const renderEmpty = React.useCallback(
     (searchActive: boolean) => (
@@ -614,17 +637,17 @@ const BackupTable = React.memo(function BackupTable({
 const BackupTableHead = React.memo(function BackupTableHead() {
   return (
     <WorkspaceTableHead className="sticky top-0 z-20 bg-background/95 shadow-[0_1px_0_var(--border)] backdrop-blur">
+      <WorkspaceTableHeading className="w-10 px-2">
+        <span className="sr-only">Select</span>
+      </WorkspaceTableHeading>
       <WorkspaceTableHeading className="w-14">
         <span className="sr-only">Status</span>
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-auto sm:w-[27%]">
+      <WorkspaceTableHeading className="w-auto sm:w-[34%]">
         Backup
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[20%] md:table-cell">
+      <WorkspaceTableHeading className="hidden w-[22%] md:table-cell">
         Target
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[14%] lg:table-cell">
-        Destinations
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-24 xl:table-cell">
         Size
@@ -632,7 +655,7 @@ const BackupTableHead = React.memo(function BackupTableHead() {
       <WorkspaceTableHeading className="hidden w-28 sm:table-cell">
         Created
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-48 text-right">
+      <WorkspaceTableHeading className="w-40 text-right">
         Actions
       </WorkspaceTableHeading>
     </WorkspaceTableHead>
@@ -641,32 +664,45 @@ const BackupTableHead = React.memo(function BackupTableHead() {
 
 const BackupTableRow = React.memo(function BackupTableRow({
   backup,
+  destinations,
   onDialog,
   relayName,
-  storageNames,
   targetAvailable,
   targetName,
 }: {
   backup: Backup
+  destinations: ReadonlyArray<BackupAvailabilityDestination>
   onDialog: (dialog: BackupDialog) => void
   relayName: string
-  storageNames: ReadonlyMap<string, string>
   targetAvailable: boolean
   targetName: string
 }) {
+  const missingTarget = !targetAvailable
+  const backupReady =
+    backup.status === "available" && !backupIsActive(backup)
   const canRestore =
-    backup.status === "available" &&
-    !backupIsActive(backup) &&
+    backupReady &&
     targetAvailable &&
     (backup.targetKind === "instance" || backup.targetKind === "database")
+  const canRecreate = backupReady && missingTarget
   const canDownload = backup.status === "available"
+  const target = backupTargetPresentation(backup, relayName, targetName)
 
   return (
-    <tr className="group transition-colors hover:bg-muted/20">
-      <WorkspaceTableCell>
+    <tr className="group transition-colors hover:bg-muted/20 has-checked:bg-primary/[0.07]">
+      <WorkspaceTableCell className="h-auto px-2 py-2.5">
+        <label className="grid size-7 place-items-center">
+          <input
+            aria-label={`Select ${backup.name}`}
+            className="size-4 rounded-[3px] border-input accent-primary"
+            type="checkbox"
+          />
+        </label>
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="h-auto py-2.5">
         <BackupStatusBadge backup={backup} />
       </WorkspaceTableCell>
-      <WorkspaceTableCell>
+      <WorkspaceTableCell className="h-auto py-2.5">
         <div className="min-w-0">
           <p className="truncate text-sm font-semibold">{backup.name}</p>
           <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
@@ -677,69 +713,76 @@ const BackupTableRow = React.memo(function BackupTableRow({
               {backup.taskError}
             </p>
           ) : null}
+          <BackupAvailabilityTags
+            backup={backup}
+            destinations={destinations}
+          />
         </div>
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden md:table-cell">
-        <div className="flex min-w-0 items-center gap-2">
-          <BackupTargetIcon kind={backup.targetKind} />
-          <span className="min-w-0">
-            <span className="block truncate text-xs font-medium">
-              {targetName}
-            </span>
-            <span className="block truncate text-[0.625rem] text-muted-foreground">
-              {relayName}
-            </span>
-          </span>
-        </div>
+      <WorkspaceTableCell className="hidden h-auto py-2.5 md:table-cell">
+        <BackupTargetLink
+          available={targetAvailable}
+          backup={backup}
+          target={target}
+        />
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden lg:table-cell">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {backup.artifacts.map((artifact) => (
-            <BackupDestinationTag
-              key={artifact.id}
-              artifact={artifact}
-              storageName={
-                artifact.storageId
-                  ? (storageNames.get(artifact.storageId) ?? "S3 destination")
-                  : "Local Relay"
-              }
-            />
-          ))}
-        </div>
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden font-mono text-[0.625rem] text-muted-foreground xl:table-cell">
+      <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground xl:table-cell">
         {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden text-[0.625rem] whitespace-nowrap text-muted-foreground sm:table-cell">
+      <WorkspaceTableCell className="hidden h-auto py-2.5 text-[0.625rem] whitespace-nowrap text-muted-foreground sm:table-cell">
         <BackupCreatedTime createdAt={backup.createdAt} />
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="text-right">
-        <div className="flex items-center justify-end gap-0.5">
-          <Button
-            aria-label={`Restore ${backup.name}`}
-            className="h-8 px-2.5 text-xs"
-            disabled={!canRestore}
-            size="sm"
-            type="button"
-            variant="outline"
-            onClick={() => onDialog({ backup, kind: "restore" })}
-          >
-            <RotateCcwClock /> Restore
-          </Button>
-          <BackupActionButton
-            disabled={!canDownload}
-            icon={Download}
-            label={`Download ${backup.name}`}
-            tooltip="Download or create a link"
-            onClick={() => onDialog({ backup, kind: "download" })}
-          />
-          <BackupActionButton
-            disabled={backupIsActive(backup)}
-            icon={Trash2}
-            label={`Delete ${backup.name}`}
-            tooltip="Delete backup"
-            onClick={() => onDialog({ backup, kind: "delete" })}
-          />
+      <WorkspaceTableCell className="h-auto py-2.5 text-right">
+        <div className="flex flex-col items-end gap-1">
+          {missingTarget ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">
+                  <Button
+                    aria-label={`Recreate ${target.kindLabel.toLowerCase()} from ${backup.name}`}
+                    className="h-7 px-2.5 text-xs"
+                    disabled={!canRecreate}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    <RotateCcwClock /> Recreate
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {missingTargetMessage(backup.targetKind)}
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <Button
+              aria-label={`Restore ${backup.name}`}
+              className="h-7 px-2.5 text-xs"
+              disabled={!canRestore}
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => onDialog({ backup, kind: "restore" })}
+            >
+              <RotateCcwClock /> Restore
+            </Button>
+          )}
+          <div className="flex items-center justify-end gap-0.5">
+            <BackupActionButton
+              disabled={!canDownload}
+              icon={Download}
+              label={`Download ${backup.name}`}
+              tooltip="Download or create a link"
+              onClick={() => onDialog({ backup, kind: "download" })}
+            />
+            <BackupActionButton
+              disabled={backupIsActive(backup)}
+              icon={Trash2}
+              label={`Delete ${backup.name}`}
+              tooltip="Delete backup"
+              onClick={() => onDialog({ backup, kind: "delete" })}
+            />
+          </div>
         </div>
       </WorkspaceTableCell>
     </tr>
@@ -773,41 +816,161 @@ function BackupStatusBadge({ backup }: { backup: Backup }) {
   )
 }
 
-function BackupDestinationTag({
-  artifact,
-  storageName,
+function BackupAvailabilityTags({
+  backup,
+  destinations,
 }: {
-  artifact: Backup["artifacts"][number]
-  storageName: string
+  backup: Backup
+  destinations: ReadonlyArray<BackupAvailabilityDestination>
 }) {
-  const available = artifact.status === "available"
-  const active = artifact.status === "queued" || artifact.status === "running"
-  const label = artifact.storageId ? "S3" : "Local"
+  const tags = backupAvailabilityTags(backup, destinations)
+  return (
+    <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+      <span className="text-[0.625rem] text-muted-foreground">
+        Availability:
+      </span>
+      {tags.map((tag) => (
+        <BackupAvailabilityTag key={tag.key} tag={tag} />
+      ))}
+    </div>
+  )
+}
+
+function BackupAvailabilityTag({
+  tag,
+}: {
+  tag: {
+    error: string | null
+    key: string
+    label: string
+    name: string
+    state: BackupAvailabilityState
+  }
+}) {
+  const working = tag.state === "working"
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <span
-          className={`inline-flex h-6 items-center gap-1 rounded-md border px-2 font-mono text-[0.5625rem] font-semibold uppercase ${
-            available
-              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-              : active
-                ? "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-                : "border-destructive/30 bg-destructive/10 text-destructive"
-          }`}
+          className={`inline-flex h-6 max-w-36 items-center gap-1 rounded-md border px-2 font-mono text-[0.5625rem] font-semibold ${tag.key === "local" ? "uppercase" : ""} ${availabilityTagClassName(tag.state)}`}
         >
-          {active ? (
-            <LoaderCircle className="size-2.5 animate-spin" />
-          ) : available ? (
-            <Check className="size-2.5" />
+          {working ? (
+            <LoaderCircle className="size-2.5 shrink-0 animate-spin" />
+          ) : tag.state === "available" ? (
+            <Check className="size-2.5 shrink-0" />
           ) : null}
-          {label}
+          <span className="truncate">{tag.label}</span>
         </span>
       </TooltipTrigger>
       <TooltipContent side="top">
-        {storageName} · {artifactStatusLabel(artifact.status)}
-        {artifact.error ? ` · ${artifact.error}` : ""}
+        {tag.name} · {availabilityStateLabel(tag.state)}
+        {tag.error ? ` · ${tag.error}` : ""}
       </TooltipContent>
     </Tooltip>
+  )
+}
+
+function BackupMissingTargetTooltip({
+  children,
+  kind,
+  missing,
+}: {
+  children: React.ReactElement
+  kind: Backup["targetKind"]
+  missing: boolean
+}) {
+  if (!missing) return children
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{children}</TooltipTrigger>
+      <TooltipContent>{missingTargetMessage(kind)}</TooltipContent>
+    </Tooltip>
+  )
+}
+
+function BackupTargetLink({
+  available,
+  backup,
+  target,
+}: {
+  available: boolean
+  backup: Backup
+  target: BackupTargetPresentation
+}) {
+  const content = (
+    <span className="flex min-w-0 items-center gap-2">
+      <BackupTargetIcon available={available} kind={backup.targetKind} />
+      <span className="min-w-0">
+        <span className="block truncate text-xs font-medium">
+          <span className="text-muted-foreground">{target.kindLabel}:</span>{" "}
+          <span className={available ? "text-primary" : "text-muted-foreground"}>
+            {target.name}
+          </span>
+        </span>
+        <span className="mt-0.5 block truncate font-mono text-[0.5625rem] text-muted-foreground">
+          {target.id}
+        </span>
+      </span>
+    </span>
+  )
+  const className =
+    "-mx-3 -my-2.5 block min-w-0 px-3 py-2.5 outline-none transition-colors hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring/40"
+
+  if (!available) {
+    return (
+      <BackupMissingTargetTooltip kind={backup.targetKind} missing>
+        <div
+          aria-label={missingTargetMessage(backup.targetKind)}
+          className="-mx-3 -my-2.5 cursor-help px-3 py-2.5"
+        >
+          {content}
+        </div>
+      </BackupMissingTargetTooltip>
+    )
+  }
+
+  if (backup.targetKind === "instance") {
+    return (
+      <Link
+        aria-label={`Open ${target.name}`}
+        className={className}
+        params={{
+          serverId: relayInstanceRouteId(
+            backup.relayId,
+            backup.targetId.slice(0, 8)
+          ),
+        }}
+        preload="intent"
+        to="/server/$serverId/console"
+      >
+        {content}
+      </Link>
+    )
+  }
+
+  if (backup.targetKind === "database") {
+    return (
+      <Link
+        aria-label={`Open ${target.name}`}
+        className={className}
+        preload="intent"
+        search={{ search: target.id }}
+        to="/infra/databases"
+      >
+        {content}
+      </Link>
+    )
+  }
+
+  return (
+    <Link
+      aria-label={`View ${target.name}`}
+      className={className}
+      preload="intent"
+      to="/infra/relays"
+    >
+      {content}
+    </Link>
   )
 }
 
@@ -832,11 +995,23 @@ function BackupCreatedTime({ createdAt }: { createdAt: string }) {
   )
 }
 
-function BackupTargetIcon({ kind }: { kind: Backup["targetKind"] }) {
+function BackupTargetIcon({
+  available = true,
+  kind,
+}: {
+  available?: boolean
+  kind: Backup["targetKind"]
+}) {
   const Icon =
     kind === "database" ? Database : kind === "platform" ? ShieldCheck : Server
   return (
-    <span className="grid size-7 shrink-0 place-items-center rounded-md border border-border/70 bg-background/60 text-muted-foreground">
+    <span
+      className={`grid size-7 shrink-0 place-items-center rounded-md border bg-background/60 ${
+        available
+          ? "border-primary/30 text-primary"
+          : "border-border/70 text-muted-foreground"
+      }`}
+    >
       <Icon className="size-3.5" />
     </span>
   )
@@ -2353,6 +2528,103 @@ function backupTargetName(
   )
 }
 
+function backupTargetPresentation(
+  backup: Backup,
+  relayName: string,
+  targetName: string
+): BackupTargetPresentation {
+  if (backup.targetKind === "platform") {
+    return {
+      id: backup.relayId,
+      kindLabel: "Relay",
+      name: relayName,
+    }
+  }
+  const shortId = backup.targetId.slice(0, 8)
+  return {
+    id: shortId,
+    kindLabel: backup.targetKind === "database" ? "Database" : "Server",
+    name: targetName === backup.targetId ? shortId : targetName,
+  }
+}
+
+function missingTargetMessage(kind: Backup["targetKind"]): string {
+  if (kind === "database") return "This database no longer exists"
+  if (kind === "platform") return "This Relay no longer exists"
+  return "This server no longer exists"
+}
+
+function backupAvailabilityTags(
+  backup: Backup,
+  destinations: ReadonlyArray<BackupAvailabilityDestination>
+): Array<{
+  error: string | null
+  key: string
+  label: string
+  name: string
+  state: BackupAvailabilityState
+}> {
+  const artifactsByStorage = new Map<string, Backup["artifacts"][number]>()
+  for (const artifact of backup.artifacts) {
+    artifactsByStorage.set(artifact.storageId ?? "local", artifact)
+  }
+  const tags = destinations.map((destination) => {
+    const key = destination.id ?? "local"
+    const artifact = artifactsByStorage.get(key)
+    return {
+      error: artifact?.error ?? null,
+      key,
+      label: destination.id ? destination.name : "Local",
+      name: destination.id ? destination.name : "Local Relay",
+      state: artifactAvailabilityState(artifact?.status),
+    }
+  })
+  const seen = new Set(tags.map((tag) => tag.key))
+  for (const artifact of backup.artifacts) {
+    const key = artifact.storageId ?? "local"
+    if (seen.has(key)) continue
+    tags.push({
+      error: artifact.error,
+      key,
+      label: artifact.storageId ? "S3" : "Local",
+      name: artifact.storageId ? "S3 destination" : "Local Relay",
+      state: artifactAvailabilityState(artifact.status),
+    })
+  }
+  return tags
+}
+
+function artifactAvailabilityState(
+  status: Backup["artifacts"][number]["status"] | undefined
+): BackupAvailabilityState {
+  if (status === "available") return "available"
+  if (status === "failed") return "failed"
+  if (status === "queued" || status === "running" || status === "deleting") {
+    return "working"
+  }
+  return "missing"
+}
+
+function availabilityTagClassName(state: BackupAvailabilityState): string {
+  if (state === "available") {
+    return "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+  }
+  if (state === "working") {
+    return "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
+  }
+  if (state === "failed") {
+    return "border-destructive/30 bg-destructive/10 text-destructive"
+  }
+  return "border-border/70 bg-muted/40 text-muted-foreground"
+}
+
+function availabilityStateLabel(state: BackupAvailabilityState): string {
+  if (state === "available") return "Available"
+  if (state === "working") return "Copying"
+  if (state === "failed") return "Failed"
+  return "Not stored here"
+}
+
 function targetKey(
   kind: "database" | "instance" | "platform",
   relayId: string,
@@ -2379,22 +2651,13 @@ function backupSearchText(backup: Backup): string {
     backup.targetId,
     backup.targetKind,
     backup.status,
+    backup.relayId,
     ...backup.artifacts.map((artifact) =>
       artifact.storageId ? "s3" : "local"
     ),
   ]
     .filter(Boolean)
     .join(" ")
-}
-
-function artifactStatusLabel(
-  status: Backup["artifacts"][number]["status"]
-): string {
-  if (status === "available") return "Available"
-  if (status === "failed") return "Failed"
-  if (status === "deleting") return "Deleting"
-  if (status === "deleted") return "Deleted"
-  return status === "queued" ? "Queued" : "Running"
 }
 
 function shortRelativeBackupTime(timestamp: number): string | null {
