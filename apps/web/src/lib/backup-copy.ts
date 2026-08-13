@@ -1,4 +1,7 @@
-import { Readable } from "node:stream"
+import { request as httpRequest } from "node:http"
+import type { IncomingMessage } from "node:http"
+import { request as httpsRequest } from "node:https"
+import type { Readable } from "node:stream"
 
 import { Cause, Effect } from "effect"
 
@@ -13,7 +16,12 @@ import { BackupStorageError } from "@/effect/errors"
 import { forkAppEffect } from "@/effect/runtime"
 import { signLocalBackupDownload } from "@/lib/backup-download"
 import { putS3BackupObject, withS3BackupObject } from "@/lib/backup-storage-s3"
-import { listPersistedRelays } from "@/lib/relay-registry"
+import { relayControlEndpoint } from "@/lib/relay-control-endpoint"
+import {
+  listPersistedRelays,
+  loadRelayCredentials,
+  type PersistedRelay,
+} from "@/lib/relay-registry"
 
 let copyWorkerRunning = false
 let copyWorkerRequested = false
@@ -179,11 +187,28 @@ const localBackupCopySourceEffect = Effect.fn("backups.localCopySource")(
           cause,
         }),
     })
-    if (new URL(signed.url).origin !== new URL(relay.browserOrigin).origin) {
+    const signedUrl = new URL(signed.url)
+    if (signedUrl.origin !== new URL(relay.browserOrigin).origin) {
       return yield* copyFailure("The local backup download URL is invalid")
     }
+    const credentials = yield* Effect.tryPromise({
+      try: () => loadRelayCredentials(relay.id),
+      catch: (cause) =>
+        BackupStorageError.make({
+          code: "copy_download_failed",
+          operation: "backup.copy.download",
+          reason: "The backup Relay credentials are unavailable",
+          cause,
+        }),
+    })
     const response = yield* Effect.tryPromise({
-      try: () => fetch(signed.url, { redirect: "error" }),
+      try: (signal) =>
+        requestRelayBackup(
+          relay,
+          credentials.caCertificatePem,
+          signedUrl,
+          signal
+        ),
       catch: (cause) =>
         BackupStorageError.make({
           code: "copy_download_failed",
@@ -192,25 +217,14 @@ const localBackupCopySourceEffect = Effect.fn("backups.localCopySource")(
           cause,
         }),
     })
-    if (!response.ok || !response.body) {
+    const statusCode = response.statusCode ?? 0
+    if (statusCode < 200 || statusCode >= 300) {
+      response.destroy()
       return yield* copyFailure("The backup file could not be read for copying")
     }
-    const contentLength = Number(response.headers.get("content-length"))
-    const body = yield* Effect.try({
-      try: () =>
-        Readable.fromWeb(
-          response.body as import("node:stream/web").ReadableStream
-        ),
-      catch: (cause) =>
-        BackupStorageError.make({
-          code: "copy_stream_failed",
-          operation: "backup.copy.stream",
-          reason: "The backup file could not be streamed for copying",
-          cause,
-        }),
-    })
+    const contentLength = Number(response.headers["content-length"])
     return {
-      body,
+      body: response,
       contentLength:
         Number.isFinite(contentLength) && contentLength > 0
           ? contentLength
@@ -218,6 +232,41 @@ const localBackupCopySourceEffect = Effect.fn("backups.localCopySource")(
     }
   }
 )
+
+function requestRelayBackup(
+  relay: PersistedRelay,
+  caCertificatePem: string | null,
+  signedUrl: URL,
+  signal: AbortSignal
+): Promise<IncomingMessage> {
+  const endpoint = relayControlEndpoint(relay)
+  const protocol = endpoint.useTls ? "https" : "http"
+  const url = new URL(
+    signedUrl.pathname + signedUrl.search,
+    `${protocol}://${formatHost(endpoint.hostname)}:${endpoint.port}`
+  )
+  const request = endpoint.useTls ? httpsRequest : httpRequest
+  return new Promise((resolve, reject) => {
+    const outgoing = request(
+      url,
+      {
+        ca: endpoint.useTls ? (caCertificatePem ?? undefined) : undefined,
+        method: "GET",
+        rejectUnauthorized: endpoint.useTls,
+        signal,
+      },
+      resolve
+    )
+    outgoing.once("error", reject)
+    outgoing.end()
+  })
+}
+
+function formatHost(hostname: string): string {
+  return hostname.includes(":") && !hostname.startsWith("[")
+    ? `[${hostname}]`
+    : hostname
+}
 
 function uploadBackupCopyEffect(
   task: ClaimedBackupCopyTask,

@@ -117,6 +117,7 @@ type BackupAvailabilityDestination = {
   enabled: boolean
   id: string | null
   name: string
+  ownerUserId: string | null
 }
 type BackupAvailabilityTagView = {
   error: string | null
@@ -323,11 +324,12 @@ export const BackupsPage = React.memo(function BackupsPage({
   )
   const availabilityDestinations = React.useMemo(
     (): Array<BackupAvailabilityDestination> => [
-      { enabled: true, id: null, name: "Local" },
+      { enabled: true, id: null, name: "Local", ownerUserId: null },
       ...storage.map((destination) => ({
         enabled: destination.enabled,
         id: destination.id,
         name: destination.name,
+        ownerUserId: destination.ownerUserId,
       })),
     ],
     [storage]
@@ -411,6 +413,7 @@ export const BackupsPage = React.memo(function BackupsPage({
           <BackupTable
             backups={filteredBackups}
             canCreate={canCreateBackup}
+            currentUserId={capabilities.user.id}
             destinations={availabilityDestinations}
             dialogStore={dialogStore}
             filtered={Boolean(selectedServer || filters.status)}
@@ -731,6 +734,7 @@ const BackupDialogHost = React.memo(function BackupDialogHost({
 const BackupTable = React.memo(function BackupTable({
   backups,
   canCreate,
+  currentUserId,
   destinations,
   dialogStore,
   filtered,
@@ -740,6 +744,7 @@ const BackupTable = React.memo(function BackupTable({
 }: {
   backups: Array<Backup>
   canCreate: (backup: Backup) => boolean
+  currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
   filtered: boolean
@@ -757,6 +762,7 @@ const BackupTable = React.memo(function BackupTable({
       <BackupTableRow
         backup={backup}
         canCreate={canCreate(backup)}
+        currentUserId={currentUserId}
         destinations={destinations}
         dialogStore={dialogStore}
         relayName={relayNames.get(backup.relayId) ?? backup.relayId}
@@ -770,7 +776,14 @@ const BackupTable = React.memo(function BackupTable({
         targetName={backupTargetName(backup, targetNames)}
       />
     ),
-    [canCreate, destinations, dialogStore, relayNames, targetNames]
+    [
+      canCreate,
+      currentUserId,
+      destinations,
+      dialogStore,
+      relayNames,
+      targetNames,
+    ]
   )
   const renderMobileRow = React.useCallback(
     (backup: Backup) => (
@@ -778,6 +791,7 @@ const BackupTable = React.memo(function BackupTable({
         key={backup.id}
         backup={backup}
         canCreate={canCreate(backup)}
+        currentUserId={currentUserId}
         destinations={destinations}
         dialogStore={dialogStore}
         relayName={relayNames.get(backup.relayId) ?? backup.relayId}
@@ -791,7 +805,14 @@ const BackupTable = React.memo(function BackupTable({
         targetName={backupTargetName(backup, targetNames)}
       />
     ),
-    [canCreate, destinations, dialogStore, relayNames, targetNames]
+    [
+      canCreate,
+      currentUserId,
+      destinations,
+      dialogStore,
+      relayNames,
+      targetNames,
+    ]
   )
   const renderEmpty = React.useCallback(
     (searchActive: boolean) => (
@@ -899,6 +920,7 @@ const BackupTableHead = React.memo(function BackupTableHead() {
 const BackupTableRow = React.memo(function BackupTableRow({
   backup,
   canCreate,
+  currentUserId,
   destinations,
   dialogStore,
   relayName,
@@ -907,6 +929,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
 }: {
   backup: Backup
   canCreate: boolean
+  currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
   relayName: string
@@ -932,6 +955,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
+            currentUserId={currentUserId}
             destinations={destinations}
           />
         </div>
@@ -970,6 +994,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
 const BackupMobileRow = React.memo(function BackupMobileRow({
   backup,
   canCreate,
+  currentUserId,
   destinations,
   dialogStore,
   relayName,
@@ -978,6 +1003,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
 }: {
   backup: Backup
   canCreate: boolean
+  currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
   relayName: string
@@ -1018,6 +1044,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
       <BackupAvailabilityTags
         backup={backup}
         canCopy={canCreate}
+        currentUserId={currentUserId}
         destinations={destinations}
       />
       <div className="mt-3 flex justify-end border-t pt-2.5">
@@ -1234,15 +1261,21 @@ const BackupNameEditor = React.memo(function BackupNameEditor({
 const BackupAvailabilityTags = React.memo(function BackupAvailabilityTags({
   backup,
   canCopy,
+  currentUserId,
   destinations,
 }: {
   backup: Backup
   canCopy: boolean
+  currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
 }) {
   const queryClient = useQueryClient()
   const tags = backupAvailabilityTags(backup, destinations)
-  const extraDestinations = extraBackupDestinations(backup, destinations)
+  const extraDestinations = extraBackupDestinations(
+    backup,
+    currentUserId,
+    destinations
+  )
   const copyDisabledReason = backupCopyDisabledReason(
     backup,
     canCopy,
@@ -3224,10 +3257,20 @@ function backupAvailabilityTags(
 
 function extraBackupDestinations(
   backup: Backup,
+  currentUserId: string,
   destinations: ReadonlyArray<BackupAvailabilityDestination>
 ): Array<BackupAvailabilityDestination & { id: string }> {
   return destinations.flatMap((destination) => {
-    if (!destination.enabled || !destination.id) return []
+    if (
+      !destination.enabled ||
+      !destination.id ||
+      (backup.targetKind === "platform"
+        ? destination.ownerUserId !== null
+        : destination.ownerUserId !== null &&
+          destination.ownerUserId !== currentUserId)
+    ) {
+      return []
+    }
     const artifact = backup.artifacts.find(
       (candidate) => candidate.storageId === destination.id
     )
