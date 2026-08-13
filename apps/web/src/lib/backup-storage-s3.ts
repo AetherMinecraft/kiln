@@ -3,7 +3,7 @@ import { lookup } from "node:dns"
 import { Agent } from "node:https"
 import { BlockList, isIP } from "node:net"
 import type { LookupFunction } from "node:net"
-import type { Readable } from "node:stream"
+import { Readable } from "node:stream"
 
 import {
   DeleteObjectCommand,
@@ -25,6 +25,8 @@ import { BackupStorageError } from "@/effect/errors"
 
 const CONNECTION_TEST_PREFIX = "kiln/connection-tests"
 const PRESIGNED_UPLOAD_SECONDS = 7 * 24 * 60 * 60
+const DEFAULT_S3_REQUEST_TIMEOUT_MS = 30_000
+const BACKUP_TRANSFER_REQUEST_TIMEOUT_MS = 14 * 60 * 1_000
 const BLOCKED_ADDRESSES = new BlockList()
 const BLOCKED_IPV4: ReadonlyArray<readonly [string, number]> = [
   ["0.0.0.0", 8],
@@ -203,18 +205,66 @@ export function putS3BackupObject(
     objectKey: string
   }
 ) {
-  return withS3Client(credential, (client) =>
-    s3Request("storage.putObject", () =>
-      client.send(
-        new PutObjectCommand({
-          Body: input.body,
-          Bucket: credential.bucket,
-          ContentLength: input.contentLength,
-          ContentType: input.contentType ?? "application/zip",
-          Key: input.objectKey,
-        })
-      )
-    ).pipe(Effect.asVoid)
+  return withS3Client(
+    credential,
+    (client) =>
+      s3Request("storage.putObject", () =>
+        client.send(
+          new PutObjectCommand({
+            Body: input.body,
+            Bucket: credential.bucket,
+            ContentLength: input.contentLength,
+            ContentType: input.contentType ?? "application/zip",
+            Key: input.objectKey,
+          })
+        )
+      ).pipe(Effect.asVoid),
+    BACKUP_TRANSFER_REQUEST_TIMEOUT_MS
+  )
+}
+
+export function withS3BackupObject<TResult, TError, TRequirements>(
+  credential: S3BackupCredential,
+  objectKey: string,
+  use: (input: {
+    body: Readable
+    contentLength: number | undefined
+  }) => Effect.Effect<TResult, TError, TRequirements>
+) {
+  return withS3Client(
+    credential,
+    (client) =>
+      Effect.gen(function* () {
+        const output = yield* s3Request("storage.getObject", () =>
+          client.send(
+            new GetObjectCommand({
+              Bucket: credential.bucket,
+              Key: objectKey,
+            })
+          )
+        )
+        if (!(output.Body instanceof Readable)) {
+          return yield* Effect.fail(
+            backupStorageError(
+              "invalid_s3_body",
+              "storage.getObject",
+              "The S3-compatible storage response could not be streamed"
+            )
+          )
+        }
+        const body = output.Body
+        return yield* use({
+          body,
+          contentLength: output.ContentLength,
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              body.destroy()
+            })
+          )
+        )
+      }),
+    BACKUP_TRANSFER_REQUEST_TIMEOUT_MS
   )
 }
 
@@ -326,11 +376,12 @@ export function signS3BackupRestore(
 
 function withS3Client<TResult, TError, TRequirements>(
   credential: S3BackupCredential,
-  use: (client: S3Client) => Effect.Effect<TResult, TError, TRequirements>
+  use: (client: S3Client) => Effect.Effect<TResult, TError, TRequirements>,
+  requestTimeout = DEFAULT_S3_REQUEST_TIMEOUT_MS
 ) {
   return Effect.acquireUseRelease(
     Effect.try({
-      try: () => makeS3Client(credential),
+      try: () => makeS3Client(credential, requestTimeout),
       catch: (cause) =>
         backupStorageError(
           "invalid_s3_client",
@@ -347,7 +398,10 @@ function withS3Client<TResult, TError, TRequirements>(
   )
 }
 
-function makeS3Client(credential: S3BackupCredential): S3Client {
+function makeS3Client(
+  credential: S3BackupCredential,
+  requestTimeout: number
+): S3Client {
   const endpoint = normalizeS3Endpoint(credential.endpoint)
   const endpointHost = new URL(endpoint).hostname.replace(/^\[|\]$/gu, "")
   if (
@@ -366,7 +420,7 @@ function makeS3Client(credential: S3BackupCredential): S3Client {
     : new NodeHttpHandler({
         connectionTimeout: 10_000,
         httpsAgent: new Agent({ lookup: publicS3Lookup }),
-        requestTimeout: 30_000,
+        requestTimeout,
       })
   return new S3Client({
     credentials: {

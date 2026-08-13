@@ -156,7 +156,10 @@ export function backupsQueryOptions() {
       query.state.data?.some(
         (backup) =>
           ["queued", "running", "deleting"].includes(backup.status) ||
-          ["queued", "running"].includes(backup.taskStatus)
+          ["queued", "running"].includes(backup.taskStatus) ||
+          backup.artifacts.some((artifact) =>
+            ["queued", "running", "deleting"].includes(artifact.status)
+          )
       )
         ? 1_500
         : false,

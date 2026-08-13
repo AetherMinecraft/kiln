@@ -1174,6 +1174,12 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
                    AND active_task.task_kind = 'restore'
                    AND active_task.status IN ('queued', 'running')
               )
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM ${databaseTable("backup_copy_task")} active_copy
+                 WHERE active_copy.backup_id = backup.id
+                   AND active_copy.status IN ('queued', 'running')
+              )
             FOR UPDATE`,
           [input.backupId]
         )
@@ -1232,6 +1238,26 @@ export const reserveBackupCopyEffect = Effect.fn("backups.reserveCopy")(
     const database = yield* Database
     return yield* database.transaction("backup_copy_reserve", (transaction) =>
       Effect.gen(function* () {
+        const source = (yield* transaction.queryRows<
+          { id: string } & RowDataPacket
+        >(
+          `SELECT artifact.id
+             FROM ${databaseTable("backup")} backup
+             JOIN ${databaseTable("backup_artifact")} artifact
+               ON artifact.backup_id = backup.id
+            WHERE backup.id = ? AND backup.status = 'available'
+              AND artifact.id = ? AND artifact.status = 'available'
+            LIMIT 1
+            FOR UPDATE`,
+          [input.backupId, input.sourceArtifactId]
+        ))[0]
+        if (!source) {
+          return yield* BackupStorageError.make({
+            code: "backup_unavailable",
+            operation: "backup.copy",
+            reason: "A successful backup file is required before copying",
+          })
+        }
         const storage = (yield* transaction.queryRows<BackupStorageKeyRow>(
           `SELECT id, object_prefix, owner_user_id
                FROM ${databaseTable("backup_storage")}

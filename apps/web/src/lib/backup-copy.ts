@@ -12,10 +12,7 @@ import { loadBackupStorageCredentialEffect } from "@/effect/backup-storage"
 import { BackupStorageError } from "@/effect/errors"
 import { forkAppEffect } from "@/effect/runtime"
 import { signLocalBackupDownload } from "@/lib/backup-download"
-import {
-  putS3BackupObject,
-  signS3BackupDownload,
-} from "@/lib/backup-storage-s3"
+import { putS3BackupObject, withS3BackupObject } from "@/lib/backup-storage-s3"
 import { listPersistedRelays } from "@/lib/relay-registry"
 
 let copyWorkerRunning = false
@@ -65,6 +62,10 @@ const processBackupCopyTaskEffect = Effect.fn("backups.processCopy")(function* (
     taskId,
   })
   yield* transferBackupCopyEffect(task).pipe(
+    Effect.timeoutOrElse({
+      duration: "14 minutes",
+      orElse: () => copyFailure("The backup copy timed out"),
+    }),
     Effect.matchCauseEffect({
       onFailure: (cause) => {
         const error = backupCopyFailureMessage(cause)
@@ -105,96 +106,13 @@ const processBackupCopyTaskEffect = Effect.fn("backups.processCopy")(function* (
 const transferBackupCopyEffect = Effect.fn("backups.transferCopy")(function* (
   task: ClaimedBackupCopyTask
 ) {
-  const downloadUrl = yield* backupCopyDownloadUrlEffect(task)
   const destination = yield* loadBackupStorageCredentialEffect(
     task.destinationStorageId
   )
   if (!destination) {
     return yield* copyFailure("Backup destination is unavailable")
   }
-  const response = yield* Effect.tryPromise({
-    try: () => fetch(downloadUrl),
-    catch: (cause) =>
-      BackupStorageError.make({
-        code: "copy_download_failed",
-        operation: "backup.copy.download",
-        reason: "The backup file could not be read for copying",
-        cause,
-      }),
-  })
-  if (!response.ok || !response.body) {
-    return yield* copyFailure("The backup file could not be read for copying")
-  }
-  const contentLength = Number(response.headers.get("content-length"))
-  const stream = yield* Effect.try({
-    try: () =>
-      Readable.fromWeb(
-        response.body as import("node:stream/web").ReadableStream
-      ),
-    catch: (cause) =>
-      BackupStorageError.make({
-        code: "copy_stream_failed",
-        operation: "backup.copy.stream",
-        reason: "The backup file could not be streamed for copying",
-        cause,
-      }),
-  })
-  yield* putS3BackupObject(destination, {
-    body: stream,
-    ...(Number.isFinite(contentLength) && contentLength > 0
-      ? { contentLength }
-      : task.bytes === null
-        ? {}
-        : { contentLength: task.bytes }),
-    objectKey: task.destinationObjectKey,
-  }).pipe(
-    Effect.ensuring(
-      Effect.sync(() => {
-        stream.destroy()
-      })
-    )
-  )
-})
-
-const backupCopyDownloadUrlEffect = Effect.fn("backups.copyDownloadUrl")(
-  function* (task: ClaimedBackupCopyTask) {
-    if (task.sourceStorageId === null) {
-      if (task.sourceObjectKey) {
-        return yield* copyFailure("Local backup metadata is invalid")
-      }
-      const relays = yield* Effect.tryPromise({
-        try: listPersistedRelays,
-        catch: (cause) =>
-          BackupStorageError.make({
-            code: "copy_relay_lookup_failed",
-            operation: "backup.copy.relay",
-            reason: "The backup Relay is unavailable",
-            cause,
-          }),
-      })
-      const relay = relays.find(
-        (candidate) => candidate.enabled && candidate.id === task.relayId
-      )
-      if (!relay) return yield* copyFailure("The backup Relay is unavailable")
-      const signed = yield* Effect.tryPromise({
-        try: () =>
-          signLocalBackupDownload(
-            relay,
-            { id: task.backupId },
-            task.filename,
-            task.requestedBy,
-            300
-          ),
-        catch: (cause) =>
-          BackupStorageError.make({
-            code: "copy_download_sign_failed",
-            operation: "backup.copy.signLocal",
-            reason: "The local backup could not be prepared for copying",
-            cause,
-          }),
-      })
-      return signed.url
-    }
+  if (task.sourceStorageId !== null) {
     if (!task.sourceObjectKey) {
       return yield* copyFailure("Backup object key is unavailable")
     }
@@ -204,14 +122,115 @@ const backupCopyDownloadUrlEffect = Effect.fn("backups.copyDownloadUrl")(
     if (!source) {
       return yield* copyFailure("Backup source destination is unavailable")
     }
-    return (yield* signS3BackupDownload(
+    return yield* withS3BackupObject(
       source,
       task.sourceObjectKey,
-      task.filename,
-      300
-    )).url
+      ({ body, contentLength }) =>
+        uploadBackupCopyEffect(
+          task,
+          destination,
+          body,
+          contentLength ?? task.bytes ?? undefined
+        )
+    )
+  }
+  const source = yield* localBackupCopySourceEffect(task)
+  yield* uploadBackupCopyEffect(
+    task,
+    destination,
+    source.body,
+    source.contentLength
+  ).pipe(Effect.ensuring(Effect.sync(() => source.body.destroy())))
+})
+
+const localBackupCopySourceEffect = Effect.fn("backups.localCopySource")(
+  function* (task: ClaimedBackupCopyTask) {
+    if (task.sourceObjectKey) {
+      return yield* copyFailure("Local backup metadata is invalid")
+    }
+    const relays = yield* Effect.tryPromise({
+      try: listPersistedRelays,
+      catch: (cause) =>
+        BackupStorageError.make({
+          code: "copy_relay_lookup_failed",
+          operation: "backup.copy.relay",
+          reason: "The backup Relay is unavailable",
+          cause,
+        }),
+    })
+    const relay = relays.find(
+      (candidate) => candidate.enabled && candidate.id === task.relayId
+    )
+    if (!relay) return yield* copyFailure("The backup Relay is unavailable")
+    const signed = yield* Effect.tryPromise({
+      try: () =>
+        signLocalBackupDownload(
+          relay,
+          { id: task.backupId },
+          task.filename,
+          task.requestedBy,
+          300
+        ),
+      catch: (cause) =>
+        BackupStorageError.make({
+          code: "copy_download_sign_failed",
+          operation: "backup.copy.signLocal",
+          reason: "The local backup could not be prepared for copying",
+          cause,
+        }),
+    })
+    if (new URL(signed.url).origin !== new URL(relay.browserOrigin).origin) {
+      return yield* copyFailure("The local backup download URL is invalid")
+    }
+    const response = yield* Effect.tryPromise({
+      try: () => fetch(signed.url, { redirect: "error" }),
+      catch: (cause) =>
+        BackupStorageError.make({
+          code: "copy_download_failed",
+          operation: "backup.copy.download",
+          reason: "The backup file could not be read for copying",
+          cause,
+        }),
+    })
+    if (!response.ok || !response.body) {
+      return yield* copyFailure("The backup file could not be read for copying")
+    }
+    const contentLength = Number(response.headers.get("content-length"))
+    const body = yield* Effect.try({
+      try: () =>
+        Readable.fromWeb(
+          response.body as import("node:stream/web").ReadableStream
+        ),
+      catch: (cause) =>
+        BackupStorageError.make({
+          code: "copy_stream_failed",
+          operation: "backup.copy.stream",
+          reason: "The backup file could not be streamed for copying",
+          cause,
+        }),
+    })
+    return {
+      body,
+      contentLength:
+        Number.isFinite(contentLength) && contentLength > 0
+          ? contentLength
+          : (task.bytes ?? undefined),
+    }
   }
 )
+
+function uploadBackupCopyEffect(
+  task: ClaimedBackupCopyTask,
+  destination: Parameters<typeof putS3BackupObject>[0],
+  body: Readable,
+  contentLength: number | undefined
+) {
+  return putS3BackupObject(destination, {
+    body,
+    ...(contentLength === undefined ? {} : { contentLength }),
+    objectKey: task.destinationObjectKey,
+  })
+}
 
 function copyFailure(reason: string) {
   return BackupStorageError.make({

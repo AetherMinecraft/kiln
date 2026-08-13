@@ -357,14 +357,20 @@ describe("backup copy reservation", () => {
       transaction: (_operation, run) =>
         run({
           execute: () => Effect.die("Unexpected transaction write"),
-          queryRows: <TRow extends RowDataPacket>() =>
-            Effect.succeed([
-              {
-                id: input.storageId,
-                object_prefix: "backups",
-                owner_user_id: "user-two",
-              },
-            ] as unknown as ReadonlyArray<TRow>),
+          queryRows: <TRow extends RowDataPacket>(sql: string) =>
+            Effect.succeed(
+              (sql.includes("backup_storage")
+                ? [
+                    {
+                      id: input.storageId,
+                      object_prefix: "backups",
+                      owner_user_id: "user-two",
+                    },
+                  ]
+                : [
+                    { id: input.sourceArtifactId },
+                  ]) as unknown as ReadonlyArray<TRow>
+            ),
         }),
     })
 
@@ -377,7 +383,6 @@ describe("backup copy reservation", () => {
 
   it("queues the artifact and durable copy task", async () => {
     const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
-    let queryCount = 0
     const databaseLayer = Layer.succeed(Database)({
       execute: () => Effect.die("Unexpected standalone database write"),
       queryRows: () => Effect.die("Unexpected standalone database query"),
@@ -388,10 +393,9 @@ describe("backup copy reservation", () => {
               writes.push({ sql, values })
               return emptyResult
             }),
-          queryRows: <TRow extends RowDataPacket>() =>
-            Effect.sync(() => {
-              queryCount += 1
-              return (queryCount === 1
+          queryRows: <TRow extends RowDataPacket>(sql: string) =>
+            Effect.succeed(
+              (sql.includes("backup_storage")
                 ? [
                     {
                       id: input.storageId,
@@ -399,8 +403,10 @@ describe("backup copy reservation", () => {
                       owner_user_id: "user-one",
                     },
                   ]
-                : []) as unknown as ReadonlyArray<TRow>
-            }),
+                : sql.includes("JOIN")
+                  ? [{ id: input.sourceArtifactId }]
+                  : []) as unknown as ReadonlyArray<TRow>
+            ),
         }),
     })
 
