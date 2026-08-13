@@ -25,6 +25,7 @@ import {
 
 let copyWorkerRunning = false
 let copyWorkerRequested = false
+const BACKUP_COPY_IDLE_TIMEOUT_MS = 60_000
 
 export function scheduleBackupCopyProcessing(): void {
   copyWorkerRequested = true
@@ -70,10 +71,6 @@ const processBackupCopyTaskEffect = Effect.fn("backups.processCopy")(function* (
     taskId,
   })
   yield* transferBackupCopyEffect(task).pipe(
-    Effect.timeoutOrElse({
-      duration: "14 minutes",
-      orElse: () => copyFailure("The backup copy timed out"),
-    }),
     Effect.matchCauseEffect({
       onFailure: (cause) => {
         const error = backupCopyFailureMessage(cause)
@@ -258,6 +255,9 @@ function requestRelayBackup(
       resolve
     )
     outgoing.once("error", reject)
+    outgoing.setTimeout(BACKUP_COPY_IDLE_TIMEOUT_MS, () => {
+      outgoing.destroy(new Error("The backup copy stopped making progress"))
+    })
     outgoing.end()
   })
 }

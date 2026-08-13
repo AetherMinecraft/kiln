@@ -26,7 +26,7 @@ import { BackupStorageError } from "@/effect/errors"
 const CONNECTION_TEST_PREFIX = "kiln/connection-tests"
 const PRESIGNED_UPLOAD_SECONDS = 7 * 24 * 60 * 60
 const DEFAULT_S3_REQUEST_TIMEOUT_MS = 30_000
-const BACKUP_TRANSFER_REQUEST_TIMEOUT_MS = 14 * 60 * 1_000
+const BACKUP_TRANSFER_IDLE_TIMEOUT_MS = 60_000
 const BLOCKED_ADDRESSES = new BlockList()
 const BLOCKED_IPV4: ReadonlyArray<readonly [string, number]> = [
   ["0.0.0.0", 8],
@@ -164,32 +164,35 @@ export function verifyS3BackupCredential(credential: S3BackupCredential) {
     .join("/")
   return withS3Client(credential, (client) =>
     Effect.acquireUseRelease(
-      s3Request("storage.verify.put", () =>
+      s3Request("storage.verify.put", (signal) =>
         client.send(
           new PutObjectCommand({
             Body: new Uint8Array(),
             Bucket: credential.bucket,
             ContentType: "application/octet-stream",
             Key: objectKey,
-          })
+          }),
+          { abortSignal: signal }
         )
       ),
       () =>
-        s3Request("storage.verify.head", () =>
+        s3Request("storage.verify.head", (signal) =>
           client.send(
             new HeadObjectCommand({
               Bucket: credential.bucket,
               Key: objectKey,
-            })
+            }),
+            { abortSignal: signal }
           )
         ),
       () =>
-        s3Request("storage.verify.delete", () =>
+        s3Request("storage.verify.delete", (signal) =>
           client.send(
             new DeleteObjectCommand({
               Bucket: credential.bucket,
               Key: objectKey,
-            })
+            }),
+            { abortSignal: signal }
           )
         ).pipe(Effect.ignore)
     ).pipe(Effect.asVoid)
@@ -208,7 +211,7 @@ export function putS3BackupObject(
   return withS3Client(
     credential,
     (client) =>
-      s3Request("storage.putObject", () =>
+      s3Request("storage.putObject", (signal) =>
         client.send(
           new PutObjectCommand({
             Body: input.body,
@@ -216,10 +219,11 @@ export function putS3BackupObject(
             ContentLength: input.contentLength,
             ContentType: input.contentType ?? "application/zip",
             Key: input.objectKey,
-          })
+          }),
+          { abortSignal: signal }
         )
       ).pipe(Effect.asVoid),
-    BACKUP_TRANSFER_REQUEST_TIMEOUT_MS
+    BACKUP_TRANSFER_IDLE_TIMEOUT_MS
   )
 }
 
@@ -235,12 +239,13 @@ export function withS3BackupObject<TResult, TError, TRequirements>(
     credential,
     (client) =>
       Effect.gen(function* () {
-        const output = yield* s3Request("storage.getObject", () =>
+        const output = yield* s3Request("storage.getObject", (signal) =>
           client.send(
             new GetObjectCommand({
               Bucket: credential.bucket,
               Key: objectKey,
-            })
+            }),
+            { abortSignal: signal }
           )
         )
         if (!(output.Body instanceof Readable)) {
@@ -264,7 +269,7 @@ export function withS3BackupObject<TResult, TError, TRequirements>(
           )
         )
       }),
-    BACKUP_TRANSFER_REQUEST_TIMEOUT_MS
+    BACKUP_TRANSFER_IDLE_TIMEOUT_MS
   )
 }
 
@@ -505,7 +510,7 @@ function normalizePeerAddress(value: string): string {
 
 function s3Request<TResult>(
   operation: string,
-  request: () => Promise<TResult>
+  request: (signal: AbortSignal) => Promise<TResult>
 ) {
   return Effect.tryPromise({
     try: request,

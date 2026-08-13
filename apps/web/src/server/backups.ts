@@ -37,6 +37,7 @@ import {
 } from "@/lib/access-control"
 import { hasBackupPermission } from "@/lib/backup-access"
 import { scheduleBackupCopyProcessing } from "@/lib/backup-copy"
+import { selectBackupCopySource } from "@/lib/backup-copy-source"
 import { signLocalBackupDownload } from "@/lib/backup-download"
 import { relayRpc } from "@/lib/relay-connection"
 import { signS3BackupDownload } from "@/lib/backup-storage-s3"
@@ -426,11 +427,7 @@ export const copyBackupToDestination = createServerFn({ method: "POST" })
       user.id,
       backup.targetKind === "platform"
     )
-    const source =
-      backup.artifacts.find(
-        (artifact) =>
-          artifact.status === "available" && artifact.storageId === null
-      ) ?? backup.artifacts.find((artifact) => artifact.status === "available")
+    const source = selectBackupCopySource(backup.artifacts)
     if (!source) {
       throw new Error("A successful backup file is required before copying")
     }

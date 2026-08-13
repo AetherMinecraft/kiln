@@ -263,10 +263,16 @@ export const BackupsPage = React.memo(function BackupsPage({
     () =>
       backupScopeOptions({
         databases,
+        includePlatform: capabilities.isPlatformAdmin,
         nodes: backupScope.nodes,
         servers: backupScope.servers,
       }),
-    [backupScope.nodes, backupScope.servers, databases]
+    [
+      backupScope.nodes,
+      backupScope.servers,
+      capabilities.isPlatformAdmin,
+      databases,
+    ]
   )
   const selectedServer = React.useMemo(
     () =>
@@ -339,12 +345,7 @@ export const BackupsPage = React.memo(function BackupsPage({
       backups.filter((backup) => {
         if (backup.status === "deleted") return false
         if (!backupMatchesScope(backup, selectedServer)) return false
-        if (filters.status === "active") return backupIsActive(backup)
-        if (filters.status === "available") {
-          return backup.status === "available"
-        }
-        if (filters.status === "failed") return backup.status === "failed"
-        return true
+        return backupMatchesStatusFilter(backup, filters.status)
       }),
     [backups, filters.status, selectedServer]
   )
@@ -358,10 +359,14 @@ export const BackupsPage = React.memo(function BackupsPage({
       }),
     [backupScope.nodes, backupScope.servers, capabilities, databases]
   )
-  const selectedCreateTargetKey =
-    selectedServer && (selectedServer.kind ?? "server") === "server"
-      ? targetKey("instance", selectedServer.relayId, selectedServer.id)
-      : undefined
+  const scopedCreateTargetKey = selectedServer
+    ? selectedBackupCreateTargetKey(selectedServer)
+    : undefined
+  const selectedCreateTargetKey = createTargets.some(
+    (target) => target.key === scopedCreateTargetKey
+  )
+    ? scopedCreateTargetKey
+    : undefined
   const canManageSelectedServer = Boolean(
     selectedServer &&
     (selectedServer.kind ?? "server") === "server" &&
@@ -3017,10 +3022,12 @@ function DeleteBackupDialog({
 
 function backupScopeOptions({
   databases,
+  includePlatform,
   nodes,
   servers,
 }: {
   databases: Awaited<ReturnType<typeof getManagedDatabaseDirectory>>
+  includePlatform: boolean
   nodes: ReturnType<typeof selectBackupScope>["nodes"]
   servers: ReturnType<typeof selectBackupScope>["servers"]
 }): Array<ServerPickerOption> {
@@ -3045,15 +3052,17 @@ function backupScopeOptions({
       relayName: database.relayName,
     })
   }
-  for (const node of nodes) {
-    options.push({
-      description: `Relay · ${node.relayId}`,
-      id: node.relayId,
-      kind: "relay",
-      name: node.relayName,
-      relayId: node.relayId,
-      relayName: node.relayName,
-    })
+  if (includePlatform) {
+    for (const node of nodes) {
+      options.push({
+        description: `Relay · ${node.relayId}`,
+        id: node.relayId,
+        kind: "relay",
+        name: node.relayName,
+        relayId: node.relayId,
+        relayName: node.relayName,
+      })
+    }
   }
   return options
 }
@@ -3079,6 +3088,17 @@ function backupMatchesScope(
     )
   }
   return backup.targetKind === "platform" && backup.relayId === selected.relayId
+}
+
+function selectedBackupCreateTargetKey(selected: ServerPickerOption): string {
+  const kind = selected.kind ?? "server"
+  if (kind === "database") {
+    return targetKey("database", selected.relayId, selected.id)
+  }
+  if (kind === "relay") {
+    return targetKey("platform", selected.relayId, "kiln")
+  }
+  return targetKey("instance", selected.relayId, selected.id)
 }
 
 function availableCreateTargets({
@@ -3166,6 +3186,20 @@ function backupIsActive(backup: Backup): boolean {
     (backup.status === "available" &&
       (backup.taskStatus === "queued" || backup.taskStatus === "running"))
   )
+}
+
+function backupMatchesStatusFilter(
+  backup: Backup,
+  status: BackupFilters["status"]
+): boolean {
+  if (!status) return true
+  const active = backupIsActive(backup)
+  if (status === "active") return active
+  const failed =
+    backup.status === "failed" ||
+    backup.artifacts.some((artifact) => artifact.status === "failed")
+  if (status === "failed") return !active && failed
+  return !active && !failed && backup.status === "available"
 }
 
 function backupTargetName(
