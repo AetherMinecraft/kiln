@@ -643,16 +643,19 @@ const BackupTableHead = React.memo(function BackupTableHead() {
       <WorkspaceTableHeading className="w-14">
         <span className="sr-only">Status</span>
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-auto sm:w-[34%]">
+      <WorkspaceTableHeading className="w-auto sm:w-[26%]">
         Backup
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[18%] sm:table-cell">
+        File
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[22%] md:table-cell">
         Target
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-24 xl:table-cell">
+      <WorkspaceTableHeading className="hidden w-24 lg:table-cell">
         Size
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-28 sm:table-cell">
+      <WorkspaceTableHeading className="hidden w-28 xl:table-cell">
         Created
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="w-40 text-right">
@@ -705,9 +708,6 @@ const BackupTableRow = React.memo(function BackupTableRow({
       <WorkspaceTableCell className="h-auto py-2.5">
         <div className="min-w-0">
           <p className="truncate text-sm font-semibold">{backup.name}</p>
-          <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
-            {backup.filename ?? backup.id}
-          </p>
           {backup.taskError ? (
             <p className="mt-1 line-clamp-1 text-[0.625rem] text-destructive">
               {backup.taskError}
@@ -719,6 +719,11 @@ const BackupTableRow = React.memo(function BackupTableRow({
           />
         </div>
       </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground sm:table-cell">
+        <span className="block truncate" title={backup.filename ?? backup.id}>
+          {backup.filename ?? backup.id}
+        </span>
+      </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 md:table-cell">
         <BackupTargetLink
           available={targetAvailable}
@@ -726,10 +731,10 @@ const BackupTableRow = React.memo(function BackupTableRow({
           target={target}
         />
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground xl:table-cell">
+      <WorkspaceTableCell className="hidden h-auto py-2.5 font-mono text-[0.625rem] text-muted-foreground lg:table-cell">
         {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 text-[0.625rem] whitespace-nowrap text-muted-foreground sm:table-cell">
+      <WorkspaceTableCell className="hidden h-auto py-2.5 text-[0.625rem] whitespace-nowrap text-muted-foreground xl:table-cell">
         <BackupCreatedTime createdAt={backup.createdAt} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="h-auto py-2.5 text-right">
