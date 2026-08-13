@@ -67,6 +67,7 @@ import { formatBytes, writeLine, writeTable, writeText } from "./output.js"
 import { formatPowerResponse } from "./power.js"
 import { downloadSftpFileEffect, uploadSftpFileEffect } from "./sftp.js"
 import { runCliProgram } from "./runtime.js"
+import { updateCliEffect } from "./update.js"
 import release from "../../../release.json" with { type: "json" }
 
 const VERSION = process.env.KILN_VERSION?.trim() || release.releaseLine
@@ -114,6 +115,12 @@ const runCommandEffect = Effect.fn("cli.command")(function* (
   }
   if (group === "logout") {
     yield* logoutEffect(args)
+    return
+  }
+  if (group === "update") {
+    if (action !== undefined) return yield* invalidUsage("Usage: kiln update")
+    yield* updateCliEffect()
+    writeLine("Kiln CLI updated to the latest version.")
     return
   }
 
@@ -1120,6 +1127,7 @@ Usage:
 Commands:
   login [url]                              Sign in to Kiln or Hearth
   logout                                  Sign out of the active profile
+  update                                  Update only the Kiln CLI with npm
   whoami                                  Show the current account
   relays list                             List accessible Relays
   relay info <relay-id>                   Show Relay metadata and capacity
