@@ -316,11 +316,20 @@ export const getBackups = createServerFn({ method: "GET" }).handler(
         )
         .map((backup) => backup.relayId)
     )
-    await Promise.allSettled(
-      relays
-        .filter((relay) => visibleRelayIds.has(relay.id))
-        .map((relay) => reconcileRelayBackups(relay, user.id))
+    const hasActiveRelayTasks = catalog.some(
+      (backup) =>
+        visibleRelayIds.has(backup.relayId) &&
+        (["queued", "running", "deleting"].includes(backup.status) ||
+          backup.taskStatus === "queued" ||
+          backup.taskStatus === "running")
     )
+    if (hasActiveRelayTasks) {
+      await Promise.allSettled(
+        relays
+          .filter((relay) => visibleRelayIds.has(relay.id))
+          .map((relay) => reconcileRelayBackups(relay, user.id))
+      )
+    }
     const reconciled = await runAppEffect(
       "backups.listReconciled",
       listBackupCatalogEffect()

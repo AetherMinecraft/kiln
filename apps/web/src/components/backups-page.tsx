@@ -1074,7 +1074,7 @@ const BackupRowActions = React.memo(function BackupRowActions({
 }) {
   const canRestore =
     backup.status === "available" &&
-    !backupIsActive(backup) &&
+    !backupSourceIsActive(backup) &&
     targetAvailable &&
     (backup.targetKind === "instance" || backup.targetKind === "database")
   const restore = (
@@ -3181,8 +3181,14 @@ function canCreateForResource(
 
 function backupIsActive(backup: Backup): boolean {
   return (
+    backupSourceIsActive(backup) ||
+    backup.artifacts.some((artifact) => activeStatuses.has(artifact.status))
+  )
+}
+
+function backupSourceIsActive(backup: Backup): boolean {
+  return (
     activeStatuses.has(backup.status) ||
-    backup.artifacts.some((artifact) => activeStatuses.has(artifact.status)) ||
     (backup.status === "available" &&
       (backup.taskStatus === "queued" || backup.taskStatus === "running"))
   )

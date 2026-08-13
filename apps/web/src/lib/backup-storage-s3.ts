@@ -405,7 +405,7 @@ function withS3Client<TResult, TError, TRequirements>(
 
 function makeS3Client(
   credential: S3BackupCredential,
-  requestTimeout: number
+  socketTimeout: number
 ): S3Client {
   const endpoint = normalizeS3Endpoint(credential.endpoint)
   const endpointHost = new URL(endpoint).hostname.replace(/^\[|\]$/gu, "")
@@ -420,13 +420,13 @@ function makeS3Client(
       "The S3 endpoint resolves to a private or reserved network address"
     )
   }
-  const requestHandler = credential.allowPrivateNetwork
-    ? undefined
-    : new NodeHttpHandler({
-        connectionTimeout: 10_000,
-        httpsAgent: new Agent({ lookup: publicS3Lookup }),
-        requestTimeout,
-      })
+  const requestHandler = new NodeHttpHandler({
+    connectionTimeout: 10_000,
+    ...(credential.allowPrivateNetwork
+      ? {}
+      : { httpsAgent: new Agent({ lookup: publicS3Lookup }) }),
+    socketTimeout,
+  })
   return new S3Client({
     credentials: {
       accessKeyId: credential.accessKeyId,
@@ -435,7 +435,7 @@ function makeS3Client(
     endpoint,
     forcePathStyle: credential.forcePathStyle,
     region: credential.region,
-    ...(requestHandler === undefined ? {} : { requestHandler }),
+    requestHandler,
   })
 }
 
