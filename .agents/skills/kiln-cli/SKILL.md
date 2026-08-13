@@ -56,6 +56,19 @@ Use `--profile <name>` on any command to select a saved profile. `KILN_URL`,
 `KILN_TOKEN`, and `KILN_CONFIG` support isolated automation, but prefer the
 user's existing authenticated profile for interactive work.
 
+## Update the CLI
+
+Update the locally installed CLI with:
+
+```sh
+kiln update
+```
+
+This reinstalls `kiln-cli@latest` globally through pnpm or Bun when the CLI can
+identify that installer, with npm as the default and fallback. It updates only
+the CLI executable; it does not update Hearth, Relays, or managed servers, and
+it does not require authentication.
+
 ## Resolve a server
 
 Discover targets instead of guessing identifiers:

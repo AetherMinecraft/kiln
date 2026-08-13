@@ -37,10 +37,16 @@ Before editing files for a substantial task:
 
 ## Setup
 
+This repository uses the local-clone option for the Effect source checkout.
+If `.repos/effect` is missing, run `pnpm prepare` to clone it automatically;
+do not prompt for a subtree, submodule, or clone choice. Never edit the
+checkout directly.
+
 Run once per clone from `main`:
 
 ```sh
 vp install --frozen-lockfile
+pnpm prepare
 pnpm dev:setup
 ```
 
