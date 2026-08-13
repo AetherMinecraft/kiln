@@ -58,15 +58,16 @@ user's existing authenticated profile for interactive work.
 
 ## Update the CLI
 
-Update the locally installed CLI through npm with:
+Update the locally installed CLI with:
 
 ```sh
 kiln update
 ```
 
-This reinstalls `kiln-cli@latest` globally. It updates only the CLI executable;
-it does not update Hearth, Relays, or managed servers, and it does not require
-authentication.
+This reinstalls `kiln-cli@latest` globally through pnpm or Bun when the CLI can
+identify that installer, with npm as the default and fallback. It updates only
+the CLI executable; it does not update Hearth, Relays, or managed servers, and
+it does not require authentication.
 
 ## Resolve a server
 

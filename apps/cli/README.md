@@ -26,8 +26,10 @@ Update an existing global CLI installation with:
 kiln update
 ```
 
-This runs `npm install --global kiln-cli@latest`. It updates only the local
-Kiln CLI, not Hearth or any Relay.
+The updater reuses pnpm or Bun when it can identify that package manager as the
+owner of the installed CLI. Otherwise, and whenever that update fails, it uses
+`npm install --global kiln-cli@latest`. This updates only the local Kiln CLI,
+not Hearth or any Relay.
 
 ## Install the agent skill
 

@@ -1127,7 +1127,7 @@ Usage:
 Commands:
   login [url]                              Sign in to Kiln or Hearth
   logout                                  Sign out of the active profile
-  update                                  Update only the Kiln CLI with npm
+  update                                  Update only the Kiln CLI
   whoami                                  Show the current account
   relays list                             List accessible Relays
   relay info <relay-id>                   Show Relay metadata and capacity
