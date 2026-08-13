@@ -23,6 +23,7 @@ describe("S3 backup storage", () => {
 
   it("bounds generated keys even when target names require heavy escaping", () => {
     const key = backupObjectKey({
+      artifactKind: "archive",
       backupId: "00000000-0000-4000-8000-000000000001",
       installationId: "kiln-production",
       objectPrefix: "p".repeat(512),
@@ -37,6 +38,7 @@ describe("S3 backup storage", () => {
   it("encodes generated key segments without changing the operator prefix", () => {
     expect(
       backupObjectKey({
+        artifactKind: "archive",
         backupId: "00000000-0000-4000-8000-000000000001",
         installationId: "kiln.dev",
         objectPrefix: "team/backups",
@@ -45,8 +47,30 @@ describe("S3 backup storage", () => {
         targetKind: "instance",
       })
     ).toBe(
-      "team/backups/kiln/kiln.dev/relay%2Fid/instance/server%20..%2F%20one/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000001.zip"
+      "team/backups/kiln/kiln.dev/relay%2Fid/instance/server%20..%2F%20one/00000000-0000-4000-8000-000000000001/backup-00000000.zip"
     )
+    expect(
+      backupObjectKey({
+        artifactKind: "database_dump",
+        backupId: "abcdef01-0000-4000-8000-000000000001",
+        installationId: "kiln.dev",
+        objectPrefix: "team/backups",
+        relayId: "relay-id",
+        targetId: "database-1",
+        targetKind: "database",
+      })
+    ).toMatch(/\/backup-abcdef01\.dmp\.gz$/u)
+    expect(
+      backupObjectKey({
+        artifactKind: "platform_bundle",
+        backupId: "abcdef01-0000-4000-8000-000000000001",
+        installationId: "kiln.dev",
+        objectPrefix: "team/backups",
+        relayId: "relay-id",
+        targetId: "platform",
+        targetKind: "platform",
+      })
+    ).toMatch(/\/backup-abcdef01\.kiln$/u)
   })
 
   it("rejects private, local, reserved, and invalid addresses", () => {

@@ -15,9 +15,10 @@ import { pipeline } from "node:stream/promises"
 import { createGunzip, createGzip } from "node:zlib"
 import { Effect, Result } from "effect"
 
-import type {
-  BackupCreateTaskInput,
-  BackupCreateTaskResult,
+import {
+  backupArtifactFilename,
+  type BackupCreateTaskInput,
+  type BackupCreateTaskResult,
 } from "@workspace/contracts"
 
 import { command } from "./command.js"
@@ -127,7 +128,7 @@ export async function createEncryptedPlatformBackup(
   return {
     bytes: metadata.size,
     checksumSha256: digest.digest("hex"),
-    filename: `kiln-${installationId}-${manifest.createdAt.slice(0, 10)}.kiln`,
+    filename: backupArtifactFilename(input.backupId, "platform_bundle"),
     warnings: [],
   }
 }
