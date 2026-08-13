@@ -312,6 +312,7 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
             artifactId: randomUUID(),
             objectKey: storage
               ? backupObjectKey({
+                  artifactKind: input.artifactKind,
                   backupId: input.backupId,
                   installationId: kilnInstallationId(),
                   objectPrefix: storage.object_prefix,

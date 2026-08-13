@@ -15,6 +15,11 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
 import { NodeHttpHandler } from "@smithy/node-http-handler"
 import { Effect, Result } from "effect"
 
+import {
+  backupArtifactFilename,
+  type BackupArtifactKind,
+} from "@workspace/contracts"
+
 import { BackupStorageError } from "@/effect/errors"
 
 const CONNECTION_TEST_PREFIX = "kiln/connection-tests"
@@ -124,6 +129,7 @@ export function normalizeObjectPrefix(value: string): string {
 }
 
 export function backupObjectKey(input: {
+  artifactKind: BackupArtifactKind
   backupId: string
   installationId: string
   objectPrefix: string
@@ -139,7 +145,7 @@ export function backupObjectKey(input: {
     input.targetKind,
     objectKeySegment(input.targetId),
     objectKeySegment(input.backupId),
-    `${objectKeySegment(input.backupId)}.zip`,
+    backupArtifactFilename(input.backupId, input.artifactKind),
   ]
     .filter(Boolean)
     .join("/")

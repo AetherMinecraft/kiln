@@ -347,3 +347,16 @@ export type BackupTaskKind = z.infer<typeof backupTaskKindSchema>
 export type BackupTaskResult = z.infer<typeof backupTaskResultSchema>
 export type BackupTaskStatus = z.infer<typeof backupTaskStatusSchema>
 export type RelayBackupTask = z.infer<typeof relayBackupTaskSchema>
+
+const BACKUP_ARTIFACT_EXTENSIONS = {
+  archive: "zip",
+  database_dump: "dmp.gz",
+  platform_bundle: "kiln",
+} as const satisfies Record<BackupArtifactKind, string>
+
+export function backupArtifactFilename(
+  backupId: string,
+  artifactKind: BackupArtifactKind
+): string {
+  return `backup-${backupId.slice(0, 8)}.${BACKUP_ARTIFACT_EXTENSIONS[artifactKind]}`
+}

@@ -155,7 +155,15 @@ describe("Relay backups", () => {
               progress
             )
           )
-          const archivePath = resolve(directory, "backups", result.filename)
+          assert.strictEqual(
+            result.filename,
+            `backup-${input.backupId.slice(0, 8)}.zip`
+          )
+          const archivePath = resolve(
+            directory,
+            "backups",
+            `${input.backupId}.zip`
+          )
           const archive = yield* Effect.promise(() => readFile(archivePath))
           assert.strictEqual(result.bytes, archive.byteLength)
           assert.strictEqual(

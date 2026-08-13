@@ -17,20 +17,21 @@ import {
   stat,
   statfs,
 } from "node:fs/promises"
-import { basename, relative, resolve, sep } from "node:path"
+import { relative, resolve, sep } from "node:path"
 import { isIP } from "node:net"
 import { constants as zlibConstants } from "node:zlib"
 import { Effect, Fiber, Queue, Result } from "effect"
 import { minimatch } from "minimatch"
 import ZipStream from "zip-stream"
 
-import type {
-  BackupArchiveManifest,
-  BackupCreateTaskInput,
-  BackupCreateTaskResult,
-  BackupDeleteTaskInput,
-  BackupTaskInput,
-  RelayBackupTask,
+import {
+  backupArtifactFilename,
+  type BackupArchiveManifest,
+  type BackupCreateTaskInput,
+  type BackupCreateTaskResult,
+  type BackupDeleteTaskInput,
+  type BackupTaskInput,
+  type RelayBackupTask,
 } from "@workspace/contracts"
 
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
@@ -652,7 +653,7 @@ export async function createPortableInstanceBackup(
           return {
             bytes: written.bytes,
             checksumSha256: written.checksumSha256,
-            filename: basename(destination),
+            filename: backupArtifactFilename(input.backupId, "archive"),
             warnings: warnings.slice(0, 1_000),
           } satisfies BackupCreateTaskResult
         },

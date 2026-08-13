@@ -7,10 +7,11 @@ import { pipeline } from "node:stream/promises"
 import { createGunzip, createGzip } from "node:zlib"
 import { Effect, Result } from "effect"
 
-import type {
-  BackupCreateTaskInput,
-  BackupCreateTaskResult,
-  RelayManagedDatabase,
+import {
+  backupArtifactFilename,
+  type BackupCreateTaskInput,
+  type BackupCreateTaskResult,
+  type RelayManagedDatabase,
 } from "@workspace/contracts"
 
 import type { DatabaseDriver } from "./databases.js"
@@ -68,7 +69,7 @@ export async function createCompressedDatabaseBackup(
   return {
     bytes: metadata.size,
     checksumSha256: digest.digest("hex"),
-    filename: `${safeFileName(database.name)}-${new Date().toISOString().slice(0, 10)}.dmp.gz`,
+    filename: backupArtifactFilename(input.backupId, "database_dump"),
     warnings: [],
   }
 }
@@ -207,11 +208,3 @@ function byteMeter(
   })
 }
 
-function safeFileName(name: string): string {
-  return (
-    name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/gu, "-")
-      .replace(/^-+|-+$/gu, "") || "database"
-  )
-}
