@@ -2,7 +2,7 @@ import { spawn } from "node:child_process"
 import { existsSync, realpathSync } from "node:fs"
 import { basename, dirname, join, parse, resolve } from "node:path"
 
-import { Effect } from "effect"
+import { Effect, Result } from "effect"
 
 import { commandError } from "./errors.js"
 import { writeLine } from "./output.js"
@@ -76,19 +76,15 @@ export const updateCliEffect = Effect.fn("cli.update")(function* (
 export function detectCliPackageManager(
   options: CliPackageManagerDetection = {}
 ): CliPackageManager {
-  try {
-    const entrypointPath =
-      options.entrypointPath ?? process.argv[1] ?? process.execPath
-    const environment = options.environment ?? process.env
-    const filesystem = options.filesystem ?? nodeFileSystem
-    const packageRoot = dirname(resolve(entrypointPath))
+  const entrypointPath =
+    options.entrypointPath ?? process.argv[1] ?? process.execPath
+  const environment = options.environment ?? process.env
+  const filesystem = options.filesystem ?? nodeFileSystem
+  const packageRoot = dirname(resolve(entrypointPath))
 
-    if (isPnpmManagedInstall(packageRoot, filesystem)) return "pnpm"
-    if (isBunManagedInstall(entrypointPath, environment)) return "bun"
-    return "npm"
-  } catch {
-    return "npm"
-  }
+  if (isPnpmManagedInstall(packageRoot, filesystem)) return "pnpm"
+  if (isBunManagedInstall(entrypointPath, environment)) return "bun"
+  return "npm"
 }
 
 export function cliUpdateCommand(
@@ -127,11 +123,9 @@ function updateArguments(
 function detectPackageManagerOrNpm(
   detectPackageManager: () => CliPackageManager
 ): CliPackageManager {
-  try {
-    return detectPackageManager()
-  } catch {
-    return "npm"
-  }
+  return Result.try(detectPackageManager).pipe(
+    Result.getOrElse((): CliPackageManager => "npm")
+  )
 }
 
 function isPnpmManagedInstall(
@@ -167,11 +161,9 @@ function ancestorOwnsPnpmPackage(
 }
 
 function canonicalPath(path: string, filesystem: DetectionFileSystem): string {
-  try {
-    return resolve(filesystem.realpath(path))
-  } catch {
-    return resolve(path)
-  }
+  return Result.try(() => resolve(filesystem.realpath(path))).pipe(
+    Result.getOrElse(() => resolve(path))
+  )
 }
 
 function isBunManagedInstall(
