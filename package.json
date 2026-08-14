@@ -27,8 +27,6 @@
     "doctor": "npx react-doctor@latest"
   },
   "devDependencies": {
-    "playwright-core": "1.55.0",
-    "react-doctor": "^0.8.1",
     "typescript": "^6",
     "vite": "catalog:",
     "vite-plus": "catalog:"
