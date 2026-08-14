@@ -348,12 +348,10 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
 
     if (hearth) {
       if (failures.length === 0) dismissToast(systemUpdateToastId)
-      onOpenChange(false)
       setHearthCompletion(hearth)
     }
   }, [
     active.length,
-    onOpenChange,
     onRetryTarget,
     open,
     reconnecting,
@@ -543,7 +541,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
           const hearth = updates.find((update) => update.component === "hearth")
           if (hearth) {
             dismissToast(systemUpdateToastId)
-            onOpenChange(false)
             setHearthCompletion({
               version: latestVersion,
               versionName: latestVersionName,
@@ -560,7 +557,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       clearMockTimers,
       heldHearthUpdate,
       mockActive.length,
-      onOpenChange,
       updateMutation.isPending,
     ]
   )
@@ -813,7 +809,7 @@ const ActiveUpdatesFallback = React.memo(function ActiveUpdatesFallback({
       <section className="overflow-hidden rounded-xl border bg-card/45">
         {active.map((update) => (
           <div
-            className="flex h-24 items-center gap-3 border-b px-4 last:border-b-0"
+            className="flex h-20 items-center gap-3 border-b px-4 last:border-b-0"
             key={update.operationId}
           >
             <span className="grid size-9 shrink-0 place-items-center rounded-lg border bg-background/55 text-primary">
@@ -821,7 +817,7 @@ const ActiveUpdatesFallback = React.memo(function ActiveUpdatesFallback({
             </span>
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-semibold">{update.name}</p>
-              <div className="mt-3 h-4">
+              <div className="mt-2 h-4">
                 <UpdateProgressBar phase={update.phase} />
               </div>
             </div>
@@ -1179,7 +1175,7 @@ const UpdateStatusCallout = React.memo(function UpdateStatusCallout({
 }) {
   return (
     <span
-      className={`inline-flex h-5 w-[6.75rem] items-center justify-center rounded-[3px] border px-2 font-mono text-[0.5rem] font-semibold tracking-[0.08em] uppercase ${status.tone}`}
+      className={`inline-flex h-5 w-32 shrink-0 items-center justify-center rounded-[3px] border px-2 font-mono text-[0.5rem] leading-none font-semibold tracking-[0.06em] whitespace-nowrap uppercase ${status.tone}`}
     >
       {status.label}
     </span>
@@ -1217,7 +1213,7 @@ const UpdateTargetRow = React.memo(function UpdateTargetRow({
   return (
     <div
       ref={rowRef}
-      className={`grid gap-3 px-4 py-4 transition-colors sm:h-28 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center ${
+      className={`grid gap-3 px-4 py-3 transition-colors sm:h-20 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center ${
         focused
           ? "bg-amber-400/[0.055] ring-1 ring-amber-400/20 ring-inset"
           : ""
@@ -1238,8 +1234,10 @@ const UpdateTargetRow = React.memo(function UpdateTargetRow({
           )}
         </span>
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 className="truncate text-sm font-semibold">{target.name}</h3>
+          <div className="flex h-5 min-w-0 items-center gap-2 overflow-hidden">
+            <h3 className="min-w-0 truncate text-sm font-semibold">
+              {target.name}
+            </h3>
             {currentRelease ? (
               <>
                 <span
@@ -1249,7 +1247,7 @@ const UpdateTargetRow = React.memo(function UpdateTargetRow({
                   ·
                 </span>
                 <GitHubVersionLink href={currentRelease.url}>
-                  <span className="block truncate text-sm font-semibold text-foreground">
+                  <span className="block max-w-56 truncate text-sm font-semibold text-foreground">
                     {currentRelease.name}
                   </span>
                 </GitHubVersionLink>
@@ -1257,22 +1255,17 @@ const UpdateTargetRow = React.memo(function UpdateTargetRow({
             ) : null}
             <UpdateStatusCallout status={status} />
           </div>
-          <div className="mt-1.5">
-            <OverviewVersionLink
-              currentVersion={target.currentVersion}
-              latestVersion={latestVersion}
-              releases={releases}
-            />
-          </div>
           <div className="mt-2 h-4 overflow-hidden" aria-live="polite">
             {updating ? (
               <UpdateProgressBar phase={activeUpdate?.phase} />
-            ) : !target.eligible && target.reason ? (
-              <p className="flex min-w-0 items-center gap-1.5 truncate text-[0.625rem] leading-4 text-muted-foreground">
-                <WifiOff className="size-3 shrink-0" />
-                <span className="truncate">{target.reason}</span>
-              </p>
-            ) : null}
+            ) : (
+              <OverviewVersionLink
+                currentVersion={target.currentVersion}
+                latestVersion={latestVersion}
+                reason={!target.eligible ? target.reason : null}
+                releases={releases}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -1341,11 +1334,11 @@ const UpdateProgressBar = React.memo(function UpdateProgressBar({
         aria-valuemax={100}
         aria-valuemin={0}
         aria-valuenow={progress.percent}
-        className="h-1.5 min-w-24 flex-1 overflow-hidden rounded-full bg-muted/70"
+        className="h-1.5 min-w-24 flex-1 overflow-hidden bg-muted/70"
         role="progressbar"
       >
         <div
-          className="h-full rounded-full bg-primary transition-[width] duration-500"
+          className="h-full bg-primary transition-[width] duration-500"
           style={{ width: `${progress.percent}%` }}
         />
       </div>
@@ -1359,44 +1352,54 @@ const UpdateProgressBar = React.memo(function UpdateProgressBar({
 const OverviewVersionLink = React.memo(function OverviewVersionLink({
   currentVersion,
   latestVersion,
+  reason,
   releases,
 }: {
   currentVersion: string | null
   latestVersion: string
+  reason: string | null
   releases: ReadonlyArray<PublicKilnRelease>
 }) {
   const currentRelease = findKilnRelease(releases, currentVersion)
-  if (currentRelease) {
-    return (
-      <GitHubVersionLink href={currentRelease.url}>
-        <span className="block font-mono text-[0.5625rem] text-muted-foreground">
-          {currentRelease.tag}
-        </span>
-      </GitHubVersionLink>
-    )
-  }
-
-  if (isKilnReleaseVersion(currentVersion)) {
-    return (
-      <GitHubVersionLink href={githubReleaseUrl(currentVersion)}>
-        <span className="block font-mono text-[0.5625rem] text-muted-foreground">
-          v{currentVersion}
-        </span>
-      </GitHubVersionLink>
-    )
-  }
-
   const latestRelease = findKilnRelease(releases, latestVersion)
   return (
-    <div className="text-[0.625rem] text-muted-foreground">
-      <span className="block">{displayVersion(currentVersion)}</span>
-      <GitHubVersionLink
-        href={latestRelease?.url ?? githubReleaseUrl(latestVersion)}
-      >
-        <span className="mt-0.5 block font-mono text-[0.5625rem]">
-          Latest: v{latestVersion}
-        </span>
-      </GitHubVersionLink>
+    <div className="flex min-w-0 items-center gap-1.5 overflow-hidden text-[0.625rem] leading-4 whitespace-nowrap text-muted-foreground">
+      {currentRelease ? (
+        <GitHubVersionLink href={currentRelease.url}>
+          <span className="block max-w-56 truncate font-mono text-[0.5625rem]">
+            {currentRelease.tag}
+          </span>
+        </GitHubVersionLink>
+      ) : isKilnReleaseVersion(currentVersion) ? (
+        <GitHubVersionLink href={githubReleaseUrl(currentVersion)}>
+          <span className="block max-w-56 truncate font-mono text-[0.5625rem]">
+            v{currentVersion}
+          </span>
+        </GitHubVersionLink>
+      ) : (
+        <>
+          <span className="shrink-0">{displayVersion(currentVersion)}</span>
+          <span aria-hidden="true">·</span>
+          <GitHubVersionLink
+            href={latestRelease?.url ?? githubReleaseUrl(latestVersion)}
+          >
+            <span className="block max-w-56 truncate font-mono text-[0.5625rem]">
+              Latest: v{latestVersion}
+            </span>
+          </GitHubVersionLink>
+        </>
+      )}
+      {reason ? (
+        <>
+          <span aria-hidden="true" className="shrink-0">
+            ·
+          </span>
+          <span className="flex min-w-0 items-center gap-1.5">
+            <WifiOff className="size-3 shrink-0" />
+            <span className="truncate">{reason}</span>
+          </span>
+        </>
+      ) : null}
     </div>
   )
 })
@@ -1926,7 +1929,6 @@ function showSystemUpdateProgressToast(
     id: systemUpdateToastId,
     description: reconnecting ? "Reconnecting…" : undefined,
     duration: Infinity,
-    icon: <LoaderCircle className="size-4 animate-spin text-primary" />,
     closeButton: false,
     dismissible: false,
     action: onOpen ? { label: "View updates", onClick: onOpen } : undefined,
