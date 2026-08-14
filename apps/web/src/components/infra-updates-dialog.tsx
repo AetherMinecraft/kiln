@@ -133,6 +133,10 @@ const githubIssuesUrl = "https://github.com/kiln-site/hearth/issues/new/choose"
 const githubReleasesUrl = `${githubRepositoryUrl}/releases`
 const systemUpdateToastId = "system-update"
 const minimumUpdateCheckDuration = 750
+const completedUpdateDisplayDuration = 1_500
+const mockRelayPhaseDuration = 325
+const mockHearthPhaseDuration = 850
+const mockHearthDialogDelay = 1_800
 const releaseDateFormatter = new Intl.DateTimeFormat("en-US", {
   dateStyle: "medium",
   timeZone: "UTC",
@@ -191,6 +195,8 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
   const completedOperations = React.useRef(new Set<string>())
   const reconnectingOperations = React.useRef(new Set<string>())
   const mockTimers = React.useRef<Array<number>>([])
+  const completedUpdateTimers = React.useRef(new Set<number>())
+  const completedUpdatesRef = React.useRef<ReadonlyArray<ActiveUpdate>>([])
   const heldHearthUpdateRef = React.useRef<ActiveUpdate | null>(null)
   const mockActiveRef = React.useRef<ReadonlyArray<ActiveUpdate>>([])
   const preparingUpdatesRef = React.useRef<ReadonlyArray<ActiveUpdate>>([])
@@ -206,6 +212,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       ...activeRef.current,
       ...(heldHearthUpdateRef.current ? [heldHearthUpdateRef.current] : []),
       ...mockActiveRef.current,
+      ...completedUpdatesRef.current,
       ...preparingUpdatesRef.current,
     ])
   }, [activityStore])
@@ -218,6 +225,39 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       setActive(stored)
     },
     [publishDisplayedActive]
+  )
+
+  const holdCompletedUpdate = React.useCallback(
+    (update: ActiveUpdate) => {
+      activityStore.setPhase(update.operationId, "completed")
+      completedUpdatesRef.current = [
+        ...completedUpdatesRef.current.filter(
+          (completed) => completed.operationId !== update.operationId
+        ),
+        { ...update, phase: "completed" },
+      ]
+      publishDisplayedActive()
+
+      const timer = window.setTimeout(() => {
+        completedUpdatesRef.current = completedUpdatesRef.current.filter(
+          (completed) => completed.operationId !== update.operationId
+        )
+        completedUpdateTimers.current.delete(timer)
+        publishDisplayedActive()
+      }, completedUpdateDisplayDuration)
+      completedUpdateTimers.current.add(timer)
+    },
+    [activityStore, publishDisplayedActive]
+  )
+
+  React.useEffect(
+    () => () => {
+      for (const timer of completedUpdateTimers.current) {
+        window.clearTimeout(timer)
+      }
+      completedUpdateTimers.current.clear()
+    },
+    []
   )
 
   React.useEffect(() => {
@@ -337,12 +377,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       if (completedOperations.current.has(completed.operationId)) return
       completedOperations.current.add(completed.operationId)
 
-      replaceActive(
-        activeRef.current.filter(
-          (item) => item.operationId !== completed.operationId
-        )
+      const remainingActive = activeRef.current.filter(
+        (item) => item.operationId !== completed.operationId
       )
       if (operation === null || operation === undefined) {
+        replaceActive(remainingActive)
         const disposition = systemUpdateCompletionDisposition(
           completed.component,
           "failed"
@@ -357,6 +396,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       }
 
       if (operation.status === "failed") {
+        replaceActive(remainingActive)
         const disposition = systemUpdateCompletionDisposition(
           completed.component,
           "failed"
@@ -375,7 +415,9 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         completed.component,
         "succeeded"
       )
-      if (disposition.clearPresence) clearSystemUpdateActive(completed)
+      const lockUntilReload =
+        disposition.lockUntilReload && isViewedHearthUpdate(completed)
+      if (!lockUntilReload) clearSystemUpdateActive(completed)
       resetUpdateFailureCount(completed.targetKey)
       const completedVersion = completed.targetVersion ?? operation.version
       storeChangelogRange(
@@ -388,7 +430,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
         queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
       ])
-      if (disposition.lockUntilReload) {
+      if (lockUntilReload) {
         const completion = {
           version: completedVersion,
           versionName:
@@ -405,9 +447,23 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
           }
           publishDisplayedActive()
         }
+      } else {
+        holdCompletedUpdate({
+          ...completed,
+          targetVersion: completedVersion,
+          versionName:
+            completed.versionName ?? friendlyVersionName(completedVersion),
+        })
       }
+      replaceActive(remainingActive)
     },
-    [activityStore, publishDisplayedActive, queryClient, replaceActive]
+    [
+      activityStore,
+      holdCompletedUpdate,
+      publishDisplayedActive,
+      queryClient,
+      replaceActive,
+    ]
   )
 
   React.useEffect(() => {
@@ -525,61 +581,93 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       mockActiveRef.current = updates
       publishDisplayedActive()
       showSystemUpdateProgressToast(latestVersionName, false)
-      phases.forEach((phase, index) => {
-        const timer = window.setTimeout(
-          () => {
-            for (const [targetIndex, update] of updates.entries()) {
+      const viewedHearth = updates.find(isViewedHearthUpdate)
+      const toastTimelineUpdate = viewedHearth ?? updates[0]
+      for (const update of updates) {
+        const phaseDuration = isViewedHearthUpdate(update)
+          ? mockHearthPhaseDuration
+          : mockRelayPhaseDuration
+        phases.forEach((phase, index) => {
+          const timer = window.setTimeout(
+            () => {
+              const completed = index === phases.length - 1
               activityStore.setPhase(
                 update.operationId,
-                phase === "replace.removeBackup" &&
-                  update.component === "hearth"
-                  ? "awaitingReload"
-                  : targetIndex === 0 || index > 1
-                    ? phase
-                    : (phases[Math.max(0, index - 1)] ?? phase)
+                completed
+                  ? isViewedHearthUpdate(update)
+                    ? "awaitingReload"
+                    : "completed"
+                  : phase
               )
-            }
-            if (
-              phase === "reconnecting" ||
-              phases[index - 1] === "reconnecting"
-            ) {
-              showSystemUpdateProgressToast(
-                latestVersionName,
-                phase === "reconnecting"
-              )
-            }
-            if (phase === "replace.removeBackup") {
-              const hearthUpdates = updates.filter(
-                (update) => update.component === "hearth"
-              )
-              mockActiveRef.current = hearthUpdates
-              publishDisplayedActive()
-              if (hearthUpdates.length === 0) {
-                showSystemUpdateSuccessToast(latestVersionName)
+              if (
+                update.operationId === toastTimelineUpdate?.operationId &&
+                (phase === "reconnecting" ||
+                  phases[index - 1] === "reconnecting")
+              ) {
+                showSystemUpdateProgressToast(
+                  latestVersionName,
+                  phase === "reconnecting"
+                )
               }
-            }
-          },
-          650 * (index + 1)
+            },
+            phaseDuration * (index + 1)
+          )
+          mockTimers.current.push(timer)
+        })
+
+        if (!isViewedHearthUpdate(update)) {
+          const releaseTimer = window.setTimeout(
+            () => {
+              mockActiveRef.current = mockActiveRef.current.filter(
+                (activeUpdate) =>
+                  activeUpdate.operationId !== update.operationId
+              )
+              publishDisplayedActive()
+            },
+            phaseDuration * phases.length + completedUpdateDisplayDuration
+          )
+          mockTimers.current.push(releaseTimer)
+        }
+      }
+
+      const longestUpdateDuration = Math.max(
+        ...updates.map(
+          (update) =>
+            (isViewedHearthUpdate(update)
+              ? mockHearthPhaseDuration
+              : mockRelayPhaseDuration) * phases.length
         )
-        mockTimers.current.push(timer)
-      })
+      )
       const completionTimer = window.setTimeout(
         () => {
-          const hearth = updates.find((update) => update.component === "hearth")
-          mockActiveRef.current = hearth ? [hearth] : []
-          publishDisplayedActive()
-          mockTimers.current = []
-          if (hearth) {
+          if (viewedHearth) {
             dismissToast(systemUpdateToastId)
             setHearthCompletion({
               version: latestVersion,
               versionName: latestVersionName,
             })
+          } else {
+            showSystemUpdateSuccessToast(latestVersionName)
           }
         },
-        650 * (phases.length + 4)
+        viewedHearth
+          ? mockHearthPhaseDuration * phases.length + mockHearthDialogDelay
+          : longestUpdateDuration
       )
       mockTimers.current.push(completionTimer)
+
+      const cleanupTimer = window.setTimeout(
+        () => {
+          mockTimers.current = []
+        },
+        Math.max(
+          longestUpdateDuration + completedUpdateDisplayDuration,
+          viewedHearth
+            ? mockHearthPhaseDuration * phases.length + mockHearthDialogDelay
+            : 0
+        ) + 50
+      )
+      mockTimers.current.push(cleanupTimer)
     },
     [activityStore, clearMockTimers, publishDisplayedActive]
   )
@@ -1625,7 +1713,7 @@ const UpdateProgressBar = React.memo(function UpdateProgressBar({
   )
   const phase = React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
   const progress = systemUpdateProgress(phase, phase === "reconnecting")
-  const completed = phase === "awaitingReload"
+  const completed = phase === "awaitingReload" || phase === "completed"
   return (
     <div className="flex max-w-md items-center gap-2 [contain:layout_paint_style]">
       <div
@@ -1637,7 +1725,7 @@ const UpdateProgressBar = React.memo(function UpdateProgressBar({
         role="progressbar"
       >
         <div
-          className={`h-full transition-[width] duration-500 ${completed ? "bg-emerald-400" : "bg-primary"}`}
+          className="h-full bg-primary transition-[width] duration-500"
           style={{ width: `${progress.percent}%` }}
         />
       </div>
@@ -2139,6 +2227,12 @@ function updateTargets(overview: UpdateOverview): Array<UpdateTarget> {
       })
     ),
   ]
+}
+
+function isViewedHearthUpdate(
+  update: Pick<ActiveUpdate, "component" | "targetKey">
+): boolean {
+  return update.component === "hearth" && update.targetKey === "hearth"
 }
 
 async function startUpdates(

@@ -37,4 +37,11 @@ describe("system update progress", () => {
       percent: 100,
     })
   })
+
+  it("briefly marks other completed targets as updated", () => {
+    expect(systemUpdateProgress("completed", false)).toEqual({
+      label: "Updated",
+      percent: 100,
+    })
+  })
 })
