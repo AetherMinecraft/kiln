@@ -4,16 +4,11 @@ import { useRouter, useRouterState } from "@tanstack/react-router"
 
 import { InfraUpdatesDialog } from "@/components/infra-updates-dialog"
 import { accessCapabilitiesQueryOptions } from "@/lib/query-options"
-import {
-  consumeUpdateDialogResume,
-  type UpdateDialogResume,
-} from "@/lib/system-update-dialog-resume"
 
 type InfraUpdateDialogState = {
   open: boolean
   relayId: string | null
   requestId: number
-  resume: UpdateDialogResume | null
 }
 
 export interface InfraUpdateDialogStore {
@@ -21,7 +16,6 @@ export interface InfraUpdateDialogStore {
   getServerSnapshot: () => InfraUpdateDialogState
   getSnapshot: () => InfraUpdateDialogState
   open: (relayId?: string) => void
-  restore: (resume: UpdateDialogResume) => void
   subscribe: (listener: () => void) => () => void
 }
 
@@ -29,7 +23,6 @@ const closedUpdateDialogState: InfraUpdateDialogState = {
   open: false,
   relayId: null,
   requestId: 0,
-  resume: null,
 }
 
 const InfraUpdateDialogContext =
@@ -50,7 +43,6 @@ function createInfraUpdateDialogStore(): InfraUpdateDialogStore {
         open: false,
         relayId: null,
         requestId: state.requestId,
-        resume: null,
       }),
     getServerSnapshot: () => closedUpdateDialogState,
     getSnapshot: () => state,
@@ -59,16 +51,6 @@ function createInfraUpdateDialogStore(): InfraUpdateDialogStore {
         open: true,
         relayId: relayId ?? null,
         requestId: state.requestId + 1,
-        resume: null,
-      }),
-    restore: (resume) =>
-      publish({
-        open: true,
-        relayId: resume.targetKey.startsWith("relay:")
-          ? resume.targetKey.slice("relay:".length)
-          : null,
-        requestId: state.requestId + 1,
-        resume,
       }),
     subscribe: (listener) => {
       listeners.add(listener)
@@ -101,11 +83,6 @@ export const InfraUpdateDialogProvider = React.memo(
     React.useEffect(() => {
       if (awayFromInfrastructure && store.getSnapshot().open) store.close()
     }, [awayFromInfrastructure, store])
-
-    React.useEffect(() => {
-      const resume = consumeUpdateDialogResume()
-      if (resume) store.restore(resume)
-    }, [store])
 
     return (
       <InfraUpdateDialogContext.Provider value={store}>
@@ -162,7 +139,6 @@ const PlatformAdminInfraUpdatesDialogHost = React.memo(
         initialRelayId={state.relayId}
         open={state.open}
         requestId={state.requestId}
-        resume={state.resume}
         onRetryTarget={returnToUpdater}
         onOpenChange={handleOpenChange}
       />

@@ -185,6 +185,39 @@ describe("container replacement", () => {
       })
   )
 
+  effectIt.effect("reports replacement phases in execution order", () =>
+    Effect.gen(function* () {
+      const phases: Array<string> = []
+
+      yield* replaceContainerEffect(
+        {
+          backupName: "hearth-backup",
+          targetContainer: "hearth",
+          targetImage: `ghcr.io/kiln-site/hearth@sha256:${"c".repeat(64)}`,
+          targetReference: "ghcr.io/kiln-site/hearth:latest-nightly",
+          targetVersion: "0.1.0-nightly.2",
+        },
+        new FakeDocker(),
+        (phase) =>
+          Effect.sync(() => {
+            phases.push(phase)
+          })
+      )
+
+      expect(phases).toEqual([
+        "replace.inspectContainer",
+        "replace.tagTarget",
+        "replace.stopCurrent",
+        "replace.renameCurrent",
+        "replace.createTarget",
+        "replace.connectNetwork",
+        "replace.startTarget",
+        "replace.waitUntilHealthy",
+        "replace.removeBackup",
+      ])
+    })
+  )
+
   effectIt.effect("preserves an explicitly configured hostname", () =>
     Effect.gen(function* () {
       const docker = new FakeDocker({

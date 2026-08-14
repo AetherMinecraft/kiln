@@ -112,6 +112,7 @@ export function replaceContainerEffect(
       yield* updateOperation("replace.stopCurrent", () =>
         docker.command(["stop", "--time", "30", input.targetContainer], 45_000)
       )
+      if (onPhase) yield* onPhase("replace.renameCurrent")
       yield* updateOperation("replace.renameCurrent", () =>
         docker.command(["rename", input.targetContainer, input.backupName])
       )
@@ -158,6 +159,9 @@ export function replaceContainerEffect(
       )
       replacementCreated = true
 
+      if (networkNames.length > 1 && onPhase) {
+        yield* onPhase("replace.connectNetwork")
+      }
       yield* Effect.forEach(
         networkNames.filter((network) => network !== primaryNetwork),
         (network) => {
