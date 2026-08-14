@@ -67,6 +67,7 @@ export interface UpdateOperation {
   batchId?: string
   component: KilnComponent
   error: string | null
+  phase?: string
   finishedAt: string | null
   id: string
   previousImage: string
@@ -458,6 +459,7 @@ const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
       batchId,
       component: targetComponent,
       error: null,
+      phase: "Preparing",
       finishedAt: null,
       id: randomUUID(),
       previousImage: container.Config.Image,
@@ -1225,6 +1227,7 @@ function isUpdateOperation(value: unknown): value is UpdateOperation {
     optionalString(value.batchId) &&
     (value.component === "hearth" || value.component === "relay") &&
     (value.error === null || typeof value.error === "string") &&
+    optionalString(value.phase) &&
     (value.finishedAt === null || typeof value.finishedAt === "string") &&
     typeof value.id === "string" &&
     typeof value.previousImage === "string" &&

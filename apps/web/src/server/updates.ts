@@ -43,6 +43,7 @@ const updateOperationSchema = z.object({
   error: z.string().nullable(),
   finishedAt: z.string().nullable(),
   id: z.uuid(),
+  phase: z.string().optional(),
   previousImage: z.string(),
   requestedImage: z.string(),
   startedAt: z.string(),
