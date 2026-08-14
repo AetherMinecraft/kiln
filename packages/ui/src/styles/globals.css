@@ -205,9 +205,10 @@
 }
 
 /*
- * Large displays scale the root rem. That grows type and rem-based chrome
- * together, the same way browser zoom does, so rows and the sidebar stay
- * in proportion with the text. Mobile stays at 16px.
+ * Large displays scale the root rem so type and rem-based controls grow
+ * together, the same way browser zoom does. Fixed-pixel layout primitives,
+ * including sidebar widths and collapsed controls, remain stable. Mobile
+ * stays at 16px.
  */
 html {
   --type-viewport-scale: 1;
@@ -220,14 +221,9 @@ html {
     --type-viewport-scale: 1.0625;
   }
 }
-@media (min-width: 1440px) {
-  html {
-    --type-viewport-scale: 1.125;
-  }
-}
 @media (min-width: 1920px) {
   html {
-    --type-viewport-scale: 1.1875;
+    --type-viewport-scale: 1.125;
   }
 }
 @media (min-width: 2560px) {
