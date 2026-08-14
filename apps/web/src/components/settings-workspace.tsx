@@ -489,15 +489,6 @@ function InstanceUsersCard({
     setTransferTarget(null)
     transferMutation.reset()
   }
-  const directlyListedUserIds = React.useMemo(
-    () =>
-      new Set([
-        ...(usersQuery.data?.owner?.id ? [usersQuery.data.owner.id] : []),
-        ...(usersQuery.data?.users.map((user) => user.userId) ?? []),
-      ]),
-    [usersQuery.data?.owner?.id, usersQuery.data?.users]
-  )
-
   return (
     <InfoCard className="flex h-[26rem] flex-col lg:h-full lg:min-h-[32rem]">
       <InfoCardHeader
@@ -545,9 +536,6 @@ function InstanceUsersCard({
                 userId={usersQuery.data.owner?.id ?? null}
                 instanceId={instance.id}
                 canManage={usersQuery.data.canManage}
-                platformAdministrator={
-                  usersQuery.data.owner?.platformAdministrator
-                }
                 onPermissions={() =>
                   setPermissionsUser(
                     usersQuery.data.owner?.email ?? "Unknown owner"
@@ -563,31 +551,11 @@ function InstanceUsersCard({
                   instanceId={instance.id}
                   canManage={usersQuery.data.canManage}
                   canTransferOwnership={usersQuery.data.canTransferOwnership}
-                  platformAdministrator={user.platformAdministrator}
                   onPermissions={() => setPermissionsUser(user.email)}
                   onRemove={() => setRemoveTarget(user)}
                   onTransferOwnership={() => setTransferTarget(user)}
                   protectedOwnerGrant={user.role === "owner"}
                   relayAccess={user.resourceType === "relay"}
-                />
-              ))}
-              {usersQuery.data.platformAdministrators.length > 0 ? (
-                <tr aria-hidden="true">
-                  <td
-                    colSpan={2}
-                    className="h-1.5 border-y border-primary/15 bg-primary/5 p-0"
-                  />
-                </tr>
-              ) : null}
-              {usersQuery.data.platformAdministrators.map((administrator) => (
-                <AccessUserRow
-                  key={`platform:${administrator.id}`}
-                  email={administrator.email}
-                  userId={administrator.id}
-                  instanceId={instance.id}
-                  implicitAdministrator
-                  platformAdministrator
-                  directlyListed={directlyListedUserIds.has(administrator.id)}
                 />
               ))}
             </tbody>
@@ -726,9 +694,6 @@ function AccessUserRow({
   email,
   instanceId,
   owner = false,
-  platformAdministrator = false,
-  implicitAdministrator = false,
-  directlyListed = false,
   onPermissions,
   onRemove,
   onTransferOwnership,
@@ -741,9 +706,6 @@ function AccessUserRow({
   email: string
   instanceId: string
   owner?: boolean
-  platformAdministrator?: boolean
-  implicitAdministrator?: boolean
-  directlyListed?: boolean
   onPermissions?: () => void
   onRemove?: () => void
   onTransferOwnership?: () => void
@@ -769,19 +731,6 @@ function AccessUserRow({
             >
               Owner
             </Badge>
-          ) : null}
-          {platformAdministrator ? (
-            <Badge
-              variant="outline"
-              className="border-primary/30 bg-primary/8 font-mono text-[0.5rem] text-primary"
-            >
-              Platform admin
-            </Badge>
-          ) : null}
-          {implicitAdministrator ? (
-            <span className="truncate font-mono text-[0.5rem] text-muted-foreground">
-              {directlyListed ? "Also listed above" : "Implicit access"}
-            </span>
           ) : null}
           {relayAccess ? (
             <Badge
