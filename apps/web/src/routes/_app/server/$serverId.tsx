@@ -1,7 +1,6 @@
 import {
   Outlet,
   createFileRoute,
-  notFound,
   redirect,
 } from "@tanstack/react-router"
 
@@ -32,7 +31,7 @@ export const Route = createFileRoute("/_app/server/$serverId")({
       throw redirectToServerList(params.serverId)
     }
     if (resolution.status === "not-found") {
-      throw notFound({ routeId: "/_app" })
+      throw redirect({ to: "/infra/servers", replace: true })
     }
     const instance = resolution.instance
     const routeIdentifier = relayInstanceRouteIdentifier(
