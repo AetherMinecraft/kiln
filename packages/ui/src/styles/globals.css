@@ -220,14 +220,9 @@ html {
     --type-viewport-scale: 1.0625;
   }
 }
-@media (min-width: 1440px) {
-  html {
-    --type-viewport-scale: 1.125;
-  }
-}
 @media (min-width: 1920px) {
   html {
-    --type-viewport-scale: 1.1875;
+    --type-viewport-scale: 1.125;
   }
 }
 @media (min-width: 2560px) {
