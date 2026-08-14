@@ -1,0 +1,98 @@
+export interface SystemUpdateActivity {
+  name: string
+  operationId: string
+  phase?: string
+  targetKey: string
+}
+
+export interface SystemUpdateActivityStore {
+  getActivitiesSnapshot: () => ReadonlyArray<SystemUpdateActivity>
+  getBusySnapshot: () => boolean
+  getPhaseSnapshot: (operationId: string) => string | undefined
+  getTargetActivitySnapshot: (
+    targetKey: string
+  ) => SystemUpdateActivity | undefined
+  setActivities: (activities: ReadonlyArray<SystemUpdateActivity>) => void
+  setPhase: (operationId: string, phase: string) => void
+  subscribeActivities: (listener: () => void) => () => void
+  subscribePhase: (operationId: string, listener: () => void) => () => void
+  subscribeTargetActivity: (
+    targetKey: string,
+    listener: () => void
+  ) => () => void
+}
+
+export function createSystemUpdateActivityStore(): SystemUpdateActivityStore {
+  let activities: ReadonlyArray<SystemUpdateActivity> = []
+  const phases = new Map<string, string>()
+  const activityListeners = new Set<() => void>()
+  const phaseListeners = new Map<string, Set<() => void>>()
+  const targetListeners = new Map<string, Set<() => void>>()
+
+  const subscribeKeyed = (
+    listeners: Map<string, Set<() => void>>,
+    key: string,
+    listener: () => void
+  ) => {
+    const keyListeners = listeners.get(key) ?? new Set()
+    keyListeners.add(listener)
+    listeners.set(key, keyListeners)
+    return () => {
+      keyListeners.delete(listener)
+      if (keyListeners.size === 0) listeners.delete(key)
+    }
+  }
+
+  return {
+    getActivitiesSnapshot: () => activities,
+    getBusySnapshot: () => activities.length > 0,
+    getPhaseSnapshot: (operationId) => phases.get(operationId),
+    getTargetActivitySnapshot: (targetKey) =>
+      activities.find((activity) => activity.targetKey === targetKey),
+    setActivities: (nextActivities) => {
+      const previousByTarget = new Map(
+        activities.map((activity) => [activity.targetKey, activity])
+      )
+      const nextByTarget = new Map(
+        nextActivities.map((activity) => [activity.targetKey, activity])
+      )
+      if (
+        previousByTarget.size === nextByTarget.size &&
+        [...previousByTarget].every(
+          ([targetKey, activity]) =>
+            nextByTarget.get(targetKey)?.operationId === activity.operationId
+        )
+      ) {
+        return
+      }
+      activities = [...nextActivities]
+      for (const listener of activityListeners) listener()
+      const targetKeys = new Set([
+        ...previousByTarget.keys(),
+        ...nextByTarget.keys(),
+      ])
+      for (const targetKey of targetKeys) {
+        if (
+          previousByTarget.get(targetKey)?.operationId ===
+          nextByTarget.get(targetKey)?.operationId
+        ) {
+          continue
+        }
+        for (const listener of targetListeners.get(targetKey) ?? []) listener()
+      }
+    },
+    setPhase: (operationId, phase) => {
+      if (phases.get(operationId) === phase) return
+      phases.set(operationId, phase)
+      for (const listener of phaseListeners.get(operationId) ?? []) listener()
+    },
+    subscribeActivities: (listener) => {
+      activityListeners.add(listener)
+      return () => activityListeners.delete(listener)
+    },
+    subscribePhase: (operationId, listener) =>
+      subscribeKeyed(phaseListeners, operationId, listener),
+    subscribeTargetActivity: (targetKey, listener) =>
+      subscribeKeyed(targetListeners, targetKey, listener),
+  }
+}

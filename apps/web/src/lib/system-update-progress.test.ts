@@ -33,7 +33,7 @@ describe("system update progress", () => {
 
   it("holds a completed Hearth row until reload", () => {
     expect(systemUpdateProgress("awaitingReload", false)).toEqual({
-      label: "Reload needed",
+      label: "Updated",
       percent: 100,
     })
   })

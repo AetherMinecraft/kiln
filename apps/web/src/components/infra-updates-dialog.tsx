@@ -2,7 +2,6 @@ import * as React from "react"
 import {
   queryOptions,
   useMutation,
-  useQueries,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query"
@@ -51,6 +50,10 @@ import {
   systemUpdateCompletionDisposition,
   type SystemUpdateBatchState,
 } from "@/lib/system-update-batch"
+import {
+  createSystemUpdateActivityStore,
+  type SystemUpdateActivityStore,
+} from "@/lib/system-update-activity-store"
 import { systemUpdateProgress } from "@/lib/system-update-progress"
 import {
   applicationConnectionToastId,
@@ -102,6 +105,13 @@ type UpdateFailure = {
   target: UpdateTarget | ActiveUpdate
 }
 
+type SystemUpdateOperation = Awaited<ReturnType<typeof getSystemUpdateStatus>>
+
+type ActiveUpdatePollerController = {
+  complete: (update: ActiveUpdate, operation: SystemUpdateOperation) => void
+  setReconnecting: (operationId: string, reconnecting: boolean) => void
+}
+
 const inactiveUpdateBatch = inactiveSystemUpdateBatch<
   UpdateFailure,
   HearthUpdateCompletion
@@ -149,6 +159,7 @@ function activeUpdateQueryOptions(active: ActiveUpdate) {
         : 2_000,
     retry: 2,
     retryDelay: 2_000,
+    notifyOnChangeProps: ["data", "isError", "isRefetchError", "isSuccess"],
   })
 }
 
@@ -168,9 +179,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
   const queryClient = useQueryClient()
   const [pending, setPending] = React.useState<PendingUpdate | null>(null)
   const [active, setActive] = React.useState<Array<ActiveUpdate>>([])
-  const [mockActive, setMockActive] = React.useState<Array<ActiveUpdate>>([])
-  const [heldHearthUpdate, setHeldHearthUpdate] =
-    React.useState<ActiveUpdate | null>(null)
+  const [activityStore] = React.useState(createSystemUpdateActivityStore)
   const [hearthCompletion, setHearthCompletion] =
     React.useState<HearthUpdateCompletion | null>(null)
   const [changelogRevision, setChangelogRevision] = React.useState(0)
@@ -180,7 +189,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       inactiveUpdateBatch
     )
   const completedOperations = React.useRef(new Set<string>())
+  const reconnectingOperations = React.useRef(new Set<string>())
   const mockTimers = React.useRef<Array<number>>([])
+  const heldHearthUpdateRef = React.useRef<ActiveUpdate | null>(null)
+  const mockActiveRef = React.useRef<ReadonlyArray<ActiveUpdate>>([])
+  const preparingUpdatesRef = React.useRef<ReadonlyArray<ActiveUpdate>>([])
   const viewStoreRef = React.useRef<UpdateDialogViewStore | null>(null)
   if (viewStoreRef.current === null) {
     viewStoreRef.current = createUpdateDialogViewStore(
@@ -188,14 +201,23 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     )
   }
   const viewStore = viewStoreRef.current
+  const publishDisplayedActive = React.useCallback(() => {
+    activityStore.setActivities([
+      ...activeRef.current,
+      ...(heldHearthUpdateRef.current ? [heldHearthUpdateRef.current] : []),
+      ...mockActiveRef.current,
+      ...preparingUpdatesRef.current,
+    ])
+  }, [activityStore])
   const replaceActive = React.useCallback(
     (next: ReadonlyArray<ActiveUpdate>) => {
       const stored = [...next]
       activeRef.current = stored
       storeActiveUpdates(stored)
+      publishDisplayedActive()
       setActive(stored)
     },
-    []
+    [publishDisplayedActive]
   )
 
   React.useEffect(() => {
@@ -212,7 +234,10 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       return stored ? parseActiveUpdates(JSON.parse(stored) as unknown) : []
     })
     if (Result.isSuccess(restored) && restored.success.length > 0) {
-      for (const update of restored.success) registerUpdatePresence(update)
+      for (const update of restored.success) {
+        activityStore.setPhase(update.operationId, update.phase ?? "Preparing")
+        registerUpdatePresence(update)
+      }
       const versionName =
         restored.success[0]?.versionName ??
         friendlyVersionName(restored.success[0]?.targetVersion ?? null)
@@ -222,14 +247,18 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     } else {
       window.localStorage.removeItem(activeSystemUpdateStorageKey)
     }
-  }, [replaceActive])
+  }, [activityStore, replaceActive])
 
   const registerStartedUpdate = React.useCallback(
     (update: ActiveUpdate) => {
+      activityStore.setPhase(update.operationId, update.phase ?? "Preparing")
+      preparingUpdatesRef.current = preparingUpdatesRef.current.filter(
+        (preparing) => preparing.targetKey !== update.targetKey
+      )
       registerUpdatePresence(update)
       replaceActive([...activeRef.current, update])
     },
-    [replaceActive]
+    [activityStore, replaceActive]
   )
   const updateMutation = useMutation({
     mutationFn: (update: PendingUpdate) =>
@@ -240,6 +269,28 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         registerStartedUpdate
       ),
     onMutate: (update) => {
+      const preparingUpdates = update.targets.flatMap((target) =>
+        isTargetUpdating(activeRef.current, target)
+          ? []
+          : [
+              {
+                component: target.component,
+                name: target.name,
+                operationId: `preparing:${target.key}`,
+                phase: "Preparing",
+                previousVersion: target.currentVersion,
+                relayId: target.relayId ?? "preparing",
+                targetVersion: update.latestVersion,
+                targetKey: target.key,
+                versionName: update.latestVersionName,
+              } satisfies ActiveUpdate,
+            ]
+      )
+      for (const preparing of preparingUpdates) {
+        activityStore.setPhase(preparing.operationId, "Preparing")
+      }
+      preparingUpdatesRef.current = preparingUpdates
+      publishDisplayedActive()
       batch.current = beginSystemUpdateBatch(
         batch.current,
         update.latestVersionName
@@ -257,114 +308,33 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       }
       void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
     },
+    onSettled: () => {
+      preparingUpdatesRef.current = []
+      publishDisplayedActive()
+    },
   })
 
-  const operationQueries = useQueries({
-    queries: active.map(activeUpdateQueryOptions),
-  })
-  const reconnecting = operationQueries.some(
-    (query) => query.isError || query.isRefetchError
-  )
-  const preparingUpdates = React.useMemo(
-    () =>
-      updateMutation.isPending && pending
-        ? pending.targets.flatMap((target) =>
-            isTargetUpdating(active, target)
-              ? []
-              : [
-                  {
-                    component: target.component,
-                    name: target.name,
-                    operationId: `preparing:${target.key}`,
-                    phase: "Preparing",
-                    previousVersion: target.currentVersion,
-                    relayId: target.relayId ?? "preparing",
-                    targetVersion: pending.latestVersion,
-                    targetKey: target.key,
-                    versionName: pending.latestVersionName,
-                  } satisfies ActiveUpdate,
-                ]
-          )
-        : [],
-    [active, pending, updateMutation.isPending]
-  )
-  const displayedActive = React.useMemo(
-    () => [
-      ...active,
-      ...(heldHearthUpdate ? [heldHearthUpdate] : []),
-      ...mockActive,
-      ...preparingUpdates,
-    ],
-    [active, heldHearthUpdate, mockActive, preparingUpdates]
-  )
-
-  React.useEffect(() => {
-    const phases = new Map(
-      operationQueries.flatMap((query, index) => {
-        const phase =
-          query.isError || query.isRefetchError
-            ? "reconnecting"
-            : query.data?.phase
-        const update = active[index]
-        return phase && update ? [[update.operationId, phase] as const] : []
-      })
-    )
-    if (phases.size === 0) return
-    const next = active.map((update) => {
-      const phase = phases.get(update.operationId)
-      return phase && phase !== update.phase ? { ...update, phase } : update
-    })
-    if (next.some((update, index) => update !== active[index])) {
-      replaceActive(next)
-    }
-  }, [active, operationQueries, replaceActive])
-
-  React.useEffect(() => {
-    if (!batch.current.active) return
-    if (activeRef.current.length > 0 || updateMutation.isPending) {
+  const handleOperationReconnectingChange = React.useCallback(
+    (operationId: string, reconnecting: boolean) => {
+      const wasReconnecting = reconnectingOperations.current.size > 0
+      if (reconnecting) reconnectingOperations.current.add(operationId)
+      else reconnectingOperations.current.delete(operationId)
+      const isReconnecting = reconnectingOperations.current.size > 0
+      if (wasReconnecting === isReconnecting) return
+      if (!batch.current.active || activeRef.current.length === 0) return
       showSystemUpdateProgressToast(
         batch.current.versionName ?? "the latest version",
-        reconnecting,
+        isReconnecting,
         open ? undefined : () => onRetryTarget(null)
       )
-      return
-    }
+    },
+    [onRetryTarget, open]
+  )
 
-    const completedBatch = batch.current
-    batch.current = inactiveSystemUpdateBatch<
-      UpdateFailure,
-      HearthUpdateCompletion
-    >()
-    const failures = completedBatch.failures
-    const hearth = completedBatch.hearthCompletion
-
-    if (failures.length > 0) {
-      showSystemUpdateFailureToast(failures, onRetryTarget)
-    } else if (hearth === null) {
-      showSystemUpdateSuccessToast(
-        completedBatch.versionName ?? "the latest version"
-      )
-    }
-
-    if (hearth) {
-      if (failures.length === 0) dismissToast(systemUpdateToastId)
-      setHearthCompletion(hearth)
-    }
-  }, [
-    active.length,
-    onRetryTarget,
-    open,
-    reconnecting,
-    updateMutation.isPending,
-  ])
-
-  React.useEffect(() => {
-    for (const [index, operationQuery] of operationQueries.entries()) {
-      const completed = active[index]
-      if (!completed || !operationQuery.isSuccess) continue
-      const operation = operationQuery.data
-      if (operation?.status === "running") continue
-      if (completedOperations.current.has(completed.operationId)) continue
+  const handleOperationComplete = React.useCallback(
+    (completed: ActiveUpdate, operation: SystemUpdateOperation) => {
+      if (operation?.status === "running") return
+      if (completedOperations.current.has(completed.operationId)) return
       completedOperations.current.add(completed.operationId)
 
       replaceActive(
@@ -383,7 +353,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
           target: completed,
         })
         void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
-        continue
+        return
       }
 
       if (operation.status === "failed") {
@@ -399,7 +369,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
           target: completed,
         })
         void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
-        continue
+        return
       }
       const disposition = systemUpdateCompletionDisposition(
         completed.component,
@@ -426,16 +396,52 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         }
         batch.current = recordHearthUpdateCompletion(batch.current, completion)
         if (isHearthUpdateLocked(batch.current)) {
-          setHeldHearthUpdate({
+          activityStore.setPhase(completed.operationId, "awaitingReload")
+          heldHearthUpdateRef.current = {
             ...completed,
             phase: "awaitingReload",
             targetVersion: completedVersion,
             versionName: completion.versionName,
-          })
+          }
+          publishDisplayedActive()
         }
       }
+    },
+    [activityStore, publishDisplayedActive, queryClient, replaceActive]
+  )
+
+  React.useEffect(() => {
+    if (!batch.current.active) return
+    if (activeRef.current.length > 0 || updateMutation.isPending) {
+      showSystemUpdateProgressToast(
+        batch.current.versionName ?? "the latest version",
+        reconnectingOperations.current.size > 0,
+        open ? undefined : () => onRetryTarget(null)
+      )
+      return
     }
-  }, [active, operationQueries, queryClient, replaceActive])
+
+    const completedBatch = batch.current
+    batch.current = inactiveSystemUpdateBatch<
+      UpdateFailure,
+      HearthUpdateCompletion
+    >()
+    const failures = completedBatch.failures
+    const hearth = completedBatch.hearthCompletion
+
+    if (failures.length > 0) {
+      showSystemUpdateFailureToast(failures, onRetryTarget)
+    } else if (hearth === null) {
+      showSystemUpdateSuccessToast(
+        completedBatch.versionName ?? "the latest version"
+      )
+    }
+
+    if (hearth) {
+      if (failures.length === 0) dismissToast(systemUpdateToastId)
+      setHearthCompletion(hearth)
+    }
+  }, [active.length, onRetryTarget, open, updateMutation.isPending])
 
   const clearMockTimers = React.useCallback(() => {
     for (const timer of mockTimers.current) window.clearTimeout(timer)
@@ -444,6 +450,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
 
   React.useEffect(() => clearMockTimers, [clearMockTimers])
 
+  const updateMutationPendingRef = React.useRef(updateMutation.isPending)
+  React.useEffect(() => {
+    updateMutationPendingRef.current = updateMutation.isPending
+  }, [updateMutation.isPending])
+
   const handleUpdate = React.useCallback(
     (
       targets: ReadonlyArray<UpdateTarget>,
@@ -451,9 +462,9 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       latestVersionName?: string
     ) => {
       if (
-        updateMutation.isPending ||
+        updateMutationPendingRef.current ||
         batch.current.active ||
-        heldHearthUpdate !== null
+        heldHearthUpdateRef.current !== null
       ) {
         return
       }
@@ -464,7 +475,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         targets,
       })
     },
-    [heldHearthUpdate, updateMutation.isPending]
+    []
   )
 
   const handleMockUpdate = React.useCallback(
@@ -475,11 +486,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     ) => {
       if (
         targets.length === 0 ||
-        updateMutation.isPending ||
+        updateMutationPendingRef.current ||
         batch.current.active ||
         activeRef.current.length > 0 ||
-        heldHearthUpdate !== null ||
-        mockActive.length > 0
+        heldHearthUpdateRef.current !== null ||
+        mockActiveRef.current.length > 0
       ) {
         return
       }
@@ -508,27 +519,45 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         "replace.removeBackup",
       ]
 
-      setMockActive(updates)
+      for (const update of updates) {
+        activityStore.setPhase(update.operationId, "Preparing")
+      }
+      mockActiveRef.current = updates
+      publishDisplayedActive()
       showSystemUpdateProgressToast(latestVersionName, false)
       phases.forEach((phase, index) => {
         const timer = window.setTimeout(
           () => {
-            setMockActive((current) =>
-              current.map((update, targetIndex) => ({
-                ...update,
-                phase:
-                  phase === "replace.removeBackup" &&
+            for (const [targetIndex, update] of updates.entries()) {
+              activityStore.setPhase(
+                update.operationId,
+                phase === "replace.removeBackup" &&
                   update.component === "hearth"
-                    ? "awaitingReload"
-                    : targetIndex === 0 || index > 1
-                      ? phase
-                      : phases[Math.max(0, index - 1)],
-              }))
-            )
-            showSystemUpdateProgressToast(
-              latestVersionName,
-              phase === "reconnecting"
-            )
+                  ? "awaitingReload"
+                  : targetIndex === 0 || index > 1
+                    ? phase
+                    : (phases[Math.max(0, index - 1)] ?? phase)
+              )
+            }
+            if (
+              phase === "reconnecting" ||
+              phases[index - 1] === "reconnecting"
+            ) {
+              showSystemUpdateProgressToast(
+                latestVersionName,
+                phase === "reconnecting"
+              )
+            }
+            if (phase === "replace.removeBackup") {
+              const hearthUpdates = updates.filter(
+                (update) => update.component === "hearth"
+              )
+              mockActiveRef.current = hearthUpdates
+              publishDisplayedActive()
+              if (hearthUpdates.length === 0) {
+                showSystemUpdateSuccessToast(latestVersionName)
+              }
+            }
           },
           650 * (index + 1)
         )
@@ -536,61 +565,50 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       })
       const completionTimer = window.setTimeout(
         () => {
-          setMockActive([])
-          mockTimers.current = []
           const hearth = updates.find((update) => update.component === "hearth")
+          mockActiveRef.current = hearth ? [hearth] : []
+          publishDisplayedActive()
+          mockTimers.current = []
           if (hearth) {
             dismissToast(systemUpdateToastId)
             setHearthCompletion({
               version: latestVersion,
               versionName: latestVersionName,
             })
-          } else {
-            showSystemUpdateSuccessToast(latestVersionName)
           }
         },
         650 * (phases.length + 4)
       )
       mockTimers.current.push(completionTimer)
     },
-    [
-      clearMockTimers,
-      heldHearthUpdate,
-      mockActive.length,
-      updateMutation.isPending,
-    ]
+    [activityStore, clearMockTimers, publishDisplayedActive]
+  )
+
+  const pollerController = React.useMemo<ActiveUpdatePollerController>(
+    () => ({
+      complete: handleOperationComplete,
+      setReconnecting: handleOperationReconnectingChange,
+    }),
+    [handleOperationComplete, handleOperationReconnectingChange]
   )
 
   return (
     <>
-      <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent
-          aria-describedby={undefined}
-          className="h-[min(46rem,calc(100dvh-2rem))] max-h-none grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:max-w-[calc(100%-2rem)] xl:max-w-5xl"
-        >
-          <div className="border-b bg-background/35 px-5 pt-5">
-            <UpdaterTitleBar
-              open={open}
-              updating={displayedActive.length > 0}
-            />
-            <UpdaterViewTabs store={viewStore} />
-          </div>
-          <UpdateDialogData
-            active={displayedActive}
-            changelogRevision={changelogRevision}
-            focusedRelayId={initialRelayId}
-            open={open}
-            starting={
-              updateMutation.isPending ||
-              mockActive.length > 0 ||
-              displayedActive.length > 0
-            }
-            store={viewStore}
-            onMockUpdate={handleMockUpdate}
-            onUpdate={handleUpdate}
-          />
-        </DialogContent>
-      </Dialog>
+      <ActiveUpdatePollers
+        active={active}
+        activityStore={activityStore}
+        controller={pollerController}
+      />
+      <UpdaterDialog
+        activityStore={activityStore}
+        changelogRevision={changelogRevision}
+        focusedRelayId={initialRelayId}
+        open={open}
+        store={viewStore}
+        onMockUpdate={handleMockUpdate}
+        onOpenChange={onOpenChange}
+        onUpdate={handleUpdate}
+      />
 
       <UpdateConfirmation
         error={
@@ -634,21 +652,122 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
   )
 })
 
-const UpdateDialogData = React.memo(function UpdateDialogData({
-  active,
+const UpdaterDialog = React.memo(function UpdaterDialog({
+  activityStore,
   changelogRevision,
   focusedRelayId,
   open,
-  starting,
+  store,
+  onMockUpdate,
+  onOpenChange,
+  onUpdate,
+}: {
+  activityStore: SystemUpdateActivityStore
+  changelogRevision: number
+  focusedRelayId: string | null
+  open: boolean
+  store: UpdateDialogViewStore
+  onMockUpdate: (
+    targets: ReadonlyArray<UpdateTarget>,
+    latestVersion: string,
+    latestVersionName: string
+  ) => void
+  onOpenChange: (open: boolean) => void
+  onUpdate: (
+    targets: ReadonlyArray<UpdateTarget>,
+    latestVersion: string,
+    latestVersionName?: string
+  ) => void
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        aria-describedby={undefined}
+        className="h-[min(46rem,calc(100dvh-2rem))] max-h-none grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:max-w-[calc(100%-2rem)] xl:max-w-5xl"
+      >
+        <div className="border-b bg-background/35 px-5 pt-5">
+          <UpdaterTitleBar activityStore={activityStore} open={open} />
+          <UpdaterViewTabs store={store} />
+        </div>
+        <UpdateDialogData
+          activityStore={activityStore}
+          changelogRevision={changelogRevision}
+          focusedRelayId={focusedRelayId}
+          open={open}
+          store={store}
+          onMockUpdate={onMockUpdate}
+          onUpdate={onUpdate}
+        />
+      </DialogContent>
+    </Dialog>
+  )
+})
+
+const ActiveUpdatePollers = React.memo(function ActiveUpdatePollers({
+  active,
+  activityStore,
+  controller,
+}: {
+  active: ReadonlyArray<ActiveUpdate>
+  activityStore: SystemUpdateActivityStore
+  controller: ActiveUpdatePollerController
+}) {
+  return active.map((update) => (
+    <ActiveUpdatePoller
+      activityStore={activityStore}
+      controller={controller}
+      key={update.operationId}
+      update={update}
+    />
+  ))
+})
+
+const ActiveUpdatePoller = React.memo(function ActiveUpdatePoller({
+  activityStore,
+  controller,
+  update,
+}: {
+  activityStore: SystemUpdateActivityStore
+  controller: ActiveUpdatePollerController
+  update: ActiveUpdate
+}) {
+  const operationQuery = useQuery(activeUpdateQueryOptions(update))
+  const completed = React.useRef(false)
+  const reconnecting = operationQuery.isError || operationQuery.isRefetchError
+  const phase = reconnecting ? "reconnecting" : operationQuery.data?.phase
+
+  React.useEffect(() => {
+    if (phase) activityStore.setPhase(update.operationId, phase)
+  }, [activityStore, phase, update.operationId])
+
+  React.useEffect(() => {
+    controller.setReconnecting(update.operationId, reconnecting)
+    return () => controller.setReconnecting(update.operationId, false)
+  }, [controller, reconnecting, update.operationId])
+
+  React.useEffect(() => {
+    if (!operationQuery.isSuccess || completed.current) return
+    if (operationQuery.data?.status === "running") return
+    completed.current = true
+    controller.complete(update, operationQuery.data)
+  }, [controller, operationQuery.data, operationQuery.isSuccess, update])
+
+  return null
+})
+
+const UpdateDialogData = React.memo(function UpdateDialogData({
+  activityStore,
+  changelogRevision,
+  focusedRelayId,
+  open,
   store,
   onMockUpdate,
   onUpdate,
 }: {
-  active: ReadonlyArray<ActiveUpdate>
+  activityStore: SystemUpdateActivityStore
   changelogRevision: number
   focusedRelayId: string | null
   open: boolean
-  starting: boolean
   store: UpdateDialogViewStore
   onMockUpdate: (
     targets: ReadonlyArray<UpdateTarget>,
@@ -661,6 +780,11 @@ const UpdateDialogData = React.memo(function UpdateDialogData({
     latestVersionName?: string
   ) => void
 }) {
+  const active = React.useSyncExternalStore(
+    activityStore.subscribeActivities,
+    activityStore.getActivitiesSnapshot,
+    activityStore.getActivitiesSnapshot
+  )
   const overviewQuery = useQuery({
     ...updateOverviewQueryOptions(),
     enabled: open && active.length === 0,
@@ -674,7 +798,7 @@ const UpdateDialogData = React.memo(function UpdateDialogData({
 
   return (
     <UpdateDialogBody
-      active={active}
+      activityStore={activityStore}
       changelogRevision={changelogRevision}
       errorMessage={
         overviewQuery.error instanceof Error
@@ -685,39 +809,36 @@ const UpdateDialogData = React.memo(function UpdateDialogData({
       focusedRelayId={focusedRelayId}
       overview={overview}
       pending={overviewQuery.isPending && active.length === 0}
-      starting={starting}
       store={store}
       targets={targets}
       onMockUpdate={onMockUpdate}
-      onRetry={() => void overviewQuery.refetch()}
+      onRetry={overviewQuery.refetch}
       onUpdate={onUpdate}
     />
   )
 })
 
 const UpdateDialogBody = React.memo(function UpdateDialogBody({
-  active,
+  activityStore,
   changelogRevision,
   errorMessage,
   failed,
   focusedRelayId,
   overview,
   pending,
-  starting,
   store,
   targets,
   onMockUpdate,
   onRetry,
   onUpdate,
 }: {
-  active: ReadonlyArray<ActiveUpdate>
+  activityStore: SystemUpdateActivityStore
   changelogRevision: number
   errorMessage: string
   failed: boolean
   focusedRelayId: string | null
   overview: UpdateOverview | undefined
   pending: boolean
-  starting: boolean
   store: UpdateDialogViewStore
   targets: Array<UpdateTarget>
   onMockUpdate: (
@@ -761,10 +882,9 @@ const UpdateDialogBody = React.memo(function UpdateDialogBody({
             role="tabpanel"
           >
             <UpdateOverviewView
-              active={active}
+              activityStore={activityStore}
               focusedRelayId={focusedRelayId}
               overview={overview}
-              starting={starting}
               targets={targets}
               onMockUpdate={onMockUpdate}
               onChangelog={store.openChangelog}
@@ -792,18 +912,25 @@ const UpdateDialogBody = React.memo(function UpdateDialogBody({
             </div>
           ) : null}
         </>
-      ) : active.length > 0 ? (
-        <ActiveUpdatesFallback active={active} />
-      ) : null}
+      ) : (
+        <ActiveUpdatesFallback activityStore={activityStore} />
+      )}
     </div>
   )
 })
 
 const ActiveUpdatesFallback = React.memo(function ActiveUpdatesFallback({
-  active,
+  activityStore,
 }: {
-  active: ReadonlyArray<ActiveUpdate>
+  activityStore: SystemUpdateActivityStore
 }) {
+  const active = React.useSyncExternalStore(
+    activityStore.subscribeActivities,
+    activityStore.getActivitiesSnapshot,
+    activityStore.getActivitiesSnapshot
+  )
+  if (active.length === 0) return null
+
   return (
     <div className="h-full overflow-y-auto p-4 sm:p-5">
       <section className="overflow-hidden rounded-xl border bg-card/45">
@@ -818,7 +945,11 @@ const ActiveUpdatesFallback = React.memo(function ActiveUpdatesFallback({
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-semibold">{update.name}</p>
               <div className="mt-2 h-4">
-                <UpdateProgressBar phase={update.phase} />
+                <UpdateProgressBar
+                  activityStore={activityStore}
+                  initialPhase={update.phase}
+                  operationId={update.operationId}
+                />
               </div>
             </div>
           </div>
@@ -829,11 +960,11 @@ const ActiveUpdatesFallback = React.memo(function ActiveUpdatesFallback({
 })
 
 const UpdaterTitleBar = React.memo(function UpdaterTitleBar({
+  activityStore,
   open,
-  updating,
 }: {
+  activityStore: SystemUpdateActivityStore
   open: boolean
-  updating: boolean
 }) {
   return (
     <DialogHeader className="flex-row items-center justify-between gap-3 pr-10">
@@ -841,18 +972,23 @@ const UpdaterTitleBar = React.memo(function UpdaterTitleBar({
         <CloudDownload className="size-5 text-primary" />
         Kiln Updater
       </DialogTitle>
-      <UpdaterCheckControl open={open} updating={updating} />
+      <UpdaterCheckControl activityStore={activityStore} open={open} />
     </DialogHeader>
   )
 })
 
 const UpdaterCheckControl = React.memo(function UpdaterCheckControl({
+  activityStore,
   open,
-  updating,
 }: {
+  activityStore: SystemUpdateActivityStore
   open: boolean
-  updating: boolean
 }) {
+  const updating = React.useSyncExternalStore(
+    activityStore.subscribeActivities,
+    activityStore.getBusySnapshot,
+    activityStore.getBusySnapshot
+  )
   const overviewQuery = useQuery({
     ...updateOverviewQueryOptions(),
     enabled: open && !updating,
@@ -979,19 +1115,17 @@ const ViewButton = React.memo(function ViewButton({
 })
 
 const UpdateOverviewView = React.memo(function UpdateOverviewView({
-  active,
+  activityStore,
   focusedRelayId,
   overview,
-  starting,
   targets,
   onMockUpdate,
   onChangelog,
   onUpdate,
 }: {
-  active: ReadonlyArray<ActiveUpdate>
+  activityStore: SystemUpdateActivityStore
   focusedRelayId: string | null
   overview: UpdateOverview
-  starting: boolean
   targets: Array<UpdateTarget>
   onMockUpdate: (
     targets: ReadonlyArray<UpdateTarget>,
@@ -1008,16 +1142,6 @@ const UpdateOverviewView = React.memo(function UpdateOverviewView({
   const latestRelease = overview.releases[0] ?? null
   const hearthTarget = targets.find((target) => target.component === "hearth")
   const relayTargets = targets.filter((target) => target.component === "relay")
-  const availableTargets = latestRelease
-    ? targets.filter(
-        (target) =>
-          targetHasUpdate(target, overview.releases) &&
-          !isTargetUpdating(active, target)
-      )
-    : []
-  const mockableTargets = targets.filter(
-    (target) => !isTargetUpdating(active, target)
-  )
 
   return (
     <div className="space-y-4 p-4 sm:p-5">
@@ -1034,44 +1158,14 @@ const UpdateOverviewView = React.memo(function UpdateOverviewView({
             </p>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            disabled={starting || availableTargets.length === 0}
-            size="sm"
-            type="button"
-            onClick={() => {
-              if (latestRelease) {
-                onUpdate(
-                  availableTargets,
-                  latestRelease.version,
-                  latestRelease.name
-                )
-              }
-            }}
-          >
-            <CloudDownload />
-            Update all
-          </Button>
-          {import.meta.env.DEV ? (
-            <Button
-              disabled={starting || mockableTargets.length === 0}
-              size="sm"
-              type="button"
-              variant="outline"
-              onClick={() => {
-                if (latestRelease) {
-                  onMockUpdate(
-                    mockableTargets,
-                    latestRelease.version,
-                    latestRelease.name
-                  )
-                }
-              }}
-            >
-              Mock update
-            </Button>
-          ) : null}
-        </div>
+        <UpdateOverviewControls
+          activityStore={activityStore}
+          latestRelease={latestRelease}
+          releases={overview.releases}
+          targets={targets}
+          onMockUpdate={onMockUpdate}
+          onUpdate={onUpdate}
+        />
       </section>
 
       <section className="overflow-hidden rounded-xl border bg-card/45">
@@ -1080,12 +1174,11 @@ const UpdateOverviewView = React.memo(function UpdateOverviewView({
             <UpdateSectionLabel component="hearth" />
             {hearthTarget ? (
               <UpdateTargetRow
-                active={active}
+                activityStore={activityStore}
                 focused={false}
                 key={hearthTarget.key}
                 latestVersion={latestRelease.version}
                 releases={overview.releases}
-                starting={starting}
                 target={hearthTarget}
                 onChangelog={onChangelog}
                 onUpdate={onUpdate}
@@ -1098,12 +1191,11 @@ const UpdateOverviewView = React.memo(function UpdateOverviewView({
                 <div className="divide-y divide-border/70">
                   {relayTargets.map((target) => (
                     <UpdateTargetRow
-                      active={active}
+                      activityStore={activityStore}
                       focused={target.relayId === focusedRelayId}
                       key={target.key}
                       latestVersion={latestRelease.version}
                       releases={overview.releases}
-                      starting={starting}
                       target={target}
                       onChangelog={onChangelog}
                       onUpdate={onUpdate}
@@ -1123,6 +1215,88 @@ const UpdateOverviewView = React.memo(function UpdateOverviewView({
           </p>
         )}
       </section>
+    </div>
+  )
+})
+
+const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
+  activityStore,
+  latestRelease,
+  releases,
+  targets,
+  onMockUpdate,
+  onUpdate,
+}: {
+  activityStore: SystemUpdateActivityStore
+  latestRelease: PublicKilnRelease | null
+  releases: ReadonlyArray<PublicKilnRelease>
+  targets: ReadonlyArray<UpdateTarget>
+  onMockUpdate: (
+    targets: ReadonlyArray<UpdateTarget>,
+    latestVersion: string,
+    latestVersionName: string
+  ) => void
+  onUpdate: (
+    targets: ReadonlyArray<UpdateTarget>,
+    latestVersion: string,
+    latestVersionName?: string
+  ) => void
+}) {
+  const active = React.useSyncExternalStore(
+    activityStore.subscribeActivities,
+    activityStore.getActivitiesSnapshot,
+    activityStore.getActivitiesSnapshot
+  )
+  const activeTargetKeys = new Set(active.map((update) => update.targetKey))
+  const availableTargets = latestRelease
+    ? targets.filter(
+        (target) =>
+          targetHasUpdate(target, releases) && !activeTargetKeys.has(target.key)
+      )
+    : []
+  const mockableTargets = targets.filter(
+    (target) => !activeTargetKeys.has(target.key)
+  )
+  const updating = active.length > 0
+
+  return (
+    <div className="flex shrink-0 items-center gap-2">
+      <Button
+        disabled={updating || availableTargets.length === 0}
+        size="sm"
+        type="button"
+        onClick={() => {
+          if (latestRelease) {
+            onUpdate(
+              availableTargets,
+              latestRelease.version,
+              latestRelease.name
+            )
+          }
+        }}
+      >
+        <CloudDownload />
+        Update all
+      </Button>
+      {import.meta.env.DEV ? (
+        <Button
+          disabled={updating || mockableTargets.length === 0}
+          size="sm"
+          type="button"
+          variant="outline"
+          onClick={() => {
+            if (latestRelease) {
+              onMockUpdate(
+                mockableTargets,
+                latestRelease.version,
+                latestRelease.name
+              )
+            }
+          }}
+        >
+          Mock update
+        </Button>
+      ) : null}
     </div>
   )
 })
@@ -1149,11 +1323,10 @@ const UpdateSectionLabel = React.memo(function UpdateSectionLabel({
 })
 
 type UpdateTargetRowProps = {
-  active: ReadonlyArray<ActiveUpdate>
+  activityStore: SystemUpdateActivityStore
   focused: boolean
   latestVersion: string
   releases: ReadonlyArray<PublicKilnRelease>
-  starting: boolean
   target: UpdateTarget
   onChangelog: (targetKey: string) => void
   onUpdate: (
@@ -1175,7 +1348,7 @@ const UpdateStatusCallout = React.memo(function UpdateStatusCallout({
 }) {
   return (
     <span
-      className={`inline-flex h-5 w-32 shrink-0 items-center justify-center rounded-[3px] border px-2 font-mono text-[0.5rem] leading-none font-semibold tracking-[0.06em] whitespace-nowrap uppercase ${status.tone}`}
+      className={`inline-flex h-5 w-fit shrink-0 items-center justify-center rounded-[3px] border px-1.5 font-mono text-[0.5rem] leading-none font-semibold tracking-[0.06em] whitespace-nowrap uppercase ${status.tone}`}
     >
       {status.label}
     </span>
@@ -1183,28 +1356,16 @@ const UpdateStatusCallout = React.memo(function UpdateStatusCallout({
 })
 
 const UpdateTargetRow = React.memo(function UpdateTargetRow({
-  active,
+  activityStore,
   focused,
   latestVersion,
   releases,
-  starting,
   target,
   onChangelog,
   onUpdate,
 }: UpdateTargetRowProps) {
   const rowRef = React.useRef<HTMLDivElement>(null)
-  const comparison = compareLatestReleaseVersion(
-    target.currentVersion,
-    releases
-  )
-  const updating = isTargetUpdating(active, target)
-  const activeUpdate = activeUpdateForTarget(active, target)
-  const updateAvailable = targetHasUpdate(target, releases)
-  const reinstallAvailable = target.eligible && comparison === 0
   const currentRelease = findKilnRelease(releases, target.currentVersion)
-  const latestRelease = findKilnRelease(releases, latestVersion)
-  const status = targetStatus(target, comparison, updating)
-  const Icon = target.component === "hearth" ? ServerCog : RadioTower
 
   React.useEffect(() => {
     if (focused) rowRef.current?.scrollIntoView({ block: "nearest" })
@@ -1220,19 +1381,7 @@ const UpdateTargetRow = React.memo(function UpdateTargetRow({
       }`}
     >
       <div className="flex min-w-0 items-start gap-3">
-        <span
-          className={`grid size-9 shrink-0 place-items-center rounded-lg border ${
-            target.component === "hearth"
-              ? "border-primary/25 bg-primary/[0.07] text-primary"
-              : "bg-background/55 text-muted-foreground"
-          }`}
-        >
-          {updating ? (
-            <LoaderCircle className="size-4 animate-spin" />
-          ) : (
-            <Icon className="size-4" />
-          )}
-        </span>
+        <UpdateTargetIcon activityStore={activityStore} target={target} />
         <div className="min-w-0 flex-1">
           <div className="flex h-5 min-w-0 items-center gap-2 overflow-hidden">
             <h3 className="min-w-0 truncate text-sm font-semibold">
@@ -1253,19 +1402,19 @@ const UpdateTargetRow = React.memo(function UpdateTargetRow({
                 </GitHubVersionLink>
               </>
             ) : null}
-            <UpdateStatusCallout status={status} />
+            <UpdateTargetStatusCallout
+              activityStore={activityStore}
+              releases={releases}
+              target={target}
+            />
           </div>
           <div className="mt-2 h-4 overflow-hidden" aria-live="polite">
-            {updating ? (
-              <UpdateProgressBar phase={activeUpdate?.phase} />
-            ) : (
-              <OverviewVersionLink
-                currentVersion={target.currentVersion}
-                latestVersion={latestVersion}
-                reason={!target.eligible ? target.reason : null}
-                releases={releases}
-              />
-            )}
+            <UpdateTargetDetails
+              activityStore={activityStore}
+              latestVersion={latestVersion}
+              releases={releases}
+              target={target}
+            />
           </div>
         </div>
       </div>
@@ -1280,55 +1429,205 @@ const UpdateTargetRow = React.memo(function UpdateTargetRow({
           <History />
           View changes
         </Button>
-        <Button
-          className={
-            updating
-              ? "w-28 border-sky-400/30 bg-sky-400/10 text-sky-300 opacity-100"
-              : "w-28"
-          }
-          size="sm"
-          type="button"
-          disabled={
-            starting || (!updateAvailable && !reinstallAvailable) || updating
-          }
-          onClick={() =>
-            onUpdate(
-              [target],
-              latestVersion,
-              latestRelease?.name ?? friendlyVersionName(latestVersion)
-            )
-          }
-        >
-          {updating ? (
-            <LoaderCircle className="animate-spin" />
-          ) : updateAvailable ? (
-            <CloudDownload />
-          ) : reinstallAvailable ? (
-            <RefreshCw />
-          ) : (
-            <Check />
-          )}
-          {updating
-            ? "Updating..."
-            : updateAvailable
-              ? "Update"
-              : reinstallAvailable
-                ? "Reinstall"
-                : "Unavailable"}
-        </Button>
+        <UpdateTargetAction
+          activityStore={activityStore}
+          latestVersion={latestVersion}
+          releases={releases}
+          target={target}
+          onUpdate={onUpdate}
+        />
       </div>
     </div>
   )
 }, areUpdateTargetRowPropsEqual)
 
-const UpdateProgressBar = React.memo(function UpdateProgressBar({
-  phase,
+function useTargetActivity(
+  activityStore: SystemUpdateActivityStore,
+  targetKey: string
+) {
+  const subscribe = React.useCallback(
+    (listener: () => void) =>
+      activityStore.subscribeTargetActivity(targetKey, listener),
+    [activityStore, targetKey]
+  )
+  const getSnapshot = React.useCallback(
+    () => activityStore.getTargetActivitySnapshot(targetKey),
+    [activityStore, targetKey]
+  )
+  return React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
+const UpdateTargetIcon = React.memo(function UpdateTargetIcon({
+  activityStore,
+  target,
 }: {
-  phase: string | undefined
+  activityStore: SystemUpdateActivityStore
+  target: UpdateTarget
 }) {
-  const progress = systemUpdateProgress(phase, phase === "reconnecting")
+  const updating = useTargetActivity(activityStore, target.key) !== undefined
+  const Icon = target.component === "hearth" ? ServerCog : RadioTower
   return (
-    <div className="flex max-w-md items-center gap-2">
+    <span
+      className={`grid size-9 shrink-0 place-items-center rounded-lg border ${
+        target.component === "hearth"
+          ? "border-primary/25 bg-primary/[0.07] text-primary"
+          : "bg-background/55 text-muted-foreground"
+      }`}
+    >
+      {updating ? (
+        <LoaderCircle className="size-4 animate-spin" />
+      ) : (
+        <Icon className="size-4" />
+      )}
+    </span>
+  )
+})
+
+const UpdateTargetStatusCallout = React.memo(
+  function UpdateTargetStatusCallout({
+    activityStore,
+    releases,
+    target,
+  }: {
+    activityStore: SystemUpdateActivityStore
+    releases: ReadonlyArray<PublicKilnRelease>
+    target: UpdateTarget
+  }) {
+    const updating = useTargetActivity(activityStore, target.key) !== undefined
+    const comparison = compareLatestReleaseVersion(
+      target.currentVersion,
+      releases
+    )
+    return (
+      <UpdateStatusCallout
+        status={targetStatus(target, comparison, updating)}
+      />
+    )
+  }
+)
+
+const UpdateTargetDetails = React.memo(function UpdateTargetDetails({
+  activityStore,
+  latestVersion,
+  releases,
+  target,
+}: {
+  activityStore: SystemUpdateActivityStore
+  latestVersion: string
+  releases: ReadonlyArray<PublicKilnRelease>
+  target: UpdateTarget
+}) {
+  const activeUpdate = useTargetActivity(activityStore, target.key)
+  return activeUpdate ? (
+    <UpdateProgressBar
+      activityStore={activityStore}
+      initialPhase={activeUpdate.phase}
+      operationId={activeUpdate.operationId}
+    />
+  ) : (
+    <OverviewVersionLink
+      currentVersion={target.currentVersion}
+      latestVersion={latestVersion}
+      reason={!target.eligible ? target.reason : null}
+      releases={releases}
+    />
+  )
+})
+
+const UpdateTargetAction = React.memo(function UpdateTargetAction({
+  activityStore,
+  latestVersion,
+  releases,
+  target,
+  onUpdate,
+}: {
+  activityStore: SystemUpdateActivityStore
+  latestVersion: string
+  releases: ReadonlyArray<PublicKilnRelease>
+  target: UpdateTarget
+  onUpdate: (
+    targets: ReadonlyArray<UpdateTarget>,
+    latestVersion: string,
+    latestVersionName?: string
+  ) => void
+}) {
+  const updating = useTargetActivity(activityStore, target.key) !== undefined
+  const starting = React.useSyncExternalStore(
+    activityStore.subscribeActivities,
+    activityStore.getBusySnapshot,
+    activityStore.getBusySnapshot
+  )
+  const comparison = compareLatestReleaseVersion(
+    target.currentVersion,
+    releases
+  )
+  const updateAvailable = targetHasUpdate(target, releases)
+  const reinstallAvailable = target.eligible && comparison === 0
+  const latestRelease = findKilnRelease(releases, latestVersion)
+
+  return (
+    <Button
+      className={
+        updating
+          ? "w-28 border-sky-400/30 bg-sky-400/10 text-sky-300 opacity-100"
+          : "w-28"
+      }
+      size="sm"
+      type="button"
+      disabled={
+        starting || (!updateAvailable && !reinstallAvailable) || updating
+      }
+      onClick={() =>
+        onUpdate(
+          [target],
+          latestVersion,
+          latestRelease?.name ?? friendlyVersionName(latestVersion)
+        )
+      }
+    >
+      {updating ? (
+        <LoaderCircle className="animate-spin" />
+      ) : updateAvailable ? (
+        <CloudDownload />
+      ) : reinstallAvailable ? (
+        <RefreshCw />
+      ) : (
+        <Check />
+      )}
+      {updating
+        ? "Updating..."
+        : updateAvailable
+          ? "Update"
+          : reinstallAvailable
+            ? "Reinstall"
+            : "Unavailable"}
+    </Button>
+  )
+})
+
+const UpdateProgressBar = React.memo(function UpdateProgressBar({
+  activityStore,
+  initialPhase,
+  operationId,
+}: {
+  activityStore: SystemUpdateActivityStore
+  initialPhase: string | undefined
+  operationId: string
+}) {
+  const subscribe = React.useCallback(
+    (listener: () => void) =>
+      activityStore.subscribePhase(operationId, listener),
+    [activityStore, operationId]
+  )
+  const getSnapshot = React.useCallback(
+    () => activityStore.getPhaseSnapshot(operationId) ?? initialPhase,
+    [activityStore, initialPhase, operationId]
+  )
+  const phase = React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+  const progress = systemUpdateProgress(phase, phase === "reconnecting")
+  const completed = phase === "awaitingReload"
+  return (
+    <div className="flex max-w-md items-center gap-2 [contain:layout_paint_style]">
       <div
         aria-label={`${progress.label}: ${progress.percent}%`}
         aria-valuemax={100}
@@ -1338,12 +1637,15 @@ const UpdateProgressBar = React.memo(function UpdateProgressBar({
         role="progressbar"
       >
         <div
-          className="h-full bg-primary transition-[width] duration-500"
+          className={`h-full transition-[width] duration-500 ${completed ? "bg-emerald-400" : "bg-primary"}`}
           style={{ width: `${progress.percent}%` }}
         />
       </div>
-      <span className="w-24 truncate text-right text-[0.5625rem] text-muted-foreground">
-        {progress.label}
+      <span
+        className={`flex w-24 shrink-0 items-center justify-end gap-1 text-[0.5625rem] ${completed ? "text-emerald-300" : "text-muted-foreground"}`}
+      >
+        <span className="truncate">{progress.label}</span>
+        {completed ? <Check aria-hidden="true" className="size-3" /> : null}
       </span>
     </div>
   )
@@ -2069,15 +2371,11 @@ function areUpdateTargetRowPropsEqual(
 ): boolean {
   return (
     previous.focused === next.focused &&
+    previous.activityStore === next.activityStore &&
     previous.latestVersion === next.latestVersion &&
     previous.releases === next.releases &&
-    previous.starting === next.starting &&
     previous.onChangelog === next.onChangelog &&
     previous.onUpdate === next.onUpdate &&
-    isTargetUpdating(previous.active, previous.target) ===
-      isTargetUpdating(next.active, next.target) &&
-    activeUpdateForTarget(previous.active, previous.target)?.phase ===
-      activeUpdateForTarget(next.active, next.target)?.phase &&
     areUpdateTargetsEqual(previous.target, next.target)
   )
 }
@@ -2185,17 +2483,6 @@ function isTargetUpdating(
   target: UpdateTarget
 ): boolean {
   return active.some(
-    (item) =>
-      item.component === target.component &&
-      (target.component === "hearth" || item.relayId === target.relayId)
-  )
-}
-
-function activeUpdateForTarget(
-  active: ReadonlyArray<ActiveUpdate>,
-  target: UpdateTarget
-): ActiveUpdate | undefined {
-  return active.find(
     (item) =>
       item.component === target.component &&
       (target.component === "hearth" || item.relayId === target.relayId)
