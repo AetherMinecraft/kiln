@@ -603,8 +603,8 @@ function AuthHeading({
 }) {
   return (
     <div className="mb-8 flex flex-col items-center text-center">
-      <HearthMark className="size-9 rounded-xl" />
-      <h1 className="mt-5 font-heading text-2xl font-semibold tracking-[-0.04em]">
+      <HearthMark className="size-11" />
+      <h1 className="mt-3 font-heading text-2xl font-semibold tracking-[-0.04em]">
         {mode === "setup"
           ? "Set up Kiln"
           : mode === "sign-in"
