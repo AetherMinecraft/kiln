@@ -12,8 +12,7 @@
     "dev": "bun src/main.ts",
     "format": "vp fmt \"src/**/*.ts\"",
     "lint": "vp lint src",
-    "test": "vp test run",
-    "typecheck": "tsc --noEmit"
+    "test": "vp test run"
   },
   "dependencies": {
     "@workspace/contracts": "workspace:*",

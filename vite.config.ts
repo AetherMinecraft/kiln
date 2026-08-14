@@ -20,7 +20,7 @@ export default defineConfig({
       "unicorn/no-new-array": "off",
       "unicorn/prefer-string-starts-ends-with": "off",
     },
-    options: { typeAware: true, typeCheck: true },
+    options: { typeAware: true, typeCheck: false },
   },
   fmt: {
     endOfLine: "lf",

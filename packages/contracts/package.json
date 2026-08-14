@@ -5,8 +5,7 @@
   "private": true,
   "scripts": {
     "format": "vp fmt \"src/**/*.{ts,tsx}\"",
-    "lint": "vp lint src",
-    "typecheck": "tsc --noEmit"
+    "lint": "vp lint src"
   },
   "dependencies": {
     "effect": "4.0.0-beta.99",

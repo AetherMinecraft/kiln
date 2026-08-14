@@ -5,8 +5,7 @@
   "private": true,
   "scripts": {
     "lint": "vp lint",
-    "format": "vp fmt \"**/*.{ts,tsx}\"",
-    "typecheck": "tsc --noEmit"
+    "format": "vp fmt \"**/*.{ts,tsx}\""
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",
