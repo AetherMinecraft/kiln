@@ -24,6 +24,7 @@ interface UpdateOperation {
   batchId?: string
   component: "hearth" | "relay"
   error: string | null
+  phase?: string
   finishedAt: string | null
   id: string
   previousImage: string
@@ -79,7 +80,11 @@ const runOperationEffect = Effect.fn("relay.updater.replace")(function* (
         targetReference,
         targetVersion: operation.version,
       },
-      dockerRuntime
+      dockerRuntime,
+      (phase) =>
+        updateOperationEffect({ ...operation, phase }).pipe(
+          Effect.catch(() => Effect.void)
+        )
     )
   )
   yield* updateOperationEffect({
@@ -362,6 +367,7 @@ function isUpdateOperation(value: unknown): value is UpdateOperation {
     optionalString(value.batchId) &&
     (value.component === "hearth" || value.component === "relay") &&
     (value.error === null || typeof value.error === "string") &&
+    optionalString(value.phase) &&
     (value.finishedAt === null || typeof value.finishedAt === "string") &&
     typeof value.id === "string" &&
     typeof value.previousImage === "string" &&
