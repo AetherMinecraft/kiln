@@ -99,7 +99,6 @@ interface AccessOverviewRow extends RowDataPacket {
   email: string
   id: string
   name: string
-  platform_role: string | null
   resource_id: string
   resource_type: "database" | "instance" | "relay"
   role: (typeof accessRoles)[number]
@@ -124,7 +123,6 @@ interface InstanceGrantRow extends RowDataPacket {
   created_at: Date
   email: string
   id: string
-  platform_role: string | null
   resource_type: "instance" | "relay"
   role: string
   user_id: string
@@ -133,14 +131,6 @@ interface InstanceGrantRow extends RowDataPacket {
 interface InstanceUserRow extends RowDataPacket {
   email: string
   id: string
-  name: string
-  role: string | null
-}
-
-interface PlatformAdministratorRow extends RowDataPacket {
-  email: string
-  id: string
-  name: string
 }
 
 interface ExistingAccessUserRow extends RowDataPacket {
@@ -155,7 +145,6 @@ interface InstanceOwnerDirectoryRow extends RowDataPacket {
   email: string
   instance_id: string
   name: string
-  platform_role: string | null
   user_id: string
 }
 
@@ -277,11 +266,10 @@ export const getInstanceUsers = createServerFn({ method: "GET" })
           roleHasPermission(grant.role, "access.manage")
       )
 
-    const [grantRows, owner, platformAdministrators] = await Promise.all([
+    const [grantRows, owner] = await Promise.all([
       databasePool.query<Array<InstanceGrantRow>>(
         `SELECT grant_row.id, grant_row.user_id, grant_row.role,
-                grant_row.resource_type, grant_row.created_at, auth_user.email,
-                auth_user.role AS platform_role
+                grant_row.resource_type, grant_row.created_at, auth_user.email
            FROM ${databaseTable("access_grant")} AS grant_row
            JOIN ${databaseTable("user")} AS auth_user
              ON auth_user.id = grant_row.user_id
@@ -298,7 +286,6 @@ export const getInstanceUsers = createServerFn({ method: "GET" })
         [relay.id, data.instanceId]
       ),
       ownerId ? instanceOwnerUser(ownerId, user) : null,
-      platformAdmin ? listPlatformAdministrators() : [],
     ])
     const grants = deduplicateEffectiveInstanceGrants(
       grantRows[0].flatMap((grant) =>
@@ -308,7 +295,6 @@ export const getInstanceUsers = createServerFn({ method: "GET" })
                 createdAt: grant.created_at.toISOString(),
                 email: grant.email,
                 id: grant.id,
-                platformAdministrator: grant.platform_role === "admin",
                 resourceType: grant.resource_type,
                 role: grant.role,
                 userId: grant.user_id,
@@ -322,7 +308,6 @@ export const getInstanceUsers = createServerFn({ method: "GET" })
       canOpenAccessPage,
       canTransferOwnership: platformAdmin || owner?.id === user.id,
       owner,
-      platformAdministrators,
       users: grants.filter((grant) => grant.userId !== owner?.id),
     }
   })
@@ -335,8 +320,7 @@ async function relayAccessOverview(
     databasePool.query<Array<AccessOverviewRow>>(
       `SELECT grant_row.id, grant_row.user_id, grant_row.resource_type,
               grant_row.resource_id, grant_row.role, grant_row.created_at,
-              auth_user.name, auth_user.email,
-              auth_user.role AS platform_role
+              auth_user.name, auth_user.email
          FROM ${databaseTable("access_grant")} AS grant_row
          JOIN ${databaseTable("user")} AS auth_user ON auth_user.id = grant_row.user_id
         WHERE grant_row.relay_id = ?
@@ -355,8 +339,7 @@ async function relayAccessOverview(
     ),
     databasePool.query<Array<InstanceOwnerDirectoryRow>>(
       `SELECT instance_row.instance_id, instance_row.owner_id AS user_id,
-              instance_row.created_at, auth_user.name, auth_user.email,
-              auth_user.role AS platform_role
+              instance_row.created_at, auth_user.name, auth_user.email
          FROM ${databaseTable("instance")} AS instance_row
          JOIN ${databaseTable("user")} AS auth_user
            ON auth_user.id = instance_row.owner_id
@@ -406,7 +389,6 @@ async function relayAccessOverview(
         email: grant.email,
         id: grant.id,
         name: grant.name,
-        platformAdministrator: grant.platform_role === "admin",
         instanceOwner:
           grant.resource_type === "instance" &&
           isCurrentInstanceOwnerGrant({
@@ -444,7 +426,6 @@ async function relayAccessOverview(
       email: owner.email,
       instanceId: owner.instance_id,
       name: owner.name,
-      platformAdministrator: owner.platform_role === "admin",
       relayId: relay.id,
       relayName: relay.name,
       userId: owner.user_id,
@@ -1075,20 +1056,6 @@ function sendAccessGrantedNotification(input: {
   })
 }
 
-async function listPlatformAdministrators() {
-  const [rows] = await databasePool.query<Array<PlatformAdministratorRow>>(
-    `SELECT id, name, email
-       FROM ${databaseTable("user")}
-      WHERE role = 'admin'
-      ORDER BY name ASC, email ASC`
-  )
-  return rows.map((administrator) => ({
-    email: administrator.email,
-    id: administrator.id,
-    name: administrator.name,
-  }))
-}
-
 async function canManageOwners(
   user: Awaited<ReturnType<typeof requireAuthenticatedUser>>,
   relayId: string
@@ -1250,15 +1217,10 @@ async function instanceOwnerUser(
   currentUser: Awaited<ReturnType<typeof requireAuthenticatedUser>>
 ) {
   if (ownerId === currentUser.id) {
-    return {
-      email: currentUser.email,
-      id: currentUser.id,
-      name: currentUser.name,
-      platformAdministrator: isPlatformAdmin(currentUser),
-    }
+    return { email: currentUser.email, id: currentUser.id }
   }
   const [rows] = await databasePool.query<Array<InstanceUserRow>>(
-    `SELECT id, name, email, role
+    `SELECT id, email
        FROM ${databaseTable("user")} WHERE id = ? LIMIT 1`,
     [ownerId]
   )
@@ -1267,13 +1229,9 @@ async function instanceOwnerUser(
     ? {
         email: owner.email,
         id: owner.id,
-        name: owner.name,
-        platformAdministrator: owner.role === "admin",
       }
     : {
         email: "Former user",
         id: ownerId,
-        name: "Former user",
-        platformAdministrator: false,
       }
 }

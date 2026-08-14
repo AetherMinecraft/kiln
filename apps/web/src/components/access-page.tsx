@@ -98,7 +98,6 @@ interface AccessDirectoryRow {
   instanceId: string | null
   instanceOwner: boolean
   key: string
-  platformAdministrator: boolean
   relayId: string
   relayName: string
   resourceId: string
@@ -693,14 +692,6 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
           </span>
           <div className="flex min-w-0 items-center gap-1.5">
             <p className="truncate text-xs font-medium">{row.email}</p>
-            {row.platformAdministrator ? (
-              <Badge
-                variant="outline"
-                className="hidden border-primary/30 bg-primary/8 font-mono text-[0.4375rem] text-primary sm:inline-flex"
-              >
-                Platform admin
-              </Badge>
-            ) : null}
           </div>
         </div>
       </WorkspaceTableCell>
@@ -1392,7 +1383,6 @@ function accessGrantDirectoryRow(
     instanceId: grant.resourceType === "instance" ? grant.resourceId : null,
     instanceOwner: grant.instanceOwner,
     key: `grant:${grant.id}`,
-    platformAdministrator: grant.platformAdministrator,
     relayId: grant.relayId,
     relayName: grant.relayName,
     resourceId: grant.resourceId,
@@ -1419,7 +1409,6 @@ function accessOwnerDirectoryRow(
     instanceId: owner.instanceId,
     instanceOwner: true,
     key: `owner:${owner.relayId}:${owner.instanceId}:${owner.userId}`,
-    platformAdministrator: owner.platformAdministrator,
     relayId: owner.relayId,
     relayName: owner.relayName,
     resourceId: owner.instanceId,
