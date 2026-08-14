@@ -42,6 +42,15 @@ import {
   findKilnRelease,
   isKilnReleaseVersion,
 } from "@/lib/release-version"
+import {
+  beginSystemUpdateBatch,
+  inactiveSystemUpdateBatch,
+  isHearthUpdateLocked,
+  recordHearthUpdateCompletion,
+  recordSystemUpdateFailure,
+  systemUpdateCompletionDisposition,
+  type SystemUpdateBatchState,
+} from "@/lib/system-update-batch"
 import { systemUpdateProgress } from "@/lib/system-update-progress"
 import {
   applicationConnectionToastId,
@@ -87,6 +96,16 @@ type HearthUpdateCompletion = {
   version: string
   versionName: string
 }
+
+type UpdateFailure = {
+  message: string
+  target: UpdateTarget | ActiveUpdate
+}
+
+const inactiveUpdateBatch = inactiveSystemUpdateBatch<
+  UpdateFailure,
+  HearthUpdateCompletion
+>()
 
 type DialogView = "changelog" | "overview"
 
@@ -150,18 +169,16 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
   const [pending, setPending] = React.useState<PendingUpdate | null>(null)
   const [active, setActive] = React.useState<Array<ActiveUpdate>>([])
   const [mockActive, setMockActive] = React.useState<Array<ActiveUpdate>>([])
+  const [heldHearthUpdate, setHeldHearthUpdate] =
+    React.useState<ActiveUpdate | null>(null)
   const [hearthCompletion, setHearthCompletion] =
     React.useState<HearthUpdateCompletion | null>(null)
   const [changelogRevision, setChangelogRevision] = React.useState(0)
   const activeRef = React.useRef<ReadonlyArray<ActiveUpdate>>([])
-  const batchActive = React.useRef(false)
-  const batchFailures = React.useRef<
-    Array<{ message: string; target: UpdateTarget | ActiveUpdate }>
-  >([])
-  const batchHearthCompletion = React.useRef<HearthUpdateCompletion | null>(
-    null
-  )
-  const batchVersionName = React.useRef<string | null>(null)
+  const batch =
+    React.useRef<SystemUpdateBatchState<UpdateFailure, HearthUpdateCompletion>>(
+      inactiveUpdateBatch
+    )
   const completedOperations = React.useRef(new Set<string>())
   const mockTimers = React.useRef<Array<number>>([])
   const viewStoreRef = React.useRef<UpdateDialogViewStore | null>(null)
@@ -196,11 +213,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     })
     if (Result.isSuccess(restored) && restored.success.length > 0) {
       for (const update of restored.success) registerUpdatePresence(update)
-      batchActive.current = true
-      batchVersionName.current =
+      const versionName =
         restored.success[0]?.versionName ??
         friendlyVersionName(restored.success[0]?.targetVersion ?? null)
-      showSystemUpdateProgressToast(batchVersionName.current, false)
+      batch.current = beginSystemUpdateBatch(batch.current, versionName)
+      showSystemUpdateProgressToast(versionName, false)
       replaceActive(restored.success)
     } else {
       window.localStorage.removeItem(activeSystemUpdateStorageKey)
@@ -223,17 +240,20 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         registerStartedUpdate
       ),
     onMutate: (update) => {
-      batchActive.current = true
-      batchFailures.current = []
-      batchHearthCompletion.current = null
-      batchVersionName.current = update.latestVersionName
+      batch.current = beginSystemUpdateBatch(
+        batch.current,
+        update.latestVersionName
+      )
       dismissToast(systemUpdateToastId)
-      showSystemUpdateProgressToast(update.latestVersionName, false)
+      showSystemUpdateProgressToast(
+        batch.current.versionName ?? update.latestVersionName,
+        false
+      )
     },
     onSuccess: ({ failures }) => {
       setPending(null)
       for (const failure of failures) {
-        batchFailures.current.push(failure)
+        batch.current = recordSystemUpdateFailure(batch.current, failure)
       }
       void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
     },
@@ -269,8 +289,13 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     [active, pending, updateMutation.isPending]
   )
   const displayedActive = React.useMemo(
-    () => [...active, ...mockActive, ...preparingUpdates],
-    [active, mockActive, preparingUpdates]
+    () => [
+      ...active,
+      ...(heldHearthUpdate ? [heldHearthUpdate] : []),
+      ...mockActive,
+      ...preparingUpdates,
+    ],
+    [active, heldHearthUpdate, mockActive, preparingUpdates]
   )
 
   React.useEffect(() => {
@@ -295,27 +320,29 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
   }, [active, operationQueries, replaceActive])
 
   React.useEffect(() => {
-    if (!batchActive.current) return
+    if (!batch.current.active) return
     if (activeRef.current.length > 0 || updateMutation.isPending) {
       showSystemUpdateProgressToast(
-        batchVersionName.current ?? "the latest version",
+        batch.current.versionName ?? "the latest version",
         reconnecting,
         open ? undefined : () => onRetryTarget(null)
       )
       return
     }
 
-    batchActive.current = false
-    const failures = batchFailures.current
-    const hearth = batchHearthCompletion.current
-    batchFailures.current = []
-    batchHearthCompletion.current = null
+    const completedBatch = batch.current
+    batch.current = inactiveSystemUpdateBatch<
+      UpdateFailure,
+      HearthUpdateCompletion
+    >()
+    const failures = completedBatch.failures
+    const hearth = completedBatch.hearthCompletion
 
     if (failures.length > 0) {
       showSystemUpdateFailureToast(failures, onRetryTarget)
     } else if (hearth === null) {
       showSystemUpdateSuccessToast(
-        batchVersionName.current ?? "the latest version"
+        completedBatch.versionName ?? "the latest version"
       )
     }
 
@@ -348,8 +375,12 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         )
       )
       if (operation === null || operation === undefined) {
-        clearSystemUpdateActive(completed)
-        batchFailures.current.push({
+        const disposition = systemUpdateCompletionDisposition(
+          completed.component,
+          "failed"
+        )
+        if (disposition.clearPresence) clearSystemUpdateActive(completed)
+        batch.current = recordSystemUpdateFailure(batch.current, {
           message: `${completed.name}'s saved update operation could not be found. Check the target container before trying again.`,
           target: completed,
         })
@@ -358,8 +389,12 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       }
 
       if (operation.status === "failed") {
-        clearSystemUpdateActive(completed)
-        batchFailures.current.push({
+        const disposition = systemUpdateCompletionDisposition(
+          completed.component,
+          "failed"
+        )
+        if (disposition.clearPresence) clearSystemUpdateActive(completed)
+        batch.current = recordSystemUpdateFailure(batch.current, {
           message:
             operation.error ??
             "The update failed. The previous container was restored.",
@@ -368,7 +403,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
         continue
       }
-      clearSystemUpdateActive(completed)
+      const disposition = systemUpdateCompletionDisposition(
+        completed.component,
+        "succeeded"
+      )
+      if (disposition.clearPresence) clearSystemUpdateActive(completed)
       resetUpdateFailureCount(completed.targetKey)
       const completedVersion = completed.targetVersion ?? operation.version
       storeChangelogRange(
@@ -381,11 +420,20 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
         queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
       ])
-      if (operation.component === "hearth") {
-        batchHearthCompletion.current = {
+      if (disposition.lockUntilReload) {
+        const completion = {
           version: completedVersion,
           versionName:
             completed.versionName ?? friendlyVersionName(completedVersion),
+        }
+        batch.current = recordHearthUpdateCompletion(batch.current, completion)
+        if (isHearthUpdateLocked(batch.current)) {
+          setHeldHearthUpdate({
+            ...completed,
+            phase: "awaitingReload",
+            targetVersion: completedVersion,
+            versionName: completion.versionName,
+          })
         }
       }
     }
@@ -404,7 +452,13 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       latestVersion: string,
       latestVersionName?: string
     ) => {
-      if (updateMutation.isPending) return
+      if (
+        updateMutation.isPending ||
+        batch.current.active ||
+        heldHearthUpdate !== null
+      ) {
+        return
+      }
       setPending({
         latestVersion,
         latestVersionName:
@@ -412,7 +466,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         targets,
       })
     },
-    [updateMutation.isPending]
+    [heldHearthUpdate, updateMutation.isPending]
   )
 
   const handleMockUpdate = React.useCallback(
@@ -424,7 +478,9 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       if (
         targets.length === 0 ||
         updateMutation.isPending ||
+        batch.current.active ||
         activeRef.current.length > 0 ||
+        heldHearthUpdate !== null ||
         mockActive.length > 0
       ) {
         return
@@ -463,9 +519,12 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
               current.map((update, targetIndex) => ({
                 ...update,
                 phase:
-                  targetIndex === 0 || index > 1
-                    ? phase
-                    : phases[Math.max(0, index - 1)],
+                  phase === "replace.removeBackup" &&
+                  update.component === "hearth"
+                    ? "awaitingReload"
+                    : targetIndex === 0 || index > 1
+                      ? phase
+                      : phases[Math.max(0, index - 1)],
               }))
             )
             showSystemUpdateProgressToast(
@@ -493,11 +552,17 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
             showSystemUpdateSuccessToast(latestVersionName)
           }
         },
-        650 * (phases.length + 1)
+        650 * (phases.length + 4)
       )
       mockTimers.current.push(completionTimer)
     },
-    [clearMockTimers, mockActive.length, onOpenChange, updateMutation.isPending]
+    [
+      clearMockTimers,
+      heldHearthUpdate,
+      mockActive.length,
+      onOpenChange,
+      updateMutation.isPending,
+    ]
   )
 
   return (
@@ -519,7 +584,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
             changelogRevision={changelogRevision}
             focusedRelayId={initialRelayId}
             open={open}
-            starting={updateMutation.isPending || mockActive.length > 0}
+            starting={
+              updateMutation.isPending ||
+              mockActive.length > 0 ||
+              displayedActive.length > 0
+            }
             store={viewStore}
             onMockUpdate={handleMockUpdate}
             onUpdate={handleUpdate}

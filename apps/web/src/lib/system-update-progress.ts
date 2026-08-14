@@ -5,6 +5,7 @@ export type SystemUpdateProgress = {
 
 const progressByPhase: Readonly<Record<string, SystemUpdateProgress>> = {
   Preparing: { label: "Preparing", percent: 5 },
+  awaitingReload: { label: "Reload needed", percent: 100 },
   reconnecting: { label: "Reconnecting", percent: 88 },
   "replace.inspectContainer": { label: "Checking", percent: 10 },
   "replace.inspectImage": { label: "Checking", percent: 10 },
