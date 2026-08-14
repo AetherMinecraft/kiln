@@ -3,7 +3,6 @@ import { HeadContent, Scripts } from "@tanstack/react-router"
 import { Toaster } from "@workspace/ui/components/sonner"
 import { TooltipProvider } from "@workspace/ui/components/tooltip"
 
-import { KilnLogoSwitcher } from "@/components/kiln-logo-switcher"
 import { appearanceBootScript } from "@/lib/appearance"
 
 export function AppDocument({ children }: { children: React.ReactNode }) {
@@ -16,7 +15,6 @@ export function AppDocument({ children }: { children: React.ReactNode }) {
       <body className="overflow-hidden antialiased">
         <Toaster />
         <TooltipProvider delayDuration={250}>{children}</TooltipProvider>
-        {import.meta.env.DEV ? <KilnLogoSwitcher /> : null}
         <Scripts />
       </body>
     </html>
