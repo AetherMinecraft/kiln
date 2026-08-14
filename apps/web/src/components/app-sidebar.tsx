@@ -161,7 +161,7 @@ const AppSidebarView = React.memo(function AppSidebarView({
               className="h-11 data-[state=open]:bg-sidebar-accent"
               tooltip="Kiln"
             >
-              <HearthMark />
+              <HearthMark className="group-data-[collapsible=icon]:size-[32px]!" />
               <span className="min-w-0 flex-1 truncate font-heading text-[0.9375rem] font-semibold tracking-[-0.02em]">
                 Kiln
               </span>
@@ -483,7 +483,7 @@ const ServerSelector = React.memo(function ServerSelector({
           <SidebarMenuButton
             size="lg"
             tooltip="Switch server"
-            className={`mb-2 h-auto min-h-13 border border-l-2 border-sidebar-border/80 bg-background/45 py-2 ${instance ? statusBorderTone(instance.observedState) : "border-l-muted-foreground/25"} group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:min-h-8 group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:p-2!`}
+            className={`mb-2 h-auto min-h-13 border border-l-2 border-sidebar-border/80 bg-background/45 py-2 ${instance ? statusBorderTone(instance.observedState) : "border-l-muted-foreground/25"} group-data-[collapsible=icon]:min-h-[32px]! group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:p-[8px]!`}
           >
             <ServerTypeIcon
               implementation={instance?.implementation ?? ""}
@@ -742,7 +742,7 @@ function AccountNavigation({
           <SettingsNavigationButton />
         </SidebarMenuItem>
         <SidebarMenuItem>
-          <div className="flex h-11 items-center gap-2 px-2 group-data-[collapsible=icon]:px-0">
+          <div className="flex h-11 items-center gap-2 px-2 group-data-[collapsible=icon]:h-[44px] group-data-[collapsible=icon]:px-0">
             <Avatar
               size="sm"
               className="rounded-none group-data-[collapsible=icon]:hidden"
@@ -784,7 +784,7 @@ function SignOutButton({
       <TooltipTrigger asChild>
         <button
           type="button"
-          className="ml-auto grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors group-data-[collapsible=icon]:mx-auto hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45"
+          className="ml-auto grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors group-data-[collapsible=icon]:mx-auto group-data-[collapsible=icon]:size-[28px]! hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45"
           aria-label={signingOut ? "Signing out" : "Sign out"}
           disabled={signingOut}
           onClick={() => {
@@ -796,9 +796,9 @@ function SignOutButton({
           }}
         >
           {signingOut ? (
-            <LoaderCircle className="size-4 animate-spin" />
+            <LoaderCircle className="size-4 animate-spin group-data-[collapsible=icon]:size-[16px]!" />
           ) : (
-            <LogOut className="size-4" />
+            <LogOut className="size-4 group-data-[collapsible=icon]:size-[16px]!" />
           )}
         </button>
       </TooltipTrigger>
