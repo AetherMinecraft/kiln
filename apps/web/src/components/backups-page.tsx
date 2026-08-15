@@ -1731,54 +1731,73 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
 }: {
   backup: Backup
 }) {
-  const [now, setNow] = React.useState(() => Date.now())
-  React.useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
-    return () => window.clearInterval(timer)
-  }, [])
   const percent = backupTaskProgressPercent(backup)
-  const updatedAt = new Date(backup.taskUpdatedAt).getTime()
-  const progressAge =
-    shortRelativeBackupTime(updatedAt, now) ??
-    backupDateCompact.format(updatedAt)
   return (
-    <div className="min-w-0" aria-live="polite">
-      <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] leading-none text-muted-foreground">
-        <span className="truncate font-medium text-foreground/80">
-          {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
-        </span>
-        <span className="shrink-0 tabular-nums">
-          {percent === null
-            ? backup.taskBytesCompleted > 0
-              ? formatBytes(backup.taskBytesCompleted)
-              : "Working…"
-            : `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`}
-        </span>
+    <div className="min-w-0">
+      <div aria-live="polite">
+        <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] leading-none text-muted-foreground">
+          <span className="truncate font-medium text-foreground/80">
+            {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
+          </span>
+          <span className="shrink-0 tabular-nums">
+            {percent === null
+              ? backup.taskBytesCompleted > 0
+                ? formatBytes(backup.taskBytesCompleted)
+                : "Working…"
+              : `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`}
+          </span>
+        </div>
+        <Progress
+          aria-label={`${backup.name} progress`}
+          className={
+            percent === null
+              ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
+              : ""
+          }
+          value={percent ?? undefined}
+        />
       </div>
-      <Progress
-        aria-label={`${backup.name} progress`}
-        className={
-          percent === null
-            ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
-            : ""
-        }
-        value={percent ?? undefined}
-      />
       <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[0.625rem] text-muted-foreground">
-        {backup.taskCurrentPath ? (
-          <BackupCurrentPath path={backup.taskCurrentPath} />
-        ) : (
-          <span className="min-w-0 flex-1" />
-        )}
-        <span
-          className="shrink-0"
-          suppressHydrationWarning
-          title={backupDate.format(updatedAt)}
-        >
-          Last progress {progressAge}
-        </span>
+        <div aria-live="polite" className="flex min-w-0 flex-1">
+          {backup.taskCurrentPath ? (
+            <BackupCurrentPath path={backup.taskCurrentPath} />
+          ) : null}
+        </div>
+        <BackupElapsedTimer startedAt={backup.taskStartedAt} />
       </div>
     </div>
+  )
+})
+
+const BackupElapsedTimer = React.memo(function BackupElapsedTimer({
+  startedAt,
+}: {
+  startedAt: string | null
+}) {
+  const parsedStartedAt = startedAt ? new Date(startedAt).getTime() : Number.NaN
+  const startedAtMs = Number.isFinite(parsedStartedAt) ? parsedStartedAt : null
+  const [now, setNow] = React.useState(() => Date.now())
+  React.useEffect(() => {
+    if (startedAtMs === null) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [startedAtMs])
+  const elapsed = formatBackupElapsed(
+    startedAtMs === null ? 0 : now - startedAtMs
+  )
+  return (
+    <span
+      aria-label={`Elapsed backup time ${elapsed}`}
+      className="shrink-0 font-mono tabular-nums"
+      suppressHydrationWarning
+      title={
+        startedAtMs === null
+          ? "Waiting to start"
+          : `Started ${backupDate.format(startedAtMs)}`
+      }
+    >
+      {elapsed}
+    </span>
   )
 })
 
@@ -4318,6 +4337,13 @@ function shortRelativeBackupTime(
     return `${Math.floor(elapsed / backupDayMs)}d ago`
   }
   return null
+}
+
+function formatBackupElapsed(elapsedMs: number): string {
+  const elapsedSeconds = Math.floor(Math.max(0, elapsedMs) / 1_000)
+  const minutes = Math.floor(elapsedSeconds / 60)
+  const seconds = elapsedSeconds % 60
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
 }
 
 function parseOptionalInteger(value: string, label: string): number | null {

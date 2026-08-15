@@ -49,6 +49,7 @@ export type RelayGameHostSource = "configured" | "public_ip" | "relay"
 export interface RelayConfig {
   advertisedHost: string
   advertisedHostInferred: boolean
+  backupTimeoutMs: number
   brickCatalogUrl: string
   bootstrapToken: string | null
   browserOrigin: string
@@ -157,6 +158,9 @@ export function loadConfig(
     advertisedHost,
     advertisedHostInferred:
       !environment.KILN_RELAY_HOST?.trim() && !coolifyPublicOrigin,
+    backupTimeoutMs:
+      positiveIntegerEnvironment(environment, "KILN_BACKUP_TIMEOUT", 60) *
+      60_000,
     brickCatalogUrl:
       environment.KILN_BRICKS_CATALOG_URL?.trim() ||
       "https://raw.githubusercontent.com/kiln-site/hearth/main/apps/bricks/catalog.yml",
@@ -491,6 +495,19 @@ function integerEnvironment(
   const value = Number(configured || fallback)
   if (!Number.isInteger(value) || value < minimum || value > maximum) {
     throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`)
+  }
+  return value
+}
+
+function positiveIntegerEnvironment(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number
+): number {
+  const configured = environment[name]?.trim()
+  const value = Number(configured || fallback)
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`)
   }
   return value
 }

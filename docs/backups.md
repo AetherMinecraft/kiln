@@ -56,6 +56,10 @@ the first release because Relay already has a small, proven SQLite state layer
 and adopting the experimental persistence stack would add a second storage
 abstraction for one consumer.
 
+Create tasks have a bounded runtime. Relay cancels and aborts a backup after
+`KILN_BACKUP_TIMEOUT` minutes; the default is `60`. The timeout starts when the
+worker claims the task, so time spent queued does not consume its runtime.
+
 ## Catalog and policy
 
 A backup records its Relay, target kind and ID, artifact kind, reason, storage
