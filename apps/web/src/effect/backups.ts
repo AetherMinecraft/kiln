@@ -119,6 +119,7 @@ interface DispatchableBackupRow extends RowDataPacket {
 }
 
 interface KnownBackupTaskRow extends RowDataPacket {
+  backup_status: BackupRow["status"]
   bytes_completed: number | string
   id: string
   relay_updated_at_ms: number | string | null
@@ -599,6 +600,7 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
       Effect.gen(function* () {
         const knownTasks = yield* transaction.queryRows<KnownBackupTaskRow>(
           `SELECT task.id, task.status, task.bytes_completed,
+                  backup.status AS backup_status,
                   task.relay_updated_at_ms
              FROM ${databaseTable("backup_task")} task
              JOIN ${databaseTable("backup")} backup ON backup.id = task.backup_id
@@ -727,6 +729,12 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
           return
         }
         if (task.kind !== "create") return
+        if (
+          knownTask.backup_status === "deleting" ||
+          knownTask.backup_status === "deleted"
+        ) {
+          return
+        }
         if (task.status === "queued" || task.status === "running") {
           yield* transaction.execute(
             `UPDATE ${databaseTable("backup")}
@@ -1868,7 +1876,7 @@ export function shouldApplyRelayBackupTaskSnapshot(
     return incoming.updatedAt > current.relayUpdatedAt
   }
   if (incoming.status === current.status) {
-    return incoming.bytesCompleted >= current.bytesCompleted
+    return incoming.bytesCompleted > current.bytesCompleted
   }
   return (
     backupTaskStatusOrder(incoming.status) >

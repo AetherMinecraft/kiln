@@ -1194,12 +1194,16 @@ function writeBackupArchive(
     let bytes = 0
     let settled = false
 
+    const ignoreLateStreamError = () => undefined
     const cleanup = () => {
       archive.off("error", failed)
+      archive.on("error", ignoreLateStreamError)
       output.off("error", failed)
+      output.on("error", ignoreLateStreamError)
       output.off("close", finished)
       archive.off("data", outputChunk)
       activeSource?.off("error", failed)
+      activeSource?.on("error", ignoreLateStreamError)
       signal.removeEventListener("abort", aborted)
     }
     const finish = (cause?: Error) => {
@@ -1216,6 +1220,7 @@ function writeBackupArchive(
         })
     }
     const failed = (cause: Error) => {
+      if (settled) return
       activeSource?.destroy()
       archive.destroy()
       output.destroy()
@@ -1313,6 +1318,10 @@ function writeBackupArchive(
         return
       }
       const { handle, metadata: opened } = openedResult.success
+      if (settled) {
+        await handle.close()
+        return
+      }
       if (
         !opened.isFile() ||
         opened.dev !== entry.device ||

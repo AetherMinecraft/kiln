@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { createWriteStream, existsSync, mkdtempSync, rmSync } from "node:fs"
 import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -11,6 +11,7 @@ import type {
   BackupCreateTaskInput,
   BackupCreateTaskResult,
   BackupRestoreTaskInput,
+  BackupTaskPhase,
 } from "@workspace/contracts"
 import { relayBackupTaskSchema } from "@workspace/contracts"
 
@@ -178,10 +179,15 @@ describe("Relay backups", () => {
             symlink("level.dat", resolve(root, "world", "latest"))
           )
 
-          const progress = {
+          const progress: {
+            completed: number
+            currentPath: string | null
+            phase: BackupTaskPhase
+            total: number
+          } = {
             completed: 0,
             currentPath: null,
-            phase: "preparing" as const,
+            phase: "preparing",
             total: 0,
           }
           const input = backupInput(3)
@@ -237,6 +243,52 @@ describe("Relay backups", () => {
         }),
       (directory) =>
         Effect.sync(() => rmSync(directory, { force: true, recursive: true }))
+    )
+  )
+
+  it.effect("absorbs late stream errors after archive cancellation", () =>
+    Effect.acquireUseRelease(
+      temporaryDirectory("kiln-backup-cancel-"),
+      (directory) =>
+        Effect.promise(async () => {
+          const config = testConfig(directory)
+          const root = resolve(directory, "instances", "instance-1")
+          await mkdir(root, { recursive: true })
+          await writeFile(
+            resolve(root, "large.bin"),
+            randomBytes(8 * 1024 * 1024)
+          )
+          const controller = new AbortController()
+          const progress = {
+            completed: 0,
+            currentPath: null,
+            phase: "preparing" as const,
+            total: 0,
+          }
+          const input = backupInput(10)
+          const archiveRejected = createPortableInstanceBackup(
+            config,
+            input,
+            testInstance(),
+            progress,
+            controller.signal
+          ).then(
+            () => false,
+            () => true
+          )
+          while (progress.completed === 0) {
+            await new Promise<void>((resolveTurn) => setImmediate(resolveTurn))
+          }
+
+          controller.abort()
+          assert.isTrue(await archiveRejected)
+          await new Promise<void>((resolveTurn) => setImmediate(resolveTurn))
+
+          assert.isFalse(
+            existsSync(resolve(directory, "backups", `${input.backupId}.zip`))
+          )
+        }),
+      removeTemporaryDirectory
     )
   )
 

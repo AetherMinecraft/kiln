@@ -1182,6 +1182,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
   targetName: string
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
+  const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
 
   return (
     <tr className="group transition-colors hover:bg-muted/20 has-checked:bg-primary/[0.07]">
@@ -1195,7 +1196,11 @@ const BackupTableRow = React.memo(function BackupTableRow({
             editable={canCreate}
             name={backup.name}
           />
-          <BackupTaskState backup={backup} />
+          {hasTaskFeedback ? null : (
+            <div className="mt-1">
+              <BackupTaskFeedback backup={backup} />
+            </div>
+          )}
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
@@ -1213,17 +1218,31 @@ const BackupTableRow = React.memo(function BackupTableRow({
           targetKind={backup.targetKind}
         />
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground sm:table-cell">
-        <span className="block truncate" title={backup.filename ?? backup.id}>
-          {backup.filename ?? backup.id}
-        </span>
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm whitespace-nowrap text-muted-foreground lg:table-cell">
-        {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm whitespace-nowrap text-muted-foreground xl:table-cell">
-        <BackupCreatedTime createdAt={backup.createdAt} />
-      </WorkspaceTableCell>
+      {hasTaskFeedback ? (
+        <WorkspaceTableCell
+          className="hidden h-auto py-2.5 md:table-cell"
+          colSpan={3}
+        >
+          <BackupTaskFeedback backup={backup} />
+        </WorkspaceTableCell>
+      ) : (
+        <>
+          <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground sm:table-cell">
+            <span
+              className="block truncate"
+              title={backup.filename ?? backup.id}
+            >
+              {backup.filename ?? backup.id}
+            </span>
+          </WorkspaceTableCell>
+          <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm whitespace-nowrap text-muted-foreground lg:table-cell">
+            {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
+          </WorkspaceTableCell>
+          <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm whitespace-nowrap text-muted-foreground xl:table-cell">
+            <BackupCreatedTime createdAt={backup.createdAt} />
+          </WorkspaceTableCell>
+        </>
+      )}
       <WorkspaceTableCell className="h-auto py-2.5">
         <BackupRowActions
           backup={backup}
@@ -1258,6 +1277,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
   targetName: string
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
+  const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
   return (
     <article
       aria-label={backup.name}
@@ -1271,7 +1291,11 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
             editable={canCreate}
             name={backup.name}
           />
-          <BackupTaskState backup={backup} />
+          {hasTaskFeedback ? null : (
+            <div className="mt-1">
+              <BackupTaskFeedback backup={backup} />
+            </div>
+          )}
         </div>
       </div>
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
@@ -1283,15 +1307,21 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
           targetKind={backup.targetKind}
         />
       </div>
-      <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 text-xs text-muted-foreground">
-        <span className="truncate" title={backup.filename ?? backup.id}>
-          {backup.filename ?? backup.id}
-        </span>
-        <span className="whitespace-nowrap">
-          {backup.bytes === null ? "—" : formatBytes(backup.bytes)} ·{" "}
-          <BackupCreatedTime createdAt={backup.createdAt} />
-        </span>
-      </div>
+      {hasTaskFeedback ? (
+        <div className="mt-2.5">
+          <BackupTaskFeedback backup={backup} />
+        </div>
+      ) : (
+        <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 text-xs text-muted-foreground">
+          <span className="truncate" title={backup.filename ?? backup.id}>
+            {backup.filename ?? backup.id}
+          </span>
+          <span className="whitespace-nowrap">
+            {backup.bytes === null ? "—" : formatBytes(backup.bytes)} ·{" "}
+            <BackupCreatedTime createdAt={backup.createdAt} />
+          </span>
+        </div>
+      )}
       <BackupAvailabilityTags
         backup={backup}
         canCopy={canCreate}
@@ -1615,7 +1645,7 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
   )
 })
 
-const BackupTaskState = React.memo(function BackupTaskState({
+const BackupTaskFeedback = React.memo(function BackupTaskFeedback({
   backup,
 }: {
   backup: Backup
@@ -1631,7 +1661,7 @@ const BackupTaskState = React.memo(function BackupTaskState({
     <Tooltip>
       <TooltipTrigger asChild>
         <p
-          className={`mt-1 flex min-w-0 items-center gap-1 text-[0.6875rem] ${cancelled ? "text-muted-foreground" : "text-destructive"}`}
+          className={`flex min-w-0 items-center gap-1.5 text-xs ${cancelled ? "text-muted-foreground" : "text-destructive"}`}
         >
           {cancelled ? (
             <CircleStop className="size-3 shrink-0" />
@@ -1674,7 +1704,7 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
     shortRelativeBackupTime(updatedAt, now) ??
     backupDateCompact.format(updatedAt)
   return (
-    <div className="mt-1.5 max-w-md" aria-live="polite">
+    <div className="min-w-0" aria-live="polite">
       <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] leading-none text-muted-foreground">
         <span className="truncate font-medium text-foreground/80">
           {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
@@ -3892,6 +3922,17 @@ function backupIsActive(backup: Backup): boolean {
   return (
     backupSourceIsActive(backup) ||
     backup.artifacts.some((artifact) => activeStatuses.has(artifact.status))
+  )
+}
+
+function backupHasCreateTaskFeedback(backup: Backup): boolean {
+  if (backup.taskKind !== "create") return false
+  if (backup.taskStatus === "queued" || backup.taskStatus === "running") {
+    return true
+  }
+  return (
+    Boolean(backup.taskError) &&
+    (backup.taskStatus === "failed" || backup.taskStatus === "cancelled")
   )
 }
 
