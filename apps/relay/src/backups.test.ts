@@ -1,16 +1,17 @@
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { createWriteStream, existsSync, mkdtempSync, rmSync } from "node:fs"
 import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { afterAll, assert, describe, it, layer } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Fiber } from "effect"
 import ZipStream from "zip-stream"
 
 import type {
   BackupCreateTaskInput,
   BackupCreateTaskResult,
   BackupRestoreTaskInput,
+  BackupTaskPhase,
 } from "@workspace/contracts"
 import { relayBackupTaskSchema } from "@workspace/contracts"
 
@@ -40,11 +41,13 @@ describe("Relay backups", () => {
       bytesCompleted: 1,
       bytesTotal: 1,
       createdAt: 1,
+      currentPath: null,
       error: null,
       finishedAt: 2,
       input,
       inputRefreshRequired: false,
       kind: "create" as const,
+      phase: null,
       result: backupResult(0),
       startedAt: 1,
       status: "succeeded" as const,
@@ -52,6 +55,12 @@ describe("Relay backups", () => {
       updatedAt: 2,
     }
     assert.isTrue(relayBackupTaskSchema.safeParse(task).success)
+    const legacyTask = structuredClone(task)
+    Reflect.deleteProperty(legacyTask, "currentPath")
+    Reflect.deleteProperty(legacyTask, "phase")
+    const parsedLegacyTask = relayBackupTaskSchema.parse(legacyTask)
+    assert.strictEqual(parsedLegacyTask.currentPath, null)
+    assert.strictEqual(parsedLegacyTask.phase, null)
     assert.isFalse(
       relayBackupTaskSchema.safeParse({
         ...task,
@@ -106,6 +115,77 @@ describe("Relay backups", () => {
         )
       })
     )
+
+    it.effect("cancels a running create task and aborts its archive work", () =>
+      Effect.gen(function* () {
+        let started: (() => void) | undefined
+        const archiveStarted = new Promise<void>((resolveStarted) => {
+          started = resolveStarted
+        })
+        const manager = yield* BackupManager.make({
+          config: loadConfig({
+            KILN_RELAY_DATA_DIR: testDirectory,
+            KILN_RELAY_HOST: "relay.test",
+            NODE_ENV: "test",
+          }),
+          createArchive: (_input, _instance, _progress, signal) =>
+            new Promise((_resolveArchive, rejectArchive) => {
+              signal.addEventListener(
+                "abort",
+                () => rejectArchive(signal.reason),
+                { once: true }
+              )
+              started?.()
+            }),
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+        })
+        const input = backupInput(9)
+        yield* manager.enqueue(input)
+        const worker = yield* Effect.forkChild(manager.runPending())
+        yield* Effect.promise(() => archiveStarted)
+
+        const cancelled = yield* manager.cancel(input.taskId)
+        yield* Fiber.join(worker)
+
+        assert.strictEqual(cancelled?.status, "cancelled")
+        assert.strictEqual(
+          (yield* manager.get(input.taskId))?.error,
+          "Cancelled by user"
+        )
+      })
+    )
+
+    it.effect("cancels a queued create task before archive work starts", () =>
+      Effect.gen(function* () {
+        let archiveCalls = 0
+        const manager = yield* BackupManager.make({
+          config: loadConfig({
+            KILN_RELAY_DATA_DIR: testDirectory,
+            KILN_RELAY_HOST: "relay.test",
+            NODE_ENV: "test",
+          }),
+          createArchive: async () => {
+            archiveCalls += 1
+            return backupResult(11)
+          },
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+        })
+        const input = backupInput(11)
+        yield* manager.enqueue(input)
+
+        const cancelled = yield* manager.cancel(input.taskId)
+        yield* manager.runPending()
+
+        assert.strictEqual(cancelled?.status, "cancelled")
+        assert.strictEqual(archiveCalls, 0)
+        assert.strictEqual(
+          (yield* manager.get(input.taskId))?.error,
+          "Cancelled by user"
+        )
+      })
+    )
   })
 
   it.effect("creates an atomic, checksummed archive with safe exclusions", () =>
@@ -136,7 +216,17 @@ describe("Relay backups", () => {
             symlink("level.dat", resolve(root, "world", "latest"))
           )
 
-          const progress = { completed: 0, total: 0 }
+          const progress: {
+            completed: number
+            currentPath: string | null
+            phase: BackupTaskPhase
+            total: number
+          } = {
+            completed: 0,
+            currentPath: null,
+            phase: "preparing",
+            total: 0,
+          }
           const input = backupInput(3)
           yield* Effect.promise(() =>
             mkdir(resolve(directory, "backups"), { recursive: true })
@@ -193,6 +283,52 @@ describe("Relay backups", () => {
     )
   )
 
+  it.effect("absorbs late stream errors after archive cancellation", () =>
+    Effect.acquireUseRelease(
+      temporaryDirectory("kiln-backup-cancel-"),
+      (directory) =>
+        Effect.promise(async () => {
+          const config = testConfig(directory)
+          const root = resolve(directory, "instances", "instance-1")
+          await mkdir(root, { recursive: true })
+          await writeFile(
+            resolve(root, "large.bin"),
+            randomBytes(8 * 1024 * 1024)
+          )
+          const controller = new AbortController()
+          const progress = {
+            completed: 0,
+            currentPath: null,
+            phase: "preparing" as const,
+            total: 0,
+          }
+          const input = backupInput(10)
+          const archiveRejected = createPortableInstanceBackup(
+            config,
+            input,
+            testInstance(),
+            progress,
+            controller.signal
+          ).then(
+            () => false,
+            () => true
+          )
+          while (progress.completed === 0) {
+            await new Promise<void>((resolveTurn) => setImmediate(resolveTurn))
+          }
+
+          controller.abort()
+          assert.isTrue(await archiveRejected)
+          await new Promise<void>((resolveTurn) => setImmediate(resolveTurn))
+
+          assert.isFalse(
+            existsSync(resolve(directory, "backups", `${input.backupId}.zip`))
+          )
+        }),
+      removeTemporaryDirectory
+    )
+  )
+
   it.effect("restores a verified archive through a staged directory swap", () =>
     Effect.acquireUseRelease(
       temporaryDirectory("kiln-backup-restore-"),
@@ -208,6 +344,8 @@ describe("Relay backups", () => {
           const created = yield* Effect.promise(() =>
             createPortableInstanceBackup(config, input, testInstance(), {
               completed: 0,
+              currentPath: null,
+              phase: "preparing",
               total: 0,
             })
           )

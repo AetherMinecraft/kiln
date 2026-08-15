@@ -11,6 +11,8 @@ import {
   Archive,
   ArrowLeft,
   Check,
+  CircleAlert,
+  CircleStop,
   Cloud,
   CloudCog,
   Copy,
@@ -50,6 +52,7 @@ import {
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
+import { Progress } from "@workspace/ui/components/progress"
 import { showToast } from "@workspace/ui/components/sonner"
 import { Switch } from "@workspace/ui/components/switch"
 import { Textarea } from "@workspace/ui/components/textarea"
@@ -87,6 +90,7 @@ import {
   relaySnapshotQueryOptions,
 } from "@/lib/query-options"
 import {
+  cancelBackup,
   createDatabaseBackup,
   createInstanceBackup,
   createPlatformBackup,
@@ -1178,6 +1182,8 @@ const BackupTableRow = React.memo(function BackupTableRow({
   targetName: string
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
+  const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
+  const showsCreatedTimeWithFeedback = backup.taskStatus === "cancelled"
 
   return (
     <tr className="group transition-colors hover:bg-muted/20 has-checked:bg-primary/[0.07]">
@@ -1191,11 +1197,11 @@ const BackupTableRow = React.memo(function BackupTableRow({
             editable={canCreate}
             name={backup.name}
           />
-          {backup.taskError ? (
-            <p className="mt-1 line-clamp-1 text-[0.625rem] text-destructive">
-              {backup.taskError}
-            </p>
-          ) : null}
+          {hasTaskFeedback ? null : (
+            <div className="mt-1">
+              <BackupTaskFeedback backup={backup} />
+            </div>
+          )}
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
@@ -1214,19 +1220,32 @@ const BackupTableRow = React.memo(function BackupTableRow({
         />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground sm:table-cell">
-        <span className="block truncate" title={backup.filename ?? backup.id}>
-          {backup.filename ?? backup.id}
-        </span>
+        {hasTaskFeedback ? (
+          <DesktopBackupTaskFeedback backup={backup} />
+        ) : (
+          <span className="block truncate" title={backup.filename ?? backup.id}>
+            {backup.filename ?? backup.id}
+          </span>
+        )}
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm whitespace-nowrap text-muted-foreground lg:table-cell">
-        {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
+      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground lg:table-cell">
+        {hasTaskFeedback ? null : (
+          <span className="whitespace-nowrap">
+            {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
+          </span>
+        )}
       </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm whitespace-nowrap text-muted-foreground xl:table-cell">
-        <BackupCreatedTime createdAt={backup.createdAt} />
+      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground xl:table-cell">
+        {hasTaskFeedback && !showsCreatedTimeWithFeedback ? null : (
+          <span className="whitespace-nowrap">
+            <BackupCreatedTime createdAt={backup.createdAt} />
+          </span>
+        )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="h-auto py-2.5">
         <BackupRowActions
           backup={backup}
+          canCancel={canCreate}
           dialogStore={dialogStore}
           targetAvailable={targetAvailable}
         />
@@ -1257,6 +1276,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
   targetName: string
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
+  const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
   return (
     <article
       aria-label={backup.name}
@@ -1270,11 +1290,11 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
             editable={canCreate}
             name={backup.name}
           />
-          {backup.taskError ? (
-            <p className="mt-1 line-clamp-2 text-[0.625rem] text-destructive">
-              {backup.taskError}
-            </p>
-          ) : null}
+          {hasTaskFeedback ? null : (
+            <div className="mt-1">
+              <BackupTaskFeedback backup={backup} />
+            </div>
+          )}
         </div>
       </div>
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
@@ -1286,15 +1306,21 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
           targetKind={backup.targetKind}
         />
       </div>
-      <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 text-xs text-muted-foreground">
-        <span className="truncate" title={backup.filename ?? backup.id}>
-          {backup.filename ?? backup.id}
-        </span>
-        <span className="whitespace-nowrap">
-          {backup.bytes === null ? "—" : formatBytes(backup.bytes)} ·{" "}
-          <BackupCreatedTime createdAt={backup.createdAt} />
-        </span>
-      </div>
+      {hasTaskFeedback ? (
+        <div className="mt-2.5">
+          <BackupTaskFeedback backup={backup} />
+        </div>
+      ) : (
+        <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 text-xs text-muted-foreground">
+          <span className="truncate" title={backup.filename ?? backup.id}>
+            {backup.filename ?? backup.id}
+          </span>
+          <span className="whitespace-nowrap">
+            {backup.bytes === null ? "—" : formatBytes(backup.bytes)} ·{" "}
+            <BackupCreatedTime createdAt={backup.createdAt} />
+          </span>
+        </div>
+      )}
       <BackupAvailabilityTags
         backup={backup}
         canCopy={canCreate}
@@ -1304,6 +1330,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
       <div className="mt-3 flex justify-end border-t pt-2.5">
         <BackupRowActions
           backup={backup}
+          canCancel={canCreate}
           dialogStore={dialogStore}
           targetAvailable={targetAvailable}
         />
@@ -1617,15 +1644,200 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
   )
 })
 
+const BackupTaskFeedback = React.memo(function BackupTaskFeedback({
+  backup,
+}: {
+  backup: Backup
+}) {
+  const active =
+    backup.taskStatus === "queued" || backup.taskStatus === "running"
+  if (active) {
+    return <ActiveBackupTaskState backup={backup} />
+  }
+  if (!backup.taskError) return null
+  const cancelled = backup.taskStatus === "cancelled"
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <p
+          className={`flex min-w-0 items-center gap-1.5 text-xs ${cancelled ? "text-muted-foreground" : "text-destructive"}`}
+        >
+          {cancelled ? (
+            <CircleStop className="size-3 shrink-0" />
+          ) : (
+            <CircleAlert className="size-3 shrink-0" />
+          )}
+          <span className="truncate">{backup.taskError}</span>
+        </p>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-sm whitespace-normal" side="bottom">
+        {backup.taskPhase ? `${backupTaskPhaseLabel(backup.taskPhase)} · ` : ""}
+        {backup.taskCurrentPath ? `${backup.taskCurrentPath} · ` : ""}
+        {backup.taskError}
+      </TooltipContent>
+    </Tooltip>
+  )
+})
+
+const DesktopBackupTaskFeedback = React.memo(
+  function DesktopBackupTaskFeedback({ backup }: { backup: Backup }) {
+    const feedbackRef = React.useRef<HTMLDivElement>(null)
+    React.useLayoutEffect(() => {
+      const feedback = feedbackRef.current
+      const cell = feedback?.parentElement
+      const row = cell?.parentElement
+      const actionsCell = row?.lastElementChild
+      const createdCell = actionsCell?.previousElementSibling
+      if (
+        !feedback ||
+        !(cell instanceof HTMLTableCellElement) ||
+        !(actionsCell instanceof HTMLTableCellElement) ||
+        !(createdCell instanceof HTMLTableCellElement)
+      ) {
+        return
+      }
+      const fitToActions = () => {
+        const feedbackLeft = feedback.getBoundingClientRect().left
+        const showCreatedTime =
+          backup.taskStatus === "cancelled" &&
+          window.getComputedStyle(createdCell).display !== "none"
+        const boundaryCell = showCreatedTime ? createdCell : actionsCell
+        const boundaryLeft = boundaryCell.getBoundingClientRect().left
+        const trailingInset = Number.parseFloat(
+          window.getComputedStyle(boundaryCell).paddingLeft
+        )
+        feedback.style.width = `${Math.max(
+          0,
+          boundaryLeft - feedbackLeft - trailingInset
+        )}px`
+      }
+      const observer = new ResizeObserver(fitToActions)
+      observer.observe(cell)
+      observer.observe(createdCell)
+      observer.observe(actionsCell)
+      fitToActions()
+      return () => observer.disconnect()
+    }, [backup.taskStatus])
+    return (
+      <div ref={feedbackRef} className="relative z-10 min-w-0">
+        <BackupTaskFeedback backup={backup} />
+      </div>
+    )
+  }
+)
+
+const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
+  backup,
+}: {
+  backup: Backup
+}) {
+  const [now, setNow] = React.useState(() => Date.now())
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const percent = backupTaskProgressPercent(backup)
+  const updatedAt = new Date(backup.taskUpdatedAt).getTime()
+  const progressAge =
+    shortRelativeBackupTime(updatedAt, now) ??
+    backupDateCompact.format(updatedAt)
+  return (
+    <div className="min-w-0" aria-live="polite">
+      <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] leading-none text-muted-foreground">
+        <span className="truncate font-medium text-foreground/80">
+          {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
+        </span>
+        <span className="shrink-0 tabular-nums">
+          {percent === null
+            ? backup.taskBytesCompleted > 0
+              ? formatBytes(backup.taskBytesCompleted)
+              : "Working…"
+            : `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`}
+        </span>
+      </div>
+      <Progress
+        aria-label={`${backup.name} progress`}
+        className={
+          percent === null
+            ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
+            : ""
+        }
+        value={percent ?? undefined}
+      />
+      <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[0.625rem] text-muted-foreground">
+        {backup.taskCurrentPath ? (
+          <BackupCurrentPath path={backup.taskCurrentPath} />
+        ) : (
+          <span className="min-w-0 flex-1" />
+        )}
+        <span
+          className="shrink-0"
+          suppressHydrationWarning
+          title={backupDate.format(updatedAt)}
+        >
+          Last progress {progressAge}
+        </span>
+      </div>
+    </div>
+  )
+})
+
+const BackupCurrentPath = React.memo(function BackupCurrentPath({
+  path,
+}: {
+  path: string
+}) {
+  const segments = path.split("/")
+  const filename = segments.at(-1) ?? path
+  if (segments.length === 1) {
+    return (
+      <code className="mr-auto min-w-0 truncate font-mono" title={path}>
+        {path}
+      </code>
+    )
+  }
+  const firstDirectory = segments[0]
+  const middleDirectories =
+    segments.length > 2 ? segments.slice(1, -1).join("/") : null
+  return (
+    <code
+      className={`mr-auto grid min-w-0 font-mono ${middleDirectories ? "grid-cols-[minmax(7ch,1fr)_minmax(0,max-content)]" : "grid-cols-[minmax(4ch,1fr)_minmax(0,max-content)]"}`}
+      title={path}
+    >
+      <span
+        className={`grid min-w-0 ${middleDirectories ? "grid-cols-[minmax(4ch,max-content)_minmax(3ch,1fr)]" : "grid-cols-[minmax(4ch,max-content)]"}`}
+      >
+        <span className="flex min-w-0">
+          <span className="truncate">{firstDirectory}</span>
+          <span>/</span>
+        </span>
+        {middleDirectories ? (
+          <span className="flex min-w-0">
+            <span className="truncate">{middleDirectories}</span>
+            <span>/</span>
+          </span>
+        ) : null}
+      </span>
+      <span className="truncate">{filename}</span>
+    </code>
+  )
+})
+
 const BackupRowActions = React.memo(function BackupRowActions({
   backup,
+  canCancel,
   dialogStore,
   targetAvailable,
 }: {
   backup: Backup
+  canCancel: boolean
   dialogStore: BackupDialogStore
   targetAvailable: boolean
 }) {
+  const cancellable =
+    canCancel &&
+    backup.taskKind === "create" &&
+    (backup.taskStatus === "queued" || backup.taskStatus === "running")
   const canRestore =
     backup.status === "available" &&
     !backupSourceIsActive(backup) &&
@@ -1645,7 +1857,9 @@ const BackupRowActions = React.memo(function BackupRowActions({
   )
   return (
     <div className="flex items-center gap-0.5">
-      {targetAvailable ? (
+      {cancellable ? (
+        <CancelBackupButton backup={backup} />
+      ) : targetAvailable ? (
         restore
       ) : (
         <Tooltip>
@@ -1672,6 +1886,51 @@ const BackupRowActions = React.memo(function BackupRowActions({
         onClick={() => dialogStore.open({ backup, kind: "delete" })}
       />
     </div>
+  )
+})
+
+const CancelBackupButton = React.memo(function CancelBackupButton({
+  backup,
+}: {
+  backup: Backup
+}) {
+  const queryClient = useQueryClient()
+  const cancel = useMutation({
+    mutationFn: () => cancelBackup({ data: { backupId: backup.id } }),
+    onError: (error) => {
+      showToast({
+        message:
+          error instanceof Error ? error.message : "Could not cancel backup",
+        type: "error",
+      })
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
+      showToast({ message: "Backup cancelled", type: "success" })
+    },
+  })
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-label={`Cancel ${backup.name}`}
+          disabled={cancel.isPending}
+          size="sm"
+          type="button"
+          variant="destructive"
+          onClick={() => cancel.mutate()}
+        >
+          {cancel.isPending ? (
+            <LoaderCircle className="animate-spin" />
+          ) : (
+            <CircleStop />
+          )}
+          Cancel
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">Stop creating this backup</TooltipContent>
+    </Tooltip>
   )
 })
 
@@ -3740,6 +3999,17 @@ function backupIsActive(backup: Backup): boolean {
   )
 }
 
+function backupHasCreateTaskFeedback(backup: Backup): boolean {
+  if (backup.taskKind !== "create") return false
+  if (backup.taskStatus === "queued" || backup.taskStatus === "running") {
+    return true
+  }
+  return (
+    Boolean(backup.taskError) &&
+    (backup.taskStatus === "failed" || backup.taskStatus === "cancelled")
+  )
+}
+
 function backupSourceIsActive(backup: Backup): boolean {
   return (
     activeStatuses.has(backup.status) ||
@@ -3955,6 +4225,35 @@ function backupStatusFilterLabel(status: BackupFilters["status"]): string {
   )
 }
 
+function backupTaskPhaseLabel(
+  phase: Backup["taskPhase"],
+  status?: Backup["taskStatus"]
+): string {
+  if (!phase) return status === "queued" ? "Queued" : "Working"
+  switch (phase) {
+    case "preparing":
+      return "Preparing"
+    case "collecting":
+      return "Scanning files"
+    case "archiving":
+      return "Archiving"
+    case "dumping":
+      return "Exporting data"
+    case "uploading":
+      return "Uploading"
+    case "finalizing":
+      return "Finalizing"
+  }
+}
+
+function backupTaskProgressPercent(backup: Backup): number | null {
+  if (backup.taskBytesTotal === null || backup.taskBytesTotal <= 0) return null
+  return Math.min(
+    100,
+    Math.round((backup.taskBytesCompleted / backup.taskBytesTotal) * 100)
+  )
+}
+
 function subscribeToMobileBackupLayout(onChange: () => void): () => void {
   const media = window.matchMedia(mobileBackupLayoutQuery)
   media.addEventListener("change", onChange)
@@ -3982,6 +4281,9 @@ function backupSearchText(backup: Backup): string {
     backup.targetKind,
     backup.status,
     backup.relayId,
+    backup.taskCurrentPath,
+    backup.taskError,
+    backup.taskPhase,
     ...backup.artifacts.map((artifact) =>
       artifact.storageId ? "s3" : "local"
     ),
@@ -4000,8 +4302,11 @@ function backupMatchesSearch(
   )
 }
 
-function shortRelativeBackupTime(timestamp: number): string | null {
-  const elapsed = Math.max(0, Date.now() - timestamp)
+function shortRelativeBackupTime(
+  timestamp: number,
+  now: number = Date.now()
+): string | null {
+  const elapsed = Math.max(0, now - timestamp)
   if (elapsed < backupMinuteMs) return "just now"
   if (elapsed < backupHourMs) {
     return `${Math.floor(elapsed / backupMinuteMs)}m ago`

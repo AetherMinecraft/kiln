@@ -47,6 +47,7 @@ export const relayControlOperations = [
   "database.dump.export",
   "database.dump.import",
   "backup.task.enqueue",
+  "backup.task.cancel",
   "backup.task.get",
   "backup.task.list",
   "instance.create",

@@ -727,7 +727,8 @@ export function isAuditedOperation(operation: RelayControlOperation): boolean {
     operation === "database.network.write" ||
     operation === "database.dump.export" ||
     operation === "database.dump.import" ||
-    operation === "backup.task.enqueue"
+    operation === "backup.task.enqueue" ||
+    operation === "backup.task.cancel"
   )
 }
 
@@ -901,6 +902,8 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       if (kind === "delete") return "backup.delete"
       return null
     }
+    case "backup.task.cancel":
+      return "backup.create"
     case "backup.task.get":
     case "backup.task.list":
       return "backup.read"

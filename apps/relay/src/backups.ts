@@ -19,6 +19,7 @@ import {
 } from "node:fs/promises"
 import { relative, resolve, sep } from "node:path"
 import { isIP } from "node:net"
+import { Transform } from "node:stream"
 import { constants as zlibConstants } from "node:zlib"
 import { Effect, Fiber, Queue, Result } from "effect"
 import { minimatch } from "minimatch"
@@ -31,6 +32,7 @@ import {
   type BackupCreateTaskResult,
   type BackupDeleteTaskInput,
   type BackupTaskInput,
+  type BackupTaskPhase,
   type RelayBackupTask,
 } from "@workspace/contracts"
 
@@ -68,6 +70,8 @@ const DEFAULT_EXCLUDES = [
 
 type BackupProgress = {
   completed: number
+  currentPath: string | null
+  phase: BackupTaskPhase
   total: number
 }
 
@@ -84,7 +88,8 @@ type ArchiveEntry = {
 type CreateArchive = (
   input: BackupCreateTaskInput,
   instance: RelayInstanceConfig,
-  progress: BackupProgress
+  progress: BackupProgress,
+  signal: AbortSignal
 ) => Promise<BackupCreateTaskResult>
 
 export class BackupManager {
@@ -97,6 +102,7 @@ export class BackupManager {
   readonly #databases: DatabaseDriver | null
   readonly #state: RelayStateStore["Service"]
   readonly #wake: Queue.Queue<void>
+  readonly #activeCreates = new Map<string, AbortController>()
 
   private constructor(options: {
     config: RelayConfig
@@ -130,12 +136,13 @@ export class BackupManager {
         config: options.config,
         createArchive:
           options.createArchive ??
-          ((input, instance, progress) =>
+          ((input, instance, progress, signal) =>
             createPortableInstanceBackup(
               options.config,
               input,
               instance,
-              progress
+              progress,
+              signal
             )),
         findInstance: options.findInstance,
         isInstanceStopped: options.isInstanceStopped,
@@ -175,6 +182,14 @@ export class BackupManager {
     return this.#state.listBackupTasks(updatedAfter)
   }
 
+  cancel(taskId: string) {
+    return Effect.gen({ self: this }, function* () {
+      const cancelled = yield* this.#state.cancelBackupTask(taskId, Date.now())
+      if (cancelled) this.#activeCreates.get(taskId)?.abort()
+      return yield* this.#state.getBackupTask(taskId)
+    })
+  }
+
   run() {
     return Effect.gen({ self: this }, function* () {
       while (true) {
@@ -193,7 +208,14 @@ export class BackupManager {
       while (true) {
         const task = yield* this.#state.claimNextBackupTask(Date.now())
         if (!task) return
-        yield* this.#execute(task).pipe(
+        const controller =
+          task.kind === "create" ? new AbortController() : undefined
+        if (controller) {
+          this.#activeCreates.set(task.taskId, controller)
+          const current = yield* this.#state.getBackupTask(task.taskId)
+          if (!current || current.status !== "running") controller.abort()
+        }
+        yield* this.#execute(task, controller?.signal).pipe(
           Effect.catch((cause) =>
             this.#state
               .failBackupTask(
@@ -202,22 +224,29 @@ export class BackupManager {
                 Date.now()
               )
               .pipe(
-                Effect.tap(() =>
-                  Effect.logError("Relay backup task failed", {
-                    backupId: task.backupId,
-                    cause,
-                    taskId: task.taskId,
-                  })
+                Effect.tap((failed) =>
+                  failed
+                    ? Effect.logError("Relay backup task failed", {
+                        backupId: task.backupId,
+                        cause,
+                        taskId: task.taskId,
+                      })
+                    : Effect.void
                 ),
                 Effect.asVoid
               )
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (controller) this.#activeCreates.delete(task.taskId)
+            })
           )
         )
       }
     })
   }
 
-  #execute(task: RelayBackupTask) {
+  #execute(task: RelayBackupTask, signal?: AbortSignal) {
     return Effect.gen({ self: this }, function* () {
       if (task.input.kind === "restore") {
         const input = task.input
@@ -371,12 +400,18 @@ export class BackupManager {
         return
       }
       const input = task.input
+      const createSignal = signal ?? new AbortController().signal
       if (
         input.target.kind === "platform" &&
         input.artifactKind === "platform_bundle" &&
         input.mode === "full"
       ) {
-        const progress = { completed: 0, total: 0 }
+        const progress: BackupProgress = {
+          completed: 0,
+          currentPath: null,
+          phase: "preparing",
+          total: 0,
+        }
         const progressFiber = yield* Effect.forkChild(
           Effect.sleep("500 millis").pipe(
             Effect.andThen(
@@ -385,7 +420,9 @@ export class BackupManager {
                   .updateBackupTaskProgress(
                     task.taskId,
                     progress.completed,
-                    null,
+                    progress.total || null,
+                    progress.phase,
+                    progress.currentPath,
                     Date.now()
                   )
                   .pipe(Effect.asVoid)
@@ -402,13 +439,15 @@ export class BackupManager {
           })
         )
         yield* promiseEffect(() => rm(destination, { force: true }))
-        const created = yield* Effect.tryPromise({
+        progress.phase = "dumping"
+        const result = yield* Effect.tryPromise({
           try: () =>
             createEncryptedPlatformBackup(
               this.#config,
               input,
               destination,
-              progress
+              progress,
+              createSignal
             ),
           catch: (cause) =>
             RelayBackupError.make({
@@ -417,14 +456,32 @@ export class BackupManager {
               reason: backupErrorMessage(cause),
               cause,
             }),
-        }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
-        const result = yield* storeCreatedBackup(this.#config, input, created)
+        }).pipe(
+          Effect.flatMap((created) =>
+            storeCreatedBackup(
+              this.#config,
+              input,
+              created,
+              progress,
+              createSignal
+            )
+          ),
+          Effect.onError(() =>
+            promiseEffect(() => rm(destination, { force: true })).pipe(
+              Effect.ignore
+            )
+          ),
+          Effect.ensuring(Fiber.interrupt(progressFiber))
+        )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
           result,
           Date.now()
         )
         if (!completed) {
+          yield* promiseEffect(() => rm(destination, { force: true })).pipe(
+            Effect.ignore
+          )
           return yield* backupFailure(
             "task_state_changed",
             "create.complete",
@@ -445,7 +502,12 @@ export class BackupManager {
             "The database backup driver is unavailable"
           )
         }
-        const progress = { completed: 0, total: 0 }
+        const progress: BackupProgress = {
+          completed: 0,
+          currentPath: null,
+          phase: "dumping",
+          total: 0,
+        }
         const progressFiber = yield* Effect.forkChild(
           Effect.sleep("500 millis").pipe(
             Effect.andThen(
@@ -454,7 +516,9 @@ export class BackupManager {
                   .updateBackupTaskProgress(
                     task.taskId,
                     progress.completed,
-                    null,
+                    progress.total || null,
+                    progress.phase,
+                    progress.currentPath,
                     Date.now()
                   )
                   .pipe(Effect.asVoid)
@@ -471,13 +535,14 @@ export class BackupManager {
           })
         )
         yield* promiseEffect(() => rm(destination, { force: true }))
-        const created = yield* Effect.tryPromise({
+        const result = yield* Effect.tryPromise({
           try: () =>
             createCompressedDatabaseBackup(
               this.#databases!,
               input,
               destination,
-              progress
+              progress,
+              createSignal
             ),
           catch: (cause) =>
             RelayBackupError.make({
@@ -486,14 +551,32 @@ export class BackupManager {
               reason: backupErrorMessage(cause),
               cause,
             }),
-        }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
-        const result = yield* storeCreatedBackup(this.#config, input, created)
+        }).pipe(
+          Effect.flatMap((created) =>
+            storeCreatedBackup(
+              this.#config,
+              input,
+              created,
+              progress,
+              createSignal
+            )
+          ),
+          Effect.onError(() =>
+            promiseEffect(() => rm(destination, { force: true })).pipe(
+              Effect.ignore
+            )
+          ),
+          Effect.ensuring(Fiber.interrupt(progressFiber))
+        )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
           result,
           Date.now()
         )
         if (!completed) {
+          yield* promiseEffect(() => rm(destination, { force: true })).pipe(
+            Effect.ignore
+          )
           return yield* backupFailure(
             "task_state_changed",
             "create.complete",
@@ -531,7 +614,12 @@ export class BackupManager {
         )
       }
 
-      const progress = { completed: 0, total: 0 }
+      const progress: BackupProgress = {
+        completed: 0,
+        currentPath: null,
+        phase: "preparing",
+        total: 0,
+      }
       const progressFiber = yield* Effect.forkChild(
         Effect.sleep("500 millis").pipe(
           Effect.andThen(
@@ -541,6 +629,8 @@ export class BackupManager {
                   task.taskId,
                   progress.completed,
                   progress.total || null,
+                  progress.phase,
+                  progress.currentPath,
                   Date.now()
                 )
                 .pipe(Effect.asVoid)
@@ -549,8 +639,8 @@ export class BackupManager {
           Effect.forever
         )
       )
-      const archived = yield* Effect.tryPromise({
-        try: () => this.#createArchive(input, instance, progress),
+      const result = yield* Effect.tryPromise({
+        try: () => this.#createArchive(input, instance, progress, createSignal),
         catch: (cause) =>
           cause instanceof RelayBackupError
             ? cause
@@ -560,14 +650,32 @@ export class BackupManager {
                 reason: backupErrorMessage(cause),
                 cause,
               }),
-      }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
-      const result = yield* storeCreatedBackup(this.#config, input, archived)
+      }).pipe(
+        Effect.flatMap((archived) =>
+          storeCreatedBackup(
+            this.#config,
+            input,
+            archived,
+            progress,
+            createSignal
+          )
+        ),
+        Effect.onError(() =>
+          promiseEffect(() =>
+            rm(backupArchivePath(this.#config, input.backupId), { force: true })
+          ).pipe(Effect.ignore)
+        ),
+        Effect.ensuring(Fiber.interrupt(progressFiber))
+      )
       const completed = yield* this.#state.completeBackupTask(
         task.taskId,
         result,
         Date.now()
       )
       if (!completed) {
+        yield* promiseEffect(() =>
+          rm(backupArchivePath(this.#config, input.backupId), { force: true })
+        ).pipe(Effect.ignore)
         return yield* backupFailure(
           "task_state_changed",
           "create.complete",
@@ -582,8 +690,10 @@ export async function createPortableInstanceBackup(
   config: RelayConfig,
   input: BackupCreateTaskInput,
   instance: RelayInstanceConfig,
-  progress: BackupProgress
+  progress: BackupProgress,
+  signal: AbortSignal = new AbortController().signal
 ): Promise<BackupCreateTaskResult> {
+  signal.throwIfAborted()
   const configuredRoot = await realpath(config.rootDirectory)
   const instanceRoot = await realpath(
     resolve(configuredRoot, instance.directory)
@@ -613,7 +723,15 @@ export async function createPortableInstanceBackup(
     const result = await Effect.runPromise(
       Effect.tryPromise({
         try: async () => {
-          const collected = await collectBackupEntries(instanceRoot, patterns)
+          progress.phase = "collecting"
+          progress.currentPath = null
+          const collected = await collectBackupEntries(
+            instanceRoot,
+            patterns,
+            progress,
+            signal
+          )
+          signal.throwIfAborted()
           progress.completed = 0
           progress.total = collected.entries.reduce(
             (total, entry) => total + entry.size,
@@ -629,6 +747,7 @@ export async function createPortableInstanceBackup(
             collected.entries,
             maximumBytes,
             progress,
+            signal,
             {
               artifactKind: "archive",
               backupId: input.backupId,
@@ -649,6 +768,9 @@ export async function createPortableInstanceBackup(
               )
             )
           }
+          progress.phase = "finalizing"
+          progress.currentPath = null
+          signal.throwIfAborted()
           await rename(temporary, destination)
           return {
             bytes: written.bytes,
@@ -686,13 +808,25 @@ export async function createPortableInstanceBackup(
 function storeCreatedBackup(
   config: RelayConfig,
   input: BackupCreateTaskInput,
-  result: BackupCreateTaskResult
+  result: BackupCreateTaskResult,
+  progress: BackupProgress,
+  signal: AbortSignal
 ) {
   return Effect.gen(function* () {
+    progress.phase = "uploading"
+    progress.currentPath = null
     const destinations = [input.destination, ...(input.replicas ?? [])]
+    const uploadCount = destinations.filter(
+      (destination) => destination.kind === "s3"
+    ).length
+    if (uploadCount > 0) {
+      progress.completed = 0
+      progress.total = result.bytes * uploadCount
+    }
     const outcomes: NonNullable<BackupCreateTaskResult["artifacts"]> = []
     let available = 0
     for (const destination of destinations) {
+      signal.throwIfAborted()
       if (destination.kind === "local") {
         available += 1
         if (destination.artifactId) {
@@ -705,7 +839,18 @@ function storeCreatedBackup(
         continue
       }
       const uploaded = yield* Effect.result(
-        uploadBackupArtifact(config, { ...input, destination }, result)
+        uploadBackupArtifact(
+          config,
+          { ...input, destination },
+          result,
+          signal,
+          (bytes) => {
+            progress.completed = Math.min(
+              progress.total,
+              progress.completed + bytes
+            )
+          }
+        )
       )
       if (Result.isSuccess(uploaded)) {
         available += 1
@@ -736,6 +881,8 @@ function storeCreatedBackup(
         "The backup archive could not be stored in any destination"
       )
     }
+    signal.throwIfAborted()
+    progress.phase = "finalizing"
     return { ...result, artifacts: outcomes }
   })
 }
@@ -745,7 +892,9 @@ function uploadBackupArtifact(
   input: BackupCreateTaskInput & {
     destination: Extract<BackupCreateTaskInput["destination"], { kind: "s3" }>
   },
-  result: BackupCreateTaskResult
+  result: BackupCreateTaskResult,
+  signal: AbortSignal,
+  onChunk: (bytes: number) => void
 ) {
   if (result.bytes > MAX_S3_SINGLE_PUT_BYTES) {
     return backupFailure(
@@ -764,6 +913,8 @@ function uploadBackupArtifact(
           "content-length": String(result.bytes),
         },
         method: "PUT",
+        onBodyChunk: onChunk,
+        signal,
         url: input.destination.uploadUrl,
       }),
     catch: (cause) =>
@@ -851,6 +1002,8 @@ function sendSignedBackupRequest(input: {
   bodyPath?: string
   headers: Readonly<Record<string, string>>
   method: "DELETE" | "PUT"
+  onBodyChunk?: (bytes: number) => void
+  signal?: AbortSignal
   url: string
 }): Promise<void> {
   const url = new URL(input.url)
@@ -874,6 +1027,7 @@ function sendSignedBackupRequest(input: {
         headers: input.headers,
         lookup: input.allowPrivateNetwork ? undefined : secureRemoteLookup,
         method: input.method,
+        signal: input.signal,
       },
       (response) => {
         let responseBytes = 0
@@ -899,9 +1053,21 @@ function sendSignedBackupRequest(input: {
     })
     request.once("error", rejectRequest)
     if (input.bodyPath) {
-      const body = createReadStream(input.bodyPath)
+      const body = createReadStream(input.bodyPath, { signal: input.signal })
       body.once("error", (cause) => request.destroy(cause))
-      body.pipe(request)
+      const onBodyChunk = input.onBodyChunk
+      if (!onBodyChunk) {
+        body.pipe(request)
+        return
+      }
+      const meter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          onBodyChunk(chunk.byteLength)
+          callback(null, chunk)
+        },
+      })
+      meter.once("error", (cause) => request.destroy(cause))
+      body.pipe(meter).pipe(request)
     } else {
       request.end()
     }
@@ -934,19 +1100,24 @@ async function cleanupBackupPartials(
 
 async function collectBackupEntries(
   root: string,
-  patterns: ReadonlyArray<string>
+  patterns: ReadonlyArray<string>,
+  progress: BackupProgress,
+  signal: AbortSignal
 ): Promise<{ entries: Array<ArchiveEntry>; warnings: Array<string> }> {
   const entries: Array<ArchiveEntry> = []
   const warnings: Array<string> = []
 
   const visit = async (directory: string): Promise<void> => {
+    signal.throwIfAborted()
     const children = []
     for await (const child of await opendir(directory)) children.push(child)
     children.sort((left, right) => left.name.localeCompare(right.name))
     for (const child of children) {
+      signal.throwIfAborted()
       const absolute = resolve(directory, child.name)
       requireContained(root, absolute)
       const name = relative(root, absolute).split(sep).join("/")
+      progress.currentPath = name
       const inspected = await Effect.runPromise(
         Effect.result(promiseEffect(() => lstat(absolute)))
       )
@@ -1001,6 +1172,7 @@ async function collectBackupEntries(
   }
 
   await visit(root)
+  progress.currentPath = null
   return { entries, warnings }
 }
 
@@ -1032,6 +1204,7 @@ function writeBackupArchive(
   entries: ReadonlyArray<ArchiveEntry>,
   maxBytes: number | null,
   progress: BackupProgress,
+  signal: AbortSignal,
   manifest: BackupArchiveManifest
 ): Promise<{
   bytes: number
@@ -1055,12 +1228,17 @@ function writeBackupArchive(
     let bytes = 0
     let settled = false
 
+    const ignoreLateStreamError = () => undefined
     const cleanup = () => {
       archive.off("error", failed)
+      archive.on("error", ignoreLateStreamError)
       output.off("error", failed)
+      output.on("error", ignoreLateStreamError)
       output.off("close", finished)
       archive.off("data", outputChunk)
       activeSource?.off("error", failed)
+      activeSource?.on("error", ignoreLateStreamError)
+      signal.removeEventListener("abort", aborted)
     }
     const finish = (cause?: Error) => {
       if (settled) return
@@ -1076,11 +1254,13 @@ function writeBackupArchive(
         })
     }
     const failed = (cause: Error) => {
+      if (settled) return
       activeSource?.destroy()
       archive.destroy()
       output.destroy()
       finish(cause)
     }
+    const aborted = () => failed(backupAbortError(signal))
     const outputChunk = (chunk: Buffer) => {
       bytes += chunk.byteLength
       if (maxBytes !== null && bytes > maxBytes) {
@@ -1100,6 +1280,11 @@ function writeBackupArchive(
     output.once("error", failed)
     output.once("close", finished)
     archive.on("data", outputChunk)
+    signal.addEventListener("abort", aborted, { once: true })
+    if (signal.aborted) {
+      aborted()
+      return
+    }
     archive.pipe(output)
 
     const append = (index: number) => {
@@ -1135,6 +1320,8 @@ function writeBackupArchive(
         )
         return
       }
+      progress.phase = "archiving"
+      progress.currentPath = entry.name
       const openedResult = await Effect.runPromise(
         Effect.result(
           promiseEffect(() =>
@@ -1165,6 +1352,10 @@ function writeBackupArchive(
         return
       }
       const { handle, metadata: opened } = openedResult.success
+      if (settled) {
+        await handle.close()
+        return
+      }
       if (
         !opened.isFile() ||
         opened.dev !== entry.device ||
@@ -1179,7 +1370,7 @@ function writeBackupArchive(
         append(index + 1)
         return
       }
-      const source = handle.createReadStream()
+      const source = handle.createReadStream({ signal })
       activeSource = source
       source.once("error", failed)
       source.on("data", (chunk) => {
@@ -1272,6 +1463,12 @@ function backupFailure(code: string, operation: string, reason: string) {
 
 function backupErrorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : "Backup operation failed"
+}
+
+function backupAbortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Backup creation cancelled")
 }
 
 function backupWarning(message: string): string {

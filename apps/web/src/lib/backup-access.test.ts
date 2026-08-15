@@ -45,9 +45,16 @@ const backup = {
   storageId: null,
   targetId: "instance-1",
   targetKind: "instance",
+  taskBytesCompleted: 1,
+  taskBytesTotal: 1,
+  taskCurrentPath: null,
   taskError: null,
   taskId: "319864b6-421f-4a19-8946-f51048245d73",
+  taskKind: "create",
+  taskPhase: null,
+  taskStartedAt: "2026-08-10T00:00:00.000Z",
   taskStatus: "succeeded",
+  taskUpdatedAt: "2026-08-10T00:00:00.000Z",
   warnings: [],
 } satisfies BackupCatalogRecord
 

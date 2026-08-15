@@ -165,6 +165,77 @@ describe("backup limits", () => {
 })
 
 describe("backup reconciliation", () => {
+  it("does not resurrect a deleted backup from its historical create task", async () => {
+    const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: (sql, values) =>
+            Effect.sync(() => {
+              writes.push({ sql, values })
+              return emptyResult
+            }),
+          queryRows: <TRow extends RowDataPacket>() =>
+            Effect.succeed([
+              {
+                backup_status: "deleted",
+                bytes_completed: 0,
+                id: "task-one",
+                relay_updated_at_ms: null,
+                status: "queued",
+              },
+            ] as unknown as ReadonlyArray<TRow>),
+        }),
+    })
+    const task = {
+      backupId: "backup-one",
+      bytesCompleted: 256,
+      bytesTotal: 256,
+      createdAt: 50,
+      currentPath: null,
+      error: null,
+      finishedAt: 200,
+      input: {
+        artifactKind: "archive",
+        backupId: "backup-one",
+        destination: {
+          artifactId: "00000000-0000-4000-8000-000000000001",
+          kind: "local",
+        },
+        exclude: [],
+        kind: "create",
+        maxBytes: null,
+        mode: "full",
+        reason: "manual",
+        replicas: [],
+        target: { id: "instance-one", kind: "instance" },
+        taskId: "task-one",
+      },
+      inputRefreshRequired: false,
+      kind: "create",
+      phase: null,
+      result: {
+        bytes: 256,
+        checksumSha256: "a".repeat(64),
+        filename: "backup-one.zip",
+        warnings: [],
+      },
+      startedAt: 100,
+      status: "succeeded",
+      taskId: "task-one",
+      updatedAt: 200,
+    } satisfies RelayBackupTask
+
+    await Effect.runPromise(
+      reconcileBackupTaskEffect(task).pipe(Effect.provide(databaseLayer))
+    )
+
+    expect(writes).toHaveLength(1)
+    expect(writes[0]?.sql).toContain("backup_task")
+  })
+
   it("keeps artifacts available when their deletion fails", async () => {
     const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
     const databaseLayer = Layer.succeed(Database)({
@@ -197,6 +268,7 @@ describe("backup reconciliation", () => {
       bytesCompleted: 0,
       bytesTotal: null,
       createdAt: 50,
+      currentPath: null,
       error: null,
       finishedAt: 200,
       input: {
@@ -211,6 +283,7 @@ describe("backup reconciliation", () => {
       },
       inputRefreshRequired: false,
       kind: "delete",
+      phase: null,
       result: {
         artifacts: [
           {
@@ -304,6 +377,12 @@ describe("backup reconciliation", () => {
         { bytesCompleted: 128, status: "running", updatedAt: 100 }
       )
     ).toBe(true)
+    expect(
+      shouldApplyRelayBackupTaskSnapshot(
+        { bytesCompleted: 128, relayUpdatedAt: 100, status: "running" },
+        { bytesCompleted: 128, status: "running", updatedAt: 100 }
+      )
+    ).toBe(false)
   })
 })
 

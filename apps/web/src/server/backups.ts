@@ -5,6 +5,7 @@ import { z } from "zod"
 
 import {
   databaseEngineSupportsLogicalBackups,
+  relayBackupTaskSchema,
   relayIdSchema,
   relaySnapshotSchema,
 } from "@workspace/contracts"
@@ -13,6 +14,7 @@ import { createBackupDownloadShareEffect } from "@/effect/backup-download-shares
 import {
   listBackupCatalogEffect,
   getInstanceBackupPolicyEffect,
+  reconcileBackupTaskEffect,
   renameBackupEffect,
   reserveBackupCopyEffect,
   reserveBackupDeleteEffect,
@@ -361,6 +363,46 @@ export const getInstanceBackupPolicy = createServerFn({ method: "GET" })
       "backups.getInstancePolicy",
       getInstanceBackupPolicyEffect(data.relayId, data.instanceId)
     )
+  })
+
+export const cancelBackup = createServerFn({ method: "POST" })
+  .validator(backupIdInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const catalog = await runAppEffect(
+      "backups.listForCancel",
+      listBackupCatalogEffect()
+    )
+    const backup = catalog.find((candidate) => candidate.id === data.backupId)
+    if (!backup) throw new Error("Backup not found")
+    if (
+      backup.taskKind !== "create" ||
+      (backup.taskStatus !== "queued" && backup.taskStatus !== "running")
+    ) {
+      throw new Error("This backup is no longer being created")
+    }
+    const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+    if (!hasBackupPermission(user, grants, backup, "backup.create")) {
+      throw new Error("You do not have permission to cancel this backup")
+    }
+    const relay = await requireBackupRelay(backup.relayId)
+    const task = relayBackupTaskSchema.parse(
+      await relayRpc(
+        relay,
+        "backup.task.cancel",
+        { taskId: backup.taskId },
+        15_000,
+        user.id
+      )
+    )
+    await runAppEffect(
+      "backups.reconcileCancel",
+      reconcileBackupTaskEffect(task)
+    )
+    if (task.status !== "cancelled") {
+      throw new Error("This backup is no longer being created")
+    }
+    return { cancelled: true as const }
   })
 
 export const deleteBackup = createServerFn({ method: "POST" })

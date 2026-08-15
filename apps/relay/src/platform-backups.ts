@@ -46,8 +46,10 @@ export async function createEncryptedPlatformBackup(
   config: RelayConfig,
   input: BackupCreateTaskInput,
   destination: string,
-  progress: { completed: number; total: number }
+  progress: { completed: number; total: number },
+  signal: AbortSignal = new AbortController().signal
 ): Promise<BackupCreateTaskResult> {
+  signal.throwIfAborted()
   const installationId = requiredInstallationId(config, input.target.id)
   const recoveryKey = requiredRecoveryKey(config)
   const container = await hearthDatabaseContainer(installationId)
@@ -97,9 +99,10 @@ export async function createEncryptedPlatformBackup(
               createGzip({ level: 6 }),
               cipher,
               storedLimit,
-              createWriteStream(destination, { flags: "a" })
+              createWriteStream(destination, { flags: "a" }),
+              { signal }
             ),
-            requireSuccessfulProcess(child, stderr),
+            requireSuccessfulProcess(child, stderr, signal),
           ]),
         catch: (cause) => cause,
       })
@@ -124,7 +127,9 @@ export async function createEncryptedPlatformBackup(
   )
   const metadata = await stat(destination)
   const digest = createHash("sha256")
-  for await (const chunk of createReadStream(destination)) digest.update(chunk)
+  for await (const chunk of createReadStream(destination, { signal })) {
+    digest.update(chunk)
+  }
   return {
     bytes: metadata.size,
     checksumSha256: digest.digest("hex"),
@@ -442,19 +447,27 @@ function collectProcessErrors(child: ChildProcessWithoutNullStreams) {
 
 function requireSuccessfulProcess(
   child: ChildProcessWithoutNullStreams,
-  stderr: () => string
+  stderr: () => string,
+  signal?: AbortSignal
 ): Promise<void> {
   return new Promise((resolveProcess, rejectProcess) => {
+    const aborted = () => {
+      clearTimeout(timeout)
+      child.kill("SIGKILL")
+      rejectProcess(signal?.reason ?? new Error("Platform backup cancelled"))
+    }
     const timeout = setTimeout(() => {
       child.kill("SIGKILL")
       rejectProcess(new Error("Platform backup command timed out"))
     }, PLATFORM_BACKUP_TIMEOUT_MS)
     child.once("error", (cause) => {
       clearTimeout(timeout)
+      signal?.removeEventListener("abort", aborted)
       rejectProcess(cause)
     })
     child.once("close", (code) => {
       clearTimeout(timeout)
+      signal?.removeEventListener("abort", aborted)
       if (code === 0) resolveProcess()
       else
         rejectProcess(
@@ -463,6 +476,8 @@ function requireSuccessfulProcess(
           )
         )
     })
+    signal?.addEventListener("abort", aborted, { once: true })
+    if (signal?.aborted) aborted()
   })
 }
 

@@ -231,6 +231,7 @@ describe("Relay control socket", () => {
         Effect.sync(() => {
           audits.push(input)
         }),
+      cancelBackupTask: () => Effect.succeed(false),
       createInvitation: () => Effect.void,
       findActiveInvitation: () => Effect.succeed(null),
       findClientById: (clientId) =>
@@ -604,6 +605,7 @@ describe("Relay control socket", () => {
     })
     const state = RelayStateStore.of({
       appendAudit: () => Effect.void,
+      cancelBackupTask: () => Effect.succeed(false),
       createInvitation: () => Effect.void,
       findActiveInvitation: () => Effect.succeed(null),
       findClientById: (clientId) =>

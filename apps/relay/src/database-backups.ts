@@ -29,8 +29,10 @@ export async function createCompressedDatabaseBackup(
   databases: DatabaseDriver,
   input: BackupCreateTaskInput,
   destination: string,
-  progress: DatabaseBackupProgress
+  progress: DatabaseBackupProgress,
+  signal: AbortSignal = new AbortController().signal
 ): Promise<BackupCreateTaskResult> {
+  signal.throwIfAborted()
   const database = await databases.backupTarget(input.target.id)
   const child = spawnDatabaseClient(database, "export")
   const stderr = collectProcessErrors(child)
@@ -49,9 +51,10 @@ export async function createCompressedDatabaseBackup(
               sourceMeter,
               createGzip({ level: 6 }),
               storedLimit,
-              createWriteStream(destination, { flags: "wx", mode: 0o600 })
+              createWriteStream(destination, { flags: "wx", mode: 0o600 }),
+              { signal }
             ),
-            requireSuccessfulProcess(child, stderr),
+            requireSuccessfulProcess(child, stderr, signal),
           ]),
         catch: (cause) => cause,
       })
@@ -65,7 +68,9 @@ export async function createCompressedDatabaseBackup(
 
   const metadata = await stat(destination)
   const digest = createHash("sha256")
-  for await (const chunk of createReadStream(destination)) digest.update(chunk)
+  for await (const chunk of createReadStream(destination, { signal })) {
+    digest.update(chunk)
+  }
   return {
     bytes: metadata.size,
     checksumSha256: digest.digest("hex"),
@@ -164,25 +169,35 @@ function collectProcessErrors(child: ChildProcessWithoutNullStreams) {
 
 function requireSuccessfulProcess(
   child: ChildProcessWithoutNullStreams,
-  stderr: () => string
+  stderr: () => string,
+  signal?: AbortSignal
 ): Promise<void> {
   return new Promise((resolve, reject) => {
+    const aborted = () => {
+      clearTimeout(timeout)
+      child.kill("SIGKILL")
+      reject(signal?.reason ?? new Error("Database backup cancelled"))
+    }
     const timeout = setTimeout(() => {
       child.kill("SIGKILL")
       reject(new Error("Database backup command timed out"))
     }, DATABASE_BACKUP_TIMEOUT_MS)
     child.once("error", (cause) => {
       clearTimeout(timeout)
+      signal?.removeEventListener("abort", aborted)
       reject(cause)
     })
     child.once("close", (code) => {
       clearTimeout(timeout)
+      signal?.removeEventListener("abort", aborted)
       if (code === 0) resolve()
       else
         reject(
           new Error(stderr() || `Database command exited with code ${code}`)
         )
     })
+    signal?.addEventListener("abort", aborted, { once: true })
+    if (signal?.aborted) aborted()
   })
 }
 
@@ -207,4 +222,3 @@ function byteMeter(
     },
   })
 }
-
