@@ -1842,6 +1842,8 @@ function usePortLease({
   const portDirty = React.useRef(false)
   const portValueRef = React.useRef("")
   const sealedRef = React.useRef(false)
+  const initialReservationProtocol =
+    initialPort === undefined ? protocol : undefined
 
   React.useEffect(() => {
     const currentGeneration = generation.current + 1
@@ -1883,8 +1885,9 @@ function usePortLease({
         }
       }
     }
+    if (initialReservationProtocol === undefined) return
     const leasePromise = reserveInstancePort({
-      data: { instanceId, protocol, relayId },
+      data: { instanceId, protocol: initialReservationProtocol, relayId },
     })
     leasePromiseRef.current = leasePromise
     Effect.runFork(
@@ -1940,7 +1943,7 @@ function usePortLease({
         )
       }
     }
-  }, [enabled, initialPort, instanceId, protocol, relayId])
+  }, [enabled, initialPort, initialReservationProtocol, instanceId, relayId])
 
   React.useEffect(() => {
     if (!enabled || !lease || sealed) return
@@ -2713,7 +2716,7 @@ function PortAllocationDialog({
                   readOnly={!isDefaultServer || !canEditPublicPort}
                   type="number"
                   value={
-                    isDefaultServer
+                    isDefaultServer && canEditPublicPort
                       ? publicPortLease.portValue
                       : allocation
                         ? String(allocation.externalPort)

@@ -57,6 +57,16 @@ export const accessPermissions = [
 
 export type AccessPermission = (typeof accessPermissions)[number]
 
+export function instancePortsWritePermission(
+  ports: ReadonlyArray<{ externalPort?: number; id?: string }>
+): AccessPermission {
+  return ports.some(
+    (port) => port.id !== undefined && port.externalPort !== undefined
+  )
+    ? "instance.network.public-port.write"
+    : "instance.network.write"
+}
+
 const rolePermissions: Record<AccessRole, ReadonlySet<AccessPermission>> = {
   owner: new Set(accessPermissions),
   admin: new Set(

@@ -37,7 +37,10 @@ import {
   recordFileViewed,
   setFilePinned,
 } from "@/lib/file-activity"
-import type { AccessPermission } from "@/lib/permissions"
+import {
+  instancePortsWritePermission,
+  type AccessPermission,
+} from "@/lib/permissions"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { requireAuthenticatedUser } from "@/server/auth"
 import {
@@ -394,11 +397,10 @@ export const updateInstanceWebRoutes = createServerFn({ method: "POST" })
 export const updateInstancePorts = createServerFn({ method: "POST" })
   .validator(portsInputSchema)
   .handler(async ({ data }) => {
-    const permission = data.ports.some(
+    const updatesPrimaryPublicPort = data.ports.some(
       (port) => port.id === "primary" && port.externalPort !== undefined
     )
-      ? "instance.network.public-port.write"
-      : "instance.network.write"
+    const permission = instancePortsWritePermission(data.ports)
     const value = await relayRequest(
       `/v1/instances/${encodeURIComponent(data.instanceId)}/ports`,
       {
@@ -412,6 +414,9 @@ export const updateInstancePorts = createServerFn({ method: "POST" })
       240_000
     )
     const instance = relayInstanceSchema.parse(value)
+    if (updatesPrimaryPublicPort) {
+      await provisionInstanceDomainBestEffort(instance, data.relayId)
+    }
     await runAppEffect(
       "relay.snapshot.invalidate",
       invalidateRelayCache(relayCachePolicy.snapshot(data.relayId))
