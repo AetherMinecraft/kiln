@@ -394,6 +394,11 @@ export const updateInstanceWebRoutes = createServerFn({ method: "POST" })
 export const updateInstancePorts = createServerFn({ method: "POST" })
   .validator(portsInputSchema)
   .handler(async ({ data }) => {
+    const permission = data.ports.some(
+      (port) => port.id === "primary" && port.externalPort !== undefined
+    )
+      ? "instance.network.public-port.write"
+      : "instance.network.write"
     const value = await relayRequest(
       `/v1/instances/${encodeURIComponent(data.instanceId)}/ports`,
       {
@@ -401,7 +406,7 @@ export const updateInstancePorts = createServerFn({ method: "POST" })
         headers: { "Content-Type": "application/json" },
         method: "PUT",
       },
-      "instance.network.write",
+      permission,
       data.instanceId,
       data.relayId,
       240_000
@@ -417,6 +422,10 @@ export const updateInstancePorts = createServerFn({ method: "POST" })
 export const reserveInstancePort = createServerFn({ method: "POST" })
   .validator(portLeaseInputSchema)
   .handler(async ({ data }) => {
+    const permission =
+      data.externalPort === undefined
+        ? "instance.network.write"
+        : "instance.network.public-port.write"
     const value = await relayRequest(
       `/v1/instances/${encodeURIComponent(data.instanceId)}/ports`,
       {
@@ -428,7 +437,7 @@ export const reserveInstancePort = createServerFn({ method: "POST" })
         headers: { "Content-Type": "application/json" },
         method: "POST",
       },
-      "instance.network.write",
+      permission,
       data.instanceId,
       data.relayId
     )

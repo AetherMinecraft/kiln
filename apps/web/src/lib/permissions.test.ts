@@ -25,6 +25,23 @@ describe("server deletion permissions", () => {
   })
 })
 
+describe("primary public port permissions", () => {
+  it("limits public port changes to owners and administrators", () => {
+    expect(
+      roleHasPermission("owner", "instance.network.public-port.write")
+    ).toBe(true)
+    expect(
+      roleHasPermission("admin", "instance.network.public-port.write")
+    ).toBe(true)
+    expect(
+      roleHasPermission("operator", "instance.network.public-port.write")
+    ).toBe(false)
+    expect(
+      roleHasPermission("viewer", "instance.network.public-port.write")
+    ).toBe(false)
+  })
+})
+
 describe("backup permissions", () => {
   it("allows operators to manage backups without granting server deletion", () => {
     expect(roleHasPermission("operator", "backup.create")).toBe(true)

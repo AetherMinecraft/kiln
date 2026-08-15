@@ -36,6 +36,7 @@ export const accessPermissions = [
   "instance.logs.share",
   "instance.network.read",
   "instance.network.write",
+  "instance.network.public-port.write",
   "instance.sftp.connect",
   "database.read",
   "database.create",

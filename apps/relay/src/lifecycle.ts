@@ -1633,8 +1633,16 @@ export class LifecycleDriver {
                 pending.push({ port: existing.externalPort, protocol })
               }
             }
+            const externalPort =
+              input.externalPort !== undefined && input.leaseId !== undefined
+                ? await this.#claimPortLease(instance.id, input, inspected)
+                : existing.externalPort
+            if (externalPort !== existing.externalPort) {
+              pending.push({ port: externalPort, protocol: input.protocol })
+            }
             allocations.push({
               ...existing,
+              externalPort,
               internalPort: input.internalPort,
               name: input.name,
               protocol: input.protocol,

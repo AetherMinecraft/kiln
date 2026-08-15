@@ -235,6 +235,7 @@ function WebRoutesNetworkPage({
         <ConfiguredRoutesSection
           key={editGamePort ? "edit-game-port" : "network"}
           canRestart={permissions.power && relayConnected}
+          canPublicPortWrite={permissions.networkPublicPortWrite}
           canWrite={permissions.networkWrite}
           editGamePort={editGamePort}
           instance={instance}
@@ -330,6 +331,7 @@ function webRouteRemovalKey(id: string) {
 
 const ConfiguredRoutesSection = React.memo(function ConfiguredRoutesSection({
   canRestart,
+  canPublicPortWrite,
   canWrite,
   editGamePort,
   instance,
@@ -345,6 +347,7 @@ const ConfiguredRoutesSection = React.memo(function ConfiguredRoutesSection({
   onRestart,
 }: {
   canRestart: boolean
+  canPublicPortWrite: boolean
   canWrite: boolean
   editGamePort: boolean
   instance: InstanceWorkspaceInstance
@@ -744,7 +747,7 @@ const ConfiguredRoutesSection = React.memo(function ConfiguredRoutesSection({
         <AddNetworkRouteDialog
           canAddPort={primaryPort !== undefined && instance.ports.length < 16}
           canAddWebRoute={(routes?.length ?? 16) < 16}
-          canEditPublicPort={canWrite}
+          canEditPublicPort={canPublicPortWrite}
           error={
             update.error || routeError
               ? errorMessage(update.error ?? routeError)
@@ -787,17 +790,20 @@ const ConfiguredRoutesSection = React.memo(function ConfiguredRoutesSection({
               : "closed"
         }
         allocation={dialog?.mode === "edit-port" ? dialog.allocation : null}
+        canEditPublicPort={canPublicPortWrite}
         error={update.error ? errorMessage(update.error) : null}
         open={
           dialog?.mode === "edit-port" || dialog?.mode === "recover-primary"
         }
         pending={update.isPending}
+        instanceId={instance.id}
         pendingPrimaryPort={
           dialog?.mode === "recover-primary"
             ? (pendingPrimaryPort ?? null)
             : null
         }
         recoveringPrimary={dialog?.mode === "recover-primary"}
+        relayId={instance.relayId}
         onOpenChange={(open) => {
           if (!open && !update.isPending) {
             setDialog(null)
@@ -1812,11 +1818,13 @@ function useCopyFeedback(value: string) {
 
 function usePortLease({
   enabled,
+  initialPort,
   instanceId,
   protocol,
   relayId,
 }: {
   enabled: boolean
+  initialPort?: number
   instanceId: string
   protocol: RelayInstancePortProtocol
   relayId: string
@@ -1853,12 +1861,28 @@ function usePortLease({
 
     setError(null)
     setLease(null)
-    setPending(true)
-    setPortValueState("")
+    setPending(initialPort === undefined)
+    setPortValueState(initialPort === undefined ? "" : String(initialPort))
     portDirty.current = false
-    portValueRef.current = ""
+    portValueRef.current = initialPort === undefined ? "" : String(initialPort)
     sealedRef.current = false
     setSealed(false)
+    if (initialPort !== undefined) {
+      return () => {
+        generation.current += 1
+        leasePromiseRef.current = null
+        const currentLease = leaseRef.current
+        leaseRef.current = null
+        portValueRef.current = ""
+        if (currentLease) {
+          forkPromise(() =>
+            releaseInstancePort({
+              data: { instanceId, leaseId: currentLease.id, relayId },
+            })
+          )
+        }
+      }
+    }
     const leasePromise = reserveInstancePort({
       data: { instanceId, protocol, relayId },
     })
@@ -1916,7 +1940,7 @@ function usePortLease({
         )
       }
     }
-  }, [enabled, instanceId, protocol, relayId])
+  }, [enabled, initialPort, instanceId, protocol, relayId])
 
   React.useEffect(() => {
     if (!enabled || !lease || sealed) return
@@ -2004,7 +2028,9 @@ function usePortLease({
       }
       currentLease = leaseRef.current
     }
-    if (!currentLease) throw new Error("Public port is still being reserved")
+    if (!currentLease && initialPort === undefined) {
+      throw new Error("Public port is still being reserved")
+    }
     const externalPort = Number(portValueRef.current)
     if (
       !Number.isInteger(externalPort) ||
@@ -2013,7 +2039,10 @@ function usePortLease({
     ) {
       throw new Error("Public Port must be between 1 and 65535")
     }
-    if (externalPort === currentLease.externalPort) {
+    if (
+      (currentLease && externalPort === currentLease.externalPort) ||
+      (!currentLease && externalPort === initialPort)
+    ) {
       portDirty.current = false
       return currentLease
     }
@@ -2025,11 +2054,11 @@ function usePortLease({
         try: async () => {
           const nextLease = await reserveInstancePort({
             data: {
-              externalPort,
               instanceId,
-              leaseId: currentLease.id,
               protocol,
               relayId,
+              externalPort,
+              ...(currentLease ? { leaseId: currentLease.id } : {}),
             },
           })
           if (generation.current !== currentGeneration) {
@@ -2065,7 +2094,7 @@ function usePortLease({
         )
       )
     )
-  }, [instanceId, protocol, relayId])
+  }, [initialPort, instanceId, protocol, relayId])
 
   const commitForSubmit = React.useCallback(async () => {
     const currentGeneration = generation.current
@@ -2508,19 +2537,25 @@ function AddNetworkRouteDialog({
 
 function PortAllocationDialog({
   allocation,
+  canEditPublicPort,
   error,
+  instanceId,
   open,
   pending,
   pendingPrimaryPort,
+  relayId,
   recoveringPrimary = false,
   onOpenChange,
   onSubmit,
 }: {
   allocation: RelayInstancePortAllocation | null
+  canEditPublicPort: boolean
   error: string | null
+  instanceId: string
   open: boolean
   pending: boolean
   pendingPrimaryPort: RelayInstancePendingPrimaryPort | null
+  relayId: string
   recoveringPrimary?: boolean
   onOpenChange: (open: boolean) => void
   onSubmit: (port: RelayInstancePortInput) => Promise<void>
@@ -2536,6 +2571,16 @@ function PortAllocationDialog({
   const [internalPort, setInternalPort] = React.useState(
     pendingPrimaryPort ? String(pendingPrimaryPort.internalPort) : ""
   )
+  const publicPortLease = usePortLease({
+    enabled:
+      isDefaultServer && allocation?.kind === "primary" && canEditPublicPort,
+    initialPort:
+      allocation?.kind === "primary" ? allocation.externalPort : undefined,
+    instanceId,
+    protocol,
+    relayId,
+  })
+  const dialogPending = pending || publicPortLease.pending
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -2586,8 +2631,28 @@ function PortAllocationDialog({
               return
             }
             setValidationError(null)
+            const publicPortLeaseResult =
+              isDefaultServer &&
+              allocation?.kind === "primary" &&
+              canEditPublicPort
+                ? await recoverPromise(
+                    () => publicPortLease.commitForSubmit(),
+                    (cause) => {
+                      setValidationError(errorMessage(cause))
+                      return undefined
+                    }
+                  )
+                : null
+            if (publicPortLeaseResult === undefined) return
+            const port = publicPortLeaseResult
+              ? {
+                  ...parsed.data,
+                  externalPort: publicPortLeaseResult.externalPort,
+                  leaseId: publicPortLeaseResult.id,
+                }
+              : parsed.data
             await recoverPromise(
-              () => onSubmit(parsed.data),
+              () => onSubmit(port),
               () => undefined
             )
           }}
@@ -2637,9 +2702,23 @@ function PortAllocationDialog({
                 <Input
                   aria-label="Public Port"
                   className="font-mono"
-                  disabled
+                  disabled={
+                    !isDefaultServer ||
+                    !canEditPublicPort ||
+                    publicPortLease.pending
+                  }
+                  onChange={(event) =>
+                    publicPortLease.setPortValue(event.target.value)
+                  }
+                  readOnly={!isDefaultServer || !canEditPublicPort}
                   type="number"
-                  value={allocation ? String(allocation.externalPort) : ""}
+                  value={
+                    isDefaultServer
+                      ? publicPortLease.portValue
+                      : allocation
+                        ? String(allocation.externalPort)
+                        : ""
+                  }
                 />
               </label>
             )}
@@ -2655,23 +2734,27 @@ function PortAllocationDialog({
             </label>
           </div>
 
-          {validationError || error ? (
+          {validationError || publicPortLease.error || error ? (
             <p className="text-xs text-destructive">
-              {validationError ?? error}
+              {validationError ?? publicPortLease.error ?? error}
             </p>
           ) : null}
 
           <DialogFooter>
             <DialogClose
               render={
-                <Button disabled={pending} type="button" variant="outline" />
+                <Button
+                  disabled={dialogPending}
+                  type="button"
+                  variant="outline"
+                />
               }
             >
               Cancel
             </DialogClose>
-            <Button disabled={pending} type="submit">
-              {pending ? <LoaderCircle className="animate-spin" /> : null}
-              {pending
+            <Button disabled={dialogPending} type="submit">
+              {dialogPending ? <LoaderCircle className="animate-spin" /> : null}
+              {dialogPending
                 ? "Applying"
                 : recoveringPrimary
                   ? "Assign Default Server"
