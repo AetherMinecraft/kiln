@@ -35,6 +35,20 @@ async function ensureBackupSchema(database) {
     `SHOW COLUMNS FROM ${databaseTable("backup_task")}`
   )
   const taskColumnNames = new Set(taskColumns.map((column) => column.Field))
+  const progressAdditions = [
+    [
+      "phase",
+      "ENUM('preparing', 'collecting', 'archiving', 'dumping', 'uploading', 'finalizing') NULL AFTER bytes_total",
+    ],
+    ["current_path", "VARCHAR(2048) NULL AFTER phase"],
+  ].filter(([name]) => !taskColumnNames.has(name))
+  if (progressAdditions.length > 0) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_task")} ${progressAdditions
+        .map(([name, definition]) => `ADD COLUMN ${name} ${definition}`)
+        .join(", ")}`
+    )
+  }
   if (!taskColumnNames.has("reserved_bytes")) {
     await database.query(
       `ALTER TABLE ${databaseTable("backup_task")}

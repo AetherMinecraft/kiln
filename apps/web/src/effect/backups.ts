@@ -6,6 +6,7 @@ import type {
   BackupCreateTaskInput,
   BackupDeleteTaskInput,
   BackupRestoreTaskInput,
+  BackupTaskPhase,
   BackupTaskStatus,
   RelayBackupTask,
 } from "@workspace/contracts"
@@ -88,8 +89,15 @@ interface BackupRow extends RowDataPacket {
   target_id: string
   target_kind: "database" | "instance" | "platform"
   task_error: string | null
+  task_bytes_completed: number | string
+  task_bytes_total: number | string | null
+  task_current_path: string | null
   task_id: string
+  task_kind: "create" | "delete" | "restore"
+  task_phase: BackupTaskPhase | null
+  task_started_at_ms: number | string | null
   task_status: "cancelled" | "failed" | "queued" | "running" | "succeeded"
+  task_updated_at_ms: number | string
   warnings: unknown
 }
 
@@ -168,9 +176,16 @@ export interface BackupCatalogRecord {
   storageId: string | null
   targetId: string
   targetKind: BackupRow["target_kind"]
+  taskBytesCompleted: number
+  taskBytesTotal: number | null
+  taskCurrentPath: string | null
   taskError: string | null
   taskId: string
+  taskKind: BackupRow["task_kind"]
+  taskPhase: BackupTaskPhase | null
+  taskStartedAt: string | null
   taskStatus: BackupRow["task_status"]
+  taskUpdatedAt: string
   warnings: Array<string>
 }
 
@@ -613,7 +628,8 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
         }
         yield* transaction.execute(
           `UPDATE ${databaseTable("backup_task")}
-              SET status = ?, bytes_completed = ?, bytes_total = ?, error = ?,
+              SET status = ?, bytes_completed = ?, bytes_total = ?,
+                  phase = ?, current_path = ?, error = ?,
                   started_at = FROM_UNIXTIME(? / 1000),
                   finished_at = FROM_UNIXTIME(? / 1000),
                   relay_updated_at_ms = ?
@@ -622,6 +638,8 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
             task.status,
             task.bytesCompleted,
             task.bytesTotal,
+            task.phase,
+            task.currentPath,
             task.error,
             task.startedAt,
             task.finishedAt,
@@ -826,8 +844,12 @@ export const listBackupCatalogEffect = Effect.fn("backups.list")(function* () {
             backup.object_key,
             ROUND(UNIX_TIMESTAMP(backup.completed_at) * 1000) AS completed_at_ms,
             ROUND(UNIX_TIMESTAMP(backup.created_at) * 1000) AS created_at_ms,
-            task.id AS task_id, task.status AS task_status,
-            task.error AS task_error
+            task.id AS task_id, task.task_kind AS task_kind,
+            task.status AS task_status, task.bytes_completed AS task_bytes_completed,
+            task.bytes_total AS task_bytes_total, task.phase AS task_phase,
+            task.current_path AS task_current_path, task.error AS task_error,
+            ROUND(UNIX_TIMESTAMP(task.started_at) * 1000) AS task_started_at_ms,
+            ROUND(UNIX_TIMESTAMP(task.updated_at) * 1000) AS task_updated_at_ms
        FROM ${databaseTable("backup")} backup
        JOIN ${databaseTable("backup_task")} task ON task.id = (
          SELECT latest.id
@@ -883,9 +905,28 @@ export const listBackupCatalogEffect = Effect.fn("backups.list")(function* () {
     storageId: row.storage_id,
     targetId: row.target_id,
     targetKind: row.target_kind,
+    taskBytesCompleted: safeDatabaseNumber(
+      row.task_bytes_completed,
+      "backup task progress"
+    ),
+    taskBytesTotal: nullableDatabaseNumber(
+      row.task_bytes_total,
+      "backup task total"
+    ),
+    taskCurrentPath: row.task_current_path,
     taskError: row.task_error,
     taskId: row.task_id,
+    taskKind: row.task_kind,
+    taskPhase: row.task_phase,
+    taskStartedAt: timestampIso(
+      row.task_started_at_ms,
+      "backup task started at"
+    ),
     taskStatus: row.task_status,
+    taskUpdatedAt: requiredTimestampIso(
+      row.task_updated_at_ms,
+      "backup task updated at"
+    ),
     warnings: parseWarnings(row.warnings),
   })) satisfies Array<BackupCatalogRecord>
 })

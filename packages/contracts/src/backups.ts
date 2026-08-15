@@ -84,6 +84,15 @@ export const backupTaskStatusSchema = z.enum([
   "cancelled",
 ])
 
+export const backupTaskPhaseSchema = z.enum([
+  "preparing",
+  "collecting",
+  "archiving",
+  "dumping",
+  "uploading",
+  "finalizing",
+])
+
 export const backupArtifactStatusSchema = z.enum([
   "queued",
   "running",
@@ -282,11 +291,13 @@ export const relayBackupTaskSchema = z
     bytesCompleted: z.number().int().nonnegative(),
     bytesTotal: z.number().int().nonnegative().nullable(),
     createdAt: z.number().int().nonnegative(),
+    currentPath: z.string().max(2_048).nullable(),
     error: z.string().max(4_096).nullable(),
     finishedAt: z.number().int().nonnegative().nullable(),
     input: backupTaskInputSchema,
     inputRefreshRequired: z.boolean(),
     kind: backupTaskKindSchema,
+    phase: backupTaskPhaseSchema.nullable(),
     result: backupTaskResultSchema.nullable(),
     startedAt: z.number().int().nonnegative().nullable(),
     status: backupTaskStatusSchema,
@@ -344,6 +355,7 @@ export type BackupTarget = z.infer<typeof backupTargetSchema>
 export type BackupTargetKind = z.infer<typeof backupTargetKindSchema>
 export type BackupTaskInput = z.infer<typeof backupTaskInputSchema>
 export type BackupTaskKind = z.infer<typeof backupTaskKindSchema>
+export type BackupTaskPhase = z.infer<typeof backupTaskPhaseSchema>
 export type BackupTaskResult = z.infer<typeof backupTaskResultSchema>
 export type BackupTaskStatus = z.infer<typeof backupTaskStatusSchema>
 export type RelayBackupTask = z.infer<typeof relayBackupTaskSchema>

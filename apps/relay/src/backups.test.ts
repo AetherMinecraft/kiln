@@ -4,7 +4,7 @@ import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { afterAll, assert, describe, it, layer } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Fiber } from "effect"
 import ZipStream from "zip-stream"
 
 import type {
@@ -40,11 +40,13 @@ describe("Relay backups", () => {
       bytesCompleted: 1,
       bytesTotal: 1,
       createdAt: 1,
+      currentPath: null,
       error: null,
       finishedAt: 2,
       input,
       inputRefreshRequired: false,
       kind: "create" as const,
+      phase: null,
       result: backupResult(0),
       startedAt: 1,
       status: "succeeded" as const,
@@ -106,6 +108,46 @@ describe("Relay backups", () => {
         )
       })
     )
+
+    it.effect("cancels a running create task and aborts its archive work", () =>
+      Effect.gen(function* () {
+        let started: (() => void) | undefined
+        const archiveStarted = new Promise<void>((resolveStarted) => {
+          started = resolveStarted
+        })
+        const manager = yield* BackupManager.make({
+          config: loadConfig({
+            KILN_RELAY_DATA_DIR: testDirectory,
+            KILN_RELAY_HOST: "relay.test",
+            NODE_ENV: "test",
+          }),
+          createArchive: (_input, _instance, _progress, signal) =>
+            new Promise((_resolveArchive, rejectArchive) => {
+              signal.addEventListener(
+                "abort",
+                () => rejectArchive(signal.reason),
+                { once: true }
+              )
+              started?.()
+            }),
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+        })
+        const input = backupInput(9)
+        yield* manager.enqueue(input)
+        const worker = yield* Effect.forkChild(manager.runPending())
+        yield* Effect.promise(() => archiveStarted)
+
+        const cancelled = yield* manager.cancel(input.taskId)
+        yield* Fiber.join(worker)
+
+        assert.strictEqual(cancelled?.status, "cancelled")
+        assert.strictEqual(
+          (yield* manager.get(input.taskId))?.error,
+          "Cancelled by user"
+        )
+      })
+    )
   })
 
   it.effect("creates an atomic, checksummed archive with safe exclusions", () =>
@@ -136,7 +178,12 @@ describe("Relay backups", () => {
             symlink("level.dat", resolve(root, "world", "latest"))
           )
 
-          const progress = { completed: 0, total: 0 }
+          const progress = {
+            completed: 0,
+            currentPath: null,
+            phase: "preparing" as const,
+            total: 0,
+          }
           const input = backupInput(3)
           yield* Effect.promise(() =>
             mkdir(resolve(directory, "backups"), { recursive: true })
@@ -208,6 +255,8 @@ describe("Relay backups", () => {
           const created = yield* Effect.promise(() =>
             createPortableInstanceBackup(config, input, testInstance(), {
               completed: 0,
+              currentPath: null,
+              phase: "preparing",
               total: 0,
             })
           )

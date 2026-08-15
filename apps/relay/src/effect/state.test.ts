@@ -400,7 +400,32 @@ describe("Relay state", () => {
         assert.strictEqual(claimed?.taskId, first.taskId)
         assert.strictEqual(claimed?.status, "running")
         assert.isTrue(
-          yield* store.updateBackupTaskProgress(first.taskId, 50, 100, 120)
+          yield* store.updateBackupTaskProgress(
+            first.taskId,
+            50,
+            100,
+            "archiving",
+            "world/level.dat",
+            120
+          )
+        )
+        const inProgress = yield* store.getBackupTask(first.taskId)
+        assert.strictEqual(inProgress?.phase, "archiving")
+        assert.strictEqual(inProgress?.currentPath, "world/level.dat")
+        assert.strictEqual(inProgress?.updatedAt, 120)
+        assert.isTrue(
+          yield* store.updateBackupTaskProgress(
+            first.taskId,
+            50,
+            100,
+            "archiving",
+            "world/level.dat",
+            125
+          )
+        )
+        assert.strictEqual(
+          (yield* store.getBackupTask(first.taskId))?.updatedAt,
+          120
         )
         assert.isTrue(
           yield* store.completeBackupTask(
@@ -427,7 +452,14 @@ describe("Relay state", () => {
         const next = yield* store.claimNextBackupTask(140)
         assert.strictEqual(next?.taskId, second.taskId)
         assert.isTrue(
-          yield* store.updateBackupTaskProgress(second.taskId, 50, 100, 145)
+          yield* store.updateBackupTaskProgress(
+            second.taskId,
+            50,
+            100,
+            "uploading",
+            null,
+            145
+          )
         )
         assert.strictEqual(yield* store.requeueInterruptedBackupTasks(150), 1)
         const requeued = yield* store.getBackupTask(second.taskId)
@@ -537,7 +569,14 @@ describe("Relay state", () => {
           local.taskId
         )
         assert.isTrue(
-          yield* store.updateBackupTaskProgress(local.taskId, 25, 50, 320)
+          yield* store.updateBackupTaskProgress(
+            local.taskId,
+            25,
+            50,
+            "archiving",
+            "server.properties",
+            320
+          )
         )
 
         assert.strictEqual(yield* store.requeueInterruptedBackupTasks(330), 1)

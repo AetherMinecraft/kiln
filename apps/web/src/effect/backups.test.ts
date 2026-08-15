@@ -197,6 +197,7 @@ describe("backup reconciliation", () => {
       bytesCompleted: 0,
       bytesTotal: null,
       createdAt: 50,
+      currentPath: null,
       error: null,
       finishedAt: 200,
       input: {
@@ -211,6 +212,7 @@ describe("backup reconciliation", () => {
       },
       inputRefreshRequired: false,
       kind: "delete",
+      phase: null,
       result: {
         artifacts: [
           {

@@ -11,6 +11,8 @@ import {
   Archive,
   ArrowLeft,
   Check,
+  CircleAlert,
+  CircleStop,
   Cloud,
   CloudCog,
   Copy,
@@ -50,6 +52,7 @@ import {
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
+import { Progress } from "@workspace/ui/components/progress"
 import { showToast } from "@workspace/ui/components/sonner"
 import { Switch } from "@workspace/ui/components/switch"
 import { Textarea } from "@workspace/ui/components/textarea"
@@ -87,6 +90,7 @@ import {
   relaySnapshotQueryOptions,
 } from "@/lib/query-options"
 import {
+  cancelBackup,
   createDatabaseBackup,
   createInstanceBackup,
   createPlatformBackup,
@@ -1191,11 +1195,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
             editable={canCreate}
             name={backup.name}
           />
-          {backup.taskError ? (
-            <p className="mt-1 line-clamp-1 text-[0.625rem] text-destructive">
-              {backup.taskError}
-            </p>
-          ) : null}
+          <BackupTaskState backup={backup} />
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
@@ -1227,6 +1227,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
       <WorkspaceTableCell className="h-auto py-2.5">
         <BackupRowActions
           backup={backup}
+          canCancel={canCreate}
           dialogStore={dialogStore}
           targetAvailable={targetAvailable}
         />
@@ -1270,11 +1271,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
             editable={canCreate}
             name={backup.name}
           />
-          {backup.taskError ? (
-            <p className="mt-1 line-clamp-2 text-[0.625rem] text-destructive">
-              {backup.taskError}
-            </p>
-          ) : null}
+          <BackupTaskState backup={backup} />
         </div>
       </div>
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
@@ -1304,6 +1301,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
       <div className="mt-3 flex justify-end border-t pt-2.5">
         <BackupRowActions
           backup={backup}
+          canCancel={canCreate}
           dialogStore={dialogStore}
           targetAvailable={targetAvailable}
         />
@@ -1617,15 +1615,125 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
   )
 })
 
+const BackupTaskState = React.memo(function BackupTaskState({
+  backup,
+}: {
+  backup: Backup
+}) {
+  const active =
+    backup.taskStatus === "queued" || backup.taskStatus === "running"
+  if (active) {
+    return <ActiveBackupTaskState backup={backup} />
+  }
+  if (!backup.taskError) return null
+  const cancelled = backup.taskStatus === "cancelled"
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <p
+          className={`mt-1 flex min-w-0 items-center gap-1 text-[0.6875rem] ${cancelled ? "text-muted-foreground" : "text-destructive"}`}
+        >
+          {cancelled ? (
+            <CircleStop className="size-3 shrink-0" />
+          ) : (
+            <CircleAlert className="size-3 shrink-0" />
+          )}
+          <span className="truncate">{backup.taskError}</span>
+        </p>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-sm whitespace-normal" side="bottom">
+        {backup.taskPhase ? `${backupTaskPhaseLabel(backup.taskPhase)} · ` : ""}
+        {backup.taskCurrentPath ? `${backup.taskCurrentPath} · ` : ""}
+        {backup.taskError}
+      </TooltipContent>
+    </Tooltip>
+  )
+})
+
+const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
+  backup,
+}: {
+  backup: Backup
+}) {
+  const [now, setNow] = React.useState(() => Date.now())
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const hasTotal = backup.taskBytesTotal !== null && backup.taskBytesTotal > 0
+  const percent = hasTotal
+    ? Math.min(
+        100,
+        Math.round(
+          (backup.taskBytesCompleted / (backup.taskBytesTotal ?? 1)) * 100
+        )
+      )
+    : null
+  const updatedAt = new Date(backup.taskUpdatedAt).getTime()
+  const progressAge =
+    shortRelativeBackupTime(updatedAt, now) ??
+    backupDateCompact.format(updatedAt)
+  return (
+    <div className="mt-1.5 max-w-md" aria-live="polite">
+      <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] leading-none text-muted-foreground">
+        <span className="truncate font-medium text-foreground/80">
+          {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
+        </span>
+        <span className="shrink-0 tabular-nums">
+          {percent === null
+            ? backup.taskBytesCompleted > 0
+              ? formatBytes(backup.taskBytesCompleted)
+              : "Working…"
+            : `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`}
+        </span>
+      </div>
+      <Progress
+        aria-label={`${backup.name} progress`}
+        className={
+          percent === null
+            ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
+            : ""
+        }
+        value={percent ?? undefined}
+      />
+      <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[0.625rem] text-muted-foreground">
+        {backup.taskCurrentPath ? (
+          <code
+            className="min-w-0 flex-1 truncate font-mono"
+            title={backup.taskCurrentPath}
+          >
+            {backup.taskCurrentPath}
+          </code>
+        ) : (
+          <span className="min-w-0 flex-1" />
+        )}
+        <span
+          className="shrink-0"
+          suppressHydrationWarning
+          title={backupDate.format(updatedAt)}
+        >
+          Last progress {progressAge}
+        </span>
+      </div>
+    </div>
+  )
+})
+
 const BackupRowActions = React.memo(function BackupRowActions({
   backup,
+  canCancel,
   dialogStore,
   targetAvailable,
 }: {
   backup: Backup
+  canCancel: boolean
   dialogStore: BackupDialogStore
   targetAvailable: boolean
 }) {
+  const cancellable =
+    canCancel &&
+    backup.taskKind === "create" &&
+    (backup.taskStatus === "queued" || backup.taskStatus === "running")
   const canRestore =
     backup.status === "available" &&
     !backupSourceIsActive(backup) &&
@@ -1645,7 +1753,9 @@ const BackupRowActions = React.memo(function BackupRowActions({
   )
   return (
     <div className="flex items-center gap-0.5">
-      {targetAvailable ? (
+      {cancellable ? (
+        <CancelBackupButton backup={backup} />
+      ) : targetAvailable ? (
         restore
       ) : (
         <Tooltip>
@@ -1672,6 +1782,51 @@ const BackupRowActions = React.memo(function BackupRowActions({
         onClick={() => dialogStore.open({ backup, kind: "delete" })}
       />
     </div>
+  )
+})
+
+const CancelBackupButton = React.memo(function CancelBackupButton({
+  backup,
+}: {
+  backup: Backup
+}) {
+  const queryClient = useQueryClient()
+  const cancel = useMutation({
+    mutationFn: () => cancelBackup({ data: { backupId: backup.id } }),
+    onError: (error) => {
+      showToast({
+        message:
+          error instanceof Error ? error.message : "Could not cancel backup",
+        type: "error",
+      })
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
+      showToast({ message: "Backup cancelled", type: "success" })
+    },
+  })
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-label={`Cancel ${backup.name}`}
+          disabled={cancel.isPending}
+          size="sm"
+          type="button"
+          variant="destructive"
+          onClick={() => cancel.mutate()}
+        >
+          {cancel.isPending ? (
+            <LoaderCircle className="animate-spin" />
+          ) : (
+            <CircleStop />
+          )}
+          Cancel
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">Stop creating this backup</TooltipContent>
+    </Tooltip>
   )
 })
 
@@ -3955,6 +4110,27 @@ function backupStatusFilterLabel(status: BackupFilters["status"]): string {
   )
 }
 
+function backupTaskPhaseLabel(
+  phase: Backup["taskPhase"],
+  status?: Backup["taskStatus"]
+): string {
+  if (!phase) return status === "queued" ? "Queued" : "Working"
+  switch (phase) {
+    case "preparing":
+      return "Preparing"
+    case "collecting":
+      return "Scanning files"
+    case "archiving":
+      return "Archiving"
+    case "dumping":
+      return "Exporting data"
+    case "uploading":
+      return "Uploading"
+    case "finalizing":
+      return "Finalizing"
+  }
+}
+
 function subscribeToMobileBackupLayout(onChange: () => void): () => void {
   const media = window.matchMedia(mobileBackupLayoutQuery)
   media.addEventListener("change", onChange)
@@ -3982,6 +4158,9 @@ function backupSearchText(backup: Backup): string {
     backup.targetKind,
     backup.status,
     backup.relayId,
+    backup.taskCurrentPath,
+    backup.taskError,
+    backup.taskPhase,
     ...backup.artifacts.map((artifact) =>
       artifact.storageId ? "s3" : "local"
     ),
@@ -4000,8 +4179,11 @@ function backupMatchesSearch(
   )
 }
 
-function shortRelativeBackupTime(timestamp: number): string | null {
-  const elapsed = Math.max(0, Date.now() - timestamp)
+function shortRelativeBackupTime(
+  timestamp: number,
+  now: number = Date.now()
+): string | null {
+  const elapsed = Math.max(0, now - timestamp)
   if (elapsed < backupMinuteMs) return "just now"
   if (elapsed < backupHourMs) {
     return `${Math.floor(elapsed / backupMinuteMs)}m ago`

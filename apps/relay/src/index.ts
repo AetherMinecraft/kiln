@@ -1122,6 +1122,13 @@ async function executeControlRequest(
         "relay.backups.enqueue",
         backupManager.enqueue(backupTaskInputSchema.parse(request.payload))
       )
+    case "backup.task.cancel":
+      return runRelayEffect(
+        "relay.backups.cancel",
+        backupManager.cancel(
+          backupTaskIdSchema.parse(requiredString(payload, "taskId"))
+        )
+      )
     case "backup.task.get":
       return runRelayEffect(
         "relay.backups.get",
