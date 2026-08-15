@@ -30,6 +30,21 @@ describe("server deletion permissions", () => {
 })
 
 describe("public port permissions", () => {
+  it("reserves public port range overrides for platform administrators", () => {
+    expect(
+      platformRoleHasPermission(
+        "admin",
+        "platform.network.override-public-port-range"
+      )
+    ).toBe(true)
+    expect(
+      platformRoleHasPermission(
+        "user",
+        "platform.network.override-public-port-range"
+      )
+    ).toBe(false)
+  })
+
   it("limits public port changes to owners and administrators", () => {
     expect(
       roleHasPermission("owner", "instance.network.public-port.write")

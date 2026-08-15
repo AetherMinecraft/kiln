@@ -5,6 +5,7 @@ export const platformPermissions = [
   "platform.appearance.manage-default",
   "platform.backups.manage-storage",
   "platform.backups.manage-limits",
+  "platform.network.override-public-port-range",
 ] as const
 export type PlatformPermission = (typeof platformPermissions)[number]
 

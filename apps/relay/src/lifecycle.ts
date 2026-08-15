@@ -1775,7 +1775,8 @@ export class LifecycleDriver {
           instanceId,
           input.protocol,
           inspected,
-          input.externalPort ?? previous?.externalPort
+          input.externalPort ?? previous?.externalPort,
+          input.overridePortRange
         )
       )
       reserved = { externalPort, protocol: input.protocol }
@@ -2444,7 +2445,8 @@ export class LifecycleDriver {
     instanceId: string,
     protocol: RelayInstancePortAllocation["protocol"],
     existing: ReadonlyArray<RelayInstance>,
-    requestedPort?: number
+    requestedPort?: number,
+    overridePortRange = false
   ): Promise<number> {
     const protocols = portProtocols(protocol)
     const unavailable = new Set<number>()
@@ -2473,6 +2475,7 @@ export class LifecycleDriver {
     const { end, start } = this.#config.gamePortRange
     if (
       requestedPort !== undefined &&
+      !overridePortRange &&
       (requestedPort < start || requestedPort > end)
     ) {
       throw new Error(

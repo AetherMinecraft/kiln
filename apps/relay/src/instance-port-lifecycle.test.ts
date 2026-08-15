@@ -313,6 +313,71 @@ describe("instance port lifecycle", () => {
     )
   })
 
+  effectIt.effect(
+    "allows an explicit public port outside the configured range only with an override",
+    () =>
+      Effect.gen(function* () {
+        const dataDirectory = yield* Effect.tryPromise(() =>
+          mkdtemp(join(tmpdir(), "kiln-public-port-range-override-"))
+        )
+        temporaryDirectories.push(dataDirectory)
+        const config = loadConfig({
+          KILN_RELAY_DATA_DIR: dataDirectory,
+          KILN_RELAY_GAME_PORT_RANGE: "32124-32124",
+          KILN_RELAY_PROXY: "hearth",
+          KILN_RELAY_RESOURCE_NAMESPACE: "public-port-range-override-test",
+          NODE_ENV: "test",
+        })
+        const instance = relayInstanceSchema.parse({
+          brickNetworkMode: "direct",
+          connectAddress: "port-range-override.test:32123",
+          containerId: "port-range-override-container",
+          desiredState: "stopped",
+          directory: "e".repeat(40),
+          game: "Minecraft",
+          id: "e".repeat(40),
+          implementation: "Paper",
+          javaVersion: "21",
+          managedByRelay: true,
+          name: "Port range override server",
+          observedState: "stopped",
+          publicHost: "port-range-override.test",
+          publicPort: 32_123,
+          service: "kiln-port-range-override",
+          shortId: "eeeeeeee",
+          startedAt: null,
+          status: "created",
+          version: "1.21.11",
+        })
+        const docker = {
+          inspectInstances: vi.fn(async () => [instance]),
+          publishedHostPorts: vi.fn(async () => new Set<number>()),
+        } as unknown as DockerDriver
+        const lifecycle = new LifecycleDriver(
+          config,
+          docker,
+          {} as BrickCatalog
+        )
+
+        const denied = yield* lifecycle
+          .reserveInstancePortEffect(instance.id, {
+            externalPort: 8_211,
+            protocol: "tcp",
+          })
+          .pipe(Effect.flip)
+        expect(denied.message).toContain(
+          "Public port must be between 32124 and 32124"
+        )
+
+        const lease = yield* lifecycle.reserveInstancePortEffect(instance.id, {
+          externalPort: 8_211,
+          overridePortRange: true,
+          protocol: "tcp",
+        })
+        expect(lease.externalPort).toBe(8_211)
+      })
+  )
+
   it("reserves added protocols on a replacement public port", async () => {
     const dataDirectory = await mkdtemp(
       join(tmpdir(), "kiln-primary-port-protocol-")
