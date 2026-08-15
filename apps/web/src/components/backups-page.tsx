@@ -1766,12 +1766,7 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
       />
       <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[0.625rem] text-muted-foreground">
         {backup.taskCurrentPath ? (
-          <code
-            className="min-w-0 flex-1 truncate font-mono"
-            title={backup.taskCurrentPath}
-          >
-            {backup.taskCurrentPath}
-          </code>
+          <BackupCurrentPath path={backup.taskCurrentPath} />
         ) : (
           <span className="min-w-0 flex-1" />
         )}
@@ -1784,6 +1779,47 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
         </span>
       </div>
     </div>
+  )
+})
+
+const BackupCurrentPath = React.memo(function BackupCurrentPath({
+  path,
+}: {
+  path: string
+}) {
+  const segments = path.split("/")
+  const filename = segments.at(-1) ?? path
+  if (segments.length === 1) {
+    return (
+      <code className="mr-auto min-w-0 truncate font-mono" title={path}>
+        {path}
+      </code>
+    )
+  }
+  const firstDirectory = segments[0]
+  const middleDirectories =
+    segments.length > 2 ? segments.slice(1, -1).join("/") : null
+  return (
+    <code
+      className={`mr-auto grid min-w-0 font-mono ${middleDirectories ? "grid-cols-[minmax(7ch,1fr)_minmax(0,max-content)]" : "grid-cols-[minmax(4ch,1fr)_minmax(0,max-content)]"}`}
+      title={path}
+    >
+      <span
+        className={`grid min-w-0 ${middleDirectories ? "grid-cols-[minmax(4ch,max-content)_minmax(3ch,1fr)]" : "grid-cols-[minmax(4ch,max-content)]"}`}
+      >
+        <span className="flex min-w-0">
+          <span className="truncate">{firstDirectory}</span>
+          <span>/</span>
+        </span>
+        {middleDirectories ? (
+          <span className="flex min-w-0">
+            <span className="truncate">{middleDirectories}</span>
+            <span>/</span>
+          </span>
+        ) : null}
+      </span>
+      <span className="truncate">{filename}</span>
+    </code>
   )
 })
 
