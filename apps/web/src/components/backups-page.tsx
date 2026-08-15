@@ -1183,6 +1183,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
   const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
+  const showsCreatedTimeWithFeedback = backup.taskStatus === "cancelled"
 
   return (
     <tr className="group transition-colors hover:bg-muted/20 has-checked:bg-primary/[0.07]">
@@ -1220,7 +1221,7 @@ const BackupTableRow = React.memo(function BackupTableRow({
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground sm:table-cell">
         {hasTaskFeedback ? (
-          <DesktopBackupTaskFileFeedback backup={backup} />
+          <DesktopBackupTaskFeedback backup={backup} />
         ) : (
           <span className="block truncate" title={backup.filename ?? backup.id}>
             {backup.filename ?? backup.id}
@@ -1228,18 +1229,14 @@ const BackupTableRow = React.memo(function BackupTableRow({
         )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground lg:table-cell">
-        {hasTaskFeedback ? (
-          <DesktopBackupTaskSizeFeedback backup={backup} />
-        ) : (
+        {hasTaskFeedback ? null : (
           <span className="whitespace-nowrap">
             {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
           </span>
         )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground xl:table-cell">
-        {hasTaskFeedback ? (
-          <DesktopBackupTaskTimeFeedback backup={backup} />
-        ) : (
+        {hasTaskFeedback && !showsCreatedTimeWithFeedback ? null : (
           <span className="whitespace-nowrap">
             <BackupCreatedTime createdAt={backup.createdAt} />
           </span>
@@ -1682,98 +1679,49 @@ const BackupTaskFeedback = React.memo(function BackupTaskFeedback({
   )
 })
 
-const DesktopBackupTaskFileFeedback = React.memo(
-  function DesktopBackupTaskFileFeedback({ backup }: { backup: Backup }) {
-    const active =
-      backup.taskStatus === "queued" || backup.taskStatus === "running"
-    if (!active) return <BackupTaskFeedback backup={backup} />
-    const percent = backupTaskProgressPercent(backup)
+const DesktopBackupTaskFeedback = React.memo(
+  function DesktopBackupTaskFeedback({ backup }: { backup: Backup }) {
+    const feedbackRef = React.useRef<HTMLDivElement>(null)
+    React.useLayoutEffect(() => {
+      const feedback = feedbackRef.current
+      const cell = feedback?.parentElement
+      const row = cell?.parentElement
+      const actionsCell = row?.lastElementChild
+      const createdCell = actionsCell?.previousElementSibling
+      if (
+        !feedback ||
+        !(cell instanceof HTMLTableCellElement) ||
+        !(actionsCell instanceof HTMLTableCellElement) ||
+        !(createdCell instanceof HTMLTableCellElement)
+      ) {
+        return
+      }
+      const fitToActions = () => {
+        const feedbackLeft = feedback.getBoundingClientRect().left
+        const showCreatedTime =
+          backup.taskStatus === "cancelled" &&
+          window.getComputedStyle(createdCell).display !== "none"
+        const boundaryCell = showCreatedTime ? createdCell : actionsCell
+        const boundaryLeft = boundaryCell.getBoundingClientRect().left
+        const trailingInset = Number.parseFloat(
+          window.getComputedStyle(boundaryCell).paddingLeft
+        )
+        feedback.style.width = `${Math.max(
+          0,
+          boundaryLeft - feedbackLeft - trailingInset
+        )}px`
+      }
+      const observer = new ResizeObserver(fitToActions)
+      observer.observe(cell)
+      observer.observe(createdCell)
+      observer.observe(actionsCell)
+      fitToActions()
+      return () => observer.disconnect()
+    }, [backup.taskStatus])
     return (
-      <div className="min-w-0" aria-live="polite">
-        <p className="mb-1 truncate text-[0.6875rem] leading-none font-medium text-foreground/80">
-          {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
-        </p>
-        <Progress
-          aria-label={`${backup.name} progress`}
-          className={
-            percent === null
-              ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
-              : ""
-          }
-          value={percent ?? undefined}
-        />
-        <code
-          className="mt-1 block truncate font-mono text-[0.625rem] text-muted-foreground"
-          title={backup.taskCurrentPath ?? undefined}
-        >
-          {backup.taskCurrentPath ?? "\u00a0"}
-        </code>
+      <div ref={feedbackRef} className="relative z-10 min-w-0">
+        <BackupTaskFeedback backup={backup} />
       </div>
-    )
-  }
-)
-
-const DesktopBackupTaskSizeFeedback = React.memo(
-  function DesktopBackupTaskSizeFeedback({ backup }: { backup: Backup }) {
-    const active =
-      backup.taskStatus === "queued" || backup.taskStatus === "running"
-    if (!active) {
-      return (
-        <span
-          className={
-            backup.taskStatus === "cancelled"
-              ? "text-xs text-muted-foreground"
-              : "text-xs text-destructive"
-          }
-        >
-          {backup.taskStatus === "cancelled" ? "Cancelled" : "Failed"}
-        </span>
-      )
-    }
-    const percent = backupTaskProgressPercent(backup)
-    const transferred =
-      backup.taskBytesTotal === null
-        ? backup.taskBytesCompleted > 0
-          ? formatBytes(backup.taskBytesCompleted)
-          : "Working…"
-        : `${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal)}`
-    return (
-      <div className="min-w-0 leading-tight tabular-nums">
-        <p className="text-xs font-medium text-foreground/80">
-          {percent === null ? "—" : `${percent}%`}
-        </p>
-        <p className="mt-1 truncate text-[0.625rem]" title={transferred}>
-          {transferred}
-        </p>
-      </div>
-    )
-  }
-)
-
-const DesktopBackupTaskTimeFeedback = React.memo(
-  function DesktopBackupTaskTimeFeedback({ backup }: { backup: Backup }) {
-    const [now, setNow] = React.useState(() => Date.now())
-    React.useEffect(() => {
-      const timer = window.setInterval(() => setNow(Date.now()), 30_000)
-      return () => window.clearInterval(timer)
-    }, [])
-    const updatedAt = new Date(backup.taskUpdatedAt).getTime()
-    const progressAge =
-      shortRelativeBackupTime(updatedAt, now) ??
-      backupDateCompact.format(updatedAt)
-    return (
-      <span
-        className="block text-[0.625rem] leading-tight"
-        suppressHydrationWarning
-        title={backupDate.format(updatedAt)}
-      >
-        <span className="block">
-          {backup.taskStatus === "cancelled" ? "Cancelled" : "Last progress"}
-        </span>
-        <span className="mt-1 block text-xs whitespace-nowrap text-foreground/80">
-          {progressAge}
-        </span>
-      </span>
     )
   }
 )
