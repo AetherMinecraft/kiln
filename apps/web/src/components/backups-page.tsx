@@ -138,6 +138,7 @@ type BackupAvailabilityTagView = {
   name: string
   state: BackupAvailabilityState
   tooltip?: string
+  uploadPercent: number | null
 }
 type BackupAvailabilityState = "available" | "failed" | "missing" | "working"
 type BackupTargetPresentation = {
@@ -1732,6 +1733,7 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
   backup: Backup
 }) {
   const percent = backupTaskProgressPercent(backup)
+  const progressDetail = backupTaskProgressDetail(backup, percent)
   return (
     <div className="min-w-0">
       <div aria-live="polite">
@@ -1739,19 +1741,13 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
           <span className="truncate font-medium text-foreground/80">
             {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
           </span>
-          <span className="shrink-0 tabular-nums">
-            {percent === null
-              ? backup.taskBytesCompleted > 0
-                ? formatBytes(backup.taskBytesCompleted)
-                : "Working…"
-              : `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`}
-          </span>
+          <span className="shrink-0 tabular-nums">{progressDetail}</span>
         </div>
         <Progress
           aria-label={`${backup.name} progress`}
           className={
             percent === null
-              ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
+              ? "[&_[data-slot=progress-indicator]]:animate-pulse"
               : ""
           }
           value={percent ?? undefined}
@@ -2223,7 +2219,12 @@ function BackupAvailabilityTag({ tag }: { tag: BackupAvailabilityTagView }) {
         <span
           className={`inline-flex h-6 max-w-36 items-center gap-1 rounded-md border px-2 font-mono text-[0.5625rem] font-semibold ${tag.key === "local" || tag.key === "s3" ? "uppercase" : ""} ${availabilityTagClassName(tag.state)}`}
         >
-          {working ? (
+          {tag.uploadPercent !== null ? (
+            <BackupUploadProgress
+              label={`${tag.name} upload`}
+              percent={tag.uploadPercent}
+            />
+          ) : working ? (
             <LoaderCircle className="size-2.5 shrink-0 animate-spin" />
           ) : tag.state === "available" ? (
             <Check className="size-2.5 shrink-0" />
@@ -2233,13 +2234,58 @@ function BackupAvailabilityTag({ tag }: { tag: BackupAvailabilityTagView }) {
       </TooltipTrigger>
       <TooltipContent side="top">
         {tag.tooltip ??
-          `${tag.name} · ${availabilityStateLabel(tag.state)}${
-            tag.error ? ` · ${tag.error}` : ""
-          }`}
+          `${tag.name} · ${
+            tag.uploadPercent === null
+              ? availabilityStateLabel(tag.state)
+              : `Uploading · ${tag.uploadPercent}%`
+          }${tag.error ? ` · ${tag.error}` : ""}`}
       </TooltipContent>
     </Tooltip>
   )
 }
+
+const BackupUploadProgress = React.memo(function BackupUploadProgress({
+  label,
+  percent,
+}: {
+  label: string
+  percent: number
+}) {
+  const radius = 4
+  const circumference = 2 * Math.PI * radius
+  const offset = circumference * (1 - percent / 100)
+  return (
+    <svg
+      aria-label={`${label}: ${percent}%`}
+      aria-valuemax={100}
+      aria-valuemin={0}
+      aria-valuenow={percent}
+      className="size-2.5 shrink-0 -rotate-90"
+      role="progressbar"
+      viewBox="0 0 10 10"
+    >
+      <circle
+        className="stroke-current opacity-25"
+        cx="5"
+        cy="5"
+        fill="none"
+        r={radius}
+        strokeWidth="1.5"
+      />
+      <circle
+        className="stroke-current transition-[stroke-dashoffset] duration-300"
+        cx="5"
+        cy="5"
+        fill="none"
+        r={radius}
+        strokeDasharray={circumference}
+        strokeDashoffset={offset}
+        strokeLinecap="round"
+        strokeWidth="1.5"
+      />
+    </svg>
+  )
+})
 
 function BackupMissingTargetTooltip({
   children,
@@ -4093,6 +4139,7 @@ function backupAvailabilityTags(
   backup: Backup,
   destinations: ReadonlyArray<BackupAvailabilityDestination>
 ): Array<BackupAvailabilityTagView> {
+  const uploadPercent = backupTaskUploadProgressPercent(backup)
   const artifactsByStorage = new Map<string, Backup["artifacts"][number]>()
   for (const artifact of backup.artifacts) {
     artifactsByStorage.set(artifact.storageId ?? "local", artifact)
@@ -4101,12 +4148,15 @@ function backupAvailabilityTags(
     (destination) => {
       const key = destination.id ?? "local"
       const artifact = artifactsByStorage.get(key)
+      const state = artifactAvailabilityState(artifact?.status)
       return {
         error: artifact?.error ?? null,
         key,
         label: destination.id ? destination.name : "Local",
         name: destination.id ? destination.name : "Local Relay",
-        state: artifactAvailabilityState(artifact?.status),
+        state,
+        uploadPercent:
+          destination.id && state === "working" ? uploadPercent : null,
       }
     }
   )
@@ -4114,12 +4164,15 @@ function backupAvailabilityTags(
   for (const artifact of backup.artifacts) {
     const key = artifact.storageId ?? "local"
     if (seen.has(key)) continue
+    const state = artifactAvailabilityState(artifact.status)
     tags.push({
       error: artifact.error,
       key,
       label: artifact.storageId ? "S3" : "Local",
       name: artifact.storageId ? "S3 destination" : "Local Relay",
-      state: artifactAvailabilityState(artifact.status),
+      state,
+      uploadPercent:
+        artifact.storageId && state === "working" ? uploadPercent : null,
     })
   }
   const s3Enabled =
@@ -4133,6 +4186,7 @@ function backupAvailabilityTags(
       name: "S3",
       state: "missing",
       tooltip: "S3 not configured",
+      uploadPercent: null,
     })
   }
   return tags
@@ -4266,10 +4320,44 @@ function backupTaskPhaseLabel(
 }
 
 function backupTaskProgressPercent(backup: Backup): number | null {
+  if (backup.taskPhase === "uploading" || backup.taskPhase === "finalizing") {
+    return 100
+  }
+  if (backup.taskPhase !== "archiving") return null
   if (backup.taskBytesTotal === null || backup.taskBytesTotal <= 0) return null
   return Math.min(
     100,
-    Math.round((backup.taskBytesCompleted / backup.taskBytesTotal) * 100)
+    Math.floor((backup.taskBytesCompleted / backup.taskBytesTotal) * 100)
+  )
+}
+
+function backupTaskProgressDetail(
+  backup: Backup,
+  percent: number | null
+): string {
+  if (backup.taskPhase === "uploading") {
+    return backup.artifactKind === "archive" ? "Archive ready" : "Export ready"
+  }
+  if (backup.taskPhase === "finalizing") return "Finishing…"
+  if (percent === null) {
+    return backup.taskBytesCompleted > 0
+      ? formatBytes(backup.taskBytesCompleted)
+      : "Working…"
+  }
+  return `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`
+}
+
+function backupTaskUploadProgressPercent(backup: Backup): number | null {
+  if (
+    backup.taskPhase !== "uploading" ||
+    backup.taskBytesTotal === null ||
+    backup.taskBytesTotal <= 0
+  ) {
+    return null
+  }
+  return Math.min(
+    100,
+    Math.floor((backup.taskBytesCompleted / backup.taskBytesTotal) * 100)
   )
 }
 
