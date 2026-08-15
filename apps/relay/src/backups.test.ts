@@ -55,6 +55,12 @@ describe("Relay backups", () => {
       updatedAt: 2,
     }
     assert.isTrue(relayBackupTaskSchema.safeParse(task).success)
+    const legacyTask = structuredClone(task)
+    Reflect.deleteProperty(legacyTask, "currentPath")
+    Reflect.deleteProperty(legacyTask, "phase")
+    const parsedLegacyTask = relayBackupTaskSchema.parse(legacyTask)
+    assert.strictEqual(parsedLegacyTask.currentPath, null)
+    assert.strictEqual(parsedLegacyTask.phase, null)
     assert.isFalse(
       relayBackupTaskSchema.safeParse({
         ...task,
@@ -143,6 +149,37 @@ describe("Relay backups", () => {
         yield* Fiber.join(worker)
 
         assert.strictEqual(cancelled?.status, "cancelled")
+        assert.strictEqual(
+          (yield* manager.get(input.taskId))?.error,
+          "Cancelled by user"
+        )
+      })
+    )
+
+    it.effect("cancels a queued create task before archive work starts", () =>
+      Effect.gen(function* () {
+        let archiveCalls = 0
+        const manager = yield* BackupManager.make({
+          config: loadConfig({
+            KILN_RELAY_DATA_DIR: testDirectory,
+            KILN_RELAY_HOST: "relay.test",
+            NODE_ENV: "test",
+          }),
+          createArchive: async () => {
+            archiveCalls += 1
+            return backupResult(11)
+          },
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+        })
+        const input = backupInput(11)
+        yield* manager.enqueue(input)
+
+        const cancelled = yield* manager.cancel(input.taskId)
+        yield* manager.runPending()
+
+        assert.strictEqual(cancelled?.status, "cancelled")
+        assert.strictEqual(archiveCalls, 0)
         assert.strictEqual(
           (yield* manager.get(input.taskId))?.error,
           "Cancelled by user"

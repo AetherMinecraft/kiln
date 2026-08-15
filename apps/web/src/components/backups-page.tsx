@@ -1218,31 +1218,33 @@ const BackupTableRow = React.memo(function BackupTableRow({
           targetKind={backup.targetKind}
         />
       </WorkspaceTableCell>
-      {hasTaskFeedback ? (
-        <WorkspaceTableCell
-          className="hidden h-auto py-2.5 md:table-cell"
-          colSpan={3}
-        >
-          <BackupTaskFeedback backup={backup} />
-        </WorkspaceTableCell>
-      ) : (
-        <>
-          <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground sm:table-cell">
-            <span
-              className="block truncate"
-              title={backup.filename ?? backup.id}
-            >
-              {backup.filename ?? backup.id}
-            </span>
-          </WorkspaceTableCell>
-          <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm whitespace-nowrap text-muted-foreground lg:table-cell">
+      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground sm:table-cell">
+        {hasTaskFeedback ? (
+          <DesktopBackupTaskFileFeedback backup={backup} />
+        ) : (
+          <span className="block truncate" title={backup.filename ?? backup.id}>
+            {backup.filename ?? backup.id}
+          </span>
+        )}
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground lg:table-cell">
+        {hasTaskFeedback ? (
+          <DesktopBackupTaskSizeFeedback backup={backup} />
+        ) : (
+          <span className="whitespace-nowrap">
             {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
-          </WorkspaceTableCell>
-          <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm whitespace-nowrap text-muted-foreground xl:table-cell">
+          </span>
+        )}
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground xl:table-cell">
+        {hasTaskFeedback ? (
+          <DesktopBackupTaskTimeFeedback backup={backup} />
+        ) : (
+          <span className="whitespace-nowrap">
             <BackupCreatedTime createdAt={backup.createdAt} />
-          </WorkspaceTableCell>
-        </>
-      )}
+          </span>
+        )}
+      </WorkspaceTableCell>
       <WorkspaceTableCell className="h-auto py-2.5">
         <BackupRowActions
           backup={backup}
@@ -1680,6 +1682,102 @@ const BackupTaskFeedback = React.memo(function BackupTaskFeedback({
   )
 })
 
+const DesktopBackupTaskFileFeedback = React.memo(
+  function DesktopBackupTaskFileFeedback({ backup }: { backup: Backup }) {
+    const active =
+      backup.taskStatus === "queued" || backup.taskStatus === "running"
+    if (!active) return <BackupTaskFeedback backup={backup} />
+    const percent = backupTaskProgressPercent(backup)
+    return (
+      <div className="min-w-0" aria-live="polite">
+        <p className="mb-1 truncate text-[0.6875rem] leading-none font-medium text-foreground/80">
+          {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
+        </p>
+        <Progress
+          aria-label={`${backup.name} progress`}
+          className={
+            percent === null
+              ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
+              : ""
+          }
+          value={percent ?? undefined}
+        />
+        <code
+          className="mt-1 block truncate font-mono text-[0.625rem] text-muted-foreground"
+          title={backup.taskCurrentPath ?? undefined}
+        >
+          {backup.taskCurrentPath ?? "\u00a0"}
+        </code>
+      </div>
+    )
+  }
+)
+
+const DesktopBackupTaskSizeFeedback = React.memo(
+  function DesktopBackupTaskSizeFeedback({ backup }: { backup: Backup }) {
+    const active =
+      backup.taskStatus === "queued" || backup.taskStatus === "running"
+    if (!active) {
+      return (
+        <span
+          className={
+            backup.taskStatus === "cancelled"
+              ? "text-xs text-muted-foreground"
+              : "text-xs text-destructive"
+          }
+        >
+          {backup.taskStatus === "cancelled" ? "Cancelled" : "Failed"}
+        </span>
+      )
+    }
+    const percent = backupTaskProgressPercent(backup)
+    const transferred =
+      backup.taskBytesTotal === null
+        ? backup.taskBytesCompleted > 0
+          ? formatBytes(backup.taskBytesCompleted)
+          : "Working…"
+        : `${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal)}`
+    return (
+      <div className="min-w-0 leading-tight tabular-nums">
+        <p className="text-xs font-medium text-foreground/80">
+          {percent === null ? "—" : `${percent}%`}
+        </p>
+        <p className="mt-1 truncate text-[0.625rem]" title={transferred}>
+          {transferred}
+        </p>
+      </div>
+    )
+  }
+)
+
+const DesktopBackupTaskTimeFeedback = React.memo(
+  function DesktopBackupTaskTimeFeedback({ backup }: { backup: Backup }) {
+    const [now, setNow] = React.useState(() => Date.now())
+    React.useEffect(() => {
+      const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+      return () => window.clearInterval(timer)
+    }, [])
+    const updatedAt = new Date(backup.taskUpdatedAt).getTime()
+    const progressAge =
+      shortRelativeBackupTime(updatedAt, now) ??
+      backupDateCompact.format(updatedAt)
+    return (
+      <span
+        className="block text-[0.625rem] leading-tight"
+        suppressHydrationWarning
+        title={backupDate.format(updatedAt)}
+      >
+        <span className="block">
+          {backup.taskStatus === "cancelled" ? "Cancelled" : "Last progress"}
+        </span>
+        <span className="mt-1 block text-xs whitespace-nowrap text-foreground/80">
+          {progressAge}
+        </span>
+      </span>
+    )
+  }
+)
+
 const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
   backup,
 }: {
@@ -1690,15 +1788,7 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
     const timer = window.setInterval(() => setNow(Date.now()), 30_000)
     return () => window.clearInterval(timer)
   }, [])
-  const hasTotal = backup.taskBytesTotal !== null && backup.taskBytesTotal > 0
-  const percent = hasTotal
-    ? Math.min(
-        100,
-        Math.round(
-          (backup.taskBytesCompleted / (backup.taskBytesTotal ?? 1)) * 100
-        )
-      )
-    : null
+  const percent = backupTaskProgressPercent(backup)
   const updatedAt = new Date(backup.taskUpdatedAt).getTime()
   const progressAge =
     shortRelativeBackupTime(updatedAt, now) ??
@@ -4170,6 +4260,14 @@ function backupTaskPhaseLabel(
     case "finalizing":
       return "Finalizing"
   }
+}
+
+function backupTaskProgressPercent(backup: Backup): number | null {
+  if (backup.taskBytesTotal === null || backup.taskBytesTotal <= 0) return null
+  return Math.min(
+    100,
+    Math.round((backup.taskBytesCompleted / backup.taskBytesTotal) * 100)
+  )
 }
 
 function subscribeToMobileBackupLayout(onChange: () => void): () => void {

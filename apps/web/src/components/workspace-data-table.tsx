@@ -188,18 +188,12 @@ export function WorkspaceTableHeading({
 
 export function WorkspaceTableCell({
   className = "",
-  colSpan,
   children,
 }: {
   className?: string
-  colSpan?: number
   children: React.ReactNode
 }) {
-  return (
-    <td className={`h-14 px-3 align-middle ${className}`} colSpan={colSpan}>
-      {children}
-    </td>
-  )
+  return <td className={`h-14 px-3 align-middle ${className}`}>{children}</td>
 }
 
 function normalizeSearch(search: string): string {

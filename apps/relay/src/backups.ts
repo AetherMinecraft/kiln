@@ -19,6 +19,7 @@ import {
 } from "node:fs/promises"
 import { relative, resolve, sep } from "node:path"
 import { isIP } from "node:net"
+import { Transform } from "node:stream"
 import { constants as zlibConstants } from "node:zlib"
 import { Effect, Fiber, Queue, Result } from "effect"
 import { minimatch } from "minimatch"
@@ -419,7 +420,7 @@ export class BackupManager {
                   .updateBackupTaskProgress(
                     task.taskId,
                     progress.completed,
-                    null,
+                    progress.total || null,
                     progress.phase,
                     progress.currentPath,
                     Date.now()
@@ -515,7 +516,7 @@ export class BackupManager {
                   .updateBackupTaskProgress(
                     task.taskId,
                     progress.completed,
-                    null,
+                    progress.total || null,
                     progress.phase,
                     progress.currentPath,
                     Date.now()
@@ -815,6 +816,13 @@ function storeCreatedBackup(
     progress.phase = "uploading"
     progress.currentPath = null
     const destinations = [input.destination, ...(input.replicas ?? [])]
+    const uploadCount = destinations.filter(
+      (destination) => destination.kind === "s3"
+    ).length
+    if (uploadCount > 0) {
+      progress.completed = 0
+      progress.total = result.bytes * uploadCount
+    }
     const outcomes: NonNullable<BackupCreateTaskResult["artifacts"]> = []
     let available = 0
     for (const destination of destinations) {
@@ -831,7 +839,18 @@ function storeCreatedBackup(
         continue
       }
       const uploaded = yield* Effect.result(
-        uploadBackupArtifact(config, { ...input, destination }, result, signal)
+        uploadBackupArtifact(
+          config,
+          { ...input, destination },
+          result,
+          signal,
+          (bytes) => {
+            progress.completed = Math.min(
+              progress.total,
+              progress.completed + bytes
+            )
+          }
+        )
       )
       if (Result.isSuccess(uploaded)) {
         available += 1
@@ -874,7 +893,8 @@ function uploadBackupArtifact(
     destination: Extract<BackupCreateTaskInput["destination"], { kind: "s3" }>
   },
   result: BackupCreateTaskResult,
-  signal: AbortSignal
+  signal: AbortSignal,
+  onChunk: (bytes: number) => void
 ) {
   if (result.bytes > MAX_S3_SINGLE_PUT_BYTES) {
     return backupFailure(
@@ -893,6 +913,7 @@ function uploadBackupArtifact(
           "content-length": String(result.bytes),
         },
         method: "PUT",
+        onBodyChunk: onChunk,
         signal,
         url: input.destination.uploadUrl,
       }),
@@ -981,6 +1002,7 @@ function sendSignedBackupRequest(input: {
   bodyPath?: string
   headers: Readonly<Record<string, string>>
   method: "DELETE" | "PUT"
+  onBodyChunk?: (bytes: number) => void
   signal?: AbortSignal
   url: string
 }): Promise<void> {
@@ -1033,7 +1055,19 @@ function sendSignedBackupRequest(input: {
     if (input.bodyPath) {
       const body = createReadStream(input.bodyPath, { signal: input.signal })
       body.once("error", (cause) => request.destroy(cause))
-      body.pipe(request)
+      const onBodyChunk = input.onBodyChunk
+      if (!onBodyChunk) {
+        body.pipe(request)
+        return
+      }
+      const meter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          onBodyChunk(chunk.byteLength)
+          callback(null, chunk)
+        },
+      })
+      meter.once("error", (cause) => request.destroy(cause))
+      body.pipe(meter).pipe(request)
     } else {
       request.end()
     }
