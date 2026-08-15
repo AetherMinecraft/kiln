@@ -35,6 +35,7 @@ import {
   X,
 } from "lucide-react"
 
+import { backupArtifactFilename } from "@workspace/contracts"
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
 import {
@@ -134,6 +135,7 @@ type BackupAvailabilityDestination = {
 type BackupAvailabilityTagView = {
   error: string | null
   key: string
+  kind: "local" | "remote"
   label: string
   name: string
   state: BackupAvailabilityState
@@ -1184,7 +1186,10 @@ const BackupTableRow = React.memo(function BackupTableRow({
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
   const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
+  const showsPrimaryTaskFeedback = backupShowsPrimaryTaskFeedback(backup)
   const showsCreatedTimeWithFeedback = backup.taskStatus === "cancelled"
+  const displayBytes = backupDisplayBytes(backup)
+  const displayFilename = backupDisplayFilename(backup)
 
   return (
     <tr className="group transition-colors hover:bg-muted/20 has-checked:bg-primary/[0.07]">
@@ -1221,23 +1226,23 @@ const BackupTableRow = React.memo(function BackupTableRow({
         />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground sm:table-cell">
-        {hasTaskFeedback ? (
+        {showsPrimaryTaskFeedback ? (
           <DesktopBackupTaskFeedback backup={backup} />
         ) : (
-          <span className="block truncate" title={backup.filename ?? backup.id}>
-            {backup.filename ?? backup.id}
+          <span className="block truncate" title={displayFilename}>
+            {displayFilename}
           </span>
         )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground lg:table-cell">
-        {hasTaskFeedback ? null : (
+        {showsPrimaryTaskFeedback ? null : (
           <span className="whitespace-nowrap">
-            {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
+            {displayBytes === null ? "—" : formatBytes(displayBytes)}
           </span>
         )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground xl:table-cell">
-        {hasTaskFeedback && !showsCreatedTimeWithFeedback ? null : (
+        {showsPrimaryTaskFeedback && !showsCreatedTimeWithFeedback ? null : (
           <span className="whitespace-nowrap">
             <BackupCreatedTime createdAt={backup.createdAt} />
           </span>
@@ -1278,6 +1283,9 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
   const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
+  const showsPrimaryTaskFeedback = backupShowsPrimaryTaskFeedback(backup)
+  const displayBytes = backupDisplayBytes(backup)
+  const displayFilename = backupDisplayFilename(backup)
   return (
     <article
       aria-label={backup.name}
@@ -1307,17 +1315,17 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
           targetKind={backup.targetKind}
         />
       </div>
-      {hasTaskFeedback ? (
+      {showsPrimaryTaskFeedback ? (
         <div className="mt-2.5">
           <BackupTaskFeedback backup={backup} />
         </div>
       ) : (
         <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 text-xs text-muted-foreground">
-          <span className="truncate" title={backup.filename ?? backup.id}>
-            {backup.filename ?? backup.id}
+          <span className="truncate" title={displayFilename}>
+            {displayFilename}
           </span>
           <span className="whitespace-nowrap">
-            {backup.bytes === null ? "—" : formatBytes(backup.bytes)} ·{" "}
+            {displayBytes === null ? "—" : formatBytes(displayBytes)} ·{" "}
             <BackupCreatedTime createdAt={backup.createdAt} />
           </span>
         </div>
@@ -2213,6 +2221,7 @@ const BackupAvailabilityTags = React.memo(function BackupAvailabilityTags({
 
 function BackupAvailabilityTag({ tag }: { tag: BackupAvailabilityTagView }) {
   const working = tag.state === "working"
+  const IdleIcon = tag.kind === "local" ? HardDrive : Cloud
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -2228,7 +2237,11 @@ function BackupAvailabilityTag({ tag }: { tag: BackupAvailabilityTagView }) {
             <LoaderCircle className="size-2.5 shrink-0 animate-spin" />
           ) : tag.state === "available" ? (
             <Check className="size-2.5 shrink-0" />
-          ) : null}
+          ) : tag.state === "failed" ? (
+            <CircleAlert className="size-2.5 shrink-0" />
+          ) : (
+            <IdleIcon className="size-2.5 shrink-0" />
+          )}
           <span className="truncate">{tag.label}</span>
         </span>
       </TooltipTrigger>
@@ -4075,6 +4088,37 @@ function backupHasCreateTaskFeedback(backup: Backup): boolean {
   )
 }
 
+function backupShowsPrimaryTaskFeedback(backup: Backup): boolean {
+  if (!backupHasCreateTaskFeedback(backup)) return false
+  if (backup.taskStatus !== "queued" && backup.taskStatus !== "running") {
+    return true
+  }
+  return backup.taskPhase !== "uploading" && backup.taskPhase !== "finalizing"
+}
+
+function backupDisplayFilename(backup: Backup): string {
+  if (backup.filename) return backup.filename
+  if (backup.taskPhase === "uploading" || backup.taskPhase === "finalizing") {
+    return backupArtifactFilename(backup.id, backup.artifactKind)
+  }
+  return backup.id
+}
+
+function backupDisplayBytes(backup: Backup): number | null {
+  if (backup.bytes !== null) return backup.bytes
+  if (
+    (backup.taskPhase !== "uploading" && backup.taskPhase !== "finalizing") ||
+    backup.taskBytesTotal === null
+  ) {
+    return null
+  }
+  const remoteArtifactCount = backup.artifacts.filter(
+    (artifact) => artifact.storageId !== null
+  ).length
+  if (remoteArtifactCount === 0) return null
+  return Math.floor(backup.taskBytesTotal / remoteArtifactCount)
+}
+
 function backupSourceIsActive(backup: Backup): boolean {
   return (
     activeStatuses.has(backup.status) ||
@@ -4147,11 +4191,13 @@ function backupAvailabilityTags(
   const tags: Array<BackupAvailabilityTagView> = destinations.map(
     (destination) => {
       const key = destination.id ?? "local"
+      const kind = destination.id ? "remote" : "local"
       const artifact = artifactsByStorage.get(key)
-      const state = artifactAvailabilityState(artifact?.status)
+      const state = backupArtifactAvailabilityState(backup, artifact, kind)
       return {
         error: artifact?.error ?? null,
         key,
+        kind,
         label: destination.id ? destination.name : "Local",
         name: destination.id ? destination.name : "Local Relay",
         state,
@@ -4164,10 +4210,12 @@ function backupAvailabilityTags(
   for (const artifact of backup.artifacts) {
     const key = artifact.storageId ?? "local"
     if (seen.has(key)) continue
-    const state = artifactAvailabilityState(artifact.status)
+    const kind = artifact.storageId ? "remote" : "local"
+    const state = backupArtifactAvailabilityState(backup, artifact, kind)
     tags.push({
       error: artifact.error,
       key,
+      kind,
       label: artifact.storageId ? "S3" : "Local",
       name: artifact.storageId ? "S3 destination" : "Local Relay",
       state,
@@ -4182,6 +4230,7 @@ function backupAvailabilityTags(
     tags.push({
       error: null,
       key: "s3",
+      kind: "remote",
       label: "S3",
       name: "S3",
       state: "missing",
@@ -4190,6 +4239,24 @@ function backupAvailabilityTags(
     })
   }
   return tags
+}
+
+function backupArtifactAvailabilityState(
+  backup: Backup,
+  artifact: Backup["artifacts"][number] | undefined,
+  kind: BackupAvailabilityTagView["kind"]
+): BackupAvailabilityState {
+  const state = artifactAvailabilityState(artifact?.status)
+  if (
+    kind === "local" &&
+    state === "working" &&
+    backup.taskKind === "create" &&
+    backup.taskStatus === "running" &&
+    (backup.taskPhase === "uploading" || backup.taskPhase === "finalizing")
+  ) {
+    return "available"
+  }
+  return state
 }
 
 function extraBackupDestinations(
