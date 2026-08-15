@@ -1733,34 +1733,36 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
 }) {
   const percent = backupTaskProgressPercent(backup)
   return (
-    <div className="min-w-0" aria-live="polite">
-      <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] leading-none text-muted-foreground">
-        <span className="truncate font-medium text-foreground/80">
-          {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
-        </span>
-        <span className="shrink-0 tabular-nums">
-          {percent === null
-            ? backup.taskBytesCompleted > 0
-              ? formatBytes(backup.taskBytesCompleted)
-              : "Working…"
-            : `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`}
-        </span>
+    <div className="min-w-0">
+      <div aria-live="polite">
+        <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] leading-none text-muted-foreground">
+          <span className="truncate font-medium text-foreground/80">
+            {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
+          </span>
+          <span className="shrink-0 tabular-nums">
+            {percent === null
+              ? backup.taskBytesCompleted > 0
+                ? formatBytes(backup.taskBytesCompleted)
+                : "Working…"
+              : `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`}
+          </span>
+        </div>
+        <Progress
+          aria-label={`${backup.name} progress`}
+          className={
+            percent === null
+              ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
+              : ""
+          }
+          value={percent ?? undefined}
+        />
       </div>
-      <Progress
-        aria-label={`${backup.name} progress`}
-        className={
-          percent === null
-            ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
-            : ""
-        }
-        value={percent ?? undefined}
-      />
       <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[0.625rem] text-muted-foreground">
-        {backup.taskCurrentPath ? (
-          <BackupCurrentPath path={backup.taskCurrentPath} />
-        ) : (
-          <span className="min-w-0 flex-1" />
-        )}
+        <div aria-live="polite" className="flex min-w-0 flex-1">
+          {backup.taskCurrentPath ? (
+            <BackupCurrentPath path={backup.taskCurrentPath} />
+          ) : null}
+        </div>
         <BackupElapsedTimer startedAt={backup.taskStartedAt} />
       </div>
     </div>
@@ -1780,10 +1782,12 @@ const BackupElapsedTimer = React.memo(function BackupElapsedTimer({
     const timer = window.setInterval(() => setNow(Date.now()), 1_000)
     return () => window.clearInterval(timer)
   }, [startedAtMs])
+  const elapsed = formatBackupElapsed(
+    startedAtMs === null ? 0 : now - startedAtMs
+  )
   return (
     <span
-      aria-label="Elapsed backup time"
-      aria-live="off"
+      aria-label={`Elapsed backup time ${elapsed}`}
       className="shrink-0 font-mono tabular-nums"
       suppressHydrationWarning
       title={
@@ -1792,7 +1796,7 @@ const BackupElapsedTimer = React.memo(function BackupElapsedTimer({
           : `Started ${backupDate.format(startedAtMs)}`
       }
     >
-      {formatBackupElapsed(startedAtMs === null ? 0 : now - startedAtMs)}
+      {elapsed}
     </span>
   )
 })
