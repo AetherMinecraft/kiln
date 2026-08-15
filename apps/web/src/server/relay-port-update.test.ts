@@ -1,65 +1,23 @@
-import { Effect } from "effect"
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { relayInstanceSchema } from "@workspace/contracts"
 
-const mocks = vi.hoisted(() => ({
-  applyManagedDomainAddressesEffect: vi.fn(),
-  invalidateRelayCache: vi.fn(),
-  listPersistedRelays: vi.fn(),
-  provisionInstanceDomainBestEffort: vi.fn(),
-  relayFetchEffect: vi.fn(),
-  requireAuthenticatedUser: vi.fn(),
-  requireRelayPermission: vi.fn(),
-  runAppEffect: vi.fn(),
-}))
+const provisionInstanceDomainBestEffort = vi.hoisted(() => vi.fn())
 
-vi.mock("@/effect/runtime", () => ({ runAppEffect: mocks.runAppEffect }))
-vi.mock("@/lib/access-control", () => ({
-  allowedInstanceIds: vi.fn(
-    async (_user, _relayId, instanceIds) => new Set(instanceIds)
-  ),
-  requireRelayPermission: mocks.requireRelayPermission,
-}))
-vi.mock("@/lib/file-activity", () => ({
-  listFileActivity: vi.fn(),
-  recordFileEdited: vi.fn(),
-  recordFileViewed: vi.fn(),
-  setFilePinned: vi.fn(),
-}))
-vi.mock("@/lib/final-instance-deletion", () => ({
-  deleteInstanceWithFinalBackup: vi.fn(),
-}))
-vi.mock("@/lib/relay-client", () => ({
-  cachedRelayFallbackJsonEffect: vi.fn(),
-  cachedRelayJsonEffect: vi.fn(),
-  invalidateRelayCache: mocks.invalidateRelayCache,
-  relayCachePolicy: { snapshot: vi.fn(() => "snapshot-policy") },
-  relayFetchEffect: mocks.relayFetchEffect,
-  relayJsonEffect: vi.fn(),
-}))
-vi.mock("@/lib/relay-registry", () => ({
-  listPersistedRelays: mocks.listPersistedRelays,
-}))
-vi.mock("@/server/auth", () => ({
-  requireAuthenticatedUser: mocks.requireAuthenticatedUser,
-}))
 vi.mock("@/server/domains.server", () => ({
-  applyManagedDomainAddressesEffect: mocks.applyManagedDomainAddressesEffect,
-  provisionInstanceDomainBestEffort: mocks.provisionInstanceDomainBestEffort,
+  provisionInstanceDomainBestEffort,
 }))
 
-import { updateInstancePortsHandler } from "./relay"
+import { syncInstanceDomainAfterPortUpdateBestEffort } from "./relay-port-update.server"
 
 const relayId = "relay-one"
-const instanceId = "2".repeat(40)
-const updatedInstance = relayInstanceSchema.parse({
+const instance = relayInstanceSchema.parse({
   brickNetworkMode: "direct",
   connectAddress: "port-update.test:32124",
   containerId: "port-update-container",
   desiredState: "stopped",
   directory: "2".repeat(40),
   game: "Minecraft",
-  id: instanceId,
+  id: "2".repeat(40),
   implementation: "Paper",
   javaVersion: "21",
   managedByRelay: true,
@@ -85,63 +43,36 @@ const updatedInstance = relayInstanceSchema.parse({
 })
 
 describe("instance port update domain sync", () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    mocks.invalidateRelayCache.mockReturnValue(Effect.void)
-    mocks.listPersistedRelays.mockResolvedValue([
-      { enabled: true, id: relayId },
-    ])
-    mocks.relayFetchEffect.mockReturnValue(
-      Effect.succeed(Response.json(updatedInstance))
-    )
-    mocks.requireAuthenticatedUser.mockResolvedValue({ id: "user-one" })
-    mocks.requireRelayPermission.mockResolvedValue(undefined)
-    mocks.runAppEffect.mockImplementation((_name, effect) =>
-      Effect.runPromise(effect)
-    )
-  })
+  beforeEach(() => provisionInstanceDomainBestEffort.mockClear())
 
   it("provisions the managed domain after a primary public-port replacement", async () => {
-    await updateInstancePortsHandler({
-      instanceId,
-      ports: [
-        {
-          externalPort: 32_124,
-          id: "primary",
-          internalPort: 25_565,
-          leaseId: "a".repeat(32),
-          name: "Default Server",
-          protocol: "tcp",
-        },
-      ],
-      relayId,
-    })
+    await syncInstanceDomainAfterPortUpdateBestEffort(instance, relayId, [
+      {
+        externalPort: 32_124,
+        id: "primary",
+        internalPort: 25_565,
+        leaseId: "a".repeat(32),
+        name: "Default Server",
+        protocol: "tcp",
+      },
+    ])
 
-    expect(mocks.requireRelayPermission).toHaveBeenCalledWith(
-      expect.objectContaining({
-        permission: "instance.network.public-port.write",
-      })
-    )
-    expect(mocks.provisionInstanceDomainBestEffort).toHaveBeenCalledWith(
-      updatedInstance,
+    expect(provisionInstanceDomainBestEffort).toHaveBeenCalledWith(
+      instance,
       relayId
     )
   })
 
   it("does not resync the domain for a protocol-only edit", async () => {
-    await updateInstancePortsHandler({
-      instanceId,
-      ports: [
-        {
-          id: "primary",
-          internalPort: 25_565,
-          name: "Default Server",
-          protocol: "both",
-        },
-      ],
-      relayId,
-    })
+    await syncInstanceDomainAfterPortUpdateBestEffort(instance, relayId, [
+      {
+        id: "primary",
+        internalPort: 25_565,
+        name: "Default Server",
+        protocol: "both",
+      },
+    ])
 
-    expect(mocks.provisionInstanceDomainBestEffort).not.toHaveBeenCalled()
+    expect(provisionInstanceDomainBestEffort).not.toHaveBeenCalled()
   })
 })

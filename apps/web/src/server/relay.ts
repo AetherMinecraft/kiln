@@ -53,6 +53,7 @@ import {
   applyManagedDomainAddressesEffect,
   provisionInstanceDomainBestEffort,
 } from "@/server/domains.server"
+import { syncInstanceDomainAfterPortUpdateBestEffort } from "@/server/relay-port-update.server"
 import { deleteInstanceWithFinalBackup } from "@/lib/final-instance-deletion"
 import {
   cachedRelayFallbackJsonEffect,
@@ -396,37 +397,32 @@ export const updateInstanceWebRoutes = createServerFn({ method: "POST" })
 
 export const updateInstancePorts = createServerFn({ method: "POST" })
   .validator(portsInputSchema)
-  .handler(({ data }) => updateInstancePortsHandler(data))
-
-export async function updateInstancePortsHandler(
-  data: z.infer<typeof portsInputSchema>
-) {
-  const updatesPrimaryPublicPort = data.ports.some(
-    (port) => port.id === "primary" && port.externalPort !== undefined
-  )
-  const permission = instancePortsWritePermission(data.ports)
-  const value = await relayRequest(
-    `/v1/instances/${encodeURIComponent(data.instanceId)}/ports`,
-    {
-      body: JSON.stringify({ ports: data.ports }),
-      headers: { "Content-Type": "application/json" },
-      method: "PUT",
-    },
-    permission,
-    data.instanceId,
-    data.relayId,
-    240_000
-  )
-  const instance = relayInstanceSchema.parse(value)
-  if (updatesPrimaryPublicPort) {
-    await provisionInstanceDomainBestEffort(instance, data.relayId)
-  }
-  await runAppEffect(
-    "relay.snapshot.invalidate",
-    invalidateRelayCache(relayCachePolicy.snapshot(data.relayId))
-  )
-  return { ...instance, relayId: data.relayId }
-}
+  .handler(async ({ data }) => {
+    const permission = instancePortsWritePermission(data.ports)
+    const value = await relayRequest(
+      `/v1/instances/${encodeURIComponent(data.instanceId)}/ports`,
+      {
+        body: JSON.stringify({ ports: data.ports }),
+        headers: { "Content-Type": "application/json" },
+        method: "PUT",
+      },
+      permission,
+      data.instanceId,
+      data.relayId,
+      240_000
+    )
+    const instance = relayInstanceSchema.parse(value)
+    await syncInstanceDomainAfterPortUpdateBestEffort(
+      instance,
+      data.relayId,
+      data.ports
+    )
+    await runAppEffect(
+      "relay.snapshot.invalidate",
+      invalidateRelayCache(relayCachePolicy.snapshot(data.relayId))
+    )
+    return { ...instance, relayId: data.relayId }
+  })
 
 export const reserveInstancePort = createServerFn({ method: "POST" })
   .validator(portLeaseInputSchema)
