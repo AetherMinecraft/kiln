@@ -471,6 +471,7 @@ function testConfig(dataDirectory: string): RelayConfig {
   return {
     advertisedHost: "127.0.0.1",
     advertisedHostInferred: false,
+    backupTimeoutMs: 60 * 60_000,
     bootstrapToken: null,
     brickCatalogUrl: "https://example.test/catalog.yml",
     browserOrigin: "https://127.0.0.1:4100",

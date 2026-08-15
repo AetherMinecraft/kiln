@@ -57,6 +57,8 @@ const MAX_BACKUP_ENTRIES = 100_000
 const ZIP_OVERHEAD_RESERVE_BYTES = 64 * 1024 * 1024
 const MAX_S3_SINGLE_PUT_BYTES = 5 * 1024 ** 3
 const BACKUP_TRANSFER_IDLE_TIMEOUT_MS = 30_000
+const BACKUP_TIMEOUT_REASON =
+  "Cancelled after reaching the configured backup timeout"
 const DEFAULT_EXCLUDES = [
   ".DS_Store",
   "Thumbs.db",
@@ -215,6 +217,28 @@ export class BackupManager {
           const current = yield* this.#state.getBackupTask(task.taskId)
           if (!current || current.status !== "running") controller.abort()
         }
+        const timeoutFiber =
+          task.kind === "create"
+            ? yield* Effect.forkChild(
+                Effect.sleep(this.#config.backupTimeoutMs).pipe(
+                  Effect.andThen(
+                    Effect.suspend(() =>
+                      this.#state.cancelBackupTask(
+                        task.taskId,
+                        Date.now(),
+                        BACKUP_TIMEOUT_REASON
+                      )
+                    )
+                  ),
+                  Effect.tap((cancelled) =>
+                    cancelled
+                      ? Effect.sync(() => controller?.abort())
+                      : Effect.void
+                  ),
+                  Effect.asVoid
+                )
+              )
+            : undefined
         yield* this.#execute(task, controller?.signal).pipe(
           Effect.catch((cause) =>
             this.#state
@@ -237,9 +261,12 @@ export class BackupManager {
               )
           ),
           Effect.ensuring(
-            Effect.sync(() => {
-              if (controller) this.#activeCreates.delete(task.taskId)
-            })
+            timeoutFiber ? Fiber.interrupt(timeoutFiber) : Effect.void
+          ),
+          Effect.ensuring(
+            controller
+              ? Effect.sync(() => this.#activeCreates.delete(task.taskId))
+              : Effect.void
           )
         )
       }

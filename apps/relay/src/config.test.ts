@@ -20,11 +20,24 @@ describe("loadConfig", () => {
     expect(config.tlsMode).toBe("development")
     expect(config.sftpDevAuthentication).toBe(true)
     expect(config.mclogsApiUrl).toBe("https://api.mclo.gs/1/log")
+    expect(config.backupTimeoutMs).toBe(60 * 60_000)
     expect(config.runtimeRecovery).toEqual({
       initialDelayMs: 5_000,
       maxRetries: 2,
       stabilityMs: 300_000,
     })
+  })
+
+  it("configures the backup timeout in minutes", () => {
+    expect(
+      loadConfig({
+        KILN_BACKUP_TIMEOUT: "90",
+        NODE_ENV: "development",
+      }).backupTimeoutMs
+    ).toBe(90 * 60_000)
+    expect(() =>
+      loadConfig({ KILN_BACKUP_TIMEOUT: "0", NODE_ENV: "development" })
+    ).toThrow("KILN_BACKUP_TIMEOUT must be a positive integer")
   })
 
   it("configures bounded server crash recovery", () => {

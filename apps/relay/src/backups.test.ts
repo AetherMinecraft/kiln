@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { afterAll, assert, describe, it, layer } from "@effect/vitest"
 import { Effect, Fiber } from "effect"
+import { TestClock } from "effect/testing"
 import ZipStream from "zip-stream"
 
 import type {
@@ -152,6 +153,50 @@ describe("Relay backups", () => {
         assert.strictEqual(
           (yield* manager.get(input.taskId))?.error,
           "Cancelled by user"
+        )
+      })
+    )
+
+    it.effect("automatically cancels a create task at the backup timeout", () =>
+      Effect.gen(function* () {
+        let started: (() => void) | undefined
+        const archiveStarted = new Promise<void>((resolveStarted) => {
+          started = resolveStarted
+        })
+        const manager = yield* BackupManager.make({
+          config: {
+            ...loadConfig({
+              KILN_RELAY_DATA_DIR: testDirectory,
+              KILN_RELAY_HOST: "relay.test",
+              NODE_ENV: "test",
+            }),
+            backupTimeoutMs: 10,
+          },
+          createArchive: (_input, _instance, _progress, signal) =>
+            new Promise((_resolveArchive, rejectArchive) => {
+              signal.addEventListener(
+                "abort",
+                () => rejectArchive(signal.reason),
+                { once: true }
+              )
+              started?.()
+            }),
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+        })
+        const input = backupInput(12)
+        yield* manager.enqueue(input)
+        const worker = yield* Effect.forkChild(manager.runPending())
+        yield* Effect.promise(() => archiveStarted)
+
+        yield* TestClock.adjust("10 millis")
+        yield* Fiber.join(worker)
+
+        const cancelled = yield* manager.get(input.taskId)
+        assert.strictEqual(cancelled?.status, "cancelled")
+        assert.strictEqual(
+          cancelled?.error,
+          "Cancelled after reaching the configured backup timeout"
         )
       })
     )

@@ -1731,16 +1731,7 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
 }: {
   backup: Backup
 }) {
-  const [now, setNow] = React.useState(() => Date.now())
-  React.useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
-    return () => window.clearInterval(timer)
-  }, [])
   const percent = backupTaskProgressPercent(backup)
-  const updatedAt = new Date(backup.taskUpdatedAt).getTime()
-  const progressAge =
-    shortRelativeBackupTime(updatedAt, now) ??
-    backupDateCompact.format(updatedAt)
   return (
     <div className="min-w-0" aria-live="polite">
       <div className="mb-1 flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] leading-none text-muted-foreground">
@@ -1770,15 +1761,39 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
         ) : (
           <span className="min-w-0 flex-1" />
         )}
-        <span
-          className="shrink-0"
-          suppressHydrationWarning
-          title={backupDate.format(updatedAt)}
-        >
-          Last progress {progressAge}
-        </span>
+        <BackupElapsedTimer startedAt={backup.taskStartedAt} />
       </div>
     </div>
+  )
+})
+
+const BackupElapsedTimer = React.memo(function BackupElapsedTimer({
+  startedAt,
+}: {
+  startedAt: string | null
+}) {
+  const parsedStartedAt = startedAt ? new Date(startedAt).getTime() : Number.NaN
+  const startedAtMs = Number.isFinite(parsedStartedAt) ? parsedStartedAt : null
+  const [now, setNow] = React.useState(() => Date.now())
+  React.useEffect(() => {
+    if (startedAtMs === null) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [startedAtMs])
+  return (
+    <span
+      aria-label="Elapsed backup time"
+      aria-live="off"
+      className="shrink-0 font-mono tabular-nums"
+      suppressHydrationWarning
+      title={
+        startedAtMs === null
+          ? "Waiting to start"
+          : `Started ${backupDate.format(startedAtMs)}`
+      }
+    >
+      {formatBackupElapsed(startedAtMs === null ? 0 : now - startedAtMs)}
+    </span>
   )
 })
 
@@ -4318,6 +4333,13 @@ function shortRelativeBackupTime(
     return `${Math.floor(elapsed / backupDayMs)}d ago`
   }
   return null
+}
+
+function formatBackupElapsed(elapsedMs: number): string {
+  const elapsedSeconds = Math.floor(Math.max(0, elapsedMs) / 1_000)
+  const minutes = Math.floor(elapsedSeconds / 60)
+  const seconds = elapsedSeconds % 60
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
 }
 
 function parseOptionalInteger(value: string, label: string): number | null {

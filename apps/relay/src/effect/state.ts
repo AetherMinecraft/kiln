@@ -292,7 +292,8 @@ export class RelayStateStore extends Context.Service<
     ) => Effect.Effect<boolean, RelayStateError>
     readonly cancelBackupTask: (
       taskId: string,
-      now: number
+      now: number,
+      reason?: string
     ) => Effect.Effect<boolean, RelayStateError>
     readonly completeBackupTask: (
       taskId: string,
@@ -1094,7 +1095,7 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
-    cancelBackupTask: (taskId, now) =>
+    cancelBackupTask: (taskId, now, reason = "Cancelled by user") =>
       run(
         "cancel_backup_task",
         sql.withTransaction(
@@ -1112,7 +1113,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               UPDATE relay_backup_tasks
               SET status = 'cancelled',
                   result_json = NULL,
-                  error = 'Cancelled by user',
+                  error = ${reason.slice(0, 2_048)},
                   finished_at = ${now},
                   updated_at = ${now}
               WHERE task_id = ${taskId}
