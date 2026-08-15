@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test"
 
-import { platformRoleHasPermission, roleHasPermission } from "@/lib/permissions"
+import {
+  instancePortsWritePermission,
+  platformRoleHasPermission,
+  roleHasPermission,
+} from "@/lib/permissions"
 
 describe("platform appearance permissions", () => {
   it("reserves appearance defaults for platform administrators", () => {
@@ -22,6 +26,40 @@ describe("server deletion permissions", () => {
   it("does not allow operators or viewers to delete servers", () => {
     expect(roleHasPermission("operator", "instance.delete")).toBe(false)
     expect(roleHasPermission("viewer", "instance.delete")).toBe(false)
+  })
+})
+
+describe("public port permissions", () => {
+  it("limits public port changes to owners and administrators", () => {
+    expect(
+      roleHasPermission("owner", "instance.network.public-port.write")
+    ).toBe(true)
+    expect(
+      roleHasPermission("admin", "instance.network.public-port.write")
+    ).toBe(true)
+    expect(
+      roleHasPermission("operator", "instance.network.public-port.write")
+    ).toBe(false)
+    expect(
+      roleHasPermission("viewer", "instance.network.public-port.write")
+    ).toBe(false)
+  })
+
+  it("protects replacements without blocking new allocations", () => {
+    expect(
+      instancePortsWritePermission([{ externalPort: 32_124, id: "primary" }])
+    ).toBe("instance.network.public-port.write")
+    expect(
+      instancePortsWritePermission([
+        { externalPort: 32_124, id: "custom-allocation" },
+      ])
+    ).toBe("instance.network.public-port.write")
+    expect(instancePortsWritePermission([{ externalPort: 32_124 }])).toBe(
+      "instance.network.write"
+    )
+    expect(instancePortsWritePermission([{ id: "primary" }])).toBe(
+      "instance.network.write"
+    )
   })
 })
 

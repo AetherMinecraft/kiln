@@ -37,7 +37,10 @@ import {
   recordFileViewed,
   setFilePinned,
 } from "@/lib/file-activity"
-import type { AccessPermission } from "@/lib/permissions"
+import {
+  instancePortsWritePermission,
+  type AccessPermission,
+} from "@/lib/permissions"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { requireAuthenticatedUser } from "@/server/auth"
 import {
@@ -50,6 +53,7 @@ import {
   applyManagedDomainAddressesEffect,
   provisionInstanceDomainBestEffort,
 } from "@/server/domains.server"
+import { syncInstanceDomainAfterPortUpdateBestEffort } from "@/server/relay-port-update.server"
 import { deleteInstanceWithFinalBackup } from "@/lib/final-instance-deletion"
 import {
   cachedRelayFallbackJsonEffect,
@@ -394,6 +398,7 @@ export const updateInstanceWebRoutes = createServerFn({ method: "POST" })
 export const updateInstancePorts = createServerFn({ method: "POST" })
   .validator(portsInputSchema)
   .handler(async ({ data }) => {
+    const permission = instancePortsWritePermission(data.ports)
     const value = await relayRequest(
       `/v1/instances/${encodeURIComponent(data.instanceId)}/ports`,
       {
@@ -401,12 +406,17 @@ export const updateInstancePorts = createServerFn({ method: "POST" })
         headers: { "Content-Type": "application/json" },
         method: "PUT",
       },
-      "instance.network.write",
+      permission,
       data.instanceId,
       data.relayId,
       240_000
     )
     const instance = relayInstanceSchema.parse(value)
+    await syncInstanceDomainAfterPortUpdateBestEffort(
+      instance,
+      data.relayId,
+      data.ports
+    )
     await runAppEffect(
       "relay.snapshot.invalidate",
       invalidateRelayCache(relayCachePolicy.snapshot(data.relayId))
@@ -417,6 +427,10 @@ export const updateInstancePorts = createServerFn({ method: "POST" })
 export const reserveInstancePort = createServerFn({ method: "POST" })
   .validator(portLeaseInputSchema)
   .handler(async ({ data }) => {
+    const permission =
+      data.externalPort === undefined
+        ? "instance.network.write"
+        : "instance.network.public-port.write"
     const value = await relayRequest(
       `/v1/instances/${encodeURIComponent(data.instanceId)}/ports`,
       {
@@ -428,7 +442,7 @@ export const reserveInstancePort = createServerFn({ method: "POST" })
         headers: { "Content-Type": "application/json" },
         method: "POST",
       },
-      "instance.network.write",
+      permission,
       data.instanceId,
       data.relayId
     )

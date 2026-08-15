@@ -68,6 +68,7 @@ export const InstanceRouteFrame = React.memo(function InstanceRouteFrame({
       deleteServer: can("instance.delete"),
       filesWrite: can("instance.files.write"),
       networkRead: can("instance.network.read"),
+      networkPublicPortWrite: can("instance.network.public-port.write"),
       networkWrite: can("instance.network.write"),
       power: can("instance.power"),
       settings: can("instance.settings"),

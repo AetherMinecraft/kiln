@@ -1620,11 +1620,18 @@ export class LifecycleDriver {
             continue
           }
           if (existing) {
+            const externalPort =
+              input.externalPort !== undefined && input.leaseId !== undefined
+                ? await this.#claimPortLease(instance.id, input, inspected)
+                : existing.externalPort
             const previousProtocols = new Set(portProtocols(existing.protocol))
             const addedProtocols = portProtocols(input.protocol).filter(
               (protocol) => !previousProtocols.has(protocol)
             )
-            if (addedProtocols.length > 0) {
+            if (
+              externalPort === existing.externalPort &&
+              addedProtocols.length > 0
+            ) {
               await this.#reservePublishedPortProtocols(
                 existing.externalPort,
                 addedProtocols
@@ -1633,8 +1640,12 @@ export class LifecycleDriver {
                 pending.push({ port: existing.externalPort, protocol })
               }
             }
+            if (externalPort !== existing.externalPort) {
+              pending.push({ port: externalPort, protocol: input.protocol })
+            }
             allocations.push({
               ...existing,
+              externalPort,
               internalPort: input.internalPort,
               name: input.name,
               protocol: input.protocol,
