@@ -29,6 +29,7 @@ import { z } from "zod"
 
 import {
   allowedInstanceIds,
+  hasPlatformPermission,
   requireRelayPermission,
 } from "@/lib/access-control"
 import {
@@ -134,7 +135,7 @@ const portsInputSchema = instanceInputSchema.extend({
 })
 
 const portLeaseInputSchema = instanceInputSchema.extend(
-  relayInstancePortLeaseRequestSchema.shape
+  relayInstancePortLeaseRequestSchema.omit({ overridePortRange: true }).shape
 )
 
 const portLeaseReleaseInputSchema = instanceInputSchema.extend(
@@ -431,21 +432,33 @@ export const reserveInstancePort = createServerFn({ method: "POST" })
       data.externalPort === undefined
         ? "instance.network.write"
         : "instance.network.public-port.write"
-    const value = await relayRequest(
+    const { relay, user } = await instanceRelayAccess(data.relayId)
+    await requireRelayPermission({
+      user,
+      relayId: relay.id,
+      permission,
+      instanceId: data.instanceId,
+    })
+    const response = await relayFetch(
+      relay,
       `/v1/instances/${encodeURIComponent(data.instanceId)}/ports`,
       {
         body: JSON.stringify({
           externalPort: data.externalPort,
           leaseId: data.leaseId,
+          overridePortRange: hasPlatformPermission(
+            user,
+            "platform.network.override-public-port-range"
+          ),
           protocol: data.protocol,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
       },
-      permission,
-      data.instanceId,
-      data.relayId
+      undefined,
+      user.id
     )
+    const value = await response.json()
     return relayInstancePortLeaseSchema.parse(value)
   })
 

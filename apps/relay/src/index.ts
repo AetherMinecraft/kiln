@@ -1396,6 +1396,7 @@ async function executeControlRequest(
       const input = relayInstancePortLeaseRequestSchema.parse({
         externalPort: payload.externalPort,
         leaseId: payload.leaseId,
+        overridePortRange: payload.overridePortRange,
         protocol: payload.protocol,
       })
       return runRelayEffect(

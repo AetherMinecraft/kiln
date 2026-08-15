@@ -795,6 +795,7 @@ export const relayInstancePortLeaseRequestSchema = z
       .string()
       .regex(/^[a-f0-9]{32}$/u)
       .optional(),
+    overridePortRange: z.boolean().optional(),
     protocol: relayInstancePortProtocolSchema,
   })
   .strict()
