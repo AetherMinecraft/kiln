@@ -1,5 +1,3 @@
-import { BrickWallFire } from "lucide-react"
-
 import { cn } from "@workspace/ui/lib/utils"
 
 export function HearthMark({ className }: { className?: string }) {
@@ -7,11 +5,18 @@ export function HearthMark({ className }: { className?: string }) {
     <div
       aria-hidden="true"
       className={cn(
-        "relative grid size-8 shrink-0 place-items-center overflow-hidden bg-primary text-primary-foreground shadow-[inset_0_0_0_1px_hsl(var(--accent-hue)_100%_96%/0.14),var(--brand-shadow)]",
+        "relative grid size-8 shrink-0 place-items-center text-primary",
         className
       )}
     >
-      <BrickWallFire className="size-[78%]!" strokeWidth={1.9} />
+      <span
+        className="size-full scale-[1.35] bg-current [mask-position:center] [mask-repeat:no-repeat] [mask-size:contain]"
+        style={{
+          WebkitMaskImage:
+            "var(--kiln-logo, url('/branding/kiln-oven.svg'))",
+          maskImage: "var(--kiln-logo, url('/branding/kiln-oven.svg'))",
+        }}
+      />
     </div>
   )
 }
