@@ -839,12 +839,13 @@ export async function createPortableInstanceBackup(
   })
 }
 
-function storeCreatedBackup(
+export function storeCreatedBackup(
   config: RelayConfig,
   input: BackupCreateTaskInput,
   result: BackupCreateTaskResult,
   progress: BackupProgress,
-  signal: AbortSignal
+  signal: AbortSignal,
+  uploadArtifact: typeof uploadBackupArtifact = uploadBackupArtifact
 ) {
   return Effect.gen(function* () {
     progress.phase = "uploading"
@@ -872,7 +873,7 @@ function storeCreatedBackup(
       progress.completed = 0
       progress.currentArtifactId = destination.artifactId ?? null
       const uploaded = yield* Effect.result(
-        uploadBackupArtifact(
+        uploadArtifact(
           config,
           { ...input, destination },
           result,

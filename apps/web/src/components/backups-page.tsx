@@ -35,7 +35,6 @@ import {
   X,
 } from "lucide-react"
 
-import { backupArtifactFilename } from "@workspace/contracts"
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
 import {
@@ -67,7 +66,10 @@ import { ServerScopePicker } from "@/components/server-scope-picker"
 import type { ServerPickerOption } from "@/components/server-picker-list"
 import { timestampedBackupName } from "@/lib/backup-name"
 import {
+  backupDisplayFilename,
   backupDisplayBytes,
+  backupHasCreateTaskFeedback,
+  backupShowsPrimaryTaskFeedback,
   backupTaskUploadProgressPercent,
 } from "@/lib/backup-progress-presentation"
 import { relayInstanceRouteId } from "@/lib/relay-fleet"
@@ -4079,33 +4081,6 @@ function backupIsActive(backup: Backup): boolean {
     backupSourceIsActive(backup) ||
     backup.artifacts.some((artifact) => activeStatuses.has(artifact.status))
   )
-}
-
-function backupHasCreateTaskFeedback(backup: Backup): boolean {
-  if (backup.taskKind !== "create") return false
-  if (backup.taskStatus === "queued" || backup.taskStatus === "running") {
-    return true
-  }
-  return (
-    Boolean(backup.taskError) &&
-    (backup.taskStatus === "failed" || backup.taskStatus === "cancelled")
-  )
-}
-
-function backupShowsPrimaryTaskFeedback(backup: Backup): boolean {
-  if (!backupHasCreateTaskFeedback(backup)) return false
-  if (backup.taskStatus !== "queued" && backup.taskStatus !== "running") {
-    return true
-  }
-  return backup.taskPhase !== "uploading" && backup.taskPhase !== "finalizing"
-}
-
-function backupDisplayFilename(backup: Backup): string {
-  if (backup.filename) return backup.filename
-  if (backup.taskPhase === "uploading" || backup.taskPhase === "finalizing") {
-    return backupArtifactFilename(backup.id, backup.artifactKind)
-  }
-  return backup.id
 }
 
 function backupSourceIsActive(backup: Backup): boolean {

@@ -20,6 +20,7 @@ import {
   BackupManager,
   backupPathIsExcluded,
   createPortableInstanceBackup,
+  storeCreatedBackup,
 } from "./backups.js"
 import {
   recoverInterruptedRestores,
@@ -78,6 +79,65 @@ describe("Relay backups", () => {
       }).success
     )
   })
+
+  it.effect("keeps completed upload progress through finalizing", () =>
+    Effect.gen(function* () {
+      const localArtifactId = "30000000-0000-4000-8000-000000000001"
+      const remoteArtifactId = "30000000-0000-4000-8000-000000000002"
+      const input = {
+        ...backupInput(12),
+        destination: { artifactId: localArtifactId, kind: "local" },
+        replicas: [
+          {
+            allowPrivateNetwork: false,
+            artifactId: remoteArtifactId,
+            headers: {},
+            kind: "s3",
+            objectKey: "backups/test.zip",
+            uploadUrl: "https://example.com/backups/test.zip",
+          },
+        ],
+      } satisfies BackupCreateTaskInput & { kind: "create" }
+      const result = backupResult(12)
+      const progress = {
+        completed: 0,
+        currentArtifactId: null,
+        currentPath: null,
+        phase: "uploading",
+        total: 0,
+      } satisfies Parameters<typeof storeCreatedBackup>[3]
+
+      const stored = yield* storeCreatedBackup(
+        testConfig(testDirectory),
+        input,
+        result,
+        progress,
+        new AbortController().signal,
+        (_config, _input, uploaded, _signal, onChunk) => {
+          onChunk(1)
+          onChunk(uploaded.bytes - 1)
+          return Effect.succeed(uploaded)
+        }
+      )
+
+      assert.strictEqual(progress.completed, result.bytes)
+      assert.strictEqual(progress.currentArtifactId, remoteArtifactId)
+      assert.strictEqual(progress.phase, "finalizing")
+      assert.strictEqual(progress.total, result.bytes)
+      assert.deepStrictEqual(stored.artifacts, [
+        {
+          artifactId: localArtifactId,
+          error: null,
+          status: "available",
+        },
+        {
+          artifactId: remoteArtifactId,
+          error: null,
+          status: "available",
+        },
+      ])
+    })
+  )
 
   layer(makeRelayStateLayer(join(testDirectory, "relay.sqlite")))((it) => {
     it.effect("runs durable tasks through one Relay-wide worker", () =>

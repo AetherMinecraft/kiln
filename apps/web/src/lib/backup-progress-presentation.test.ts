@@ -1,22 +1,37 @@
 import { describe, expect, it } from "vite-plus/test"
 
 import {
+  backupDisplayFilename,
   backupDisplayBytes,
+  backupShowsPrimaryTaskFeedback,
+  backupShowsUploadArtifact,
   backupTaskUploadProgressPercent,
 } from "@/lib/backup-progress-presentation"
 
+type TestBackup = Parameters<typeof backupDisplayBytes>[0] &
+  Parameters<typeof backupDisplayFilename>[0] &
+  Parameters<typeof backupShowsPrimaryTaskFeedback>[0]
+
 const uploadingBackup = {
+  artifactKind: "archive",
   artifacts: [{ storageId: "storage-1" }],
   bytes: null,
+  filename: null,
+  id: "00000000-0000-4000-8000-000000000001",
   taskBytesCompleted: 25,
   taskBytesTotal: 100,
   taskCurrentArtifactId: "artifact-1",
+  taskError: null,
+  taskKind: "create",
   taskPhase: "uploading",
-} satisfies Parameters<typeof backupDisplayBytes>[0]
+  taskStatus: "running",
+} satisfies TestBackup
 
 describe("backup progress presentation", () => {
   it("shows determinate upload progress and the archived size", () => {
     expect(backupDisplayBytes(uploadingBackup)).toBe(100)
+    expect(backupShowsPrimaryTaskFeedback(uploadingBackup)).toBe(false)
+    expect(backupShowsUploadArtifact(uploadingBackup)).toBe(true)
     expect(backupTaskUploadProgressPercent(uploadingBackup)).toBe(25)
   })
 
@@ -25,9 +40,12 @@ describe("backup progress presentation", () => {
       ...uploadingBackup,
       taskBytesCompleted: 100,
       taskPhase: "finalizing",
-    } satisfies Parameters<typeof backupDisplayBytes>[0]
+    } satisfies TestBackup
 
     expect(backupDisplayBytes(backup)).toBe(100)
+    expect(backupDisplayFilename(backup)).toBe("backup-00000000.zip")
+    expect(backupShowsPrimaryTaskFeedback(backup)).toBe(false)
+    expect(backupShowsUploadArtifact(backup)).toBe(true)
     expect(backupTaskUploadProgressPercent(backup)).toBe(100)
   })
 
@@ -38,9 +56,12 @@ describe("backup progress presentation", () => {
       taskBytesTotal: 800,
       taskCurrentArtifactId: null,
       taskPhase: "finalizing",
-    } satisfies Parameters<typeof backupDisplayBytes>[0]
+    } satisfies TestBackup
 
     expect(backupDisplayBytes(backup)).toBeNull()
+    expect(backupDisplayFilename(backup)).toBe(backup.id)
+    expect(backupShowsPrimaryTaskFeedback(backup)).toBe(true)
+    expect(backupShowsUploadArtifact(backup)).toBe(false)
     expect(backupTaskUploadProgressPercent(backup)).toBeNull()
   })
 })

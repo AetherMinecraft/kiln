@@ -1,12 +1,66 @@
-import type { BackupTaskPhase } from "@workspace/contracts"
+import {
+  backupArtifactFilename,
+  type BackupArtifactKind,
+  type BackupTaskKind,
+  type BackupTaskPhase,
+  type BackupTaskStatus,
+} from "@workspace/contracts"
 
-type BackupProgressPresentation = {
+type BackupUploadPhasePresentation = {
+  taskCurrentArtifactId: string | null
+  taskPhase: BackupTaskPhase | null
+}
+
+type BackupProgressPresentation = BackupUploadPhasePresentation & {
   artifacts: ReadonlyArray<{ storageId: string | null }>
   bytes: number | null
   taskBytesCompleted: number
   taskBytesTotal: number | null
-  taskCurrentArtifactId: string | null
-  taskPhase: BackupTaskPhase | null
+}
+
+type BackupTaskFeedbackPresentation = BackupUploadPhasePresentation & {
+  taskError: string | null
+  taskKind: BackupTaskKind | null
+  taskStatus: BackupTaskStatus | null
+}
+
+type BackupFilenamePresentation = BackupUploadPhasePresentation & {
+  artifactKind: BackupArtifactKind
+  filename: string | null
+  id: string
+}
+
+export function backupHasCreateTaskFeedback(
+  backup: BackupTaskFeedbackPresentation
+): boolean {
+  if (backup.taskKind !== "create") return false
+  if (backup.taskStatus === "queued" || backup.taskStatus === "running") {
+    return true
+  }
+  return (
+    Boolean(backup.taskError) &&
+    (backup.taskStatus === "failed" || backup.taskStatus === "cancelled")
+  )
+}
+
+export function backupShowsPrimaryTaskFeedback(
+  backup: BackupTaskFeedbackPresentation
+): boolean {
+  if (!backupHasCreateTaskFeedback(backup)) return false
+  if (backup.taskStatus !== "queued" && backup.taskStatus !== "running") {
+    return true
+  }
+  return !backupShowsUploadArtifact(backup)
+}
+
+export function backupDisplayFilename(
+  backup: BackupFilenamePresentation
+): string {
+  if (backup.filename) return backup.filename
+  if (backupShowsUploadArtifact(backup)) {
+    return backupArtifactFilename(backup.id, backup.artifactKind)
+  }
+  return backup.id
 }
 
 export function backupDisplayBytes(
@@ -43,8 +97,8 @@ export function backupTaskUploadProgressPercent(
   )
 }
 
-function backupShowsUploadArtifact(
-  backup: BackupProgressPresentation
+export function backupShowsUploadArtifact(
+  backup: BackupUploadPhasePresentation
 ): boolean {
   return (
     backup.taskPhase === "uploading" ||
