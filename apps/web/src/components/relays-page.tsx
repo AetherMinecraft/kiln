@@ -76,7 +76,7 @@ import {
   isKilnReleaseVersion,
 } from "@/lib/release-version"
 import type { PublicKilnRelease } from "@/effect/github-releases"
-import { kilnGitRepository } from "@/lib/git-repository"
+import { useKilnGitRepository } from "@/lib/git-repository"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import {
   addRelay,
@@ -1877,9 +1877,12 @@ function RelayVersion({
   version: string | null
   onOpenUpdates: (relayId?: string) => void
 }) {
+  const gitRepository = useKilnGitRepository()
   const release = findKilnRelease(releases, version)
   const versionLabel = !version ? (
-    <span className="truncate font-mono text-[0.5625rem] text-foreground">—</span>
+    <span className="truncate font-mono text-[0.5625rem] text-foreground">
+      —
+    </span>
   ) : release ? (
     <a
       href={release.url}
@@ -1893,7 +1896,7 @@ function RelayVersion({
     </a>
   ) : isGitCommitSha(version) ? (
     <a
-      href={`${kilnGitRepository}/commit/${version}`}
+      href={`${gitRepository}/commit/${version}`}
       target="_blank"
       rel="noreferrer"
       aria-label={`View Relay commit ${version}`}

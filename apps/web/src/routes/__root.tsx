@@ -3,13 +3,13 @@ import { geistLatin, jetBrainsMonoLatin } from "@workspace/ui/lib/font-assets"
 
 import appCss from "@workspace/ui/globals.css?url"
 
-import {
-  AppErrorPage,
-  AppNotFoundPage,
-} from "@/components/app-error-page"
+import { AppErrorPage, AppNotFoundPage } from "@/components/app-error-page"
 import type { AppRouterContext } from "@/lib/query-client"
+import { getPublicRuntimeConfig } from "@/server/runtime-config"
 
 export const Route = createRootRouteWithContext<AppRouterContext>()({
+  loader: () => getPublicRuntimeConfig(),
+  staleTime: Infinity,
   head: () => ({
     meta: [
       {

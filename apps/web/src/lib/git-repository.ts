@@ -1,10 +1,12 @@
-import {
-  kilnGitRepositorySlug,
-  resolveKilnGitRepository,
-} from "@workspace/contracts"
+import { getRouteApi } from "@tanstack/react-router"
+import { kilnGitRepositorySlug } from "@workspace/contracts"
 
-export const kilnGitRepository = resolveKilnGitRepository(
-  import.meta.env.VITE_KILN_GIT_REPO
-)
-export const kilnGitRepositorySlugValue =
-  kilnGitRepositorySlug(kilnGitRepository)
+const rootRouteApi = getRouteApi("__root__")
+
+export function useKilnGitRepository(): string {
+  return rootRouteApi.useLoaderData().gitRepository
+}
+
+export function useKilnGitRepositorySlug(): string {
+  return kilnGitRepositorySlug(useKilnGitRepository())
+}

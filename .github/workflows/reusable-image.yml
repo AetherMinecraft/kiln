@@ -39,6 +39,11 @@ on:
         type: string
         default: |
           type=sha,prefix=sha-
+      source_label:
+        description: Explicit org.opencontainers.image.source override
+        required: false
+        type: string
+        default: ""
       publish_manifest:
         description: Whether this workflow should publish the multi-platform manifest
         required: false
@@ -111,6 +116,8 @@ jobs:
           tags: |
             ${{ inputs.tags }}
             ${{ inputs.nightly_version && format('type=raw,value={0}', steps.nightly.outputs.version) || '' }}
+          labels: |
+            ${{ inputs.source_label && format('org.opencontainers.image.source={0}', inputs.source_label) || '' }}
 
       - name: Prepare Sentry source maps
         if: github.event_name != 'pull_request' && inputs.prepare_sentry_source_maps && matrix.architecture == 'amd64'

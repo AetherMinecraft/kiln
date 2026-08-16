@@ -47,5 +47,6 @@ jobs:
       dockerfile: ${{ matrix.dockerfile }}
       cache_scope: ${{ matrix.cache_scope }}
       build_args: ${{ matrix.build_args }}
+      source_label: https://github.com/kiln-site/hearth
       tags: |
         type=sha,prefix=sha-
