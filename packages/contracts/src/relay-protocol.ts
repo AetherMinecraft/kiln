@@ -1,7 +1,9 @@
 import { Schema } from "effect"
 
 export const relayControlProtocol = "kiln-relay.v1" as const
-export const relayControlProtocolVersion = 1 as const
+// Release compatibility level for response-shape changes. Keep this separate
+// from the WebSocket subprotocol so Hearth can be upgraded before Relay.
+export const relayControlProtocolVersion = 2 as const
 export const relayBrowserProtocol = "kiln-relay-browser.v1" as const
 export const relayBrowserConsoleProtocol = "kiln-relay-browser.v2" as const
 export const relayBrowserConsoleProtocols = [
