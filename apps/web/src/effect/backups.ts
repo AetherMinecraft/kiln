@@ -654,7 +654,12 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
           ]
         )
         if (task.kind === "delete") {
-          if (task.status === "queued" || task.status === "running") {
+          const active = task.status === "queued" || task.status === "running"
+          const outcomes =
+            task.result && !("bytes" in task.result)
+              ? (task.result.artifacts ?? [])
+              : []
+          if (active) {
             yield* transaction.execute(
               `UPDATE ${databaseTable("backup")}
                   SET status = 'deleting'
@@ -663,12 +668,38 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
             )
             yield* transaction.execute(
               `UPDATE ${databaseTable("backup_artifact")}
-                  SET status = 'deleting'
-                WHERE backup_id = ? AND status <> 'deleted'`,
+                  SET status = 'available'
+                WHERE backup_id = ? AND status = 'deleting'`,
               [task.backupId]
             )
+            if (task.currentArtifactId) {
+              yield* transaction.execute(
+                `UPDATE ${databaseTable("backup_artifact")}
+                    SET status = 'deleting', error = NULL
+                  WHERE id = ? AND backup_id = ? AND status <> 'deleted'`,
+                [task.currentArtifactId, task.backupId]
+              )
+            }
+            for (const outcome of outcomes) {
+              const artifactStatus =
+                outcome.status === "deleted" ? "deleted" : "available"
+              yield* transaction.execute(
+                `UPDATE ${databaseTable("backup_artifact")}
+                    SET status = ?, error = ?,
+                        deleted_at = CASE WHEN ? = 'deleted'
+                          THEN FROM_UNIXTIME(? / 1000) ELSE NULL END
+                  WHERE id = ? AND backup_id = ?`,
+                [
+                  artifactStatus,
+                  outcome.error,
+                  artifactStatus,
+                  task.updatedAt,
+                  outcome.artifactId,
+                  task.backupId,
+                ]
+              )
+            }
           } else if (task.status === "succeeded") {
-            const outcomes = task.result?.artifacts ?? []
             if (outcomes.length === 0) {
               yield* transaction.execute(
                 `UPDATE ${databaseTable("backup_artifact")}
@@ -724,9 +755,9 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
             )
             yield* transaction.execute(
               `UPDATE ${databaseTable("backup_artifact")}
-                  SET status = 'available'
+                  SET status = 'available', error = ?
                 WHERE backup_id = ? AND status = 'deleting'`,
-              [task.backupId]
+              [task.error, task.backupId]
             )
           }
           return

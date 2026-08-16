@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, assert, describe, layer } from "@effect/vitest"
 import { Effect } from "effect"
-import type { BackupTaskInput } from "@workspace/contracts"
+import type { BackupTaskInput, BackupTaskResult } from "@workspace/contracts"
 
 import { makeRelayStateLayer, RelayStateStore } from "./state.js"
 
@@ -553,6 +553,40 @@ describe("Relay state", () => {
         const completedDeletion = yield* store.getBackupTask(deletion.taskId)
         assert.strictEqual(completedDeletion?.bytesCompleted, 0)
         assert.strictEqual(completedDeletion?.status, "succeeded")
+      })
+    )
+
+    it.effect("persists per-artifact delete progress", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const artifactId = "32000000-0000-4000-8000-000000000001"
+        const input = {
+          backupId: "32000000-0000-4000-8000-000000000002",
+          destination: { artifactId, kind: "local" },
+          kind: "delete",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "32000000-0000-4000-8000-000000000003",
+        } satisfies BackupTaskInput
+        yield* store.enqueueBackupTask(input, 1_000)
+        yield* store.claimNextBackupTask(1_010)
+        const result = {
+          artifacts: [{ artifactId, error: null, status: "deleted" }],
+          warnings: [],
+        } satisfies BackupTaskResult
+
+        assert.isTrue(
+          yield* store.updateBackupTaskOperationProgress(
+            input.taskId,
+            artifactId,
+            result,
+            1_020
+          )
+        )
+        const running = yield* store.getBackupTask(input.taskId)
+        assert.strictEqual(running?.currentArtifactId, artifactId)
+        assert.deepStrictEqual(running?.result, result)
+        assert.strictEqual(running?.status, "running")
+        yield* store.completeBackupTask(input.taskId, result, 1_030)
       })
     )
 

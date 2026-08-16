@@ -292,6 +292,12 @@ export class RelayStateStore extends Context.Service<
       currentArtifactId: string | null,
       now: number
     ) => Effect.Effect<boolean, RelayStateError>
+    readonly updateBackupTaskOperationProgress: (
+      taskId: string,
+      currentArtifactId: string | null,
+      result: BackupTaskResult,
+      now: number
+    ) => Effect.Effect<boolean, RelayStateError>
     readonly cancelBackupTask: (
       taskId: string,
       now: number,
@@ -1107,6 +1113,41 @@ const makeRelayStateStore = Effect.gen(function* () {
                   OR phase IS NOT ${phase}
                   OR current_artifact_id IS NOT ${currentArtifactId}
                   OR current_path IS NOT ${currentPath?.slice(0, 2_048) ?? null}
+                )
+            `
+            return true
+          })
+        )
+      ),
+    updateBackupTaskOperationProgress: (
+      taskId,
+      currentArtifactId,
+      result,
+      now
+    ) =>
+      run(
+        "update_backup_task_operation_progress",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<{ taskId: string }>`
+              SELECT task_id AS taskId
+              FROM relay_backup_tasks
+              WHERE task_id = ${taskId} AND kind = 'delete'
+                AND status = 'running'
+              LIMIT 1
+            `
+            if (!rows[0]) return false
+            const resultJson = JSON.stringify(result)
+            yield* sql`
+              UPDATE relay_backup_tasks
+              SET current_artifact_id = ${currentArtifactId},
+                  result_json = ${resultJson},
+                  updated_at = ${now}
+              WHERE task_id = ${taskId} AND kind = 'delete'
+                AND status = 'running'
+                AND (
+                  current_artifact_id IS NOT ${currentArtifactId}
+                  OR result_json IS NOT ${resultJson}
                 )
             `
             return true

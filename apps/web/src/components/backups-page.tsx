@@ -12,6 +12,7 @@ import {
   ArrowLeft,
   Check,
   CircleAlert,
+  CircleOff,
   CircleStop,
   Cloud,
   CloudCog,
@@ -68,7 +69,6 @@ import { timestampedBackupName } from "@/lib/backup-name"
 import {
   backupDisplayFilename,
   backupDisplayBytes,
-  backupHasCreateTaskFeedback,
   backupShowsPrimaryTaskFeedback,
   backupTaskUploadProgressPercent,
 } from "@/lib/backup-progress-presentation"
@@ -148,7 +148,13 @@ type BackupAvailabilityTagView = {
   tooltip?: string
   uploadPercent: number | null
 }
-type BackupAvailabilityState = "available" | "failed" | "missing" | "working"
+type BackupAvailabilityState =
+  | "available"
+  | "cancelled"
+  | "deleting"
+  | "failed"
+  | "missing"
+  | "working"
 type BackupTargetPresentation = {
   id: string
   kindLabel: "Database" | "Relay" | "Server"
@@ -173,9 +179,13 @@ type BackupDialogState =
   | { backup: Backup; kind: "download" }
   | { backup: Backup; kind: "restore" }
 type BackupDialogStore = ReturnType<typeof createBackupDialogStore>
+type BackupDeleteFeedbackStore = ReturnType<
+  typeof createBackupDeleteFeedbackStore
+>
 type BackupSelectionStore = ReturnType<typeof createBackupSelectionStore>
 
 const closedBackupDialog = { kind: "closed" } as const
+const emptyBackupDeleteFeedback: ReadonlyMap<string, Backup> = new Map()
 const emptyBackupSelection: ReadonlySet<string> = new Set()
 const minimumBackupSyncFeedbackMs = 1000
 
@@ -245,6 +255,36 @@ function createBackupSelectionStore() {
   }
 }
 
+function createBackupDeleteFeedbackStore() {
+  let deleting: ReadonlyMap<string, Backup> = emptyBackupDeleteFeedback
+  const listeners = new Set<() => void>()
+
+  function publish(next: ReadonlyMap<string, Backup>) {
+    if (next === deleting) return
+    deleting = next
+    for (const listener of listeners) listener()
+  }
+
+  return {
+    getServerSnapshot: () => emptyBackupDeleteFeedback,
+    getSnapshot: () => deleting,
+    mark: (backups: ReadonlyArray<Backup>) => {
+      const next = new Map(deleting)
+      for (const backup of backups) next.set(backup.id, backup)
+      publish(next)
+    },
+    remove: (backupIds: ReadonlyArray<string>) => {
+      const next = new Map(deleting)
+      for (const backupId of backupIds) next.delete(backupId)
+      if (next.size !== deleting.size) publish(next)
+    },
+    subscribe: (listener: () => void) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+  }
+}
+
 interface CreateTarget {
   id: string
   key: string
@@ -255,6 +295,7 @@ interface CreateTarget {
 }
 
 const activeStatuses = new Set(["queued", "running", "deleting"])
+const completedDeleteFeedbackMs = 1_000
 const mobileBackupLayoutQuery = "(max-width: 767px)"
 const backupSelectionBlockingOverlaySelector = [
   '[data-slot="combobox-content"][data-open]',
@@ -306,6 +347,127 @@ export function createBackupSearchStore(initialValue: string) {
   return createWorkspaceTableSearchStore(initialValue)
 }
 
+function completedDeleteFeedback(backup: Backup): Backup {
+  return {
+    ...backup,
+    artifacts: backup.artifacts.map((artifact) => ({
+      ...artifact,
+      error: null,
+      status: "deleted",
+    })),
+    taskCurrentArtifactId: null,
+    taskError: null,
+    taskPhase: null,
+    taskStatus: "succeeded",
+  }
+}
+
+function backupWithDeleteIntent(backup: Backup): Backup {
+  const firstArtifact = backup.artifacts.find(
+    (artifact) => artifact.status !== "deleted"
+  )
+  return {
+    ...backup,
+    artifacts: backup.artifacts.map((artifact) =>
+      artifact.id === firstArtifact?.id
+        ? { ...artifact, error: null, status: "deleting" }
+        : artifact
+    ),
+    status: "deleting",
+    taskCurrentArtifactId: firstArtifact?.id ?? null,
+    taskError: null,
+    taskKind: "delete",
+    taskPhase: null,
+    taskStatus: "queued",
+  }
+}
+
+function useBackupsWithDeleteFeedback(
+  backups: Array<Backup>,
+  deleteFeedbackStore: BackupDeleteFeedbackStore
+): Array<Backup> {
+  const deleting = React.useSyncExternalStore(
+    deleteFeedbackStore.subscribe,
+    deleteFeedbackStore.getSnapshot,
+    deleteFeedbackStore.getServerSnapshot
+  )
+  const [visibleBackups, setVisibleBackups] = React.useState(backups)
+  const visibleBackupsRef = React.useRef(backups)
+  const removalTimers = React.useRef(new Map<string, number>())
+
+  React.useLayoutEffect(() => {
+    const incoming = new Map(backups.map((backup) => [backup.id, backup]))
+    const next: Array<Backup> = []
+    for (const current of visibleBackupsRef.current) {
+      const updated = incoming.get(current.id)
+      if (updated) {
+        const timer = removalTimers.current.get(current.id)
+        if (timer !== undefined) {
+          window.clearTimeout(timer)
+          removalTimers.current.delete(current.id)
+        }
+        const deleteIntent = deleting.has(current.id)
+        const deleteFinishedWithError =
+          updated.taskKind === "delete" &&
+          (updated.taskStatus === "cancelled" ||
+            updated.taskStatus === "failed")
+        next.push(
+          deleteIntent && !deleteFinishedWithError
+            ? updated.status === "deleting"
+              ? updated
+              : backupWithDeleteIntent(updated)
+            : updated
+        )
+        incoming.delete(current.id)
+        continue
+      }
+      if (current.status !== "deleting" && !deleting.has(current.id)) continue
+      next.push(completedDeleteFeedback(current))
+      if (removalTimers.current.has(current.id)) continue
+      const timer = window.setTimeout(() => {
+        removalTimers.current.delete(current.id)
+        const remaining = visibleBackupsRef.current.filter(
+          (backup) => backup.id !== current.id
+        )
+        visibleBackupsRef.current = remaining
+        setVisibleBackups(remaining)
+        deleteFeedbackStore.remove([current.id])
+      }, completedDeleteFeedbackMs)
+      removalTimers.current.set(current.id, timer)
+    }
+    next.push(
+      ...[...incoming.values()].map((backup) =>
+        deleting.has(backup.id) ? backupWithDeleteIntent(backup) : backup
+      )
+    )
+    visibleBackupsRef.current = next
+    setVisibleBackups(next)
+  }, [backups, deleteFeedbackStore, deleting])
+
+  React.useEffect(
+    () => () => {
+      for (const timer of removalTimers.current.values()) {
+        window.clearTimeout(timer)
+      }
+      removalTimers.current.clear()
+    },
+    []
+  )
+
+  React.useEffect(() => {
+    const finished = backups.flatMap((backup) =>
+      deleting.has(backup.id) &&
+      backup.taskKind === "delete" &&
+      (backup.taskStatus === "cancelled" || backup.taskStatus === "failed")
+        ? [backup.id]
+        : []
+    )
+    if (finished.length > 0) deleteFeedbackStore.remove(finished)
+  }, [backups, deleteFeedbackStore, deleting])
+
+  return visibleBackups
+}
+
 export const BackupsPage = React.memo(function BackupsPage({
   filters,
   onFiltersChange,
@@ -332,7 +494,12 @@ export const BackupsPage = React.memo(function BackupsPage({
     accessCapabilitiesQueryOptions()
   )
   const [dialogStore] = React.useState(createBackupDialogStore)
+  const [deleteFeedbackStore] = React.useState(createBackupDeleteFeedbackStore)
   const [selectionStore] = React.useState(createBackupSelectionStore)
+  const visibleBackups = useBackupsWithDeleteFeedback(
+    backups,
+    deleteFeedbackStore
+  )
 
   const scopeOptions = React.useMemo(
     () =>
@@ -417,12 +584,12 @@ export const BackupsPage = React.memo(function BackupsPage({
   )
   const filteredBackups = React.useMemo(
     () =>
-      backups.filter((backup) => {
+      visibleBackups.filter((backup) => {
         if (backup.status === "deleted") return false
         if (!backupMatchesScope(backup, selectedServer)) return false
         return backupMatchesStatusFilter(backup, filters.status)
       }),
-    [backups, filters.status, selectedServer]
+    [filters.status, selectedServer, visibleBackups]
   )
   React.useLayoutEffect(() => {
     const retainVisibleSelection = () => {
@@ -521,11 +688,16 @@ export const BackupsPage = React.memo(function BackupsPage({
             targetNames={targetNames}
           />
         </div>
-        <BackupBulkActions backups={backups} selectionStore={selectionStore} />
+        <BackupBulkActions
+          backups={backups}
+          deleteFeedbackStore={deleteFeedbackStore}
+          selectionStore={selectionStore}
+        />
       </section>
 
       <BackupDialogHost
         capabilities={capabilities}
+        deleteFeedbackStore={deleteFeedbackStore}
         dialogStore={dialogStore}
         selectedCreateTargetKey={selectedCreateTargetKey}
         selectedServer={selectedServer}
@@ -742,6 +914,7 @@ const BackupSyncButton = React.memo(function BackupSyncButton() {
 
 const BackupDialogHost = React.memo(function BackupDialogHost({
   capabilities,
+  deleteFeedbackStore,
   dialogStore,
   selectedCreateTargetKey,
   selectedServer,
@@ -751,6 +924,7 @@ const BackupDialogHost = React.memo(function BackupDialogHost({
   targets,
 }: {
   capabilities: Awaited<ReturnType<typeof getAccessCapabilities>>
+  deleteFeedbackStore: BackupDeleteFeedbackStore
   dialogStore: BackupDialogStore
   selectedCreateTargetKey?: string
   selectedServer: ServerPickerOption | null
@@ -828,7 +1002,14 @@ const BackupDialogHost = React.memo(function BackupDialogHost({
       />
     )
   }
-  return <DeleteBackupDialog backup={dialog.backup} open onOpenChange={close} />
+  return (
+    <DeleteBackupDialog
+      backup={dialog.backup}
+      deleteFeedbackStore={deleteFeedbackStore}
+      open
+      onOpenChange={close}
+    />
+  )
 })
 
 const BackupTable = React.memo(function BackupTable({
@@ -1191,7 +1372,6 @@ const BackupTableRow = React.memo(function BackupTableRow({
   targetName: string
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
-  const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
   const showsPrimaryTaskFeedback = backupShowsPrimaryTaskFeedback(backup)
   const showsCreatedTimeWithFeedback = backup.taskStatus === "cancelled"
   const displayBytes = backupDisplayBytes(backup)
@@ -1209,11 +1389,6 @@ const BackupTableRow = React.memo(function BackupTableRow({
             editable={canCreate}
             name={backup.name}
           />
-          {hasTaskFeedback ? null : (
-            <div className="mt-1">
-              <BackupTaskFeedback backup={backup} />
-            </div>
-          )}
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
@@ -1288,7 +1463,6 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
   targetName: string
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
-  const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
   const showsPrimaryTaskFeedback = backupShowsPrimaryTaskFeedback(backup)
   const displayBytes = backupDisplayBytes(backup)
   const displayFilename = backupDisplayFilename(backup)
@@ -1305,11 +1479,6 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
             editable={canCreate}
             name={backup.name}
           />
-          {hasTaskFeedback ? null : (
-            <div className="mt-1">
-              <BackupTaskFeedback backup={backup} />
-            </div>
-          )}
         </div>
       </div>
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
@@ -1489,9 +1658,11 @@ const BackupBulkActionMenu = React.memo(function BackupBulkActionMenu({
 
 const BackupBulkActions = React.memo(function BackupBulkActions({
   backups,
+  deleteFeedbackStore,
   selectionStore,
 }: {
   backups: Array<Backup>
+  deleteFeedbackStore: BackupDeleteFeedbackStore
   selectionStore: BackupSelectionStore
 }) {
   const queryClient = useQueryClient()
@@ -1500,6 +1671,9 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
     Array<Backup>
   >([])
   const remove = useMutation({
+    onMutate: (targets: Array<Backup>) => {
+      deleteFeedbackStore.mark(targets)
+    },
     mutationFn: async (targets: Array<Backup>) => {
       const settlements = await settlePromises(
         targets,
@@ -1530,6 +1704,7 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
       const deferred = deleted.filter(
         (outcome) => !outcome.result.relayAccepted
       )
+      deleteFeedbackStore.remove(failed.map((outcome) => outcome.backup.id))
 
       if (failed.length === 0) {
         setConfirmOpen(false)
@@ -2227,7 +2402,7 @@ const BackupAvailabilityTags = React.memo(function BackupAvailabilityTags({
 
 function BackupAvailabilityTag({ tag }: { tag: BackupAvailabilityTagView }) {
   const working = tag.state === "working"
-  const IdleIcon = tag.kind === "local" ? HardDrive : Cloud
+  const deleting = tag.state === "deleting"
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -2239,14 +2414,14 @@ function BackupAvailabilityTag({ tag }: { tag: BackupAvailabilityTagView }) {
               label={`${tag.name} upload`}
               percent={tag.uploadPercent}
             />
-          ) : working ? (
+          ) : working || deleting ? (
             <LoaderCircle className="size-2.5 shrink-0 animate-spin" />
           ) : tag.state === "available" ? (
             <Check className="size-2.5 shrink-0" />
           ) : tag.state === "failed" ? (
-            <CircleAlert className="size-2.5 shrink-0" />
+            <X className="size-2.5 shrink-0" />
           ) : (
-            <IdleIcon className="size-2.5 shrink-0" />
+            <CircleOff className="size-2.5 shrink-0" />
           )}
           <span className="truncate">{tag.label}</span>
         </span>
@@ -3856,16 +4031,25 @@ function RestoreBackupDialog({
 
 function DeleteBackupDialog({
   backup,
+  deleteFeedbackStore,
   onOpenChange,
   open,
 }: {
   backup: Backup
+  deleteFeedbackStore: BackupDeleteFeedbackStore
   onOpenChange: (open: boolean) => void
   open: boolean
 }) {
   const queryClient = useQueryClient()
   const remove = useMutation({
+    onMutate: () => {
+      deleteFeedbackStore.mark([backup])
+    },
     mutationFn: () => deleteBackup({ data: { backupId: backup.id } }),
+    onError: async () => {
+      deleteFeedbackStore.remove([backup.id])
+      await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
+    },
     onSuccess: async (result) => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
       showToast({
@@ -4218,10 +4402,9 @@ function backupArtifactAvailabilityState(
   artifact: Backup["artifacts"][number] | undefined,
   kind: BackupAvailabilityTagView["kind"]
 ): BackupAvailabilityState {
-  const state = artifactAvailabilityState(artifact?.status)
+  const state = artifactAvailabilityState(backup, artifact)
   if (
     kind === "local" &&
-    state === "working" &&
     backup.taskKind === "create" &&
     backup.taskStatus === "running" &&
     (backup.taskPhase === "uploading" || backup.taskPhase === "finalizing")
@@ -4286,11 +4469,22 @@ function backupCopyDisabledReason(
 }
 
 function artifactAvailabilityState(
-  status: Backup["artifacts"][number]["status"] | undefined
+  backup: Backup,
+  artifact: Backup["artifacts"][number] | undefined
 ): BackupAvailabilityState {
+  const status = artifact?.status
+  if (status === "deleting") return "deleting"
+  if (
+    status === "failed" &&
+    backup.taskKind === "create" &&
+    backup.taskStatus === "cancelled"
+  ) {
+    return "cancelled"
+  }
+  if (artifact?.error) return "failed"
   if (status === "available") return "available"
   if (status === "failed") return "failed"
-  if (status === "queued" || status === "running" || status === "deleting") {
+  if (status === "queued" || status === "running") {
     return "working"
   }
   return "missing"
@@ -4303,7 +4497,10 @@ function availabilityTagClassName(state: BackupAvailabilityState): string {
   if (state === "working") {
     return "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
   }
-  if (state === "failed") {
+  if (state === "deleting") {
+    return "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+  }
+  if (state === "failed" || state === "cancelled") {
     return "border-destructive/30 bg-destructive/10 text-destructive"
   }
   return "border-border/70 bg-muted/40 text-muted-foreground"
@@ -4311,9 +4508,11 @@ function availabilityTagClassName(state: BackupAvailabilityState): string {
 
 function availabilityStateLabel(state: BackupAvailabilityState): string {
   if (state === "available") return "Available"
-  if (state === "working") return "Copying"
+  if (state === "working") return "Backing up"
+  if (state === "deleting") return "Deleting"
+  if (state === "cancelled") return "Cancelled"
   if (state === "failed") return "Failed"
-  return "Not stored here"
+  return "Not available"
 }
 
 function targetKey(

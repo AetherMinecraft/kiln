@@ -28,6 +28,22 @@ const uploadingBackup = {
 } satisfies TestBackup
 
 describe("backup progress presentation", () => {
+  it("keeps restore feedback in the primary columns and delete feedback out", () => {
+    const activeRestore = {
+      ...uploadingBackup,
+      taskCurrentArtifactId: null,
+      taskKind: "restore",
+      taskPhase: "preparing",
+    } satisfies TestBackup
+    const activeDelete = {
+      ...activeRestore,
+      taskKind: "delete",
+    } satisfies TestBackup
+
+    expect(backupShowsPrimaryTaskFeedback(activeRestore)).toBe(true)
+    expect(backupShowsPrimaryTaskFeedback(activeDelete)).toBe(false)
+  })
+
   it("shows determinate upload progress and the archived size", () => {
     expect(backupDisplayBytes(uploadingBackup)).toBe(100)
     expect(backupShowsPrimaryTaskFeedback(uploadingBackup)).toBe(false)

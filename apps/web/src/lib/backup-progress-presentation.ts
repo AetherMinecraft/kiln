@@ -30,10 +30,10 @@ type BackupFilenamePresentation = BackupUploadPhasePresentation & {
   id: string
 }
 
-export function backupHasCreateTaskFeedback(
+export function backupHasPrimaryTaskFeedback(
   backup: BackupTaskFeedbackPresentation
 ): boolean {
-  if (backup.taskKind !== "create") return false
+  if (backup.taskKind === null || backup.taskKind === "delete") return false
   if (backup.taskStatus === "queued" || backup.taskStatus === "running") {
     return true
   }
@@ -46,7 +46,7 @@ export function backupHasCreateTaskFeedback(
 export function backupShowsPrimaryTaskFeedback(
   backup: BackupTaskFeedbackPresentation
 ): boolean {
-  if (!backupHasCreateTaskFeedback(backup)) return false
+  if (!backupHasPrimaryTaskFeedback(backup)) return false
   if (backup.taskStatus !== "queued" && backup.taskStatus !== "running") {
     return true
   }
@@ -102,7 +102,6 @@ export function backupShowsUploadArtifact(
 ): boolean {
   return (
     backup.taskPhase === "uploading" ||
-    (backup.taskPhase === "finalizing" &&
-      backup.taskCurrentArtifactId !== null)
+    (backup.taskPhase === "finalizing" && backup.taskCurrentArtifactId !== null)
   )
 }

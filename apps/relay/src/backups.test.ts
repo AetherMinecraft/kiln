@@ -11,8 +11,10 @@ import ZipStream from "zip-stream"
 import type {
   BackupCreateTaskInput,
   BackupCreateTaskResult,
+  BackupDeleteTaskInput,
   BackupRestoreTaskInput,
   BackupTaskPhase,
+  BackupTaskResult,
 } from "@workspace/contracts"
 import { relayBackupTaskSchema } from "@workspace/contracts"
 
@@ -20,6 +22,7 @@ import {
   BackupManager,
   backupPathIsExcluded,
   createPortableInstanceBackup,
+  deleteBackupArtifacts,
   storeCreatedBackup,
 } from "./backups.js"
 import {
@@ -136,6 +139,81 @@ describe("Relay backups", () => {
           status: "available",
         },
       ])
+    })
+  )
+
+  it.effect("reports deletion progress for each artifact", () =>
+    Effect.gen(function* () {
+      const localArtifactId = "31000000-0000-4000-8000-000000000001"
+      const remoteArtifactId = "31000000-0000-4000-8000-000000000002"
+      const input = {
+        backupId: "31000000-0000-4000-8000-000000000003",
+        destination: { artifactId: localArtifactId, kind: "local" },
+        kind: "delete",
+        replicas: [
+          {
+            allowPrivateNetwork: false,
+            artifactId: remoteArtifactId,
+            deleteUrl: "https://example.com/backups/test.zip",
+            headers: {},
+            kind: "s3",
+            objectKey: "backups/test.zip",
+          },
+        ],
+        target: { id: "instance-1", kind: "instance" },
+        taskId: "31000000-0000-4000-8000-000000000004",
+      } satisfies BackupDeleteTaskInput & { kind: "delete" }
+      const snapshots: Array<{
+        currentArtifactId: string | null
+        result: Exclude<BackupTaskResult, BackupCreateTaskResult>
+      }> = []
+
+      const result = yield* deleteBackupArtifacts(
+        testConfig(testDirectory),
+        input,
+        (currentArtifactId, progress) => {
+          snapshots.push({
+            currentArtifactId,
+            result: structuredClone(progress),
+          })
+          return Effect.succeed(true)
+        },
+        () => Effect.succeed({ warnings: [] })
+      )
+
+      assert.deepStrictEqual(
+        snapshots.map(({ currentArtifactId, result: progress }) => ({
+          currentArtifactId,
+          outcomes: progress.artifacts ?? [],
+        })),
+        [
+          { currentArtifactId: localArtifactId, outcomes: [] },
+          {
+            currentArtifactId: localArtifactId,
+            outcomes: [
+              { artifactId: localArtifactId, error: null, status: "deleted" },
+            ],
+          },
+          {
+            currentArtifactId: remoteArtifactId,
+            outcomes: [
+              { artifactId: localArtifactId, error: null, status: "deleted" },
+            ],
+          },
+          {
+            currentArtifactId: remoteArtifactId,
+            outcomes: [
+              { artifactId: localArtifactId, error: null, status: "deleted" },
+              {
+                artifactId: remoteArtifactId,
+                error: null,
+                status: "deleted",
+              },
+            ],
+          },
+        ]
+      )
+      assert.deepStrictEqual(result, snapshots.at(-1)?.result)
     })
   )
 
