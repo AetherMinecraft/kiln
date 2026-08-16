@@ -76,6 +76,7 @@ import {
   isKilnReleaseVersion,
 } from "@/lib/release-version"
 import type { PublicKilnRelease } from "@/effect/github-releases"
+import { kilnGitRepository } from "@/lib/git-repository"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import {
   addRelay,
@@ -1857,8 +1858,6 @@ function shortRelayId(id: string): string {
   return id.slice(0, 7)
 }
 
-const hearthRepositoryUrl = "https://github.com/kiln-site/hearth"
-
 function isGitCommitSha(value: string): boolean {
   return /^[0-9a-f]{7,40}$/i.test(value)
 }
@@ -1894,7 +1893,7 @@ function RelayVersion({
     </a>
   ) : isGitCommitSha(version) ? (
     <a
-      href={`${hearthRepositoryUrl}/commit/${version}`}
+      href={`${kilnGitRepository}/commit/${version}`}
       target="_blank"
       rel="noreferrer"
       aria-label={`View Relay commit ${version}`}

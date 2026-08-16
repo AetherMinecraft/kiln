@@ -1,5 +1,7 @@
 import { Option, Schema } from "effect"
 
+import { resolveKilnGitRepository } from "@workspace/contracts"
+
 import { parseSecretKeyring } from "../../keyring.mjs"
 import type { VersionedSecret } from "../../keyring.mjs"
 import { rootDomainForHostname } from "@/lib/domain-name"
@@ -20,6 +22,10 @@ const decodeUrl = Schema.decodeUnknownOption(Schema.URLFromString)
 
 export function kilnEnvironment(): KilnEnvironment {
   return parseKilnEnvironment(process.env.KILN_ENVIRONMENT)
+}
+
+export function kilnGitRepository(): string {
+  return resolveKilnGitRepository(process.env.KILN_GIT_REPO)
 }
 
 export function kilnInstallationId(): string {

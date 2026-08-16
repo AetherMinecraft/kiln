@@ -1,4 +1,8 @@
-export const KILN_IMAGE_SOURCE = "https://github.com/kiln-site/hearth"
+import { LEGACY_KILN_GIT_REPO } from "@workspace/contracts"
+
+// Official images retain the pre-rename source label until older Relays that
+// require this exact value have had a compatibility release available.
+export const KILN_IMAGE_SOURCE = LEGACY_KILN_GIT_REPO
 export const KILN_INSTALLATION_LABEL = "io.kiln.installation"
 
 export type KilnComponent = "hearth" | "relay"

@@ -25,7 +25,8 @@ COPY --from=java /opt/kiln-java /opt/java
 COPY apps/bricks/embers/java/entrypoint.sh /usr/local/bin/kiln-ember
 RUN chmod 0755 /usr/local/bin/kiln-ember && mkdir -p /server
 
-LABEL org.opencontainers.image.source="https://github.com/kiln-site/hearth"
+ARG KILN_GIT_REPO=https://github.com/kiln-site/kiln
+LABEL org.opencontainers.image.source="${KILN_GIT_REPO}"
 LABEL org.opencontainers.image.title="Kiln Java Ember"
 LABEL org.opencontainers.image.description="Minimal Java runtime for recipe-driven Kiln Bricks"
 LABEL kiln.ember.installation-marker="v1"

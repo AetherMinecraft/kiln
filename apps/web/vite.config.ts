@@ -9,6 +9,8 @@ import { tanstackStart } from "@tanstack/react-start/plugin/vite"
 import viteReact from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
 
+import { resolveKilnGitRepository } from "../../packages/contracts/src/git-repository"
+
 const repositoryRoot = resolve(import.meta.dirname, "../..")
 const release = JSON.parse(
   readFileSync(resolve(repositoryRoot, "release.json"), "utf8")
@@ -45,6 +47,7 @@ const config = defineConfig(({ command }) => {
             "COMMIT_SHA",
             "GITHUB_SHA",
             "KILN_BUILD_SHA",
+            "KILN_GIT_REPO",
             "KILN_VERSION",
             "SENTRY_AUTH_TOKEN",
             "SENTRY_SOURCEMAPS",
@@ -81,6 +84,9 @@ const config = defineConfig(({ command }) => {
     define: {
       "import.meta.env.VITE_KILN_BUILD_SHA": JSON.stringify(buildCommit),
       "import.meta.env.VITE_KILN_SOURCE_SHA": JSON.stringify(sourceCommit),
+      "import.meta.env.VITE_KILN_GIT_REPO": JSON.stringify(
+        resolveKilnGitRepository(process.env.KILN_GIT_REPO)
+      ),
       "import.meta.env.VITE_KILN_VERSION": JSON.stringify(
         process.env.KILN_VERSION?.trim() || release.releaseLine
       ),

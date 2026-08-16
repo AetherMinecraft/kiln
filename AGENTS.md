@@ -1,4 +1,4 @@
-# Hearth agents
+# Kiln agents
 
 Kiln is a fast, approachable, reliable self-hosted server platform panel/orchestrator. It's catered towards game servers (focus on Minecraft), but should be agnostic to other servers.
 Favor simple operation and existing patterns over new abstractions,

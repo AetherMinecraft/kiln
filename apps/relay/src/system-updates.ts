@@ -13,6 +13,8 @@ import { join } from "node:path"
 
 import {
   compareKilnReleaseVersions,
+  DEFAULT_KILN_GIT_REPO,
+  isKilnGitRepositorySource,
   isKilnNightlyVersion,
   isKilnReleaseVersion,
   kilnReleaseVersionCore,
@@ -23,7 +25,6 @@ import { command } from "./command.js"
 import type { CommandOptions, CommandResult } from "./command.js"
 import { RelaySystemUpdateError } from "./effect/errors.js"
 import {
-  KILN_IMAGE_SOURCE,
   KILN_INSTALLATION_LABEL,
   kilnComponent,
   managedImageChannel,
@@ -94,17 +95,20 @@ export class SystemUpdateManager {
   readonly #batchSemaphore = Semaphore.makeUnsafe(1)
   readonly #command: RunCommand
   readonly #installationId: string | null
+  readonly #gitRepository: string
   readonly #operationsDirectory: string
   #activeBatch: { id: string } | null = null
 
   constructor(
     config: {
       dataDirectory: string
+      gitRepository?: string
       installationId?: string | null
     },
     runCommand: RunCommand = command
   ) {
     this.#command = runCommand
+    this.#gitRepository = config.gitRepository ?? DEFAULT_KILN_GIT_REPO
     this.#installationId = config.installationId ?? null
     this.#operationsDirectory = join(config.dataDirectory, "updates")
   }
@@ -112,7 +116,7 @@ export class SystemUpdateManager {
   inspect(container: string) {
     return inspectContainerEffect(container, this.#command).pipe(
       Effect.map((inspected) =>
-        updateEligibility(inspected, this.#installationId)
+        updateEligibility(inspected, this.#installationId, this.#gitRepository)
       ),
       Effect.withSpan("relay.systemUpdates.inspect")
     )
@@ -151,6 +155,7 @@ export class SystemUpdateManager {
   ) {
     const runCommand = this.#command
     const installationId = this.#installationId
+    const gitRepository = this.#gitRepository
     const operationsDirectory = this.#operationsDirectory
     const setActiveBatch = (id: string) => {
       this.#activeBatch = { id }
@@ -185,6 +190,7 @@ export class SystemUpdateManager {
               batchId,
               startedAt,
               installationId,
+              gitRepository,
               runCommand
             ),
           { concurrency: "unbounded" }
@@ -216,6 +222,7 @@ export class SystemUpdateManager {
               pullAndVerifyImageEffect(
                 image,
                 component,
+                gitRepository,
                 runCommand,
                 signal
               ).pipe(Effect.map((inspected) => ({ image, inspected }))),
@@ -244,8 +251,10 @@ export class SystemUpdateManager {
           const volumesFromLabels = volumesFrom.Config.Labels ?? {}
           if (
             kilnComponent(volumesFromLabels["io.kiln.component"]) !== "relay" ||
-            volumesFromLabels["org.opencontainers.image.source"] !==
-              KILN_IMAGE_SOURCE
+            !isKilnGitRepositorySource(
+              volumesFromLabels["org.opencontainers.image.source"],
+              gitRepository
+            )
           ) {
             return yield* systemUpdateFailure(
               "start.verifyRelay",
@@ -406,6 +415,7 @@ const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
   batchId: string,
   startedAt: string,
   installationId: string | null,
+  gitRepository: string,
   runCommand: RunCommand
 ) {
   const targetComponent = releaseImageComponent(input.targetImage)
@@ -413,7 +423,11 @@ const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
     input.targetContainer,
     runCommand
   )
-  const eligibility = updateEligibility(container, installationId)
+  const eligibility = updateEligibility(
+    container,
+    installationId,
+    gitRepository
+  )
   if (targetComponent === null || eligibility.component !== targetComponent) {
     return yield* systemUpdateFailure(
       "start.validate",
@@ -705,7 +719,8 @@ export function imageVersionMatchesRelease(
 
 function updateEligibility(
   inspected: ContainerInspect,
-  expectedInstallationId: string | null
+  expectedInstallationId: string | null,
+  gitRepository: string
 ): {
   component: KilnComponent | null
   container: string
@@ -721,8 +736,10 @@ function updateEligibility(
   const currentImage = inspected.Config.Image
   const installationId = labels[KILN_INSTALLATION_LABEL]?.trim() || null
   const sameInstallation = installationId === expectedInstallationId
-  const official =
-    labels["org.opencontainers.image.source"] === KILN_IMAGE_SOURCE
+  const official = isKilnGitRepositorySource(
+    labels["org.opencontainers.image.source"],
+    gitRepository
+  )
   const eligibleTag = component
     ? managedImageChannel(currentImage, component)
     : null
@@ -818,6 +835,7 @@ function inspectContainerDirectEffect(
 function pullAndVerifyImageEffect(
   image: string,
   expectedComponent: KilnComponent,
+  gitRepository: string,
   runCommand: RunCommand,
   signal?: AbortSignal
 ): Effect.Effect<ImageInspect, RelaySystemUpdateError> {
@@ -846,7 +864,10 @@ function pullAndVerifyImageEffect(
     }
     const labels = inspected.Config?.Labels ?? {}
     if (
-      labels["org.opencontainers.image.source"] !== KILN_IMAGE_SOURCE ||
+      !isKilnGitRepositorySource(
+        labels["org.opencontainers.image.source"],
+        gitRepository
+      ) ||
       labels["io.kiln.component"] !== expectedComponent
     ) {
       return yield* systemUpdateFailure(

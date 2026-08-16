@@ -22,6 +22,7 @@ import { cn } from "@workspace/ui/lib/utils"
 
 import { ServerTypeIcon } from "@/components/server-type-icon"
 import { defaultBrickRuntimeName } from "@/lib/brick-variables"
+import { kilnGitRepositorySlugValue } from "@/lib/git-repository"
 
 export type BrickSelection =
   | { kind: "catalog"; brick: Brick }
@@ -62,7 +63,9 @@ function isOfficialBrick(brick: Brick): boolean {
       () =>
         new URL(brick.source).hostname.toLowerCase() ===
           "raw.githubusercontent.com" &&
-        brick.source.includes("/kiln-site/hearth/main/apps/bricks/")
+        brick.source.includes(
+          `/${kilnGitRepositorySlugValue}/main/apps/bricks/`
+        )
     ),
     () => false
   )

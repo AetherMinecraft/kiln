@@ -34,6 +34,7 @@ import { Skeleton } from "@workspace/ui/components/skeleton"
 import { dismissToast, showToast } from "@workspace/ui/components/sonner"
 
 import type { PublicKilnRelease } from "@/effect/github-releases"
+import { kilnGitRepository } from "@/lib/git-repository"
 import { queryKeys, updateOverviewQueryOptions } from "@/lib/query-options"
 import {
   compareLatestReleaseVersion,
@@ -128,9 +129,8 @@ type UpdateDialogViewStore = ReturnType<typeof createUpdateDialogViewStore>
 
 const changelogRangeStorageKey = "kiln.system-update-changelog-ranges"
 const updateFailureStorageKey = "kiln.system-update-failures"
-const githubRepositoryUrl = "https://github.com/kiln-site/hearth"
-const githubIssuesUrl = "https://github.com/kiln-site/hearth/issues/new/choose"
-const githubReleasesUrl = `${githubRepositoryUrl}/releases`
+const githubIssuesUrl = `${kilnGitRepository}/issues/new/choose`
+const githubReleasesUrl = `${kilnGitRepository}/releases`
 const systemUpdateToastId = "system-update"
 const minimumUpdateCheckDuration = 750
 const completedUpdateDisplayDuration = 1_500

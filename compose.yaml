@@ -55,6 +55,7 @@ services:
       dockerfile: apps/relay/Dockerfile
     restart: unless-stopped
     environment:
+      KILN_GIT_REPO: ${KILN_GIT_REPO:-}
       KILN_INSTALLATION_ID: ${KILN_INSTALLATION_ID:-}
       KILN_RELAY_BOOTSTRAP_TOKEN: ${KILN_RELAY_BOOTSTRAP_TOKEN:-}
       KILN_RELAY_BOOTSTRAP_TOKEN_FILE: ${KILN_RELAY_BOOTSTRAP_TOKEN_FILE:-}
@@ -79,7 +80,7 @@ services:
       KILN_RELAY_TLS_MODE: ${KILN_RELAY_TLS_MODE:-managed}
       KILN_RELAY_TLS_CERT_FILE: ${KILN_RELAY_TLS_CERT_FILE:-}
       KILN_RELAY_TLS_KEY_FILE: ${KILN_RELAY_TLS_KEY_FILE:-}
-      KILN_BRICKS_CATALOG_URL: ${KILN_BRICKS_CATALOG_URL:-https://raw.githubusercontent.com/kiln-site/hearth/main/apps/bricks/catalog.yml}
+      KILN_BRICKS_CATALOG_URL: ${KILN_BRICKS_CATALOG_URL:-}
       MCLOGS_API_URL: ${MCLOGS_API_URL:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
       SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-}
@@ -100,6 +101,7 @@ services:
       context: .
       dockerfile: apps/web/Dockerfile
       args:
+        KILN_GIT_REPO: ${KILN_GIT_REPO:-}
         VITE_SENTRY_DSN: ${VITE_SENTRY_DSN:-}
         VITE_SENTRY_REPLAYS_SESSION_SAMPLE_RATE: ${VITE_SENTRY_REPLAYS_SESSION_SAMPLE_RATE:-0.1}
         VITE_SENTRY_TRACES_SAMPLE_RATE: ${VITE_SENTRY_TRACES_SAMPLE_RATE:-0.1}
@@ -119,6 +121,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
       DB_TABLE_PREFIX: ${DB_TABLE_PREFIX:-}
       KILN_ENVIRONMENT: ${KILN_ENVIRONMENT:-prod}
+      KILN_GIT_REPO: ${KILN_GIT_REPO:-}
       KILN_INSTALLATION_ID: ${KILN_INSTALLATION_ID:-}
       CACHE_HOST: ${CACHE_HOST:-cache}
       CACHE_PORT: ${CACHE_PORT:-6379}

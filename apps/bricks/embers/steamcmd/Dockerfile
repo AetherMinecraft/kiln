@@ -20,7 +20,8 @@ RUN groupadd --gid 1000 kiln \
 COPY apps/bricks/embers/steamcmd/entrypoint.sh /usr/local/bin/kiln-ember-steamcmd
 RUN chmod 0755 /usr/local/bin/kiln-ember-steamcmd
 
-LABEL org.opencontainers.image.source="https://github.com/kiln-site/hearth"
+ARG KILN_GIT_REPO=https://github.com/kiln-site/kiln
+LABEL org.opencontainers.image.source="${KILN_GIT_REPO}"
 LABEL org.opencontainers.image.title="Kiln SteamCMD Ember"
 LABEL org.opencontainers.image.description="Generic SteamCMD runtime for recipe-driven Kiln Bricks"
 LABEL kiln.ember.installation-marker="v1"

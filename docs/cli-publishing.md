@@ -27,7 +27,7 @@ Then configure the package's trusted publisher on npm:
 
 - Provider: GitHub Actions
 - Organization: `kiln-site`
-- Repository: `hearth`
+- Repository: `kiln`
 - Workflow filename: `publish-cli.yml`
 - Allowed action: `npm publish`
 
