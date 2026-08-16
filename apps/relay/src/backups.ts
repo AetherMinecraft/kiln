@@ -855,6 +855,7 @@ function storeCreatedBackup(
     progress.total = result.bytes
     const outcomes: NonNullable<BackupCreateTaskResult["artifacts"]> = []
     let available = 0
+    let lastUploadedArtifactId: string | null = null
     for (const destination of destinations) {
       signal.throwIfAborted()
       if (destination.kind === "local") {
@@ -886,6 +887,8 @@ function storeCreatedBackup(
       )
       if (Result.isSuccess(uploaded)) {
         available += 1
+        progress.completed = progress.total
+        lastUploadedArtifactId = destination.artifactId ?? null
         if (destination.artifactId) {
           outcomes.push({
             artifactId: destination.artifactId,
@@ -915,7 +918,7 @@ function storeCreatedBackup(
     }
     signal.throwIfAborted()
     progress.phase = "finalizing"
-    progress.currentArtifactId = null
+    progress.currentArtifactId = lastUploadedArtifactId
     return { ...result, artifacts: outcomes }
   })
 }

@@ -66,6 +66,10 @@ import {
 import { ServerScopePicker } from "@/components/server-scope-picker"
 import type { ServerPickerOption } from "@/components/server-picker-list"
 import { timestampedBackupName } from "@/lib/backup-name"
+import {
+  backupDisplayBytes,
+  backupTaskUploadProgressPercent,
+} from "@/lib/backup-progress-presentation"
 import { relayInstanceRouteId } from "@/lib/relay-fleet"
 import {
   readFileDownloadPreferences,
@@ -4104,21 +4108,6 @@ function backupDisplayFilename(backup: Backup): string {
   return backup.id
 }
 
-function backupDisplayBytes(backup: Backup): number | null {
-  if (backup.bytes !== null) return backup.bytes
-  if (backup.taskPhase !== "uploading" || backup.taskBytesTotal === null) {
-    return null
-  }
-  const remoteArtifactCount = backup.artifacts.filter(
-    (artifact) => artifact.storageId !== null
-  ).length
-  if (remoteArtifactCount === 0) return null
-  if (remoteArtifactCount > 1 && backup.taskCurrentArtifactId === null) {
-    return null
-  }
-  return backup.taskBytesTotal
-}
-
 function backupSourceIsActive(backup: Backup): boolean {
   return (
     activeStatuses.has(backup.status) ||
@@ -4420,20 +4409,6 @@ function backupTaskProgressDetail(
       : "Working…"
   }
   return `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`
-}
-
-function backupTaskUploadProgressPercent(backup: Backup): number | null {
-  if (
-    backup.taskPhase !== "uploading" ||
-    backup.taskBytesTotal === null ||
-    backup.taskBytesTotal <= 0
-  ) {
-    return null
-  }
-  return Math.min(
-    100,
-    Math.floor((backup.taskBytesCompleted / backup.taskBytesTotal) * 100)
-  )
 }
 
 function subscribeToMobileBackupLayout(onChange: () => void): () => void {
