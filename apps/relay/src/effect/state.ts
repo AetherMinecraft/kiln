@@ -230,6 +230,7 @@ const RelayBackupTaskRowSchema = Schema.Struct({
   bytesCompleted: Schema.Number,
   bytesTotal: Schema.NullOr(Schema.Number),
   createdAt: Schema.Number,
+  currentArtifactId: Schema.NullOr(Schema.String),
   currentPath: Schema.NullOr(Schema.String),
   error: Schema.NullOr(Schema.String),
   finishedAt: Schema.NullOr(Schema.Number),
@@ -288,6 +289,13 @@ export class RelayStateStore extends Context.Service<
       bytesTotal: number | null,
       phase: BackupTaskPhase,
       currentPath: string | null,
+      currentArtifactId: string | null,
+      now: number
+    ) => Effect.Effect<boolean, RelayStateError>
+    readonly updateBackupTaskOperationProgress: (
+      taskId: string,
+      currentArtifactId: string | null,
+      result: BackupTaskResult,
       now: number
     ) => Effect.Effect<boolean, RelayStateError>
     readonly cancelBackupTask: (
@@ -591,6 +599,13 @@ const migrations = SqliteMigrator.fromRecord({
       ADD COLUMN current_path TEXT
     `
   }),
+  "9_backup_task_current_artifact": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`
+      ALTER TABLE relay_backup_tasks
+      ADD COLUMN current_artifact_id TEXT
+    `
+  }),
 })
 
 const makeRelayStateStore = Effect.gen(function* () {
@@ -719,6 +734,7 @@ const makeRelayStateStore = Effect.gen(function* () {
         bytesCompleted: row.bytesCompleted,
         bytesTotal: row.bytesTotal,
         createdAt: row.createdAt,
+        currentArtifactId: row.currentArtifactId,
         currentPath: row.currentPath,
         error: row.error,
         finishedAt: row.finishedAt,
@@ -754,6 +770,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               bytes_completed AS bytesCompleted,
               bytes_total AS bytesTotal,
               phase,
+              current_artifact_id AS currentArtifactId,
               current_path AS currentPath,
               error,
               created_at AS createdAt,
@@ -777,6 +794,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                 bytes_completed AS bytesCompleted,
                 bytes_total AS bytesTotal,
                 phase,
+                current_artifact_id AS currentArtifactId,
                 current_path AS currentPath,
                 error,
                 created_at AS createdAt,
@@ -798,6 +816,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                 bytes_completed AS bytesCompleted,
                 bytes_total AS bytesTotal,
                 phase,
+                current_artifact_id AS currentArtifactId,
                 current_path AS currentPath,
                 error,
                 created_at AS createdAt,
@@ -981,6 +1000,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                       input_refresh_required = 0,
                       error = NULL,
                       phase = NULL,
+                      current_artifact_id = NULL,
                       current_path = NULL,
                       updated_at = ${now}
                   WHERE task_id = ${input.taskId}
@@ -1040,6 +1060,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                   updated_at = ${now},
                   error = NULL,
                   phase = 'preparing',
+                  current_artifact_id = NULL,
                   current_path = NULL,
                   finished_at = NULL
               WHERE task_id = ${taskId}
@@ -1063,6 +1084,7 @@ const makeRelayStateStore = Effect.gen(function* () {
       bytesTotal,
       phase,
       currentPath,
+      currentArtifactId,
       now
     ) =>
       run(
@@ -1081,6 +1103,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               SET bytes_completed = ${bytesCompleted},
                   bytes_total = ${bytesTotal},
                   phase = ${phase},
+                  current_artifact_id = ${currentArtifactId},
                   current_path = ${currentPath?.slice(0, 2_048) ?? null},
                   updated_at = ${now}
               WHERE task_id = ${taskId} AND status = 'running'
@@ -1088,7 +1111,43 @@ const makeRelayStateStore = Effect.gen(function* () {
                   bytes_completed <> ${bytesCompleted}
                   OR bytes_total IS NOT ${bytesTotal}
                   OR phase IS NOT ${phase}
+                  OR current_artifact_id IS NOT ${currentArtifactId}
                   OR current_path IS NOT ${currentPath?.slice(0, 2_048) ?? null}
+                )
+            `
+            return true
+          })
+        )
+      ),
+    updateBackupTaskOperationProgress: (
+      taskId,
+      currentArtifactId,
+      result,
+      now
+    ) =>
+      run(
+        "update_backup_task_operation_progress",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<{ taskId: string }>`
+              SELECT task_id AS taskId
+              FROM relay_backup_tasks
+              WHERE task_id = ${taskId} AND kind = 'delete'
+                AND status = 'running'
+              LIMIT 1
+            `
+            if (!rows[0]) return false
+            const resultJson = JSON.stringify(result)
+            yield* sql`
+              UPDATE relay_backup_tasks
+              SET current_artifact_id = ${currentArtifactId},
+                  result_json = ${resultJson},
+                  updated_at = ${now}
+              WHERE task_id = ${taskId} AND kind = 'delete'
+                AND status = 'running'
+                AND (
+                  current_artifact_id IS NOT ${currentArtifactId}
+                  OR result_json IS NOT ${resultJson}
                 )
             `
             return true
@@ -1113,6 +1172,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               UPDATE relay_backup_tasks
               SET status = 'cancelled',
                   result_json = NULL,
+                  current_artifact_id = NULL,
                   error = ${reason.slice(0, 2_048)},
                   finished_at = ${now},
                   updated_at = ${now}
@@ -1145,6 +1205,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                   bytes_total = ${bytes},
                   error = NULL,
                   phase = NULL,
+                  current_artifact_id = NULL,
                   current_path = NULL,
                   finished_at = ${now},
                   updated_at = ${now}
@@ -1171,6 +1232,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               UPDATE relay_backup_tasks
               SET status = 'failed',
                   result_json = NULL,
+                  current_artifact_id = NULL,
                   error = ${error.slice(0, 4_096)},
                   finished_at = ${now},
                   updated_at = ${now}
@@ -1212,6 +1274,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                   bytes_completed = 0,
                   bytes_total = NULL,
                   phase = NULL,
+                  current_artifact_id = NULL,
                   current_path = NULL,
                   updated_at = ${now},
                   error = 'Relay restarted before the task completed'
@@ -1220,6 +1283,7 @@ const makeRelayStateStore = Effect.gen(function* () {
             yield* sql`
               UPDATE relay_backup_tasks
               SET status = 'failed',
+                  current_artifact_id = NULL,
                   updated_at = ${now},
                   finished_at = ${now},
                   error = 'Relay restarted during a non-repeatable task; inspect the target before retrying'

@@ -71,6 +71,7 @@ describe("Relay backup restore cleanup", () => {
       const created = yield* Effect.promise(() =>
         createPortableInstanceBackup(config, create, instance, {
           completed: 0,
+          currentArtifactId: null,
           currentPath: null,
           phase: "preparing",
           total: 0,

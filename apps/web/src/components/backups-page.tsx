@@ -12,6 +12,7 @@ import {
   ArrowLeft,
   Check,
   CircleAlert,
+  CircleOff,
   CircleStop,
   Cloud,
   CloudCog,
@@ -65,6 +66,14 @@ import {
 import { ServerScopePicker } from "@/components/server-scope-picker"
 import type { ServerPickerOption } from "@/components/server-picker-list"
 import { timestampedBackupName } from "@/lib/backup-name"
+import {
+  backupDisplayFilename,
+  backupDisplayBytes,
+  backupHasReportedDeleteArtifactProgress,
+  backupShowsPrimaryTaskFeedback,
+  backupShowsArchivedLocalArtifact,
+  backupTaskUploadProgressPercent,
+} from "@/lib/backup-progress-presentation"
 import { relayInstanceRouteId } from "@/lib/relay-fleet"
 import {
   readFileDownloadPreferences,
@@ -134,12 +143,20 @@ type BackupAvailabilityDestination = {
 type BackupAvailabilityTagView = {
   error: string | null
   key: string
+  kind: "local" | "remote"
   label: string
   name: string
   state: BackupAvailabilityState
   tooltip?: string
+  uploadPercent: number | null
 }
-type BackupAvailabilityState = "available" | "failed" | "missing" | "working"
+type BackupAvailabilityState =
+  | "available"
+  | "cancelled"
+  | "deleting"
+  | "failed"
+  | "missing"
+  | "working"
 type BackupTargetPresentation = {
   id: string
   kindLabel: "Database" | "Relay" | "Server"
@@ -164,9 +181,13 @@ type BackupDialogState =
   | { backup: Backup; kind: "download" }
   | { backup: Backup; kind: "restore" }
 type BackupDialogStore = ReturnType<typeof createBackupDialogStore>
+type BackupDeleteFeedbackStore = ReturnType<
+  typeof createBackupDeleteFeedbackStore
+>
 type BackupSelectionStore = ReturnType<typeof createBackupSelectionStore>
 
 const closedBackupDialog = { kind: "closed" } as const
+const emptyBackupDeleteFeedback: ReadonlyMap<string, Backup> = new Map()
 const emptyBackupSelection: ReadonlySet<string> = new Set()
 const minimumBackupSyncFeedbackMs = 1000
 
@@ -236,6 +257,36 @@ function createBackupSelectionStore() {
   }
 }
 
+function createBackupDeleteFeedbackStore() {
+  let deleting: ReadonlyMap<string, Backup> = emptyBackupDeleteFeedback
+  const listeners = new Set<() => void>()
+
+  function publish(next: ReadonlyMap<string, Backup>) {
+    if (next === deleting) return
+    deleting = next
+    for (const listener of listeners) listener()
+  }
+
+  return {
+    getServerSnapshot: () => emptyBackupDeleteFeedback,
+    getSnapshot: () => deleting,
+    mark: (backups: ReadonlyArray<Backup>) => {
+      const next = new Map(deleting)
+      for (const backup of backups) next.set(backup.id, backup)
+      publish(next)
+    },
+    remove: (backupIds: ReadonlyArray<string>) => {
+      const next = new Map(deleting)
+      for (const backupId of backupIds) next.delete(backupId)
+      if (next.size !== deleting.size) publish(next)
+    },
+    subscribe: (listener: () => void) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+  }
+}
+
 interface CreateTarget {
   id: string
   key: string
@@ -246,6 +297,7 @@ interface CreateTarget {
 }
 
 const activeStatuses = new Set(["queued", "running", "deleting"])
+const completedDeleteFeedbackMs = 1_000
 const mobileBackupLayoutQuery = "(max-width: 767px)"
 const backupSelectionBlockingOverlaySelector = [
   '[data-slot="combobox-content"][data-open]',
@@ -297,6 +349,127 @@ export function createBackupSearchStore(initialValue: string) {
   return createWorkspaceTableSearchStore(initialValue)
 }
 
+function completedDeleteFeedback(backup: Backup): Backup {
+  return {
+    ...backup,
+    artifacts: backup.artifacts.map((artifact) => ({
+      ...artifact,
+      error: null,
+      status: "deleted",
+    })),
+    taskCurrentArtifactId: null,
+    taskError: null,
+    taskPhase: null,
+    taskStatus: "succeeded",
+  }
+}
+
+function backupWithDeleteIntent(backup: Backup): Backup {
+  const firstArtifact = backup.artifacts.find(
+    (artifact) => artifact.status !== "deleted"
+  )
+  return {
+    ...backup,
+    artifacts: backup.artifacts.map((artifact) =>
+      artifact.id === firstArtifact?.id
+        ? { ...artifact, error: null, status: "deleting" }
+        : artifact
+    ),
+    status: "deleting",
+    taskCurrentArtifactId: firstArtifact?.id ?? null,
+    taskError: null,
+    taskKind: "delete",
+    taskPhase: null,
+    taskStatus: "queued",
+  }
+}
+
+function useBackupsWithDeleteFeedback(
+  backups: Array<Backup>,
+  deleteFeedbackStore: BackupDeleteFeedbackStore
+): Array<Backup> {
+  const deleting = React.useSyncExternalStore(
+    deleteFeedbackStore.subscribe,
+    deleteFeedbackStore.getSnapshot,
+    deleteFeedbackStore.getServerSnapshot
+  )
+  const [visibleBackups, setVisibleBackups] = React.useState(backups)
+  const visibleBackupsRef = React.useRef(backups)
+  const removalTimers = React.useRef(new Map<string, number>())
+
+  React.useLayoutEffect(() => {
+    const incoming = new Map(backups.map((backup) => [backup.id, backup]))
+    const next: Array<Backup> = []
+    for (const current of visibleBackupsRef.current) {
+      const updated = incoming.get(current.id)
+      if (updated) {
+        const timer = removalTimers.current.get(current.id)
+        if (timer !== undefined) {
+          window.clearTimeout(timer)
+          removalTimers.current.delete(current.id)
+        }
+        const deleteIntent = deleting.has(current.id)
+        const deleteFinishedWithError =
+          updated.taskKind === "delete" &&
+          (updated.taskStatus === "cancelled" ||
+            updated.taskStatus === "failed")
+        next.push(
+          deleteIntent && !deleteFinishedWithError
+            ? backupHasReportedDeleteArtifactProgress(updated)
+              ? updated
+              : backupWithDeleteIntent(updated)
+            : updated
+        )
+        incoming.delete(current.id)
+        continue
+      }
+      if (current.status !== "deleting" && !deleting.has(current.id)) continue
+      next.push(completedDeleteFeedback(current))
+      if (removalTimers.current.has(current.id)) continue
+      const timer = window.setTimeout(() => {
+        removalTimers.current.delete(current.id)
+        const remaining = visibleBackupsRef.current.filter(
+          (backup) => backup.id !== current.id
+        )
+        visibleBackupsRef.current = remaining
+        setVisibleBackups(remaining)
+        deleteFeedbackStore.remove([current.id])
+      }, completedDeleteFeedbackMs)
+      removalTimers.current.set(current.id, timer)
+    }
+    next.push(
+      ...[...incoming.values()].map((backup) =>
+        deleting.has(backup.id) ? backupWithDeleteIntent(backup) : backup
+      )
+    )
+    visibleBackupsRef.current = next
+    setVisibleBackups(next)
+  }, [backups, deleteFeedbackStore, deleting])
+
+  React.useEffect(
+    () => () => {
+      for (const timer of removalTimers.current.values()) {
+        window.clearTimeout(timer)
+      }
+      removalTimers.current.clear()
+    },
+    []
+  )
+
+  React.useEffect(() => {
+    const finished = backups.flatMap((backup) =>
+      deleting.has(backup.id) &&
+      backup.taskKind === "delete" &&
+      (backup.taskStatus === "cancelled" || backup.taskStatus === "failed")
+        ? [backup.id]
+        : []
+    )
+    if (finished.length > 0) deleteFeedbackStore.remove(finished)
+  }, [backups, deleteFeedbackStore, deleting])
+
+  return visibleBackups
+}
+
 export const BackupsPage = React.memo(function BackupsPage({
   filters,
   onFiltersChange,
@@ -323,7 +496,12 @@ export const BackupsPage = React.memo(function BackupsPage({
     accessCapabilitiesQueryOptions()
   )
   const [dialogStore] = React.useState(createBackupDialogStore)
+  const [deleteFeedbackStore] = React.useState(createBackupDeleteFeedbackStore)
   const [selectionStore] = React.useState(createBackupSelectionStore)
+  const visibleBackups = useBackupsWithDeleteFeedback(
+    backups,
+    deleteFeedbackStore
+  )
 
   const scopeOptions = React.useMemo(
     () =>
@@ -408,12 +586,12 @@ export const BackupsPage = React.memo(function BackupsPage({
   )
   const filteredBackups = React.useMemo(
     () =>
-      backups.filter((backup) => {
+      visibleBackups.filter((backup) => {
         if (backup.status === "deleted") return false
         if (!backupMatchesScope(backup, selectedServer)) return false
         return backupMatchesStatusFilter(backup, filters.status)
       }),
-    [backups, filters.status, selectedServer]
+    [filters.status, selectedServer, visibleBackups]
   )
   React.useLayoutEffect(() => {
     const retainVisibleSelection = () => {
@@ -512,11 +690,16 @@ export const BackupsPage = React.memo(function BackupsPage({
             targetNames={targetNames}
           />
         </div>
-        <BackupBulkActions backups={backups} selectionStore={selectionStore} />
+        <BackupBulkActions
+          backups={backups}
+          deleteFeedbackStore={deleteFeedbackStore}
+          selectionStore={selectionStore}
+        />
       </section>
 
       <BackupDialogHost
         capabilities={capabilities}
+        deleteFeedbackStore={deleteFeedbackStore}
         dialogStore={dialogStore}
         selectedCreateTargetKey={selectedCreateTargetKey}
         selectedServer={selectedServer}
@@ -733,6 +916,7 @@ const BackupSyncButton = React.memo(function BackupSyncButton() {
 
 const BackupDialogHost = React.memo(function BackupDialogHost({
   capabilities,
+  deleteFeedbackStore,
   dialogStore,
   selectedCreateTargetKey,
   selectedServer,
@@ -742,6 +926,7 @@ const BackupDialogHost = React.memo(function BackupDialogHost({
   targets,
 }: {
   capabilities: Awaited<ReturnType<typeof getAccessCapabilities>>
+  deleteFeedbackStore: BackupDeleteFeedbackStore
   dialogStore: BackupDialogStore
   selectedCreateTargetKey?: string
   selectedServer: ServerPickerOption | null
@@ -819,7 +1004,14 @@ const BackupDialogHost = React.memo(function BackupDialogHost({
       />
     )
   }
-  return <DeleteBackupDialog backup={dialog.backup} open onOpenChange={close} />
+  return (
+    <DeleteBackupDialog
+      backup={dialog.backup}
+      deleteFeedbackStore={deleteFeedbackStore}
+      open
+      onOpenChange={close}
+    />
+  )
 })
 
 const BackupTable = React.memo(function BackupTable({
@@ -1182,8 +1374,10 @@ const BackupTableRow = React.memo(function BackupTableRow({
   targetName: string
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
-  const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
+  const showsPrimaryTaskFeedback = backupShowsPrimaryTaskFeedback(backup)
   const showsCreatedTimeWithFeedback = backup.taskStatus === "cancelled"
+  const displayBytes = backupDisplayBytes(backup)
+  const displayFilename = backupDisplayFilename(backup)
 
   return (
     <tr className="group transition-colors hover:bg-muted/20 has-checked:bg-primary/[0.07]">
@@ -1197,11 +1391,6 @@ const BackupTableRow = React.memo(function BackupTableRow({
             editable={canCreate}
             name={backup.name}
           />
-          {hasTaskFeedback ? null : (
-            <div className="mt-1">
-              <BackupTaskFeedback backup={backup} />
-            </div>
-          )}
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
@@ -1220,23 +1409,23 @@ const BackupTableRow = React.memo(function BackupTableRow({
         />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground sm:table-cell">
-        {hasTaskFeedback ? (
+        {showsPrimaryTaskFeedback ? (
           <DesktopBackupTaskFeedback backup={backup} />
         ) : (
-          <span className="block truncate" title={backup.filename ?? backup.id}>
-            {backup.filename ?? backup.id}
+          <span className="block truncate" title={displayFilename}>
+            {displayFilename}
           </span>
         )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground lg:table-cell">
-        {hasTaskFeedback ? null : (
+        {showsPrimaryTaskFeedback ? null : (
           <span className="whitespace-nowrap">
-            {backup.bytes === null ? "—" : formatBytes(backup.bytes)}
+            {displayBytes === null ? "—" : formatBytes(displayBytes)}
           </span>
         )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground xl:table-cell">
-        {hasTaskFeedback && !showsCreatedTimeWithFeedback ? null : (
+        {showsPrimaryTaskFeedback && !showsCreatedTimeWithFeedback ? null : (
           <span className="whitespace-nowrap">
             <BackupCreatedTime createdAt={backup.createdAt} />
           </span>
@@ -1276,7 +1465,9 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
   targetName: string
 }) {
   const target = backupTargetPresentation(backup, relayName, targetName)
-  const hasTaskFeedback = backupHasCreateTaskFeedback(backup)
+  const showsPrimaryTaskFeedback = backupShowsPrimaryTaskFeedback(backup)
+  const displayBytes = backupDisplayBytes(backup)
+  const displayFilename = backupDisplayFilename(backup)
   return (
     <article
       aria-label={backup.name}
@@ -1290,11 +1481,6 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
             editable={canCreate}
             name={backup.name}
           />
-          {hasTaskFeedback ? null : (
-            <div className="mt-1">
-              <BackupTaskFeedback backup={backup} />
-            </div>
-          )}
         </div>
       </div>
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
@@ -1306,17 +1492,17 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
           targetKind={backup.targetKind}
         />
       </div>
-      {hasTaskFeedback ? (
+      {showsPrimaryTaskFeedback ? (
         <div className="mt-2.5">
           <BackupTaskFeedback backup={backup} />
         </div>
       ) : (
         <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 text-xs text-muted-foreground">
-          <span className="truncate" title={backup.filename ?? backup.id}>
-            {backup.filename ?? backup.id}
+          <span className="truncate" title={displayFilename}>
+            {displayFilename}
           </span>
           <span className="whitespace-nowrap">
-            {backup.bytes === null ? "—" : formatBytes(backup.bytes)} ·{" "}
+            {displayBytes === null ? "—" : formatBytes(displayBytes)} ·{" "}
             <BackupCreatedTime createdAt={backup.createdAt} />
           </span>
         </div>
@@ -1474,9 +1660,11 @@ const BackupBulkActionMenu = React.memo(function BackupBulkActionMenu({
 
 const BackupBulkActions = React.memo(function BackupBulkActions({
   backups,
+  deleteFeedbackStore,
   selectionStore,
 }: {
   backups: Array<Backup>
+  deleteFeedbackStore: BackupDeleteFeedbackStore
   selectionStore: BackupSelectionStore
 }) {
   const queryClient = useQueryClient()
@@ -1485,6 +1673,9 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
     Array<Backup>
   >([])
   const remove = useMutation({
+    onMutate: (targets: Array<Backup>) => {
+      deleteFeedbackStore.mark(targets)
+    },
     mutationFn: async (targets: Array<Backup>) => {
       const settlements = await settlePromises(
         targets,
@@ -1515,6 +1706,7 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
       const deferred = deleted.filter(
         (outcome) => !outcome.result.relayAccepted
       )
+      deleteFeedbackStore.remove(failed.map((outcome) => outcome.backup.id))
 
       if (failed.length === 0) {
         setConfirmOpen(false)
@@ -1732,6 +1924,7 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
   backup: Backup
 }) {
   const percent = backupTaskProgressPercent(backup)
+  const progressDetail = backupTaskProgressDetail(backup, percent)
   return (
     <div className="min-w-0">
       <div aria-live="polite">
@@ -1739,19 +1932,13 @@ const ActiveBackupTaskState = React.memo(function ActiveBackupTaskState({
           <span className="truncate font-medium text-foreground/80">
             {backupTaskPhaseLabel(backup.taskPhase, backup.taskStatus)}
           </span>
-          <span className="shrink-0 tabular-nums">
-            {percent === null
-              ? backup.taskBytesCompleted > 0
-                ? formatBytes(backup.taskBytesCompleted)
-                : "Working…"
-              : `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`}
-          </span>
+          <span className="shrink-0 tabular-nums">{progressDetail}</span>
         </div>
         <Progress
           aria-label={`${backup.name} progress`}
           className={
             percent === null
-              ? "[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
+              ? "[&_[data-slot=progress-indicator]]:animate-pulse"
               : ""
           }
           value={percent ?? undefined}
@@ -2217,29 +2404,84 @@ const BackupAvailabilityTags = React.memo(function BackupAvailabilityTags({
 
 function BackupAvailabilityTag({ tag }: { tag: BackupAvailabilityTagView }) {
   const working = tag.state === "working"
+  const deleting = tag.state === "deleting"
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <span
           className={`inline-flex h-6 max-w-36 items-center gap-1 rounded-md border px-2 font-mono text-[0.5625rem] font-semibold ${tag.key === "local" || tag.key === "s3" ? "uppercase" : ""} ${availabilityTagClassName(tag.state)}`}
         >
-          {working ? (
+          {tag.uploadPercent !== null ? (
+            <BackupUploadProgress
+              label={`${tag.name} upload`}
+              percent={tag.uploadPercent}
+            />
+          ) : working || deleting ? (
             <LoaderCircle className="size-2.5 shrink-0 animate-spin" />
           ) : tag.state === "available" ? (
             <Check className="size-2.5 shrink-0" />
-          ) : null}
+          ) : tag.state === "failed" ? (
+            <X className="size-2.5 shrink-0" />
+          ) : (
+            <CircleOff className="size-2.5 shrink-0" />
+          )}
           <span className="truncate">{tag.label}</span>
         </span>
       </TooltipTrigger>
       <TooltipContent side="top">
         {tag.tooltip ??
-          `${tag.name} · ${availabilityStateLabel(tag.state)}${
-            tag.error ? ` · ${tag.error}` : ""
-          }`}
+          `${tag.name} · ${
+            tag.uploadPercent === null
+              ? availabilityStateLabel(tag.state)
+              : `Uploading · ${tag.uploadPercent}%`
+          }${tag.error ? ` · ${tag.error}` : ""}`}
       </TooltipContent>
     </Tooltip>
   )
 }
+
+const BackupUploadProgress = React.memo(function BackupUploadProgress({
+  label,
+  percent,
+}: {
+  label: string
+  percent: number
+}) {
+  const radius = 4
+  const circumference = 2 * Math.PI * radius
+  const offset = circumference * (1 - percent / 100)
+  return (
+    <svg
+      aria-label={`${label}: ${percent}%`}
+      aria-valuemax={100}
+      aria-valuemin={0}
+      aria-valuenow={percent}
+      className="size-2.5 shrink-0 -rotate-90"
+      role="progressbar"
+      viewBox="0 0 10 10"
+    >
+      <circle
+        className="stroke-current opacity-25"
+        cx="5"
+        cy="5"
+        fill="none"
+        r={radius}
+        strokeWidth="1.5"
+      />
+      <circle
+        className="stroke-current transition-[stroke-dashoffset] duration-300"
+        cx="5"
+        cy="5"
+        fill="none"
+        r={radius}
+        strokeDasharray={circumference}
+        strokeDashoffset={offset}
+        strokeLinecap="round"
+        strokeWidth="1.5"
+      />
+    </svg>
+  )
+})
 
 function BackupMissingTargetTooltip({
   children,
@@ -3791,16 +4033,25 @@ function RestoreBackupDialog({
 
 function DeleteBackupDialog({
   backup,
+  deleteFeedbackStore,
   onOpenChange,
   open,
 }: {
   backup: Backup
+  deleteFeedbackStore: BackupDeleteFeedbackStore
   onOpenChange: (open: boolean) => void
   open: boolean
 }) {
   const queryClient = useQueryClient()
   const remove = useMutation({
+    onMutate: () => {
+      deleteFeedbackStore.mark([backup])
+    },
     mutationFn: () => deleteBackup({ data: { backupId: backup.id } }),
+    onError: async () => {
+      deleteFeedbackStore.remove([backup.id])
+      await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
+    },
     onSuccess: async (result) => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
       showToast({
@@ -4018,17 +4269,6 @@ function backupIsActive(backup: Backup): boolean {
   )
 }
 
-function backupHasCreateTaskFeedback(backup: Backup): boolean {
-  if (backup.taskKind !== "create") return false
-  if (backup.taskStatus === "queued" || backup.taskStatus === "running") {
-    return true
-  }
-  return (
-    Boolean(backup.taskError) &&
-    (backup.taskStatus === "failed" || backup.taskStatus === "cancelled")
-  )
-}
-
 function backupSourceIsActive(backup: Backup): boolean {
   return (
     activeStatuses.has(backup.status) ||
@@ -4093,6 +4333,7 @@ function backupAvailabilityTags(
   backup: Backup,
   destinations: ReadonlyArray<BackupAvailabilityDestination>
 ): Array<BackupAvailabilityTagView> {
+  const uploadPercent = backupTaskUploadProgressPercent(backup)
   const artifactsByStorage = new Map<string, Backup["artifacts"][number]>()
   for (const artifact of backup.artifacts) {
     artifactsByStorage.set(artifact.storageId ?? "local", artifact)
@@ -4100,13 +4341,22 @@ function backupAvailabilityTags(
   const tags: Array<BackupAvailabilityTagView> = destinations.map(
     (destination) => {
       const key = destination.id ?? "local"
+      const kind = destination.id ? "remote" : "local"
       const artifact = artifactsByStorage.get(key)
+      const state = backupArtifactAvailabilityState(backup, artifact, kind)
       return {
         error: artifact?.error ?? null,
         key,
+        kind,
         label: destination.id ? destination.name : "Local",
         name: destination.id ? destination.name : "Local Relay",
-        state: artifactAvailabilityState(artifact?.status),
+        state,
+        uploadPercent:
+          destination.id &&
+          artifact?.id === backup.taskCurrentArtifactId &&
+          state === "working"
+            ? uploadPercent
+            : null,
       }
     }
   )
@@ -4114,12 +4364,21 @@ function backupAvailabilityTags(
   for (const artifact of backup.artifacts) {
     const key = artifact.storageId ?? "local"
     if (seen.has(key)) continue
+    const kind = artifact.storageId ? "remote" : "local"
+    const state = backupArtifactAvailabilityState(backup, artifact, kind)
     tags.push({
       error: artifact.error,
       key,
+      kind,
       label: artifact.storageId ? "S3" : "Local",
       name: artifact.storageId ? "S3 destination" : "Local Relay",
-      state: artifactAvailabilityState(artifact.status),
+      state,
+      uploadPercent:
+        artifact.storageId &&
+        artifact.id === backup.taskCurrentArtifactId &&
+        state === "working"
+          ? uploadPercent
+          : null,
     })
   }
   const s3Enabled =
@@ -4129,13 +4388,30 @@ function backupAvailabilityTags(
     tags.push({
       error: null,
       key: "s3",
+      kind: "remote",
       label: "S3",
       name: "S3",
       state: "missing",
       tooltip: "S3 not configured",
+      uploadPercent: null,
     })
   }
   return tags
+}
+
+function backupArtifactAvailabilityState(
+  backup: Backup,
+  artifact: Backup["artifacts"][number] | undefined,
+  kind: BackupAvailabilityTagView["kind"]
+): BackupAvailabilityState {
+  const state = artifactAvailabilityState(backup, artifact)
+  if (
+    kind === "local" &&
+    backupShowsArchivedLocalArtifact(backup, state === "working")
+  ) {
+    return "available"
+  }
+  return state
 }
 
 function extraBackupDestinations(
@@ -4193,11 +4469,22 @@ function backupCopyDisabledReason(
 }
 
 function artifactAvailabilityState(
-  status: Backup["artifacts"][number]["status"] | undefined
+  backup: Backup,
+  artifact: Backup["artifacts"][number] | undefined
 ): BackupAvailabilityState {
+  const status = artifact?.status
+  if (status === "deleting") return "deleting"
+  if (
+    status === "failed" &&
+    backup.taskKind === "create" &&
+    backup.taskStatus === "cancelled"
+  ) {
+    return "cancelled"
+  }
+  if (artifact?.error) return "failed"
   if (status === "available") return "available"
   if (status === "failed") return "failed"
-  if (status === "queued" || status === "running" || status === "deleting") {
+  if (status === "queued" || status === "running") {
     return "working"
   }
   return "missing"
@@ -4210,7 +4497,10 @@ function availabilityTagClassName(state: BackupAvailabilityState): string {
   if (state === "working") {
     return "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
   }
-  if (state === "failed") {
+  if (state === "deleting") {
+    return "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+  }
+  if (state === "failed" || state === "cancelled") {
     return "border-destructive/30 bg-destructive/10 text-destructive"
   }
   return "border-border/70 bg-muted/40 text-muted-foreground"
@@ -4218,9 +4508,11 @@ function availabilityTagClassName(state: BackupAvailabilityState): string {
 
 function availabilityStateLabel(state: BackupAvailabilityState): string {
   if (state === "available") return "Available"
-  if (state === "working") return "Copying"
+  if (state === "working") return "Backing up"
+  if (state === "deleting") return "Deleting"
+  if (state === "cancelled") return "Cancelled"
   if (state === "failed") return "Failed"
-  return "Not stored here"
+  return "Not available"
 }
 
 function targetKey(
@@ -4266,11 +4558,31 @@ function backupTaskPhaseLabel(
 }
 
 function backupTaskProgressPercent(backup: Backup): number | null {
+  if (backup.taskPhase === "uploading" || backup.taskPhase === "finalizing") {
+    return 100
+  }
+  if (backup.taskPhase !== "archiving") return null
   if (backup.taskBytesTotal === null || backup.taskBytesTotal <= 0) return null
   return Math.min(
     100,
-    Math.round((backup.taskBytesCompleted / backup.taskBytesTotal) * 100)
+    Math.floor((backup.taskBytesCompleted / backup.taskBytesTotal) * 100)
   )
+}
+
+function backupTaskProgressDetail(
+  backup: Backup,
+  percent: number | null
+): string {
+  if (backup.taskPhase === "uploading") {
+    return backup.artifactKind === "archive" ? "Archive ready" : "Export ready"
+  }
+  if (backup.taskPhase === "finalizing") return "Finishing…"
+  if (percent === null) {
+    return backup.taskBytesCompleted > 0
+      ? formatBytes(backup.taskBytesCompleted)
+      : "Working…"
+  }
+  return `${percent}% · ${formatBytes(backup.taskBytesCompleted)} / ${formatBytes(backup.taskBytesTotal ?? 0)}`
 }
 
 function subscribeToMobileBackupLayout(onChange: () => void): () => void {

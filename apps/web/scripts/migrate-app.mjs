@@ -40,7 +40,11 @@ async function ensureBackupSchema(database) {
       "phase",
       "ENUM('preparing', 'collecting', 'archiving', 'dumping', 'uploading', 'finalizing') NULL AFTER bytes_total",
     ],
-    ["current_path", "VARCHAR(2048) NULL AFTER phase"],
+    [
+      "current_artifact_id",
+      "CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER phase",
+    ],
+    ["current_path", "VARCHAR(2048) NULL AFTER current_artifact_id"],
   ].filter(([name]) => !taskColumnNames.has(name))
   if (progressAdditions.length > 0) {
     await database.query(

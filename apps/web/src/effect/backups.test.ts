@@ -194,6 +194,7 @@ describe("backup reconciliation", () => {
       bytesCompleted: 256,
       bytesTotal: 256,
       createdAt: 50,
+      currentArtifactId: null,
       currentPath: null,
       error: null,
       finishedAt: 200,
@@ -268,6 +269,7 @@ describe("backup reconciliation", () => {
       bytesCompleted: 0,
       bytesTotal: null,
       createdAt: 50,
+      currentArtifactId: null,
       currentPath: null,
       error: null,
       finishedAt: 200,
@@ -321,6 +323,92 @@ describe("backup reconciliation", () => {
         !sql.includes("backup_artifact") && sql.includes("deleted_at = CASE")
     )
     expect(backupWrite?.values?.slice(0, 2)).toEqual(["available", "available"])
+  })
+
+  it("reconciles delete progress one artifact at a time", async () => {
+    const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: (sql, values) =>
+            Effect.sync(() => {
+              writes.push({ sql, values })
+              return emptyResult
+            }),
+          queryRows: <TRow extends RowDataPacket>() =>
+            Effect.succeed([
+              {
+                backup_status: "deleting",
+                bytes_completed: 0,
+                id: "task-one",
+                relay_updated_at_ms: 100,
+                status: "running",
+              },
+            ] as unknown as ReadonlyArray<TRow>),
+        }),
+    })
+    const deletedArtifactId = "33000000-0000-4000-8000-000000000001"
+    const currentArtifactId = "33000000-0000-4000-8000-000000000002"
+    const task = {
+      backupId: "backup-one",
+      bytesCompleted: 0,
+      bytesTotal: null,
+      createdAt: 50,
+      currentArtifactId,
+      currentPath: null,
+      error: null,
+      finishedAt: null,
+      input: {
+        backupId: "backup-one",
+        destination: { artifactId: deletedArtifactId, kind: "local" },
+        kind: "delete",
+        replicas: [
+          {
+            allowPrivateNetwork: false,
+            artifactId: currentArtifactId,
+            deleteUrl: "https://example.com/backups/test.zip",
+            headers: {},
+            kind: "s3",
+            objectKey: "backups/test.zip",
+          },
+        ],
+        target: { id: "instance-one", kind: "instance" },
+        taskId: "task-one",
+      },
+      inputRefreshRequired: false,
+      kind: "delete",
+      phase: null,
+      result: {
+        artifacts: [
+          { artifactId: deletedArtifactId, error: null, status: "deleted" },
+        ],
+        warnings: [],
+      },
+      startedAt: 100,
+      status: "running",
+      taskId: "task-one",
+      updatedAt: 200,
+    } satisfies RelayBackupTask
+
+    await Effect.runPromise(
+      reconcileBackupTaskEffect(task).pipe(Effect.provide(databaseLayer))
+    )
+
+    const artifactWrites = writes.filter(({ sql }) =>
+      sql.includes("backup_artifact")
+    )
+    expect(artifactWrites).toHaveLength(3)
+    expect(artifactWrites[1]?.values).toEqual([currentArtifactId, "backup-one"])
+    expect(artifactWrites[2]?.values).toEqual([
+      "deleted",
+      null,
+      "deleted",
+      200,
+      deletedArtifactId,
+      "backup-one",
+    ])
   })
 
   it("rejects stale Relay snapshots after a task has completed", () => {

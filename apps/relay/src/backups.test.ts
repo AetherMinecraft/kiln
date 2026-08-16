@@ -11,8 +11,10 @@ import ZipStream from "zip-stream"
 import type {
   BackupCreateTaskInput,
   BackupCreateTaskResult,
+  BackupDeleteTaskInput,
   BackupRestoreTaskInput,
   BackupTaskPhase,
+  BackupTaskResult,
 } from "@workspace/contracts"
 import { relayBackupTaskSchema } from "@workspace/contracts"
 
@@ -20,6 +22,8 @@ import {
   BackupManager,
   backupPathIsExcluded,
   createPortableInstanceBackup,
+  deleteBackupArtifacts,
+  storeCreatedBackup,
 } from "./backups.js"
 import {
   recoverInterruptedRestores,
@@ -42,6 +46,7 @@ describe("Relay backups", () => {
       bytesCompleted: 1,
       bytesTotal: 1,
       createdAt: 1,
+      currentArtifactId: null,
       currentPath: null,
       error: null,
       finishedAt: 2,
@@ -57,9 +62,11 @@ describe("Relay backups", () => {
     }
     assert.isTrue(relayBackupTaskSchema.safeParse(task).success)
     const legacyTask = structuredClone(task)
+    Reflect.deleteProperty(legacyTask, "currentArtifactId")
     Reflect.deleteProperty(legacyTask, "currentPath")
     Reflect.deleteProperty(legacyTask, "phase")
     const parsedLegacyTask = relayBackupTaskSchema.parse(legacyTask)
+    assert.strictEqual(parsedLegacyTask.currentArtifactId, null)
     assert.strictEqual(parsedLegacyTask.currentPath, null)
     assert.strictEqual(parsedLegacyTask.phase, null)
     assert.isFalse(
@@ -75,6 +82,140 @@ describe("Relay backups", () => {
       }).success
     )
   })
+
+  it.effect("keeps completed upload progress through finalizing", () =>
+    Effect.gen(function* () {
+      const localArtifactId = "30000000-0000-4000-8000-000000000001"
+      const remoteArtifactId = "30000000-0000-4000-8000-000000000002"
+      const input = {
+        ...backupInput(12),
+        destination: { artifactId: localArtifactId, kind: "local" },
+        replicas: [
+          {
+            allowPrivateNetwork: false,
+            artifactId: remoteArtifactId,
+            headers: {},
+            kind: "s3",
+            objectKey: "backups/test.zip",
+            uploadUrl: "https://example.com/backups/test.zip",
+          },
+        ],
+      } satisfies BackupCreateTaskInput & { kind: "create" }
+      const result = backupResult(12)
+      const progress = {
+        completed: 0,
+        currentArtifactId: null,
+        currentPath: null,
+        phase: "uploading",
+        total: 0,
+      } satisfies Parameters<typeof storeCreatedBackup>[3]
+
+      const stored = yield* storeCreatedBackup(
+        testConfig(testDirectory),
+        input,
+        result,
+        progress,
+        new AbortController().signal,
+        (_config, _input, uploaded, _signal, onChunk) => {
+          onChunk(1)
+          onChunk(uploaded.bytes - 1)
+          return Effect.succeed(uploaded)
+        }
+      )
+
+      assert.strictEqual(progress.completed, result.bytes)
+      assert.strictEqual(progress.currentArtifactId, remoteArtifactId)
+      assert.strictEqual(progress.phase, "finalizing")
+      assert.strictEqual(progress.total, result.bytes)
+      assert.deepStrictEqual(stored.artifacts, [
+        {
+          artifactId: localArtifactId,
+          error: null,
+          status: "available",
+        },
+        {
+          artifactId: remoteArtifactId,
+          error: null,
+          status: "available",
+        },
+      ])
+    })
+  )
+
+  it.effect("reports deletion progress for each artifact", () =>
+    Effect.gen(function* () {
+      const localArtifactId = "31000000-0000-4000-8000-000000000001"
+      const remoteArtifactId = "31000000-0000-4000-8000-000000000002"
+      const input = {
+        backupId: "31000000-0000-4000-8000-000000000003",
+        destination: { artifactId: localArtifactId, kind: "local" },
+        kind: "delete",
+        replicas: [
+          {
+            allowPrivateNetwork: false,
+            artifactId: remoteArtifactId,
+            deleteUrl: "https://example.com/backups/test.zip",
+            headers: {},
+            kind: "s3",
+            objectKey: "backups/test.zip",
+          },
+        ],
+        target: { id: "instance-1", kind: "instance" },
+        taskId: "31000000-0000-4000-8000-000000000004",
+      } satisfies BackupDeleteTaskInput & { kind: "delete" }
+      const snapshots: Array<{
+        currentArtifactId: string | null
+        result: Exclude<BackupTaskResult, BackupCreateTaskResult>
+      }> = []
+
+      const result = yield* deleteBackupArtifacts(
+        testConfig(testDirectory),
+        input,
+        (currentArtifactId, progress) => {
+          snapshots.push({
+            currentArtifactId,
+            result: structuredClone(progress),
+          })
+          return Effect.succeed(true)
+        },
+        () => Effect.succeed({ warnings: [] })
+      )
+
+      assert.deepStrictEqual(
+        snapshots.map(({ currentArtifactId, result: progress }) => ({
+          currentArtifactId,
+          outcomes: progress.artifacts ?? [],
+        })),
+        [
+          { currentArtifactId: localArtifactId, outcomes: [] },
+          {
+            currentArtifactId: localArtifactId,
+            outcomes: [
+              { artifactId: localArtifactId, error: null, status: "deleted" },
+            ],
+          },
+          {
+            currentArtifactId: remoteArtifactId,
+            outcomes: [
+              { artifactId: localArtifactId, error: null, status: "deleted" },
+            ],
+          },
+          {
+            currentArtifactId: remoteArtifactId,
+            outcomes: [
+              { artifactId: localArtifactId, error: null, status: "deleted" },
+              {
+                artifactId: remoteArtifactId,
+                error: null,
+                status: "deleted",
+              },
+            ],
+          },
+        ]
+      )
+      assert.deepStrictEqual(result, snapshots.at(-1)?.result)
+    })
+  )
 
   layer(makeRelayStateLayer(join(testDirectory, "relay.sqlite")))((it) => {
     it.effect("runs durable tasks through one Relay-wide worker", () =>
@@ -263,11 +404,13 @@ describe("Relay backups", () => {
 
           const progress: {
             completed: number
+            currentArtifactId: string | null
             currentPath: string | null
             phase: BackupTaskPhase
             total: number
           } = {
             completed: 0,
+            currentArtifactId: null,
             currentPath: null,
             phase: "preparing",
             total: 0,
@@ -343,6 +486,7 @@ describe("Relay backups", () => {
           const controller = new AbortController()
           const progress = {
             completed: 0,
+            currentArtifactId: null,
             currentPath: null,
             phase: "preparing" as const,
             total: 0,
@@ -389,6 +533,7 @@ describe("Relay backups", () => {
           const created = yield* Effect.promise(() =>
             createPortableInstanceBackup(config, input, testInstance(), {
               completed: 0,
+              currentArtifactId: null,
               currentPath: null,
               phase: "preparing",
               total: 0,

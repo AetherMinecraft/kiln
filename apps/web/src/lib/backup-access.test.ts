@@ -47,6 +47,7 @@ const backup = {
   targetKind: "instance",
   taskBytesCompleted: 1,
   taskBytesTotal: 1,
+  taskCurrentArtifactId: null,
   taskCurrentPath: null,
   taskError: null,
   taskId: "319864b6-421f-4a19-8946-f51048245d73",

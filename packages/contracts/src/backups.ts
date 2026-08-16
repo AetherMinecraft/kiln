@@ -291,6 +291,7 @@ export const relayBackupTaskSchema = z
     bytesCompleted: z.number().int().nonnegative(),
     bytesTotal: z.number().int().nonnegative().nullable(),
     createdAt: z.number().int().nonnegative(),
+    currentArtifactId: z.uuid().nullable().default(null),
     currentPath: z.string().max(2_048).nullable().default(null),
     error: z.string().max(4_096).nullable(),
     finishedAt: z.number().int().nonnegative().nullable(),

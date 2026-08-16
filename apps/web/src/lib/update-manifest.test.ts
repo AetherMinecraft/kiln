@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test"
+import { relayControlProtocolVersion } from "@workspace/contracts"
 
 import type { KilnReleaseManifest } from "@/effect/github-releases"
 import {
@@ -10,7 +11,7 @@ const manifest: KilnReleaseManifest = {
   channel: "nightly",
   commit: "a".repeat(40),
   compatibility: {
-    relayProtocol: 1,
+    relayProtocol: relayControlProtocolVersion,
   },
   components: {
     hearth: {
@@ -83,28 +84,30 @@ describe("update manifest validation", () => {
     ).toThrow("image version is invalid")
   })
 
-  it("rejects an incompatible Relay protocol", () => {
+  it("blocks a Relay-first update across a protocol transition", () => {
     expect(() =>
       validateUpdateManifest(
         {
           ...manifest,
           compatibility: {
-            relayProtocol: 2,
+            relayProtocol: relayControlProtocolVersion - 1,
           },
         },
         "0.1.0-nightly.2",
         "relay"
       )
-    ).toThrow("requires Relay protocol 2")
+    ).toThrow(
+      `requires Relay protocol ${relayControlProtocolVersion - 1}`
+    )
   })
 
-  it("allows Hearth to cross a Relay protocol transition", () => {
+  it("allows a Hearth-first update across a protocol transition", () => {
     expect(() =>
       validateUpdateManifest(
         {
           ...manifest,
           compatibility: {
-            relayProtocol: 2,
+            relayProtocol: relayControlProtocolVersion - 1,
           },
         },
         "0.1.0-nightly.2",

@@ -33,6 +33,7 @@ import {
   type BackupDeleteTaskInput,
   type BackupTaskInput,
   type BackupTaskPhase,
+  type BackupTaskResult,
   type RelayBackupTask,
 } from "@workspace/contracts"
 
@@ -72,10 +73,16 @@ const DEFAULT_EXCLUDES = [
 
 type BackupProgress = {
   completed: number
+  currentArtifactId: string | null
   currentPath: string | null
   phase: BackupTaskPhase
   total: number
 }
+
+type BackupOperationTaskResult = Exclude<
+  BackupTaskResult,
+  BackupCreateTaskResult
+>
 
 type ArchiveEntry = {
   absolute: string
@@ -411,11 +418,26 @@ export class BackupManager {
         return
       }
       if (task.input.kind === "delete") {
-        const result = yield* deleteBackupArtifacts(this.#config, task.input)
+        let deleteUpdatedAt = Date.now() - 1
+        const nextDeleteUpdatedAt = () => {
+          deleteUpdatedAt = Math.max(Date.now(), deleteUpdatedAt + 1)
+          return deleteUpdatedAt
+        }
+        const result = yield* deleteBackupArtifacts(
+          this.#config,
+          task.input,
+          (currentArtifactId, progress) =>
+            this.#state.updateBackupTaskOperationProgress(
+              task.taskId,
+              currentArtifactId,
+              progress,
+              nextDeleteUpdatedAt()
+            )
+        )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
           result,
-          Date.now()
+          nextDeleteUpdatedAt()
         )
         if (!completed) {
           return yield* backupFailure(
@@ -435,6 +457,7 @@ export class BackupManager {
       ) {
         const progress: BackupProgress = {
           completed: 0,
+          currentArtifactId: null,
           currentPath: null,
           phase: "preparing",
           total: 0,
@@ -450,6 +473,7 @@ export class BackupManager {
                     progress.total || null,
                     progress.phase,
                     progress.currentPath,
+                    progress.currentArtifactId,
                     Date.now()
                   )
                   .pipe(Effect.asVoid)
@@ -531,6 +555,7 @@ export class BackupManager {
         }
         const progress: BackupProgress = {
           completed: 0,
+          currentArtifactId: null,
           currentPath: null,
           phase: "dumping",
           total: 0,
@@ -546,6 +571,7 @@ export class BackupManager {
                     progress.total || null,
                     progress.phase,
                     progress.currentPath,
+                    progress.currentArtifactId,
                     Date.now()
                   )
                   .pipe(Effect.asVoid)
@@ -643,6 +669,7 @@ export class BackupManager {
 
       const progress: BackupProgress = {
         completed: 0,
+        currentArtifactId: null,
         currentPath: null,
         phase: "preparing",
         total: 0,
@@ -658,6 +685,7 @@ export class BackupManager {
                   progress.total || null,
                   progress.phase,
                   progress.currentPath,
+                  progress.currentArtifactId,
                   Date.now()
                 )
                 .pipe(Effect.asVoid)
@@ -832,26 +860,24 @@ export async function createPortableInstanceBackup(
   })
 }
 
-function storeCreatedBackup(
+export function storeCreatedBackup(
   config: RelayConfig,
   input: BackupCreateTaskInput,
   result: BackupCreateTaskResult,
   progress: BackupProgress,
-  signal: AbortSignal
+  signal: AbortSignal,
+  uploadArtifact: typeof uploadBackupArtifact = uploadBackupArtifact
 ) {
   return Effect.gen(function* () {
     progress.phase = "uploading"
+    progress.currentArtifactId = null
     progress.currentPath = null
     const destinations = [input.destination, ...(input.replicas ?? [])]
-    const uploadCount = destinations.filter(
-      (destination) => destination.kind === "s3"
-    ).length
-    if (uploadCount > 0) {
-      progress.completed = 0
-      progress.total = result.bytes * uploadCount
-    }
+    progress.completed = 0
+    progress.total = result.bytes
     const outcomes: NonNullable<BackupCreateTaskResult["artifacts"]> = []
     let available = 0
+    let lastUploadedArtifactId: string | null = null
     for (const destination of destinations) {
       signal.throwIfAborted()
       if (destination.kind === "local") {
@@ -865,8 +891,10 @@ function storeCreatedBackup(
         }
         continue
       }
+      progress.completed = 0
+      progress.currentArtifactId = destination.artifactId ?? null
       const uploaded = yield* Effect.result(
-        uploadBackupArtifact(
+        uploadArtifact(
           config,
           { ...input, destination },
           result,
@@ -881,6 +909,8 @@ function storeCreatedBackup(
       )
       if (Result.isSuccess(uploaded)) {
         available += 1
+        progress.completed = progress.total
+        lastUploadedArtifactId = destination.artifactId ?? null
         if (destination.artifactId) {
           outcomes.push({
             artifactId: destination.artifactId,
@@ -910,6 +940,7 @@ function storeCreatedBackup(
     }
     signal.throwIfAborted()
     progress.phase = "finalizing"
+    progress.currentArtifactId = lastUploadedArtifactId
     return { ...result, artifacts: outcomes }
   })
 }
@@ -954,9 +985,16 @@ function uploadBackupArtifact(
   }).pipe(Effect.as(result))
 }
 
-function deleteBackupArtifacts(
+export function deleteBackupArtifacts(
   config: RelayConfig,
-  input: BackupDeleteTaskInput & { kind: "delete" }
+  input: BackupDeleteTaskInput & { kind: "delete" },
+  updateProgress: (
+    currentArtifactId: string | null,
+    result: BackupOperationTaskResult
+  ) => ReturnType<
+    RelayStateStore["Service"]["updateBackupTaskOperationProgress"]
+  >,
+  deleteArtifact: typeof deleteBackupArtifact = deleteBackupArtifact
 ) {
   return Effect.gen(function* () {
     const outcomes: Array<{
@@ -965,8 +1003,20 @@ function deleteBackupArtifacts(
       status: "deleted" | "failed"
     }> = []
     for (const destination of [input.destination, ...(input.replicas ?? [])]) {
+      const currentArtifactId = destination.artifactId ?? null
+      const started = yield* updateProgress(currentArtifactId, {
+        artifacts: [...outcomes],
+        warnings: [],
+      })
+      if (!started) {
+        return yield* backupFailure(
+          "task_state_changed",
+          "delete.progress",
+          "The backup task was no longer running while deletion was in progress"
+        )
+      }
       const deleted = yield* Effect.result(
-        deleteBackupArtifact(config, { ...input, destination })
+        deleteArtifact(config, { ...input, destination })
       )
       if (!destination.artifactId) {
         if (Result.isFailure(deleted)) {
@@ -991,6 +1041,17 @@ function deleteBackupArtifacts(
               status: "failed",
             }
       )
+      const updated = yield* updateProgress(currentArtifactId, {
+        artifacts: [...outcomes],
+        warnings: [],
+      })
+      if (!updated) {
+        return yield* backupFailure(
+          "task_state_changed",
+          "delete.progress",
+          "The backup task was no longer running while deletion was in progress"
+        )
+      }
     }
     return { artifacts: outcomes, warnings: [] }
   })
