@@ -3,7 +3,9 @@ import { describe, expect, it } from "vite-plus/test"
 import {
   backupDisplayFilename,
   backupDisplayBytes,
+  backupHasReportedDeleteArtifactProgress,
   backupShowsPrimaryTaskFeedback,
+  backupShowsArchivedLocalArtifact,
   backupShowsUploadArtifact,
   backupTaskUploadProgressPercent,
 } from "@/lib/backup-progress-presentation"
@@ -28,6 +30,32 @@ const uploadingBackup = {
 } satisfies TestBackup
 
 describe("backup progress presentation", () => {
+  it("keeps optimistic delete feedback until Relay reports artifact progress", () => {
+    expect(
+      backupHasReportedDeleteArtifactProgress({
+        artifacts: [{ status: "available" }],
+        taskCurrentArtifactId: null,
+      })
+    ).toBe(false)
+    expect(
+      backupHasReportedDeleteArtifactProgress({
+        artifacts: [{ status: "deleting" }],
+        taskCurrentArtifactId: null,
+      })
+    ).toBe(true)
+    expect(
+      backupHasReportedDeleteArtifactProgress({
+        artifacts: [{ status: "deleted" }],
+        taskCurrentArtifactId: "artifact-1",
+      })
+    ).toBe(true)
+  })
+
+  it("only presents Local as archived when its artifact is in progress", () => {
+    expect(backupShowsArchivedLocalArtifact(uploadingBackup, false)).toBe(false)
+    expect(backupShowsArchivedLocalArtifact(uploadingBackup, true)).toBe(true)
+  })
+
   it("keeps restore feedback in the primary columns and delete feedback out", () => {
     const activeRestore = {
       ...uploadingBackup,

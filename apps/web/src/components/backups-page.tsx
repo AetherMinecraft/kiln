@@ -69,7 +69,9 @@ import { timestampedBackupName } from "@/lib/backup-name"
 import {
   backupDisplayFilename,
   backupDisplayBytes,
+  backupHasReportedDeleteArtifactProgress,
   backupShowsPrimaryTaskFeedback,
+  backupShowsArchivedLocalArtifact,
   backupTaskUploadProgressPercent,
 } from "@/lib/backup-progress-presentation"
 import { relayInstanceRouteId } from "@/lib/relay-fleet"
@@ -413,7 +415,7 @@ function useBackupsWithDeleteFeedback(
             updated.taskStatus === "failed")
         next.push(
           deleteIntent && !deleteFinishedWithError
-            ? updated.status === "deleting"
+            ? backupHasReportedDeleteArtifactProgress(updated)
               ? updated
               : backupWithDeleteIntent(updated)
             : updated
@@ -4405,9 +4407,7 @@ function backupArtifactAvailabilityState(
   const state = artifactAvailabilityState(backup, artifact)
   if (
     kind === "local" &&
-    backup.taskKind === "create" &&
-    backup.taskStatus === "running" &&
-    (backup.taskPhase === "uploading" || backup.taskPhase === "finalizing")
+    backupShowsArchivedLocalArtifact(backup, state === "working")
   ) {
     return "available"
   }

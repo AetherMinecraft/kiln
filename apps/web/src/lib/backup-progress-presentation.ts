@@ -30,6 +30,46 @@ type BackupFilenamePresentation = BackupUploadPhasePresentation & {
   id: string
 }
 
+type BackupDeleteProgressPresentation = {
+  artifacts: ReadonlyArray<{
+    status:
+      | "available"
+      | "deleted"
+      | "deleting"
+      | "failed"
+      | "queued"
+      | "running"
+  }>
+  taskCurrentArtifactId: string | null
+}
+
+type BackupLocalUploadPresentation = {
+  taskKind: BackupTaskKind | null
+  taskPhase: BackupTaskPhase | null
+  taskStatus: BackupTaskStatus | null
+}
+
+export function backupHasReportedDeleteArtifactProgress(
+  backup: BackupDeleteProgressPresentation
+): boolean {
+  return (
+    backup.taskCurrentArtifactId !== null ||
+    backup.artifacts.some((artifact) => artifact.status === "deleting")
+  )
+}
+
+export function backupShowsArchivedLocalArtifact(
+  backup: BackupLocalUploadPresentation,
+  localArtifactWorking: boolean
+): boolean {
+  return (
+    localArtifactWorking &&
+    backup.taskKind === "create" &&
+    backup.taskStatus === "running" &&
+    (backup.taskPhase === "uploading" || backup.taskPhase === "finalizing")
+  )
+}
+
 export function backupHasPrimaryTaskFeedback(
   backup: BackupTaskFeedbackPresentation
 ): boolean {
