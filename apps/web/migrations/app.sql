@@ -337,6 +337,7 @@ CREATE TABLE IF NOT EXISTS kiln_backup_task (
   bytes_completed BIGINT UNSIGNED NOT NULL DEFAULT 0,
   bytes_total BIGINT UNSIGNED NULL,
   phase ENUM('preparing', 'collecting', 'archiving', 'dumping', 'uploading', 'finalizing') NULL,
+  current_artifact_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
   current_path VARCHAR(2048) NULL,
   reserved_bytes BIGINT UNSIGNED NULL,
   relay_updated_at_ms BIGINT UNSIGNED NULL,

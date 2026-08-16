@@ -72,6 +72,7 @@ const DEFAULT_EXCLUDES = [
 
 type BackupProgress = {
   completed: number
+  currentArtifactId: string | null
   currentPath: string | null
   phase: BackupTaskPhase
   total: number
@@ -435,6 +436,7 @@ export class BackupManager {
       ) {
         const progress: BackupProgress = {
           completed: 0,
+          currentArtifactId: null,
           currentPath: null,
           phase: "preparing",
           total: 0,
@@ -450,6 +452,7 @@ export class BackupManager {
                     progress.total || null,
                     progress.phase,
                     progress.currentPath,
+                    progress.currentArtifactId,
                     Date.now()
                   )
                   .pipe(Effect.asVoid)
@@ -531,6 +534,7 @@ export class BackupManager {
         }
         const progress: BackupProgress = {
           completed: 0,
+          currentArtifactId: null,
           currentPath: null,
           phase: "dumping",
           total: 0,
@@ -546,6 +550,7 @@ export class BackupManager {
                     progress.total || null,
                     progress.phase,
                     progress.currentPath,
+                    progress.currentArtifactId,
                     Date.now()
                   )
                   .pipe(Effect.asVoid)
@@ -643,6 +648,7 @@ export class BackupManager {
 
       const progress: BackupProgress = {
         completed: 0,
+        currentArtifactId: null,
         currentPath: null,
         phase: "preparing",
         total: 0,
@@ -658,6 +664,7 @@ export class BackupManager {
                   progress.total || null,
                   progress.phase,
                   progress.currentPath,
+                  progress.currentArtifactId,
                   Date.now()
                 )
                 .pipe(Effect.asVoid)
@@ -841,15 +848,11 @@ function storeCreatedBackup(
 ) {
   return Effect.gen(function* () {
     progress.phase = "uploading"
+    progress.currentArtifactId = null
     progress.currentPath = null
     const destinations = [input.destination, ...(input.replicas ?? [])]
-    const uploadCount = destinations.filter(
-      (destination) => destination.kind === "s3"
-    ).length
-    if (uploadCount > 0) {
-      progress.completed = 0
-      progress.total = result.bytes * uploadCount
-    }
+    progress.completed = 0
+    progress.total = result.bytes
     const outcomes: NonNullable<BackupCreateTaskResult["artifacts"]> = []
     let available = 0
     for (const destination of destinations) {
@@ -865,6 +868,8 @@ function storeCreatedBackup(
         }
         continue
       }
+      progress.completed = 0
+      progress.currentArtifactId = destination.artifactId ?? null
       const uploaded = yield* Effect.result(
         uploadBackupArtifact(
           config,
@@ -910,6 +915,7 @@ function storeCreatedBackup(
     }
     signal.throwIfAborted()
     progress.phase = "finalizing"
+    progress.currentArtifactId = null
     return { ...result, artifacts: outcomes }
   })
 }

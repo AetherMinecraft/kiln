@@ -406,6 +406,7 @@ describe("Relay state", () => {
             100,
             "archiving",
             "world/level.dat",
+            null,
             120
           )
         )
@@ -420,6 +421,7 @@ describe("Relay state", () => {
             100,
             "archiving",
             "world/level.dat",
+            null,
             125
           )
         )
@@ -458,8 +460,13 @@ describe("Relay state", () => {
             100,
             "uploading",
             null,
+            "00000000-0000-4000-8000-000000000003",
             145
           )
+        )
+        assert.strictEqual(
+          (yield* store.getBackupTask(second.taskId))?.currentArtifactId,
+          "00000000-0000-4000-8000-000000000003"
         )
         assert.strictEqual(yield* store.requeueInterruptedBackupTasks(150), 1)
         const requeued = yield* store.getBackupTask(second.taskId)
@@ -467,6 +474,7 @@ describe("Relay state", () => {
         assert.isNull(requeued?.startedAt)
         assert.strictEqual(requeued?.bytesCompleted, 0)
         assert.isNull(requeued?.bytesTotal)
+        assert.isNull(requeued?.currentArtifactId)
         assert.isNull(requeued?.result)
         assert.isTrue(requeued?.inputRefreshRequired)
 
@@ -575,6 +583,7 @@ describe("Relay state", () => {
             50,
             "archiving",
             "server.properties",
+            null,
             320
           )
         )

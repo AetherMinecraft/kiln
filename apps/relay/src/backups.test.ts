@@ -42,6 +42,7 @@ describe("Relay backups", () => {
       bytesCompleted: 1,
       bytesTotal: 1,
       createdAt: 1,
+      currentArtifactId: null,
       currentPath: null,
       error: null,
       finishedAt: 2,
@@ -57,9 +58,11 @@ describe("Relay backups", () => {
     }
     assert.isTrue(relayBackupTaskSchema.safeParse(task).success)
     const legacyTask = structuredClone(task)
+    Reflect.deleteProperty(legacyTask, "currentArtifactId")
     Reflect.deleteProperty(legacyTask, "currentPath")
     Reflect.deleteProperty(legacyTask, "phase")
     const parsedLegacyTask = relayBackupTaskSchema.parse(legacyTask)
+    assert.strictEqual(parsedLegacyTask.currentArtifactId, null)
     assert.strictEqual(parsedLegacyTask.currentPath, null)
     assert.strictEqual(parsedLegacyTask.phase, null)
     assert.isFalse(
@@ -263,11 +266,13 @@ describe("Relay backups", () => {
 
           const progress: {
             completed: number
+            currentArtifactId: string | null
             currentPath: string | null
             phase: BackupTaskPhase
             total: number
           } = {
             completed: 0,
+            currentArtifactId: null,
             currentPath: null,
             phase: "preparing",
             total: 0,
@@ -343,6 +348,7 @@ describe("Relay backups", () => {
           const controller = new AbortController()
           const progress = {
             completed: 0,
+            currentArtifactId: null,
             currentPath: null,
             phase: "preparing" as const,
             total: 0,
@@ -389,6 +395,7 @@ describe("Relay backups", () => {
           const created = yield* Effect.promise(() =>
             createPortableInstanceBackup(config, input, testInstance(), {
               completed: 0,
+              currentArtifactId: null,
               currentPath: null,
               phase: "preparing",
               total: 0,

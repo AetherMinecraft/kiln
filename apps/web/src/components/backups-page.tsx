@@ -4106,17 +4106,17 @@ function backupDisplayFilename(backup: Backup): string {
 
 function backupDisplayBytes(backup: Backup): number | null {
   if (backup.bytes !== null) return backup.bytes
-  if (
-    (backup.taskPhase !== "uploading" && backup.taskPhase !== "finalizing") ||
-    backup.taskBytesTotal === null
-  ) {
+  if (backup.taskPhase !== "uploading" || backup.taskBytesTotal === null) {
     return null
   }
   const remoteArtifactCount = backup.artifacts.filter(
     (artifact) => artifact.storageId !== null
   ).length
   if (remoteArtifactCount === 0) return null
-  return Math.floor(backup.taskBytesTotal / remoteArtifactCount)
+  if (remoteArtifactCount > 1 && backup.taskCurrentArtifactId === null) {
+    return null
+  }
+  return backup.taskBytesTotal
 }
 
 function backupSourceIsActive(backup: Backup): boolean {
@@ -4202,7 +4202,11 @@ function backupAvailabilityTags(
         name: destination.id ? destination.name : "Local Relay",
         state,
         uploadPercent:
-          destination.id && state === "working" ? uploadPercent : null,
+          destination.id &&
+          artifact?.id === backup.taskCurrentArtifactId &&
+          state === "working"
+            ? uploadPercent
+            : null,
       }
     }
   )
@@ -4220,7 +4224,11 @@ function backupAvailabilityTags(
       name: artifact.storageId ? "S3 destination" : "Local Relay",
       state,
       uploadPercent:
-        artifact.storageId && state === "working" ? uploadPercent : null,
+        artifact.storageId &&
+        artifact.id === backup.taskCurrentArtifactId &&
+        state === "working"
+          ? uploadPercent
+          : null,
     })
   }
   const s3Enabled =
