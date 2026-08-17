@@ -1721,13 +1721,13 @@ const UpdateProgressBar = React.memo(function UpdateProgressBar({
   const progress = systemUpdateProgress(phase, phase === "reconnecting")
   const completed = phase === "awaitingReload" || phase === "completed"
   return (
-    <div className="flex max-w-md items-center gap-2 [contain:layout_paint_style]">
+    <div className="flex max-w-full items-center gap-2 [contain:layout_paint_style]">
       <div
         aria-label={`${progress.label}: ${progress.percent}%`}
         aria-valuemax={100}
         aria-valuemin={0}
         aria-valuenow={progress.percent}
-        className="h-1.5 min-w-24 flex-1 overflow-hidden bg-muted/70"
+        className="h-1.5 w-28 shrink-0 overflow-hidden bg-muted/70 sm:w-36"
         role="progressbar"
       >
         <div
@@ -1736,9 +1736,15 @@ const UpdateProgressBar = React.memo(function UpdateProgressBar({
         />
       </div>
       <span
-        className={`flex w-24 shrink-0 items-center justify-end gap-1 text-[0.5625rem] ${completed ? "text-emerald-300" : "text-muted-foreground"}`}
+        className={`flex min-w-0 items-center gap-1.5 text-[0.5625rem] whitespace-nowrap ${completed ? "text-emerald-300" : "text-muted-foreground"}`}
       >
-        <span className="truncate">{progress.label}</span>
+        <span>{progress.label}</span>
+        <span
+          aria-hidden="true"
+          className="font-mono text-[0.5rem] tabular-nums opacity-70"
+        >
+          {progress.percent}%
+        </span>
         {completed ? <Check aria-hidden="true" className="size-3" /> : null}
       </span>
     </div>

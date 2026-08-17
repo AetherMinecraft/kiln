@@ -3,7 +3,7 @@ import { describe, expect, it } from "vite-plus/test"
 import { systemUpdateProgress } from "./system-update-progress"
 
 describe("system update progress", () => {
-  it("maps replacement phases to short, monotonic progress", () => {
+  it("maps replacement phases to descriptive, monotonic progress", () => {
     const phases = [
       "replace.inspectContainer",
       "replace.tagTarget",
@@ -21,26 +21,40 @@ describe("system update progress", () => {
     expect(percentages).toEqual(
       Array.from(percentages).sort((left, right) => left - right)
     )
-    expect(progress.every(({ label }) => label.length <= 12)).toBe(true)
+    expect(progress).toContainEqual({
+      label: "Starting container",
+      percent: 76,
+    })
+    expect(progress).toContainEqual({
+      label: "Waiting for health check",
+      percent: 90,
+    })
+  })
+
+  it("describes the image download while the update request starts", () => {
+    expect(systemUpdateProgress("Preparing", false)).toEqual({
+      label: "Downloading image",
+      percent: 5,
+    })
   })
 
   it("shows expected connection loss as reconnecting", () => {
     expect(systemUpdateProgress("replace.stopCurrent", true)).toEqual({
-      label: "Reconnecting",
+      label: "Reconnecting to Kiln",
       percent: 88,
     })
   })
 
   it("holds a completed Hearth row until reload", () => {
     expect(systemUpdateProgress("awaitingReload", false)).toEqual({
-      label: "Updated",
+      label: "Update complete",
       percent: 100,
     })
   })
 
   it("briefly marks other completed targets as updated", () => {
     expect(systemUpdateProgress("completed", false)).toEqual({
-      label: "Updated",
+      label: "Update complete",
       percent: 100,
     })
   })
