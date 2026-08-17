@@ -25,22 +25,15 @@ Before editing files for a substantial task:
 - Keep `.agents/skills/kiln-cli/SKILL.md` in sync with CLI changes.
 - Add only critical deterministic tests; prefer browser validation during
   development.
-- This project uses Sentry.io for errors, traces, session replays, and more.
-  `SENTRY_TRACES_SAMPLE_RATE` is set to 100% in local development. Review the
+- This project uses Sentry.io for errors, traces, session replays, and more. Review the
   `sentry-cli` skill when debugging.
 - Avoid patching framework/library internals unless explicitly given permission.
-- Use Sonner for transient feedback and shared tooltips for icon-only controls;
-  do not add feedback UI that shifts the page layout.
+- Use Sonner for transient feedback and shared tooltips
 - For user-visible or runtime work, use T3 Code's collaborative Preview against
   the OrbStack URL printed by `pnpm dev:docker`; never use a local IP for
   development or validation.
 
 ## Setup
-
-This repository uses the local-clone option for the Effect source checkout.
-If `.repos/effect` is missing, run `pnpm prepare` to clone it automatically;
-do not prompt for a subtree, submodule, or clone choice. Never edit the
-checkout directly.
 
 Run once per clone from `main`:
 
@@ -50,67 +43,66 @@ pnpm prepare
 pnpm dev:setup
 ```
 
+# Pull Requests
+
+These are just suggestions, don't treat these as law.
+
+## PR Branches
+
 Name branches as `<type>/<task>`, with a short lowercase kebab-case task:
 
-| Prefix      | Use for                                      |
-| ----------- | -------------------------------------------- |
-| `feat/`     | New capabilities                             |
-| `fix/`      | Bugs and regressions                         |
-| `refactor/` | Behavior-preserving code changes             |
-| `ui/`       | Visual and interaction changes               |
-| `perf/`     | Performance improvements                     |
-| `infra/`    | Docker, deployment, and runtime tooling      |
-| `docs/`     | Documentation only                           |
-| `test/`     | Test-only changes                            |
-| `chore/`    | Dependencies and repository maintenance      |
-| `ci/`       | CI and release automation                    |
+Examples:
+
+| Prefix  | Use for                        |
+| ------- | ------------------------------ |
+| `feat/` | New capabilities               |
+| `fix/`  | Bugs and regressions           |
+| `ui/`   | Visual and interaction changes |
+| `ci/`   | CI and release automation      |
 
 For example: `fix/panel-disconnect`. Do not use personal or agent-name
 prefixes.
 
-Use `<type>(<scope>): <short human title>` for PR titles. Scopes are `hearth`, `bricks`,
-`relay`, and `repo` for repo-wide changes. For work spanning multiple scopes,
-list them comma-separated. For example: `fix(hearth): panel disconnect` or
-`feat(hearth,relay): add server events`.
+## PR Title
 
-## Pull request descriptions
+Use `<type>(<scope>): <short human title>`.
+Examples:
+
+- fix(relay): prevent player disconnects when updating relays
+- ci(repo): update agent skills
+- ui(cli): improve help menu visual
+
+## PR Description
 
 Keep PR descriptions minimal and human:
 
 ```md
 # Why
+
 What it fixes or implements. Link an issue when one exists.
 
 # Summary
+
 Brief summary.
 
 # Notes
+
 Breaking changes, compatibility notes, migration steps, or anything else reviewers need to know.
 ```
 
 Do not update the description during review for follow-up commits or fixes unless the overall PR changes.
 
-For every change:
+# Implementing a change
 
-1. Switch to `main` and run `git pull --ff-only`.
-2. Run `pnpm dev:docker:down` on `main` so its baseline stack is not left
-   running.
-3. In T3 Code, create a correctly named branch and worktree from `main`; never
-   work directly on `main`.
-4. In the new worktree, run `pnpm dev:docker`.
-5. Immediately open the printed OrbStack URL in T3 Preview, leave it available
+Before making a change to any of Kiln's core components, you'll need to set up the preview/testing environment:
+
+1. In the new worktree, run `pnpm dev:docker`.
+2. Immediately open the printed OrbStack URL in T3 Preview, leave it available
    for the user, and confirm Hearth loads before making any changes.
-6. Develop and validate using that T3 Preview.
-7. Commit, push, and open a ready-for-review PR. Never merge the PR yourself.
+3. Develop and validate using that T3 Preview.
+4. Commit, push, and open a ready-for-review PR. Never merge the PR yourself.
 
-Do not run a development stack or Preview from `main`. Only active change
-worktrees should have running Docker containers and open Previews.
-
-Before deleting any worktree, run `pnpm dev:docker:destroy` inside it to remove
-its isolated stack and data. Use `pnpm dev:docker:down` only to stop a stack
-temporarily while retaining its data.
-
-After a PR is merged:
+# After PR Merge Cleanup
 
 1. Run `pnpm dev:docker:destroy` in the merged worktree.
 2. Switch to `main` and run `git pull --ff-only`.
@@ -118,6 +110,6 @@ After a PR is merged:
 
 # Reference Repos
 
-This project takes inspiration on Pterodactyl's Panel (https://github.com/pterodactyl/panel) and wings (https://github.com/pterodactyl/wings). There's also a properly fully pterodactyl compliant alternative Hyrodactyl (formerly Pyrodactyl) that we reference (https://github.com/blueprintframework/hydrodactyl).
+This project takes inspiration on Pterodactyl's Panel (https://github.com/pterodactyl/panel) and wings (https://github.com/pterodactyl/wings).
 
 References Note: Do not assume that the decisions they make is the correct one. The vision for our project is to be a reimagined pterodactyl, not a pterodactyl clone. We can still learn from them as they have been battletested for millions of users.
