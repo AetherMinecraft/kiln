@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises"
 import { join } from "node:path"
 
+import { resolveKilnGitRepository } from "../../../packages/contracts/src/git-repository.ts"
 import { resolveCliVersion } from "./version.mjs"
 
 const root = join(import.meta.dir, "..")
@@ -16,6 +17,7 @@ const repositoryRoot = join(root, "../..")
 const dist = join(root, "dist")
 const npmDist = join(dist, "npm")
 const version = await resolveCliVersion({ repositoryRoot })
+const gitRepository = resolveKilnGitRepository(process.env.KILN_GIT_REPO)
 const npmOnly = process.argv.includes("--npm-only")
 
 await rm(dist, { force: true, recursive: true })
@@ -130,11 +132,11 @@ function publishedManifest() {
     engines: { node: ">=20" },
     repository: {
       type: "git",
-      url: "git+https://github.com/kiln-site/hearth.git",
+      url: `git+${gitRepository}.git`,
       directory: "apps/cli",
     },
     homepage: "https://kiln.site",
-    bugs: "https://github.com/kiln-site/hearth/issues",
+    bugs: `${gitRepository}/issues`,
     license: "SEE LICENSE IN LICENSE",
     keywords: ["kiln", "hearth", "server", "cli"],
     publishConfig: { access: "public" },

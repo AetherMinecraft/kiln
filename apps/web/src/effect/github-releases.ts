@@ -1,14 +1,15 @@
 import { Effect, Schema } from "effect"
 
 import {
+  kilnGitRepositoryApiUrl,
   isKilnNightlyVersion,
   kilnReleaseVersionCore,
 } from "@workspace/contracts"
 
 import { ExternalServiceError } from "@/effect/errors"
+import { kilnGitRepository } from "@/lib/environment"
 import { isKilnReleaseVersion, orderKilnReleases } from "@/lib/release-version"
 
-const repositoryApi = "https://api.github.com/repos/kiln-site/hearth/releases"
 const headers = {
   Accept: "application/vnd.github+json",
   "User-Agent": "kiln-hearth",
@@ -67,6 +68,10 @@ export type PublicKilnRelease = {
 
 export const listKilnReleasesEffect = Effect.fn("github.releases.list")(
   function* () {
+    const repositoryApi = kilnGitRepositoryApiUrl(
+      kilnGitRepository(),
+      "releases"
+    )
     const releases = yield* requestJson(
       `${repositoryApi}?per_page=100`,
       Schema.Array(GitHubReleaseSchema)
@@ -125,6 +130,10 @@ export const listKilnReleasesEffect = Effect.fn("github.releases.list")(
 
 export const kilnReleaseManifestEffect = Effect.fn("github.releases.manifest")(
   function* (tag: string) {
+    const repositoryApi = kilnGitRepositoryApiUrl(
+      kilnGitRepository(),
+      "releases"
+    )
     const release = yield* requestJson(
       `${repositoryApi}/tags/${encodeURIComponent(tag)}`,
       GitHubReleaseSchema

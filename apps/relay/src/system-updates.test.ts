@@ -55,6 +55,7 @@ const hearthContainer = {
 class FakeCommand {
   readonly calls: Array<Array<string>> = []
   currentVersion = "0.1.0-nightly.1"
+  imageSource = KILN_IMAGE_SOURCE
   imageVersion = "0.1.0-nightly.18"
   helperRunning = true
   holdPull = false
@@ -85,7 +86,7 @@ class FakeCommand {
           Config: {
             Labels: {
               "io.kiln.component": component,
-              "org.opencontainers.image.source": KILN_IMAGE_SOURCE,
+              "org.opencontainers.image.source": this.imageSource,
               "org.opencontainers.image.version": this.imageVersion,
             },
           },
@@ -167,6 +168,28 @@ describe("release image versions", () => {
         const run = docker.calls.find((arguments_) => arguments_[0] === "run")
         expect(run).toContain(`KILN_UPDATE_BATCH_ID=${operation.batchId}`)
         expect(run).toContain(relayContainer.Id)
+      })
+    )
+  )
+
+  effectIt.effect("accepts images from the configured repository", () =>
+    withTemporaryDataDirectory((dataDirectory) =>
+      Effect.gen(function* () {
+        const docker = new FakeCommand()
+        docker.imageSource = "https://github.com/example/kiln-fork"
+        const manager = new SystemUpdateManager(
+          { dataDirectory, gitRepository: docker.imageSource },
+          docker.run
+        )
+
+        const operation = yield* manager.start({
+          helperImage: targetImage,
+          targetContainer: "kiln-relay",
+          targetImage,
+          version: "0.1.0",
+        })
+
+        expect(operation.status).toBe("running")
       })
     )
   )

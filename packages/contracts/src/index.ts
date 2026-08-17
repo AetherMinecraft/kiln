@@ -10,6 +10,7 @@ export * from "./cli.js"
 export * from "./instance-limits.js"
 export * from "./instance-state-reason.js"
 export * from "./backups.js"
+export * from "./git-repository.js"
 
 export const relayIdSchema = z.string().regex(/^[A-Za-z\d_-]{43}$/u)
 

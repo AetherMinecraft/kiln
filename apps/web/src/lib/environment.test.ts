@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test"
 
 import {
   cliDefaultAccessDays,
+  kilnGitRepository,
   kilnInstallationId,
   kilnRootDomain,
 } from "./environment"
@@ -9,6 +10,7 @@ import {
 const originalKilnUrl = process.env.KILN_URL
 const originalCliDefaultAccessDays = process.env.KILN_CLI_DEFAULT_ACCESS_DAYS
 const originalKilnInstallationId = process.env.KILN_INSTALLATION_ID
+const originalKilnGitRepo = process.env.KILN_GIT_REPO
 
 afterEach(() => {
   if (originalKilnUrl === undefined) delete process.env.KILN_URL
@@ -23,6 +25,23 @@ afterEach(() => {
   } else {
     process.env.KILN_INSTALLATION_ID = originalKilnInstallationId
   }
+  if (originalKilnGitRepo === undefined) delete process.env.KILN_GIT_REPO
+  else process.env.KILN_GIT_REPO = originalKilnGitRepo
+})
+
+describe("kilnGitRepository", () => {
+  it("defaults to the Kiln repository and normalizes overrides", () => {
+    delete process.env.KILN_GIT_REPO
+    expect(kilnGitRepository()).toBe("https://github.com/kiln-site/kiln")
+
+    process.env.KILN_GIT_REPO = "example/fork.git"
+    expect(kilnGitRepository()).toBe("https://github.com/example/fork")
+  })
+
+  it("rejects values that cannot back GitHub API and raw content URLs", () => {
+    process.env.KILN_GIT_REPO = "https://git.example.com/example/fork"
+    expect(() => kilnGitRepository()).toThrow("KILN_GIT_REPO")
+  })
 })
 
 describe("kilnInstallationId", () => {

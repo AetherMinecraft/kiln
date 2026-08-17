@@ -9,6 +9,10 @@ import type {
   RelayInstancePortProtocol,
   RelayInstanceTailscale,
 } from "@workspace/contracts"
+import {
+  kilnGitRepositoryRawUrl,
+  resolveKilnGitRepository,
+} from "@workspace/contracts"
 
 export interface RelayInstanceConfig {
   brickFormat?: string
@@ -69,6 +73,7 @@ export interface RelayConfig {
     start: number
   }
   gameHostSource: RelayGameHostSource
+  gitRepository: string
   host: string
   installationId: string | null
   managedLabel: string
@@ -154,6 +159,7 @@ export function loadConfig(
     advertisedHost,
     directPublicPort
   )
+  const gitRepository = resolveKilnGitRepository(environment.KILN_GIT_REPO)
   return {
     advertisedHost,
     advertisedHostInferred:
@@ -163,7 +169,7 @@ export function loadConfig(
       60_000,
     brickCatalogUrl:
       environment.KILN_BRICKS_CATALOG_URL?.trim() ||
-      "https://raw.githubusercontent.com/kiln-site/hearth/main/apps/bricks/catalog.yml",
+      kilnGitRepositoryRawUrl(gitRepository, "apps/bricks/catalog.yml"),
     bootstrapToken: bootstrapToken(environment),
     browserOrigin:
       proxyMode === "traefik"
@@ -187,6 +193,7 @@ export function loadConfig(
     gameHost,
     gamePortRange: relayGamePortRange(environment),
     gameHostSource,
+    gitRepository,
     host: environment.KILN_RELAY_BIND_HOST?.trim() || "0.0.0.0",
     installationId,
     managedLabel: "kiln.relay.managed=true",

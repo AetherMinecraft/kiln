@@ -1,7 +1,7 @@
 # Versioning and updates
 
 Kiln publishes Hearth and Relay together from the public
-[`kiln-site/hearth`](https://github.com/kiln-site/hearth) repository. GitHub
+[`kiln-site/kiln`](https://github.com/kiln-site/kiln) repository. GitHub
 Releases is the release index and GHCR is the only image source.
 
 ## Versions and channels

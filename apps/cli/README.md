@@ -37,7 +37,7 @@ Install the Kiln skill globally so supported coding agents can discover and use
 the CLI across projects:
 
 ```sh
-npx skills@latest add kiln-site/hearth --skill kiln-cli --global
+npx skills@latest add kiln-site/kiln --skill kiln-cli --global
 ```
 
 The installer detects supported agents and places the standard Agent Skill in

@@ -38,6 +38,7 @@ FROM docker:29.6.2-cli AS docker-cli
 
 FROM gcr.io/distroless/nodejs24-debian12 AS runtime
 
+ENV KILN_GIT_REPO=https://github.com/kiln-site/kiln
 ENV NODE_ENV=production
 WORKDIR /app
 
@@ -52,6 +53,8 @@ COPY --chmod=755 apps/relay/bin/kiln-relay.mjs /usr/local/bin/kiln-relay
 ARG KILN_VERSION
 ARG SOURCE_COMMIT
 
+# Keep the legacy source label until older Relays have received the
+# repository-rename compatibility check.
 LABEL org.opencontainers.image.source="https://github.com/kiln-site/hearth" \
   org.opencontainers.image.version="${KILN_VERSION}" \
   org.opencontainers.image.revision="${SOURCE_COMMIT}" \

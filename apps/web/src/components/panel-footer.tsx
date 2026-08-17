@@ -1,12 +1,12 @@
 import { cn } from "@workspace/ui/lib/utils"
 
+import { useKilnGitRepository } from "@/lib/git-repository"
 import { footerSocialLinkIds, socialLinks } from "@/lib/social-links"
 
-const repositoryUrl = "https://github.com/kiln-site/hearth"
-
 export function PanelFooter({ className }: { className?: string }) {
+  const gitRepository = useKilnGitRepository()
   const commit = import.meta.env.VITE_KILN_BUILD_SHA.trim()
-  const commitUrl = commit ? `${repositoryUrl}/commit/${commit}` : null
+  const commitUrl = commit ? `${gitRepository}/commit/${commit}` : null
   const shortCommit = commit.slice(0, 7)
   const year = new Date().getUTCFullYear()
 

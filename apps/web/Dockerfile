@@ -51,13 +51,17 @@ RUN --mount=type=cache,target=/home/vp/.local/share/pnpm/store,uid=1000,gid=1000
 
 FROM gcr.io/distroless/nodejs24-debian12:nonroot AS runtime
 
+ARG KILN_GIT_REPO=https://github.com/kiln-site/kiln
 ARG KILN_VERSION
 ARG SOURCE_COMMIT
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
+ENV KILN_GIT_REPO=$KILN_GIT_REPO
 ENV PORT=3000
 WORKDIR /app
 
+# Keep the legacy source label until older Relays have received the
+# repository-rename compatibility check.
 LABEL org.opencontainers.image.source="https://github.com/kiln-site/hearth" \
   org.opencontainers.image.version="${KILN_VERSION}" \
   org.opencontainers.image.revision="${SOURCE_COMMIT}" \

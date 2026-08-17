@@ -34,6 +34,7 @@ import { Skeleton } from "@workspace/ui/components/skeleton"
 import { dismissToast, showToast } from "@workspace/ui/components/sonner"
 
 import type { PublicKilnRelease } from "@/effect/github-releases"
+import { useKilnGitRepository } from "@/lib/git-repository"
 import { queryKeys, updateOverviewQueryOptions } from "@/lib/query-options"
 import {
   compareLatestReleaseVersion,
@@ -128,9 +129,6 @@ type UpdateDialogViewStore = ReturnType<typeof createUpdateDialogViewStore>
 
 const changelogRangeStorageKey = "kiln.system-update-changelog-ranges"
 const updateFailureStorageKey = "kiln.system-update-failures"
-const githubRepositoryUrl = "https://github.com/kiln-site/hearth"
-const githubIssuesUrl = "https://github.com/kiln-site/hearth/issues/new/choose"
-const githubReleasesUrl = `${githubRepositoryUrl}/releases`
 const systemUpdateToastId = "system-update"
 const minimumUpdateCheckDuration = 750
 const completedUpdateDisplayDuration = 1_500
@@ -180,6 +178,8 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
   onRetryTarget: (relayId: string | null) => void
   requestId: number
 }) {
+  const gitRepository = useKilnGitRepository()
+  const githubIssuesUrl = `${gitRepository}/issues/new/choose`
   const queryClient = useQueryClient()
   const [pending, setPending] = React.useState<PendingUpdate | null>(null)
   const [active, setActive] = React.useState<Array<ActiveUpdate>>([])
@@ -486,7 +486,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     const hearth = completedBatch.hearthCompletion
 
     if (failures.length > 0) {
-      showSystemUpdateFailureToast(failures, onRetryTarget)
+      showSystemUpdateFailureToast(failures, onRetryTarget, githubIssuesUrl)
     } else if (hearth === null) {
       showSystemUpdateSuccessToast(
         completedBatch.versionName ?? "the latest version"
@@ -497,7 +497,13 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       if (failures.length === 0) dismissToast(systemUpdateToastId)
       setHearthCompletion(hearth)
     }
-  }, [active.length, onRetryTarget, open, updateMutation.isPending])
+  }, [
+    active.length,
+    githubIssuesUrl,
+    onRetryTarget,
+    open,
+    updateMutation.isPending,
+  ])
 
   const clearMockTimers = React.useCallback(() => {
     for (const timer of mockTimers.current) window.clearTimeout(timer)
@@ -1750,6 +1756,7 @@ const OverviewVersionLink = React.memo(function OverviewVersionLink({
   reason: string | null
   releases: ReadonlyArray<PublicKilnRelease>
 }) {
+  const gitRepository = useKilnGitRepository()
   const currentRelease = findKilnRelease(releases, currentVersion)
   const latestRelease = findKilnRelease(releases, latestVersion)
   return (
@@ -1761,7 +1768,9 @@ const OverviewVersionLink = React.memo(function OverviewVersionLink({
           </span>
         </GitHubVersionLink>
       ) : isKilnReleaseVersion(currentVersion) ? (
-        <GitHubVersionLink href={githubReleaseUrl(currentVersion)}>
+        <GitHubVersionLink
+          href={githubReleaseUrl(gitRepository, currentVersion)}
+        >
           <span className="block max-w-56 truncate font-mono text-[0.5625rem]">
             v{currentVersion}
           </span>
@@ -1771,7 +1780,10 @@ const OverviewVersionLink = React.memo(function OverviewVersionLink({
           <span className="shrink-0">{displayVersion(currentVersion)}</span>
           <span aria-hidden="true">·</span>
           <GitHubVersionLink
-            href={latestRelease?.url ?? githubReleaseUrl(latestVersion)}
+            href={
+              latestRelease?.url ??
+              githubReleaseUrl(gitRepository, latestVersion)
+            }
           >
             <span className="block max-w-56 truncate font-mono text-[0.5625rem]">
               Latest: v{latestVersion}
@@ -1932,6 +1944,8 @@ const ChangelogSelectionHeader = React.memo(function ChangelogSelectionHeader({
   store: UpdateDialogViewStore
   targets: Array<UpdateTarget>
 }) {
+  const gitRepository = useKilnGitRepository()
+  const githubReleasesUrl = `${gitRepository}/releases`
   const selectedKey = React.useSyncExternalStore(
     store.subscribeTarget,
     store.getTargetSnapshot,
@@ -2351,7 +2365,8 @@ function showSystemUpdateFailureToast(
     message: string
     target: UpdateTarget | ActiveUpdate
   }>,
-  onRetryTarget: (relayId: string | null) => void
+  onRetryTarget: (relayId: string | null) => void,
+  githubIssuesUrl: string
 ): void {
   const first = failures[0]
   if (!first) return
@@ -2858,8 +2873,8 @@ function formatReleaseDate(publishedAt: string | null): string {
     : "Recently published"
 }
 
-function githubReleaseUrl(version: string): string {
-  return `${githubReleasesUrl}/tag/${encodeURIComponent(`v${version}`)}`
+function githubReleaseUrl(gitRepository: string, version: string): string {
+  return `${gitRepository}/releases/tag/${encodeURIComponent(`v${version}`)}`
 }
 
 function markdownTextLines(

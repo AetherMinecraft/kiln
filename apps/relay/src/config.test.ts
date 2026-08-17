@@ -10,6 +10,23 @@ import {
 } from "./config.js"
 
 describe("loadConfig", () => {
+  it("derives the default Brick catalog from the configured repository", () => {
+    const defaults = loadConfig({ NODE_ENV: "development" })
+    expect(defaults.gitRepository).toBe("https://github.com/kiln-site/kiln")
+    expect(defaults.brickCatalogUrl).toBe(
+      "https://raw.githubusercontent.com/kiln-site/kiln/main/apps/bricks/catalog.yml"
+    )
+
+    const fork = loadConfig({
+      KILN_GIT_REPO: "example/kiln-fork",
+      NODE_ENV: "development",
+    })
+    expect(fork.gitRepository).toBe("https://github.com/example/kiln-fork")
+    expect(fork.brickCatalogUrl).toBe(
+      "https://raw.githubusercontent.com/example/kiln-fork/main/apps/bricks/catalog.yml"
+    )
+  })
+
   it("defaults the Relay and SFTP ports", () => {
     const config = loadConfig({ NODE_ENV: "development" })
 

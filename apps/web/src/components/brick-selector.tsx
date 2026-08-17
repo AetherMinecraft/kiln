@@ -22,6 +22,7 @@ import { cn } from "@workspace/ui/lib/utils"
 
 import { ServerTypeIcon } from "@/components/server-type-icon"
 import { defaultBrickRuntimeName } from "@/lib/brick-variables"
+import { useKilnGitRepositorySlug } from "@/lib/git-repository"
 
 export type BrickSelection =
   | { kind: "catalog"; brick: Brick }
@@ -55,14 +56,14 @@ const SORT_OPTIONS: ReadonlyArray<{ id: BrickSort; label: string }> = [
 
 const EMPTY_BRICKS: Array<Brick> = []
 
-function isOfficialBrick(brick: Brick): boolean {
+function isOfficialBrick(brick: Brick, gitRepositorySlug: string): boolean {
   if (brick.metadata.author.trim().toLowerCase() === "kiln") return true
   return Result.getOrElse(
     Result.try(
       () =>
         new URL(brick.source).hostname.toLowerCase() ===
           "raw.githubusercontent.com" &&
-        brick.source.includes("/kiln-site/hearth/main/apps/bricks/")
+        brick.source.includes(`/${gitRepositorySlug}/main/apps/bricks/`)
     ),
     () => false
   )
@@ -104,19 +105,21 @@ function formatGameLabel(brick: Brick): string {
   return brick.metadata.game
 }
 
-function sourceLabel(brick: Brick): string {
-  return isOfficialBrick(brick) ? "Official" : "Community"
+function sourceLabel(brick: Brick, gitRepositorySlug: string): string {
+  return isOfficialBrick(brick, gitRepositorySlug) ? "Official" : "Community"
 }
 
 function filterAndSortBricks(
   bricks: Array<Brick>,
   {
     category,
+    gitRepositorySlug,
     query,
     sort,
     sourceFilter,
   }: {
     category: BrickCategoryId
+    gitRepositorySlug: string
     query: string
     sort: BrickSort
     sourceFilter: BrickSourceFilter
@@ -130,8 +133,18 @@ function filterAndSortBricks(
 
   const filtered = bricks.filter((brick) => {
     if (category !== "all" && brickCategory(brick) !== category) return false
-    if (sourceFilter === "official" && !isOfficialBrick(brick)) return false
-    if (sourceFilter === "community" && isOfficialBrick(brick)) return false
+    if (
+      sourceFilter === "official" &&
+      !isOfficialBrick(brick, gitRepositorySlug)
+    ) {
+      return false
+    }
+    if (
+      sourceFilter === "community" &&
+      isOfficialBrick(brick, gitRepositorySlug)
+    ) {
+      return false
+    }
     if (!normalized) return true
     const text = searchTextBySource.get(brick.source) ?? ""
     return text.includes(normalized)
@@ -145,7 +158,8 @@ function filterAndSortBricks(
       return b.metadata.name.localeCompare(a.metadata.name)
     }
     const officialDelta =
-      Number(isOfficialBrick(b)) - Number(isOfficialBrick(a))
+      Number(isOfficialBrick(b, gitRepositorySlug)) -
+      Number(isOfficialBrick(a, gitRepositorySlug))
     if (officialDelta !== 0) return officialDelta
     return a.metadata.name.localeCompare(b.metadata.name)
   })
@@ -171,6 +185,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   configuration?: React.ReactNode
   emptyMessage?: string
 }) {
+  const gitRepositorySlug = useKilnGitRepositorySlug()
   const [category, setCategory] = React.useState<BrickCategoryId>("all")
   const [query, setQuery] = React.useState("")
   const [sourceFilter, setSourceFilter] =
@@ -182,11 +197,12 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
     () =>
       filterAndSortBricks(catalogBricks, {
         category,
+        gitRepositorySlug,
         query,
         sort,
         sourceFilter,
       }),
-    [catalogBricks, category, query, sort, sourceFilter]
+    [catalogBricks, category, gitRepositorySlug, query, sort, sourceFilter]
   )
 
   const selectedCatalog = selection?.kind === "catalog" ? selection.brick : null
@@ -217,6 +233,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
                   const next =
                     filterAndSortBricks(catalogBricks, {
                       category: item.id,
+                      gitRepositorySlug,
                       query,
                       sort,
                       sourceFilter,
@@ -336,7 +353,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
             <ul className="flex flex-col gap-0.5">
               {visibleBricks.map((brick) => {
                 const selected = selectedCatalog?.source === brick.source
-                const official = isOfficialBrick(brick)
+                const official = isOfficialBrick(brick, gitRepositorySlug)
                 return (
                   <li key={brick.source}>
                     <button
@@ -364,7 +381,8 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
                           {brick.metadata.name}
                         </span>
                         <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
-                          {sourceLabel(brick)} · {formatGameLabel(brick)}
+                          {sourceLabel(brick, gitRepositorySlug)} ·{" "}
+                          {formatGameLabel(brick)}
                         </span>
                       </span>
                       {official ? (
@@ -387,6 +405,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
       <BrickDetailsPanel
         selection={selection}
         disabled={disabled}
+        gitRepositorySlug={gitRepositorySlug}
         onSelectionChange={onSelectionChange}
         configuration={configuration}
       />
@@ -397,11 +416,13 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
 const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
   selection,
   disabled,
+  gitRepositorySlug,
   onSelectionChange,
   configuration,
 }: {
   selection: BrickSelection | null
   disabled: boolean
+  gitRepositorySlug: string
   onSelectionChange: (selection: BrickSelection | null) => void
   configuration?: React.ReactNode
 }) {
@@ -463,7 +484,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
   }
 
   const brick = selection.brick
-  const official = isOfficialBrick(brick)
+  const official = isOfficialBrick(brick, gitRepositorySlug)
   const tags = brick.metadata.tags ?? []
 
   return (
