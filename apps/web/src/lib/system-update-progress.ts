@@ -4,20 +4,23 @@ export type SystemUpdateProgress = {
 }
 
 const progressByPhase: Readonly<Record<string, SystemUpdateProgress>> = {
-  Preparing: { label: "Preparing", percent: 5 },
-  awaitingReload: { label: "Updated", percent: 100 },
-  completed: { label: "Updated", percent: 100 },
-  reconnecting: { label: "Reconnecting", percent: 88 },
-  "replace.inspectContainer": { label: "Checking", percent: 10 },
-  "replace.inspectImage": { label: "Checking", percent: 10 },
-  "replace.tagTarget": { label: "Preparing", percent: 20 },
-  "replace.stopCurrent": { label: "Stopping", percent: 32 },
-  "replace.renameCurrent": { label: "Swapping", percent: 44 },
-  "replace.createTarget": { label: "Creating", percent: 56 },
-  "replace.connectNetwork": { label: "Connecting", percent: 64 },
-  "replace.startTarget": { label: "Starting", percent: 76 },
-  "replace.waitUntilHealthy": { label: "Checking", percent: 90 },
-  "replace.removeBackup": { label: "Cleaning up", percent: 96 },
+  Preparing: { label: "Preparing update", percent: 5 },
+  awaitingReload: { label: "Update complete", percent: 100 },
+  completed: { label: "Update complete", percent: 100 },
+  reconnecting: { label: "Reconnecting to Kiln", percent: 88 },
+  "replace.inspectContainer": { label: "Checking container", percent: 10 },
+  "replace.inspectImage": { label: "Checking image", percent: 10 },
+  "replace.tagTarget": { label: "Preparing image", percent: 20 },
+  "replace.stopCurrent": { label: "Stopping container", percent: 32 },
+  "replace.renameCurrent": { label: "Swapping containers", percent: 44 },
+  "replace.createTarget": { label: "Creating container", percent: 56 },
+  "replace.connectNetwork": { label: "Connecting network", percent: 64 },
+  "replace.startTarget": { label: "Starting container", percent: 76 },
+  "replace.waitUntilHealthy": {
+    label: "Waiting for health check",
+    percent: 90,
+  },
+  "replace.removeBackup": { label: "Removing old container", percent: 96 },
 }
 
 export function systemUpdateProgress(
