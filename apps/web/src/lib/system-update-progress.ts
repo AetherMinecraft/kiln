@@ -4,7 +4,7 @@ export type SystemUpdateProgress = {
 }
 
 const progressByPhase: Readonly<Record<string, SystemUpdateProgress>> = {
-  Preparing: { label: "Downloading image", percent: 5 },
+  Preparing: { label: "Preparing update", percent: 5 },
   awaitingReload: { label: "Update complete", percent: 100 },
   completed: { label: "Update complete", percent: 100 },
   reconnecting: { label: "Reconnecting to Kiln", percent: 88 },
@@ -20,7 +20,7 @@ const progressByPhase: Readonly<Record<string, SystemUpdateProgress>> = {
     label: "Waiting for health check",
     percent: 90,
   },
-  "replace.removeBackup": { label: "Removing backup", percent: 96 },
+  "replace.removeBackup": { label: "Removing old container", percent: 96 },
 }
 
 export function systemUpdateProgress(

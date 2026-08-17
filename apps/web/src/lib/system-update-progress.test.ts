@@ -29,12 +29,24 @@ describe("system update progress", () => {
       label: "Waiting for health check",
       percent: 90,
     })
+    expect(progress.every(({ label }) => label.length <= 24)).toBe(true)
   })
 
-  it("describes the image download while the update request starts", () => {
+  it("does not overstate work before a detailed phase is available", () => {
     expect(systemUpdateProgress("Preparing", false)).toEqual({
-      label: "Downloading image",
+      label: "Preparing update",
       percent: 5,
+    })
+    expect(systemUpdateProgress("unrecognized.phase", false)).toEqual({
+      label: "Preparing update",
+      percent: 5,
+    })
+  })
+
+  it("identifies replacement cleanup as container cleanup", () => {
+    expect(systemUpdateProgress("replace.removeBackup", false)).toEqual({
+      label: "Removing old container",
+      percent: 96,
     })
   })
 
