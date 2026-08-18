@@ -911,13 +911,14 @@ function AddUserDialog({
           </Field>
 
           {canAssignPlatformAccess ? (
-            <Field label="Type">
+            <div className="text-[0.625rem] font-medium text-muted-foreground">
+              <span className="mb-1.5 block">Type</span>
               <AccessTypePicker
                 accessType={accessType}
                 disabled={mutation.isPending}
                 onSelect={setAccessType}
               />
-            </Field>
+            </div>
           ) : null}
 
           <div
@@ -1094,7 +1095,7 @@ const AccessTypePicker = React.memo(function AccessTypePicker({
             aria-pressed={selected}
             className={`min-h-10 rounded-md px-2 py-1.5 text-center text-[0.625rem] leading-4 font-semibold transition-colors focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none sm:text-xs ${
               selected
-                ? "bg-background text-foreground shadow-sm ring-1 ring-border"
+                ? "bg-primary/15 text-primary shadow-sm ring-1 ring-primary/35"
                 : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
             } disabled:pointer-events-none disabled:opacity-45`}
             disabled={disabled}
