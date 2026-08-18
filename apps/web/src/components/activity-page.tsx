@@ -863,12 +863,12 @@ function ActivitySelect({
     >
       <SelectTrigger
         aria-label={ariaLabel}
-        className="h-8 min-w-0 gap-1.5 px-2 text-xs"
+        className="h-8 min-w-0 gap-1.5 px-2 text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:whitespace-nowrap"
       >
         <span className="shrink-0 text-muted-foreground [&_svg]:size-3.5">
           {icon}
         </span>
-        <SelectValue className="min-w-0 truncate" />
+        <SelectValue />
       </SelectTrigger>
       <SelectContent className="w-max min-w-(--radix-select-trigger-width)">
         {children}
