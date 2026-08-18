@@ -68,7 +68,6 @@ import {
   useWorkspaceTableSearchInput,
 } from "@/components/workspace-data-table"
 import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
-import type { FleetRelayInstance } from "@/lib/relay-fleet"
 import type { AccessRole } from "@/lib/permissions"
 import { accessRoleDetails, accessRoles, isAccessRole } from "@/lib/permissions"
 import {
@@ -94,10 +93,22 @@ type ManagedDatabaseDirectory = Awaited<
 >
 type AccessType = "platform_admin" | "relay_creator" | "scoped"
 
+interface AccessAssignmentDraft {
+  accessType: AccessType
+  role: AccessRole
+  targetKey: string
+}
+
 interface AccessTarget extends ServerPickerOption {
   databaseId: string | null
   instanceId: string | null
   resourceName: string
+}
+
+interface AccessPageInstance {
+  id: string
+  name: string
+  relayId: string
 }
 
 interface AccessDirectoryRow {
@@ -143,7 +154,7 @@ const invitationExpiryFormatter = new Intl.DateTimeFormat(undefined, {
 export function AccessPage({
   instances,
 }: {
-  instances: Array<FleetRelayInstance>
+  instances: Array<AccessPageInstance>
 }) {
   const queryClient = useQueryClient()
   const { data: overview } = useSuspenseQuery(accessOverviewQueryOptions())
@@ -195,6 +206,14 @@ export function AccessPage({
   )
   const openAddDialog = React.useCallback(() => setAddOpen(true), [])
   const openPendingDialog = React.useCallback(() => setPendingOpen(true), [])
+  const completeAddUser = React.useCallback(
+    (result: Awaited<ReturnType<typeof grantOrInviteAccess>>) => {
+      setAddOpen(false)
+      showAccessAssignmentToast(result)
+      void invalidateAccessQueries(queryClient)
+    },
+    [queryClient]
+  )
 
   const updateGrantMutation = useMutation({
     mutationFn: updateAccessGrant,
@@ -322,11 +341,7 @@ export function AccessPage({
           canAssignPlatformAccess={capabilities.isPlatformAdmin}
           ownerRelayIds={ownerRelayIds}
           targets={targets}
-          onComplete={(result) => {
-            setAddOpen(false)
-            showAccessAssignmentToast(result)
-            void invalidateAccessQueries(queryClient)
-          }}
+          onComplete={completeAddUser}
           onOpenChange={setAddOpen}
         />
       ) : null}
@@ -809,7 +824,7 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
   )
 })
 
-function AddUserDialog({
+const AddUserDialog = React.memo(function AddUserDialog({
   open,
   canAssignPlatformAccess,
   ownerRelayIds,
@@ -824,13 +839,11 @@ function AddUserDialog({
   onComplete: (result: Awaited<ReturnType<typeof grantOrInviteAccess>>) => void
   onOpenChange: (open: boolean) => void
 }) {
-  const [accessType, setAccessType] = React.useState<AccessType>("scoped")
-  const [email, setEmail] = React.useState("")
-  const [targetKey, setTargetKey] = React.useState(() =>
-    targets[0] ? serverPickerOptionKey(targets[0]) : ""
-  )
-  const [role, setRole] = React.useState<AccessRole>("operator")
-  const [scopeOpen, setScopeOpen] = React.useState(false)
+  const assignmentRef = React.useRef<AccessAssignmentDraft>({
+    accessType: "scoped",
+    role: "operator",
+    targetKey: targets[0] ? serverPickerOptionKey(targets[0]) : "",
+  })
   const mutation = useMutation({
     mutationFn: grantOrInviteAccess,
     onError: (cause) =>
@@ -840,37 +853,37 @@ function AddUserDialog({
       }),
     onSuccess: onComplete,
   })
-  const selectedTarget = targets.find(
-    (target) => serverPickerOptionKey(target) === targetKey
-  )
-  const selectedKeys = React.useMemo(
-    () => new Set(targetKey ? [targetKey] : []),
-    [targetKey]
-  )
-  const assignableRoles = selectedTarget
-    ? rolesForRelay(ownerRelayIds, selectedTarget.relayId)
-    : accessRoles.filter((accessRole) => accessRole !== "owner")
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if ((accessType === "scoped" && !selectedTarget) || mutation.isPending)
+    if (mutation.isPending) return
+    const formData = new FormData(event.currentTarget)
+    const email = formData.get("email")
+    if (typeof email !== "string" || !email) return
+    const assignment = assignmentRef.current
+    const selectedTarget = targets.find(
+      (target) => serverPickerOptionKey(target) === assignment.targetKey
+    )
+    if (assignment.accessType === "scoped" && !selectedTarget) {
+      showToast({ message: "Choose an access scope", type: "error" })
       return
+    }
     await Effect.runPromise(
       Effect.tryPromise({
         try: () =>
           mutation.mutateAsync({
             data:
-              accessType === "scoped" && selectedTarget
+              assignment.accessType === "scoped" && selectedTarget
                 ? {
-                    accessType,
+                    accessType: assignment.accessType,
                     databaseId: selectedTarget.databaseId,
                     email,
                     instanceId: selectedTarget.instanceId,
                     relayId: selectedTarget.relayId,
                     resourceName: selectedTarget.resourceName,
-                    role,
+                    role: assignment.role,
                   }
-                : accessType === "platform_admin"
+                : assignment.accessType === "platform_admin"
                   ? { accessType: "platform_admin", email }
                   : { accessType: "relay_creator", email },
           }),
@@ -902,129 +915,20 @@ function AddUserDialog({
             <Input
               autoFocus
               required
+              name="email"
               type="email"
               autoComplete="email"
               placeholder="operator@example.com"
-              value={email}
-              onChange={(event) => setEmail(event.currentTarget.value)}
             />
           </Field>
 
-          {canAssignPlatformAccess ? (
-            <div className="text-[0.625rem] font-medium text-muted-foreground">
-              <span className="mb-1.5 block">Type</span>
-              <AccessTypePicker
-                accessType={accessType}
-                disabled={mutation.isPending}
-                onSelect={setAccessType}
-              />
-            </div>
-          ) : null}
-
-          <div
-            className={
-              accessType === "scoped"
-                ? "grid gap-3 sm:grid-cols-[minmax(0,1fr)_9rem]"
-                : undefined
-            }
-          >
-            <Field label="Access">
-              {accessType === "scoped" ? (
-                <Popover open={scopeOpen} onOpenChange={setScopeOpen}>
-                  <PopoverTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      className="h-10 w-full justify-between px-3 text-left"
-                    >
-                      {selectedTarget ? (
-                        <span className="flex min-w-0 items-center gap-2.5">
-                          <ScopeIcon
-                            resourceType={
-                              selectedTarget.kind === "server"
-                                ? "instance"
-                                : (selectedTarget.kind ?? "relay")
-                            }
-                          />
-                          <span className="min-w-0 truncate text-xs font-semibold">
-                            {selectedTarget.name}
-                          </span>
-                        </span>
-                      ) : (
-                        <span className="text-muted-foreground">
-                          Choose scope
-                        </span>
-                      )}
-                      <ChevronDown className="ml-3 size-4 shrink-0 text-muted-foreground" />
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent
-                    align="start"
-                    className="z-[70] w-[min(34rem,calc(100vw-3rem))] p-1.5"
-                  >
-                    <ServerPickerList
-                      ariaLabel="Access scopes"
-                      emptyMessage="No matching Relays, servers, or databases."
-                      multiple={false}
-                      searchPlaceholder="Search by server, Relay, database, or ID"
-                      selectedKeys={selectedKeys}
-                      servers={targets}
-                      onSelect={(option) => {
-                        const nextKey = serverPickerOptionKey(option)
-                        const nextTarget = targets.find(
-                          (target) => serverPickerOptionKey(target) === nextKey
-                        )
-                        setTargetKey(nextKey)
-                        if (
-                          role === "owner" &&
-                          nextTarget &&
-                          !ownerRelayIds.has(nextTarget.relayId)
-                        ) {
-                          setRole("operator")
-                        }
-                        setScopeOpen(false)
-                      }}
-                    />
-                  </PopoverContent>
-                </Popover>
-              ) : (
-                <Button
-                  className="h-10 w-full justify-between px-3 text-xs disabled:opacity-70"
-                  disabled
-                  type="button"
-                  variant="outline"
-                >
-                  {accessType === "platform_admin"
-                    ? "Hearth + all Relays"
-                    : "Own Relays"}
-                  <ChevronDown className="size-4 text-muted-foreground" />
-                </Button>
-              )}
-            </Field>
-
-            {accessType === "scoped" ? (
-              <Field label="Role">
-                <Select
-                  value={role}
-                  onValueChange={(value) => setRole(accessRoleFromValue(value))}
-                >
-                  <SelectTrigger
-                    aria-label="Role"
-                    className="h-10 w-full px-3 text-xs"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent className="z-[70]">
-                    {assignableRoles.map((accessRole) => (
-                      <SelectItem key={accessRole} value={accessRole}>
-                        {accessRoleDetails[accessRole].label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-            ) : null}
-          </div>
+          <AccessConfigurationFields
+            assignmentRef={assignmentRef}
+            canAssignPlatformAccess={canAssignPlatformAccess}
+            disabled={mutation.isPending}
+            ownerRelayIds={ownerRelayIds}
+            targets={targets}
+          />
 
           <DialogFooter>
             <Button
@@ -1035,14 +939,7 @@ function AddUserDialog({
             >
               Cancel
             </Button>
-            <Button
-              type="submit"
-              disabled={
-                !email ||
-                (accessType === "scoped" && !selectedTarget) ||
-                mutation.isPending
-              }
-            >
+            <Button type="submit" disabled={mutation.isPending}>
               {mutation.isPending ? (
                 <LoaderCircle className="animate-spin" />
               ) : (
@@ -1055,7 +952,253 @@ function AddUserDialog({
       </DialogContent>
     </Dialog>
   )
+})
+
+const AccessConfigurationFields = React.memo(
+  function AccessConfigurationFields({
+    assignmentRef,
+    canAssignPlatformAccess,
+    disabled,
+    ownerRelayIds,
+    targets,
+  }: {
+    assignmentRef: React.RefObject<AccessAssignmentDraft>
+    canAssignPlatformAccess: boolean
+    disabled: boolean
+    ownerRelayIds: ReadonlySet<string>
+    targets: Array<AccessTarget>
+  }) {
+    const [accessType, setAccessType] = React.useState<AccessType>("scoped")
+    const selectAccessType = React.useCallback(
+      (nextAccessType: AccessType) => {
+        assignmentRef.current.accessType = nextAccessType
+        setAccessType(nextAccessType)
+      },
+      [assignmentRef]
+    )
+
+    return (
+      <>
+        {canAssignPlatformAccess ? (
+          <div className="text-[0.625rem] font-medium text-muted-foreground">
+            <span className="mb-1.5 block">Type</span>
+            <AccessTypePicker
+              accessType={accessType}
+              disabled={disabled}
+              onSelect={selectAccessType}
+            />
+          </div>
+        ) : null}
+
+        {accessType === "scoped" ? (
+          <ScopedAccessFields
+            assignmentRef={assignmentRef}
+            ownerRelayIds={ownerRelayIds}
+            targets={targets}
+          />
+        ) : (
+          <PresetAccessField accessType={accessType} />
+        )}
+      </>
+    )
+  }
+)
+
+const PresetAccessField = React.memo(function PresetAccessField({
+  accessType,
+}: {
+  accessType: Exclude<AccessType, "scoped">
+}) {
+  return (
+    <Field label="Access">
+      <div className="flex h-10 w-full items-center rounded-md border border-input/90 bg-input/20 px-3 text-xs text-foreground/70">
+        {accessType === "platform_admin" ? "Hearth + all Relays" : "Own Relays"}
+      </div>
+    </Field>
+  )
+})
+
+interface AccessRoleFieldHandle {
+  setRole: (role: AccessRole) => void
 }
+
+const AccessRoleField = React.memo(
+  React.forwardRef<
+    AccessRoleFieldHandle,
+    {
+      initialRole: AccessRole
+      onRoleChange: (role: AccessRole) => void
+      roles: ReadonlyArray<AccessRole>
+    }
+  >(function AccessRoleField({ initialRole, onRoleChange, roles }, ref) {
+    const [role, setRole] = React.useState(initialRole)
+    React.useImperativeHandle(ref, () => ({ setRole }), [])
+
+    const updateRole = React.useCallback(
+      (value: string) => {
+        const nextRole = accessRoleFromValue(value)
+        setRole(nextRole)
+        onRoleChange(nextRole)
+      },
+      [onRoleChange]
+    )
+
+    return (
+      <Field label="Role">
+        <Select value={role} onValueChange={updateRole}>
+          <SelectTrigger aria-label="Role" className="h-10 w-full px-3 text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent className="z-[70]">
+            {roles.map((accessRole) => (
+              <SelectItem key={accessRole} value={accessRole}>
+                {accessRoleDetails[accessRole].label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </Field>
+    )
+  })
+)
+
+const AccessScopeField = React.memo(function AccessScopeField({
+  onSelect,
+  selectedTarget,
+  targetKey,
+  targets,
+}: {
+  onSelect: (option: ServerPickerOption) => void
+  selectedTarget: AccessTarget | undefined
+  targetKey: string
+  targets: Array<AccessTarget>
+}) {
+  const [open, setOpen] = React.useState(false)
+  const selectedKeys = React.useMemo(
+    () => new Set(targetKey ? [targetKey] : []),
+    [targetKey]
+  )
+  const selectTarget = React.useCallback(
+    (option: ServerPickerOption) => {
+      onSelect(option)
+      setOpen(false)
+    },
+    [onSelect]
+  )
+
+  return (
+    <Field label="Access">
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="outline"
+            className="h-10 w-full justify-between px-3 text-left"
+          >
+            {selectedTarget ? (
+              <span className="flex min-w-0 items-center gap-2.5">
+                <ScopeIcon
+                  resourceType={
+                    selectedTarget.kind === "server"
+                      ? "instance"
+                      : (selectedTarget.kind ?? "relay")
+                  }
+                />
+                <span className="min-w-0 truncate text-xs font-semibold">
+                  {selectedTarget.name}
+                </span>
+              </span>
+            ) : (
+              <span className="text-muted-foreground">Choose scope</span>
+            )}
+            <ChevronDown className="ml-3 size-4 shrink-0 text-muted-foreground" />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent
+          align="start"
+          className="z-[70] w-[min(34rem,calc(100vw-3rem))] p-1.5"
+        >
+          <ServerPickerList
+            ariaLabel="Access scopes"
+            emptyMessage="No matching Relays, servers, or databases."
+            multiple={false}
+            searchPlaceholder="Search by server, Relay, database, or ID"
+            selectedKeys={selectedKeys}
+            servers={targets}
+            onSelect={selectTarget}
+          />
+        </PopoverContent>
+      </Popover>
+    </Field>
+  )
+})
+
+const ScopedAccessFields = React.memo(function ScopedAccessFields({
+  assignmentRef,
+  ownerRelayIds,
+  targets,
+}: {
+  assignmentRef: React.RefObject<AccessAssignmentDraft>
+  ownerRelayIds: ReadonlySet<string>
+  targets: Array<AccessTarget>
+}) {
+  const [targetKey, setTargetKey] = React.useState(
+    assignmentRef.current.targetKey
+  )
+  const roleFieldRef = React.useRef<AccessRoleFieldHandle>(null)
+  const selectedTarget = targets.find(
+    (target) => serverPickerOptionKey(target) === targetKey
+  )
+  const assignableRoles = React.useMemo(
+    () =>
+      selectedTarget
+        ? rolesForRelay(ownerRelayIds, selectedTarget.relayId)
+        : accessRoles.filter((accessRole) => accessRole !== "owner"),
+    [ownerRelayIds, selectedTarget]
+  )
+  const selectTarget = React.useCallback(
+    (option: ServerPickerOption) => {
+      const nextKey = serverPickerOptionKey(option)
+      const nextTarget = targets.find(
+        (target) => serverPickerOptionKey(target) === nextKey
+      )
+      assignmentRef.current.targetKey = nextKey
+      setTargetKey(nextKey)
+      if (
+        assignmentRef.current.role === "owner" &&
+        nextTarget &&
+        !ownerRelayIds.has(nextTarget.relayId)
+      ) {
+        assignmentRef.current.role = "operator"
+        roleFieldRef.current?.setRole("operator")
+      }
+    },
+    [assignmentRef, ownerRelayIds, targets]
+  )
+  const updateRole = React.useCallback(
+    (role: AccessRole) => {
+      assignmentRef.current.role = role
+    },
+    [assignmentRef]
+  )
+
+  return (
+    <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_9rem]">
+      <AccessScopeField
+        onSelect={selectTarget}
+        selectedTarget={selectedTarget}
+        targetKey={targetKey}
+        targets={targets}
+      />
+      <AccessRoleField
+        ref={roleFieldRef}
+        initialRole={assignmentRef.current.role}
+        onRoleChange={updateRole}
+        roles={assignableRoles}
+      />
+    </div>
+  )
+})
 
 const accessTypeOptions = [
   {
@@ -1087,26 +1230,44 @@ const AccessTypePicker = React.memo(function AccessTypePicker({
       role="group"
       aria-label="Access type"
     >
-      {accessTypeOptions.map((option) => {
-        const selected = accessType === option.value
-        return (
-          <button
-            key={option.value}
-            aria-pressed={selected}
-            className={`min-h-10 rounded-md px-2 py-1.5 text-center text-[0.625rem] leading-4 font-semibold transition-colors focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none sm:text-xs ${
-              selected
-                ? "bg-primary/15 text-primary shadow-sm ring-1 ring-primary/35"
-                : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
-            } disabled:pointer-events-none disabled:opacity-45`}
-            disabled={disabled}
-            type="button"
-            onClick={() => onSelect(option.value)}
-          >
-            {option.label}
-          </button>
-        )
-      })}
+      {accessTypeOptions.map((option) => (
+        <AccessTypeOption
+          key={option.value}
+          disabled={disabled}
+          option={option}
+          selected={accessType === option.value}
+          onSelect={onSelect}
+        />
+      ))}
     </div>
+  )
+})
+
+const AccessTypeOption = React.memo(function AccessTypeOption({
+  disabled,
+  onSelect,
+  option,
+  selected,
+}: {
+  disabled: boolean
+  onSelect: (accessType: AccessType) => void
+  option: (typeof accessTypeOptions)[number]
+  selected: boolean
+}) {
+  return (
+    <button
+      aria-pressed={selected}
+      className={`min-h-10 rounded-md px-2 py-1.5 text-center text-[0.625rem] leading-4 font-semibold transition-colors focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none sm:text-xs ${
+        selected
+          ? "bg-primary/15 text-primary shadow-sm ring-1 ring-primary/35"
+          : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
+      } disabled:pointer-events-none disabled:opacity-45`}
+      disabled={disabled}
+      type="button"
+      onClick={() => onSelect(option.value)}
+    >
+      {option.label}
+    </button>
   )
 })
 
@@ -1171,7 +1332,7 @@ function PendingInvitationsDialog({
 }: {
   databases: ManagedDatabaseDirectory
   invitations: AccessOverview["invitations"]
-  instances: Array<FleetRelayInstance>
+  instances: Array<AccessPageInstance>
   open: boolean
   ownerRelayIds: ReadonlySet<string>
   pendingId?: string
@@ -1401,10 +1562,10 @@ function HydratedDate({ value }: { value: string }) {
 
 function accessTargets(
   overview: AccessOverview,
-  instances: Array<FleetRelayInstance>,
+  instances: Array<AccessPageInstance>,
   databases: ManagedDatabaseDirectory
 ): Array<AccessTarget> {
-  const instancesByRelay = new Map<string, Array<FleetRelayInstance>>()
+  const instancesByRelay = new Map<string, Array<AccessPageInstance>>()
   for (const instance of instances) {
     const relayInstances = instancesByRelay.get(instance.relayId) ?? []
     relayInstances.push(instance)
@@ -1465,7 +1626,7 @@ function accessTargets(
 
 function accessDirectoryRows(
   overview: AccessOverview,
-  instances: Array<FleetRelayInstance>,
+  instances: Array<AccessPageInstance>,
   databases: ManagedDatabaseDirectory
 ): Array<AccessDirectoryRow> {
   const instanceNames = new Map(
