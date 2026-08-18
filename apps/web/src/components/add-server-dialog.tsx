@@ -459,6 +459,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
         >
           <SelectTrigger className="h-8 w-full">
             <SelectValue
+              className="min-w-0 flex-1 truncate text-left"
               placeholder={
                 relays.length === 0
                   ? "No Relays available"
