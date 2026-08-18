@@ -2924,7 +2924,7 @@ function DownloadBackupDialog({
               >
                 <SelectTrigger
                   aria-label="Temporary URL duration unit"
-                  className="h-9 shrink-0 px-3 whitespace-nowrap"
+                  className="h-8 shrink-0 px-3 whitespace-nowrap"
                 >
                   <SelectValue />
                 </SelectTrigger>
