@@ -87,7 +87,7 @@ export const BrickVariableField = React.memo(function BrickVariableField({
           <SelectTrigger
             aria-labelledby={labelId}
             aria-required={definition.required}
-            className="h-10 w-full overflow-hidden px-3 text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate"
+            className="h-8 w-full overflow-hidden px-3 text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate"
           >
             <SelectValue placeholder="Select an option" />
           </SelectTrigger>
