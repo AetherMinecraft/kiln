@@ -52,10 +52,10 @@ export function InvitationPage({
   const platformInvitation = preview?.accessType !== "scoped"
   const invitationLabel = preview
     ? preview.accessType === "platform_admin"
-      ? "Platform admin"
+      ? "Platform Admin"
       : preview.accessType === "relay_creator"
-        ? "Bring your own Relay"
-        : (preview.role ?? "Scoped access")
+        ? "Bring Your Own Relays"
+        : (preview.role ?? "Scoped Access")
     : "Access"
 
   async function accept() {
@@ -144,7 +144,7 @@ export function InvitationPage({
                 {preview.accessType === "platform_admin"
                   ? "Administer Kiln"
                   : preview.accessType === "relay_creator"
-                    ? "Bring your own Relay"
+                    ? "Bring Your Own Relays"
                     : `Join ${preview.relayName}`}
               </h1>
               <p className="mt-3 text-sm leading-6 text-muted-foreground">
