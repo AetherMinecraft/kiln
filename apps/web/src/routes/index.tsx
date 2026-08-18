@@ -55,7 +55,11 @@ export const Route = createFileRoute("/")({
       getUiPreferences(),
     ])
     if (connection.status !== "connected") {
-      if (state.user.isDevelopmentBypass || state.user.role === "admin") {
+      if (
+        state.user.isDevelopmentBypass ||
+        state.user.role === "admin" ||
+        state.user.role === "relay_creator"
+      ) {
         throw redirect({ to: "/infra/relays" })
       }
       throw redirect({

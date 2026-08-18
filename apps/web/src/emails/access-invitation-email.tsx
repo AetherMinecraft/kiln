@@ -18,7 +18,7 @@ export interface AccessInvitationEmailProps {
   inviterName: string
   resourceName: string
   role: string
-  scope: "database" | "instance" | "relay"
+  scope: "database" | "instance" | "platform" | "relay"
 }
 
 export function AccessInvitationEmail({
@@ -64,9 +64,11 @@ export function AccessInvitationEmail({
                 You&apos;re invited
               </Heading>
               <Text className="text-smoke mt-5 text-[15px] leading-[24px]">
-                {inviterName} invited you to the {scope} {resourceName} as{" "}
-                {role}. Sign in with this email address, or create an account,
-                to accept.
+                {scope === "platform"
+                  ? `${inviterName} invited you to Kiln as ${role}.`
+                  : `${inviterName} invited you to the ${scope} ${resourceName} as ${role}.`}{" "}
+                Sign in with this email address, or create an account, to
+                accept.
               </Text>
               <Button
                 href={inviteUrl}

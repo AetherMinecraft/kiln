@@ -911,7 +911,13 @@ const RelayDeleteButton = React.memo(function RelayDeleteButton({
         queryKeys.relays,
         (current) => current?.filter((item) => item.id !== relayId)
       )
-      await invalidateRelayRuntimeQueries(queryClient)
+      await Promise.all([
+        invalidateRelayRuntimeQueries(queryClient),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.access.capabilities,
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.access.overview }),
+      ])
     },
   })
 
@@ -1195,7 +1201,13 @@ function AddRelayDialog({
             ? current.map((item) => (item.id === relay.id ? relay : item))
             : [...(current ?? []), relay]
       )
-      await invalidateRelayRuntimeQueries(queryClient)
+      await Promise.all([
+        invalidateRelayRuntimeQueries(queryClient),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.access.capabilities,
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.access.overview }),
+      ])
     },
   })
 
@@ -1807,9 +1819,9 @@ function selectHasEnabledRelay(relays: Array<PersistedRelay>): boolean {
 }
 
 function selectCanReviewUpdates(capabilities: {
-  isPlatformAdmin: boolean
+  canUpdateRelays: boolean
 }): boolean {
-  return capabilities.isPlatformAdmin
+  return capabilities.canUpdateRelays
 }
 
 function selectRelayUpdateSummary(overview: UpdateOverview): {

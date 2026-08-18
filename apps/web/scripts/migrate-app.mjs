@@ -24,6 +24,7 @@ try {
   await ensureInstanceOwnershipSchema(connection)
   await ensureTailscaleNetworkSchema(connection)
   await ensureDatabaseAccessSchema(connection)
+  await ensureAccessAssignmentSchema(connection)
   await ensureBackupSchema(connection)
   console.log("Kiln application tables are up to date")
 } finally {
@@ -127,6 +128,49 @@ async function ensureDatabaseAccessSchema(database) {
     await database.query(
       `ALTER TABLE ${databaseTable("invitation")}
        ADD COLUMN database_id CHAR(40) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER instance_id`
+    )
+  }
+}
+
+async function ensureAccessAssignmentSchema(database) {
+  const [relayCreatorColumns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("relay")} LIKE 'created_by'`
+  )
+  if (relayCreatorColumns.length === 0) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("relay")}
+       ADD COLUMN created_by VARCHAR(36) NULL AFTER node_version`
+    )
+  }
+
+  const [invitationColumns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("invitation")}`
+  )
+  const invitationColumnNames = new Set(
+    invitationColumns.map((column) => column.Field)
+  )
+  if (!invitationColumnNames.has("access_type")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("invitation")}
+       ADD COLUMN access_type ENUM('scoped', 'platform_admin', 'relay_creator')
+         NOT NULL DEFAULT 'scoped' AFTER email`
+    )
+  }
+  const relayIdColumn = invitationColumns.find(
+    (column) => column.Field === "relay_id"
+  )
+  const roleColumn = invitationColumns.find((column) => column.Field === "role")
+  const invitationChanges = [
+    relayIdColumn?.Null === "NO"
+      ? "MODIFY relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NULL"
+      : null,
+    roleColumn?.Null === "NO"
+      ? "MODIFY role ENUM('owner', 'admin', 'operator', 'viewer') NULL"
+      : null,
+  ].filter(Boolean)
+  if (invitationChanges.length > 0) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("invitation")} ${invitationChanges.join(", ")}`
     )
   }
 }

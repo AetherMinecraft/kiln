@@ -15,7 +15,12 @@ import {
 } from "@workspace/contracts"
 import { z } from "zod"
 
-import { isPlatformAdmin, requireRelayPermission } from "@/lib/access-control"
+import {
+  isPlatformAdmin,
+  isRelayCreator,
+  requireRelayPermission,
+} from "@/lib/access-control"
+import type { AuthenticatedUser } from "@/lib/auth-session"
 import { hydrateBrickVariables } from "@/lib/brick-variables"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
@@ -49,11 +54,8 @@ const startupInputSchema = relayUpdateInstanceStartupSchema.extend(
 export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
   async () => {
     const user = await requireAuthenticatedUser()
-    if (!isPlatformAdmin(user)) {
-      throw new Error("Platform administrator access required")
-    }
     const candidates = (await listPersistedRelays()).filter(
-      (relay) => relay.enabled
+      (relay) => relay.enabled && canProvisionOnRelay(user, relay)
     )
     const snapshots = await Promise.allSettled(
       candidates.map((relay) => requestRelay(relay, "/v1/snapshot"))
@@ -89,10 +91,8 @@ export const createBrickInstance = createServerFn({ method: "POST" })
   .validator(createInputSchema)
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
-    if (!isPlatformAdmin(user)) {
-      throw new Error("Platform administrator access required")
-    }
     const relay = await requiredRelay(data.relayId)
+    requireRelayProvisionAccess(user, relay)
     const input = relayCreateInstanceSchema.parse(data)
     const instance = relayInstanceSchema.parse(
       await requestRelay(
@@ -286,10 +286,8 @@ export const loadBrickRecipe = createServerFn({ method: "POST" })
   .validator(recipeInputSchema)
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
-    if (!isPlatformAdmin(user)) {
-      throw new Error("Platform administrator access required")
-    }
     const relay = await requiredRelay(data.relayId)
+    requireRelayProvisionAccess(user, relay)
     return brickSchema.parse(
       await requestRelay(
         relay,
@@ -302,10 +300,8 @@ export const configureBrickNetworking = createServerFn({ method: "POST" })
   .validator(networkingInputSchema)
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
-    if (!isPlatformAdmin(user)) {
-      throw new Error("Platform administrator access required")
-    }
     const relay = await requiredRelay(data.relayId)
+    requireRelayProvisionAccess(user, relay)
     const input = relayNetworkingSchema.parse(data)
     const networking = relayNetworkingSchema.parse(
       await requestRelay(
@@ -332,6 +328,25 @@ async function requiredRelay(id: string): Promise<PersistedRelay> {
   )
   if (!relay) throw new Error("Relay not found")
   return relay
+}
+
+function canProvisionOnRelay(
+  user: AuthenticatedUser,
+  relay: PersistedRelay
+): boolean {
+  return (
+    isPlatformAdmin(user) ||
+    (isRelayCreator(user) && relay.createdBy === user.id)
+  )
+}
+
+function requireRelayProvisionAccess(
+  user: AuthenticatedUser,
+  relay: PersistedRelay
+): void {
+  if (!canProvisionOnRelay(user, relay)) {
+    throw new Error("You can only provision on Relays you created")
+  }
 }
 
 async function requestRelay(
