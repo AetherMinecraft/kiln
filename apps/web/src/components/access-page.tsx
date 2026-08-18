@@ -656,7 +656,9 @@ function AccessFilterSelect({
         <span className="text-muted-foreground [&_svg]:size-3.5">{icon}</span>
         <SelectValue />
       </SelectTrigger>
-      <SelectContent>{children}</SelectContent>
+      <SelectContent className="w-max min-w-(--radix-select-trigger-width)">
+        {children}
+      </SelectContent>
     </Select>
   )
 }
