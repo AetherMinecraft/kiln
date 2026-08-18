@@ -160,12 +160,8 @@ export function CliAuthorizationPage({
           </span>
         </div>
 
-        <label
-          id="cli-access-duration-label"
-          htmlFor="cli-access-duration"
-          className="grid gap-2 text-xs font-medium"
-        >
-          Access duration
+        <div className="grid gap-2 text-xs font-medium">
+          <span id="cli-access-duration-label">Access duration</span>
           <Select
             value={duration}
             onValueChange={(value) => {
@@ -192,7 +188,7 @@ export function CliAuthorizationPage({
               </SelectItem>
             </SelectContent>
           </Select>
-        </label>
+        </div>
       </div>
 
       {error ? (
