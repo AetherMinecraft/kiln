@@ -50,6 +50,7 @@ export interface PersistedRelay {
   browserOrigin: string
   clientId: string
   createdAt: string
+  createdBy: string | null
   enabled: boolean
   hostname: string
   id: string
@@ -114,6 +115,7 @@ interface RelayRow extends RowDataPacket {
   client_public_key: string
   client_role: "custom" | "full_access" | "read_only"
   created_at: Date
+  created_by: string | null
   enabled: number
   hostname: string
   id: string
@@ -206,7 +208,7 @@ async function findPersistedRelayRow(id: string): Promise<RelayRow | null> {
             last_connected_at, last_error, managed_ember_count,
             node_arch, node_platform, node_version,
             relay_public_key, relay_ca_certificate,
-            client_public_key, client_private_key_ciphertext, created_at
+            client_public_key, client_private_key_ciphertext, created_by, created_at
        FROM ${databaseTable("relay")}
       WHERE id = ?
       LIMIT 1`,
@@ -224,7 +226,7 @@ export const listPersistedRelaysEffect = Effect.fn("relays.list")(function* () {
             last_connected_at, last_error, managed_ember_count,
             node_arch, node_platform, node_version,
             relay_public_key, relay_ca_certificate,
-            client_public_key, client_private_key_ciphertext, created_at
+            client_public_key, client_private_key_ciphertext, created_by, created_at
        FROM ${databaseTable("relay")}
       ORDER BY name ASC, created_at ASC`
   )
@@ -665,8 +667,8 @@ async function pairWithEnvelope(
         id, name, hostname, port, use_tls, browser_origin,
         relay_public_key, relay_ca_certificate,
         client_id, client_public_key, client_private_key_ciphertext,
-        client_role, client_actions, enabled
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)`,
+        client_role, client_actions, enabled, created_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?)`,
       [
         envelope.relayFingerprint,
         initialName,
@@ -681,6 +683,7 @@ async function pairWithEnvelope(
         encryptedPrivateKey,
         response.role,
         JSON.stringify(response.actions),
+        subject ?? null,
       ]
     )
   }
@@ -1078,6 +1081,7 @@ function toPersistedRelay(row: RelayRow): PersistedRelay {
     browserOrigin: row.browser_origin,
     clientId: row.client_id,
     createdAt: row.created_at.toISOString(),
+    createdBy: row.created_by,
     enabled: Boolean(row.enabled),
     hostname: row.hostname,
     id: row.id,

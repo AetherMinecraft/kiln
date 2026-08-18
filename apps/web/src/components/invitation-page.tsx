@@ -8,6 +8,7 @@ import {
   Clock3,
   LoaderCircle,
   LogOut,
+  RadioTower,
   Server,
   ShieldCheck,
 } from "lucide-react"
@@ -48,6 +49,14 @@ export function InvitationPage({
   const [error, setError] = React.useState<string | null>(null)
   const [accepted, setAccepted] = React.useState(false)
   const invitePath = `/invite?token=${encodeURIComponent(token)}`
+  const platformInvitation = preview?.accessType !== "scoped"
+  const invitationLabel = preview
+    ? preview.accessType === "platform_admin"
+      ? "Platform admin"
+      : preview.accessType === "relay_creator"
+        ? "Bring your own Relay"
+        : (preview.role ?? "Scoped access")
+    : "Access"
 
   async function accept() {
     setPending(true)
@@ -132,29 +141,43 @@ export function InvitationPage({
                 Access request
               </p>
               <h1 className="mt-2 font-heading text-3xl font-semibold tracking-[-0.05em]">
-                Join {preview.relayName}
+                {preview.accessType === "platform_admin"
+                  ? "Administer Kiln"
+                  : preview.accessType === "relay_creator"
+                    ? "Bring your own Relay"
+                    : `Join ${preview.relayName}`}
               </h1>
               <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                You&apos;ve been invited as{" "}
-                <span className="font-medium text-foreground">
-                  {preview.role}
-                </span>
-                {preview.instanceId
-                  ? " on one managed instance"
-                  : " across this Relay"}
-                .
+                {preview.accessType === "platform_admin"
+                  ? "You’ve been invited to manage Hearth and every connected Relay."
+                  : preview.accessType === "relay_creator"
+                    ? "You’ve been invited to create and manage your own Relays, including Relay updates. Hearth updates stay restricted."
+                    : `You’ve been invited as ${preview.role ?? "a user"}${
+                        preview.instanceId
+                          ? " on one managed instance."
+                          : " across this Relay."
+                      }`}
               </p>
             </div>
 
             <div className="mt-6 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-xl border bg-background/60 p-4">
-              <Server className="mt-0.5 size-4 text-primary" />
+              {preview.accessType === "relay_creator" ? (
+                <RadioTower className="mt-0.5 size-4 text-primary" />
+              ) : platformInvitation ? (
+                <ShieldCheck className="mt-0.5 size-4 text-primary" />
+              ) : (
+                <Server className="mt-0.5 size-4 text-primary" />
+              )}
               <span className="text-xs font-medium">{preview.relayName}</span>
               <span />
               <span className="font-mono text-[0.625rem] text-muted-foreground">
-                {preview.instanceId
-                  ? `Instance · ${preview.instanceId.slice(0, 10)}`
-                  : "Entire Relay"}{" "}
-                · {preview.role}
+                {platformInvitation
+                  ? invitationLabel
+                  : `${
+                      preview.instanceId
+                        ? `Instance · ${preview.instanceId.slice(0, 10)}`
+                        : "Entire Relay"
+                    } · ${invitationLabel}`}
               </span>
             </div>
 

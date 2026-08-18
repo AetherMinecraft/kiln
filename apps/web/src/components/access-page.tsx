@@ -8,6 +8,8 @@ import { Link } from "@tanstack/react-router"
 import { Effect } from "effect"
 import {
   Activity,
+  ArrowLeft,
+  ArrowRight,
   ChevronDown,
   Clock3,
   Database,
@@ -16,8 +18,10 @@ import {
   Network,
   Plus,
   RefreshCw,
+  RadioTower,
   Search,
   Server,
+  ShieldCheck,
   Trash2,
   UserRound,
   Users,
@@ -65,6 +69,7 @@ import type { FleetRelayInstance } from "@/lib/relay-fleet"
 import type { AccessRole } from "@/lib/permissions"
 import { accessRoleDetails, accessRoles, isAccessRole } from "@/lib/permissions"
 import {
+  accessCapabilitiesQueryOptions,
   accessOverviewQueryOptions,
   managedDatabaseDirectoryQueryOptions,
   queryKeys,
@@ -84,6 +89,7 @@ type AccessOwner = AccessOverview["owners"][number]
 type ManagedDatabaseDirectory = Awaited<
   ReturnType<typeof getManagedDatabaseDirectory>
 >
+type AccessType = "platform_admin" | "relay_creator" | "scoped"
 
 interface AccessTarget extends ServerPickerOption {
   databaseId: string | null
@@ -138,6 +144,9 @@ export function AccessPage({
 }) {
   const queryClient = useQueryClient()
   const { data: overview } = useSuspenseQuery(accessOverviewQueryOptions())
+  const { data: capabilities } = useSuspenseQuery(
+    accessCapabilitiesQueryOptions()
+  )
   const { data: databases } = useSuspenseQuery(
     managedDatabaseDirectoryQueryOptions()
   )
@@ -307,6 +316,7 @@ export function AccessPage({
       {addOpen ? (
         <AddUserDialog
           open
+          canAssignPlatformAccess={capabilities.isPlatformAdmin}
           ownerRelayIds={ownerRelayIds}
           targets={targets}
           onComplete={(result) => {
@@ -710,7 +720,9 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
         </div>
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden lg:table-cell">
-        <p className="truncate text-[0.625rem] text-foreground">{row.relayName}</p>
+        <p className="truncate text-[0.625rem] text-foreground">
+          {row.relayName}
+        </p>
         <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
           {row.relayId}
         </p>
@@ -792,17 +804,22 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
 
 function AddUserDialog({
   open,
+  canAssignPlatformAccess,
   ownerRelayIds,
   targets,
   onComplete,
   onOpenChange,
 }: {
   open: boolean
+  canAssignPlatformAccess: boolean
   ownerRelayIds: ReadonlySet<string>
   targets: Array<AccessTarget>
   onComplete: (result: Awaited<ReturnType<typeof grantOrInviteAccess>>) => void
   onOpenChange: (open: boolean) => void
 }) {
+  const [accessType, setAccessType] = React.useState<AccessType | null>(() =>
+    canAssignPlatformAccess ? null : "scoped"
+  )
   const [email, setEmail] = React.useState("")
   const [targetKey, setTargetKey] = React.useState(() =>
     targets[0] ? serverPickerOptionKey(targets[0]) : ""
@@ -831,19 +848,30 @@ function AddUserDialog({
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!selectedTarget || mutation.isPending) return
+    if (
+      !accessType ||
+      (accessType === "scoped" && !selectedTarget) ||
+      mutation.isPending
+    )
+      return
     await Effect.runPromise(
       Effect.tryPromise({
         try: () =>
           mutation.mutateAsync({
-            data: {
-              databaseId: selectedTarget.databaseId,
-              email,
-              instanceId: selectedTarget.instanceId,
-              relayId: selectedTarget.relayId,
-              resourceName: selectedTarget.resourceName,
-              role,
-            },
+            data:
+              accessType === "scoped" && selectedTarget
+                ? {
+                    accessType,
+                    databaseId: selectedTarget.databaseId,
+                    email,
+                    instanceId: selectedTarget.instanceId,
+                    relayId: selectedTarget.relayId,
+                    resourceName: selectedTarget.resourceName,
+                    role,
+                  }
+                : accessType === "platform_admin"
+                  ? { accessType: "platform_admin", email }
+                  : { accessType: "relay_creator", email },
           }),
         catch: (cause) => cause,
       }).pipe(Effect.catch(() => Effect.void))
@@ -858,136 +886,266 @@ function AddUserDialog({
       }}
     >
       <DialogContent
-        className="overflow-visible sm:max-w-xl"
+        className="overflow-visible sm:max-w-2xl"
         showCloseButton={!mutation.isPending}
       >
-        <DialogHeader>
-          <DialogTitle>Add user access</DialogTitle>
-          <DialogDescription>
-            Existing accounts receive access immediately. New emails receive a
-            seven-day invitation. When email delivery is configured, both paths
-            send an email.
-          </DialogDescription>
-        </DialogHeader>
-        <form className="space-y-4" onSubmit={(event) => void submit(event)}>
-          <Field label="Email address">
-            <Input
-              autoFocus
-              required
-              type="email"
-              autoComplete="email"
-              placeholder="operator@example.com"
-              value={email}
-              onChange={(event) => setEmail(event.currentTarget.value)}
-            />
-          </Field>
-
-          <Field label="Access scope">
-            <Popover open={scopeOpen} onOpenChange={setScopeOpen}>
-              <PopoverTrigger asChild>
+        {accessType ? (
+          <DialogHeader>
+            <div className="flex items-center gap-2">
+              {canAssignPlatformAccess ? (
                 <Button
+                  aria-label="Choose another access type"
+                  className="-ml-2 size-7"
+                  disabled={mutation.isPending}
+                  size="icon-sm"
                   type="button"
-                  variant="outline"
-                  className="h-auto min-h-10 w-full justify-between px-3 py-2 text-left"
+                  variant="ghost"
+                  onClick={() => setAccessType(null)}
                 >
-                  {selectedTarget ? (
-                    <span className="flex min-w-0 items-center gap-2.5">
-                      <ScopeIcon
-                        resourceType={
-                          selectedTarget.kind === "server"
-                            ? "instance"
-                            : (selectedTarget.kind ?? "relay")
-                        }
-                      />
-                      <span className="min-w-0">
-                        <span className="block truncate text-xs font-semibold">
-                          {selectedTarget.name}
-                        </span>
-                        <span className="block truncate font-mono text-[0.5rem] text-muted-foreground">
-                          {selectedTarget.description}
-                        </span>
-                      </span>
-                    </span>
-                  ) : (
-                    <span className="text-muted-foreground">Choose scope</span>
-                  )}
-                  <ChevronDown className="ml-3 size-4 shrink-0 text-muted-foreground" />
+                  <ArrowLeft />
                 </Button>
-              </PopoverTrigger>
-              <PopoverContent
-                align="start"
-                className="z-[70] w-[min(34rem,calc(100vw-3rem))] p-1.5"
+              ) : null}
+              <p className="font-mono text-[0.5625rem] tracking-[0.14em] text-primary uppercase">
+                {accessTypeLabel(accessType)}
+              </p>
+            </div>
+            <DialogTitle>Add user access</DialogTitle>
+            <DialogDescription>
+              Existing accounts receive access immediately. New emails receive a
+              seven-day invitation.
+            </DialogDescription>
+          </DialogHeader>
+        ) : (
+          <DialogHeader>
+            <DialogTitle>How should this user work in Kiln?</DialogTitle>
+            <DialogDescription>
+              Choose the boundary first. You can fine-tune scoped access on the
+              next step.
+            </DialogDescription>
+          </DialogHeader>
+        )}
+
+        {!accessType ? (
+          <AccessTypePicker onSelect={setAccessType} />
+        ) : (
+          <form className="space-y-4" onSubmit={(event) => void submit(event)}>
+            <Field label="Email address">
+              <Input
+                autoFocus
+                required
+                type="email"
+                autoComplete="email"
+                placeholder="operator@example.com"
+                value={email}
+                onChange={(event) => setEmail(event.currentTarget.value)}
+              />
+            </Field>
+
+            {accessType === "scoped" ? (
+              <Field label="Access scope">
+                <Popover open={scopeOpen} onOpenChange={setScopeOpen}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-auto min-h-10 w-full justify-between px-3 py-2 text-left"
+                    >
+                      {selectedTarget ? (
+                        <span className="flex min-w-0 items-center gap-2.5">
+                          <ScopeIcon
+                            resourceType={
+                              selectedTarget.kind === "server"
+                                ? "instance"
+                                : (selectedTarget.kind ?? "relay")
+                            }
+                          />
+                          <span className="min-w-0">
+                            <span className="block truncate text-xs font-semibold">
+                              {selectedTarget.name}
+                            </span>
+                            <span className="block truncate font-mono text-[0.5rem] text-muted-foreground">
+                              {selectedTarget.description}
+                            </span>
+                          </span>
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">
+                          Choose scope
+                        </span>
+                      )}
+                      <ChevronDown className="ml-3 size-4 shrink-0 text-muted-foreground" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent
+                    align="start"
+                    className="z-[70] w-[min(34rem,calc(100vw-3rem))] p-1.5"
+                  >
+                    <ServerPickerList
+                      ariaLabel="Access scopes"
+                      emptyMessage="No matching Relays, servers, or databases."
+                      multiple={false}
+                      searchPlaceholder="Search by server, Relay, database, or ID"
+                      selectedKeys={selectedKeys}
+                      servers={targets}
+                      onSelect={(option) => {
+                        const nextKey = serverPickerOptionKey(option)
+                        const nextTarget = targets.find(
+                          (target) => serverPickerOptionKey(target) === nextKey
+                        )
+                        setTargetKey(nextKey)
+                        if (
+                          role === "owner" &&
+                          nextTarget &&
+                          !ownerRelayIds.has(nextTarget.relayId)
+                        ) {
+                          setRole("operator")
+                        }
+                        setScopeOpen(false)
+                      }}
+                    />
+                  </PopoverContent>
+                </Popover>
+              </Field>
+            ) : null}
+
+            {accessType === "scoped" ? (
+              <Field label="Role">
+                <select
+                  className="h-10 w-full rounded-md border border-input bg-background px-3 text-xs outline-none focus:border-ring"
+                  value={role}
+                  onChange={(event) =>
+                    setRole(accessRoleFromValue(event.currentTarget.value))
+                  }
+                >
+                  {assignableRoles.map((accessRole) => (
+                    <option key={accessRole} value={accessRole}>
+                      {accessRoleDetails[accessRole].label}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-2 text-[0.625rem] leading-4 text-muted-foreground">
+                  {accessRoleDetails[role].description}
+                </p>
+              </Field>
+            ) : (
+              <AccessTypeSummary accessType={accessType} />
+            )}
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={mutation.isPending}
+                onClick={() => onOpenChange(false)}
               >
-                <ServerPickerList
-                  ariaLabel="Access scopes"
-                  emptyMessage="No matching Relays, servers, or databases."
-                  multiple={false}
-                  searchPlaceholder="Search by server, Relay, database, or ID"
-                  selectedKeys={selectedKeys}
-                  servers={targets}
-                  onSelect={(option) => {
-                    const nextKey = serverPickerOptionKey(option)
-                    const nextTarget = targets.find(
-                      (target) => serverPickerOptionKey(target) === nextKey
-                    )
-                    setTargetKey(nextKey)
-                    if (
-                      role === "owner" &&
-                      nextTarget &&
-                      !ownerRelayIds.has(nextTarget.relayId)
-                    ) {
-                      setRole("operator")
-                    }
-                    setScopeOpen(false)
-                  }}
-                />
-              </PopoverContent>
-            </Popover>
-          </Field>
-
-          <Field label="Role">
-            <select
-              className="h-10 w-full rounded-md border border-input bg-background px-3 text-xs outline-none focus:border-ring"
-              value={role}
-              onChange={(event) =>
-                setRole(accessRoleFromValue(event.currentTarget.value))
-              }
-            >
-              {assignableRoles.map((accessRole) => (
-                <option key={accessRole} value={accessRole}>
-                  {accessRoleDetails[accessRole].label}
-                </option>
-              ))}
-            </select>
-            <p className="mt-2 text-[0.625rem] leading-4 text-muted-foreground">
-              {accessRoleDetails[role].description}
-            </p>
-          </Field>
-
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              disabled={mutation.isPending}
-              onClick={() => onOpenChange(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              disabled={!selectedTarget || mutation.isPending}
-            >
-              {mutation.isPending ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <Plus />
-              )}
-              Add user
-            </Button>
-          </DialogFooter>
-        </form>
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                disabled={
+                  !email ||
+                  (accessType === "scoped" && !selectedTarget) ||
+                  mutation.isPending
+                }
+              >
+                {mutation.isPending ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : (
+                  <Plus />
+                )}
+                Add user
+              </Button>
+            </DialogFooter>
+          </form>
+        )}
       </DialogContent>
     </Dialog>
+  )
+}
+
+const accessTypeOptions = [
+  {
+    description: "Full access to Hearth, every Relay, and platform settings.",
+    icon: ShieldCheck,
+    label: "Platform admin",
+    scope: "Hearth + all Relays",
+    value: "platform_admin",
+  },
+  {
+    description:
+      "Create and manage only their own Relays, including Relay updates—not Hearth updates.",
+    icon: RadioTower,
+    label: "Bring your own Relay",
+    scope: "Own Relays",
+    value: "relay_creator",
+  },
+  {
+    description:
+      "Choose exact Relays, servers, or databases and assign a role for each scope.",
+    icon: ListFilter,
+    label: "Scoped access",
+    scope: "Selected resources",
+    value: "scoped",
+  },
+] as const
+
+const AccessTypePicker = React.memo(function AccessTypePicker({
+  onSelect,
+}: {
+  onSelect: (accessType: AccessType) => void
+}) {
+  return (
+    <div className="grid gap-2" role="group" aria-label="Access types">
+      {accessTypeOptions.map((option) => (
+        <button
+          key={option.value}
+          className="group grid w-full grid-cols-[auto_1fr_auto] items-center gap-3 rounded-lg border bg-background/35 px-3.5 py-3 text-left transition-colors hover:border-primary/45 hover:bg-primary/[0.04] focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35 focus-visible:outline-none"
+          type="button"
+          onClick={() => onSelect(option.value)}
+        >
+          <span className="grid size-9 place-items-center rounded-md border bg-card text-muted-foreground transition-colors group-hover:text-primary">
+            <option.icon className="size-4" />
+          </span>
+          <span className="min-w-0">
+            <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+              <span className="text-xs font-semibold text-foreground">
+                {option.label}
+              </span>
+              <span className="font-mono text-[0.5rem] tracking-wide text-muted-foreground uppercase">
+                {option.scope}
+              </span>
+            </span>
+            <span className="mt-1 block text-[0.625rem] leading-4 text-muted-foreground">
+              {option.description}
+            </span>
+          </span>
+          <ArrowRight className="size-4 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary" />
+        </button>
+      ))}
+    </div>
+  )
+})
+
+function AccessTypeSummary({ accessType }: { accessType: AccessType }) {
+  const option = accessTypeOptions.find((item) => item.value === accessType)
+  if (!option) return null
+  return (
+    <div className="flex items-start gap-3 rounded-lg border border-primary/20 bg-primary/[0.04] px-3.5 py-3">
+      <option.icon className="mt-0.5 size-4 shrink-0 text-primary" />
+      <div>
+        <p className="text-xs font-semibold">{option.scope}</p>
+        <p className="mt-1 text-[0.625rem] leading-4 text-muted-foreground">
+          {option.description}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function accessTypeLabel(accessType: AccessType): string {
+  return (
+    accessTypeOptions.find((option) => option.value === accessType)?.label ??
+    "Access"
   )
 }
 
@@ -1057,7 +1215,7 @@ function PendingInvitationsDialog({
   ownerRelayIds: ReadonlySet<string>
   pendingId?: string
   onOpenChange: (open: boolean) => void
-  onRevoke: (id: string, relayId: string) => void
+  onRevoke: (id: string, relayId: string | null) => void
 }) {
   const titleRef = React.useRef<HTMLHeadingElement>(null)
   const instanceNames = React.useMemo(
@@ -1137,6 +1295,13 @@ function PendingInvitationsDialog({
                     : undefined
                   const resourceName =
                     databaseName ?? instanceName ?? invitation.relayName
+                  const platformInvitation = invitation.accessType !== "scoped"
+                  const invitationRole =
+                    invitation.accessType === "platform_admin"
+                      ? "Platform admin"
+                      : invitation.accessType === "relay_creator"
+                        ? "Relay creator"
+                        : invitation.role
                   return (
                     <tr key={invitation.id} className="hover:bg-accent/25">
                       <WorkspaceTableCell>
@@ -1145,13 +1310,17 @@ function PendingInvitationsDialog({
                         </p>
                       </WorkspaceTableCell>
                       <WorkspaceTableCell>
-                        <p className="truncate text-[0.625rem]">{resourceName}</p>
+                        <p className="truncate text-[0.625rem]">
+                          {resourceName}
+                        </p>
                         <p className="font-mono text-[0.5rem] text-muted-foreground uppercase">
-                          {databaseName
-                            ? "Database"
-                            : instanceName
-                              ? "Server"
-                              : "Relay"}
+                          {platformInvitation
+                            ? "Platform"
+                            : databaseName
+                              ? "Database"
+                              : instanceName
+                                ? "Server"
+                                : "Relay"}
                         </p>
                       </WorkspaceTableCell>
                       <WorkspaceTableCell>
@@ -1159,7 +1328,7 @@ function PendingInvitationsDialog({
                           variant="outline"
                           className="font-mono text-[0.5rem] capitalize"
                         >
-                          {invitation.role}
+                          {invitationRole}
                         </Badge>
                       </WorkspaceTableCell>
                       <WorkspaceTableCell className="font-mono text-[0.5625rem] text-muted-foreground">
@@ -1178,6 +1347,7 @@ function PendingInvitationsDialog({
                                   disabled={
                                     pendingId !== undefined ||
                                     (invitation.role === "owner" &&
+                                      invitation.relayId !== null &&
                                       !ownerRelayIds.has(invitation.relayId))
                                   }
                                   onClick={() =>
@@ -1194,6 +1364,7 @@ function PendingInvitationsDialog({
                             </TooltipTrigger>
                             <TooltipContent side="bottom">
                               {invitation.role === "owner" &&
+                              invitation.relayId !== null &&
                               !ownerRelayIds.has(invitation.relayId)
                                 ? "Only a Relay owner can revoke this invitation"
                                 : "Revoke invitation"}
@@ -1439,7 +1610,8 @@ function showAccessAssignmentToast(
   if (result.kind === "granted") {
     const notificationDescription = {
       disabled: "Email delivery is disabled; no notification was sent.",
-      failed: "Access was granted, but the notification email could not be sent.",
+      failed:
+        "Access was granted, but the notification email could not be sent.",
       sent: "A notification email was sent.",
     } satisfies Record<typeof result.notificationStatus, string>
     showToast({

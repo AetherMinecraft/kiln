@@ -3,14 +3,45 @@ import { Effect, Layer } from "effect"
 import type { ResultSetHeader } from "mysql2/promise"
 
 import { Database } from "@/effect/database"
+import type { AuthenticatedUser } from "@/lib/auth-session"
 import {
   accessGrantRoleChangeError,
   deduplicateEffectiveInstanceGrants,
   deleteInstanceAccessEffect,
   isBlockedInstanceOwnerRoleChange,
   isCurrentInstanceOwnerGrant,
+  isPlatformAdmin,
   isProtectedInstanceOwnerGrant,
+  isRelayCreator,
 } from "@/lib/access-control"
+
+const authenticatedUser = {
+  email: "user@example.com",
+  emailVerified: true,
+  id: "user-one",
+  isDevelopmentBypass: false,
+  name: "User",
+  role: "user",
+  twoFactorEnabled: false,
+} satisfies AuthenticatedUser
+
+describe("platform access roles", () => {
+  it("keeps Relay creators distinct from platform administrators", () => {
+    const relayCreator = {
+      ...authenticatedUser,
+      role: "relay_creator",
+    } satisfies AuthenticatedUser
+    const platformAdmin = {
+      ...authenticatedUser,
+      role: "admin",
+    } satisfies AuthenticatedUser
+
+    assert.isTrue(isRelayCreator(relayCreator))
+    assert.isFalse(isPlatformAdmin(relayCreator))
+    assert.isTrue(isPlatformAdmin(platformAdmin))
+    assert.isFalse(isRelayCreator(platformAdmin))
+  })
+})
 
 const emptyResult: ResultSetHeader = {
   affectedRows: 0,
