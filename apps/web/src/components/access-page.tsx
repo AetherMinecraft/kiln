@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  ShieldCheck,
   Trash2,
   UserRound,
   Users,
@@ -80,6 +81,7 @@ import {
   getAccessOverview,
   grantOrInviteAccess,
   removeAccessGrant,
+  removePlatformAccess,
   revokeAccessInvitation,
   updateAccessGrant,
 } from "@/server/access"
@@ -92,6 +94,13 @@ type ManagedDatabaseDirectory = Awaited<
   ReturnType<typeof getManagedDatabaseDirectory>
 >
 type AccessType = "platform_admin" | "relay_creator" | "scoped"
+type PlatformAccessType = Exclude<AccessType, "scoped">
+type AccessDirectoryRole = AccessRole | PlatformAccessType
+type AccessDirectoryResourceType =
+  | "database"
+  | "instance"
+  | "platform"
+  | "relay"
 
 interface AccessAssignmentDraft {
   accessType: AccessType
@@ -111,33 +120,59 @@ interface AccessPageInstance {
   relayId: string
 }
 
-interface AccessDirectoryRow {
+interface AccessDirectoryRowBase {
   createdAt: string
   email: string
-  grant: AccessGrant | null
-  instanceId: string | null
-  instanceOwner: boolean
   key: string
   relayId: string
   relayName: string
   resourceId: string
   resourceName: string
-  resourceType: "database" | "instance" | "relay"
-  role: AccessRole
+  resourceType: AccessDirectoryResourceType
+  role: AccessDirectoryRole
   userId: string
 }
 
-interface RemoveTarget {
+interface ScopedAccessDirectoryRow extends AccessDirectoryRowBase {
+  accessType: "scoped"
+  grant: AccessGrant | null
+  instanceId: string | null
+  instanceOwner: boolean
+  resourceType: "database" | "instance" | "relay"
+  role: AccessRole
+}
+
+interface PlatformAccessDirectoryRow extends AccessDirectoryRowBase {
+  accessType: PlatformAccessType
+  grant: null
+  instanceId: null
+  instanceOwner: false
+  resourceType: "platform"
+  role: PlatformAccessType
+}
+
+type AccessDirectoryRow = PlatformAccessDirectoryRow | ScopedAccessDirectoryRow
+
+interface ScopedRemoveTarget {
+  accessType: "scoped"
   email: string
   grantId: string
   relayId: string
   resourceName: string
 }
 
+interface PlatformRemoveTarget {
+  accessType: PlatformAccessType
+  email: string
+  userId: string
+}
+
+type RemoveTarget = PlatformRemoveTarget | ScopedRemoveTarget
+
 interface AccessFilters {
   relayId: string
-  resourceType: "" | AccessDirectoryRow["resourceType"]
-  role: "" | AccessRole
+  resourceType: "" | AccessDirectoryResourceType
+  role: "" | AccessDirectoryRole
 }
 
 const emptyAccessFilters: AccessFilters = {
@@ -184,6 +219,11 @@ export function AccessPage({
     () => accessDirectoryRows(overview, instances, databases),
     [databases, instances, overview]
   )
+  const platformAdminIds = overview.platformUsers.flatMap((platformUser) =>
+    platformUser.accessType === "platform_admin" ? [platformUser.id] : []
+  )
+  const solePlatformAdminId =
+    platformAdminIds.length === 1 ? platformAdminIds[0] : undefined
   const filteredRows = React.useMemo(
     () =>
       rows.filter(
@@ -233,6 +273,19 @@ export function AccessPage({
         type: "error",
       }),
   })
+  const removePlatformMutation = useMutation({
+    mutationFn: removePlatformAccess,
+    onSuccess: async () => {
+      setRemoveTarget(null)
+      showToast({ message: "Platform access removed", type: "success" })
+      await invalidateAccessQueries(queryClient)
+    },
+    onError: (cause) =>
+      showToast({
+        message: errorMessage(cause, "Could not remove platform access"),
+        type: "error",
+      }),
+  })
   const revokeInvitationMutation = useMutation({
     mutationFn: revokeAccessInvitation,
     onSuccess: async () => {
@@ -270,8 +323,17 @@ export function AccessPage({
     [updateGrant]
   )
   const selectRemoveTarget = React.useCallback((row: AccessDirectoryRow) => {
+    if (row.accessType !== "scoped") {
+      setRemoveTarget({
+        accessType: row.accessType,
+        email: row.email,
+        userId: row.userId,
+      })
+      return
+    }
     if (!row.grant) return
     setRemoveTarget({
+      accessType: "scoped",
       email: row.email,
       grantId: row.grant.id,
       relayId: row.relayId,
@@ -295,6 +357,7 @@ export function AccessPage({
           activeFilterCount={activeFilterCount}
           filters={filters}
           invitationCount={overview.invitations.length}
+          platformAccessVisible={capabilities.isPlatformAdmin}
           relays={overview.relays}
           searchStore={searchStore}
           onAdd={openAddDialog}
@@ -304,6 +367,7 @@ export function AccessPage({
         <AccessDirectoryTable
           filtersActive={activeFilterCount > 0}
           ownerRelayIds={ownerRelayIds}
+          solePlatformAdminId={solePlatformAdminId}
           pendingGrantId={
             updateGrantMutation.isPending
               ? updateGrantMutation.variables?.data.id
@@ -347,17 +411,28 @@ export function AccessPage({
       ) : null}
 
       <RemoveAccessDialog
-        pending={removeGrantMutation.isPending}
-        target={removeTarget}
-        onConfirm={(target) =>
-          removeGrantMutation.mutate({
-            data: { id: target.grantId, relayId: target.relayId },
-          })
+        pending={
+          removeGrantMutation.isPending || removePlatformMutation.isPending
         }
+        target={removeTarget}
+        onConfirm={(target) => {
+          if (target.accessType === "scoped") {
+            removeGrantMutation.mutate({
+              data: { id: target.grantId, relayId: target.relayId },
+            })
+            return
+          }
+          removePlatformMutation.mutate({ data: { userId: target.userId } })
+        }}
         onOpenChange={(open) => {
-          if (!open && !removeGrantMutation.isPending) {
+          if (
+            !open &&
+            !removeGrantMutation.isPending &&
+            !removePlatformMutation.isPending
+          ) {
             setRemoveTarget(null)
             removeGrantMutation.reset()
+            removePlatformMutation.reset()
           }
         }}
       />
@@ -369,6 +444,7 @@ const AccessToolbar = React.memo(function AccessToolbar({
   activeFilterCount,
   filters,
   invitationCount,
+  platformAccessVisible,
   relays,
   searchStore,
   onAdd,
@@ -378,6 +454,7 @@ const AccessToolbar = React.memo(function AccessToolbar({
   activeFilterCount: number
   filters: AccessFilters
   invitationCount: number
+  platformAccessVisible: boolean
   relays: AccessOverview["relays"]
   searchStore: WorkspaceTableSearchStore
   onAdd: () => void
@@ -413,7 +490,13 @@ const AccessToolbar = React.memo(function AccessToolbar({
             onFiltersChange({ role: accessRoleFilterFromValue(role) })
           }
         >
-          <option value="">All roles</option>
+          <option value="">All roles and types</option>
+          {platformAccessVisible ? (
+            <>
+              <option value="platform_admin">Platform Admin</option>
+              <option value="relay_creator">Bring Your Own Relays</option>
+            </>
+          ) : null}
           {accessRoles.map((role) => (
             <option key={role} value={role}>
               {accessRoleDetails[role].label}
@@ -432,6 +515,9 @@ const AccessToolbar = React.memo(function AccessToolbar({
           }
         >
           <option value="">All scopes</option>
+          {platformAccessVisible ? (
+            <option value="platform">Platform</option>
+          ) : null}
           <option value="relay">Relays</option>
           <option value="instance">Servers</option>
           <option value="database">Databases</option>
@@ -576,6 +662,7 @@ const AccessDirectoryTable = React.memo(function AccessDirectoryTable({
   pendingGrantId,
   rows,
   searchStore,
+  solePlatformAdminId,
   onRemove,
   onRoleChange,
 }: {
@@ -584,6 +671,7 @@ const AccessDirectoryTable = React.memo(function AccessDirectoryTable({
   pendingGrantId?: string
   rows: Array<AccessDirectoryRow>
   searchStore: WorkspaceTableSearchStore
+  solePlatformAdminId?: string
   onRemove: (row: AccessDirectoryRow) => void
   onRoleChange: (row: AccessDirectoryRow, role: AccessRole) => void
 }) {
@@ -592,12 +680,13 @@ const AccessDirectoryTable = React.memo(function AccessDirectoryTable({
       <AccessDirectoryTableRow
         ownerRelayIds={ownerRelayIds}
         pending={row.grant?.id === pendingGrantId}
+        protectedPlatformAdmin={row.userId === solePlatformAdminId}
         row={row}
         onRemove={onRemove}
         onRoleChange={onRoleChange}
       />
     ),
-    [onRemove, onRoleChange, ownerRelayIds, pendingGrantId]
+    [onRemove, onRoleChange, ownerRelayIds, pendingGrantId, solePlatformAdminId]
   )
   const renderEmpty = React.useCallback(
     (searchActive: boolean) => (
@@ -607,12 +696,12 @@ const AccessDirectoryTable = React.memo(function AccessDirectoryTable({
           <p className="mt-3 text-sm font-semibold">
             {searchActive || filtersActive
               ? "No matching access"
-              : "No scoped users yet"}
+              : "No users yet"}
           </p>
           <p className="mt-1 text-[0.6875rem] text-muted-foreground">
             {searchActive || filtersActive
               ? "Try another email, scope, Relay, or role."
-              : "Add a user to grant access to a Relay, server, or database."}
+              : "Add a user to grant platform or scoped access."}
           </p>
         </div>
       </div>
@@ -663,16 +752,27 @@ const AccessDirectoryTableHead = React.memo(
 const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
   ownerRelayIds,
   pending,
+  protectedPlatformAdmin,
   row,
   onRemove,
   onRoleChange,
 }: {
   ownerRelayIds: ReadonlySet<string>
   pending: boolean
+  protectedPlatformAdmin: boolean
   row: AccessDirectoryRow
   onRemove: (row: AccessDirectoryRow) => void
   onRoleChange: (row: AccessDirectoryRow, role: AccessRole) => void
 }) {
+  if (row.accessType !== "scoped") {
+    return (
+      <PlatformAccessDirectoryTableRow
+        protectedAdmin={protectedPlatformAdmin}
+        row={row}
+        onRemove={onRemove}
+      />
+    )
+  }
   const ownerActionAllowed =
     row.role !== "owner" || ownerRelayIds.has(row.relayId)
   const canRepairOwnerRole =
@@ -823,6 +923,93 @@ const AccessDirectoryTableRow = React.memo(function AccessDirectoryTableRow({
     </tr>
   )
 })
+
+const PlatformAccessDirectoryTableRow = React.memo(
+  function PlatformAccessDirectoryTableRow({
+    protectedAdmin,
+    row,
+    onRemove,
+  }: {
+    protectedAdmin: boolean
+    row: PlatformAccessDirectoryRow
+    onRemove: (row: AccessDirectoryRow) => void
+  }) {
+    const label =
+      row.accessType === "platform_admin"
+        ? "Platform Admin"
+        : "Bring Your Own Relays"
+
+    return (
+      <tr className="group transition-colors hover:bg-accent/25">
+        <WorkspaceTableCell>
+          <div className="flex min-w-0 items-center gap-2.5">
+            <span className="grid size-7 shrink-0 place-items-center rounded-md border border-primary/25 bg-primary/10 text-primary">
+              <UserRound className="size-3.5" />
+            </span>
+            <p className="truncate text-xs font-medium">{row.email}</p>
+          </div>
+        </WorkspaceTableCell>
+        <WorkspaceTableCell>
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="grid size-7 shrink-0 place-items-center rounded-md border border-primary/25 bg-primary/10 text-primary">
+              <ShieldCheck className="size-3.5" />
+            </span>
+            <div className="min-w-0">
+              <p className="truncate text-[0.625rem] font-medium text-foreground">
+                {row.resourceName}
+              </p>
+              <p className="truncate font-mono text-[0.5rem] text-muted-foreground uppercase">
+                Platform
+              </p>
+            </div>
+          </div>
+        </WorkspaceTableCell>
+        <WorkspaceTableCell className="hidden lg:table-cell">
+          <p className="truncate text-[0.625rem] text-foreground">
+            {row.accessType === "platform_admin" ? "All Relays" : "Own Relays"}
+          </p>
+          <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
+            —
+          </p>
+        </WorkspaceTableCell>
+        <WorkspaceTableCell>
+          <div className="flex h-8 w-full items-center rounded-md border border-primary/25 bg-primary/10 px-3 text-[0.625rem] font-medium text-primary">
+            {label}
+          </div>
+        </WorkspaceTableCell>
+        <WorkspaceTableCell className="hidden font-mono text-[0.5625rem] text-muted-foreground xl:table-cell">
+          <HydratedDate value={row.createdAt} />
+        </WorkspaceTableCell>
+        <WorkspaceTableCell className="px-1 sm:px-3">
+          <div className="flex items-center justify-end">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    className="text-muted-foreground hover:text-destructive"
+                    aria-label={`Remove platform access for ${row.email}`}
+                    disabled={protectedAdmin}
+                    onClick={() => onRemove(row)}
+                  >
+                    <Trash2 />
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {protectedAdmin
+                  ? "At least one Platform Admin is required"
+                  : "Remove platform access"}
+              </TooltipContent>
+            </Tooltip>
+          </div>
+        </WorkspaceTableCell>
+      </tr>
+    )
+  }
+)
 
 const AddUserDialog = React.memo(function AddUserDialog({
   open,
@@ -1282,15 +1469,37 @@ function RemoveAccessDialog({
   onConfirm: (target: RemoveTarget) => void
   onOpenChange: (open: boolean) => void
 }) {
+  const platformTarget = target?.accessType !== "scoped" ? target : null
   return (
     <Dialog open={target !== null} onOpenChange={onOpenChange}>
       <DialogContent showCloseButton={!pending}>
         <DialogHeader>
-          <DialogTitle>Remove this access?</DialogTitle>
+          <DialogTitle>
+            {platformTarget ? "Remove platform access?" : "Remove this access?"}
+          </DialogTitle>
           <DialogDescription>
-            {target?.email ?? "This user"} will lose access to{" "}
-            {target?.resourceName ?? "this scope"}. Their Kiln account and all
-            other server or Relay access will remain intact.
+            {platformTarget ? (
+              platformTarget.accessType === "platform_admin" ? (
+                <>
+                  {platformTarget.email} will lose access to Hearth and all
+                  Relays. Existing server ownership remains.
+                </>
+              ) : (
+                <>
+                  {platformTarget.email} will no longer be able to add or manage
+                  Relays. Existing scoped access remains.
+                </>
+              )
+            ) : (
+              <>
+                {target?.email ?? "This user"} will lose access to{" "}
+                {target?.accessType === "scoped"
+                  ? target.resourceName
+                  : "this scope"}
+                . Their Kiln account and all other server or Relay access will
+                remain intact.
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
@@ -1656,7 +1865,8 @@ function accessDirectoryRows(
       ? []
       : [accessOwnerDirectoryRow(owner, instanceNames)]
   )
-  return [...grantRows, ...ownerRows].sort((left, right) =>
+  const platformRows = overview.platformUsers.map(platformAccessDirectoryRow)
+  return [...platformRows, ...grantRows, ...ownerRows].sort((left, right) =>
     `${left.email}\u0000${left.resourceName}`.localeCompare(
       `${right.email}\u0000${right.resourceName}`
     )
@@ -1670,6 +1880,7 @@ function accessGrantDirectoryRow(
 ): AccessDirectoryRow {
   const resourceKey = accessResourceKey(grant.relayId, grant.resourceId)
   return {
+    accessType: "scoped",
     createdAt: grant.createdAt,
     email: grant.email,
     grant,
@@ -1696,6 +1907,7 @@ function accessOwnerDirectoryRow(
   instanceNames: ReadonlyMap<string, string>
 ): AccessDirectoryRow {
   return {
+    accessType: "scoped",
     createdAt: owner.createdAt,
     email: owner.email,
     grant: null,
@@ -1714,6 +1926,30 @@ function accessOwnerDirectoryRow(
   }
 }
 
+function platformAccessDirectoryRow(
+  platformUser: AccessOverview["platformUsers"][number]
+): PlatformAccessDirectoryRow {
+  return {
+    accessType: platformUser.accessType,
+    createdAt: platformUser.createdAt,
+    email: platformUser.email,
+    grant: null,
+    instanceId: null,
+    instanceOwner: false,
+    key: `platform:${platformUser.id}`,
+    relayId: "",
+    relayName: "",
+    resourceId: platformUser.accessType,
+    resourceName:
+      platformUser.accessType === "platform_admin"
+        ? "Hearth + all Relays"
+        : "Own Relays",
+    resourceType: "platform",
+    role: platformUser.accessType,
+    userId: platformUser.id,
+  }
+}
+
 function accessResourceKey(relayId: string, resourceId: string): string {
   return `${relayId}:${resourceId}`
 }
@@ -1723,7 +1959,13 @@ function accessDirectoryRowKey(row: AccessDirectoryRow): string {
 }
 
 function accessDirectorySearchText(row: AccessDirectoryRow): string {
-  return `${row.email} ${row.resourceName} ${row.resourceId} ${row.resourceType} ${row.relayName} ${row.relayId} ${row.role}`
+  const roleLabel =
+    row.role === "platform_admin"
+      ? "Platform Admin"
+      : row.role === "relay_creator"
+        ? "Bring Your Own Relays"
+        : accessRoleDetails[row.role].label
+  return `${row.email} ${row.resourceName} ${row.resourceId} ${row.resourceType} ${row.relayName} ${row.relayId} ${roleLabel}`
 }
 
 function showAccessAssignmentToast(
@@ -1791,13 +2033,20 @@ function accessRoleFromValue(value: string): AccessRole {
 }
 
 function accessRoleFilterFromValue(value: string): AccessFilters["role"] {
-  return isAccessRole(value) ? value : ""
+  return isAccessRole(value) ||
+    value === "platform_admin" ||
+    value === "relay_creator"
+    ? value
+    : ""
 }
 
 function accessResourceFilterFromValue(
   value: string
 ): AccessFilters["resourceType"] {
-  return value === "database" || value === "instance" || value === "relay"
+  return value === "database" ||
+    value === "instance" ||
+    value === "platform" ||
+    value === "relay"
     ? value
     : ""
 }

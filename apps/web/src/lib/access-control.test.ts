@@ -13,6 +13,7 @@ import {
   isPlatformAdmin,
   isProtectedInstanceOwnerGrant,
   isRelayCreator,
+  visibleRelaysForUser,
 } from "@/lib/access-control"
 
 const authenticatedUser = {
@@ -40,6 +41,40 @@ describe("platform access roles", () => {
     assert.isFalse(isPlatformAdmin(relayCreator))
     assert.isTrue(isPlatformAdmin(platformAdmin))
     assert.isFalse(isRelayCreator(platformAdmin))
+  })
+
+  it("exposes only created or granted Relays outside platform administration", () => {
+    const relays = [
+      { createdBy: "creator", id: "owned" },
+      { createdBy: "someone-else", id: "granted" },
+      { createdBy: "someone-else", id: "private" },
+    ]
+    const creator = {
+      ...authenticatedUser,
+      id: "creator",
+      role: "relay_creator",
+    } satisfies AuthenticatedUser
+
+    assert.deepEqual(
+      visibleRelaysForUser(creator, relays, [{ relayId: "granted" }]).map(
+        (relay) => relay.id
+      ),
+      ["owned", "granted"]
+    )
+    assert.deepEqual(
+      visibleRelaysForUser(authenticatedUser, relays, [
+        { relayId: "granted" },
+      ]).map((relay) => relay.id),
+      ["granted"]
+    )
+    assert.deepEqual(
+      visibleRelaysForUser(
+        { ...authenticatedUser, role: "admin" },
+        relays,
+        []
+      ).map((relay) => relay.id),
+      ["owned", "granted", "private"]
+    )
   })
 })
 

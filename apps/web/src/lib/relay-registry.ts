@@ -774,11 +774,37 @@ export const setPersistedRelayEnabledEffect = Effect.fn("relays.setEnabled")(
   }
 )
 
+export const deletePersistedRelayEffect = Effect.fn("relay.deletePersisted")(
+  function* (id: string) {
+    const database = yield* Database
+    yield* database.transaction("relay.deletePersisted", (transaction) =>
+      Effect.gen(function* () {
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("invitation")}
+              SET revoked_at = CURRENT_TIMESTAMP(3)
+            WHERE relay_id = ?
+              AND accepted_at IS NULL
+              AND revoked_at IS NULL`,
+          [id]
+        )
+        yield* transaction.execute(
+          `DELETE FROM ${databaseTable("access_grant")} WHERE relay_id = ?`,
+          [id]
+        )
+        const result = yield* transaction.execute(
+          `DELETE FROM ${databaseTable("relay")} WHERE id = ?`,
+          [id]
+        )
+        if (result.affectedRows !== 1) {
+          return yield* Effect.fail(new Error("Relay not found"))
+        }
+      })
+    )
+  }
+)
+
 export async function deletePersistedRelay(id: string): Promise<void> {
-  const [result] = await databasePool.execute<
-    import("mysql2/promise").ResultSetHeader
-  >(`DELETE FROM ${databaseTable("relay")} WHERE id = ?`, [id])
-  if (result.affectedRows !== 1) throw new Error("Relay not found")
+  await runAppEffect("relay.deletePersisted", deletePersistedRelayEffect(id))
   const { closeRelayConnection } = await import("@/lib/relay-connection")
   closeRelayConnection(id)
 }

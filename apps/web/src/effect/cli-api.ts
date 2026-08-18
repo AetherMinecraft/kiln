@@ -62,6 +62,7 @@ import { CliAccessError, RelayUnavailableError } from "@/effect/errors"
 import {
   allowedInstanceIdsEffect,
   isPlatformAdmin,
+  isRelayCreator,
   listUserGrantsEffect,
   requireRelayPermissionEffect,
 } from "@/lib/access-control"
@@ -646,13 +647,13 @@ export const getCliBackupDownloadEffect = Effect.fn("cli.api.backups.download")(
 export const createCliServerEffect = Effect.fn("cli.api.servers.create")(
   function* (principal: CliPrincipal, unknownInput: unknown) {
     yield* requireCliWrite(principal)
-    if (!isPlatformAdmin(principal.user)) {
-      return yield* forbidden(
-        "Platform administrator access is required to create servers."
-      )
-    }
     const input = yield* parseInput(cliCreateServerRequestSchema, unknownInput)
     const relay = yield* requiredRelay(input.relayId)
+    if (!canCreateCliServer(principal.user, relay)) {
+      return yield* forbidden(
+        "You can only create servers on Relays you manage."
+      )
+    }
     const recipe = yield* resolveBrickSource(relay, input.brick, principal)
     const result = yield* relayRpcEffect(
       relay,
@@ -679,6 +680,16 @@ export const createCliServerEffect = Effect.fn("cli.api.servers.create")(
     })
   }
 )
+
+export function canCreateCliServer(
+  user: CliPrincipal["user"],
+  relay: Pick<PersistedRelay, "createdBy">
+): boolean {
+  return (
+    isPlatformAdmin(user) ||
+    (isRelayCreator(user) && relay.createdBy === user.id)
+  )
+}
 
 export const updateCliServerStartupEffect = Effect.fn(
   "cli.api.servers.startup.update"

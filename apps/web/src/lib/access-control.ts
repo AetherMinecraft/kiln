@@ -245,6 +245,22 @@ export function isRelayCreator(user: AuthenticatedUser): boolean {
   return !user.isDevelopmentBypass && user.role === "relay_creator"
 }
 
+export function visibleRelaysForUser<
+  TRelay extends { createdBy: string | null; id: string },
+>(
+  user: AuthenticatedUser,
+  relays: ReadonlyArray<TRelay>,
+  grants: Iterable<Pick<AccessGrant, "relayId">>
+): Array<TRelay> {
+  if (isPlatformAdmin(user)) return [...relays]
+  const grantedRelayIds = new Set(Array.from(grants, (grant) => grant.relayId))
+  return relays.filter(
+    (relay) =>
+      grantedRelayIds.has(relay.id) ||
+      (isRelayCreator(user) && relay.createdBy === user.id)
+  )
+}
+
 export function hasPlatformPermission(
   user: AuthenticatedUser,
   permission: PlatformPermission
