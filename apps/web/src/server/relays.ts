@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto"
-
 import { createServerFn } from "@tanstack/react-start"
 import {
   relayConnectionSettingsSchema,
@@ -14,8 +12,6 @@ import {
 import { z } from "zod"
 
 import { isPlatformAdmin, isRelayCreator } from "@/lib/access-control"
-import { databasePool } from "@/lib/database"
-import { databaseTable } from "@/lib/database-config"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { requireAuthenticatedUser } from "@/server/auth"
 
@@ -119,20 +115,10 @@ export const addRelay = createServerFn({ method: "POST" })
     if (preview.mode === "repair") {
       await requireRelayAdministrator(preview.relayFingerprint)
     }
-    const relay = await pairPersistedRelay(data.pairingUri, user.id)
-    if (preview.mode === "add" && isRelayCreator(user)) {
-      if (relay.createdBy !== user.id) {
-        throw new Error("You can only manage Relays you created")
-      }
-      await databasePool.execute(
-        `INSERT INTO ${databaseTable("access_grant")}
-          (id, user_id, relay_id, resource_type, resource_id, role, granted_by)
-         VALUES (?, ?, ?, 'relay', ?, 'owner', ?)
-         ON DUPLICATE KEY UPDATE role = 'owner', granted_by = VALUES(granted_by)`,
-        [randomUUID(), user.id, relay.id, relay.id, user.id]
-      )
-    }
-    return relay
+    return pairPersistedRelay(data.pairingUri, {
+      canManageAnyRelay: isPlatformAdmin(user),
+      userId: user.id,
+    })
   })
 
 export const updateRelay = createServerFn({ method: "POST" })

@@ -151,6 +151,14 @@ describe("platform access changes", () => {
         )
       )
       assert.isTrue(
+        statements.some(
+          ({ sql, values }) =>
+            sql.includes("kiln_invitation") &&
+            sql.includes("access_type <> 'scoped'") &&
+            values[0] === target.email
+        )
+      )
+      assert.isTrue(
         statements.some(({ sql }) => /DELETE FROM .*session/u.test(sql))
       )
       assert.isTrue(

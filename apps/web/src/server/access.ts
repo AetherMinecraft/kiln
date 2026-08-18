@@ -1402,6 +1402,15 @@ export function removePlatformAccessEffect(input: {
             `UPDATE ${databaseTable("user")} SET role = 'user' WHERE id = ?`,
             [target.id]
           )
+          yield* transaction.execute(
+            `UPDATE ${databaseTable("invitation")}
+                SET revoked_at = CURRENT_TIMESTAMP(3)
+              WHERE email = ?
+                AND access_type <> 'scoped'
+                AND accepted_at IS NULL
+                AND revoked_at IS NULL`,
+            [target.email]
+          )
           yield* revokeUserCredentials(transaction, target.id)
           return { removed: true }
         })
