@@ -104,6 +104,14 @@ parse_quoted_args() {
   return 0
 }
 
+is_java_argument_file() {
+  case "$1" in
+    @@*) return 1 ;;
+    @*|-XX:VMOptionsFile|-XX:VMOptionsFile=*|-XX:Flags|-XX:Flags=*) return 0 ;;
+  esac
+  return 1
+}
+
 is_managed_java_arg() {
   case "$1" in
     --nogui|-Xms*|-Xmx*) return 0 ;;
@@ -116,6 +124,10 @@ parse_quoted_args "${KILN_JAVA_ARGS:-}" || exit $?
 extra_java_args=()
 ignored_java_args=()
 for arg in "${quoted_args[@]}"; do
+  if is_java_argument_file "${arg}"; then
+    echo "[Kiln Ember] Java argument files are not allowed in KILN_JAVA_ARGS: ${arg}" >&2
+    exit 64
+  fi
   if is_managed_java_arg "${arg}"; then
     ignored_java_args+=("${arg}")
   else

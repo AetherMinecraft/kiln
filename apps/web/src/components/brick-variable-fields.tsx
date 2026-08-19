@@ -34,6 +34,9 @@ export const BrickVariableField = React.memo(function BrickVariableField({
       <label className="flex cursor-pointer items-center justify-between rounded-lg border border-border/75 bg-background/45 px-3 py-2.5 text-xs">
         <span>
           <span className="block font-medium">{definition.label}</span>
+          <span className="mt-0.5 block text-[0.5625rem] leading-4 text-muted-foreground">
+            {definition.description}
+          </span>
         </span>
         <input
           type="checkbox"
@@ -161,6 +164,9 @@ export const BrickVariableField = React.memo(function BrickVariableField({
           required={definition.required}
         />
       )}
+      <span className="block text-[0.5625rem] leading-4 font-normal">
+        {definition.description}
+      </span>
     </div>
   )
 })

@@ -418,6 +418,22 @@ test("the Java Ember rejects unmatched quotes in extra JVM arguments", async (co
   assert.deepEqual(result.args, [])
 })
 
+test("the Java Ember rejects JVM argument files in extra JVM arguments", async (context) => {
+  const argfile = await runPaperJavaEmber(context, {
+    KILN_JAVA_ARGS: "-XX:+UseG1GC @/server/flags.txt",
+  })
+  assert.equal(argfile.status, 64, argfile.stderr)
+  assert.match(argfile.stderr, /Java argument files are not allowed in KILN_JAVA_ARGS: @\/server\/flags.txt/u)
+  assert.deepEqual(argfile.args, [])
+
+  const optionsFile = await runPaperJavaEmber(context, {
+    KILN_JAVA_ARGS: "-XX:VMOptionsFile=/server/flags.txt",
+  })
+  assert.equal(optionsFile.status, 64, optionsFile.stderr)
+  assert.match(optionsFile.stderr, /Java argument files are not allowed in KILN_JAVA_ARGS: -XX:VMOptionsFile=\/server\/flags.txt/u)
+  assert.deepEqual(optionsFile.args, [])
+})
+
 test("the Java Ember rejects marker names outside the reserved namespace", async (context) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "kiln-java-ember-"))
   context.after(() => rm(temporaryDirectory, { force: true, recursive: true }))

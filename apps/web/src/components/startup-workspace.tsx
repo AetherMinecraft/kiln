@@ -48,6 +48,7 @@ import {
 } from "@/components/instance-workspace-context"
 import { WorkspaceSummaryCard } from "@/components/workspace-summary-card"
 import {
+  canPairMinecraftJavaVersionFields,
   defaultBrickVariables,
   unavailableMinecraftJavaVersion,
   updateBrickVariable,
@@ -492,10 +493,9 @@ function StartupSettingsForm({
     value: BrickVariableValue | undefined
   ) => void
 }) {
-  const versionDefinition = variableDefinitions.version
-  const javaVersionDefinition = variableDefinitions.java_version
   const javaArgsDefinition = variableDefinitions.java_args
-  const pairVersionAndJava = Boolean(versionDefinition && javaVersionDefinition)
+  const pairVersionAndJava =
+    canPairMinecraftJavaVersionFields(variableDefinitions)
   const groupedNames = new Set(
     [
       pairVersionAndJava ? "version" : null,

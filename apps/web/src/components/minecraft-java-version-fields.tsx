@@ -153,6 +153,9 @@ export const MinecraftJavaVersionFields = React.memo(
               required={required}
             />
           )}
+          <span className="block text-[0.5625rem] leading-4 font-normal">
+            {versionDefinition.description}
+          </span>
         </div>
         {javaDefinition && javaVersions.length > 0 ? (
           <div className="w-[5.75rem] shrink-0 space-y-1.5 text-xs font-medium text-muted-foreground">

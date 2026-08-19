@@ -185,7 +185,7 @@ describe("Brick recipes", () => {
           rules: {
             maxLength: 2048,
             pattern:
-              "^(?!.*(?:^|\\s)(?:-Xm[sx]\\S*|-XX:(?:InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)(?:=\\S*)?|--nogui)(?:\\s|$)).*$",
+              "^(?!.*(?:^|\\s)(?:@(?!@)\\S+|-Xm[sx]\\S*|-XX:(?:InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM|VMOptionsFile|Flags)(?:=\\S*)?|--nogui)(?:\\s|$)).*$",
           },
         },
       },
@@ -222,6 +222,14 @@ describe("Brick recipes", () => {
         java_args: '-Dmessage="hello world"',
       }).environment.KILN_JAVA_ARGS
     ).toBe('-Dmessage="hello world"')
+    expect(() =>
+      resolveBrick(javaRecipe, { java_args: "@/server/flags.txt" })
+    ).toThrow(/recipe rule/u)
+    expect(() =>
+      resolveBrick(javaRecipe, {
+        java_args: "-XX:VMOptionsFile=/server/flags.txt",
+      })
+    ).toThrow(/recipe rule/u)
   })
 
   it("rejects expressions because templates are not executable", () => {

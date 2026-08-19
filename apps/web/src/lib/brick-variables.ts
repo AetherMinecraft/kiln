@@ -18,6 +18,15 @@ export function usesLongStringBrickField(
   )
 }
 
+export function canPairMinecraftJavaVersionFields(
+  definitions: Brick["variables"]
+): boolean {
+  return (
+    definitions.version?.type === "string" &&
+    definitions.java_version?.type === "string"
+  )
+}
+
 export function updateBrickVariable(
   variables: Readonly<Record<string, BrickVariableValue>>,
   name: string,

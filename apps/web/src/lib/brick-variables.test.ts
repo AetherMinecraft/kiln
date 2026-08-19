@@ -13,6 +13,7 @@ import {
   stringVariableAllows,
   supportedJavaVersions,
   unavailableMinecraftJavaVersion,
+  canPairMinecraftJavaVersionFields,
   usesLongStringBrickField,
   withRecommendedMinecraftJava,
 } from "./brick-variables.js"
@@ -151,6 +152,21 @@ describe("Minecraft Java defaults", () => {
       })
     ).toBe(false)
     expect(usesLongStringBrickField(paper.variables.version)).toBe(false)
+  })
+
+  it("only pairs Minecraft and Java fields when both are strings", () => {
+    expect(canPairMinecraftJavaVersionFields(paper.variables)).toBe(true)
+    expect(
+      canPairMinecraftJavaVersionFields({
+        ...paper.variables,
+        version: { ...paper.variables.version, type: "number" },
+      })
+    ).toBe(false)
+    expect(
+      canPairMinecraftJavaVersionFields({
+        version: paper.variables.version,
+      })
+    ).toBe(false)
   })
 
   it("blocks a required version with no default until a value is submitted", () => {
