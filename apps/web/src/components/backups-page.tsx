@@ -3184,19 +3184,26 @@ function CreateBackupDialog({
           </label>
           <label className="block">
             <span className="mb-2 block text-xs font-medium">Target</span>
-            <select
-              aria-label="Backup target"
-              className="h-9 w-full rounded-lg border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            <Select
+              disabled={targets.length === 0}
               value={targetKeyValue}
-              onChange={(event) => setTargetKeyValue(event.currentTarget.value)}
+              onValueChange={setTargetKeyValue}
             >
-              {targets.map((option) => (
-                <option key={option.key} value={option.key}>
-                  {targetKindLabel(option.kind)} · {option.name} ·{" "}
-                  {option.relayName}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger
+                aria-label="Backup target"
+                className="h-8 w-full [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:text-left"
+              >
+                <SelectValue placeholder="No targets available" />
+              </SelectTrigger>
+              <SelectContent className="w-max max-w-[calc(100vw-2rem)] min-w-(--radix-select-trigger-width)">
+                {targets.map((option) => (
+                  <SelectItem key={option.key} value={option.key}>
+                    {targetKindLabel(option.kind)} · {option.name} ·{" "}
+                    {option.relayName}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </label>
           <fieldset>
             <legend className="mb-2 text-xs font-medium">Destinations</legend>
