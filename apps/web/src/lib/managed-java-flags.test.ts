@@ -49,4 +49,28 @@ describe("managed Java startup flags", () => {
     expect(dockerMemoryBytes("512M")).toBe(512 * 1024 ** 2)
     expect(dockerMemoryBytes("nope")).toBeNull()
   })
+
+  it("resolves Brick templates in managed flag environment values", () => {
+    expect(
+      managedJavaStartupFlags(
+        {
+          MIN_RAM: "{{ variables.min_memory }}",
+          MAX_RAM: "{{ variables.max_memory }}",
+          KILN_SERVER_ARGS: "{{ variables.extra_args }}",
+        },
+        "4G",
+        { min_memory: "768M", max_memory: "1800M", extra_args: "--nogui" }
+      )
+    ).toBe("-Xms768M -Xmx1800M --nogui")
+    expect(
+      managedJavaStartupFlags(
+        {
+          MIN_RAM: "{{ variables.min_memory }}",
+          KILN_JAVA_MAX_RAM_PERCENTAGE: "{{ variables.heap_percent }}",
+        },
+        "2G",
+        { min_memory: "512M", heap_percent: "50" }
+      )
+    ).toBe("-Xms512M -Xmx1G --nogui")
+  })
 })

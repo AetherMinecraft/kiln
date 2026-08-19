@@ -402,6 +402,7 @@ const StartupForm = React.memo(function StartupForm({
         <StartupSettingsForm
           allocation={allocation}
           brickId={view.id}
+          brickName={view.name}
           canEdit={canEdit}
           configuredMemoryBytes={configuredMemoryBytes}
           diskLimitGiB={diskLimitGiB}
@@ -460,6 +461,7 @@ const StartupForm = React.memo(function StartupForm({
 function StartupSettingsForm({
   allocation,
   brickId,
+  brickName,
   canEdit,
   configuredMemoryBytes,
   diskLimitGiB,
@@ -476,6 +478,7 @@ function StartupSettingsForm({
 }: {
   allocation: StartupResourceAllocation
   brickId: string
+  brickName: string
   canEdit: boolean
   configuredMemoryBytes: number
   diskLimitGiB: string
@@ -509,7 +512,10 @@ function StartupSettingsForm({
   const memory =
     typeof variables.memory === "string" ? variables.memory : undefined
   const managedFlags = javaArgsDefinition
-    ? managedJavaStartupFlags(environment, memory)
+    ? managedJavaStartupFlags(environment, memory, variables, {
+        id: brickId,
+        name: brickName,
+      })
     : null
   const hasFields =
     entries.length > 0 || pairVersionAndJava || Boolean(javaArgsDefinition)

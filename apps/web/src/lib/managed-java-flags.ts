@@ -1,3 +1,7 @@
+import type { BrickVariableValue } from "@workspace/contracts"
+
+import { interpolateBrickEnvironment } from "./brick-variables.js"
+
 const DEFAULT_MIN_RAM = "512M"
 const DEFAULT_MAX_RAM_PERCENTAGE = 75
 const MEBIBYTE = 1024 ** 2
@@ -24,15 +28,18 @@ export function dockerMemoryBytes(value: string): number | null {
 
 export function managedJavaStartupFlags(
   environment: Readonly<Record<string, string>>,
-  memory: string | undefined
+  memory: string | undefined,
+  variables: Readonly<Record<string, BrickVariableValue>> = {},
+  brick?: { id: string; name?: string }
 ): string {
-  const minRam = environment.MIN_RAM?.trim() || DEFAULT_MIN_RAM
+  const resolved = interpolateBrickEnvironment(environment, variables, brick)
+  const minRam = resolved.MIN_RAM?.trim() || DEFAULT_MIN_RAM
   const flags = [`-Xms${minRam}`]
-  const maxRam = environment.MAX_RAM?.trim()
+  const maxRam = resolved.MAX_RAM?.trim()
   if (maxRam) flags.push(`-Xmx${maxRam}`)
   else {
     const percentage = Number(
-      environment.KILN_JAVA_MAX_RAM_PERCENTAGE ?? DEFAULT_MAX_RAM_PERCENTAGE
+      resolved.KILN_JAVA_MAX_RAM_PERCENTAGE ?? DEFAULT_MAX_RAM_PERCENTAGE
     )
     const heapBytes =
       memory && Number.isFinite(percentage)
@@ -44,9 +51,9 @@ export function managedJavaStartupFlags(
         : `-XX:MaxRAMPercentage=${Number.isFinite(percentage) ? percentage : DEFAULT_MAX_RAM_PERCENTAGE}`
     )
   }
-  if (!Object.hasOwn(environment, "KILN_SERVER_ARGS")) flags.push("--nogui")
+  if (!Object.hasOwn(resolved, "KILN_SERVER_ARGS")) flags.push("--nogui")
   else {
-    const serverArgs = environment.KILN_SERVER_ARGS.trim()
+    const serverArgs = resolved.KILN_SERVER_ARGS.trim()
     if (serverArgs) flags.push(serverArgs)
   }
   return flags.join(" ")

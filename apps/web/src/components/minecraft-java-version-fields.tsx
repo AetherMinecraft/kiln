@@ -14,9 +14,9 @@ import {
 import { BrickVersionPicker } from "@/components/brick-version-picker"
 import { brickArtifactCatalog } from "@/lib/brick-artifact"
 import {
+  javaVersionSelectOptions,
   recommendedSupportedJavaVersion,
   stringVariableAllows,
-  supportedJavaVersions,
 } from "@/lib/brick-variables"
 import { brickVersionsQueryOptions } from "@/lib/query-options"
 
@@ -101,8 +101,11 @@ export const MinecraftJavaVersionFields = React.memo(
       versionDefinition?.required && versionDefinition.default === undefined
     )
     const javaVersions = React.useMemo(
-      () => (javaDefinition ? supportedJavaVersions(javaDefinition) : []),
-      [javaDefinition]
+      () =>
+        javaDefinition
+          ? javaVersionSelectOptions(javaDefinition, javaVersion)
+          : [],
+      [javaDefinition, javaVersion]
     )
     const changeVersion = React.useCallback(
       (nextVersion: string) => {

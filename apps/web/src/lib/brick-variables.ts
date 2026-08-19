@@ -90,18 +90,42 @@ export function supportedJavaVersions(
   return candidates.filter((version) => stringVariableAllows(definition, version))
 }
 
+export function javaVersionSelectOptions(
+  definition: Brick["variables"][string],
+  current?: string
+): Array<string> {
+  const listed = supportedJavaVersions(definition)
+  if (listed.length === 0) return []
+  const extras = [
+    current?.trim() || undefined,
+    definition.default === undefined ? undefined : String(definition.default),
+  ]
+  const options = [...listed]
+  for (const value of extras) {
+    if (
+      value &&
+      !options.includes(value) &&
+      stringVariableAllows(definition, value)
+    ) {
+      options.push(value)
+    }
+  }
+  return options
+}
+
 export function recommendedSupportedJavaVersion(
   brickId: string,
   definition: Brick["variables"][string],
   minecraftVersion: string
 ): string | null {
-  const supported = supportedJavaVersions(definition)
+  const supported = javaVersionSelectOptions(definition)
   if (supported.length === 0) return null
   const required = requiredMinecraftJavaVersion(brickId, minecraftVersion)
   if (required && supported.includes(required)) return required
+  if (required && stringVariableAllows(definition, required)) return required
   const fallback =
     definition.default === undefined ? null : String(definition.default)
-  if (fallback && supported.includes(fallback)) return fallback
+  if (fallback && stringVariableAllows(definition, fallback)) return fallback
   return supported.at(-1) ?? null
 }
 
@@ -178,17 +202,48 @@ export function defaultBrickInstanceName(brick: Brick): string {
   return `${brick.metadata.name}${version === undefined ? "" : ` ${String(version)}`}`
 }
 
+export function interpolateBrickTemplate(
+  template: string,
+  values: Readonly<Record<string, BrickVariableValue>>,
+  brick?: { id: string; name?: string }
+): string {
+  return template.replace(
+    /\{\{\s*(variables\.([a-z][a-z0-9_]{0,47})|brick\.(id|name))\s*\}\}/gu,
+    (
+      match,
+      _expression: string,
+      variable: string | undefined,
+      field: string | undefined
+    ) => {
+      if (variable) {
+        if (!Object.hasOwn(values, variable)) return match
+        const value = values[variable]
+        return value === undefined ? match : String(value)
+      }
+      if (field === "name") return brick?.name ?? match
+      if (field === "id") return brick?.id ?? match
+      return match
+    }
+  )
+}
+
+export function interpolateBrickEnvironment(
+  environment: Readonly<Record<string, string>>,
+  values: Readonly<Record<string, BrickVariableValue>>,
+  brick?: { id: string; name?: string }
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(environment).map(([name, value]) => [
+      name,
+      interpolateBrickTemplate(value, values, brick),
+    ])
+  )
+}
+
 export function defaultBrickRuntimeName(brick: Brick): string {
-  const variables = defaultBrickVariables(brick)
-  return brick.runtime.name
-    .replace(
-      /\{\{\s*variables\.([a-z][a-z0-9_]{0,47})\s*\}\}/gu,
-      (template, variable: string) =>
-        Object.hasOwn(variables, variable)
-          ? String(variables[variable])
-          : template
-    )
-    .replace(/\{\{\s*brick\.(id|name)\s*\}\}/gu, (_template, field: string) =>
-      field === "name" ? brick.metadata.name : brick.metadata.id
-    )
+  return interpolateBrickTemplate(
+    brick.runtime.name,
+    defaultBrickVariables(brick),
+    { id: brick.metadata.id, name: brick.metadata.name }
+  )
 }

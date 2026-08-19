@@ -14,6 +14,8 @@ import {
   supportedJavaVersions,
   unavailableMinecraftJavaVersion,
   canPairMinecraftJavaVersionFields,
+  interpolateBrickTemplate,
+  javaVersionSelectOptions,
   usesLongStringBrickField,
   withRecommendedMinecraftJava,
 } from "./brick-variables.js"
@@ -89,6 +91,11 @@ describe("Minecraft Java defaults", () => {
     expect(defaultBrickRuntimeName({ ...paper, source: "paper.yml" })).toBe(
       "Java 21"
     )
+    expect(
+      interpolateBrickTemplate("-Xms{{ variables.min_memory }}", {
+        min_memory: "768M",
+      })
+    ).toBe("-Xms768M")
   })
 
   it("hydrates missing legacy Startup variables without replacing overrides", () => {
@@ -130,6 +137,32 @@ describe("Minecraft Java defaults", () => {
         rules: { pattern: "^graal-[0-9]+$", maxLength: 16 },
       })
     ).toEqual([])
+  })
+
+  it("keeps valid custom Java versions in the selector", () => {
+    const customJava = {
+      ...paper.variables.java_version,
+      default: "22",
+      options: undefined,
+      rules: { pattern: "^(?:17|22)$", maxLength: 2 },
+    }
+    expect(supportedJavaVersions(customJava)).toEqual(["17"])
+    expect(javaVersionSelectOptions(customJava)).toEqual(["17", "22"])
+    expect(javaVersionSelectOptions(customJava, "22")).toEqual(["17", "22"])
+    expect(javaVersionSelectOptions(customJava, "17")).toEqual(["17", "22"])
+    expect(
+      javaVersionSelectOptions(
+        {
+          ...customJava,
+          default: "graal-21",
+          rules: { pattern: "^graal-[0-9]+$", maxLength: 16 },
+        },
+        "graal-21"
+      )
+    ).toEqual([])
+    expect(recommendedSupportedJavaVersion("paper", customJava, "1.21.11")).toBe(
+      "22"
+    )
   })
 
   it("rejects custom versions that break Brick pattern or length rules", () => {
