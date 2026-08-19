@@ -2027,11 +2027,7 @@ const UNPARSEABLE_BACKUP_TASK_ERROR =
   "The Relay journal row could not be parsed"
 
 function parseBackupTaskInputJson(value: string): unknown {
-  try {
-    return JSON.parse(value)
-  } catch {
-    return null
-  }
+  return Result.getOrNull(Result.try((): unknown => JSON.parse(value)))
 }
 
 function fallbackBackupTarget(input: unknown): BackupTaskInput["target"] {
