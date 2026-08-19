@@ -408,6 +408,26 @@ test("the Java Ember ignores heap aliases in extra JVM arguments", async (contex
   ])
 })
 
+test("the Java Ember ignores flags that disable container-aware heap", async (context) => {
+  const result = await runPaperJavaEmber(context, {
+    KILN_JAVA_ARGS: "-XX:+UseG1GC -XX:-UseContainerSupport -XX:-UseCGroupMemoryLimitForHeap",
+  })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(
+    result.stderr,
+    /ignoring managed JVM flags: -XX:-UseContainerSupport -XX:-UseCGroupMemoryLimitForHeap/u
+  )
+  assert.deepEqual(result.args, [
+    "-Xms512M",
+    "-XX:MaxRAMPercentage=75.0",
+    "-XX:+UseG1GC",
+    "-jar",
+    "paper.jar",
+    "--nogui",
+  ])
+})
+
 test("the Java Ember rejects unmatched quotes in extra JVM arguments", async (context) => {
   const result = await runPaperJavaEmber(context, {
     KILN_JAVA_ARGS: '-Dmessage="hello world',

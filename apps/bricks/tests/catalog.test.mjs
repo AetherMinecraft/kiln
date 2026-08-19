@@ -10,7 +10,7 @@ import { parse } from "yaml"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const JAVA_ARGS_RULE_PATTERN =
-  "^(?!.*(?:^|\\s)(?:@(?!@)\\S+|-Xm[sx]\\S*|-XX:(?:InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM|VMOptionsFile|Flags)(?:=\\S*)?|--nogui)(?:\\s|$)).*$"
+  "^(?!.*(?:^|\\s)(?:@(?!@)\\S+|-Xm[sx]\\S*|-XX:(?:-UseContainerSupport|-UseCGroupMemoryLimitForHeap|InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM|VMOptionsFile|Flags)(?:=\\S*)?|--nogui)(?:\\s|$)).*$"
 const loadJson = async (path) => JSON.parse(await readFile(join(root, path), "utf8"))
 const loadYaml = async (path) => parse(await readFile(join(root, path), "utf8"), {
   maxAliasCount: 20,
@@ -82,13 +82,13 @@ test("the official catalog and every recipe satisfy the v1 schemas", async () =>
       )
       assert.doesNotMatch(
         javaArgs.default ?? "",
-        /(?:-Xm[sx]\b|-XX:(?:InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)\b|--nogui)/u,
+        /(?:-Xm[sx]\b|-XX:(?:-UseContainerSupport|-UseCGroupMemoryLimitForHeap|InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)\b|--nogui)/u,
         `${recipePath}: java_args defaults must omit managed heap and --nogui flags`,
       )
       assert.equal(
         javaArgs.rules?.pattern,
         JAVA_ARGS_RULE_PATTERN,
-        `${recipePath}: java_args must reject heap aliases, argument files, and --nogui`,
+        `${recipePath}: java_args must reject heap aliases, argument files, container-support overrides, and --nogui`,
       )
       const javaArgsPattern = new RegExp(javaArgs.rules?.pattern ?? "", "u")
       assert.equal(javaArgsPattern.test(javaArgs.default ?? ""), true)
@@ -107,6 +107,11 @@ test("the official catalog and every recipe satisfy the v1 schemas", async () =>
       assert.equal(javaArgsPattern.test("-XX:+UseG1GC @flags.txt"), false)
       assert.equal(javaArgsPattern.test("-XX:VMOptionsFile=/server/flags.txt"), false)
       assert.equal(javaArgsPattern.test("-Dcontact=ops@example.com"), true)
+      assert.equal(javaArgsPattern.test("-XX:-UseContainerSupport"), false)
+      assert.equal(
+        javaArgsPattern.test("-XX:+UseG1GC -XX:-UseCGroupMemoryLimitForHeap"),
+        false,
+      )
     }
   }
 })

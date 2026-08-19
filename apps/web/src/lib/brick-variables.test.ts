@@ -122,6 +122,14 @@ describe("Minecraft Java defaults", () => {
     expect(
       recommendedSupportedJavaVersion("paper", paper.variables.java_version, "1.16.5")
     ).toBe("17")
+    expect(
+      supportedJavaVersions({
+        ...paper.variables.java_version,
+        default: "graal-21",
+        options: undefined,
+        rules: { pattern: "^graal-[0-9]+$", maxLength: 16 },
+      })
+    ).toEqual([])
   })
 
   it("rejects custom versions that break Brick pattern or length rules", () => {

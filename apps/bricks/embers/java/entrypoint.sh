@@ -116,7 +116,7 @@ is_managed_java_arg() {
   case "$1" in
     --nogui|-Xms*|-Xmx*) return 0 ;;
   esac
-  local managed_pattern='^-XX:(InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)(=.*)?$'
+  local managed_pattern='^-XX:(-UseContainerSupport|-UseCGroupMemoryLimitForHeap|InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)(=.*)?$'
   [[ $1 =~ ${managed_pattern} ]]
 }
 

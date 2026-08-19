@@ -185,7 +185,7 @@ describe("Brick recipes", () => {
           rules: {
             maxLength: 2048,
             pattern:
-              "^(?!.*(?:^|\\s)(?:@(?!@)\\S+|-Xm[sx]\\S*|-XX:(?:InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM|VMOptionsFile|Flags)(?:=\\S*)?|--nogui)(?:\\s|$)).*$",
+              "^(?!.*(?:^|\\s)(?:@(?!@)\\S+|-Xm[sx]\\S*|-XX:(?:-UseContainerSupport|-UseCGroupMemoryLimitForHeap|InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM|VMOptionsFile|Flags)(?:=\\S*)?|--nogui)(?:\\s|$)).*$",
           },
         },
       },
@@ -229,6 +229,9 @@ describe("Brick recipes", () => {
       resolveBrick(javaRecipe, {
         java_args: "-XX:VMOptionsFile=/server/flags.txt",
       })
+    ).toThrow(/recipe rule/u)
+    expect(() =>
+      resolveBrick(javaRecipe, { java_args: "-XX:-UseContainerSupport" })
     ).toThrow(/recipe rule/u)
   })
 
