@@ -6,6 +6,7 @@ import { CircleAlert, HardDrive, LoaderCircle, Rocket } from "lucide-react"
 import {
   DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
   type Brick,
+  type BrickVariable,
   type BrickVariableValue,
 } from "@workspace/contracts"
 
@@ -28,6 +29,8 @@ import {
   BrickCatalogBrowser,
   type BrickSelection,
 } from "@/components/brick-selector"
+import { BrickVersionPicker } from "@/components/brick-version-picker"
+import { brickArtifactCatalog } from "@/lib/brick-artifact"
 import {
   defaultBrickInstanceName,
   defaultBrickVariables,
@@ -42,6 +45,7 @@ import {
 import type { PersistedRelay } from "@/lib/relay-registry"
 import {
   brickCatalogQueryOptions,
+  brickVersionsQueryOptions,
   queryKeys,
   relayConnectionQueryOptions,
 } from "@/lib/query-options"
@@ -387,38 +391,12 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
         />
       </label>
       {versionDefinition ? (
-        <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
-          <span className="flex items-center justify-between gap-3">
-            <span>{versionDefinition.label}</span>
-            {versionDefinition.default === undefined ? null : (
-              <span className="font-mono text-[0.5625rem] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
-                {String(versionDefinition.default)} default
-              </span>
-            )}
-          </span>
-          <Input
-            key={`${selectionIdentity}:version`}
-            name="version"
-            defaultValue={
-              versionDefinition.default === undefined
-                ? ""
-                : String(versionDefinition.default)
-            }
-            placeholder="Enter a version"
-            pattern={versionDefinition.rules?.pattern}
-            minLength={versionDefinition.rules?.minLength}
-            maxLength={versionDefinition.rules?.maxLength}
-            disabled={pending}
-            className="font-mono tabular-nums"
-            required={
-              versionDefinition.required &&
-              versionDefinition.default === undefined
-            }
-          />
-          <span className="block text-[0.5625rem] leading-relaxed font-normal text-muted-foreground/65">
-            {versionDefinition.description}
-          </span>
-        </label>
+        <MinecraftVersionField
+          key={`${selectionIdentity}:version`}
+          definition={versionDefinition}
+          disabled={pending}
+          selection={selection}
+        />
       ) : null}
       <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
         <span className="flex items-center justify-between gap-3">
@@ -615,6 +593,128 @@ function relaySupportsSelection(
   return architectures.some(
     (architecture) => normalizeArchitecture(architecture) === relayArchitecture
   )
+}
+
+const MinecraftVersionField = React.memo(function MinecraftVersionField({
+  definition,
+  disabled,
+  selection,
+}: {
+  definition: BrickVariable
+  disabled: boolean
+  selection: BrickSelection | null
+}) {
+  const labelId = React.useId()
+  const defaultVersion =
+    definition.default === undefined ? "" : String(definition.default)
+  const [version, setVersion] = React.useState(defaultVersion)
+  const catalog =
+    selection?.kind === "catalog"
+      ? brickArtifactCatalog(selection.brick)
+      : null
+  const versionsQuery = useQuery({
+    ...brickVersionsQueryOptions(catalog?.type ?? "", catalog?.variant ?? ""),
+    enabled: catalog !== null,
+  })
+  const versions = React.useMemo(
+    () =>
+      supportedBrickVersions(
+        versionsQuery.data?.versions ?? [],
+        definition,
+        defaultVersion
+      ),
+    [defaultVersion, definition, versionsQuery.data?.versions]
+  )
+  const usePicker =
+    catalog !== null &&
+    !versionsQuery.isError &&
+    (versionsQuery.isPending || versions.length > 0)
+  const required =
+    definition.required && definition.default === undefined
+
+  return (
+    <div className="block space-y-1.5 text-xs font-medium text-muted-foreground">
+      <span className="flex items-center justify-between gap-3">
+        <span id={labelId}>{definition.label}</span>
+        {definition.default === undefined ? null : (
+          <span className="font-mono text-[0.5625rem] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
+            {String(definition.default)} default
+          </span>
+        )}
+      </span>
+      {usePicker ? (
+        <BrickVersionPicker
+          labelledBy={labelId}
+          name="version"
+          value={version}
+          versions={versions}
+          disabled={disabled}
+          loading={versionsQuery.isPending}
+          required={required}
+          onChange={setVersion}
+        />
+      ) : (
+        <Input
+          aria-labelledby={labelId}
+          name="version"
+          value={version}
+          onChange={(event) => setVersion(event.currentTarget.value)}
+          placeholder="Enter a version"
+          pattern={definition.rules?.pattern}
+          minLength={definition.rules?.minLength}
+          maxLength={definition.rules?.maxLength}
+          disabled={disabled}
+          className="font-mono tabular-nums"
+          required={required}
+        />
+      )}
+      <span className="block text-[0.5625rem] leading-relaxed font-normal text-muted-foreground/65">
+        {definition.description}
+      </span>
+    </div>
+  )
+})
+
+function supportedBrickVersions(
+  versions: ReadonlyArray<string>,
+  definition: BrickVariable,
+  defaultVersion: string
+): Array<string> {
+  const pattern = versionPattern(definition.rules?.pattern)
+  const allowed = versions.filter((version) =>
+    versionAllowed(version, definition, pattern)
+  )
+  if (defaultVersion && !allowed.includes(defaultVersion)) {
+    return versionAllowed(defaultVersion, definition, pattern)
+      ? [defaultVersion, ...allowed]
+      : allowed
+  }
+  return allowed
+}
+
+function versionPattern(source: string | undefined): RegExp | null {
+  if (!source) return null
+  return Result.getOrNull(Result.try(() => new RegExp(source, "u")))
+}
+
+function versionAllowed(
+  version: string,
+  definition: BrickVariable,
+  pattern: RegExp | null
+): boolean {
+  if (
+    definition.rules?.minLength !== undefined &&
+    version.length < definition.rules.minLength
+  ) {
+    return false
+  }
+  if (
+    definition.rules?.maxLength !== undefined &&
+    version.length > definition.rules.maxLength
+  ) {
+    return false
+  }
+  return pattern ? pattern.test(version) : true
 }
 
 function minecraftVersionDefinition(selection: BrickSelection | null) {
