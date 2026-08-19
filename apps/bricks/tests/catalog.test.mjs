@@ -70,6 +70,27 @@ test("the official catalog and every recipe satisfy the v1 schemas", async () =>
     if (installationMarker) {
       assert.match(installationMarker, /^\.kiln-[a-zA-Z0-9._-]{1,58}$/u)
     }
+    if (recipe.runtime.image.includes("bricks-java:")) {
+      const javaArgs = recipe.variables.java_args
+      assert.equal(javaArgs?.type, "string", `${recipePath}: Java recipes must declare java_args`)
+      assert.equal(
+        recipe.runtime.environment.KILN_JAVA_ARGS,
+        "{{ variables.java_args }}",
+        `${recipePath}: Java recipes must map java_args to KILN_JAVA_ARGS`,
+      )
+      assert.doesNotMatch(
+        javaArgs.default ?? "",
+        /(?:-Xms|-Xmx|-XX:MaxRAMPercentage|--nogui)/u,
+        `${recipePath}: java_args defaults must omit managed heap and --nogui flags`,
+      )
+      const javaArgsPattern = new RegExp(javaArgs.rules?.pattern ?? "", "u")
+      assert.equal(javaArgsPattern.test(javaArgs.default ?? ""), true)
+      assert.equal(javaArgsPattern.test(""), true)
+      assert.equal(javaArgsPattern.test("-XX:+UseG1GC -Dkiln.test=true"), true)
+      assert.equal(javaArgsPattern.test("-Xmx2G"), false)
+      assert.equal(javaArgsPattern.test("-XX:+UseG1GC --nogui"), false)
+      assert.equal(javaArgsPattern.test("-XX:MaxRAMPercentage=75.0"), false)
+    }
   }
 })
 

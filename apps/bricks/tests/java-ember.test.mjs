@@ -293,6 +293,77 @@ printf '%s\n' "$@" > "$FAKE_JAVA_ARGUMENTS"
   )
 })
 
+test("the Java Ember inserts extra JVM arguments between memory flags and the jar", async (context) => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "kiln-java-ember-"))
+  context.after(() => rm(temporaryDirectory, { force: true, recursive: true }))
+
+  const binDirectory = join(temporaryDirectory, "bin")
+  await Promise.all([
+    mkdir(binDirectory, { recursive: true }),
+    writeFile(join(temporaryDirectory, "paper.jar"), "complete artifact"),
+  ])
+
+  const javaPath = join(binDirectory, "java")
+  await writeFile(
+    javaPath,
+    `#!/usr/bin/env bash
+set -eu
+if [[ "\${1:-}" == "-version" ]]; then
+  echo 'openjdk version "test"' >&2
+  exit 0
+fi
+printf '%s\\n' "$@" > "$FAKE_JAVA_ARGUMENTS"
+`
+  )
+  await chmod(javaPath, 0o755)
+
+  const source = await readFile(join(root, "embers/java/entrypoint.sh"), "utf8")
+  const entrypointPath = join(temporaryDirectory, "entrypoint.sh")
+  await writeFile(
+    entrypointPath,
+    source.replace("cd /server", 'cd "${KILN_TEST_SERVER_DIRECTORY:?}"')
+  )
+  await chmod(entrypointPath, 0o755)
+
+  const argumentsPath = join(temporaryDirectory, "java-arguments")
+  const result = await new Promise((resolveResult, rejectResult) => {
+    const child = spawn(entrypointPath, {
+      env: {
+        FAKE_JAVA_ARGUMENTS: argumentsPath,
+        KILN_ARTIFACT_FILE: "paper.jar",
+        KILN_ARTIFACT_URL: "https://example.invalid/paper.jar",
+        KILN_IMPLEMENTATION: "paper",
+        KILN_JAVA_ARGS: "-XX:+UseG1GC -XX:+AlwaysPreTouch",
+        KILN_SERVER_KIND: "minecraft",
+        KILN_TEST_SERVER_DIRECTORY: temporaryDirectory,
+        KILN_VERSION: "1.21.11",
+        PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    let stderr = ""
+    child.stderr.setEncoding("utf8").on("data", (chunk) => {
+      stderr += chunk
+    })
+    child.once("error", rejectResult)
+    child.once("close", (status) => resolveResult({ status, stderr }))
+  })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(
+    (await readFile(argumentsPath, "utf8")).trimEnd().split("\n"),
+    [
+      "-Xms512M",
+      "-XX:MaxRAMPercentage=75.0",
+      "-XX:+UseG1GC",
+      "-XX:+AlwaysPreTouch",
+      "-jar",
+      "paper.jar",
+      "--nogui",
+    ]
+  )
+})
+
 test("the Java Ember rejects marker names outside the reserved namespace", async (context) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "kiln-java-ember-"))
   context.after(() => rm(temporaryDirectory, { force: true, recursive: true }))
