@@ -32,6 +32,10 @@ export const backupTaskIdSchema = z.uuid()
 
 export const backupChecksumSha256Schema = z.string().regex(/^[a-f0-9]{64}$/u)
 
+export const resticSnapshotIdSchema = z.string().regex(/^[a-f0-9]{8,64}$/u)
+
+export const backupRepositoryPasswordSchema = z.string().min(1).max(1_024)
+
 export const backupFilenameSchema = z
   .string()
   .min(1)
@@ -54,6 +58,7 @@ export const backupArtifactKindSchema = z.enum([
   "archive",
   "database_dump",
   "platform_bundle",
+  "restic_snapshot",
 ])
 
 export const backupModeSchema = z.enum(["full", "incremental"])
@@ -74,7 +79,13 @@ export const backupStatusSchema = z.enum([
   "deleted",
 ])
 
-export const backupTaskKindSchema = z.enum(["create", "restore", "delete"])
+export const backupTaskKindSchema = z.enum([
+  "create",
+  "restore",
+  "delete",
+  "export",
+  "prune",
+])
 
 export const backupTaskStatusSchema = z.enum([
   "queued",
@@ -127,34 +138,97 @@ export const backupS3UploadDestinationSchema = z
   })
   .strict()
 
-export const backupCreateTaskInputSchema = z
+export const backupResticDestinationSchema = z
+  .object({
+    artifactId: z.uuid().optional(),
+    kind: z.literal("restic"),
+    repositoryPassword: backupRepositoryPasswordSchema.optional(),
+  })
+  .strict()
+
+const backupArchiveDestinationSchema = z.discriminatedUnion("kind", [
+  backupLocalDestinationSchema,
+  backupS3UploadDestinationSchema,
+])
+
+const backupCreateTaskInputObjectSchema = z
   .object({
     artifactKind: backupArtifactKindSchema,
     backupId: backupIdSchema,
     destination: z.discriminatedUnion("kind", [
       backupLocalDestinationSchema,
       backupS3UploadDestinationSchema,
+      backupResticDestinationSchema,
     ]),
     exclude: z.array(z.string().min(1).max(1_024)).max(1_000),
     maxBytes: z.number().int().positive().nullable(),
     mode: backupModeSchema,
     reason: backupReasonSchema,
-    replicas: z
-      .array(
-        z.discriminatedUnion("kind", [
-          backupLocalDestinationSchema,
-          backupS3UploadDestinationSchema,
-        ])
-      )
-      .max(15)
-      .optional(),
+    replicas: z.array(backupArchiveDestinationSchema).max(15).optional(),
     target: backupTargetSchema,
     taskId: backupTaskIdSchema,
   })
   .strict()
 
+function refineResticCreateInput(
+  input: z.infer<typeof backupCreateTaskInputObjectSchema>,
+  context: z.RefinementCtx
+) {
+  const restic = input.destination.kind === "restic"
+  if (restic) {
+    if ((input.replicas?.length ?? 0) > 0) {
+      context.addIssue({
+        code: "custom",
+        message: "Restic backups cannot replicate to additional destinations",
+        path: ["replicas"],
+      })
+    }
+    if (input.mode !== "incremental") {
+      context.addIssue({
+        code: "custom",
+        message: "Restic destinations require incremental mode",
+        path: ["mode"],
+      })
+    }
+    if (input.artifactKind !== "restic_snapshot") {
+      context.addIssue({
+        code: "custom",
+        message: "Restic destinations require a restic_snapshot artifact",
+        path: ["artifactKind"],
+      })
+    }
+    if (input.target.kind !== "instance") {
+      context.addIssue({
+        code: "custom",
+        message: "Restic backups are only supported for instance targets",
+        path: ["target", "kind"],
+      })
+    }
+    return
+  }
+  if (input.mode === "incremental") {
+    context.addIssue({
+      code: "custom",
+      message: "Incremental backups require a restic destination",
+      path: ["destination", "kind"],
+    })
+  }
+  if (input.artifactKind === "restic_snapshot") {
+    context.addIssue({
+      code: "custom",
+      message: "restic_snapshot artifacts require a restic destination",
+      path: ["artifactKind"],
+    })
+  }
+}
+
+export const backupCreateTaskInputSchema =
+  backupCreateTaskInputObjectSchema.superRefine(refineResticCreateInput)
+
 export const backupLocalSourceSchema = z
   .object({
+    bytes: z.number().int().nonnegative(),
+    checksumSha256: backupChecksumSha256Schema,
     kind: z.literal("local"),
   })
   .strict()
@@ -162,42 +236,55 @@ export const backupLocalSourceSchema = z
 export const backupRemoteSourceSchema = z
   .object({
     allowPrivateNetwork: z.boolean().default(false),
+    bytes: z.number().int().nonnegative(),
+    checksumSha256: backupChecksumSha256Schema,
     downloadUrl: backupHttpsUrlSchema,
     headers: z.record(z.string(), z.string()).default({}),
     kind: z.literal("remote"),
   })
   .strict()
 
+export const backupResticSourceSchema = z
+  .object({
+    kind: z.literal("restic"),
+    repositoryPassword: backupRepositoryPasswordSchema.optional(),
+    snapshotId: resticSnapshotIdSchema,
+  })
+  .strict()
+
 export const backupRestoreTaskInputSchema = z
   .object({
     backupId: backupIdSchema,
-    bytes: z.number().int().nonnegative(),
-    checksumSha256: backupChecksumSha256Schema,
     source: z.discriminatedUnion("kind", [
       backupLocalSourceSchema,
       backupRemoteSourceSchema,
+      backupResticSourceSchema,
     ]),
     target: backupTargetSchema,
     taskId: backupTaskIdSchema,
   })
   .strict()
 
+export const backupS3DeleteDestinationSchema =
+  backupS3UploadDestinationSchema.omit({ uploadUrl: true }).extend({
+    deleteUrl: backupHttpsUrlSchema,
+  })
+
 export const backupDeleteTaskInputSchema = z
   .object({
     backupId: backupIdSchema,
     destination: z.discriminatedUnion("kind", [
       backupLocalDestinationSchema,
-      backupS3UploadDestinationSchema.omit({ uploadUrl: true }).extend({
-        deleteUrl: backupHttpsUrlSchema,
+      backupS3DeleteDestinationSchema,
+      backupResticDestinationSchema.extend({
+        snapshotId: resticSnapshotIdSchema,
       }),
     ]),
     replicas: z
       .array(
         z.discriminatedUnion("kind", [
           backupLocalDestinationSchema,
-          backupS3UploadDestinationSchema.omit({ uploadUrl: true }).extend({
-            deleteUrl: backupHttpsUrlSchema,
-          }),
+          backupS3DeleteDestinationSchema,
         ])
       )
       .max(15)
@@ -206,29 +293,84 @@ export const backupDeleteTaskInputSchema = z
     taskId: backupTaskIdSchema,
   })
   .strict()
+  .superRefine((input, context) => {
+    if (input.destination.kind !== "restic") return
+    if ((input.replicas?.length ?? 0) > 0) {
+      context.addIssue({
+        code: "custom",
+        message: "Restic deletes cannot target additional destinations",
+        path: ["replicas"],
+      })
+    }
+  })
+
+export const backupExportTaskInputSchema = z
+  .object({
+    backupId: backupIdSchema,
+    expiresAt: z.number().int().positive(),
+    repositoryPassword: backupRepositoryPasswordSchema.optional(),
+    snapshotId: resticSnapshotIdSchema,
+    target: backupTargetSchema,
+    taskId: backupTaskIdSchema,
+  })
+  .strict()
+
+export const backupPruneTaskInputSchema = z
+  .object({
+    backupId: backupIdSchema,
+    repositoryPassword: backupRepositoryPasswordSchema.optional(),
+    target: backupTargetSchema,
+    taskId: backupTaskIdSchema,
+  })
+  .strict()
 
 export const backupTaskInputSchema = z.discriminatedUnion("kind", [
-  backupCreateTaskInputSchema.extend({ kind: z.literal("create") }),
+  backupCreateTaskInputObjectSchema
+    .extend({ kind: z.literal("create") })
+    .superRefine(refineResticCreateInput),
   backupRestoreTaskInputSchema.extend({ kind: z.literal("restore") }),
   backupDeleteTaskInputSchema.extend({ kind: z.literal("delete") }),
+  backupExportTaskInputSchema.extend({ kind: z.literal("export") }),
+  backupPruneTaskInputSchema.extend({ kind: z.literal("prune") }),
 ])
 
-export const backupCreateTaskResultSchema = z
+const backupArtifactOutcomeSchema = z
   .object({
-    artifacts: z
-      .array(
-        z
-          .object({
-            artifactId: z.uuid(),
-            error: z.string().max(4_096).nullable(),
-            status: z.enum(["available", "failed"]),
-          })
-          .strict()
-      )
-      .max(16)
-      .optional(),
+    artifactId: z.uuid(),
+    error: z.string().max(4_096).nullable(),
+    status: z.enum(["available", "failed"]),
+  })
+  .strict()
+
+export const backupArchiveCreateTaskResultSchema = z
+  .object({
+    artifacts: z.array(backupArtifactOutcomeSchema).max(16).optional(),
     bytes: z.number().int().nonnegative(),
     checksumSha256: backupChecksumSha256Schema,
+    filename: backupFilenameSchema,
+    warnings: z.array(z.string().max(1_024)).max(1_000),
+  })
+  .strict()
+
+export const backupResticCreateTaskResultSchema = z
+  .object({
+    artifacts: z.array(backupArtifactOutcomeSchema).max(16).optional(),
+    bytes: z.number().int().nonnegative(),
+    snapshotId: resticSnapshotIdSchema,
+    warnings: z.array(z.string().max(1_024)).max(1_000),
+  })
+  .strict()
+
+export const backupCreateTaskResultSchema = z.union([
+  backupArchiveCreateTaskResultSchema,
+  backupResticCreateTaskResultSchema,
+])
+
+export const backupExportTaskResultSchema = z
+  .object({
+    bytes: z.number().int().nonnegative(),
+    checksumSha256: backupChecksumSha256Schema,
+    expiresAt: z.number().int().positive(),
     filename: backupFilenameSchema,
     warnings: z.array(z.string().max(1_024)).max(1_000),
   })
@@ -281,7 +423,9 @@ export const backupOperationTaskResultSchema = z
   .strict()
 
 export const backupTaskResultSchema = z.union([
-  backupCreateTaskResultSchema,
+  backupArchiveCreateTaskResultSchema,
+  backupResticCreateTaskResultSchema,
+  backupExportTaskResultSchema,
   backupOperationTaskResultSchema,
 ])
 
@@ -325,13 +469,33 @@ export const relayBackupTaskSchema = z
       })
       return
     }
-    if (task.kind === "create" && !("bytes" in task.result)) {
+    if (task.kind === "create" && task.input.kind === "create") {
+      const restic = task.input.destination.kind === "restic"
+      if (restic && !isResticCreateTaskResult(task.result)) {
+        context.addIssue({
+          code: "custom",
+          message: "Succeeded restic create tasks require a snapshot result",
+        })
+      }
+      if (!restic && !isArchiveCreateTaskResult(task.result)) {
+        context.addIssue({
+          code: "custom",
+          message: "Succeeded create tasks require an artifact result",
+        })
+      }
+    }
+    if (task.kind === "export" && !isExportTaskResult(task.result)) {
       context.addIssue({
         code: "custom",
-        message: "Succeeded create tasks require an artifact result",
+        message: "Succeeded export tasks require a staged archive result",
       })
     }
-    if (task.kind !== "create" && "bytes" in task.result) {
+    if (
+      (task.kind === "restore" ||
+        task.kind === "delete" ||
+        task.kind === "prune") &&
+      !isBackupOperationTaskResult(task.result)
+    ) {
       context.addIssue({
         code: "custom",
         message: "Backup operation tasks cannot return an artifact result",
@@ -342,11 +506,22 @@ export const relayBackupTaskSchema = z
 export type BackupArtifactKind = z.infer<typeof backupArtifactKindSchema>
 export type BackupArchiveManifest = z.infer<typeof backupArchiveManifestSchema>
 export type BackupCreateTaskInput = z.infer<typeof backupCreateTaskInputSchema>
+export type BackupArchiveCreateTaskResult = z.infer<
+  typeof backupArchiveCreateTaskResultSchema
+>
+export type BackupResticCreateTaskResult = z.infer<
+  typeof backupResticCreateTaskResultSchema
+>
 export type BackupCreateTaskResult = z.infer<
   typeof backupCreateTaskResultSchema
 >
 export type BackupDeleteTaskInput = z.infer<typeof backupDeleteTaskInputSchema>
+export type BackupExportTaskInput = z.infer<typeof backupExportTaskInputSchema>
+export type BackupExportTaskResult = z.infer<
+  typeof backupExportTaskResultSchema
+>
 export type BackupMode = z.infer<typeof backupModeSchema>
+export type BackupPruneTaskInput = z.infer<typeof backupPruneTaskInputSchema>
 export type BackupReason = z.infer<typeof backupReasonSchema>
 export type BackupRestoreTaskInput = z.infer<
   typeof backupRestoreTaskInputSchema
@@ -365,6 +540,7 @@ const BACKUP_ARTIFACT_EXTENSIONS = {
   archive: "zip",
   database_dump: "dmp.gz",
   platform_bundle: "kiln",
+  restic_snapshot: "zip",
 } as const satisfies Record<BackupArtifactKind, string>
 
 export function backupArtifactFilename(
@@ -372,4 +548,50 @@ export function backupArtifactFilename(
   artifactKind: BackupArtifactKind
 ): string {
   return `backup-${backupId.slice(0, 8)}.${BACKUP_ARTIFACT_EXTENSIONS[artifactKind]}`
+}
+
+export function isArchiveCreateTaskResult(
+  result: BackupTaskResult
+): result is BackupArchiveCreateTaskResult {
+  return "checksumSha256" in result && "filename" in result && !("expiresAt" in result)
+}
+
+export function isResticCreateTaskResult(
+  result: BackupTaskResult
+): result is BackupResticCreateTaskResult {
+  return "snapshotId" in result
+}
+
+export function isExportTaskResult(
+  result: BackupTaskResult
+): result is BackupExportTaskResult {
+  return "expiresAt" in result && "filename" in result
+}
+
+export function isBackupOperationTaskResult(
+  result: BackupTaskResult
+): result is z.infer<typeof backupOperationTaskResultSchema> {
+  return !("bytes" in result)
+}
+
+export function redactBackupTaskInput(input: BackupTaskInput): BackupTaskInput {
+  return backupTaskInputSchema.parse(omitRepositoryPassword(input))
+}
+
+export function redactRelayBackupTask(task: RelayBackupTask): RelayBackupTask {
+  return relayBackupTaskSchema.parse({
+    ...task,
+    input: redactBackupTaskInput(task.input),
+  })
+}
+
+function omitRepositoryPassword(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(omitRepositoryPassword)
+  if (value === null || typeof value !== "object") return value
+  const result: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === "repositoryPassword") continue
+    result[key] = omitRepositoryPassword(entry)
+  }
+  return result
 }
