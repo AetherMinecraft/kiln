@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test"
 import {
   backupObjectKey,
   deleteS3PrefixObjectPages,
+  failIfS3DeleteObjectsErrored,
   isPublicS3Address,
   isRetryableS3Failure,
   isSafeResticObjectPrefix,
@@ -130,6 +131,26 @@ describe("restic S3 prefixes", () => {
     )
     expect(listed).toEqual([undefined, "page-2"])
     expect(deleted).toEqual([["a", "b"], ["c"]])
+  })
+
+  it("fails prefix purge when S3 reports per-key delete errors", () => {
+    expect(() =>
+      failIfS3DeleteObjectsErrored({
+        Errors: [
+          { Code: "AccessDenied", Key: "pack/a", Message: "Access Denied" },
+        ],
+      })
+    ).toThrow("S3 could not delete pack/a: AccessDenied: Access Denied")
+    expect(() =>
+      failIfS3DeleteObjectsErrored({
+        Errors: [
+          { Code: "InternalError", Key: "a" },
+          { Code: "InternalError", Key: "b" },
+        ],
+      })
+    ).toThrow("S3 could not delete 2 objects under this prefix")
+    expect(() => failIfS3DeleteObjectsErrored({ Errors: [] })).not.toThrow()
+    expect(() => failIfS3DeleteObjectsErrored({})).not.toThrow()
   })
 
   it("retries transient S3 failures except 4xx, 403, and 404", () => {

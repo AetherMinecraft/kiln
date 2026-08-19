@@ -74,7 +74,6 @@ export const listBackupStorageEffect = Effect.fn("backupStorage.list")(
     const rows = yield* database.queryRows<BackupStoragePublicRow>(
       "backup_storage_list",
       `${backupStoragePublicSelect}
-        WHERE deleting = FALSE
        ORDER BY owner_user_id IS NOT NULL, name ASC, id ASC`
     )
     return rows.map(toRecord)
@@ -350,6 +349,12 @@ export const deleteBackupStorageEffect = Effect.fn("backupStorage.delete")(
             [storageId]
           )
         }
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("backup_policy")}
+              SET storage_id = NULL
+            WHERE storage_id = ?`,
+          [storageId]
+        )
       })
     )
     const credential = yield* loadBackupStorageCredentialEffect(storageId)

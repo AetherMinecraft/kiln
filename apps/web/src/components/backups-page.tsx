@@ -583,7 +583,7 @@ export const BackupsPage = React.memo(function BackupsPage({
     (): Array<BackupAvailabilityDestination> => [
       { enabled: true, id: null, name: "Local", ownerUserId: null },
       ...storage.map((destination) => ({
-        enabled: destination.enabled,
+        enabled: destination.enabled && !destination.deleting,
         id: destination.id,
         name: destination.name,
         ownerUserId: destination.ownerUserId,
@@ -3121,6 +3121,7 @@ function CreateBackupDialog({
       storage.filter(
         (destination) =>
           destination.enabled &&
+          !destination.deleting &&
           (target?.kind !== "platform" || destination.ownerUserId === null)
       ),
     [storage, target?.kind]
@@ -3421,12 +3422,25 @@ function InstanceBackupSettingsEditor({
   const [adminSizeLimit, setAdminSizeLimit] = React.useState(() =>
     bytesToGiBInput(policy.adminSizeLimitBytes)
   )
-  const [storageId, setStorageId] = React.useState(policy.storageId ?? "local")
-  const [exclude, setExclude] = React.useState(() => policy.exclude.join("\n"))
   const enabledStorage = React.useMemo(
-    () => storage.filter((destination) => destination.enabled),
+    () =>
+      storage.filter(
+        (destination) => destination.enabled && !destination.deleting
+      ),
     [storage]
   )
+  const [storageId, setStorageId] = React.useState(() =>
+    policy.storageId &&
+    storage.some(
+      (destination) =>
+        destination.id === policy.storageId &&
+        destination.enabled &&
+        !destination.deleting
+    )
+      ? policy.storageId
+      : "local"
+  )
+  const [exclude, setExclude] = React.useState(() => policy.exclude.join("\n"))
   const save = useMutation({
     mutationFn: async () => {
       const operations: Array<Promise<unknown>> = [
@@ -3655,6 +3669,7 @@ function BackupStorageDialog({
                 {storage.map((destination) => {
                   const canManage =
                     isPlatformAdmin || destination.ownerUserId === currentUserId
+                  const retryDelete = destination.deleting
                   return (
                     <div
                       key={destination.id}
@@ -3673,7 +3688,9 @@ function BackupStorageDialog({
                               ? "Platform"
                               : "Personal"}
                           </Badge>
-                          {!destination.enabled ? (
+                          {destination.deleting ? (
+                            <Badge variant="outline">Deleting</Badge>
+                          ) : !destination.enabled ? (
                             <Badge variant="outline">Disabled</Badge>
                           ) : null}
                         </span>
@@ -3683,21 +3700,38 @@ function BackupStorageDialog({
                             ? ` / ${destination.objectPrefix}`
                             : ""}
                         </span>
+                        {destination.lastError ? (
+                          <span className="mt-1 block text-[0.625rem] leading-4 text-destructive">
+                            {destination.lastError}
+                          </span>
+                        ) : null}
                       </span>
                       {canManage ? (
                         <div className="flex shrink-0 items-center gap-1">
                           <BackupActionButton
-                            disabled={false}
+                            disabled={destination.deleting}
                             icon={Pencil}
                             label={`Edit ${destination.name}`}
-                            tooltip="Edit destination"
+                            tooltip={
+                              destination.deleting
+                                ? "Finish deleting this destination before editing"
+                                : "Edit destination"
+                            }
                             onClick={() => setEditor(destination)}
                           />
                           <BackupActionButton
                             disabled={false}
                             icon={Trash2}
-                            label={`Delete ${destination.name}`}
-                            tooltip="Delete destination"
+                            label={
+                              retryDelete
+                                ? `Retry deleting ${destination.name}`
+                                : `Delete ${destination.name}`
+                            }
+                            tooltip={
+                              retryDelete
+                                ? "Retry destination delete"
+                                : "Delete destination"
+                            }
                             onClick={() => setDeleteCandidate(destination)}
                           />
                         </div>
@@ -3990,12 +4024,15 @@ function DeleteBackupStorageDialog({
   open: boolean
 }) {
   const queryClient = useQueryClient()
+  const retry = destination.deleting
   const remove = useMutation({
     mutationFn: () => deleteBackupStorage({ data: { id: destination.id } }),
-    onSuccess: async () => {
+    onSettled: async () => {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.backups.storage,
       })
+    },
+    onSuccess: () => {
       showToast({
         message: `${destination.name} deleted`,
         type: "success",
@@ -4008,12 +4045,18 @@ function DeleteBackupStorageDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete destination?</DialogTitle>
+          <DialogTitle>
+            {retry ? "Retry destination delete?" : "Delete destination?"}
+          </DialogTitle>
           <DialogDescription>
-            “{destination.name}” can only be deleted when no retained backups
-            reference it. Objects already in the bucket are not removed.
+            {retry
+              ? `“${destination.name}” is still marked deleting. Retry purges remaining S3 prefixes, then removes the destination.`
+              : `“${destination.name}” can only be deleted when no retained backups reference it. Objects already in the bucket are not removed.`}
           </DialogDescription>
         </DialogHeader>
+        {destination.lastError ? (
+          <p className="text-xs text-destructive">{destination.lastError}</p>
+        ) : null}
         {remove.error ? (
           <p className="text-xs text-destructive">{remove.error.message}</p>
         ) : null}
@@ -4036,7 +4079,7 @@ function DeleteBackupStorageDialog({
             ) : (
               <Trash2 />
             )}
-            Delete destination
+            {retry ? "Retry delete" : "Delete destination"}
           </Button>
         </DialogFooter>
       </DialogContent>

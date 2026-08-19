@@ -304,10 +304,11 @@ object versions after DeleteObjects; configure a bucket lifecycle rule if that
 storage must not remain billable.
 
 Destination deletion is two-phase: the row is marked `deleting` so new backups
-cannot select it, S3 repository prefixes are purged, then foreign keys on
-deleted catalog rows are cleared and the destination is removed. A purge
-failure leaves the destination in `deleting` with `last_error` so a retry
-resumes instead of silently orphaning data.
+cannot select it, preferred destination policies that pointed at it are cleared,
+S3 repository prefixes are purged, then foreign keys on deleted catalog rows are
+cleared and the destination is removed. A purge failure leaves the destination
+listed as `deleting` with `last_error` so the operator can retry instead of
+silently orphaning data.
 
 Development preview (`pnpm dev:docker`) starts a TLS MinIO at
 `https://minio:9000`. Register it as a platform destination with path-style

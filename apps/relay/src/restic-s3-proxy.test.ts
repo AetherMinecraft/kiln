@@ -51,6 +51,7 @@ describe("restic S3 CONNECT proxy", () => {
     })
     expect(parseResticS3ConnectTarget("s3.example.com:443/evil")).toBeNull()
     expect(parseResticS3ConnectTarget("user:pass@s3.example.com:443")).toBeNull()
+    expect(parseResticS3ConnectTarget("[")).toBeNull()
     const authorized = connectRequest("s3.example.com:443", token)
     expect(
       parseResticS3ConnectRequest(authorized, { endpointPort: 443, token })

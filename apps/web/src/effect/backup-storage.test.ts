@@ -3,7 +3,10 @@ import { Effect, Layer } from "effect"
 import type { ResultSetHeader, RowDataPacket } from "mysql2/promise"
 
 import { Database } from "@/effect/database"
-import { deleteBackupStorageEffect } from "@/effect/backup-storage"
+import {
+  deleteBackupStorageEffect,
+  listBackupStorageEffect,
+} from "@/effect/backup-storage"
 import { BackupStorageError } from "@/effect/errors"
 import { deleteS3BackupPrefix } from "@/lib/backup-storage-s3"
 
@@ -52,6 +55,31 @@ const repositoryPrefix =
   "team/kiln/kiln.dev/relay-one/restic/instance/instance-one/repo-one"
 
 describe("backup storage deletion", () => {
+  it("lists destinations that are still deleting", async () => {
+    let listSql = ""
+    await Effect.runPromise(
+      listBackupStorageEffect().pipe(
+        Effect.provide(
+          Layer.succeed(Database)({
+            execute: () => Effect.succeed(emptyResult),
+            queryRows: (_operation, sql) =>
+              Effect.sync(() => {
+                listSql = sql
+                return []
+              }),
+            transaction: (_operation, run) =>
+              run({
+                execute: () => Effect.succeed(emptyResult),
+                queryRows: () => Effect.succeed([]),
+              }),
+          })
+        )
+      )
+    )
+    expect(listSql).toContain("FROM")
+    expect(listSql).not.toContain("deleting = FALSE")
+  })
+
   it("refuses destinations that still have cataloged backups", async () => {
     await expect(
       Effect.runPromise(
@@ -95,6 +123,13 @@ describe("backup storage deletion", () => {
     expect(writes.some((write) => write.sql.includes("deleting = TRUE"))).toBe(
       true
     )
+    expect(
+      writes.some(
+        (write) =>
+          write.sql.includes("backup_policy") &&
+          write.sql.includes("storage_id = NULL")
+      )
+    ).toBe(true)
     expect(writes.some((write) => write.sql.includes("last_error"))).toBe(true)
     expect(
       writes.some((write) => write.sql.includes("DELETE FROM") && write.sql.includes("backup_storage"))

@@ -1,7 +1,15 @@
 import { randomBytes } from "node:crypto"
 import { lookup as dnsLookup } from "node:dns"
-import { connect, createServer, isIP, type Socket } from "node:net"
+import {
+  connect,
+  createServer,
+  isIP,
+  type Server,
+  type Socket,
+} from "node:net"
 import type { LookupFunction } from "node:net"
+
+import { Effect, Result } from "effect"
 
 import {
   isPublicRemoteAddress,
@@ -108,74 +116,118 @@ export function parseResticS3ConnectRequest(
   return target
 }
 
-export async function withResticS3Proxy<T>(
+export function withResticS3Proxy<T>(
   options: ResticS3ProxyOptions,
   use: (proxyUrl: string) => Promise<T>
 ): Promise<T> {
-  const server = createServer((client) => {
-    void handleConnectClient(client, options)
-  })
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(0, "127.0.0.1", () => {
-      server.off("error", reject)
-      resolve()
-    })
-  })
-  const address = server.address()
-  if (!address || typeof address === "string") {
-    server.close()
-    throw new Error("The restic S3 proxy did not bind a local port")
-  }
-  try {
-    return await use(
-      `http://user:${options.token}@127.0.0.1:${address.port}`
+  return Effect.runPromise(
+    Effect.acquireUseRelease(
+      listenResticS3Proxy(options),
+      (server) =>
+        Effect.tryPromise({
+          try: () => use(resticS3ProxyUrl(server, options.token)),
+          catch: (cause) =>
+            cause instanceof Error
+              ? cause
+              : new Error("The restic S3 proxy failed", { cause }),
+        }),
+      (server) =>
+        Effect.promise(
+          () =>
+            new Promise<void>((resolve) => {
+              server.close(() => resolve())
+            })
+        )
     )
-  } finally {
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve())
-    })
-  }
+  )
 }
 
-async function handleConnectClient(
+function listenResticS3Proxy(options: ResticS3ProxyOptions) {
+  return Effect.tryPromise({
+    try: () =>
+      new Promise<Server>((resolve, reject) => {
+        const server = createServer((client) => {
+          void handleConnectClient(client, options)
+        })
+        server.once("error", reject)
+        server.listen(0, "127.0.0.1", () => {
+          server.off("error", reject)
+          resolve(server)
+        })
+      }),
+    catch: (cause) =>
+      cause instanceof Error
+        ? cause
+        : new Error("The restic S3 proxy could not listen", { cause }),
+  })
+}
+
+function resticS3ProxyUrl(server: Server, token: string): string {
+  const address = server.address()
+  if (!address || typeof address === "string") {
+    throw new Error("The restic S3 proxy did not bind a local port")
+  }
+  return `http://user:${token}@127.0.0.1:${address.port}`
+}
+
+function handleConnectClient(
   client: Socket,
   options: ResticS3ProxyOptions
 ): Promise<void> {
-  try {
-    const raw = await readHttpHead(client)
-    const target = parseResticS3ConnectRequest(raw, options)
-    if (!target) {
-      rejectConnect(client)
-      return
-    }
-    if (!options.allowedHosts.has(target.hostname)) {
-      console.error(
-        `Rejected restic S3 CONNECT to disallowed host ${target.hostname}`
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const raw = yield* Effect.tryPromise({
+        try: () => readHttpHead(client),
+        catch: (cause) =>
+          cause instanceof Error
+            ? cause
+            : new Error("CONNECT headers failed", { cause }),
+      })
+      const target = parseResticS3ConnectRequest(raw, options)
+      if (!target) {
+        rejectConnect(client)
+        return
+      }
+      if (!options.allowedHosts.has(target.hostname)) {
+        console.error(
+          `Rejected restic S3 CONNECT to disallowed host ${target.hostname}`
+        )
+        rejectConnect(client)
+        return
+      }
+      const address = yield* Effect.promise(() =>
+        resolveConnectAddress(target.hostname, options)
       )
-      rejectConnect(client)
-      return
-    }
-    const address = await resolveConnectAddress(target.hostname, options)
-    if (!address) {
-      rejectConnect(client)
-      return
-    }
-    const upstream = await connectUpstream(address, target.port)
-    client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
-    client.pipe(upstream)
-    upstream.pipe(client)
-    const close = () => {
-      client.destroy()
-      upstream.destroy()
-    }
-    client.on("error", close)
-    upstream.on("error", close)
-    client.on("close", close)
-    upstream.on("close", close)
-  } catch {
-    rejectConnect(client)
-  }
+      if (!address) {
+        rejectConnect(client)
+        return
+      }
+      const upstream = yield* Effect.tryPromise({
+        try: () => connectUpstream(address, target.port),
+        catch: (cause) =>
+          cause instanceof Error
+            ? cause
+            : new Error("Upstream CONNECT failed", { cause }),
+      })
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
+      client.pipe(upstream)
+      upstream.pipe(client)
+      const close = () => {
+        client.destroy()
+        upstream.destroy()
+      }
+      client.on("error", close)
+      upstream.on("error", close)
+      client.on("close", close)
+      upstream.on("close", close)
+    }).pipe(
+      Effect.catch(() =>
+        Effect.sync(() => {
+          rejectConnect(client)
+        })
+      )
+    )
+  )
 }
 
 function readHttpHead(client: Socket): Promise<string> {
@@ -262,11 +314,7 @@ function connectUpstream(address: string, port: number): Promise<Socket> {
 }
 
 function parseAuthorityUrl(authority: string): URL | null {
-  try {
-    return new URL(`http://${authority}`)
-  } catch {
-    return null
-  }
+  return Result.getOrNull(Result.try(() => new URL(`http://${authority}`)))
 }
 
 function canonicalizeConnectAuthority(authority: string): string | null {

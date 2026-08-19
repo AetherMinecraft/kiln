@@ -234,6 +234,30 @@ export async function deleteS3PrefixObjectPages(
   } while (token)
 }
 
+export function failIfS3DeleteObjectsErrored(result: {
+  Errors?: ReadonlyArray<{
+    Code?: string
+    Key?: string
+    Message?: string
+  }>
+}): void {
+  const errors =
+    result.Errors?.filter((entry) => entry.Key || entry.Code) ?? []
+  if (errors.length === 0) return
+  const sample = errors[0]
+  const detail = [sample?.Key, sample?.Code, sample?.Message]
+    .filter(Boolean)
+    .join(": ")
+  throw backupStorageError(
+    "s3_request_failed",
+    "storage.deletePrefix",
+    errors.length === 1
+      ? `S3 could not delete ${detail || "an object"} under this prefix`
+      : `S3 could not delete ${errors.length} objects under this prefix`,
+    errors
+  )
+}
+
 export function isRetryableS3Failure(error: unknown): boolean {
   if (!(error instanceof BackupStorageError)) return false
   if (error.code !== "s3_request_failed") return false
@@ -639,7 +663,7 @@ function deleteS3PrefixPages(
           }
         },
         async (keys) => {
-          await client.send(
+          const result = await client.send(
             new DeleteObjectsCommand({
               Bucket: bucket,
               Delete: {
@@ -648,15 +672,18 @@ function deleteS3PrefixPages(
               },
             })
           )
+          failIfS3DeleteObjectsErrored(result)
         }
       ),
     catch: (cause) =>
-      backupStorageError(
-        "s3_request_failed",
-        "storage.deletePrefix",
-        "The S3-compatible storage request failed. Check the endpoint, region, bucket, credentials, and key permissions.",
-        cause
-      ),
+      cause instanceof BackupStorageError
+        ? cause
+        : backupStorageError(
+            "s3_request_failed",
+            "storage.deletePrefix",
+            "The S3-compatible storage request failed. Check the endpoint, region, bucket, credentials, and key permissions.",
+            cause
+          ),
   })
 }
 
