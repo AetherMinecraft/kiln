@@ -16,7 +16,7 @@ services:
       - /bin/sh
       - -lc
       - |
-        apk add --no-cache docker-cli docker-cli-compose
+        apk add --no-cache docker-cli docker-cli-compose restic
         corepack enable
         pnpm install --frozen-lockfile --ignore-scripts --filter relay...
         pnpm rebuild esbuild

@@ -906,6 +906,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       if (kind === "create") return "backup.create"
       if (kind === "restore") return "backup.restore"
       if (kind === "delete") return "backup.delete"
+      if (kind === "export") return "backup.download"
       return null
     }
     case "backup.task.cancel":

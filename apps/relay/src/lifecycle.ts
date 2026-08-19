@@ -52,6 +52,7 @@ import {
   relayTailscaleStackSchema,
 } from "@workspace/contracts"
 import type { BrickCatalog } from "./bricks.js"
+import { removeResticRepository } from "./backups.js"
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
 import type { DockerDriver } from "./docker.js"
 import {
@@ -2765,6 +2766,7 @@ export class LifecycleDriver {
         recursive: true,
         force: true,
       })
+      await removeResticRepository(this.#config, instance.id)
     }
     const networking = await this.networking()
     if (networking?.enabled) await this.#refreshCoreDnsConfiguration(networking)

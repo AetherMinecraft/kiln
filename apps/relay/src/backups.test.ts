@@ -9,6 +9,7 @@ import { TestClock } from "effect/testing"
 import ZipStream from "zip-stream"
 
 import type {
+  BackupArchiveCreateTaskResult,
   BackupCreateTaskInput,
   BackupCreateTaskResult,
   BackupDeleteTaskInput,
@@ -547,10 +548,12 @@ describe("Relay backups", () => {
           )
           const restore: BackupRestoreTaskInput & { kind: "restore" } = {
             backupId: input.backupId,
-            bytes: created.bytes,
-            checksumSha256: created.checksumSha256,
             kind: "restore",
-            source: { kind: "local" },
+            source: {
+              bytes: created.bytes,
+              checksumSha256: created.checksumSha256,
+              kind: "local",
+            },
             target: { id: "instance-1", kind: "instance" },
             taskId: "20000000-0000-4000-8000-000000000006",
           }
@@ -659,12 +662,14 @@ describe("Relay backups", () => {
                 config,
                 {
                   backupId: input.backupId,
-                  bytes: archive.byteLength,
-                  checksumSha256: createHash("sha256")
-                    .update(archive)
-                    .digest("hex"),
                   kind: "restore",
-                  source: { kind: "local" },
+                  source: {
+                    bytes: archive.byteLength,
+                    checksumSha256: createHash("sha256")
+                      .update(archive)
+                      .digest("hex"),
+                    kind: "local",
+                  },
                   target: input.target,
                   taskId: "20000000-0000-4000-8000-000000000008",
                 },
@@ -755,7 +760,7 @@ function backupInput(
   }
 }
 
-function backupResult(index: number): BackupCreateTaskResult {
+function backupResult(index: number): BackupArchiveCreateTaskResult {
   return {
     bytes: index + 1,
     checksumSha256: String(index).repeat(64),

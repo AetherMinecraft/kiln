@@ -11,11 +11,13 @@ import {
   mkdir,
   open,
   opendir,
+  readFile,
   realpath,
   rename,
   rm,
   stat,
   statfs,
+  writeFile,
 } from "node:fs/promises"
 import { relative, resolve, sep } from "node:path"
 import { isIP } from "node:net"
@@ -27,10 +29,12 @@ import ZipStream from "zip-stream"
 
 import {
   backupArtifactFilename,
+  type BackupArchiveCreateTaskResult,
   type BackupArchiveManifest,
   type BackupCreateTaskInput,
   type BackupCreateTaskResult,
   type BackupDeleteTaskInput,
+  type BackupExportTaskResult,
   type BackupTaskInput,
   type BackupTaskPhase,
   type BackupTaskResult,
@@ -49,10 +53,22 @@ import { promiseEffect } from "./effect/promise.js"
 import { RelayStateStore } from "./effect/state.js"
 import { isPublicRemoteAddress, secureRemoteLookup } from "./source-policy.js"
 import {
+  installPreparedInstanceRestore,
   materializeBackupArtifact,
+  prepareInstanceRestoreStaging,
   recoverInterruptedRestores,
   restorePortableInstanceBackup,
+  settleRestoreJournal,
 } from "./backup-restore.js"
+import {
+  createResticDriver,
+  requiredRepositoryPassword,
+  resticRepositoryPath,
+  resticSnapshotSelector,
+  translateExcludePatterns,
+  validateStagingTree,
+  type ResticDriver,
+} from "./restic.js"
 
 const MAX_BACKUP_ENTRIES = 100_000
 const ZIP_OVERHEAD_RESERVE_BYTES = 64 * 1024 * 1024
@@ -99,7 +115,7 @@ type CreateArchive = (
   instance: RelayInstanceConfig,
   progress: BackupProgress,
   signal: AbortSignal
-) => Promise<BackupCreateTaskResult>
+) => Promise<BackupArchiveCreateTaskResult>
 
 export class BackupManager {
   readonly #config: RelayConfig
@@ -109,6 +125,7 @@ export class BackupManager {
   ) => Promise<RelayInstanceConfig | null>
   readonly #isInstanceStopped: (instanceId: string) => Promise<boolean>
   readonly #databases: DatabaseDriver | null
+  readonly #restic: ResticDriver
   readonly #state: RelayStateStore["Service"]
   readonly #wake: Queue.Queue<void>
   readonly #activeCreates = new Map<string, AbortController>()
@@ -119,6 +136,7 @@ export class BackupManager {
     findInstance: (instanceId: string) => Promise<RelayInstanceConfig | null>
     isInstanceStopped: (instanceId: string) => Promise<boolean>
     databases: DatabaseDriver | null
+    restic: ResticDriver
     state: RelayStateStore["Service"]
     wake: Queue.Queue<void>
   }) {
@@ -127,6 +145,7 @@ export class BackupManager {
     this.#findInstance = options.findInstance
     this.#isInstanceStopped = options.isInstanceStopped
     this.#databases = options.databases
+    this.#restic = options.restic
     this.#state = options.state
     this.#wake = options.wake
   }
@@ -137,6 +156,7 @@ export class BackupManager {
     findInstance: (instanceId: string) => Promise<RelayInstanceConfig | null>
     isInstanceStopped: (instanceId: string) => Promise<boolean>
     databases?: DatabaseDriver
+    restic?: ResticDriver
   }) {
     return Effect.gen(function* () {
       const state = yield* RelayStateStore
@@ -156,6 +176,7 @@ export class BackupManager {
         findInstance: options.findInstance,
         isInstanceStopped: options.isInstanceStopped,
         databases: options.databases ?? null,
+        restic: options.restic ?? createResticDriver(),
         state,
         wake,
       })
@@ -170,6 +191,7 @@ export class BackupManager {
         )
       }
       yield* state.requeueInterruptedBackupTasks(Date.now())
+      yield* promiseEffect(() => sweepExpiredBackupExports(options.config))
       yield* Queue.offer(wake, undefined)
       return manager
     })
@@ -188,7 +210,9 @@ export class BackupManager {
   }
 
   list(updatedAfter?: number) {
-    return this.#state.listBackupTasks(updatedAfter)
+    return this.#state.listBackupTasks(updatedAfter).pipe(
+      Effect.map((tasks) => tasks.filter((task) => task.kind !== "prune"))
+    )
   }
 
   cancel(taskId: string) {
@@ -217,36 +241,36 @@ export class BackupManager {
       while (true) {
         const task = yield* this.#state.claimNextBackupTask(Date.now())
         if (!task) return
-        const controller =
-          task.kind === "create" ? new AbortController() : undefined
-        if (controller) {
-          this.#activeCreates.set(task.taskId, controller)
-          const current = yield* this.#state.getBackupTask(task.taskId)
-          if (!current || current.status !== "running") controller.abort()
-        }
-        const timeoutFiber =
-          task.kind === "create"
-            ? yield* Effect.forkChild(
-                Effect.sleep(this.#config.backupTimeoutMs).pipe(
-                  Effect.andThen(
-                    Effect.suspend(() =>
-                      this.#state.cancelBackupTask(
-                        task.taskId,
-                        Date.now(),
-                        BACKUP_TIMEOUT_REASON
-                      )
+        const controller = new AbortController()
+        this.#activeCreates.set(task.taskId, controller)
+        const current = yield* this.#state.getBackupTask(task.taskId)
+        if (!current || current.status !== "running") controller.abort()
+        const timeoutFiber = yield* Effect.forkChild(
+          Effect.sleep(this.#config.backupTimeoutMs).pipe(
+            Effect.andThen(
+              Effect.suspend(() =>
+                task.kind === "create"
+                  ? this.#state.cancelBackupTask(
+                      task.taskId,
+                      Date.now(),
+                      BACKUP_TIMEOUT_REASON
                     )
-                  ),
-                  Effect.tap((cancelled) =>
-                    cancelled
-                      ? Effect.sync(() => controller?.abort())
-                      : Effect.void
-                  ),
-                  Effect.asVoid
-                )
+                  : this.#state.failBackupTask(
+                      task.taskId,
+                      BACKUP_TIMEOUT_REASON,
+                      Date.now()
+                    )
               )
-            : undefined
-        yield* this.#execute(task, controller?.signal).pipe(
+            ),
+            Effect.tap((stopped) =>
+              stopped
+                ? Effect.sync(() => controller.abort())
+                : Effect.void
+            ),
+            Effect.asVoid
+          )
+        )
+        yield* this.#execute(task, controller.signal).pipe(
           Effect.catch((cause) =>
             this.#state
               .failBackupTask(
@@ -282,6 +306,71 @@ export class BackupManager {
 
   #execute(task: RelayBackupTask, signal?: AbortSignal) {
     return Effect.gen({ self: this }, function* () {
+      const createSignal = signal ?? new AbortController().signal
+      if (task.input.kind === "export") {
+        const result = yield* runResticExport(
+          this.#config,
+          this.#restic,
+          this.#findInstance,
+          task.input,
+          task.taskId,
+          (progress) =>
+            this.#state.updateBackupTaskProgress(
+              task.taskId,
+              progress.completed,
+              progress.total,
+              progress.phase,
+              progress.currentPath,
+              progress.currentArtifactId,
+              Date.now()
+            ),
+          createSignal
+        )
+        const completed = yield* this.#state.completeBackupTask(
+          task.taskId,
+          result,
+          Date.now()
+        )
+        if (!completed) {
+          return yield* backupFailure(
+            "task_state_changed",
+            "export.complete",
+            "The backup task was no longer running when export completed"
+          )
+        }
+        return
+      }
+      if (task.input.kind === "prune") {
+        yield* runResticPrune(
+          this.#config,
+          this.#restic,
+          task.input,
+          (progress) =>
+            this.#state.updateBackupTaskProgress(
+              task.taskId,
+              progress.completed,
+              progress.total,
+              progress.phase,
+              progress.currentPath,
+              progress.currentArtifactId,
+              Date.now()
+            ),
+          createSignal
+        )
+        const completed = yield* this.#state.completeBackupTask(
+          task.taskId,
+          { warnings: [] },
+          Date.now()
+        )
+        if (!completed) {
+          return yield* backupFailure(
+            "task_state_changed",
+            "prune.complete",
+            "The backup task was no longer running when prune completed"
+          )
+        }
+        return
+      }
       if (task.input.kind === "restore") {
         const input = task.input
         if (input.target.kind === "database") {
@@ -386,23 +475,33 @@ export class BackupManager {
             "Stop the server before restoring a backup"
           )
         }
-        const result = yield* Effect.tryPromise({
-          try: () =>
-            restorePortableInstanceBackup(
-              this.#config,
-              { ...input, kind: "restore" },
-              instance
-            ),
-          catch: (cause) =>
-            cause instanceof RelayBackupError
-              ? cause
-              : RelayBackupError.make({
-                  code: "restore_failed",
-                  operation: "restore",
-                  reason: backupErrorMessage(cause),
-                  cause,
-                }),
-        })
+        const result = yield* (
+          input.source.kind === "restic"
+            ? runResticRestore(
+                this.#config,
+                this.#restic,
+                input,
+                instance,
+                createSignal
+              )
+            : Effect.tryPromise({
+                try: () =>
+                  restorePortableInstanceBackup(
+                    this.#config,
+                    { ...input, kind: "restore" },
+                    instance
+                  ),
+                catch: (cause) =>
+                  cause instanceof RelayBackupError
+                    ? cause
+                    : RelayBackupError.make({
+                        code: "restore_failed",
+                        operation: "restore",
+                        reason: backupErrorMessage(cause),
+                        cause,
+                      }),
+              })
+        )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
           result,
@@ -423,17 +522,27 @@ export class BackupManager {
           deleteUpdatedAt = Math.max(Date.now(), deleteUpdatedAt + 1)
           return deleteUpdatedAt
         }
-        const result = yield* deleteBackupArtifacts(
-          this.#config,
-          task.input,
-          (currentArtifactId, progress) =>
-            this.#state.updateBackupTaskOperationProgress(
-              task.taskId,
-              currentArtifactId,
-              progress,
-              nextDeleteUpdatedAt()
-            )
-        )
+        const result =
+          task.input.destination.kind === "restic"
+            ? yield* runResticForget(
+                this.#config,
+                this.#restic,
+                this.#state,
+                this.#wake,
+                task.input,
+                createSignal
+              )
+            : yield* deleteBackupArtifacts(
+                this.#config,
+                task.input,
+                (currentArtifactId, progress) =>
+                  this.#state.updateBackupTaskOperationProgress(
+                    task.taskId,
+                    currentArtifactId,
+                    progress,
+                    nextDeleteUpdatedAt()
+                  )
+              )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
           result,
@@ -449,7 +558,6 @@ export class BackupManager {
         return
       }
       const input = task.input
-      const createSignal = signal ?? new AbortController().signal
       if (
         input.target.kind === "platform" &&
         input.artifactKind === "platform_bundle" &&
@@ -639,6 +747,43 @@ export class BackupManager {
         return
       }
       if (
+        input.destination.kind === "restic" &&
+        input.mode === "incremental" &&
+        input.artifactKind === "restic_snapshot" &&
+        input.target.kind === "instance"
+      ) {
+        const result = yield* runResticCreate(
+          this.#config,
+          this.#restic,
+          this.#findInstance,
+          input,
+          (progress) =>
+            this.#state.updateBackupTaskProgress(
+              task.taskId,
+              progress.completed,
+              progress.total || null,
+              progress.phase,
+              progress.currentPath,
+              progress.currentArtifactId,
+              Date.now()
+            ),
+          createSignal
+        )
+        const completed = yield* this.#state.completeBackupTask(
+          task.taskId,
+          result,
+          Date.now()
+        )
+        if (!completed) {
+          return yield* backupFailure(
+            "task_state_changed",
+            "create.complete",
+            "The backup task was no longer running when the snapshot completed"
+          )
+        }
+        return
+      }
+      if (
         input.target.kind !== "instance" ||
         input.artifactKind !== "archive" ||
         input.mode !== "full"
@@ -747,7 +892,7 @@ export async function createPortableInstanceBackup(
   instance: RelayInstanceConfig,
   progress: BackupProgress,
   signal: AbortSignal = new AbortController().signal
-): Promise<BackupCreateTaskResult> {
+): Promise<BackupArchiveCreateTaskResult> {
   signal.throwIfAborted()
   const configuredRoot = await realpath(config.rootDirectory)
   const instanceRoot = await realpath(
@@ -832,7 +977,7 @@ export async function createPortableInstanceBackup(
             checksumSha256: written.checksumSha256,
             filename: backupArtifactFilename(input.backupId, "archive"),
             warnings: warnings.slice(0, 1_000),
-          } satisfies BackupCreateTaskResult
+          } satisfies BackupArchiveCreateTaskResult
         },
         catch: (cause) =>
           cause instanceof RelayBackupError
@@ -863,7 +1008,7 @@ export async function createPortableInstanceBackup(
 export function storeCreatedBackup(
   config: RelayConfig,
   input: BackupCreateTaskInput,
-  result: BackupCreateTaskResult,
+  result: BackupArchiveCreateTaskResult,
   progress: BackupProgress,
   signal: AbortSignal,
   uploadArtifact: typeof uploadBackupArtifact = uploadBackupArtifact
@@ -875,19 +1020,22 @@ export function storeCreatedBackup(
     const destinations = [input.destination, ...(input.replicas ?? [])]
     progress.completed = 0
     progress.total = result.bytes
-    const outcomes: NonNullable<BackupCreateTaskResult["artifacts"]> = []
+    const outcomes: NonNullable<BackupArchiveCreateTaskResult["artifacts"]> =
+      []
     let available = 0
     let lastUploadedArtifactId: string | null = null
     for (const destination of destinations) {
       signal.throwIfAborted()
-      if (destination.kind === "local") {
-        available += 1
-        if (destination.artifactId) {
-          outcomes.push({
-            artifactId: destination.artifactId,
-            error: null,
-            status: "available",
-          })
+      if (destination.kind !== "s3") {
+        if (destination.kind === "local") {
+          available += 1
+          if (destination.artifactId) {
+            outcomes.push({
+              artifactId: destination.artifactId,
+              error: null,
+              status: "available",
+            })
+          }
         }
         continue
       }
@@ -1066,6 +1214,9 @@ function deleteBackupArtifact(
       rm(backupArchivePath(config, input.backupId), { force: true })
     ).pipe(Effect.as({ warnings: [] }))
   }
+  if (input.destination.kind === "restic") {
+    return Effect.succeed({ warnings: [] })
+  }
   const destination = input.destination
   return Effect.tryPromise({
     try: () =>
@@ -1160,6 +1311,573 @@ function sendSignedBackupRequest(input: {
       request.end()
     }
   })
+}
+
+function backupExportDirectoryPath(config: RelayConfig): string {
+  return resolve(config.dataDirectory, "exports")
+}
+
+function backupExportPath(config: RelayConfig, backupId: string): string {
+  return resolve(backupExportDirectoryPath(config), `${backupId}.zip`)
+}
+
+function backupExportPartialPath(
+  config: RelayConfig,
+  backupId: string,
+  taskId: string
+): string {
+  return resolve(
+    backupExportDirectoryPath(config),
+    `.${backupId}.${taskId}.partial`
+  )
+}
+
+export async function removeResticRepository(
+  config: RelayConfig,
+  targetId: string
+): Promise<void> {
+  await rm(resticRepositoryPath(config, targetId), {
+    force: true,
+    recursive: true,
+  })
+}
+
+export async function sweepExpiredBackupExports(
+  config: RelayConfig,
+  now = Date.now()
+): Promise<void> {
+  const directory = backupExportDirectoryPath(config)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  for await (const entry of await opendir(directory)) {
+    if (!entry.isFile()) continue
+    const path = resolve(directory, entry.name)
+    if (entry.name.endsWith(".partial")) {
+      await rm(path, { force: true })
+      continue
+    }
+    if (!entry.name.endsWith(".zip")) continue
+    const metadata = await optionalLstat(path)
+    if (!metadata) continue
+    const marker = resolve(directory, `.${entry.name}.expires`)
+    const expiresAt = await readExportExpiry(marker)
+    if (expiresAt !== null && expiresAt <= now) {
+      await rm(path, { force: true })
+      await rm(marker, { force: true })
+    }
+  }
+}
+
+async function readExportExpiry(path: string): Promise<number | null> {
+  const contents = await Effect.runPromise(
+    Effect.result(
+      Effect.tryPromise({
+        try: () => readFile(path, "utf8"),
+        catch: (cause) => cause,
+      })
+    )
+  )
+  if (Result.isFailure(contents)) return null
+  const parsed = Number(contents.success.trim())
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
+function runResticCreate(
+  config: RelayConfig,
+  restic: ResticDriver,
+  findInstance: (instanceId: string) => Promise<RelayInstanceConfig | null>,
+  input: BackupCreateTaskInput & { kind?: "create" },
+  updateProgress: (progress: BackupProgress) => ReturnType<
+    RelayStateStore["Service"]["updateBackupTaskProgress"]
+  >,
+  signal: AbortSignal
+) {
+  return Effect.gen(function* () {
+    const password = requiredRepositoryPassword(
+      input.destination.kind === "restic"
+        ? input.destination.repositoryPassword
+        : undefined,
+      "create.restic"
+    )
+    const instance = yield* Effect.tryPromise({
+      try: () => findInstance(input.target.id),
+      catch: (cause) =>
+        RelayBackupError.make({
+          code: "instance_lookup_failed",
+          operation: "create.lookup",
+          reason: "The backup target could not be loaded",
+          cause,
+        }),
+    })
+    if (!instance) {
+      return yield* backupFailure(
+        "instance_not_found",
+        "create.lookup",
+        "The backup target no longer exists on this Relay"
+      )
+    }
+    const progress: BackupProgress = {
+      completed: 0,
+      currentArtifactId: input.destination.artifactId ?? null,
+      currentPath: null,
+      phase: "archiving",
+      total: 0,
+    }
+    const progressFiber = yield* Effect.forkChild(
+      Effect.sleep("500 millis").pipe(
+        Effect.andThen(
+          Effect.suspend(() =>
+            updateProgress(progress).pipe(Effect.asVoid)
+          )
+        ),
+        Effect.forever
+      )
+    )
+    const result = yield* Effect.tryPromise({
+      try: () =>
+        createResticSnapshot(
+          config,
+          restic,
+          input,
+          instance,
+          password,
+          progress,
+          signal
+        ),
+      catch: (cause) =>
+        cause instanceof RelayBackupError
+          ? cause
+          : RelayBackupError.make({
+              code: "restic_backup_failed",
+              operation: "create.restic",
+              reason: backupErrorMessage(cause),
+              cause,
+            }),
+    }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
+    return result
+  })
+}
+
+async function createResticSnapshot(
+  config: RelayConfig,
+  restic: ResticDriver,
+  input: BackupCreateTaskInput,
+  instance: RelayInstanceConfig,
+  password: string,
+  progress: BackupProgress,
+  signal: AbortSignal
+): Promise<BackupCreateTaskResult> {
+  const repository = resticRepositoryPath(config, input.target.id)
+  const translated = translateExcludePatterns([
+    ...DEFAULT_EXCLUDES,
+    ...input.exclude,
+  ])
+  const exists = await restic.catConfig({ password, repository, signal })
+  if (!exists) await restic.init({ password, repository, signal })
+  const existing = await restic.snapshotsByTag({
+    password,
+    repository,
+    signal,
+    tag: `task:${input.taskId}`,
+  })
+  const reuse = existing[0]
+  if (reuse) {
+    const stats = await restic.stats({
+      password,
+      repository,
+      signal,
+      snapshotId: reuse.id,
+    })
+    if (input.maxBytes !== null && stats.totalSize > input.maxBytes) {
+      throw RelayBackupError.make({
+        code: "backup_too_large",
+        operation: "create.restic",
+        reason: "The snapshot exceeds the reserved backup size",
+      })
+    }
+    progress.completed = stats.totalSize
+    progress.total = stats.totalSize
+    return {
+      artifacts: input.destination.artifactId
+        ? [
+            {
+              artifactId: input.destination.artifactId,
+              error: null,
+              status: "available",
+            },
+          ]
+        : undefined,
+      bytes: stats.totalSize,
+      snapshotId: reuse.id,
+      warnings: translated.warnings,
+    }
+  }
+  const summary = await restic.backup({
+    cwd: config.rootDirectory,
+    excludes: translated.excludes,
+    onProgress: (update) => {
+      progress.completed = update.bytesCompleted
+      progress.total = update.bytesTotal ?? progress.total
+      if (input.maxBytes !== null && progress.total > input.maxBytes) {
+        throw RelayBackupError.make({
+          code: "backup_too_large",
+          operation: "create.restic",
+          reason: "The snapshot exceeds the reserved backup size",
+        })
+      }
+    },
+    password,
+    path: instance.directory,
+    repository,
+    signal,
+    tags: [`task:${input.taskId}`, `backup:${input.backupId}`],
+  })
+  if (input.maxBytes !== null && summary.totalBytesProcessed > input.maxBytes) {
+    throw RelayBackupError.make({
+      code: "backup_too_large",
+      operation: "create.restic",
+      reason: "The snapshot exceeds the reserved backup size",
+    })
+  }
+  progress.completed = summary.totalBytesProcessed
+  progress.total = summary.totalBytesProcessed
+  return {
+    artifacts: input.destination.artifactId
+      ? [
+          {
+            artifactId: input.destination.artifactId,
+            error: null,
+            status: "available",
+          },
+        ]
+      : undefined,
+    bytes: summary.totalBytesProcessed,
+    snapshotId: summary.snapshotId,
+    warnings: translated.warnings,
+  }
+}
+
+function runResticRestore(
+  config: RelayConfig,
+  restic: ResticDriver,
+  input: Extract<BackupTaskInput, { kind: "restore" }>,
+  instance: RelayInstanceConfig,
+  signal: AbortSignal
+) {
+  return Effect.tryPromise({
+    try: async () => {
+      if (input.source.kind !== "restic") {
+        throw RelayBackupError.make({
+          code: "unsupported_restore_source",
+          operation: "restore.restic",
+          reason: "This restore is not a restic snapshot",
+        })
+      }
+      const source = input.source
+      const password = requiredRepositoryPassword(
+        source.repositoryPassword,
+        "restore.restic"
+      )
+      const prepared = await prepareInstanceRestoreStaging(
+        config,
+        instance.directory,
+        input.taskId
+      )
+      const restored = await Effect.runPromise(
+        Effect.result(
+          Effect.tryPromise({
+            try: async () => {
+              await restic.restore({
+                password,
+                repository: resticRepositoryPath(config, input.target.id),
+                selector: resticSnapshotSelector(
+                  source.snapshotId,
+                  instance.directory
+                ),
+                signal,
+                target: prepared.paths.staging,
+              })
+              await validateStagingTree(prepared.paths.staging, instance.limits)
+              await installPreparedInstanceRestore(prepared)
+              return { warnings: [] as Array<string> }
+            },
+            catch: (cause) => cause,
+          })
+        )
+      )
+      if (Result.isSuccess(restored)) return restored.success
+      const completed = await settleRestoreJournal(
+        config,
+        prepared.journal,
+        false
+      )
+      if (completed) return { warnings: [] }
+      throw restored.failure
+    },
+    catch: (cause) =>
+      cause instanceof RelayBackupError
+        ? cause
+        : RelayBackupError.make({
+            code: "restic_restore_failed",
+            operation: "restore.restic",
+            reason: backupErrorMessage(cause),
+            cause,
+          }),
+  })
+}
+
+function runResticForget(
+  config: RelayConfig,
+  restic: ResticDriver,
+  state: RelayStateStore["Service"],
+  wake: Queue.Queue<void>,
+  input: BackupDeleteTaskInput & { kind: "delete" },
+  signal: AbortSignal
+) {
+  return Effect.gen(function* () {
+    const destination = input.destination
+    if (destination.kind !== "restic") {
+      return yield* backupFailure(
+        "unsupported_delete_destination",
+        "delete.restic",
+        "This delete is not a restic snapshot"
+      )
+    }
+    const password = requiredRepositoryPassword(
+      destination.repositoryPassword,
+      "delete.restic"
+    )
+    yield* Effect.tryPromise({
+      try: () =>
+        restic.forget({
+          password,
+          repository: resticRepositoryPath(config, input.target.id),
+          signal,
+          snapshotId: destination.snapshotId,
+        }),
+      catch: (cause) =>
+        cause instanceof RelayBackupError
+          ? cause
+          : RelayBackupError.make({
+              code: "restic_forget_failed",
+              operation: "delete.restic",
+              reason: backupErrorMessage(cause),
+              cause,
+            }),
+    })
+    yield* state.enqueueBackupTask(
+      {
+        backupId: randomUUID(),
+        kind: "prune",
+        repositoryPassword: password,
+        target: input.target,
+        taskId: randomUUID(),
+      },
+      Date.now()
+    )
+    yield* Queue.offer(wake, undefined)
+    return {
+      artifacts: input.destination.artifactId
+        ? [
+            {
+              artifactId: input.destination.artifactId,
+              error: null,
+              status: "deleted" as const,
+            },
+          ]
+        : undefined,
+      warnings: [],
+    }
+  })
+}
+
+function runResticPrune(
+  config: RelayConfig,
+  restic: ResticDriver,
+  input: Extract<BackupTaskInput, { kind: "prune" }>,
+  updateProgress: (progress: BackupProgress) => ReturnType<
+    RelayStateStore["Service"]["updateBackupTaskProgress"]
+  >,
+  signal: AbortSignal
+) {
+  return Effect.gen(function* () {
+    const password = requiredRepositoryPassword(
+      input.repositoryPassword,
+      "prune.restic"
+    )
+    const progress: BackupProgress = {
+      completed: 0,
+      currentArtifactId: null,
+      currentPath: null,
+      phase: "finalizing",
+      total: 0,
+    }
+    const progressFiber = yield* Effect.forkChild(
+      Effect.sleep("500 millis").pipe(
+        Effect.andThen(
+          Effect.suspend(() => updateProgress(progress).pipe(Effect.asVoid))
+        ),
+        Effect.forever
+      )
+    )
+    yield* Effect.tryPromise({
+      try: () =>
+        restic.prune({
+          onProgress: (update) => {
+            progress.completed = update.bytesCompleted
+            progress.total = update.bytesTotal ?? progress.total
+          },
+          password,
+          repository: resticRepositoryPath(config, input.target.id),
+          signal,
+        }),
+      catch: (cause) =>
+        cause instanceof RelayBackupError
+          ? cause
+          : RelayBackupError.make({
+              code: "restic_prune_failed",
+              operation: "prune.restic",
+              reason: backupErrorMessage(cause),
+              cause,
+            }),
+    }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
+  })
+}
+
+function runResticExport(
+  config: RelayConfig,
+  restic: ResticDriver,
+  findInstance: (instanceId: string) => Promise<RelayInstanceConfig | null>,
+  input: Extract<BackupTaskInput, { kind: "export" }>,
+  taskId: string,
+  updateProgress: (progress: BackupProgress) => ReturnType<
+    RelayStateStore["Service"]["updateBackupTaskProgress"]
+  >,
+  signal: AbortSignal
+) {
+  return Effect.gen(function* () {
+    const password = requiredRepositoryPassword(
+      input.repositoryPassword,
+      "export.restic"
+    )
+    const instance = yield* Effect.tryPromise({
+      try: () => findInstance(input.target.id),
+      catch: (cause) =>
+        RelayBackupError.make({
+          code: "instance_lookup_failed",
+          operation: "export.lookup",
+          reason: "The export target could not be loaded",
+          cause,
+        }),
+    })
+    if (!instance) {
+      return yield* backupFailure(
+        "instance_not_found",
+        "export.lookup",
+        "The export target no longer exists on this Relay"
+      )
+    }
+    const destination = backupExportPath(config, input.backupId)
+    const partial = backupExportPartialPath(config, input.backupId, taskId)
+    const existing = yield* promiseEffect(() =>
+      reuseValidExport(destination, input.expiresAt)
+    )
+    if (existing) return existing
+    const progress: BackupProgress = {
+      completed: 0,
+      currentArtifactId: null,
+      currentPath: null,
+      phase: "archiving",
+      total: 0,
+    }
+    const progressFiber = yield* Effect.forkChild(
+      Effect.sleep("500 millis").pipe(
+        Effect.andThen(
+          Effect.suspend(() => updateProgress(progress).pipe(Effect.asVoid))
+        ),
+        Effect.forever
+      )
+    )
+    const result = yield* Effect.tryPromise({
+      try: async () => {
+        await mkdir(backupExportDirectoryPath(config), {
+          recursive: true,
+          mode: 0o700,
+        })
+        await rm(partial, { force: true })
+        const dumped = await restic.dumpZip({
+          destination: partial,
+          onProgress: (bytes) => {
+            progress.completed = bytes
+          },
+          password,
+          repository: resticRepositoryPath(config, input.target.id),
+          selector: resticSnapshotSelector(
+            input.snapshotId,
+            instance.directory
+          ),
+          signal,
+        })
+        await rename(partial, destination)
+        await writeExportExpiry(
+          resolve(
+            backupExportDirectoryPath(config),
+            `.${input.backupId}.zip.expires`
+          ),
+          input.expiresAt
+        )
+        progress.completed = dumped.bytes
+        progress.total = dumped.bytes
+        return {
+          bytes: dumped.bytes,
+          checksumSha256: dumped.checksumSha256,
+          expiresAt: input.expiresAt,
+          filename: backupArtifactFilename(input.backupId, "restic_snapshot"),
+          warnings: [],
+        } satisfies BackupExportTaskResult
+      },
+      catch: (cause) =>
+        cause instanceof RelayBackupError
+          ? cause
+          : RelayBackupError.make({
+              code: "restic_export_failed",
+              operation: "export.restic",
+              reason: backupErrorMessage(cause),
+              cause,
+            }),
+    }).pipe(
+      Effect.onError(() =>
+        promiseEffect(() => rm(partial, { force: true })).pipe(Effect.ignore)
+      ),
+      Effect.ensuring(Fiber.interrupt(progressFiber))
+    )
+    return result
+  })
+}
+
+async function reuseValidExport(
+  destination: string,
+  expiresAt: number
+): Promise<BackupExportTaskResult | null> {
+  if (expiresAt <= Date.now()) return null
+  const metadata = await optionalLstat(destination)
+  if (!metadata?.isFile() || metadata.isSymbolicLink()) return null
+  const digest = createHash("sha256")
+  for await (const chunk of createReadStream(destination)) digest.update(chunk)
+  return {
+    bytes: metadata.size,
+    checksumSha256: digest.digest("hex"),
+    expiresAt,
+    filename: backupArtifactFilename(
+      /backup-([0-9a-f-]{36})\.zip$/iu.exec(destination)?.[1] ??
+        destination.replace(/.*\//u, "").replace(/\.zip$/u, ""),
+      "restic_snapshot"
+    ),
+    warnings: [],
+  }
+}
+
+async function writeExportExpiry(path: string, expiresAt: number): Promise<void> {
+  await writeFile(path, `${expiresAt}\n`, { mode: 0o600 })
 }
 
 function backupDirectoryPath(config: RelayConfig): string {
@@ -1547,6 +2265,17 @@ function requireContained(root: string, candidate: string): void {
 
 function backupFailure(code: string, operation: string, reason: string) {
   return Effect.fail(RelayBackupError.make({ code, operation, reason }))
+}
+
+function optionalLstat(path: string) {
+  return Effect.runPromise(
+    Effect.result(
+      Effect.tryPromise({
+        try: () => lstat(path),
+        catch: (cause) => cause,
+      })
+    )
+  ).then((result) => (Result.isSuccess(result) ? result.success : null))
 }
 
 function backupErrorMessage(cause: unknown): string {
