@@ -24,6 +24,7 @@ import type { AuthenticatedUser } from "@/lib/auth-session"
 import { hydrateBrickVariables } from "@/lib/brick-variables"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
+import { listMcJarVersionsEffect } from "@/effect/mcjarfiles"
 import { runAppEffect } from "@/effect/runtime"
 import {
   cachedRelayJsonEffect,
@@ -34,6 +35,11 @@ import {
 } from "@/lib/relay-client"
 import { requireAuthenticatedUser } from "@/server/auth"
 import { provisionInstanceDomainBestEffort } from "@/server/domains.server"
+
+const brickVersionCatalogSchema = z.object({
+  type: z.string().regex(/^[a-z0-9-]+$/u),
+  variant: z.string().regex(/^[a-z0-9-]+$/u),
+})
 
 const relayInputSchema = z.object({ relayId: relayIdSchema })
 const createInputSchema = relayCreateInstanceSchema.extend({
@@ -86,6 +92,16 @@ export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
     }
   }
 )
+
+export const getBrickVersions = createServerFn({ method: "GET" })
+  .validator(brickVersionCatalogSchema)
+  .handler(async ({ data }) => {
+    await requireAuthenticatedUser()
+    return runAppEffect(
+      "mcjarfiles.versions",
+      listMcJarVersionsEffect(data.type, data.variant)
+    )
+  })
 
 export const createBrickInstance = createServerFn({ method: "POST" })
   .validator(createInputSchema)

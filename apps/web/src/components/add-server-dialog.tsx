@@ -1,11 +1,12 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useNavigate } from "@tanstack/react-router"
-import { Effect, Result } from "effect"
+import { Effect } from "effect"
 import { CircleAlert, HardDrive, LoaderCircle, Rocket } from "lucide-react"
 import {
   DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
   type Brick,
+  type BrickVariable,
   type BrickVariableValue,
 } from "@workspace/contracts"
 
@@ -28,9 +29,15 @@ import {
   BrickCatalogBrowser,
   type BrickSelection,
 } from "@/components/brick-selector"
+import { BrickVersionPicker } from "@/components/brick-version-picker"
+import { brickArtifactCatalog } from "@/lib/brick-artifact"
 import {
   defaultBrickInstanceName,
   defaultBrickVariables,
+  missingRequiredBrickVersion,
+  recommendedSupportedJavaVersion,
+  stringVariableAllows,
+  supportedJavaVersions,
   unavailableMinecraftJavaVersion,
   withRecommendedMinecraftJava,
 } from "@/lib/brick-variables"
@@ -42,6 +49,7 @@ import {
 import type { PersistedRelay } from "@/lib/relay-registry"
 import {
   brickCatalogQueryOptions,
+  brickVersionsQueryOptions,
   queryKeys,
   relayConnectionQueryOptions,
 } from "@/lib/query-options"
@@ -133,7 +141,7 @@ const AddServerDialog = React.memo(function AddServerDialog({
                 </p>
                 <p className="mt-1 text-[0.6875rem] text-muted-foreground">
                   {catalogQuery.error?.message ??
-                    "Connect a Relay to load official Bricks."}
+                    "Connect a Relay to load verified Bricks."}
                 </p>
               </div>
             )}
@@ -313,9 +321,37 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
       return
     }
     const submittedVersion = formData.get("version")
+    const submittedJavaVersion = formData.get("java_version")
+    if (selection.kind === "catalog") {
+      const versionDefinition = selection.brick.variables.version
+      if (missingRequiredBrickVersion(versionDefinition, submittedVersion)) {
+        setFailure({
+          selectionIdentity,
+          message: "Select a Minecraft version",
+        })
+        return
+      }
+      const version =
+        typeof submittedVersion === "string" ? submittedVersion.trim() : ""
+      if (
+        version &&
+        versionDefinition &&
+        !stringVariableAllows(versionDefinition, version)
+      ) {
+        setFailure({
+          selectionIdentity,
+          message: "Enter a valid Minecraft version",
+        })
+        return
+      }
+    }
     const configured =
       selection.kind === "catalog"
-        ? catalogVariablesForVersion(selection.brick, submittedVersion)
+        ? catalogVariablesForVersion(
+            selection.brick,
+            submittedVersion,
+            submittedJavaVersion
+          )
         : { unavailableJavaVersion: null, variables: {}, version: null }
     if (configured.unavailableJavaVersion && configured.version) {
       setFailure({
@@ -387,38 +423,12 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
         />
       </label>
       {versionDefinition ? (
-        <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
-          <span className="flex items-center justify-between gap-3">
-            <span>{versionDefinition.label}</span>
-            {versionDefinition.default === undefined ? null : (
-              <span className="font-mono text-[0.5625rem] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
-                {String(versionDefinition.default)} default
-              </span>
-            )}
-          </span>
-          <Input
-            key={`${selectionIdentity}:version`}
-            name="version"
-            defaultValue={
-              versionDefinition.default === undefined
-                ? ""
-                : String(versionDefinition.default)
-            }
-            placeholder="Enter a version"
-            pattern={versionDefinition.rules?.pattern}
-            minLength={versionDefinition.rules?.minLength}
-            maxLength={versionDefinition.rules?.maxLength}
-            disabled={pending}
-            className="font-mono tabular-nums"
-            required={
-              versionDefinition.required &&
-              versionDefinition.default === undefined
-            }
-          />
-          <span className="block text-[0.5625rem] leading-relaxed font-normal text-muted-foreground/65">
-            {versionDefinition.description}
-          </span>
-        </label>
+        <MinecraftVersionField
+          key={`${selectionIdentity}:version`}
+          definition={versionDefinition}
+          disabled={pending}
+          selection={selection}
+        />
       ) : null}
       <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
         <span className="flex items-center justify-between gap-3">
@@ -442,9 +452,6 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
           <span className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 font-mono text-[0.5625rem] text-muted-foreground/65">
             GiB
           </span>
-        </span>
-        <span className="block text-[0.5625rem] leading-relaxed font-normal text-muted-foreground/65">
-          Counts server files only; backups remain outside this allocation.
         </span>
       </label>
       <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
@@ -488,7 +495,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
                       value={relay.id}
                       disabled={!compatible}
                     >
-                      {relay.name} - {relayDisplayHost(relay)}
+                      {relay.name}
                       {compatible
                         ? ""
                         : ` — incompatible (${displayArchitecture(relay.nodeArch)})`}
@@ -567,7 +574,8 @@ function diskLimitBytesFromFormValue(
 
 function catalogVariablesForVersion(
   brick: Brick,
-  value: FormDataEntryValue | null
+  value: FormDataEntryValue | null,
+  javaValue: FormDataEntryValue | null
 ): {
   unavailableJavaVersion: string | null
   variables: Record<string, BrickVariableValue>
@@ -575,33 +583,30 @@ function catalogVariablesForVersion(
 } {
   const variables = defaultBrickVariables(brick)
   const version = typeof value === "string" ? value.trim() : ""
+  const javaVersion = typeof javaValue === "string" ? javaValue.trim() : ""
   if (!version) {
     return { unavailableJavaVersion: null, variables, version: null }
   }
   variables.version = version
+  if (javaVersion) variables.java_version = javaVersion
   const unavailableJavaVersion = unavailableMinecraftJavaVersion(
     brick.metadata.id,
     brick.variables,
-    version
+    version,
+    javaVersion || undefined
   )
   return {
     unavailableJavaVersion,
-    variables: unavailableJavaVersion
-      ? variables
-      : withRecommendedMinecraftJava(
-          brick.metadata.id,
-          brick.variables,
-          variables
-        ),
+    variables:
+      javaVersion || unavailableJavaVersion
+        ? variables
+        : withRecommendedMinecraftJava(
+            brick.metadata.id,
+            brick.variables,
+            variables
+          ),
     version,
   }
-}
-
-function relayDisplayHost(relay: PersistedRelay): string {
-  return Result.getOrElse(
-    Result.try(() => new URL(relay.browserOrigin).hostname || relay.hostname),
-    () => relay.hostname
-  )
 }
 
 function relaySupportsSelection(
@@ -617,6 +622,159 @@ function relaySupportsSelection(
   )
 }
 
+const MinecraftVersionField = React.memo(function MinecraftVersionField({
+  definition,
+  disabled,
+  selection,
+}: {
+  definition: BrickVariable
+  disabled: boolean
+  selection: BrickSelection | null
+}) {
+  const labelId = React.useId()
+  const defaultVersion =
+    definition.default === undefined ? "" : String(definition.default)
+  const [version, setVersion] = React.useState(defaultVersion)
+  const catalog =
+    selection?.kind === "catalog"
+      ? brickArtifactCatalog(selection.brick)
+      : null
+  const versionsQuery = useQuery({
+    ...brickVersionsQueryOptions(catalog?.type ?? "", catalog?.variant ?? ""),
+    enabled: catalog !== null,
+  })
+  const versions = React.useMemo(
+    () =>
+      supportedBrickVersions(
+        versionsQuery.data?.versions ?? [],
+        definition,
+        defaultVersion
+      ),
+    [defaultVersion, definition, versionsQuery.data?.versions]
+  )
+  const usePicker =
+    catalog !== null &&
+    !versionsQuery.isError &&
+    (versionsQuery.isPending || versions.length > 0)
+  const required =
+    definition.required && definition.default === undefined
+  const javaDefinition =
+    selection?.kind === "catalog"
+      ? javaVersionDefinition(selection.brick)
+      : null
+  const javaVersions = React.useMemo(
+    () => (javaDefinition ? supportedJavaVersions(javaDefinition) : []),
+    [javaDefinition]
+  )
+  const recommendedJava =
+    selection?.kind === "catalog" && javaDefinition
+      ? recommendedSupportedJavaVersion(
+          selection.brick.metadata.id,
+          javaDefinition,
+          version
+        )
+      : null
+  const [javaVersion, setJavaVersion] = React.useState(
+    recommendedJava ?? javaVersions.at(-1) ?? ""
+  )
+  const javaLabelId = React.useId()
+  const changeVersion = React.useCallback(
+    (nextVersion: string) => {
+      setVersion(nextVersion)
+      if (selection?.kind !== "catalog" || !javaDefinition) return
+      const nextJava = recommendedSupportedJavaVersion(
+        selection.brick.metadata.id,
+        javaDefinition,
+        nextVersion
+      )
+      if (nextJava) setJavaVersion(nextJava)
+    },
+    [javaDefinition, selection]
+  )
+
+  return (
+    <div className="flex items-start gap-2">
+      <div className="min-w-0 flex-1 space-y-1.5 text-xs font-medium text-muted-foreground">
+        <span id={labelId}>{definition.label}</span>
+        {usePicker ? (
+          <BrickVersionPicker
+            labelledBy={labelId}
+            name="version"
+            value={version}
+            versions={versions}
+            disabled={disabled}
+            loading={versionsQuery.isPending}
+            maxLength={definition.rules?.maxLength}
+            minLength={definition.rules?.minLength}
+            pattern={definition.rules?.pattern}
+            required={required}
+            onChange={changeVersion}
+          />
+        ) : (
+          <Input
+            aria-labelledby={labelId}
+            name="version"
+            value={version}
+            onChange={(event) => changeVersion(event.currentTarget.value)}
+            placeholder="Enter a version"
+            pattern={definition.rules?.pattern}
+            minLength={definition.rules?.minLength}
+            maxLength={definition.rules?.maxLength}
+            disabled={disabled}
+            className="font-mono tabular-nums"
+            required={required}
+          />
+        )}
+      </div>
+      {javaDefinition && javaVersions.length > 0 ? (
+        <div className="w-[5.75rem] shrink-0 space-y-1.5 text-xs font-medium text-muted-foreground">
+          <span id={javaLabelId}>Java</span>
+          <input type="hidden" name="java_version" value={javaVersion} />
+          <Select
+            value={javaVersion}
+            onValueChange={setJavaVersion}
+            disabled={disabled}
+          >
+            <SelectTrigger
+              aria-labelledby={javaLabelId}
+              className="h-8 w-full px-2.5 font-mono text-xs tabular-nums"
+            >
+              <SelectValue placeholder="Java" />
+            </SelectTrigger>
+            <SelectContent className="z-[70]">
+              {javaVersions.map((option) => (
+                <SelectItem
+                  key={option}
+                  className="font-mono text-xs tabular-nums"
+                  value={option}
+                >
+                  {option}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      ) : null}
+    </div>
+  )
+})
+
+function supportedBrickVersions(
+  versions: ReadonlyArray<string>,
+  definition: BrickVariable,
+  defaultVersion: string
+): Array<string> {
+  const allowed = versions.filter((version) =>
+    stringVariableAllows(definition, version)
+  )
+  if (defaultVersion && !allowed.includes(defaultVersion)) {
+    return stringVariableAllows(definition, defaultVersion)
+      ? [defaultVersion, ...allowed]
+      : allowed
+  }
+  return allowed
+}
+
 function minecraftVersionDefinition(selection: BrickSelection | null) {
   if (
     selection?.kind !== "catalog" ||
@@ -625,6 +783,11 @@ function minecraftVersionDefinition(selection: BrickSelection | null) {
     return null
   }
   const definition = selection.brick.variables.version
+  return definition?.type === "string" ? definition : null
+}
+
+function javaVersionDefinition(brick: Brick) {
+  const definition = brick.variables.java_version
   return definition?.type === "string" ? definition : null
 }
 
