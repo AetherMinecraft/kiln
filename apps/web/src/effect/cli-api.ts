@@ -47,6 +47,7 @@ import { cliRelaySubject, requireCliWrite } from "@/effect/cli-access"
 import {
   listBackupCatalogEffect,
   reserveBackupDeleteEffect,
+  reserveBackupExportEffect,
   reserveBackupRestoreEffect,
   reserveDatabaseBackupEffect,
   reserveInstanceBackupEffect,
@@ -404,6 +405,7 @@ export const createCliBackupEffect = Effect.fn("cli.api.backups.create")(
       input.targetKind === "instance"
         ? reserveInstanceBackupEffect({
             ...common,
+            ...(input.mode === undefined ? {} : { mode: input.mode }),
             targetId: input.targetId,
           })
         : input.targetKind === "database"
@@ -441,11 +443,16 @@ export const restoreCliBackupEffect = Effect.fn("cli.api.backups.restore")(
     )
     if (
       backup.status !== "available" ||
-      backup.backupMode !== "full" ||
       (backup.targetKind !== "instance" && backup.targetKind !== "database") ||
-      (backup.targetKind === "instance" && backup.artifactKind !== "archive") ||
+      (backup.targetKind === "instance" &&
+        !(
+          (backup.artifactKind === "archive" && backup.backupMode === "full") ||
+          (backup.artifactKind === "restic_snapshot" &&
+            backup.backupMode === "incremental")
+        )) ||
       (backup.targetKind === "database" &&
-        backup.artifactKind !== "database_dump")
+        (backup.artifactKind !== "database_dump" ||
+          backup.backupMode !== "full"))
     ) {
       return yield* cliConflict(
         "Only complete server or database backups can be restored."
@@ -592,8 +599,57 @@ export const getCliBackupDownloadEffect = Effect.fn("cli.api.backups.download")(
           candidate.status === "available" && candidate.storageId === null
       ) ??
       backup.artifacts.find((candidate) => candidate.status === "available")
-    const filename = artifact?.filename ?? backup.filename
-    if (backup.status !== "available" || !artifact || !filename) {
+    if (backup.status !== "available" || !artifact) {
+      return yield* cliConflict("The backup is not available for download.")
+    }
+    if (backup.artifactKind === "restic_snapshot") {
+      const reserved = yield* mapCliBackupFailure(
+        reserveBackupExportEffect({
+          backupId: backup.id,
+          replaceFailed: !input.poll,
+          requestedBy: principal.user.id,
+          taskId: randomUUID(),
+        }),
+        "Hearth could not prepare the snapshot export."
+      )
+      if (reserved.kind === "dispatch") {
+        const relay = yield* requiredRelay(backup.relayId)
+        yield* enqueueCliBackupEffect(principal, relay, reserved.dispatch)
+        return cliBackupDownloadResponseSchema.parse({
+          status: "preparing",
+          taskId: reserved.dispatch.taskId,
+        })
+      }
+      const remainingSeconds = Math.max(
+        1,
+        Math.min(300, Math.floor((reserved.expiresAt - Date.now()) / 1_000))
+      )
+      const relay = yield* requiredRelay(backup.relayId)
+      const signed = yield* Effect.tryPromise({
+        try: () =>
+          signLocalBackupDownload(
+            relay,
+            backup,
+            reserved.filename,
+            cliRelaySubject(principal),
+            remainingSeconds
+          ),
+        catch: (cause) =>
+          CliAccessError.make({
+            code: "relay_unavailable",
+            message: "Hearth could not sign the Relay download.",
+            retryable: true,
+            cause,
+          }),
+      })
+      return cliBackupDownloadResponseSchema.parse({
+        ...signed,
+        filename: reserved.filename,
+        status: "ready",
+      })
+    }
+    const filename = artifact.filename ?? backup.filename
+    if (!filename) {
       return yield* cliConflict("The backup is not available for download.")
     }
     if (!artifact.storageId) {
@@ -621,6 +677,7 @@ export const getCliBackupDownloadEffect = Effect.fn("cli.api.backups.download")(
       return cliBackupDownloadResponseSchema.parse({
         ...signed,
         filename,
+        status: "ready",
       })
     }
     if (!artifact.objectKey) {
@@ -640,6 +697,7 @@ export const getCliBackupDownloadEffect = Effect.fn("cli.api.backups.download")(
     return cliBackupDownloadResponseSchema.parse({
       ...signed,
       filename,
+      status: "ready",
     })
   }
 )

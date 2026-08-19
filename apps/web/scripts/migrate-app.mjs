@@ -97,6 +97,61 @@ async function ensureBackupSchema(database) {
             backup.created_at, backup.updated_at
        FROM ${databaseTable("backup")} backup`
   )
+  await database.query(
+    `CREATE TABLE IF NOT EXISTS ${databaseTable("backup_repository")} (
+      id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+      relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+      target_kind ENUM('instance', 'database', 'platform') NOT NULL,
+      target_id VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+      password_ciphertext TEXT NOT NULL,
+      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      UNIQUE KEY ${databaseTable("backup_repository_target_unique")} (relay_id, target_kind, target_id)
+    )`
+  )
+  const [backupColumns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("backup")}`
+  )
+  const backupColumnNames = new Set(backupColumns.map((column) => column.Field))
+  if (!backupColumnNames.has("restic_snapshot_id")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup")}
+       ADD COLUMN restic_snapshot_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER checksum_sha256`
+    )
+  }
+  if (!backupColumnNames.has("repository_id")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup")}
+       ADD COLUMN repository_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER restic_snapshot_id,
+       ADD KEY ${databaseTable("backup_repository_idx")} (repository_id),
+       ADD CONSTRAINT ${databaseTable("backup_repository_fk")}
+         FOREIGN KEY (repository_id) REFERENCES ${databaseTable("backup_repository")} (id) ON DELETE RESTRICT`
+    )
+  }
+  const artifactKindColumn = backupColumns.find(
+    (column) => column.Field === "artifact_kind"
+  )
+  if (!artifactKindColumn?.Type?.includes("restic_snapshot")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup")}
+       MODIFY artifact_kind ENUM('archive', 'database_dump', 'platform_bundle', 'restic_snapshot') NOT NULL`
+    )
+  }
+  const [shareColumns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("backup_download_share")} LIKE 'artifact_kind'`
+  )
+  if (!shareColumns[0]?.Type?.includes("restic_snapshot")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_download_share")}
+       MODIFY artifact_kind ENUM('archive', 'database_dump', 'platform_bundle', 'restic_snapshot') NOT NULL`
+    )
+  }
+  const taskKindColumn = taskColumns.find((column) => column.Field === "task_kind")
+  if (!taskKindColumn?.Type?.includes("export")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_task")}
+       MODIFY task_kind ENUM('create', 'restore', 'delete', 'export') NOT NULL`
+    )
+  }
 }
 
 async function ensureInstanceOwnershipSchema(database) {
