@@ -27,12 +27,10 @@ if (dsn) {
       import.meta.env.VITE_SENTRY_TRACES_SAMPLE_RATE,
       import.meta.env.PROD ? 0.05 : 1
     ),
-    replaysSessionSampleRate: import.meta.env.DEV
-      ? 1
-      : parseSampleRate(
-          import.meta.env.VITE_SENTRY_REPLAYS_SESSION_SAMPLE_RATE,
-          0.05
-        ),
+    replaysSessionSampleRate: parseSampleRate(
+      import.meta.env.VITE_SENTRY_REPLAYS_SESSION_SAMPLE_RATE,
+      0.05
+    ),
     replaysOnErrorSampleRate: 1,
     beforeSend(event, hint) {
       return isExpectedAppError(hint.originalException) ? null : event
