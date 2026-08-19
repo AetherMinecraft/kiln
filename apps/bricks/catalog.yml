@@ -4,4 +4,5 @@ recipes:
   - recipes/folia.yml
   - recipes/fabric.yml
   - recipes/velocity.yml
+  - recipes/nanolimbo.yml
   - recipes/palworld.yml

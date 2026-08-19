@@ -131,6 +131,17 @@ test("installer-aware Ember images advertise the marker protocol", async () => {
   }
 })
 
+test("NanoLimbo uses its release-matched settings and Kiln's reachable port", async () => {
+  const recipe = await loadYaml("recipes/nanolimbo.yml")
+  const version = recipe.variables.version.default
+
+  assert.equal(recipe.runtime.image, "ghcr.io/kiln-site/bricks-java:21")
+  assert.match(recipe.runtime.environment.KILN_ARTIFACT_URL, /v\{\{ variables\.version \}\}/u)
+  assert.match(recipe.runtime.environment.KILN_NANOLIMBO_SETTINGS_URL, /v\{\{ variables\.version \}\}/u)
+  assert.equal(recipe.network.ports[0].container, 25565)
+  assert.match(version, /^[0-9]+(?:\.[0-9]+){1,3}$/u)
+})
+
 test("entrypoints pass Bash syntax validation in CI", async () => {
   const entrypoints = [
     "embers/java/entrypoint.sh",

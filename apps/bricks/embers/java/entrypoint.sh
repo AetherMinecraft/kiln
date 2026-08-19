@@ -30,6 +30,31 @@ if [[ ! -s "${KILN_ARTIFACT_FILE}" ]]; then
   fi
 fi
 
+if [[ "${KILN_IMPLEMENTATION:-}" == "nanolimbo" && ! -e settings.yml ]]; then
+  : "${KILN_NANOLIMBO_SETTINGS_URL:?KILN_NANOLIMBO_SETTINGS_URL is required for NanoLimbo}"
+  echo "[Kiln Ember] downloading NanoLimbo settings"
+  if curl --fail --location --no-progress-meter --retry 2 --retry-all-errors \
+    --connect-timeout 15 --max-time 300 \
+    --output .settings.yml.download "${KILN_NANOLIMBO_SETTINGS_URL}"; then
+    sed -i \
+      -e 's/ip: "localhost"/ip: "0.0.0.0"/' \
+      -e 's/port: 65535/port: 25565/' \
+      .settings.yml.download
+    if ! grep -qF 'ip: "0.0.0.0"' .settings.yml.download || \
+      ! grep -qF 'port: 25565' .settings.yml.download; then
+      rm -f -- .settings.yml.download
+      echo "[Kiln Ember] NanoLimbo settings do not contain the expected bind configuration" >&2
+      exit 65
+    fi
+    mv -- .settings.yml.download settings.yml
+  else
+    status=$?
+    rm -f -- .settings.yml.download
+    echo "[Kiln Ember] failed to download NanoLimbo settings after 3 attempts" >&2
+    exit "${status}"
+  fi
+fi
+
 if [[ -n "${KILN_ARTIFACT_SHA256:-}" ]]; then
   printf '%s  %s\n' "${KILN_ARTIFACT_SHA256}" "${KILN_ARTIFACT_FILE}" | sha256sum --check --status
 fi
