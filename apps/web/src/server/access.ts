@@ -27,6 +27,7 @@ import { auditInstanceCreatorId } from "@/lib/activity"
 import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import { emailDeliveryConfig, kilnPublicUrl } from "@/lib/environment"
+import { invitationDestination } from "@/lib/invitation-auth"
 import { accessRoles, isAccessRole, roleHasPermission } from "@/lib/permissions"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
@@ -815,11 +816,16 @@ export const getInvitationPreview = createServerFn({ method: "GET" })
   .handler(async ({ data }) => {
     const invitation = await readInvitation(data.token)
     if (!invitation || !isInvitationPending(invitation)) return null
-    const relay = invitation.relay_id
-      ? await relayById(invitation.relay_id)
-      : null
+    const [relay, userLookup] = await Promise.all([
+      invitation.relay_id ? relayById(invitation.relay_id) : null,
+      databasePool.query<Array<ExistingAccessUserRow>>(
+        `SELECT id FROM ${databaseTable("user")} WHERE email = ? LIMIT 1`,
+        [invitation.email]
+      ),
+    ])
     return {
       accessType: invitation.access_type,
+      accountExists: userLookup[0].length > 0,
       email: invitation.email,
       databaseId: invitation.database_id,
       expiresAt: invitation.expires_at.toISOString(),
@@ -830,6 +836,11 @@ export const getInvitationPreview = createServerFn({ method: "GET" })
           : invitation.access_type === "relay_creator"
             ? "Your Relays"
             : (relay?.name ?? "Kiln Relay"),
+      returnPath: invitationDestination({
+        accessType: invitation.access_type,
+        databaseId: invitation.database_id,
+        instanceId: invitation.instance_id,
+      }),
       role: invitation.role,
     }
   })

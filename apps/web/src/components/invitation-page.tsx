@@ -49,6 +49,7 @@ export function InvitationPage({
   const [error, setError] = React.useState<string | null>(null)
   const [accepted, setAccepted] = React.useState(false)
   const invitePath = `/invite?token=${encodeURIComponent(token)}`
+  const destination = preview?.returnPath ?? "/"
   const platformInvitation = preview?.accessType !== "scoped"
   const invitationLabel = preview
     ? preview.accessType === "platform_admin"
@@ -69,7 +70,7 @@ export function InvitationPage({
         Effect.tap(() =>
           Effect.sync(() => {
             setAccepted(true)
-            window.setTimeout(() => window.location.assign("/"), 700)
+            window.setTimeout(() => window.location.assign(destination), 700)
           })
         ),
         Effect.catch((cause) =>
@@ -220,25 +221,21 @@ export function InvitationPage({
                 </div>
               )
             ) : (
-              <div className="mt-6 grid gap-2">
-                <Button className="h-11" asChild>
-                  <Link to="/" search={{ redirect: invitePath }}>
-                    Sign in to accept <ArrowRight />
-                  </Link>
-                </Button>
-                <Button className="h-11" variant="outline" asChild>
-                  <Link
-                    to="/"
-                    search={{
-                      email: preview.email,
-                      redirect: invitePath,
-                      signup: true,
-                    }}
-                  >
-                    Create an account
-                  </Link>
-                </Button>
-              </div>
+              <Button className="mt-6 h-11 w-full" asChild>
+                <Link
+                  to="/"
+                  search={{
+                    email: preview.email,
+                    redirect: invitePath,
+                    ...(preview.accountExists ? {} : { signup: true }),
+                  }}
+                >
+                  {preview.accountExists
+                    ? "Sign in to accept"
+                    : "Create an account"}{" "}
+                  <ArrowRight />
+                </Link>
+              </Button>
             )}
             <p className="mt-5 text-center text-[0.625rem] leading-4 text-muted-foreground/70">
               Only the verified address {preview.email} can accept this
