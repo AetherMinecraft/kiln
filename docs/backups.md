@@ -19,6 +19,7 @@ manual tasks use the same durable task model that schedules can enqueue later.
 - Restore with one clear action and optionally create a safety backup first.
 - Produce short-lived download URLs for both local and S3 artifacts.
 - Take a portable full backup before destructive resource deletion.
+- Deduplicate live game-server backups with Relay-local restic snapshots.
 
 ## Ownership model
 
@@ -234,20 +235,35 @@ kiln backup storage list
 `apps/cli/README.md` and `.agents/skills/kiln-cli/SKILL.md` must be updated in
 the CLI layer of the stack.
 
-## Incremental option
+## Incremental snapshots
 
-Restic is the preferred experiment after portable full backups are reliable.
-It provides encrypted, content-addressed chunks, snapshots, S3 support, and
-deduplication. Use one repository per resource for isolation and predictable
-deletion; cross-resource deduplication is not worth the credential, lock, and
-retention blast radius. Quantity limits map to retained snapshots, while size
-limits must use logical snapshot size because physical repository bytes are
-shared across snapshots.
+Live game-server backups default to restic incremental snapshots. Each
+instance has one Relay-local repository at `<data>/restic/instance/<id>/`.
+Hearth generates a repository password on first use and encrypts it with the
+installation keyring, then sends it inside the task input. Relay persists
+complete task input in its SQLite journal before acknowledging, so the
+password is durably stored while the task is live. Mitigations: task-list
+responses redact `repositoryPassword`, terminal journal rows scrub it, the
+journal file is mode 0600, and the repository lives on the same disk in the
+same trust domain.
 
-Restic snapshots are not directly downloadable archives, so Relay must export
-one through the normal download path. `forget` and `prune` are separate queued
-maintenance tasks. Final-deletion backups stay full archives so recovery does
-not depend on a mutable repository.
+Quantity limits map to retained snapshot rows. Size limits use each
+snapshot's logical restore size because physical repository bytes are shared.
+Restic's S3 backend needs raw credentials, which Relay never receives, so
+incremental mode cannot use S3 destinations. Database dumps and platform
+bundles stay full archives.
+
+Snapshots are not downloadable files. Download reserves an `export` task that
+dumps a zip of the snapshot subfolder, then issues the existing Relay token
+URL for that staged file. Export files expire after five minutes and are
+swept on Relay startup. Delete runs `restic forget` only; Relay then
+self-enqueues an internal `prune` task that Hearth never lists. A missing
+snapshot is treated as a successful forget.
+
+Pre-restore safety backups and final-deletion backups stay full zip archives
+so recovery does not depend on a mutable repository. When an instance is
+finally deleted, Hearth marks remaining incremental catalog rows deleted
+before Relay removes the repository.
 
 Ceph RGW is already covered by the S3-compatible adapter. CephFS/RBD snapshots
 are infrastructure-specific consistency sources, not a portable backup format,
@@ -275,6 +291,8 @@ and should be an optional Relay snapshot adapter rather than the default.
    browser validation.
 8. `feat/backup-cli`: list/create/status/download/restore/delete/storage CLI,
    help, README, and synchronized CLI skill documentation.
+9. `feat/backup-restic`: incremental restic snapshots as the instance default,
+   export-for-download, forget/prune split, and the full-archive escape hatch.
 
 Each layer receives targeted deterministic tests, full typecheck/lint, and a
 T3 Preview end-to-end pass before its ready-for-review PR is opened. Runtime
