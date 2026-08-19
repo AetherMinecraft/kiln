@@ -912,6 +912,7 @@ async function validateRequestedStorage(
         if (
           !storage ||
           !storage.enabled ||
+          storage.deleting ||
           (platformOnly
             ? storage.ownerUserId !== null
             : storage.ownerUserId !== null && storage.ownerUserId !== userId)

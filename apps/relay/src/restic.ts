@@ -6,10 +6,21 @@ import { dirname, relative, resolve, sep } from "node:path"
 import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 
-import { Effect, Result } from "effect"
+import { Effect, Result, Schedule } from "effect"
+import {
+  resticRepositoryPrefixSchema,
+  resticS3BucketSchema,
+  resticS3RegionSchema,
+  type ResticRepositoryLocation,
+} from "@workspace/contracts"
 
 import { RelayBackupError } from "./effect/errors.js"
 import type { RelayConfig } from "./config.js"
+import {
+  resticS3ProxyAllowedHosts,
+  resticS3ProxyToken,
+  withResticS3Proxy,
+} from "./restic-s3-proxy.js"
 
 const RESTIC_BINARY = "restic"
 const MAX_JSON_LINE_BYTES = 64 * 1024
@@ -18,6 +29,9 @@ const MAX_STAGING_ENTRIES = 100_000
 const MAX_SKIPPED_ENTRY_WARNINGS = 25
 const MAX_UNLIMITED_RESTORE_BYTES = 1024 ** 4
 const RESTIC_TERMINATE_TIMEOUT_MS = 5_000
+const RESTIC_ENV_ALLOWLIST = ["HOME", "PATH", "RESTIC_CACERT", "TMPDIR"] as const
+const RESTIC_EXIT_REPOSITORY_MISSING = 10
+const RESTIC_EXIT_WRONG_PASSWORD = 12
 
 export type ResticProgress = {
   bytesCompleted: number
@@ -44,64 +58,83 @@ export type ResticSpawn = (
   }
 ) => ChildProcess
 
+export type ResticDriverLocation =
+  | { kind: "local"; path: string }
+  | {
+      accessKeyId: string
+      allowPrivateNetwork: boolean
+      bucket: string
+      endpoint: string
+      forcePathStyle: boolean
+      kind: "s3"
+      region: string
+      repositoryPrefix: string
+      secretAccessKey: string
+    }
+
 export type ResticDriver = {
   backup: (input: {
     cwd: string
     excludes: ReadonlyArray<string>
+    location: ResticDriverLocation
     onProgress?: (progress: ResticProgress) => void
     password: string
     path: string
-    repository: string
     signal: AbortSignal
     tags: ReadonlyArray<string>
   }) => Promise<ResticSnapshotSummary>
-  catConfig: (input: {
+  cacheCleanup: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
-  }) => Promise<boolean>
+  }) => Promise<void>
+  catConfig: (input: {
+    location: ResticDriverLocation
+    password: string
+    signal: AbortSignal
+  }) => Promise<"exists" | "missing">
   dumpZip: (input: {
     destination: string
+    location: ResticDriverLocation
     onProgress?: (bytes: number) => void
     password: string
-    repository: string
     selector: string
     signal: AbortSignal
   }) => Promise<{ bytes: number; checksumSha256: string }>
   forget: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
     snapshotId: string
   }) => Promise<void>
   init: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
   }) => Promise<void>
   prune: (input: {
+    location: ResticDriverLocation
     onProgress?: (progress: ResticProgress) => void
     password: string
-    repository: string
     signal: AbortSignal
   }) => Promise<void>
   restore: (input: {
+    location: ResticDriverLocation
     onProgress?: (progress: ResticProgress) => void
     password: string
-    repository: string
     selector: string
     signal: AbortSignal
     target: string
   }) => Promise<void>
   snapshotsByTag: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
     tag: string
   }) => Promise<Array<{ id: string }>>
   stats: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
     snapshotId: string
   }) => Promise<{ totalSize: number }>
@@ -133,6 +166,60 @@ export function requiredRepositoryPassword(
     })
   }
   return password
+}
+
+export function resticDriverLocation(
+  config: RelayConfig,
+  targetId: string,
+  location: ResticRepositoryLocation | undefined
+): ResticDriverLocation {
+  if (!location || location.kind === "local") {
+    return { kind: "local", path: resticRepositoryPath(config, targetId) }
+  }
+  if (!location.accessKeyId || !location.secretAccessKey) {
+    throw RelayBackupError.make({
+      code: "repository_credentials_missing",
+      operation: "restic.repository",
+      reason: "The restic S3 repository credentials were not provided to Relay",
+    })
+  }
+  if (!resticS3BucketSchema.safeParse(location.bucket).success) {
+    throw RelayBackupError.make({
+      code: "invalid_restic_repository",
+      operation: "restic.repository",
+      reason: "The restic S3 bucket name is invalid",
+    })
+  }
+  if (!resticS3RegionSchema.safeParse(location.region).success) {
+    throw RelayBackupError.make({
+      code: "invalid_restic_repository",
+      operation: "restic.repository",
+      reason: "The restic S3 region is invalid",
+    })
+  }
+  if (!resticRepositoryPrefixSchema.safeParse(location.repositoryPrefix).success) {
+    throw RelayBackupError.make({
+      code: "invalid_restic_repository",
+      operation: "restic.repository",
+      reason: "The restic S3 repository prefix is invalid",
+    })
+  }
+  return {
+    accessKeyId: location.accessKeyId,
+    allowPrivateNetwork: location.allowPrivateNetwork,
+    bucket: location.bucket,
+    endpoint: location.endpoint,
+    forcePathStyle: location.forcePathStyle,
+    kind: "s3",
+    region: location.region,
+    repositoryPrefix: location.repositoryPrefix,
+    secretAccessKey: location.secretAccessKey,
+  }
+}
+
+export function resticRepositoryString(location: ResticDriverLocation): string {
+  if (location.kind === "local") return location.path
+  return `s3:${new URL(location.endpoint).origin}/${location.bucket}/${location.repositoryPrefix}`
 }
 
 export function translateExcludePatterns(
@@ -200,22 +287,48 @@ export function summaryFromResticJson(value: unknown): ResticSnapshotSummary | n
 
 export function createResticDriver(options?: {
   binary?: string
+  cacheDirectory?: string
   spawn?: ResticSpawn
 }): ResticDriver {
   const binary = options?.binary ?? RESTIC_BINARY
   const spawnRestic = options?.spawn ?? defaultSpawn
+  const cacheDirectory = options?.cacheDirectory
   const run = (
     args: ReadonlyArray<string>,
     input: {
       cwd?: string
+      location: ResticDriverLocation
+      mutating?: boolean
       onJson?: (value: unknown) => void
       password: string
-      repository: string
+      retryable?: boolean
       signal: AbortSignal
       stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
     }
-  ) =>
-    spawnResticCommand(spawnRestic, binary, args, input)
+  ) => {
+    const execute = async () => {
+      if (input.mutating && input.location.kind === "s3") {
+        await retryResticOperation(() =>
+          spawnResticCommand(spawnRestic, binary, ["unlock"], {
+            cacheDirectory,
+            location: input.location,
+            password: input.password,
+            signal: input.signal,
+          })
+        )
+      }
+      return spawnResticCommand(spawnRestic, binary, args, {
+        cacheDirectory,
+        cwd: input.cwd,
+        location: input.location,
+        onJson: input.onJson,
+        password: input.password,
+        signal: input.signal,
+        stdoutPipe: input.stdoutPipe,
+      })
+    }
+    return input.retryable ? retryResticOperation(execute) : execute()
+  }
 
   return {
     backup: async (input) => {
@@ -230,8 +343,9 @@ export function createResticDriver(options?: {
         ],
         {
           cwd: input.cwd,
+          location: input.location,
+          mutating: true,
           password: input.password,
-          repository: input.repository,
           signal: input.signal,
           onJson: (value) => {
             const progress = progressFromResticStatus(value)
@@ -250,16 +364,45 @@ export function createResticDriver(options?: {
       }
       return summary
     },
-    catConfig: async (input) => {
-      const result = await resultOf(() =>
-        run(["cat", "config"], {
+    cacheCleanup: async (input) => {
+      if (input.location.kind !== "s3") return
+      await resultOf(() =>
+        run(["cache", "--cleanup"], {
+          location: input.location,
           password: input.password,
-          repository: input.repository,
           signal: input.signal,
         })
       )
-      if (Result.isFailure(result)) return false
-      return result.success.exitCode === 0
+    },
+    catConfig: async (input) => {
+      const result = await resultOf(() =>
+        run(["cat", "config"], {
+          location: input.location,
+          password: input.password,
+          retryable: true,
+          signal: input.signal,
+        })
+      )
+      if (Result.isSuccess(result)) return "exists"
+      const failure = result.failure
+      if (
+        failure instanceof RelayBackupError &&
+        failure.exitCode === RESTIC_EXIT_REPOSITORY_MISSING
+      ) {
+        return "missing"
+      }
+      if (
+        failure instanceof RelayBackupError &&
+        failure.exitCode === RESTIC_EXIT_WRONG_PASSWORD
+      ) {
+        throw resticError(
+          "restic_wrong_password",
+          "cat.config",
+          failure.reason,
+          failure.exitCode
+        )
+      }
+      throw failure
     },
     dumpZip: async (input) => {
       await mkdir(dirname(input.destination), { recursive: true, mode: 0o700 })
@@ -281,8 +424,8 @@ export function createResticDriver(options?: {
       })
       const dumped = await resultOf(async () => {
         await run(["dump", "-a", "zip", input.selector, "/"], {
+          location: input.location,
           password: input.password,
-          repository: input.repository,
           signal: input.signal,
           stdoutPipe: (stdout) => pipeline(stdout, hasher, output),
         })
@@ -299,8 +442,10 @@ export function createResticDriver(options?: {
     forget: async (input) => {
       const result = await resultOf(() =>
         run(["forget", input.snapshotId], {
+          location: input.location,
+          mutating: true,
           password: input.password,
-          repository: input.repository,
+          retryable: true,
           signal: input.signal,
         })
       )
@@ -309,17 +454,20 @@ export function createResticDriver(options?: {
       throw result.failure
     },
     init: async (input) => {
-      await mkdir(input.repository, { recursive: true, mode: 0o700 })
+      if (input.location.kind === "local") {
+        await mkdir(input.location.path, { recursive: true, mode: 0o700 })
+      }
       await run(["init"], {
+        location: input.location,
         password: input.password,
-        repository: input.repository,
         signal: input.signal,
       })
     },
     prune: async (input) => {
       await run(["prune", "--json"], {
+        location: input.location,
+        mutating: true,
         password: input.password,
-        repository: input.repository,
         signal: input.signal,
         onJson: (value) => {
           const progress = progressFromResticStatus(value)
@@ -332,21 +480,24 @@ export function createResticDriver(options?: {
       await run(
         ["restore", "--json", input.selector, "--target", input.target],
         {
-        password: input.password,
-        repository: input.repository,
-        signal: input.signal,
-        onJson: (value) => {
-          const progress = progressFromResticStatus(value)
-          if (progress) input.onProgress?.(progress)
-        },
-      })
+          location: input.location,
+          mutating: true,
+          password: input.password,
+          signal: input.signal,
+          onJson: (value) => {
+            const progress = progressFromResticStatus(value)
+            if (progress) input.onProgress?.(progress)
+          },
+        }
+      )
     },
     snapshotsByTag: async (input) => {
       const result = await run(
         ["snapshots", "--json", "--tag", input.tag],
         {
+          location: input.location,
           password: input.password,
-          repository: input.repository,
+          retryable: true,
           signal: input.signal,
         }
       )
@@ -361,8 +512,9 @@ export function createResticDriver(options?: {
       const result = await run(
         ["stats", "--mode", "restore-size", "--json", input.snapshotId],
         {
+          location: input.location,
           password: input.password,
-          repository: input.repository,
+          retryable: true,
           signal: input.signal,
         }
       )
@@ -460,22 +612,52 @@ async function spawnResticCommand(
   binary: string,
   args: ReadonlyArray<string>,
   input: {
+    cacheDirectory?: string
     cwd?: string
+    location: ResticDriverLocation
     onJson?: (value: unknown) => void
     password: string
-    repository: string
+    signal: AbortSignal
+    stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
+  }
+): Promise<SpawnedRestic> {
+  if (input.location.kind !== "s3") {
+    return spawnResticOnce(spawnRestic, binary, args, input)
+  }
+  const token = resticS3ProxyToken()
+  return withResticS3Proxy(
+    {
+      allowPrivateNetwork: input.location.allowPrivateNetwork,
+      allowedHosts: resticS3ProxyAllowedHosts(input.location),
+      endpointPort: resticS3EndpointPort(input.location.endpoint),
+      token,
+    },
+    (proxyUrl) =>
+      spawnResticOnce(spawnRestic, binary, args, { ...input, proxyUrl })
+  )
+}
+
+async function spawnResticOnce(
+  spawnRestic: ResticSpawn,
+  binary: string,
+  args: ReadonlyArray<string>,
+  input: {
+    cacheDirectory?: string
+    cwd?: string
+    location: ResticDriverLocation
+    onJson?: (value: unknown) => void
+    password: string
+    proxyUrl?: string
     signal: AbortSignal
     stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
   }
 ): Promise<SpawnedRestic> {
   input.signal.throwIfAborted()
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    RESTIC_PASSWORD: input.password,
-    RESTIC_REPOSITORY: input.repository,
+  if (input.location.kind === "s3" && input.cacheDirectory) {
+    await mkdir(input.cacheDirectory, { recursive: true, mode: 0o700 })
   }
-  delete env.RESTIC_CACHE_DIR
-  const child = spawnRestic(binary, ["--no-cache", ...args], {
+  const env = resticSpawnEnv(input)
+  const child = spawnRestic(binary, [...resticGlobalArgs(input.location), ...args], {
     cwd: input.cwd,
     env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -538,10 +720,11 @@ async function spawnResticCommand(
       throw resticError(
         "restic_command_failed",
         args[0] ?? "restic",
-        stderr.trim() || `restic exited with code ${exitCode}`
+        redactResticStderr(stderr.trim() || `restic exited with code ${exitCode}`, input),
+        exitCode
       )
     }
-    return { exitCode, stderr, stdout, stdoutText }
+    return { exitCode, stderr: redactResticStderr(stderr, input), stdout, stdoutText }
   })
   input.signal.removeEventListener("abort", onAbort)
   if (Result.isFailure(completed)) {
@@ -620,8 +803,99 @@ function resultOf<T>(run: () => Promise<T>) {
   )
 }
 
-function resticError(code: string, operation: string, reason: string) {
-  return RelayBackupError.make({ code, operation, reason })
+function resticError(
+  code: string,
+  operation: string,
+  reason: string,
+  exitCode?: number
+) {
+  return RelayBackupError.make({
+    code,
+    operation,
+    reason,
+    ...(exitCode === undefined ? {} : { exitCode }),
+  })
+}
+
+function resticGlobalArgs(location: ResticDriverLocation): Array<string> {
+  const args: Array<string> = []
+  if (location.kind === "local") args.push("--no-cache")
+  if (location.kind === "s3") {
+    args.push("-o", `s3.region=${location.region}`)
+    if (location.forcePathStyle) args.push("-o", "s3.bucket-lookup=path")
+  }
+  return args
+}
+
+function resticSpawnEnv(input: {
+  cacheDirectory?: string
+  location: ResticDriverLocation
+  password: string
+  proxyUrl?: string
+}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  for (const key of RESTIC_ENV_ALLOWLIST) {
+    const value = process.env[key]
+    if (value) env[key] = value
+  }
+  env.RESTIC_PASSWORD = input.password
+  env.RESTIC_REPOSITORY = resticRepositoryString(input.location)
+  if (input.location.kind === "s3") {
+    env.AWS_ACCESS_KEY_ID = input.location.accessKeyId
+    env.AWS_SECRET_ACCESS_KEY = input.location.secretAccessKey
+    if (input.cacheDirectory) env.RESTIC_CACHE_DIR = input.cacheDirectory
+    if (input.proxyUrl) env.HTTPS_PROXY = input.proxyUrl
+  }
+  return env
+}
+
+function resticS3EndpointPort(endpoint: string): number {
+  const parsed = new URL(endpoint)
+  if (parsed.port) return Number(parsed.port)
+  return 443
+}
+
+function redactResticStderr(
+  stderr: string,
+  input: { location: ResticDriverLocation; password: string }
+): string {
+  let redacted = stderr.split(input.password).join("[redacted]")
+  if (input.location.kind === "s3") {
+    redacted = redacted
+      .split(input.location.secretAccessKey)
+      .join("[redacted]")
+      .split(input.location.accessKeyId)
+      .join("[redacted]")
+  }
+  return redacted
+}
+
+function retryResticOperation<T>(run: () => Promise<T>): Promise<T> {
+  return Effect.runPromise(
+    Effect.tryPromise({
+      try: run,
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.retry({
+        schedule: Schedule.exponential("200 millis").pipe(Schedule.jittered),
+        times: 2,
+        while: isTransientResticFailure,
+      })
+    )
+  )
+}
+
+function isTransientResticFailure(error: unknown): boolean {
+  if (!(error instanceof RelayBackupError)) return false
+  if (
+    error.exitCode === RESTIC_EXIT_REPOSITORY_MISSING ||
+    error.exitCode === RESTIC_EXIT_WRONG_PASSWORD
+  ) {
+    return false
+  }
+  return /timeout|temporar|connection reset|connection refused|network is unreachable|no such host|tls handshake|i\/o timeout|slow down|throttl|503|502|504/iu.test(
+    error.reason
+  )
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

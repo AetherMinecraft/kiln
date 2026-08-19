@@ -2,7 +2,7 @@ import { z } from "zod"
 import { Effect } from "effect"
 
 import { relayBackupTaskSchema } from "@workspace/contracts"
-import type { BackupTaskInput } from "@workspace/contracts"
+import type { BackupTaskInput, ResticRepositoryLocation } from "@workspace/contracts"
 
 import {
   listDispatchableBackupTasksEffect,
@@ -94,12 +94,12 @@ const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
   input: BackupDispatch
 ) {
   if (input.kind === "export") {
+    const repository = yield* resticRepositoryForBackup(input.backupId)
     const { repositoryPassword: _, ...task } = input
     return {
       ...task,
-      repositoryPassword: yield* loadBackupRepositoryPasswordEffect(
-        input.backupId
-      ),
+      repository: repository.location,
+      repositoryPassword: repository.password,
     } satisfies BackupTaskInput
   }
   if (input.kind === "create" && input.mode === "incremental") {
@@ -107,34 +107,45 @@ const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
     if (!artifact) {
       return yield* invalidDestination("The backup has no stored artifacts")
     }
+    const repository = yield* resticRepositoryForBackup(input.backupId)
     const { artifacts: _, repositoryPassword: __, ...task } = input
     return {
       ...task,
       destination: {
         artifactId: artifact.artifactId,
         kind: "restic" as const,
-        repositoryPassword: yield* loadBackupRepositoryPasswordEffect(
-          input.backupId
-        ),
+        repository: repository.location,
+        repositoryPassword: repository.password,
       },
       replicas: [],
     } satisfies BackupTaskInput
   }
-  if (input.kind === "delete" && input.snapshotId) {
+  if (
+    input.kind === "delete" &&
+    (input.snapshotId !== undefined || input.createTaskId !== undefined)
+  ) {
     const artifact = input.artifacts[0]
     if (!artifact) {
       return yield* invalidDestination("The backup has no stored artifacts")
     }
-    const { artifacts: _, repositoryPassword: __, snapshotId, ...task } = input
+    const repository = yield* resticRepositoryForBackup(input.backupId)
+    const {
+      artifacts: _,
+      createTaskId,
+      repositoryPassword: __,
+      snapshotId,
+      ...task
+    } = input
     return {
       ...task,
       destination: {
         artifactId: artifact.artifactId,
         kind: "restic" as const,
-        repositoryPassword: yield* loadBackupRepositoryPasswordEffect(
-          input.backupId
-        ),
-        snapshotId,
+        repository: repository.location,
+        repositoryPassword: repository.password,
+        ...(snapshotId
+          ? { snapshotId }
+          : { createTaskId: createTaskId as string }),
       },
       replicas: [],
     } satisfies BackupTaskInput
@@ -164,7 +175,11 @@ const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
       const storage = yield* loadBackupStorageCredentialEffect(
         artifact.storageId
       )
-      if (!storage || (input.kind === "create" && !storage.enabled)) {
+      if (
+        !storage ||
+        storage.deleting ||
+        (input.kind === "create" && !storage.enabled)
+      ) {
         return yield* invalidDestination(
           "The backup destination is unavailable"
         )
@@ -193,6 +208,7 @@ const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
     } as BackupTaskInput
   }
   if (input.snapshotId) {
+    const repository = yield* resticRepositoryForBackup(input.backupId)
     const {
       artifactId: _,
       objectKey: __,
@@ -205,9 +221,8 @@ const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
       ...task,
       source: {
         kind: "restic" as const,
-        repositoryPassword: yield* loadBackupRepositoryPasswordEffect(
-          input.backupId
-        ),
+        repository: repository.location,
+        repositoryPassword: repository.password,
         snapshotId,
       },
     } satisfies BackupTaskInput
@@ -266,6 +281,43 @@ function invalidDestination(reason: string) {
     reason,
   })
 }
+
+function resticRepositoryForBackup(backupId: string) {
+  return Effect.gen(function* () {
+    const repository = yield* loadBackupRepositoryPasswordEffect(backupId)
+    if (!repository.storageId) {
+      return {
+        location: { kind: "local" } satisfies ResticRepositoryLocation,
+        password: repository.password,
+      }
+    }
+    if (!repository.objectPrefix) {
+      return yield* invalidDestination("The restic repository is unavailable")
+    }
+    const storage = yield* loadBackupStorageCredentialEffect(
+      repository.storageId
+    )
+    if (!storage) {
+      return yield* invalidDestination("The backup destination is unavailable")
+    }
+    return {
+      location: {
+        accessKeyId: storage.accessKeyId,
+        allowPrivateNetwork: storage.allowPrivateNetwork,
+        bucket: storage.bucket,
+        endpoint: storage.endpoint,
+        forcePathStyle: storage.forcePathStyle,
+        kind: "s3" as const,
+        region: storage.region,
+        repositoryPrefix: repository.objectPrefix,
+        secretAccessKey: storage.secretAccessKey,
+      } satisfies ResticRepositoryLocation,
+      password: repository.password,
+    }
+  })
+}
+
+export { prepareBackupTaskEffect }
 
 export function scheduleBackupReconciliation(
   relay: PersistedRelay,

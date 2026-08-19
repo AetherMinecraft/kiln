@@ -3125,9 +3125,19 @@ function CreateBackupDialog({
       ),
     [storage, target?.kind]
   )
+  const destinationKeysInUse = React.useMemo(() => {
+    const allowed = new Set([
+      "default",
+      "local",
+      ...availableStorage.map((destination) => destination.id),
+    ])
+    const next = destinationKeys.filter((destination) => allowed.has(destination))
+    const usable = next.length > 0 ? next : ["default"]
+    return incremental ? [usable[0] ?? "default"] : usable
+  }, [availableStorage, destinationKeys, incremental])
   const selectedDestinations = React.useMemo(
-    () => new Set(destinationKeys),
-    [destinationKeys]
+    () => new Set(destinationKeysInUse),
+    [destinationKeysInUse]
   )
   const create = useMutation({
     mutationFn: async () => {
@@ -3139,7 +3149,7 @@ function CreateBackupDialog({
         ...(selectedDestinations.has("default")
           ? {}
           : {
-              storageIds: destinationKeys.map((destination) =>
+              storageIds: destinationKeysInUse.map((destination) =>
                 destination === "local" ? null : destination
               ),
             }),
@@ -3150,7 +3160,6 @@ function CreateBackupDialog({
             ...data,
             instanceId: target.id,
             mode: incremental ? "incremental" : "full",
-            ...(incremental ? { storageIds: [null] } : {}),
           },
         })
       }
@@ -3173,20 +3182,12 @@ function CreateBackupDialog({
     },
   })
 
-  React.useEffect(() => {
-    const allowed = new Set([
-      "default",
-      "local",
-      ...availableStorage.map((destination) => destination.id),
-    ])
-    setDestinationKeys((current) => {
-      const next = current.filter((destination) => allowed.has(destination))
-      return next.length > 0 ? next : ["default"]
-    })
-  }, [availableStorage])
-
   const toggleDestination = (destination: string, checked: boolean) => {
     setDestinationKeys((current) => {
+      if (incremental) {
+        if (!checked) return ["default"]
+        return [destination]
+      }
       if (destination === "default") {
         return checked ? ["default"] : ["local"]
       }
@@ -3248,11 +3249,16 @@ function CreateBackupDialog({
               <div className="grid gap-2 sm:grid-cols-2">
                 <BackupDestinationChoice
                   checked={mode === "incremental"}
-                  description="Deduplicated Relay-local snapshots"
+                  description="Deduplicated snapshots on this Relay or S3"
                   icon={Archive}
                   label="Incremental"
                   onCheckedChange={(checked) => {
-                    if (checked) setMode("incremental")
+                    if (checked) {
+                      setMode("incremental")
+                      setDestinationKeys((current) => [
+                        current[0] ?? "default",
+                      ])
+                    }
                   }}
                 />
                 <BackupDestinationChoice
@@ -3267,12 +3273,6 @@ function CreateBackupDialog({
               </div>
             </fieldset>
           ) : null}
-          {incremental ? (
-            <p className="text-[0.625rem] text-muted-foreground">
-              Incremental backups stay on this Relay. Choose full archive to
-              store a zip locally or on S3.
-            </p>
-          ) : (
           <fieldset>
             <legend className="mb-2 text-xs font-medium">Destinations</legend>
             <div className="grid gap-2 sm:grid-cols-2">
@@ -3308,14 +3308,15 @@ function CreateBackupDialog({
               ))}
             </div>
             <span className="mt-1.5 block text-[0.625rem] text-muted-foreground">
-              {target?.kind === "platform"
-                ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
-                : target?.kind === "instance"
-                  ? "Choose one or more copies. Default uses this server’s preferred destination."
-                  : "Choose one or more copies. Default uses Relay-local storage."}
+              {incremental
+                ? "Choose one destination. Incremental snapshots can stay on this Relay or use S3."
+                : target?.kind === "platform"
+                  ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
+                  : target?.kind === "instance"
+                    ? "Choose one or more copies. Default uses this server’s preferred destination."
+                    : "Choose one or more copies. Default uses Relay-local storage."}
             </span>
           </fieldset>
-          )}
           {create.error ? (
             <p className="text-xs text-destructive">{create.error.message}</p>
           ) : null}
@@ -4442,13 +4443,17 @@ function backupAvailabilityTags(
   destinations: ReadonlyArray<BackupAvailabilityDestination>
 ): Array<BackupAvailabilityTagView> {
   const incremental = backup.artifactKind === "restic_snapshot"
+  const incrementalStorageIds = new Set(
+    backup.artifacts.map((artifact) => artifact.storageId)
+  )
   const visibleDestinations = incremental
-    ? destinations.filter((destination) => destination.id === null)
+    ? destinations.filter((destination) =>
+        incrementalStorageIds.has(destination.id)
+      )
     : destinations
   const uploadPercent = backupTaskUploadProgressPercent(backup)
   const artifactsByStorage = new Map<string, Backup["artifacts"][number]>()
   for (const artifact of backup.artifacts) {
-    if (incremental && artifact.storageId !== null) continue
     artifactsByStorage.set(artifact.storageId ?? "local", artifact)
   }
   const tags: Array<BackupAvailabilityTagView> = visibleDestinations.map(
@@ -4475,7 +4480,6 @@ function backupAvailabilityTags(
   )
   const seen = new Set(tags.map((tag) => tag.key))
   for (const artifact of backup.artifacts) {
-    if (incremental && artifact.storageId !== null) continue
     const key = artifact.storageId ?? "local"
     if (seen.has(key)) continue
     const kind = artifact.storageId ? "remote" : "local"

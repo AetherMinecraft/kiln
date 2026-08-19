@@ -849,6 +849,7 @@ describe("restic backup limits and exports", () => {
           backupId,
           destination: {
             kind: "restic",
+            repository: { kind: "local" },
             repositoryPassword: "secret",
             snapshotId: "deadbeef",
           },
@@ -858,6 +859,59 @@ describe("restic backup limits and exports", () => {
         })
         yield* manager.runPending()
         assert.isFalse(existsSync(zip))
+      })
+    )
+
+    it.effect("forgets snapshots tagged with a failed create task", () =>
+      Effect.gen(function* () {
+        const forgotten: Array<string> = []
+        const tags: Array<string> = []
+        let prunedRepository: unknown
+        const s3Repository = {
+          accessKeyId: "AKIAEXAMPLE",
+          allowPrivateNetwork: true,
+          bucket: "kiln-backups",
+          endpoint: "https://s3.example.com",
+          forcePathStyle: true,
+          kind: "s3" as const,
+          region: "us-east-1",
+          repositoryPrefix: "team/repo",
+          secretAccessKey: "s3-secret",
+        }
+        const manager = yield* BackupManager.make({
+          config: testConfig(join(testDirectory, "forget-tag")),
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+          restic: mockRestic({
+            snapshotsByTag: async ({ tag }) => {
+              tags.push(tag)
+              return [{ id: "tagged001" }]
+            },
+            forget: async ({ snapshotId }) => {
+              forgotten.push(snapshotId)
+            },
+            prune: async ({ location }) => {
+              prunedRepository = location
+            },
+          }),
+        })
+        const createTaskId = "10000000-0000-4000-8000-000000000088"
+        yield* manager.enqueue({
+          backupId: "dddddddd-eeee-4fff-8000-000000000001",
+          destination: {
+            createTaskId,
+            kind: "restic",
+            repository: s3Repository,
+            repositoryPassword: "secret",
+          },
+          kind: "delete",
+          target: { id: "instance-1", kind: "instance" },
+          taskId: "10000000-0000-4000-8000-000000000098",
+        })
+        yield* manager.runPending()
+        assert.deepStrictEqual(tags, [`task:${createTaskId}`])
+        assert.deepStrictEqual(forgotten, ["tagged001"])
+        assert.deepStrictEqual(prunedRepository, s3Repository)
       })
     )
   })
@@ -870,7 +924,11 @@ function resticCreateInput(label: string, maxBytes: number): BackupCreateTaskInp
   return {
     artifactKind: "restic_snapshot",
     backupId: `00000000-0000-4000-8000-${suffix}`,
-    destination: { kind: "restic", repositoryPassword: "secret" },
+    destination: {
+      kind: "restic",
+      repository: { kind: "local" },
+      repositoryPassword: "secret",
+    },
     exclude: [],
     kind: "create",
     maxBytes,
@@ -887,7 +945,8 @@ function mockRestic(overrides: Partial<ResticDriver>): ResticDriver {
   }
   return {
     backup: unexpected,
-    catConfig: async () => true,
+    cacheCleanup: async () => undefined,
+    catConfig: async () => "exists",
     dumpZip: unexpected,
     forget: unexpected,
     init: unexpected,

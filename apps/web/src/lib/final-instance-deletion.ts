@@ -13,6 +13,7 @@ import {
   getFinalInstanceDeletionEffect,
   listPendingFinalInstanceDeletionsEffect,
   markIncrementalInstanceBackupsDeletedEffect,
+  purgeInstanceBackupRepositoriesEffect,
   reserveInstanceBackupEffect,
   updateFinalInstanceDeletionEffect,
   type FinalInstanceDeletion,
@@ -205,6 +206,10 @@ async function deleteFinalizedInstanceAttempt(
       relay.id,
       deletion.targetId
     )
+  )
+  await runAppEffect(
+    "backups.finalDelete.purgeRepositories",
+    purgeInstanceBackupRepositoriesEffect(relay.id, deletion.targetId)
   )
   const relayDeletion = await Effect.runPromise(
     Effect.result(

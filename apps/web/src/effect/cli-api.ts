@@ -1168,6 +1168,7 @@ const validateCliBackupStorage = Effect.fn("cli.api.backups.storage.authorize")(
     if (
       !storage ||
       !storage.enabled ||
+      storage.deleting ||
       (input.targetKind === "platform"
         ? storage.ownerUserId !== null
         : storage.ownerUserId !== null &&

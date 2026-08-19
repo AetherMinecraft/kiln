@@ -138,10 +138,82 @@ export const backupS3UploadDestinationSchema = z
   })
   .strict()
 
+export const resticS3BucketSchema = z
+  .string()
+  .regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u, {
+    message: "S3 bucket names must follow S3 naming rules",
+  })
+
+export const resticS3RegionSchema = z.string().regex(/^[a-z0-9-]+$/u, {
+  message: "S3 regions must contain only lowercase letters, digits, and hyphens",
+})
+
+export const resticRepositoryPrefixSchema = z
+  .string()
+  .min(1)
+  .max(1_024)
+  .regex(/^[A-Za-z0-9._/-]+$/u, {
+    message:
+      "Restic repository prefixes can contain only letters, digits, dots, underscores, slashes, and hyphens",
+  })
+  .refine((value) => !value.startsWith("/"), {
+    message: "Backup object keys must be relative",
+  })
+  .refine((value) => !value.split("/").includes(".."), {
+    message: "Backup object keys cannot traverse parent directories",
+  })
+  .refine((value) => !hasUnsafeControlCharacter(value), {
+    message: "Backup object keys cannot contain control characters",
+  })
+
+const resticS3EndpointSchema = backupHttpsUrlSchema.refine((value) => {
+  const endpoint = new URL(value)
+  return (
+    !endpoint.username &&
+    !endpoint.password &&
+    !endpoint.search &&
+    !endpoint.hash &&
+    (endpoint.pathname === "/" || endpoint.pathname === "")
+  )
+}, {
+  message:
+    "Restic S3 endpoints must be an HTTPS origin without credentials, a path, query, or fragment",
+})
+
+const resticLocalRepositoryLocationSchema = z
+  .object({
+    kind: z.literal("local"),
+  })
+  .strict()
+
+const resticS3RepositoryLocationObjectSchema = z
+  .object({
+    accessKeyId: z.string().min(1).max(512).optional(),
+    allowPrivateNetwork: z.boolean().default(false),
+    bucket: resticS3BucketSchema,
+    endpoint: resticS3EndpointSchema,
+    forcePathStyle: z.boolean().default(false),
+    kind: z.literal("s3"),
+    region: resticS3RegionSchema,
+    repositoryPrefix: resticRepositoryPrefixSchema,
+    secretAccessKey: z.string().min(1).max(2_048).optional(),
+  })
+  .strict()
+
+export const resticRepositoryLocationSchema = z.discriminatedUnion("kind", [
+  resticLocalRepositoryLocationSchema,
+  resticS3RepositoryLocationObjectSchema,
+])
+
+const defaultLocalResticRepository = { kind: "local" as const }
+
 export const backupResticDestinationSchema = z
   .object({
     artifactId: z.uuid().optional(),
     kind: z.literal("restic"),
+    repository: resticRepositoryLocationSchema.default(
+      defaultLocalResticRepository
+    ),
     repositoryPassword: backupRepositoryPasswordSchema.optional(),
   })
   .strict()
@@ -247,6 +319,9 @@ export const backupRemoteSourceSchema = z
 export const backupResticSourceSchema = z
   .object({
     kind: z.literal("restic"),
+    repository: resticRepositoryLocationSchema.default(
+      defaultLocalResticRepository
+    ),
     repositoryPassword: backupRepositoryPasswordSchema.optional(),
     snapshotId: resticSnapshotIdSchema,
   })
@@ -277,7 +352,8 @@ export const backupDeleteTaskInputSchema = z
       backupLocalDestinationSchema,
       backupS3DeleteDestinationSchema,
       backupResticDestinationSchema.extend({
-        snapshotId: resticSnapshotIdSchema,
+        createTaskId: backupTaskIdSchema.optional(),
+        snapshotId: resticSnapshotIdSchema.optional(),
       }),
     ]),
     replicas: z
@@ -302,6 +378,16 @@ export const backupDeleteTaskInputSchema = z
         path: ["replicas"],
       })
     }
+    const hasSnapshot = input.destination.snapshotId !== undefined
+    const hasCreateTask = input.destination.createTaskId !== undefined
+    if (hasSnapshot === hasCreateTask) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Restic deletes require exactly one of snapshotId or createTaskId",
+        path: ["destination", hasSnapshot ? "createTaskId" : "snapshotId"],
+      })
+    }
   })
 
 export const BACKUP_EXPORT_TTL_MIN_MS = 60_000
@@ -316,6 +402,9 @@ export const backupExportTtlMsSchema = z
 export const backupExportTaskInputSchema = z
   .object({
     backupId: backupIdSchema,
+    repository: resticRepositoryLocationSchema.default(
+      defaultLocalResticRepository
+    ),
     repositoryPassword: backupRepositoryPasswordSchema.optional(),
     snapshotId: resticSnapshotIdSchema,
     target: backupTargetSchema,
@@ -327,6 +416,9 @@ export const backupExportTaskInputSchema = z
 export const backupPruneTaskInputSchema = z
   .object({
     backupId: backupIdSchema,
+    repository: resticRepositoryLocationSchema.default(
+      defaultLocalResticRepository
+    ),
     repositoryPassword: backupRepositoryPasswordSchema.optional(),
     target: backupTargetSchema,
     taskId: backupTaskIdSchema,
@@ -531,6 +623,9 @@ export type BackupExportTaskResult = z.infer<
 >
 export type BackupMode = z.infer<typeof backupModeSchema>
 export type BackupPruneTaskInput = z.infer<typeof backupPruneTaskInputSchema>
+export type ResticRepositoryLocation = z.infer<
+  typeof resticRepositoryLocationSchema
+>
 export type BackupReason = z.infer<typeof backupReasonSchema>
 export type BackupRestoreTaskInput = z.infer<
   typeof backupRestoreTaskInputSchema
@@ -583,8 +678,14 @@ export function isBackupOperationTaskResult(
   return !("bytes" in result)
 }
 
+const BACKUP_SECRET_KEYS = new Set([
+  "accessKeyId",
+  "repositoryPassword",
+  "secretAccessKey",
+])
+
 export function redactBackupTaskInput(input: BackupTaskInput): BackupTaskInput {
-  return backupTaskInputSchema.parse(omitRepositoryPassword(input))
+  return backupTaskInputSchema.parse(omitBackupSecrets(input))
 }
 
 export function redactRelayBackupTask(task: RelayBackupTask): RelayBackupTask {
@@ -594,13 +695,13 @@ export function redactRelayBackupTask(task: RelayBackupTask): RelayBackupTask {
   })
 }
 
-function omitRepositoryPassword(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(omitRepositoryPassword)
+export function omitBackupSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(omitBackupSecrets)
   if (value === null || typeof value !== "object") return value
   const result: Record<string, unknown> = {}
   for (const [key, entry] of Object.entries(value)) {
-    if (key === "repositoryPassword") continue
-    result[key] = omitRepositoryPassword(entry)
+    if (BACKUP_SECRET_KEYS.has(key)) continue
+    result[key] = omitBackupSecrets(entry)
   }
   return result
 }

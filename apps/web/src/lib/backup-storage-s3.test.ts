@@ -2,10 +2,16 @@ import { describe, expect, it } from "vite-plus/test"
 
 import {
   backupObjectKey,
+  deleteS3PrefixObjectPages,
   isPublicS3Address,
+  isRetryableS3Failure,
+  isSafeResticObjectPrefix,
   normalizeObjectPrefix,
   normalizeS3Endpoint,
+  resticPrefixSegment,
+  resticRepositoryObjectPrefix,
 } from "./backup-storage-s3"
+import { BackupStorageError } from "@/effect/errors"
 
 describe("S3 backup storage", () => {
   it("normalizes origins and safe object prefixes", () => {
@@ -81,6 +87,71 @@ describe("S3 backup storage", () => {
     expect(isPublicS3Address("169.254.169.254")).toBe(false)
     expect(isPublicS3Address("::ffff:127.0.0.1")).toBe(false)
     expect(isPublicS3Address("::ffff:7f00:1")).toBe(false)
+    expect(isPublicS3Address("64:ff9b::7f00:1")).toBe(false)
     expect(isPublicS3Address("not-an-address")).toBe(false)
+  })
+})
+
+describe("restic S3 prefixes", () => {
+  it("keeps safe segments and hashes unsafe ones", () => {
+    expect(isSafeResticObjectPrefix("team/production")).toBe(true)
+    expect(isSafeResticObjectPrefix("team/foo bar")).toBe(false)
+    expect(isSafeResticObjectPrefix("team/../other")).toBe(false)
+    expect(resticPrefixSegment("relay-one")).toBe("relay-one")
+    expect(resticPrefixSegment("sha256-already")).toMatch(/^sha256-[a-f0-9]{64}$/u)
+    expect(resticPrefixSegment("relay/id")).toMatch(/^sha256-[a-f0-9]{64}$/u)
+    expect(
+      resticRepositoryObjectPrefix({
+        installationId: "kiln.dev",
+        objectPrefix: "team",
+        relayId: "relay-one",
+        repositoryId: "repo-one",
+        targetId: "instance-one",
+      })
+    ).toBe(
+      "team/kiln/kiln.dev/relay-one/restic/instance/instance-one/repo-one"
+    )
+  })
+
+  it("pages through prefix deletes", async () => {
+    const listed: Array<string | undefined> = []
+    const deleted: Array<ReadonlyArray<string>> = []
+    await deleteS3PrefixObjectPages(
+      async (token) => {
+        listed.push(token)
+        if (!token) {
+          return { keys: ["a", "b"], nextToken: "page-2" }
+        }
+        return { keys: ["c"] }
+      },
+      async (keys) => {
+        deleted.push(keys)
+      }
+    )
+    expect(listed).toEqual([undefined, "page-2"])
+    expect(deleted).toEqual([["a", "b"], ["c"]])
+  })
+
+  it("retries transient S3 failures except 4xx, 403, and 404", () => {
+    const failed = (status: number) =>
+      BackupStorageError.make({
+        cause: { $metadata: { httpStatusCode: status } },
+        code: "s3_request_failed",
+        operation: "storage.deletePrefix",
+        reason: "failed",
+      })
+    expect(isRetryableS3Failure(failed(500))).toBe(true)
+    expect(isRetryableS3Failure(failed(429))).toBe(false)
+    expect(isRetryableS3Failure(failed(403))).toBe(false)
+    expect(isRetryableS3Failure(failed(404))).toBe(false)
+    expect(
+      isRetryableS3Failure(
+        BackupStorageError.make({
+          code: "invalid_prefix",
+          operation: "storage.deletePrefix",
+          reason: "empty",
+        })
+      )
+    ).toBe(false)
   })
 })
