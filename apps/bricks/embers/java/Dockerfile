@@ -31,7 +31,9 @@ RUN apt-get update \
 
 COPY --from=java /opt/kiln-java /opt/java
 COPY apps/bricks/embers/java/entrypoint.sh /usr/local/bin/kiln-ember
-RUN chmod 0755 /usr/local/bin/kiln-ember && mkdir -p /server
+RUN sed -i 's/\r$//' /usr/local/bin/kiln-ember \
+  && chmod 0755 /usr/local/bin/kiln-ember \
+  && mkdir -p /server
 
 ARG KILN_GIT_REPO=https://github.com/kiln-site/kiln
 LABEL org.opencontainers.image.source="${KILN_GIT_REPO}"
