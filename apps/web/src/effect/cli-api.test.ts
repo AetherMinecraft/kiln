@@ -313,6 +313,7 @@ describe("CLI response and URL boundaries", () => {
       cliBackupDownloadResponseSchema.safeParse({
         expiresAt: "2026-08-10T00:00:00.000Z",
         filename: "backup.zip",
+        status: "ready",
         url: "http://relay.example.com/backup.zip",
       }).success
     )

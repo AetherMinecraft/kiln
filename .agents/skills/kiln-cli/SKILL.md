@@ -165,27 +165,33 @@ kiln backups list --limit 200
 ```
 
 The `DEST` column consolidates the logical backup's destinations, such as
-`local+s3`; it does not repeat a backup once per destination.
+`local+s3`; it does not repeat a backup once per destination. The `MODE`
+column is `incremental` (restic snapshots, the server default) or `full`
+(portable zip archives).
 
-Create a manual backup with a reference from `backups targets`:
+Create a manual backup with a reference from `backups targets`. Server backups
+default to incremental restic snapshots stored on the Relay. Pass `--mode full`
+for a portable zip, which can also use S3. Incremental mode cannot use S3.
 
 ```sh
 kiln backups create server <relay-id>:<instance-id> --name "Before update"
+kiln backups create server <relay-id>:<instance-id> --mode full --storage local
 kiln backups create database <relay-id>:<database-id> --name "Before migration"
 kiln backups create platform <relay-id> --name "Before Hearth update"
 ```
 
-The default destination follows the server backup policy and otherwise uses
-Relay-local storage. Override it explicitly when needed:
+The default destination for full archives follows the server backup policy and
+otherwise uses Relay-local storage. Override it explicitly when needed:
 
 ```sh
-kiln backups create server <server> --storage local
-kiln backups create server <server> --storage <destination-uuid>
+kiln backups create server <server> --mode full --storage local
+kiln backups create server <server> --mode full --storage <destination-uuid>
 ```
 
-Restore a complete server or database backup by UUID. A full safety backup is
-created first unless explicitly disabled. Game servers must be stopped;
-managed databases remain online for their logical import:
+Restore a complete server or database backup by UUID, including incremental
+snapshots. A full safety backup is created first unless explicitly disabled.
+Game servers must be stopped; managed databases remain online for their
+logical import:
 
 ```sh
 kiln backup restore <backup-id>
@@ -193,7 +199,8 @@ kiln backup restore <backup-id> --no-safety-backup
 ```
 
 Download through a temporary signed URL without printing the URL itself. The
-backup filename is used when the local path is omitted:
+backup filename is used when the local path is omitted. Incremental snapshots
+are exported to a zip first; the command waits until that export is ready:
 
 ```sh
 kiln backup download <backup-id>

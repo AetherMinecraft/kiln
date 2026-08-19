@@ -1393,11 +1393,16 @@ const BackupTableRow = React.memo(function BackupTableRow({
       </WorkspaceTableCell>
       <WorkspaceTableCell className="h-auto py-2.5">
         <div className="min-w-0">
-          <BackupNameEditor
-            backupId={backup.id}
-            editable={canCreate}
-            name={backup.name}
-          />
+          <div className="flex min-w-0 items-center gap-1.5">
+            <div className="min-w-0 flex-1">
+              <BackupNameEditor
+                backupId={backup.id}
+                editable={canCreate}
+                name={backup.name}
+              />
+            </div>
+            <BackupModeBadge mode={backup.backupMode} />
+          </div>
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
@@ -1483,11 +1488,16 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
       <div className="flex min-w-0 items-start gap-2.5">
         <BackupSelectionCheckbox backup={backup} store={selectionStore} />
         <div className="min-w-0 flex-1">
-          <BackupNameEditor
-            backupId={backup.id}
-            editable={canCreate}
-            name={backup.name}
-          />
+          <div className="flex min-w-0 items-center gap-1.5">
+            <div className="min-w-0 flex-1">
+              <BackupNameEditor
+                backupId={backup.id}
+                editable={canCreate}
+                name={backup.name}
+              />
+            </div>
+            <BackupModeBadge mode={backup.backupMode} />
+          </div>
         </div>
       </div>
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
@@ -2805,19 +2815,31 @@ function DownloadBackupDialog({
     )
   )
   const signDownload = useMutation({
-    mutationFn: (mode: "download" | "link") =>
-      getBackupDownloadUrl({
-        data: {
-          artifactId,
-          backupId: backup.id,
-          expiresInSeconds: mode === "download" ? 300 : expiresInSeconds,
-          preview: shouldPreviewBackupDownload(
-            mode,
-            readFileDownloadPreferences().previewBackupDownloads
-          ),
-        },
-      }),
+    mutationFn: async (mode: "download" | "link") => {
+      let poll = false
+      for (;;) {
+        const result = await getBackupDownloadUrl({
+          data: {
+            artifactId,
+            backupId: backup.id,
+            expiresInSeconds: mode === "download" ? 300 : expiresInSeconds,
+            poll,
+            preview: shouldPreviewBackupDownload(
+              mode,
+              readFileDownloadPreferences().previewBackupDownloads
+            ),
+          },
+        })
+        poll = true
+        if (!("url" in result)) {
+          await new Promise((resolve) => setTimeout(resolve, 1_000))
+          continue
+        }
+        return result
+      }
+    },
     onSuccess: (result, mode) => {
+      if (!("url" in result)) return
       if (mode === "link") {
         setShared(result)
         return
@@ -2842,9 +2864,17 @@ function DownloadBackupDialog({
           <DialogDescription>
             Choose an available copy, then download it or create a temporary
             signed URL.
+            {backup.artifactKind === "restic_snapshot"
+              ? " Incremental snapshots are exported to a zip first."
+              : ""}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
+          {signDownload.isPending && backup.artifactKind === "restic_snapshot" ? (
+            <p className="text-xs text-muted-foreground">
+              Preparing export…
+            </p>
+          ) : null}
           <label className="block">
             <span className="mb-2 block text-xs font-medium">Source</span>
             <Select
@@ -3083,7 +3113,9 @@ function CreateBackupDialog({
   const [destinationKeys, setDestinationKeys] = React.useState<Array<string>>([
     "default",
   ])
+  const [mode, setMode] = React.useState<"full" | "incremental">("incremental")
   const target = targets.find((candidate) => candidate.key === targetKeyValue)
+  const incremental = target?.kind === "instance" && mode === "incremental"
   const availableStorage = React.useMemo(
     () =>
       storage.filter(
@@ -3114,7 +3146,12 @@ function CreateBackupDialog({
       }
       if (target.kind === "instance") {
         return createInstanceBackup({
-          data: { ...data, instanceId: target.id },
+          data: {
+            ...data,
+            instanceId: target.id,
+            mode: incremental ? "incremental" : "full",
+            ...(incremental ? { storageIds: [null] } : {}),
+          },
         })
       }
       if (target.kind === "database") {
@@ -3205,6 +3242,37 @@ function CreateBackupDialog({
               </SelectContent>
             </Select>
           </label>
+          {target?.kind === "instance" ? (
+            <fieldset>
+              <legend className="mb-2 text-xs font-medium">Mode</legend>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <BackupDestinationChoice
+                  checked={mode === "incremental"}
+                  description="Deduplicated Relay-local snapshots"
+                  icon={Archive}
+                  label="Incremental"
+                  onCheckedChange={(checked) => {
+                    if (checked) setMode("incremental")
+                  }}
+                />
+                <BackupDestinationChoice
+                  checked={mode === "full"}
+                  description="Portable zip archive"
+                  icon={HardDrive}
+                  label="Full archive"
+                  onCheckedChange={(checked) => {
+                    if (checked) setMode("full")
+                  }}
+                />
+              </div>
+            </fieldset>
+          ) : null}
+          {incremental ? (
+            <p className="text-[0.625rem] text-muted-foreground">
+              Incremental backups stay on this Relay. Choose full archive to
+              store a zip locally or on S3.
+            </p>
+          ) : (
           <fieldset>
             <legend className="mb-2 text-xs font-medium">Destinations</legend>
             <div className="grid gap-2 sm:grid-cols-2">
@@ -3247,6 +3315,7 @@ function CreateBackupDialog({
                   : "Choose one or more copies. Default uses Relay-local storage."}
             </span>
           </fieldset>
+          )}
           {create.error ? (
             <p className="text-xs text-destructive">{create.error.message}</p>
           ) : null}
@@ -4318,6 +4387,18 @@ function backupMatchesStatusFilter(
   return !active && !failed && backup.status === "available"
 }
 
+const BackupModeBadge = React.memo(function BackupModeBadge({
+  mode,
+}: {
+  mode: Backup["backupMode"]
+}) {
+  return (
+    <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[0.625rem]">
+      {mode === "incremental" ? "Incremental" : "Full"}
+    </Badge>
+  )
+})
+
 function backupTargetName(
   backup: Backup,
   targetNames: ReadonlyMap<string, string>
@@ -4360,12 +4441,17 @@ function backupAvailabilityTags(
   backup: Backup,
   destinations: ReadonlyArray<BackupAvailabilityDestination>
 ): Array<BackupAvailabilityTagView> {
+  const incremental = backup.artifactKind === "restic_snapshot"
+  const visibleDestinations = incremental
+    ? destinations.filter((destination) => destination.id === null)
+    : destinations
   const uploadPercent = backupTaskUploadProgressPercent(backup)
   const artifactsByStorage = new Map<string, Backup["artifacts"][number]>()
   for (const artifact of backup.artifacts) {
+    if (incremental && artifact.storageId !== null) continue
     artifactsByStorage.set(artifact.storageId ?? "local", artifact)
   }
-  const tags: Array<BackupAvailabilityTagView> = destinations.map(
+  const tags: Array<BackupAvailabilityTagView> = visibleDestinations.map(
     (destination) => {
       const key = destination.id ?? "local"
       const kind = destination.id ? "remote" : "local"
@@ -4389,6 +4475,7 @@ function backupAvailabilityTags(
   )
   const seen = new Set(tags.map((tag) => tag.key))
   for (const artifact of backup.artifacts) {
+    if (incremental && artifact.storageId !== null) continue
     const key = artifact.storageId ?? "local"
     if (seen.has(key)) continue
     const kind = artifact.storageId ? "remote" : "local"
@@ -4408,10 +4495,10 @@ function backupAvailabilityTags(
           : null,
     })
   }
-  const s3Enabled =
+  const s3Configured =
     destinations.some((destination) => destination.id !== null) ||
     backup.artifacts.some((artifact) => artifact.storageId !== null)
-  if (!s3Enabled) {
+  if (!incremental && !s3Configured) {
     tags.push({
       error: null,
       key: "s3",
@@ -4479,6 +4566,9 @@ function backupCopyDisabledReason(
   extraDestinations: ReadonlyArray<BackupAvailabilityDestination>
 ): string | null {
   if (!canCopy) return "You do not have permission to copy this backup"
+  if (backup.artifactKind === "restic_snapshot") {
+    return "Incremental snapshots cannot be copied to S3"
+  }
   const hasAvailableFile = backup.artifacts.some(
     (artifact) => artifact.status === "available"
   )
