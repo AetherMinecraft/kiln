@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events"
-import { mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { mkdir, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -202,24 +202,27 @@ describe("restic driver", () => {
 })
 
 describe("restic staging validation", () => {
-  it("rejects symlinks and accepts a regular file tree", async () => {
+  it("accepts a regular file tree without warnings", async () => {
     const valid = join(testDirectory, "valid-staging")
     await mkdir(join(valid, "world"), { recursive: true })
     await writeFile(join(valid, "world", "level.dat"), "ok")
     const checked = await validateStagingTree(valid, { diskBytes: 10_000 })
     assert.strictEqual(checked.entries, 2)
     assert.strictEqual(checked.logicalBytes, 2)
+    assert.deepStrictEqual(checked.warnings, [])
+  })
 
-    const invalid = join(testDirectory, "invalid-staging")
-    await mkdir(invalid, { recursive: true })
-    await symlink("/etc/passwd", join(invalid, "link"))
-    let rejected = false
-    try {
-      await validateStagingTree(invalid, { diskBytes: 10_000 })
-    } catch {
-      rejected = true
-    }
-    assert.isTrue(rejected)
+  it("drops symlinks with a warning instead of failing the restore", async () => {
+    const staging = join(testDirectory, "symlink-staging")
+    await mkdir(join(staging, "world"), { recursive: true })
+    await writeFile(join(staging, "world", "level.dat"), "ok")
+    await symlink("/etc/passwd", join(staging, "link"))
+    const checked = await validateStagingTree(staging, { diskBytes: 10_000 })
+    assert.strictEqual(checked.logicalBytes, 2)
+    assert.strictEqual(checked.warnings.length, 1)
+    assert.include(checked.warnings[0] ?? "", "link")
+    assert.isFalse(existsSync(join(staging, "link")))
+    assert.isTrue(existsSync(join(staging, "world", "level.dat")))
   })
 })
 

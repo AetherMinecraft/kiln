@@ -731,8 +731,13 @@ describe("restic backup limits and exports", () => {
     it.effect("forgets an over-limit snapshot after backup summary", () =>
       Effect.gen(function* () {
         const forgotten: Array<string> = []
+        let pruned = 0
+        const config = testConfig(join(testDirectory, "over-limit-summary"))
+        yield* Effect.promise(() =>
+          mkdir(join(config.rootDirectory, "instance-1"), { recursive: true })
+        )
         const manager = yield* BackupManager.make({
-          config: testConfig(join(testDirectory, "over-limit-summary")),
+          config,
           findInstance: async () => testInstance(),
           isInstanceStopped: async () => true,
           restic: mockRestic({
@@ -743,6 +748,9 @@ describe("restic backup limits and exports", () => {
             forget: async ({ snapshotId }) => {
               forgotten.push(snapshotId)
             },
+            prune: async () => {
+              pruned += 1
+            },
           }),
         })
         const input = resticCreateInput("over-limit-summary", 100)
@@ -752,12 +760,14 @@ describe("restic backup limits and exports", () => {
         assert.strictEqual(task?.status, "failed")
         assert.include(task?.error ?? "", "exceeds")
         assert.deepStrictEqual(forgotten, ["oversize01"])
+        assert.strictEqual(pruned, 1)
       })
     )
 
     it.effect("forgets a reused over-limit snapshot instead of succeeding", () =>
       Effect.gen(function* () {
         const forgotten: Array<string> = []
+        let pruned = 0
         const manager = yield* BackupManager.make({
           config: testConfig(join(testDirectory, "over-limit-reuse")),
           findInstance: async () => testInstance(),
@@ -768,6 +778,9 @@ describe("restic backup limits and exports", () => {
             forget: async ({ snapshotId }) => {
               forgotten.push(snapshotId)
             },
+            prune: async () => {
+              pruned += 1
+            },
           }),
         })
         const input = resticCreateInput("over-limit-reuse", 100)
@@ -776,12 +789,14 @@ describe("restic backup limits and exports", () => {
         const task = yield* manager.get(input.taskId)
         assert.strictEqual(task?.status, "failed")
         assert.deepStrictEqual(forgotten, ["reused001"])
+        assert.strictEqual(pruned, 1)
       })
     )
 
     it.effect("forgets a snapshot committed before an over-limit progress abort", () =>
       Effect.gen(function* () {
         const forgotten: Array<string> = []
+        let pruned = 0
         const manager = yield* BackupManager.make({
           config: testConfig(join(testDirectory, "over-limit-progress")),
           findInstance: async () => testInstance(),
@@ -796,6 +811,9 @@ describe("restic backup limits and exports", () => {
             forget: async ({ snapshotId }) => {
               forgotten.push(snapshotId)
             },
+            prune: async () => {
+              pruned += 1
+            },
           }),
         })
         const input = resticCreateInput("over-limit-progress", 100)
@@ -804,6 +822,7 @@ describe("restic backup limits and exports", () => {
         const task = yield* manager.get(input.taskId)
         assert.strictEqual(task?.status, "failed")
         assert.deepStrictEqual(forgotten, ["progress1"])
+        assert.strictEqual(pruned, 1)
       })
     )
 

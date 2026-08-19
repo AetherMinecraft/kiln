@@ -784,6 +784,49 @@ describe("Relay state", () => {
       })
     )
 
+    it.effect("claims past a queued journal row that fails schema parsing", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        yield* Effect.sync(() => {
+          const database = new DatabaseSync(stateDatabase)
+          database.exec(`
+            INSERT INTO relay_backup_tasks (
+              task_id, backup_id, kind, status, input_json,
+              bytes_completed, created_at, updated_at
+            ) VALUES (
+              '44000000-0000-4000-8000-000000000011',
+              '44000000-0000-4000-8000-000000000001',
+              'export',
+              'queued',
+              '{"backupId":"44000000-0000-4000-8000-000000000001","expiresAt":1,"snapshotId":"abcdef12","target":{"id":"instance-a","kind":"instance"},"taskId":"44000000-0000-4000-8000-000000000011","kind":"export"}',
+              0,
+              100,
+              100
+            )
+          `)
+          database.close()
+        })
+        const valid: BackupTaskInput = {
+          backupId: "44000000-0000-4000-8000-000000000002",
+          kind: "export",
+          snapshotId: "abcdef12",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "44000000-0000-4000-8000-000000000012",
+          ttlMs: 60_000,
+        }
+        yield* store.enqueueBackupTask(valid, 900)
+        const claimed = yield* store.claimNextBackupTask(910)
+        assert.strictEqual(claimed?.taskId, valid.taskId)
+        assert.strictEqual(claimed?.status, "running")
+        const corrupt = yield* store.listBackupTasks()
+        const failed = corrupt.find(
+          (task) => task.taskId === "44000000-0000-4000-8000-000000000011"
+        )
+        assert.strictEqual(failed?.status, "failed")
+        yield* store.failBackupTask(valid.taskId, "test finished", 920)
+      })
+    )
+
     it.effect("prunes superseded succeeded export journal rows", () =>
       Effect.gen(function* () {
         const store = yield* RelayStateStore

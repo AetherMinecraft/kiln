@@ -15,6 +15,7 @@ const RESTIC_BINARY = "restic"
 const MAX_JSON_LINE_BYTES = 64 * 1024
 const MAX_STDERR_BYTES = 64 * 1024
 const MAX_STAGING_ENTRIES = 100_000
+const MAX_SKIPPED_ENTRY_WARNINGS = 25
 const MAX_UNLIMITED_RESTORE_BYTES = 1024 ** 4
 const RESTIC_TERMINATE_TIMEOUT_MS = 5_000
 
@@ -382,7 +383,7 @@ export function createResticDriver(options?: {
 export async function validateStagingTree(
   stagingRoot: string,
   limits: { diskBytes: number }
-): Promise<{ entries: number; logicalBytes: number }> {
+): Promise<{ entries: number; logicalBytes: number; warnings: Array<string> }> {
   const root = resolve(stagingRoot)
   const metadata = await lstat(root)
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
@@ -394,6 +395,8 @@ export async function validateStagingTree(
   }
   let entries = 0
   let logicalBytes = 0
+  let skipped = 0
+  const warnings: Array<string> = []
   const visit = async (directory: string): Promise<void> => {
     for await (const entry of await opendir(directory)) {
       entries += 1
@@ -408,11 +411,17 @@ export async function validateStagingTree(
       requireContained(root, absolute, "restore.validate")
       const child = await lstat(absolute)
       if (child.isSymbolicLink() || (!child.isFile() && !child.isDirectory())) {
-        throw resticError(
-          "unsupported_staging_entry",
-          "restore.validate",
-          `Restored files cannot include ${relative(root, absolute) || entry.name}`
-        )
+        // Full archives never contain non-regular files (the walker skips
+        // them with a warning), so drop them here for identical semantics
+        // instead of failing an otherwise valid snapshot restore.
+        await rm(absolute, { force: true, recursive: false })
+        skipped += 1
+        if (warnings.length < MAX_SKIPPED_ENTRY_WARNINGS) {
+          warnings.push(
+            `Skipped non-regular file ${relative(root, absolute) || entry.name}`
+          )
+        }
+        continue
       }
       if (child.isDirectory()) {
         await visit(absolute)
@@ -422,6 +431,11 @@ export async function validateStagingTree(
     }
   }
   await visit(root)
+  if (skipped > warnings.length) {
+    warnings.push(
+      `Skipped ${skipped - warnings.length} more non-regular files`
+    )
+  }
   const maximumBytes =
     limits.diskBytes > 0 ? limits.diskBytes : MAX_UNLIMITED_RESTORE_BYTES
   if (logicalBytes > maximumBytes) {
@@ -431,7 +445,7 @@ export async function validateStagingTree(
       "The backup expands beyond this server's disk limit"
     )
   }
-  return { entries, logicalBytes }
+  return { entries, logicalBytes, warnings }
 }
 
 type SpawnedRestic = {

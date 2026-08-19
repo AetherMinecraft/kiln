@@ -1192,30 +1192,54 @@ const makeRelayStateStore = Effect.gen(function* () {
         "claim_next_backup_task",
         sql.withTransaction(
           Effect.gen(function* () {
-            const rows = yield* sql<{ taskId: string }>`
-              SELECT task_id AS taskId
-              FROM relay_backup_tasks
-              WHERE status = 'queued' AND input_refresh_required = 0
-              ORDER BY created_at ASC, task_id ASC
-              LIMIT 1
-            `
-            const taskId = rows[0]?.taskId
-            if (!taskId) return null
-            yield* sql`
-              UPDATE relay_backup_tasks
-              SET status = 'running',
-                  started_at = COALESCE(started_at, ${now}),
-                  updated_at = ${now},
-                  error = NULL,
-                  phase = 'preparing',
-                  current_artifact_id = NULL,
-                  current_path = NULL,
-                  finished_at = NULL
-              WHERE task_id = ${taskId}
-                AND status = 'queued'
-                AND input_refresh_required = 0
-            `
-            return (yield* backupTasks({ taskId }))[0] ?? null
+            while (true) {
+              const rows = yield* sql<{ inputJson: string; taskId: string }>`
+                SELECT task_id AS taskId, input_json AS inputJson
+                FROM relay_backup_tasks
+                WHERE status = 'queued' AND input_refresh_required = 0
+                ORDER BY created_at ASC, task_id ASC
+                LIMIT 1
+              `
+              const row = rows[0]
+              if (!row) return null
+              const decoded = yield* backupTasks({ taskId: row.taskId }).pipe(
+                Effect.result
+              )
+              const task = Result.isSuccess(decoded)
+                ? (decoded.success[0] ?? null)
+                : null
+              if (!task) {
+                // A row the current schema cannot decode must not stall the
+                // whole queue: fail it terminally and claim the next task.
+                yield* sql`
+                  UPDATE relay_backup_tasks
+                  SET status = 'failed',
+                      input_json = ${scrubBackupTaskInputJson(row.inputJson)},
+                      result_json = NULL,
+                      current_artifact_id = NULL,
+                      error = ${UNPARSEABLE_BACKUP_TASK_ERROR},
+                      finished_at = ${now},
+                      updated_at = ${now}
+                  WHERE task_id = ${row.taskId}
+                `
+                continue
+              }
+              yield* sql`
+                UPDATE relay_backup_tasks
+                SET status = 'running',
+                    started_at = COALESCE(started_at, ${now}),
+                    updated_at = ${now},
+                    error = NULL,
+                    phase = 'preparing',
+                    current_artifact_id = NULL,
+                    current_path = NULL,
+                    finished_at = NULL
+                WHERE task_id = ${row.taskId}
+                  AND status = 'queued'
+                  AND input_refresh_required = 0
+              `
+              return (yield* backupTasks({ taskId: row.taskId }))[0] ?? null
+            }
           })
         )
       ),

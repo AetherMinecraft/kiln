@@ -778,6 +778,32 @@ export class BackupManager {
               Date.now()
             ),
           createSignal
+        ).pipe(
+          // An over-limit snapshot was forgotten before this error; enqueue
+          // the same internal prune as user deletes so retried creates do
+          // not accumulate unreferenced packs in the repository.
+          Effect.tapError((error) =>
+            error instanceof RelayBackupError &&
+            error.code === "backup_too_large" &&
+            input.destination.kind === "restic"
+              ? this.#state
+                  .enqueueBackupTask(
+                    {
+                      backupId: randomUUID(),
+                      kind: "prune",
+                      repositoryPassword:
+                        input.destination.repositoryPassword,
+                      target: input.target,
+                      taskId: randomUUID(),
+                    },
+                    Date.now()
+                  )
+                  .pipe(
+                    Effect.andThen(Queue.offer(this.#wake, undefined)),
+                    Effect.ignore
+                  )
+              : Effect.void
+          )
         )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
@@ -1521,6 +1547,17 @@ async function createResticSnapshot(
       warnings: translated.warnings,
     }
   }
+  // Worst case a snapshot stores one full compressed copy of the instance;
+  // deduplicated runs use far less, so this is a conservative preflight.
+  await mkdir(repository, { recursive: true, mode: 0o700 })
+  await requireBackupSpace(
+    repository,
+    await directoryLogicalBytes(
+      resolve(config.rootDirectory, instance.directory),
+      signal
+    ),
+    input.maxBytes
+  )
   const summary = await Effect.runPromise(
     Effect.result(
       Effect.tryPromise({
@@ -1705,9 +1742,12 @@ function runResticRestore(
                 signal,
                 target: prepared.paths.staging,
               })
-              await validateStagingTree(prepared.paths.staging, instance.limits)
+              const validated = await validateStagingTree(
+                prepared.paths.staging,
+                instance.limits
+              )
               await installPreparedInstanceRestore(prepared)
-              return { warnings: [] as Array<string> }
+              return { warnings: validated.warnings }
             },
             catch: (cause) => cause,
           })
@@ -1914,6 +1954,18 @@ function runResticExport(
           mode: 0o700,
         })
         await rm(partial, { force: true })
+        const stats = await restic.stats({
+          password,
+          repository: resticRepositoryPath(config, input.target.id),
+          signal,
+          snapshotId: input.snapshotId,
+        })
+        await requireBackupSpace(
+          backupExportDirectoryPath(config),
+          stats.totalSize,
+          null,
+          "export.preflight"
+        )
         const dumped = await restic.dumpZip({
           destination: partial,
           onProgress: (bytes) => {
@@ -2126,7 +2178,8 @@ async function collectBackupEntries(
 async function requireBackupSpace(
   directory: string,
   logicalBytes: number,
-  maxBytes: number | null
+  maxBytes: number | null,
+  operation = "create.preflight"
 ): Promise<void> {
   const filesystem = await statfs(directory)
   const available = BigInt(filesystem.bavail) * BigInt(filesystem.bsize)
@@ -2140,10 +2193,32 @@ async function requireBackupSpace(
   if (available < required) {
     throw RelayBackupError.make({
       code: "insufficient_space",
-      operation: "create.preflight",
+      operation,
       reason: "The Relay does not have enough free space to stage this backup",
     })
   }
+}
+
+async function directoryLogicalBytes(
+  root: string,
+  signal: AbortSignal
+): Promise<number> {
+  let total = 0
+  const visit = async (directory: string): Promise<void> => {
+    signal.throwIfAborted()
+    for await (const entry of await opendir(directory)) {
+      const absolute = resolve(directory, entry.name)
+      const child = await lstat(absolute)
+      if (child.isSymbolicLink()) continue
+      if (child.isDirectory()) {
+        await visit(absolute)
+        continue
+      }
+      if (child.isFile()) total += child.size
+    }
+  }
+  await visit(root)
+  return total
 }
 
 function writeBackupArchive(
