@@ -294,10 +294,7 @@ export function resolveInstanceStartupReconfigure(
       : (input.diskLimitBytes ?? existing.limits.diskBytes),
     forcePull: reinstall,
     recipe,
-    start: reinstall
-      ? existing.observedState === "running" ||
-        existing.observedState === "starting"
-      : input.start,
+    start: reinstall ? existing.desiredState === "running" : input.start,
     tailscale: reinstall
       ? existing.tailscale
       : (input.tailscale ?? existing.tailscale),
@@ -1909,7 +1906,8 @@ export class LifecycleDriver {
     instanceId: string,
     input: RelayUpdateInstanceStartup
   ): Promise<RelayInstance> {
-    const existing = await this.#docker.findInstance(instanceId)
+    const inspected = await this.#docker.inspectInstances()
+    const existing = inspected.find((item) => item.id === instanceId)
     if (!existing) throw new Error("Instance not found")
     if (!existing.managedByRelay) {
       throw new Error("Relay can only reconfigure containers it created")
@@ -1927,7 +1925,7 @@ export class LifecycleDriver {
     const { diskLimitBytes, forcePull, recipe, start, tailscale, variables } =
       resolveInstanceStartupReconfigure(existing, input)
     if (tailscale.enabled) {
-      const duplicate = (await this.#docker.inspectInstances()).find(
+      const duplicate = inspected.find(
         (instance) =>
           instance.id !== existing.id &&
           instance.managedByRelay &&
@@ -1947,9 +1945,7 @@ export class LifecycleDriver {
       currentDiskLimitBytes: existing.limits.diskBytes,
       directory: join(this.#config.rootDirectory, existing.directory),
       diskLimitBytes,
-      existing: (await this.#docker.inspectInstances()).filter(
-        (instance) => instance.id !== existing.id
-      ),
+      existing: inspected.filter((instance) => instance.id !== existing.id),
       memoryLimitBytes: dockerMemoryBytes(resolved.memory),
     })
     if (forcePull) {

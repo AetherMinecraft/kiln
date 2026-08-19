@@ -166,6 +166,18 @@ describe("startup reinstall resolution", () => {
     })
   })
 
+  it("starts after reinstall when the desired state is running", () => {
+    const resolved = resolveInstanceStartupReconfigure(
+      instance({ desiredState: "running", observedState: "failed" }),
+      relayUpdateInstanceStartupSchema.parse({
+        reinstall: true,
+        start: false,
+      })
+    )
+
+    expect(resolved.start).toBe(true)
+  })
+
   it("keeps a stopped server stopped even when the client asks to start", () => {
     const resolved = resolveInstanceStartupReconfigure(
       instance({ desiredState: "stopped", observedState: "stopped" }),
@@ -225,7 +237,6 @@ describe("startup reinstall pull ordering", () => {
       }
     )
     const docker = {
-      findInstance: vi.fn(async () => existing),
       inspectInstances: vi.fn(async () => [existing]),
     } as unknown as DockerDriver
     const lifecycle = new LifecycleDriver(
@@ -237,7 +248,7 @@ describe("startup reinstall pull ordering", () => {
         NODE_ENV: "test",
       }),
       docker,
-      { recipe: async () => recipe } as BrickCatalog
+      { recipe: async () => recipe } as unknown as BrickCatalog
     )
 
     await expect(
