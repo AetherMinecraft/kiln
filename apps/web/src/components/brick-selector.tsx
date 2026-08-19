@@ -18,6 +18,13 @@ import {
   DialogTitle,
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@workspace/ui/components/select"
 import { cn } from "@workspace/ui/lib/utils"
 
 import { ServerTypeIcon } from "@/components/server-type-icon"
@@ -165,9 +172,6 @@ function filterAndSortBricks(
   })
 }
 
-const selectClassName =
-  "h-8 w-full rounded-md border border-input bg-input/18 px-2.5 text-xs text-foreground outline-none transition-[border-color,background-color,box-shadow] duration-150 hover:bg-input/24 focus-visible:border-ring/75 focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
-
 export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   bricks,
   selection,
@@ -295,42 +299,60 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
             />
           </label>
           <div className="grid grid-cols-2 gap-2">
-            <select
+            <Select
               value={sourceFilter}
               disabled={disabled || customOpen}
-              onChange={(event) => {
+              onValueChange={(value) => {
                 const next = SOURCE_FILTERS.find(
-                  (option) => option.id === event.target.value
+                  (option) => option.id === value
                 )
                 if (next) setSourceFilter(next.id)
               }}
-              className={selectClassName}
-              aria-label="Filter by source"
             >
-              {SOURCE_FILTERS.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            <select
+              <SelectTrigger
+                className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
+                aria-label="Filter by source"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SOURCE_FILTERS.map((option) => (
+                  <SelectItem
+                    key={option.id}
+                    value={option.id}
+                    className="whitespace-nowrap"
+                  >
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
               value={sort}
               disabled={disabled || customOpen}
-              onChange={(event) => {
-                const next = SORT_OPTIONS.find(
-                  (option) => option.id === event.target.value
-                )
+              onValueChange={(value) => {
+                const next = SORT_OPTIONS.find((option) => option.id === value)
                 if (next) setSort(next.id)
               }}
-              className={selectClassName}
-              aria-label="Sort bricks"
             >
-              {SORT_OPTIONS.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger
+                className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
+                aria-label="Sort bricks"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SORT_OPTIONS.map((option) => (
+                  <SelectItem
+                    key={option.id}
+                    value={option.id}
+                    className="whitespace-nowrap"
+                  >
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         </div>
 
