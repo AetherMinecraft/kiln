@@ -184,8 +184,13 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
               }
               if (event.key === "Enter") {
                 event.preventDefault()
+                if (!hasTyped) {
+                  closeMenu(true)
+                  return
+                }
                 const next = visibleVersions[0] ?? customVersion
                 if (next) selectVersion(next)
+                else closeMenu(true)
               }
             }}
           />
