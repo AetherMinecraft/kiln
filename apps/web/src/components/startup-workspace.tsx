@@ -7,7 +7,7 @@ import {
   LoaderCircle,
   Play,
   RefreshCw,
-  Rocket,
+  RotateCcw,
   Save,
 } from "lucide-react"
 import type {
@@ -161,9 +161,6 @@ const StartupForm = React.memo(function StartupForm({
   const [diskLimitGiB, setDiskLimitGiB] = React.useState(() =>
     bytesToGiBInput(initialLimits.diskBytes)
   )
-  const [startAfterSave, setStartAfterSave] = React.useState(
-    () => observedState !== "running"
-  )
   const [swapOpen, setSwapOpen] = React.useState(false)
   const [reinstallOpen, setReinstallOpen] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
@@ -232,6 +229,7 @@ const StartupForm = React.memo(function StartupForm({
   })
   const pending = saveMutation.isPending || reinstallMutation.isPending
   const submittingRef = React.useRef(false)
+  const isRunning = observedState === "running"
 
   function applyBrickSelection(selection: BrickSelection) {
     if (selection.kind === "catalog") {
@@ -308,7 +306,7 @@ const StartupForm = React.memo(function StartupForm({
               instanceId,
               recipe: view.source,
               relayId,
-              start: startAfterSave,
+              start: true,
               variables,
             },
           }),
@@ -339,13 +337,9 @@ const StartupForm = React.memo(function StartupForm({
         try: () =>
           reinstallMutation.mutateAsync({
             data: {
-              diskLimitBytes: initialLimits.diskBytes,
               instanceId,
-              recipe: initialBrickSource,
               reinstall: true,
               relayId,
-              start: observedState === "running",
-              variables: initialVariables,
             },
           }),
         catch: (cause) => cause,
@@ -384,14 +378,16 @@ const StartupForm = React.memo(function StartupForm({
 
   return (
     <section className="min-h-0 flex-1 overflow-y-auto bg-card">
-      <div className="mx-auto max-w-3xl px-5 py-6 sm:px-8 sm:py-8">
-        <BrickSummary
-          view={view}
-          canEdit={canEdit}
-          pending={pending}
-          onReinstall={() => setReinstallOpen(true)}
-          onSwap={() => setSwapOpen(true)}
-        />
+      <div className="mx-auto max-w-3xl space-y-6 px-5 py-6 sm:px-8 sm:py-8">
+        <StartupSection title="Brick Selection">
+          <BrickSummary
+            view={view}
+            canEdit={canEdit}
+            pending={pending}
+            onReinstall={() => setReinstallOpen(true)}
+            onSwap={() => setSwapOpen(true)}
+          />
+        </StartupSection>
 
         <StartupSettingsForm
           allocation={allocation}
@@ -399,13 +395,12 @@ const StartupForm = React.memo(function StartupForm({
           configuredMemoryBytes={configuredMemoryBytes}
           diskLimitGiB={diskLimitGiB}
           error={reinstallOpen ? null : error}
+          isRunning={isRunning}
           pending={pending}
           saved={saved}
-          startAfterSave={startAfterSave}
           variableDefinitions={view.variables}
           variables={variables}
           onDiskLimitChange={setDiskLimitGiB}
-          onStartAfterSaveChange={setStartAfterSave}
           onSubmit={onSubmit}
           onVariableChange={(name, value) => {
             if (!canEdit) return
@@ -456,13 +451,12 @@ function StartupSettingsForm({
   configuredMemoryBytes,
   diskLimitGiB,
   error,
+  isRunning,
   pending,
   saved,
-  startAfterSave,
   variableDefinitions,
   variables,
   onDiskLimitChange,
-  onStartAfterSaveChange,
   onSubmit,
   onVariableChange,
 }: {
@@ -471,13 +465,12 @@ function StartupSettingsForm({
   configuredMemoryBytes: number
   diskLimitGiB: string
   error: string | null
+  isRunning: boolean
   pending: boolean
   saved: boolean
-  startAfterSave: boolean
   variableDefinitions: Brick["variables"]
   variables: Record<string, BrickVariableValue>
   onDiskLimitChange: (value: string) => void
-  onStartAfterSaveChange: (value: boolean) => void
   onSubmit: React.FormEventHandler<HTMLFormElement>
   onVariableChange: (
     name: string,
@@ -486,48 +479,44 @@ function StartupSettingsForm({
 }) {
   const entries = Object.entries(variableDefinitions)
   return (
-    <form className="mt-5 space-y-4" onSubmit={onSubmit}>
-      <ResourceAllocationCard
-        allocation={allocation}
-        configuredMemoryBytes={configuredMemoryBytes}
-        diskLimitGiB={diskLimitGiB}
-        disabled={!canEdit || pending}
-        onDiskLimitChange={onDiskLimitChange}
-      />
-
-      {entries.length === 0 ? (
-        <div className="rounded-xl border border-border/75 bg-background/45 px-4 py-8 text-center text-xs text-muted-foreground">
-          This Brick has no configurable Startup variables.
-        </div>
-      ) : (
-        <div className="space-y-3 rounded-xl border border-border/75 bg-background/45 p-4">
-          {entries.map(([name, definition]) => (
-            <BrickVariableField
-              key={name}
-              name={name}
-              definition={definition}
-              value={variables[name]}
-              onChange={(value) => onVariableChange(name, value)}
-            />
-          ))}
-        </div>
-      )}
-
-      <label className="flex cursor-pointer items-center justify-between rounded-xl border border-border/75 bg-background/45 px-4 py-3 text-xs">
-        <span>
-          <span className="block font-medium">Start after applying</span>
-          <span className="mt-0.5 block text-[0.5625rem] text-muted-foreground">
-            Leave off to keep the server stopped after rebuild.
+    <form className="space-y-6" onSubmit={onSubmit}>
+      <StartupSection
+        accessory={
+          <span className="font-mono text-[0.5rem] tracking-[0.08em] text-muted-foreground/60 uppercase">
+            Node capacity
           </span>
-        </span>
-        <input
-          type="checkbox"
-          checked={startAfterSave}
+        }
+        description="Limits are validated against every server on this node."
+        title="Resource Allocation"
+      >
+        <ResourceAllocationCard
+          allocation={allocation}
+          configuredMemoryBytes={configuredMemoryBytes}
+          diskLimitGiB={diskLimitGiB}
           disabled={!canEdit || pending}
-          onChange={(event) => onStartAfterSaveChange(event.target.checked)}
-          className="accent-primary"
+          onDiskLimitChange={onDiskLimitChange}
         />
-      </label>
+      </StartupSection>
+
+      <StartupSection title="Brick Configuration">
+        {entries.length === 0 ? (
+          <div className="rounded-xl border border-border/75 bg-background/45 px-4 py-8 text-center text-xs text-muted-foreground">
+            This Brick has no configurable Startup variables.
+          </div>
+        ) : (
+          <div className="space-y-3 rounded-xl border border-border/75 bg-background/45 p-4">
+            {entries.map(([name, definition]) => (
+              <BrickVariableField
+                key={name}
+                name={name}
+                definition={definition}
+                value={variables[name]}
+                onChange={(value) => onVariableChange(name, value)}
+              />
+            ))}
+          </div>
+        )}
+      </StartupSection>
 
       {error ? (
         <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 text-xs text-destructive">
@@ -536,33 +525,64 @@ function StartupSettingsForm({
         </div>
       ) : null}
 
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        {!canEdit ? (
+          <p className="mr-auto text-[0.6875rem] text-muted-foreground">
+            Connect the Relay and use an account with settings access to change
+            Startup.
+          </p>
+        ) : null}
         <Button type="submit" disabled={!canEdit || pending}>
           {pending ? (
             <LoaderCircle className="animate-spin" />
           ) : saved ? (
             <Save />
-          ) : startAfterSave ? (
-            <Play />
+          ) : isRunning ? (
+            <RotateCcw />
           ) : (
-            <Rocket />
+            <Play />
           )}
           {pending
             ? "Applying…"
             : saved
               ? "Applied"
-              : startAfterSave
-                ? "Apply & Start"
-                : "Apply Startup"}
+              : isRunning
+                ? "Apply & Restart"
+                : "Apply & Start"}
         </Button>
-        {!canEdit ? (
-          <p className="text-[0.6875rem] text-muted-foreground">
-            Connect the Relay and use an account with settings access to change
-            Startup.
-          </p>
-        ) : null}
       </div>
     </form>
+  )
+}
+
+function StartupSection({
+  accessory,
+  children,
+  description,
+  title,
+}: {
+  accessory?: React.ReactNode
+  children: React.ReactNode
+  description?: string
+  title: string
+}) {
+  return (
+    <section className="space-y-2">
+      <div className="flex items-end justify-between gap-3">
+        <div>
+          <p className="font-mono text-[0.5625rem] tracking-[0.14em] text-primary uppercase">
+            {title}
+          </p>
+          {description ? (
+            <p className="mt-0.5 text-[0.625rem] text-muted-foreground">
+              {description}
+            </p>
+          ) : null}
+        </div>
+        {accessory}
+      </div>
+      {children}
+    </section>
   )
 }
 
@@ -723,7 +743,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
       bricks={bricks}
       initial={initial}
       title="Swap Brick"
-      description="Pick another catalog Brick or a custom recipe. Startup options update immediately; apply to rebuild the container."
+      description="Pick another catalog Brick or a custom recipe. Startup options save as you edit; apply to rebuild the container and start it."
       confirmLabel="Use Brick"
       onConfirm={onConfirm}
     />

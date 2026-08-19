@@ -78,13 +78,17 @@ describe("Relay disk quotas", () => {
     expect(parsed.reinstall).toBeUndefined()
   })
 
-  it("accepts a Brick reinstall startup patch", () => {
+  it("accepts a Brick reinstall startup patch without client variables", () => {
     const parsed = relayUpdateInstanceStartupSchema.parse({
       reinstall: true,
-      variables: { memory: "4G" },
     })
 
     expect(parsed.reinstall).toBe(true)
+    expect(parsed.variables).toBeUndefined()
+  })
+
+  it("rejects a startup patch that omits both reinstall and variables", () => {
+    expect(relayUpdateInstanceStartupSchema.safeParse({}).success).toBe(false)
   })
 
   it("treats a configured zero label as a missing legacy quota", () => {

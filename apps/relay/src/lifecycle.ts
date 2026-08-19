@@ -262,6 +262,49 @@ function formatAllocationBytes(bytes: number): string {
   return `${gibibytes.toFixed(gibibytes >= 10 ? 0 : 1)} GiB`
 }
 
+export function resolveInstanceStartupReconfigure(
+  existing: RelayInstance,
+  input: RelayUpdateInstanceStartup
+): {
+  diskLimitBytes: number
+  forcePull: boolean
+  recipe: string
+  start: boolean
+  tailscale: RelayInstanceTailscale
+  variables: NonNullable<RelayInstance["variables"]>
+} {
+  const reinstall = input.reinstall === true
+  const recipe = reinstall
+    ? existing.brickSource
+    : (input.recipe ?? existing.brickSource)
+  if (!recipe) {
+    throw new Error("Instance is missing its Brick recipe source")
+  }
+  const variables = reinstall ? existing.variables : input.variables
+  if (!variables) {
+    throw new Error(
+      reinstall
+        ? "Instance is missing its applied Brick variables"
+        : "Enter startup variables"
+    )
+  }
+  return {
+    diskLimitBytes: reinstall
+      ? existing.limits.diskBytes
+      : (input.diskLimitBytes ?? existing.limits.diskBytes),
+    forcePull: reinstall,
+    recipe,
+    start: reinstall
+      ? existing.observedState === "running" ||
+        existing.observedState === "starting"
+      : input.start,
+    tailscale: reinstall
+      ? existing.tailscale
+      : (input.tailscale ?? existing.tailscale),
+    variables,
+  }
+}
+
 export class LifecycleDriver {
   readonly #bricks: BrickCatalog
   readonly #config: RelayConfig
@@ -1881,12 +1924,8 @@ export class LifecycleDriver {
         "This server does not have a recoverable primary port. Recreate it before changing startup settings."
       )
     }
-    const recipe = input.recipe ?? existing.brickSource
-    if (!recipe) {
-      throw new Error("Instance is missing its Brick recipe source")
-    }
-    const diskLimitBytes = input.diskLimitBytes ?? existing.limits.diskBytes
-    const tailscale = input.tailscale ?? existing.tailscale
+    const { diskLimitBytes, forcePull, recipe, start, tailscale, variables } =
+      resolveInstanceStartupReconfigure(existing, input)
     if (tailscale.enabled) {
       const duplicate = (await this.#docker.inspectInstances()).find(
         (instance) =>
@@ -1902,7 +1941,7 @@ export class LifecycleDriver {
       }
     }
     const definition = await this.#bricks.recipe(recipe)
-    const resolved = resolveBrick(definition, input.variables, recipe)
+    const resolved = resolveBrick(definition, variables, recipe)
     await this.#assertAllocationAvailable({
       checkExistingUsage: true,
       currentDiskLimitBytes: existing.limits.diskBytes,
@@ -1913,6 +1952,13 @@ export class LifecycleDriver {
       ),
       memoryLimitBytes: dockerMemoryBytes(resolved.memory),
     })
+    if (forcePull) {
+      await runLifecycle(
+        lifecycleOperation(() =>
+          command("docker", ["pull", resolved.image], { timeout: 300_000 })
+        )
+      )
+    }
 
     await recoverPromise(
       () =>
@@ -1938,15 +1984,15 @@ export class LifecycleDriver {
       lifecycleOperation(() =>
         this.#provisionManagedInstance({
           diskLimitBytes,
-          forcePull: input.reinstall === true,
           grandfatheredDiskLimitBytes: existing.limits.diskBytes,
           id: existing.id,
           prepareDirectory: false,
           ports: existing.ports,
           recipe,
-          start: input.start,
+          skipImagePull: forcePull,
+          start,
           tailscale,
-          variables: input.variables,
+          variables,
         })
       ).pipe(
         Effect.mapError(
@@ -1962,12 +2008,12 @@ export class LifecycleDriver {
 
   async #provisionManagedInstance(input: {
     diskLimitBytes: number
-    forcePull?: boolean
     grandfatheredDiskLimitBytes: number
     id: string
     prepareDirectory: boolean
     ports?: ReadonlyArray<RelayInstancePortAllocation>
     recipe: string
+    skipImagePull?: boolean
     start: boolean
     tailscale: RelayInstanceTailscale
     variables: RelayCreateInstance["variables"]
@@ -2089,28 +2135,28 @@ export class LifecycleDriver {
       lifecycleOperation(() =>
         command("docker", ["pull", image], { timeout: 300_000 })
       )
-    if (input.forcePull) {
-      await runLifecycle(pullImage())
-    } else if (installationMarker) {
-      await runLifecycle(
-        pullImage().pipe(
-          Effect.catch(() =>
-            lifecycleOperation(() =>
-              command("docker", ["image", "inspect", image])
-            )
-          ),
-          Effect.asVoid
+    if (!input.skipImagePull) {
+      if (installationMarker) {
+        await runLifecycle(
+          pullImage().pipe(
+            Effect.catch(() =>
+              lifecycleOperation(() =>
+                command("docker", ["image", "inspect", image])
+              )
+            ),
+            Effect.asVoid
+          )
         )
-      )
-    } else {
-      await runLifecycle(
-        lifecycleOperation(() =>
-          command("docker", ["image", "inspect", image])
-        ).pipe(
-          Effect.catch(() => pullImage()),
-          Effect.asVoid
+      } else {
+        await runLifecycle(
+          lifecycleOperation(() =>
+            command("docker", ["image", "inspect", image])
+          ).pipe(
+            Effect.catch(() => pullImage()),
+            Effect.asVoid
+          )
         )
-      )
+      }
     }
     if (installationMarker) {
       const protocol = await runLifecycle(
