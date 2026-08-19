@@ -130,13 +130,12 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
   return (
     <Popover
       open={open}
-      onOpenChange={(nextOpen, eventDetails) => {
+      onOpenChange={(nextOpen) => {
         if (nextOpen) {
           openMenu()
           return
         }
-        const discard =
-          discardEditRef.current || eventDetails.reason === "escape-key"
+        const discard = discardEditRef.current
         discardEditRef.current = false
         closeMenu(!discard)
       }}
