@@ -19,7 +19,7 @@ import {
   statfs,
   writeFile,
 } from "node:fs/promises"
-import { relative, resolve, sep } from "node:path"
+import { basename, dirname, relative, resolve, sep } from "node:path"
 import { isIP } from "node:net"
 import { Transform } from "node:stream"
 import { constants as zlibConstants } from "node:zlib"
@@ -57,6 +57,7 @@ import {
   materializeBackupArtifact,
   prepareInstanceRestoreStaging,
   recoverInterruptedRestores,
+  requireRestoreSpace,
   restorePortableInstanceBackup,
   settleRestoreJournal,
 } from "./backup-restore.js"
@@ -76,6 +77,7 @@ const MAX_S3_SINGLE_PUT_BYTES = 5 * 1024 ** 3
 const BACKUP_TRANSFER_IDLE_TIMEOUT_MS = 30_000
 const BACKUP_TIMEOUT_REASON =
   "Cancelled after reaching the configured backup timeout"
+const EXPORT_SWEEP_INTERVAL = "1 hour"
 const DEFAULT_EXCLUDES = [
   ".DS_Store",
   "Thumbs.db",
@@ -192,6 +194,14 @@ export class BackupManager {
       }
       yield* state.requeueInterruptedBackupTasks(Date.now())
       yield* promiseEffect(() => sweepExpiredBackupExports(options.config))
+      yield* Effect.forkChild(
+        Effect.sleep(EXPORT_SWEEP_INTERVAL).pipe(
+          Effect.andThen(
+            promiseEffect(() => sweepExpiredBackupExports(options.config))
+          ),
+          Effect.forever
+        )
+      )
       yield* Queue.offer(wake, undefined)
       return manager
     })
@@ -1487,13 +1497,13 @@ async function createResticSnapshot(
       signal,
       snapshotId: reuse.id,
     })
-    if (input.maxBytes !== null && stats.totalSize > input.maxBytes) {
-      throw RelayBackupError.make({
-        code: "backup_too_large",
-        operation: "create.restic",
-        reason: "The snapshot exceeds the reserved backup size",
-      })
-    }
+    await rejectOverLimitSnapshot(restic, {
+      maxBytes: input.maxBytes,
+      password,
+      repository,
+      snapshotId: reuse.id,
+      totalBytes: stats.totalSize,
+    })
     progress.completed = stats.totalSize
     progress.total = stats.totalSize
     return {
@@ -1511,35 +1521,51 @@ async function createResticSnapshot(
       warnings: translated.warnings,
     }
   }
-  const summary = await restic.backup({
-    cwd: config.rootDirectory,
-    excludes: translated.excludes,
-    onProgress: (update) => {
-      progress.completed = update.bytesCompleted
-      progress.total = update.bytesTotal ?? progress.total
-      if (input.maxBytes !== null && progress.total > input.maxBytes) {
-        throw RelayBackupError.make({
-          code: "backup_too_large",
-          operation: "create.restic",
-          reason: "The snapshot exceeds the reserved backup size",
-        })
-      }
-    },
-    password,
-    path: instance.directory,
-    repository,
-    signal,
-    tags: [`task:${input.taskId}`, `backup:${input.backupId}`],
-  })
-  if (input.maxBytes !== null && summary.totalBytesProcessed > input.maxBytes) {
-    throw RelayBackupError.make({
-      code: "backup_too_large",
-      operation: "create.restic",
-      reason: "The snapshot exceeds the reserved backup size",
+  const summary = await Effect.runPromise(
+    Effect.result(
+      Effect.tryPromise({
+        try: () =>
+          restic.backup({
+            cwd: config.rootDirectory,
+            excludes: translated.excludes,
+            onProgress: (update) => {
+              progress.completed = update.bytesCompleted
+              progress.total = update.bytesTotal ?? progress.total
+              if (input.maxBytes !== null && progress.total > input.maxBytes) {
+                throw backupTooLarge()
+              }
+            },
+            password,
+            path: instance.directory,
+            repository,
+            signal,
+            tags: [`task:${input.taskId}`, `backup:${input.backupId}`],
+          }),
+        catch: (cause) => cause,
+      })
+    )
+  )
+  if (Result.isFailure(summary)) {
+    await forgetTaggedSnapshotIfOverLimit(restic, {
+      maxBytes: input.maxBytes,
+      password,
+      repository,
+      tag: `task:${input.taskId}`,
     })
+    throw summary.failure
   }
-  progress.completed = summary.totalBytesProcessed
-  progress.total = summary.totalBytesProcessed
+  await rejectOverLimitSnapshot(
+    restic,
+    {
+      maxBytes: input.maxBytes,
+      password,
+      repository,
+      snapshotId: summary.success.snapshotId,
+      totalBytes: summary.success.totalBytesProcessed,
+    }
+  )
+  progress.completed = summary.success.totalBytesProcessed
+  progress.total = summary.success.totalBytesProcessed
   return {
     artifacts: input.destination.artifactId
       ? [
@@ -1550,10 +1576,82 @@ async function createResticSnapshot(
           },
         ]
       : undefined,
-    bytes: summary.totalBytesProcessed,
-    snapshotId: summary.snapshotId,
+    bytes: summary.success.totalBytesProcessed,
+    snapshotId: summary.success.snapshotId,
     warnings: translated.warnings,
   }
+}
+
+function backupTooLarge() {
+  return RelayBackupError.make({
+    code: "backup_too_large",
+    operation: "create.restic",
+    reason: "The snapshot exceeds the reserved backup size",
+  })
+}
+
+async function rejectOverLimitSnapshot(
+  restic: ResticDriver,
+  input: {
+    maxBytes: number | null
+    password: string
+    repository: string
+    snapshotId: string
+    totalBytes?: number
+  }
+): Promise<void> {
+  if (input.maxBytes === null) return
+  const totalBytes =
+    input.totalBytes ??
+    (
+      await restic.stats({
+        password: input.password,
+        repository: input.repository,
+        signal: new AbortController().signal,
+        snapshotId: input.snapshotId,
+      })
+    ).totalSize
+  if (totalBytes <= input.maxBytes) return
+  await restic.forget({
+    password: input.password,
+    repository: input.repository,
+    signal: new AbortController().signal,
+    snapshotId: input.snapshotId,
+  })
+  throw backupTooLarge()
+}
+
+async function forgetTaggedSnapshotIfOverLimit(
+  restic: ResticDriver,
+  input: {
+    maxBytes: number | null
+    password: string
+    repository: string
+    tag: string
+  }
+): Promise<void> {
+  if (input.maxBytes === null) return
+  const snapshots = await restic.snapshotsByTag({
+    password: input.password,
+    repository: input.repository,
+    signal: new AbortController().signal,
+    tag: input.tag,
+  })
+  const snapshot = snapshots[0]
+  if (!snapshot) return
+  const stats = await restic.stats({
+    password: input.password,
+    repository: input.repository,
+    signal: new AbortController().signal,
+    snapshotId: snapshot.id,
+  })
+  if (stats.totalSize <= input.maxBytes) return
+  await restic.forget({
+    password: input.password,
+    repository: input.repository,
+    signal: new AbortController().signal,
+    snapshotId: snapshot.id,
+  })
 }
 
 function runResticRestore(
@@ -1586,6 +1684,17 @@ function runResticRestore(
         Effect.result(
           Effect.tryPromise({
             try: async () => {
+              await requireRestoreSpace(
+                dirname(prepared.paths.staging),
+                (
+                  await restic.stats({
+                    password,
+                    repository: resticRepositoryPath(config, input.target.id),
+                    signal,
+                    snapshotId: source.snapshotId,
+                  })
+                ).totalSize
+              )
               await restic.restore({
                 password,
                 repository: resticRepositoryPath(config, input.target.id),
@@ -1664,6 +1773,7 @@ function runResticForget(
               cause,
             }),
     })
+    yield* promiseEffect(() => removeBackupExport(config, input.backupId))
     yield* state.enqueueBackupTask(
       {
         backupId: randomUUID(),
@@ -1779,7 +1889,7 @@ function runResticExport(
     const destination = backupExportPath(config, input.backupId)
     const partial = backupExportPartialPath(config, input.backupId, taskId)
     const existing = yield* promiseEffect(() =>
-      reuseValidExport(destination, input.expiresAt)
+      reuseValidExport(destination, Date.now() + input.ttlMs)
     )
     if (existing) return existing
     const progress: BackupProgress = {
@@ -1818,19 +1928,14 @@ function runResticExport(
           signal,
         })
         await rename(partial, destination)
-        await writeExportExpiry(
-          resolve(
-            backupExportDirectoryPath(config),
-            `.${input.backupId}.zip.expires`
-          ),
-          input.expiresAt
-        )
+        const expiresAt = Date.now() + input.ttlMs
+        await writeExportExpiry(backupExportExpiryPath(config, input.backupId), expiresAt)
         progress.completed = dumped.bytes
         progress.total = dumped.bytes
         return {
           bytes: dumped.bytes,
           checksumSha256: dumped.checksumSha256,
-          expiresAt: input.expiresAt,
+          expiresAt,
           filename: backupArtifactFilename(input.backupId, "restic_snapshot"),
           warnings: [],
         } satisfies BackupExportTaskResult
@@ -1854,22 +1959,58 @@ function runResticExport(
   })
 }
 
-async function reuseValidExport(
+export async function removeBackupExport(
+  config: RelayConfig,
+  backupId: string
+): Promise<void> {
+  const directory = backupExportDirectoryPath(config)
+  await rm(backupExportPath(config, backupId), { force: true })
+  await rm(backupExportExpiryPath(config, backupId), { force: true })
+  const listing = await Effect.runPromise(
+    Effect.result(
+      Effect.tryPromise({
+        try: () => opendir(directory),
+        catch: (cause) => cause,
+      })
+    )
+  )
+  if (Result.isFailure(listing)) return
+  for await (const entry of listing.success) {
+    if (
+      entry.isFile() &&
+      entry.name.startsWith(`.${backupId}.`) &&
+      entry.name.endsWith(".partial")
+    ) {
+      await rm(resolve(directory, entry.name), { force: true })
+    }
+  }
+}
+
+function backupExportExpiryPath(config: RelayConfig, backupId: string): string {
+  return resolve(backupExportDirectoryPath(config), `.${backupId}.zip.expires`)
+}
+
+export async function reuseValidExport(
   destination: string,
   expiresAt: number
 ): Promise<BackupExportTaskResult | null> {
   if (expiresAt <= Date.now()) return null
   const metadata = await optionalLstat(destination)
   if (!metadata?.isFile() || metadata.isSymbolicLink()) return null
+  const marker = resolve(dirname(destination), `.${basename(destination)}.expires`)
+  const existing = await readExportExpiry(marker)
+  const nextExpiresAt = Math.max(existing ?? 0, expiresAt)
+  if (nextExpiresAt <= Date.now()) return null
+  await writeExportExpiry(marker, nextExpiresAt)
   const digest = createHash("sha256")
   for await (const chunk of createReadStream(destination)) digest.update(chunk)
   return {
     bytes: metadata.size,
     checksumSha256: digest.digest("hex"),
-    expiresAt,
+    expiresAt: nextExpiresAt,
     filename: backupArtifactFilename(
-      /backup-([0-9a-f-]{36})\.zip$/iu.exec(destination)?.[1] ??
-        destination.replace(/.*\//u, "").replace(/\.zip$/u, ""),
+      /([0-9a-f-]{36})\.zip$/iu.exec(basename(destination))?.[1] ??
+        basename(destination).replace(/\.zip$/u, ""),
       "restic_snapshot"
     ),
     warnings: [],

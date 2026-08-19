@@ -487,7 +487,7 @@ export async function verifyBackupArtifact(
   }
 }
 
-async function requireRestoreSpace(
+export async function requireRestoreSpace(
   directory: string,
   logicalBytes: number
 ): Promise<void> {

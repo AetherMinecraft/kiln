@@ -24,8 +24,11 @@ import {
   backupPathIsExcluded,
   createPortableInstanceBackup,
   deleteBackupArtifacts,
+  removeBackupExport,
+  reuseValidExport,
   storeCreatedBackup,
 } from "./backups.js"
+import type { ResticDriver } from "./restic.js"
 import {
   recoverInterruptedRestores,
   restorePortableInstanceBackup,
@@ -687,6 +690,195 @@ describe("Relay backups", () => {
     )
   )
 })
+
+describe("restic backup limits and exports", () => {
+  it("refreshes the on-disk export expiry when a zip is reused", async () => {
+    const directory = join(testDirectory, "export-reuse")
+    await mkdir(directory, { recursive: true })
+    const backupId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    const destination = join(directory, `${backupId}.zip`)
+    const marker = join(directory, `.${backupId}.zip.expires`)
+    await writeFile(destination, "zip")
+    await writeFile(marker, `${Date.now() + 30_000}\n`)
+    const later = Date.now() + 120_000
+    const reused = await reuseValidExport(destination, later)
+    assert.strictEqual(reused?.expiresAt, later)
+    assert.strictEqual(
+      Number((await readFile(marker, "utf8")).trim()),
+      later
+    )
+  })
+
+  it("removes the export zip and expiry marker for a forgotten backup", async () => {
+    const directory = join(testDirectory, "export-cleanup")
+    const config = testConfig(directory)
+    const backupId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    await mkdir(join(config.dataDirectory, "exports"), { recursive: true })
+    const zip = join(config.dataDirectory, "exports", `${backupId}.zip`)
+    const marker = join(
+      config.dataDirectory,
+      "exports",
+      `.${backupId}.zip.expires`
+    )
+    await writeFile(zip, "zip")
+    await writeFile(marker, "1\n")
+    await removeBackupExport(config, backupId)
+    assert.isFalse(existsSync(zip))
+    assert.isFalse(existsSync(marker))
+  })
+
+  layer(makeRelayStateLayer(join(testDirectory, "restic-relay.sqlite")))((it) => {
+    it.effect("forgets an over-limit snapshot after backup summary", () =>
+      Effect.gen(function* () {
+        const forgotten: Array<string> = []
+        const manager = yield* BackupManager.make({
+          config: testConfig(join(testDirectory, "over-limit-summary")),
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+          restic: mockRestic({
+            backup: async () => ({
+              snapshotId: "oversize01",
+              totalBytesProcessed: 500,
+            }),
+            forget: async ({ snapshotId }) => {
+              forgotten.push(snapshotId)
+            },
+          }),
+        })
+        const input = resticCreateInput("over-limit-summary", 100)
+        yield* manager.enqueue(input)
+        yield* manager.runPending()
+        const task = yield* manager.get(input.taskId)
+        assert.strictEqual(task?.status, "failed")
+        assert.include(task?.error ?? "", "exceeds")
+        assert.deepStrictEqual(forgotten, ["oversize01"])
+      })
+    )
+
+    it.effect("forgets a reused over-limit snapshot instead of succeeding", () =>
+      Effect.gen(function* () {
+        const forgotten: Array<string> = []
+        const manager = yield* BackupManager.make({
+          config: testConfig(join(testDirectory, "over-limit-reuse")),
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+          restic: mockRestic({
+            snapshotsByTag: async () => [{ id: "reused001" }],
+            stats: async () => ({ totalSize: 500 }),
+            forget: async ({ snapshotId }) => {
+              forgotten.push(snapshotId)
+            },
+          }),
+        })
+        const input = resticCreateInput("over-limit-reuse", 100)
+        yield* manager.enqueue(input)
+        yield* manager.runPending()
+        const task = yield* manager.get(input.taskId)
+        assert.strictEqual(task?.status, "failed")
+        assert.deepStrictEqual(forgotten, ["reused001"])
+      })
+    )
+
+    it.effect("forgets a snapshot committed before an over-limit progress abort", () =>
+      Effect.gen(function* () {
+        const forgotten: Array<string> = []
+        const manager = yield* BackupManager.make({
+          config: testConfig(join(testDirectory, "over-limit-progress")),
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+          restic: mockRestic({
+            backup: async ({ onProgress }) => {
+              onProgress?.({ bytesCompleted: 50, bytesTotal: 500 })
+              throw new Error("restic aborted")
+            },
+            snapshotsByTag: async () => [{ id: "progress1" }],
+            stats: async () => ({ totalSize: 500 }),
+            forget: async ({ snapshotId }) => {
+              forgotten.push(snapshotId)
+            },
+          }),
+        })
+        const input = resticCreateInput("over-limit-progress", 100)
+        yield* manager.enqueue(input)
+        yield* manager.runPending()
+        const task = yield* manager.get(input.taskId)
+        assert.strictEqual(task?.status, "failed")
+        assert.deepStrictEqual(forgotten, ["progress1"])
+      })
+    )
+
+    it.effect("removes staged exports when forgetting a restic snapshot", () =>
+      Effect.gen(function* () {
+        const directory = join(testDirectory, "forget-export")
+        const config = testConfig(directory)
+        const backupId = "cccccccc-dddd-4eee-8fff-000000000001"
+        yield* Effect.promise(() =>
+          mkdir(join(config.dataDirectory, "exports"), { recursive: true })
+        )
+        const zip = join(config.dataDirectory, "exports", `${backupId}.zip`)
+        yield* Effect.promise(() => writeFile(zip, "zip"))
+        const manager = yield* BackupManager.make({
+          config,
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+          restic: mockRestic({
+            forget: async () => undefined,
+            prune: async () => undefined,
+          }),
+        })
+        yield* manager.enqueue({
+          backupId,
+          destination: {
+            kind: "restic",
+            repositoryPassword: "secret",
+            snapshotId: "deadbeef",
+          },
+          kind: "delete",
+          target: { id: "instance-1", kind: "instance" },
+          taskId: "10000000-0000-4000-8000-000000000099",
+        })
+        yield* manager.runPending()
+        assert.isFalse(existsSync(zip))
+      })
+    )
+  })
+})
+
+function resticCreateInput(label: string, maxBytes: number): BackupCreateTaskInput & {
+  kind: "create"
+} {
+  const suffix = createHash("sha256").update(label).digest("hex").slice(0, 12)
+  return {
+    artifactKind: "restic_snapshot",
+    backupId: `00000000-0000-4000-8000-${suffix}`,
+    destination: { kind: "restic", repositoryPassword: "secret" },
+    exclude: [],
+    kind: "create",
+    maxBytes,
+    mode: "incremental",
+    reason: "manual",
+    target: { id: "instance-1", kind: "instance" },
+    taskId: `10000000-0000-4000-8000-${suffix}`,
+  }
+}
+
+function mockRestic(overrides: Partial<ResticDriver>): ResticDriver {
+  const unexpected = async () => {
+    throw new Error("unexpected restic call")
+  }
+  return {
+    backup: unexpected,
+    catConfig: async () => true,
+    dumpZip: unexpected,
+    forget: unexpected,
+    init: unexpected,
+    prune: unexpected,
+    restore: unexpected,
+    snapshotsByTag: async () => [],
+    stats: async () => ({ totalSize: 0 }),
+    ...overrides,
+  }
+}
 
 function temporaryDirectory(prefix: string) {
   return Effect.promise(() =>

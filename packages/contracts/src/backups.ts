@@ -304,14 +304,23 @@ export const backupDeleteTaskInputSchema = z
     }
   })
 
+export const BACKUP_EXPORT_TTL_MIN_MS = 60_000
+export const BACKUP_EXPORT_TTL_MAX_MS = 7 * 24 * 60 * 60 * 1_000
+
+export const backupExportTtlMsSchema = z
+  .number()
+  .int()
+  .min(BACKUP_EXPORT_TTL_MIN_MS)
+  .max(BACKUP_EXPORT_TTL_MAX_MS)
+
 export const backupExportTaskInputSchema = z
   .object({
     backupId: backupIdSchema,
-    expiresAt: z.number().int().positive(),
     repositoryPassword: backupRepositoryPasswordSchema.optional(),
     snapshotId: resticSnapshotIdSchema,
     target: backupTargetSchema,
     taskId: backupTaskIdSchema,
+    ttlMs: backupExportTtlMsSchema,
   })
   .strict()
 

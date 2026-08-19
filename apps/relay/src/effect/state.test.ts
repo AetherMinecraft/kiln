@@ -642,12 +642,12 @@ describe("Relay state", () => {
         const store = yield* RelayStateStore
         const exported: BackupTaskInput = {
           backupId: "40000000-0000-4000-8000-000000000001",
-          expiresAt: Date.now() + 60_000,
           kind: "export",
           repositoryPassword: "export-secret",
           snapshotId: "abcdef12",
           target: { id: "instance-a", kind: "instance" },
           taskId: "40000000-0000-4000-8000-000000000011",
+          ttlMs: 60_000,
         }
         const prune: BackupTaskInput = {
           backupId: "40000000-0000-4000-8000-000000000002",

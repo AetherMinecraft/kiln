@@ -75,10 +75,86 @@ describe("restic exclude translation", () => {
 })
 
 describe("restic driver", () => {
+  it("passes --no-cache instead of an empty RESTIC_CACHE_DIR", async () => {
+    let args: Array<string> | undefined
+    let env: NodeJS.ProcessEnv | undefined
+    const spawn: ResticSpawn = (_command, received, options) => {
+      args = [...received]
+      env = options.env
+      const stdout = new PassThrough()
+      const stderr = new PassThrough()
+      const child = new EventEmitter() as ReturnType<ResticSpawn>
+      child.stdout = stdout
+      child.stderr = stderr
+      child.stdin = new PassThrough()
+      child.kill = () => true
+      queueMicrotask(() => {
+        stdout.end()
+        stderr.end()
+        child.emit("close", 0)
+      })
+      return child
+    }
+    const driver = createResticDriver({ spawn })
+    await driver.catConfig({
+      password: "secret",
+      repository: join(testDirectory, "repo"),
+      signal: new AbortController().signal,
+    })
+    assert.strictEqual(args?.[0], "--no-cache")
+    assert.isUndefined(env?.RESTIC_CACHE_DIR)
+  })
+
+  it("kills restic when the command promise rejects while the process is running", async () => {
+    let killed: string | undefined
+    const spawn: ResticSpawn = () => {
+      const stdout = new PassThrough()
+      const stderr = new PassThrough()
+      const child = new EventEmitter() as ReturnType<ResticSpawn>
+      child.stdout = stdout
+      child.stderr = stderr
+      child.stdin = new PassThrough()
+      child.kill = (signal) => {
+        killed = String(signal ?? "SIGTERM")
+        queueMicrotask(() => {
+          stdout.end()
+          stderr.end()
+          child.emit("close", 1)
+        })
+        return true
+      }
+      queueMicrotask(() => {
+        stdout.write(
+          '{"message_type":"status","bytes_done":10,"total_bytes":99}\n'
+        )
+      })
+      return child
+    }
+    const driver = createResticDriver({ spawn })
+    let thrown = false
+    try {
+      await driver.backup({
+        cwd: testDirectory,
+        excludes: [],
+        onProgress: () => {
+          throw new Error("too large")
+        },
+        password: "secret",
+        path: "instance",
+        repository: join(testDirectory, "repo"),
+        signal: new AbortController().signal,
+        tags: ["task:1"],
+      })
+    } catch {
+      thrown = true
+    }
+    assert.isTrue(thrown)
+    assert.strictEqual(killed, "SIGTERM")
+  })
   it("reuses a snapshot tagged with the task id", async () => {
     const spawn = fakeResticSpawn([
       {
-        match: (args) => args[0] === "cat",
+        match: (args) => args.includes("cat"),
         stdout: "{}",
       },
       {
@@ -86,7 +162,7 @@ describe("restic driver", () => {
         stdout: JSON.stringify([{ id: "abcdef12" }]),
       },
       {
-        match: (args) => args[0] === "stats",
+        match: (args) => args.includes("stats"),
         stdout: JSON.stringify({ total_size: 2048 }),
       },
     ])
@@ -111,7 +187,7 @@ describe("restic driver", () => {
     const spawn = fakeResticSpawn([
       {
         exitCode: 1,
-        match: (args) => args[0] === "forget",
+        match: (args) => args.includes("forget"),
         stderr: 'Fatal: no matching ID found for sequence "deadbeef"',
       },
     ])
@@ -186,6 +262,7 @@ describe("restic path layout", () => {
       signal: new AbortController().signal,
     })
     assert.deepStrictEqual(dumpArgs, [
+      "--no-cache",
       "dump",
       "-a",
       "zip",
