@@ -85,6 +85,11 @@ test("the official catalog and every recipe satisfy the v1 schemas", async () =>
         /(?:-Xm[sx]\b|-XX:(?:-UseContainerSupport|-UseCGroupMemoryLimitForHeap|InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)\b|--nogui)/u,
         `${recipePath}: java_args defaults must omit managed heap and --nogui flags`,
       )
+      assert.doesNotMatch(
+        javaArgs.default ?? "",
+        /--add-modules=jdk\.incubator\.vector/u,
+        `${recipePath}: java_args defaults must omit --add-modules=jdk.incubator.vector so Java 11 can start`,
+      )
       assert.equal(
         javaArgs.rules?.pattern,
         JAVA_ARGS_RULE_PATTERN,
