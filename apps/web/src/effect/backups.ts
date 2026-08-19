@@ -1202,6 +1202,7 @@ export const listDispatchableBackupTasksEffect = Effect.fn(
         target: { id: row.target_id, kind: "instance" },
         taskId: row.task_id,
         ttlMs: clampBackupExportTtlMs(
+          // Export tasks store the requested TTL (ms) in reserved_bytes.
           nullableDatabaseNumber(row.reserved_bytes, "export ttl") ??
             BACKUP_EXPORT_TTL_MIN_MS
         ),
@@ -1540,8 +1541,17 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
           taskId,
           ttlMs,
         })
+        const pruneOlderExportTasks = (keepTaskId: string) =>
+          transaction.execute(
+            `DELETE FROM ${databaseTable("backup_task")}
+              WHERE backup_id = ? AND task_kind = 'export'
+                AND status IN ('succeeded', 'failed', 'cancelled')
+                AND id <> ?`,
+            [input.backupId, keepTaskId]
+          )
         if (latest?.status === "succeeded") {
           const storedTtl = clampBackupExportTtlMs(
+            // Export tasks store the requested TTL (ms) in reserved_bytes.
             nullableDatabaseNumber(latest.reserved_bytes, "export ttl") ??
               BACKUP_EXPORT_TTL_MIN_MS
           )
@@ -1560,6 +1570,7 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
               requireFullTtl: input.requireFullTtl !== false,
             })
           ) {
+            yield* pruneOlderExportTasks(latest.id)
             return {
               expiresAt,
               filename,
@@ -1572,6 +1583,7 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
             dispatch: {
               ...dispatchFor(latest.id),
               ttlMs: clampBackupExportTtlMs(
+                // Export tasks store the requested TTL (ms) in reserved_bytes.
                 nullableDatabaseNumber(latest.reserved_bytes, "export ttl") ??
                   ttlMs
               ),
@@ -1590,10 +1602,12 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
             reason: "The snapshot export failed",
           })
         }
+        yield* pruneOlderExportTasks(input.taskId)
         yield* transaction.execute(
           `INSERT INTO ${databaseTable("backup_task")}
             (id, backup_id, task_kind, status, reserved_bytes, requested_by)
            VALUES (?, ?, 'export', 'queued', ?, ?)`,
+          // reserved_bytes holds the export TTL in milliseconds, not a byte count.
           [input.taskId, input.backupId, ttlMs, input.requestedBy]
         )
         return {
@@ -2222,7 +2236,13 @@ export function canReuseBackupExport(input: {
 }): boolean {
   if (input.remainingMs <= 0) return false
   if (!input.requireFullTtl) return true
-  return input.remainingMs >= input.requestedTtlMs
+  // Completion-anchored expiry is almost always slightly under the requested
+  // TTL, and Relay reuse already extends the staged zip. Accept remaining time
+  // at or above the signed-URL floor instead of requiring a full TTL.
+  return (
+    input.remainingMs >=
+    Math.min(input.requestedTtlMs, BACKUP_EXPORT_TTL_MIN_MS)
+  )
 }
 
 export function effectiveBackupLimit(

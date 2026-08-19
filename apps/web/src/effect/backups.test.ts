@@ -58,6 +58,20 @@ describe("backup limits", () => {
         requestedTtlMs: 15 * 60 * 60 * 1_000,
         requireFullTtl: true,
       })
+    ).toBe(true)
+    expect(
+      canReuseBackupExport({
+        remainingMs: 60_000,
+        requestedTtlMs: 15 * 60 * 60 * 1_000,
+        requireFullTtl: true,
+      })
+    ).toBe(true)
+    expect(
+      canReuseBackupExport({
+        remainingMs: 59_000,
+        requestedTtlMs: 15 * 60 * 60 * 1_000,
+        requireFullTtl: true,
+      })
     ).toBe(false)
     expect(
       canReuseBackupExport({

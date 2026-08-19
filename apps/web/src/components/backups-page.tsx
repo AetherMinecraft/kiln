@@ -4441,12 +4441,17 @@ function backupAvailabilityTags(
   backup: Backup,
   destinations: ReadonlyArray<BackupAvailabilityDestination>
 ): Array<BackupAvailabilityTagView> {
+  const incremental = backup.artifactKind === "restic_snapshot"
+  const visibleDestinations = incremental
+    ? destinations.filter((destination) => destination.id === null)
+    : destinations
   const uploadPercent = backupTaskUploadProgressPercent(backup)
   const artifactsByStorage = new Map<string, Backup["artifacts"][number]>()
   for (const artifact of backup.artifacts) {
+    if (incremental && artifact.storageId !== null) continue
     artifactsByStorage.set(artifact.storageId ?? "local", artifact)
   }
-  const tags: Array<BackupAvailabilityTagView> = destinations.map(
+  const tags: Array<BackupAvailabilityTagView> = visibleDestinations.map(
     (destination) => {
       const key = destination.id ?? "local"
       const kind = destination.id ? "remote" : "local"
@@ -4470,6 +4475,7 @@ function backupAvailabilityTags(
   )
   const seen = new Set(tags.map((tag) => tag.key))
   for (const artifact of backup.artifacts) {
+    if (incremental && artifact.storageId !== null) continue
     const key = artifact.storageId ?? "local"
     if (seen.has(key)) continue
     const kind = artifact.storageId ? "remote" : "local"
@@ -4489,10 +4495,10 @@ function backupAvailabilityTags(
           : null,
     })
   }
-  const s3Enabled =
+  const s3Configured =
     destinations.some((destination) => destination.id !== null) ||
     backup.artifacts.some((artifact) => artifact.storageId !== null)
-  if (!s3Enabled) {
+  if (!incremental && !s3Configured) {
     tags.push({
       error: null,
       key: "s3",
