@@ -54,6 +54,13 @@ import {
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
 import { Progress } from "@workspace/ui/components/progress"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@workspace/ui/components/select"
 import { showToast } from "@workspace/ui/components/sonner"
 import { Switch } from "@workspace/ui/components/switch"
 import { Textarea } from "@workspace/ui/components/textarea"
@@ -2840,26 +2847,32 @@ function DownloadBackupDialog({
         <div className="space-y-4">
           <label className="block">
             <span className="mb-2 block text-xs font-medium">Source</span>
-            <select
-              aria-label="Backup download source"
-              className="h-10 w-full rounded-lg border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            <Select
               value={artifactId}
-              onChange={(event) => {
-                setArtifactId(event.currentTarget.value)
+              onValueChange={(value) => {
+                setArtifactId(value)
                 setShared(null)
               }}
             >
-              {availableArtifacts.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.storageId
-                    ? `${storageNames.get(candidate.storageId) ?? "S3"} · S3`
-                    : "Local Relay"}
-                  {candidate.bytes === null
-                    ? ""
-                    : ` · ${formatBytes(candidate.bytes)}`}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger
+                aria-label="Backup download source"
+                className="h-10 w-full px-3 [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="w-max min-w-(--radix-select-trigger-width)">
+                {availableArtifacts.map((candidate) => (
+                  <SelectItem key={candidate.id} value={candidate.id}>
+                    {candidate.storageId
+                      ? `${storageNames.get(candidate.storageId) ?? "S3"} · S3`
+                      : "Local Relay"}
+                    {candidate.bytes === null
+                      ? ""
+                      : ` · ${formatBytes(candidate.bytes)}`}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </label>
 
           <div className="grid grid-cols-2 gap-3 rounded-lg border bg-muted/15 p-3">
@@ -2902,20 +2915,24 @@ function DownloadBackupDialog({
                   setShared(null)
                 }}
               />
-              <select
-                aria-label="Temporary URL duration unit"
-                className="h-9 rounded-lg border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              <Select
                 value={expiryUnit}
-                onChange={(event) => {
-                  setExpiryUnit(
-                    event.currentTarget.value === "hours" ? "hours" : "minutes"
-                  )
+                onValueChange={(value) => {
+                  setExpiryUnit(value === "hours" ? "hours" : "minutes")
                   setShared(null)
                 }}
               >
-                <option value="minutes">Minutes</option>
-                <option value="hours">Hours</option>
-              </select>
+                <SelectTrigger
+                  aria-label="Temporary URL duration unit"
+                  className="h-8 shrink-0 px-3 whitespace-nowrap"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="minutes">Minutes</SelectItem>
+                  <SelectItem value="hours">Hours</SelectItem>
+                </SelectContent>
+              </Select>
               <Button
                 disabled={!artifact || signDownload.isPending}
                 type="button"
