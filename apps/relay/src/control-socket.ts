@@ -776,6 +776,12 @@ export function auditDetailsForRequest(
     details.action = payload.action
   }
   if (
+    request.operation === "instance.startup.write" &&
+    payload.reinstall === true
+  ) {
+    details.reinstall = true
+  }
+  if (
     request.operation === "instance.create" &&
     result &&
     typeof result === "object" &&

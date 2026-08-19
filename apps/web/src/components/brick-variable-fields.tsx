@@ -122,6 +122,16 @@ export const BrickVariableField = React.memo(function BrickVariableField({
                 : "text"
           }
           value={value === undefined ? "" : String(value)}
+          onBlur={(event) => {
+            const next = event.currentTarget.value
+            onChange(
+              definition.type === "number"
+                ? next === ""
+                  ? undefined
+                  : Number(next)
+                : next
+            )
+          }}
           onChange={(event) => {
             const next = event.target.value
             onChange(
