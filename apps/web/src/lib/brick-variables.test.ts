@@ -10,6 +10,7 @@ import {
   hydrateBrickVariables,
   missingRequiredBrickVersion,
   recommendedSupportedJavaVersion,
+  stringVariableAllows,
   supportedJavaVersions,
   unavailableMinecraftJavaVersion,
   withRecommendedMinecraftJava,
@@ -31,6 +32,7 @@ const paper = brickRecipeSchema.parse({
       description: "Paper release to install.",
       required: true,
       default: "1.21.11",
+      rules: { pattern: "^[0-9]+(?:\\.[0-9]+){1,2}$", maxLength: 32 },
     },
     java_version: {
       type: "string",
@@ -118,6 +120,18 @@ describe("Minecraft Java defaults", () => {
     expect(
       recommendedSupportedJavaVersion("paper", paper.variables.java_version, "1.16.5")
     ).toBe("17")
+  })
+
+  it("rejects custom versions that break Brick pattern or length rules", () => {
+    expect(stringVariableAllows(paper.variables.version, "1.21.11")).toBe(true)
+    expect(stringVariableAllows(paper.variables.version, "26.2")).toBe(true)
+    expect(stringVariableAllows(paper.variables.version, "latest")).toBe(false)
+    expect(stringVariableAllows(paper.variables.version, "1.21.11-pre")).toBe(
+      false
+    )
+    expect(
+      stringVariableAllows(paper.variables.version, `${"1".repeat(33)}`)
+    ).toBe(false)
   })
 
   it("blocks a required version with no default until a value is submitted", () => {

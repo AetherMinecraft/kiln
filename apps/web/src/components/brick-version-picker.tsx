@@ -15,8 +15,11 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
   emptyMessage = "No matching versions",
   labelledBy,
   loading = false,
+  maxLength,
+  minLength,
   name,
   onChange,
+  pattern,
   placeholder = "Search versions…",
   required = false,
   value,
@@ -27,8 +30,11 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
   emptyMessage?: string
   labelledBy: string
   loading?: boolean
+  maxLength?: number
+  minLength?: number
   name: string
   onChange: (value: string) => void
+  pattern?: string
   placeholder?: string
   required?: boolean
   value: string
@@ -138,7 +144,10 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
               className
             )}
             disabled={disabled}
+            maxLength={maxLength}
+            minLength={minLength}
             name={name}
+            pattern={pattern}
             placeholder={loading ? "Loading versions…" : placeholder}
             required={required}
             role="combobox"

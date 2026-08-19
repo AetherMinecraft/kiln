@@ -120,7 +120,7 @@ export function unavailableMinecraftJavaVersion(
   return stringVariableAllows(javaDefinition, javaVersion) ? null : javaVersion
 }
 
-function stringVariableAllows(
+export function stringVariableAllows(
   definition: Brick["variables"][string],
   value: string
 ): boolean {

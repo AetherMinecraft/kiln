@@ -1,7 +1,7 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useNavigate } from "@tanstack/react-router"
-import { Effect, Result } from "effect"
+import { Effect } from "effect"
 import { CircleAlert, HardDrive, LoaderCircle, Rocket } from "lucide-react"
 import {
   DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
@@ -36,6 +36,7 @@ import {
   defaultBrickVariables,
   missingRequiredBrickVersion,
   recommendedSupportedJavaVersion,
+  stringVariableAllows,
   supportedJavaVersions,
   unavailableMinecraftJavaVersion,
   withRecommendedMinecraftJava,
@@ -321,18 +322,28 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
     }
     const submittedVersion = formData.get("version")
     const submittedJavaVersion = formData.get("java_version")
-    if (
-      selection.kind === "catalog" &&
-      missingRequiredBrickVersion(
-        selection.brick.variables.version,
-        submittedVersion
-      )
-    ) {
-      setFailure({
-        selectionIdentity,
-        message: "Select a Minecraft version",
-      })
-      return
+    if (selection.kind === "catalog") {
+      const versionDefinition = selection.brick.variables.version
+      if (missingRequiredBrickVersion(versionDefinition, submittedVersion)) {
+        setFailure({
+          selectionIdentity,
+          message: "Select a Minecraft version",
+        })
+        return
+      }
+      const version =
+        typeof submittedVersion === "string" ? submittedVersion.trim() : ""
+      if (
+        version &&
+        versionDefinition &&
+        !stringVariableAllows(versionDefinition, version)
+      ) {
+        setFailure({
+          selectionIdentity,
+          message: "Enter a valid Minecraft version",
+        })
+        return
+      }
     }
     const configured =
       selection.kind === "catalog"
@@ -693,6 +704,9 @@ const MinecraftVersionField = React.memo(function MinecraftVersionField({
             versions={versions}
             disabled={disabled}
             loading={versionsQuery.isPending}
+            maxLength={definition.rules?.maxLength}
+            minLength={definition.rules?.minLength}
+            pattern={definition.rules?.pattern}
             required={required}
             onChange={changeVersion}
           />
@@ -750,41 +764,15 @@ function supportedBrickVersions(
   definition: BrickVariable,
   defaultVersion: string
 ): Array<string> {
-  const pattern = versionPattern(definition.rules?.pattern)
   const allowed = versions.filter((version) =>
-    versionAllowed(version, definition, pattern)
+    stringVariableAllows(definition, version)
   )
   if (defaultVersion && !allowed.includes(defaultVersion)) {
-    return versionAllowed(defaultVersion, definition, pattern)
+    return stringVariableAllows(definition, defaultVersion)
       ? [defaultVersion, ...allowed]
       : allowed
   }
   return allowed
-}
-
-function versionPattern(source: string | undefined): RegExp | null {
-  if (!source) return null
-  return Result.getOrNull(Result.try(() => new RegExp(source, "u")))
-}
-
-function versionAllowed(
-  version: string,
-  definition: BrickVariable,
-  pattern: RegExp | null
-): boolean {
-  if (
-    definition.rules?.minLength !== undefined &&
-    version.length < definition.rules.minLength
-  ) {
-    return false
-  }
-  if (
-    definition.rules?.maxLength !== undefined &&
-    version.length > definition.rules.maxLength
-  ) {
-    return false
-  }
-  return pattern ? pattern.test(version) : true
 }
 
 function minecraftVersionDefinition(selection: BrickSelection | null) {
