@@ -1,5 +1,5 @@
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Result, Schema } from "effect"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type {
   BackupTaskInput,
@@ -15,6 +15,7 @@ import type {
 import {
   backupTaskInputSchema,
   backupTaskResultSchema,
+  redactBackupTaskInput,
 } from "@workspace/contracts"
 
 import { RelayStateError } from "./errors.js"
@@ -209,6 +210,8 @@ const RelayBackupTaskKindSchema = Schema.Literals([
   "create",
   "restore",
   "delete",
+  "export",
+  "prune",
 ])
 const RelayBackupTaskStatusSchema = Schema.Literals([
   "queued",
@@ -606,7 +609,76 @@ const migrations = SqliteMigrator.fromRecord({
       ADD COLUMN current_artifact_id TEXT
     `
   }),
+  "10_backup_task_kinds_export_prune": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`
+      CREATE TABLE relay_backup_tasks_next (
+        task_id TEXT PRIMARY KEY NOT NULL,
+        backup_id TEXT NOT NULL,
+        kind TEXT NOT NULL
+          CHECK (kind IN ('create', 'restore', 'delete', 'export', 'prune')),
+        status TEXT NOT NULL
+          CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+        input_json TEXT NOT NULL,
+        result_json TEXT,
+        bytes_completed INTEGER NOT NULL DEFAULT 0
+          CHECK (bytes_completed >= 0),
+        bytes_total INTEGER CHECK (bytes_total IS NULL OR bytes_total >= 0),
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        input_refresh_required INTEGER NOT NULL DEFAULT 0
+          CHECK (input_refresh_required IN (0, 1)),
+        phase TEXT
+          CHECK (phase IS NULL OR phase IN (
+            'preparing', 'collecting', 'archiving', 'dumping', 'uploading',
+            'finalizing'
+          )),
+        current_path TEXT,
+        current_artifact_id TEXT
+      ) STRICT
+    `
+    yield* sql`
+      INSERT INTO relay_backup_tasks_next (
+        task_id, backup_id, kind, status, input_json, result_json,
+        bytes_completed, bytes_total, error, created_at, started_at,
+        finished_at, updated_at, input_refresh_required, phase, current_path,
+        current_artifact_id
+      )
+      SELECT
+        task_id, backup_id, kind, status, input_json, result_json,
+        bytes_completed, bytes_total, error, created_at, started_at,
+        finished_at, updated_at, input_refresh_required, phase, current_path,
+        current_artifact_id
+      FROM relay_backup_tasks
+    `
+    yield* sql`DROP TABLE relay_backup_tasks`
+    yield* sql`
+      ALTER TABLE relay_backup_tasks_next RENAME TO relay_backup_tasks
+    `
+    yield* sql`
+      CREATE INDEX relay_backup_tasks_queue
+      ON relay_backup_tasks (status, created_at, task_id)
+    `
+    yield* sql`
+      CREATE INDEX relay_backup_tasks_updated
+      ON relay_backup_tasks (updated_at, task_id)
+    `
+  }),
 })
+
+function scrubBackupTaskInputJson(inputJson: string): string {
+  return Result.getOrElse(
+    Result.try(() => {
+      const parsed = backupTaskInputSchema.safeParse(JSON.parse(inputJson))
+      if (!parsed.success) return inputJson
+      return JSON.stringify(redactBackupTaskInput(parsed.data))
+    }),
+    () => inputJson
+  )
+}
 
 const makeRelayStateStore = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
@@ -1159,8 +1231,8 @@ const makeRelayStateStore = Effect.gen(function* () {
         "cancel_backup_task",
         sql.withTransaction(
           Effect.gen(function* () {
-            const rows = yield* sql<{ taskId: string }>`
-              SELECT task_id AS taskId
+            const rows = yield* sql<{ inputJson: string; taskId: string }>`
+              SELECT task_id AS taskId, input_json AS inputJson
               FROM relay_backup_tasks
               WHERE task_id = ${taskId}
                 AND kind = 'create'
@@ -1171,6 +1243,7 @@ const makeRelayStateStore = Effect.gen(function* () {
             yield* sql`
               UPDATE relay_backup_tasks
               SET status = 'cancelled',
+                  input_json = ${scrubBackupTaskInputJson(rows[0].inputJson)},
                   result_json = NULL,
                   current_artifact_id = NULL,
                   error = ${reason.slice(0, 2_048)},
@@ -1189,8 +1262,8 @@ const makeRelayStateStore = Effect.gen(function* () {
         "complete_backup_task",
         sql.withTransaction(
           Effect.gen(function* () {
-            const rows = yield* sql<{ taskId: string }>`
-              SELECT task_id AS taskId
+            const rows = yield* sql<{ inputJson: string; taskId: string }>`
+              SELECT task_id AS taskId, input_json AS inputJson
               FROM relay_backup_tasks
               WHERE task_id = ${taskId} AND status = 'running'
               LIMIT 1
@@ -1200,6 +1273,7 @@ const makeRelayStateStore = Effect.gen(function* () {
             yield* sql`
               UPDATE relay_backup_tasks
               SET status = 'succeeded',
+                  input_json = ${scrubBackupTaskInputJson(rows[0].inputJson)},
                   result_json = ${JSON.stringify(result)},
                   bytes_completed = ${bytes},
                   bytes_total = ${bytes},
@@ -1220,8 +1294,8 @@ const makeRelayStateStore = Effect.gen(function* () {
         "fail_backup_task",
         sql.withTransaction(
           Effect.gen(function* () {
-            const rows = yield* sql<{ taskId: string }>`
-              SELECT task_id AS taskId
+            const rows = yield* sql<{ inputJson: string; taskId: string }>`
+              SELECT task_id AS taskId, input_json AS inputJson
               FROM relay_backup_tasks
               WHERE task_id = ${taskId}
                 AND status IN ('queued', 'running')
@@ -1231,6 +1305,7 @@ const makeRelayStateStore = Effect.gen(function* () {
             yield* sql`
               UPDATE relay_backup_tasks
               SET status = 'failed',
+                  input_json = ${scrubBackupTaskInputJson(rows[0].inputJson)},
                   result_json = NULL,
                   current_artifact_id = NULL,
                   error = ${error.slice(0, 4_096)},
@@ -1278,17 +1353,25 @@ const makeRelayStateStore = Effect.gen(function* () {
                   current_path = NULL,
                   updated_at = ${now},
                   error = 'Relay restarted before the task completed'
-              WHERE status = 'running' AND kind IN ('create', 'delete')
+              WHERE status = 'running' AND kind IN ('create', 'delete', 'export', 'prune')
             `
-            yield* sql`
-              UPDATE relay_backup_tasks
-              SET status = 'failed',
-                  current_artifact_id = NULL,
-                  updated_at = ${now},
-                  finished_at = ${now},
-                  error = 'Relay restarted during a non-repeatable task; inspect the target before retrying'
+            const restores = yield* sql<{ inputJson: string; taskId: string }>`
+              SELECT task_id AS taskId, input_json AS inputJson
+              FROM relay_backup_tasks
               WHERE status = 'running' AND kind = 'restore'
             `
+            for (const restore of restores) {
+              yield* sql`
+                UPDATE relay_backup_tasks
+                SET status = 'failed',
+                    input_json = ${scrubBackupTaskInputJson(restore.inputJson)},
+                    current_artifact_id = NULL,
+                    updated_at = ${now},
+                    finished_at = ${now},
+                    error = 'Relay restarted during a non-repeatable task; inspect the target before retrying'
+                WHERE task_id = ${restore.taskId} AND status = 'running'
+              `
+            }
             return count
           })
         )

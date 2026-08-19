@@ -506,10 +506,12 @@ describe("Relay state", () => {
 
         const restore: BackupTaskInput = {
           backupId: first.backupId,
-          bytes: 100,
-          checksumSha256: "1".repeat(64),
           kind: "restore",
-          source: { kind: "local" },
+          source: {
+            bytes: 100,
+            checksumSha256: "1".repeat(64),
+            kind: "local",
+          },
           target: first.target,
           taskId: "00000000-0000-4000-8000-000000000013",
         }
@@ -630,6 +632,96 @@ describe("Relay state", () => {
         assert.strictEqual(
           (yield* store.claimNextBackupTask(340))?.taskId,
           local.taskId
+        )
+        yield* store.failBackupTask(local.taskId, "test finished", 350)
+      })
+    )
+
+    it.effect("requeues interrupted export and prune tasks", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const exported: BackupTaskInput = {
+          backupId: "40000000-0000-4000-8000-000000000001",
+          expiresAt: Date.now() + 60_000,
+          kind: "export",
+          repositoryPassword: "export-secret",
+          snapshotId: "abcdef12",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "40000000-0000-4000-8000-000000000011",
+        }
+        const prune: BackupTaskInput = {
+          backupId: "40000000-0000-4000-8000-000000000002",
+          kind: "prune",
+          repositoryPassword: "prune-secret",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "40000000-0000-4000-8000-000000000012",
+        }
+        yield* store.enqueueBackupTask(exported, 400)
+        yield* store.enqueueBackupTask(prune, 401)
+        assert.strictEqual(
+          (yield* store.claimNextBackupTask(410))?.taskId,
+          exported.taskId
+        )
+        assert.strictEqual(yield* store.requeueInterruptedBackupTasks(420), 1)
+        const requeued = yield* store.getBackupTask(exported.taskId)
+        assert.strictEqual(requeued?.status, "queued")
+        assert.strictEqual(
+          requeued?.input.kind === "export"
+            ? requeued.input.repositoryPassword
+            : undefined,
+          "export-secret"
+        )
+        yield* store.claimNextBackupTask(430)
+        yield* store.claimNextBackupTask(431)
+        assert.strictEqual(yield* store.requeueInterruptedBackupTasks(440), 2)
+        assert.strictEqual(
+          (yield* store.getBackupTask(prune.taskId))?.status,
+          "queued"
+        )
+        yield* store.failBackupTask(exported.taskId, "test finished", 450)
+        yield* store.failBackupTask(prune.taskId, "test finished", 451)
+      })
+    )
+
+    it.effect("scrubs repository passwords from terminal journal rows", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const input: BackupTaskInput = {
+          artifactKind: "restic_snapshot",
+          backupId: "41000000-0000-4000-8000-000000000001",
+          destination: {
+            kind: "restic",
+            repositoryPassword: "repo-secret",
+          },
+          exclude: [],
+          kind: "create",
+          maxBytes: null,
+          mode: "incremental",
+          reason: "manual",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "41000000-0000-4000-8000-000000000011",
+        }
+        yield* store.enqueueBackupTask(input, 500)
+        yield* store.claimNextBackupTask(510)
+        assert.isTrue(
+          yield* store.completeBackupTask(
+            input.taskId,
+            {
+              bytes: 12,
+              snapshotId: "abcdef12",
+              warnings: [],
+            },
+            520
+          )
+        )
+        const completed = yield* store.getBackupTask(input.taskId)
+        assert.strictEqual(completed?.status, "succeeded")
+        assert.strictEqual(
+          completed?.input.kind === "create" &&
+            completed.input.destination.kind === "restic"
+            ? completed.input.destination.repositoryPassword
+            : "present",
+          undefined
         )
       })
     )
