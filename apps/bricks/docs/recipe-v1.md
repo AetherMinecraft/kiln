@@ -27,8 +27,11 @@ Runtime-specific overhead must fit inside that limit; Relay does not silently
 increase it. The official Java Ember uses a container-aware heap percentage so
 native JVM memory remains within the declared allocation. Extra JVM flags belong
 in a `java_args` variable mapped to `KILN_JAVA_ARGS`; the Ember always supplies
-`-Xms` and either `-XX:MaxRAMPercentage` or `-Xmx`. Minecraft server Bricks also
-get `--nogui` from `KILN_SERVER_ARGS` unless the recipe clears that variable.
+`-Xms` and either `-XX:MaxRAMPercentage` or `-Xmx`. Heap aliases such as
+`-XX:MaxHeapSize` and `-XX:MaxRAMPercentage` are rejected by official recipes
+and ignored by the Ember. Quoted values such as `-Dmessage="hello world"` stay a
+single argument. Minecraft server Bricks also get `--nogui` from
+`KILN_SERVER_ARGS` unless the recipe clears that variable.
 
 ## Templates
 

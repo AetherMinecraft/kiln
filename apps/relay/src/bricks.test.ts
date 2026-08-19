@@ -185,7 +185,7 @@ describe("Brick recipes", () => {
           rules: {
             maxLength: 2048,
             pattern:
-              "^(?!.*(?:^|\\s)(?:-Xms\\S*|-Xmx\\S*|-XX:MaxRAMPercentage(?:=\\S*)?|--nogui)(?:\\s|$)).*$",
+              "^(?!.*(?:^|\\s)(?:-Xm[sx]\\S*|-XX:(?:InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)(?:=\\S*)?|--nogui)(?:\\s|$)).*$",
           },
         },
       },
@@ -212,8 +212,16 @@ describe("Brick recipes", () => {
       /recipe rule/u
     )
     expect(() =>
+      resolveBrick(javaRecipe, { java_args: "-XX:MaxHeapSize=1G" })
+    ).toThrow(/recipe rule/u)
+    expect(() =>
       resolveBrick(javaRecipe, { java_args: "-XX:+UseG1GC --nogui" })
     ).toThrow(/recipe rule/u)
+    expect(
+      resolveBrick(javaRecipe, {
+        java_args: '-Dmessage="hello world"',
+      }).environment.KILN_JAVA_ARGS
+    ).toBe('-Dmessage="hello world"')
   })
 
   it("rejects expressions because templates are not executable", () => {

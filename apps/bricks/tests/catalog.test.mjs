@@ -9,6 +9,8 @@ import addFormats from "ajv-formats"
 import { parse } from "yaml"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
+const JAVA_ARGS_RULE_PATTERN =
+  "^(?!.*(?:^|\\s)(?:-Xm[sx]\\S*|-XX:(?:InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)(?:=\\S*)?|--nogui)(?:\\s|$)).*$"
 const loadJson = async (path) => JSON.parse(await readFile(join(root, path), "utf8"))
 const loadYaml = async (path) => parse(await readFile(join(root, path), "utf8"), {
   maxAliasCount: 20,
@@ -80,16 +82,27 @@ test("the official catalog and every recipe satisfy the v1 schemas", async () =>
       )
       assert.doesNotMatch(
         javaArgs.default ?? "",
-        /(?:-Xms|-Xmx|-XX:MaxRAMPercentage|--nogui)/u,
+        /(?:-Xm[sx]\b|-XX:(?:InitialHeapSize|MaxHeapSize|SoftMaxHeapSize|MaxRAMPercentage|MinRAMPercentage|InitialRAMPercentage|MaxRAMFraction|InitialRAMFraction|MinRAMFraction|MaxRAM)\b|--nogui)/u,
         `${recipePath}: java_args defaults must omit managed heap and --nogui flags`,
+      )
+      assert.equal(
+        javaArgs.rules?.pattern,
+        JAVA_ARGS_RULE_PATTERN,
+        `${recipePath}: java_args must reject heap aliases and --nogui`,
       )
       const javaArgsPattern = new RegExp(javaArgs.rules?.pattern ?? "", "u")
       assert.equal(javaArgsPattern.test(javaArgs.default ?? ""), true)
       assert.equal(javaArgsPattern.test(""), true)
       assert.equal(javaArgsPattern.test("-XX:+UseG1GC -Dkiln.test=true"), true)
+      assert.equal(javaArgsPattern.test('-Dmessage="hello world"'), true)
       assert.equal(javaArgsPattern.test("-Xmx2G"), false)
       assert.equal(javaArgsPattern.test("-XX:+UseG1GC --nogui"), false)
       assert.equal(javaArgsPattern.test("-XX:MaxRAMPercentage=75.0"), false)
+      assert.equal(javaArgsPattern.test("-XX:MaxHeapSize=1G"), false)
+      assert.equal(javaArgsPattern.test("-XX:InitialHeapSize=512M"), false)
+      assert.equal(javaArgsPattern.test("-XX:MaxRAM=4G"), false)
+      assert.equal(javaArgsPattern.test("-XX:MinRAMPercentage=50"), false)
+      assert.equal(javaArgsPattern.test("-XX:MaxRAMFraction=2"), false)
     }
   }
 })

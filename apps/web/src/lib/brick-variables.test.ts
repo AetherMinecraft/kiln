@@ -13,6 +13,7 @@ import {
   stringVariableAllows,
   supportedJavaVersions,
   unavailableMinecraftJavaVersion,
+  usesLongStringBrickField,
   withRecommendedMinecraftJava,
 } from "./brick-variables.js"
 
@@ -132,6 +133,24 @@ describe("Minecraft Java defaults", () => {
     expect(
       stringVariableAllows(paper.variables.version, `${"1".repeat(33)}`)
     ).toBe(false)
+  })
+
+  it("keeps sensitive long strings out of the plaintext textarea", () => {
+    const longFlags = {
+      ...paper.variables.version,
+      label: "Java arguments",
+      required: false,
+      default: undefined,
+      rules: { maxLength: 2048 },
+    }
+    expect(usesLongStringBrickField(longFlags)).toBe(true)
+    expect(
+      usesLongStringBrickField({
+        ...longFlags,
+        sensitive: true,
+      })
+    ).toBe(false)
+    expect(usesLongStringBrickField(paper.variables.version)).toBe(false)
   })
 
   it("blocks a required version with no default until a value is submitted", () => {

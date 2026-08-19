@@ -11,8 +11,9 @@ import {
 } from "@workspace/ui/components/select"
 import { Textarea } from "@workspace/ui/components/textarea"
 
+import { usesLongStringBrickField } from "@/lib/brick-variables"
+
 const NOT_SET_SELECT_VALUE = "not-set"
-const LONG_STRING_FIELD_MAX_LENGTH = 256
 const optionSelectValue = (index: number) => `option:${index}`
 
 export const BrickVariableField = React.memo(function BrickVariableField({
@@ -110,8 +111,7 @@ export const BrickVariableField = React.memo(function BrickVariableField({
             ))}
           </SelectContent>
         </Select>
-      ) : definition.type === "string" &&
-        (definition.rules?.maxLength ?? 0) >= LONG_STRING_FIELD_MAX_LENGTH ? (
+      ) : usesLongStringBrickField(definition) ? (
         <Textarea
           aria-labelledby={labelId}
           value={value === undefined ? "" : String(value)}

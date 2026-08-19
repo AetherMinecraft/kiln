@@ -5,6 +5,19 @@ import {
 } from "@workspace/contracts"
 import { Result } from "effect"
 
+export const LONG_STRING_FIELD_MAX_LENGTH = 256
+
+export function usesLongStringBrickField(
+  definition: Brick["variables"][string]
+): boolean {
+  return (
+    definition.type === "string" &&
+    !definition.sensitive &&
+    definition.options === undefined &&
+    (definition.rules?.maxLength ?? 0) >= LONG_STRING_FIELD_MAX_LENGTH
+  )
+}
+
 export function updateBrickVariable(
   variables: Readonly<Record<string, BrickVariableValue>>,
   name: string,
