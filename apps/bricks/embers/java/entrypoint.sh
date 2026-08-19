@@ -120,22 +120,13 @@ is_managed_java_arg() {
   [[ $1 =~ ${managed_pattern} ]]
 }
 
-is_vector_add_modules() {
-  [[ $1 == --add-modules=jdk.incubator.vector ]]
-}
-
 parse_quoted_args "${KILN_JAVA_ARGS:-}" || exit $?
 extra_java_args=()
 ignored_java_args=()
-omitted_vector_add_modules=false
 for arg in "${quoted_args[@]}"; do
   if is_java_argument_file "${arg}"; then
     echo "[Kiln Ember] Java argument files are not allowed in KILN_JAVA_ARGS: ${arg}" >&2
     exit 64
-  fi
-  if is_vector_add_modules "${arg}"; then
-    omitted_vector_add_modules=true
-    continue
   fi
   if is_managed_java_arg "${arg}"; then
     ignored_java_args+=("${arg}")
@@ -155,17 +146,9 @@ else
   java_memory_args+=("-XX:MaxRAMPercentage=${KILN_JAVA_MAX_RAM_PERCENTAGE:-75.0}")
 fi
 
-java_vector_args=()
-if java --list-modules 2>/dev/null | grep -q '^jdk.incubator.vector@'; then
-  java_vector_args=(--add-modules=jdk.incubator.vector)
-elif [[ ${omitted_vector_add_modules} == true ]]; then
-  echo "[Kiln Ember] ignoring --add-modules=jdk.incubator.vector; this Java runtime does not include that module" >&2
-fi
-
 echo "[Kiln Ember] starting ${KILN_IMPLEMENTATION:-server} ${KILN_VERSION:-unknown} with Java $(java -version 2>&1 | head -1)"
 exec java \
   "${java_memory_args[@]}" \
-  "${java_vector_args[@]}" \
   "${extra_java_args[@]}" \
   -jar "${KILN_ARTIFACT_FILE}" \
   "${server_args[@]}"

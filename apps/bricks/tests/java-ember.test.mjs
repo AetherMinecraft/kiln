@@ -21,12 +21,6 @@ if [[ "\${1:-}" == "-version" ]]; then
   echo 'openjdk version "test"' >&2
   exit 0
 fi
-if [[ "\${1:-}" == "--list-modules" ]]; then
-  if [[ -n "\${FAKE_JAVA_MODULES:-}" ]]; then
-    printf '%s\\n' \${FAKE_JAVA_MODULES}
-  fi
-  exit 0
-fi
 printf '%s\\n' "$@" > "$FAKE_JAVA_ARGUMENTS"
 `
 
@@ -223,9 +217,6 @@ if [[ "\${1:-}" == "-version" ]]; then
   echo 'openjdk version "test"' >&2
   exit 0
 fi
-if [[ "\${1:-}" == "--list-modules" ]]; then
-  exit 0
-fi
 test -f "$KILN_TEST_SERVER_DIRECTORY/.kiln-ember-installed"
 echo 'fake server started'
 `
@@ -299,9 +290,6 @@ test("the Java Ember distinguishes unset and empty server arguments", async (con
 set -eu
 if [[ "\${1:-}" == "-version" ]]; then
   echo 'openjdk version "test"' >&2
-  exit 0
-fi
-if [[ "\${1:-}" == "--list-modules" ]]; then
   exit 0
 fi
 printf '%s\n' "$@" > "$FAKE_JAVA_ARGUMENTS"
@@ -384,49 +372,6 @@ test("the Java Ember inserts extra JVM arguments between memory flags and the ja
     "paper.jar",
     "--nogui",
   ])
-})
-
-test("the Java Ember enables the Vector module only when the runtime includes it", async (context) => {
-  const withoutModule = await runPaperJavaEmber(context, {
-    KILN_JAVA_ARGS:
-      "--add-modules=jdk.incubator.vector -XX:+UseG1GC",
-  })
-  assert.equal(withoutModule.status, 0, withoutModule.stderr)
-  assert.match(
-    withoutModule.stderr,
-    /ignoring --add-modules=jdk.incubator.vector; this Java runtime does not include that module/u
-  )
-  assert.deepEqual(withoutModule.args, [
-    "-Xms512M",
-    "-XX:MaxRAMPercentage=75.0",
-    "-XX:+UseG1GC",
-    "-jar",
-    "paper.jar",
-    "--nogui",
-  ])
-
-  const withModule = await runPaperJavaEmber(context, {
-    FAKE_JAVA_MODULES: "jdk.incubator.vector@21",
-    KILN_JAVA_ARGS: "--add-modules=jdk.incubator.vector -XX:+UseG1GC",
-  })
-  assert.equal(withModule.status, 0, withModule.stderr)
-  assert.doesNotMatch(withModule.stderr, /ignoring --add-modules=jdk.incubator.vector/u)
-  assert.deepEqual(withModule.args, [
-    "-Xms512M",
-    "-XX:MaxRAMPercentage=75.0",
-    "--add-modules=jdk.incubator.vector",
-    "-XX:+UseG1GC",
-    "-jar",
-    "paper.jar",
-    "--nogui",
-  ])
-
-  const injected = await runPaperJavaEmber(context, {
-    FAKE_JAVA_MODULES: "jdk.incubator.vector@21",
-    KILN_JAVA_ARGS: "-XX:+UseG1GC",
-  })
-  assert.equal(injected.status, 0, injected.stderr)
-  assert.deepEqual(injected.args, withModule.args)
 })
 
 test("the Java Ember keeps quoted JVM argument values as a single argument", async (context) => {

@@ -27,12 +27,9 @@ Runtime-specific overhead must fit inside that limit; Relay does not silently
 increase it. The official Java Ember uses a container-aware heap percentage so
 native JVM memory remains within the declared allocation. Extra JVM flags belong
 in a `java_args` variable mapped to `KILN_JAVA_ARGS`; the Ember always supplies
-`-Xms` and either `-XX:MaxRAMPercentage` or `-Xmx`. When the runtime includes
-`jdk.incubator.vector` (Java 16+), the Ember also supplies
-`--add-modules=jdk.incubator.vector` and ignores that flag in `KILN_JAVA_ARGS`
-so Java 11 can still start. Heap aliases such as `-XX:MaxHeapSize` and
-`-XX:MaxRAMPercentage` are rejected by official recipes and ignored by the Ember.
-Disabling container-aware heap sizing (`-XX:-UseContainerSupport`) is rejected
+`-Xms` and either `-XX:MaxRAMPercentage` or `-Xmx`. Heap aliases such as
+`-XX:MaxHeapSize` and `-XX:MaxRAMPercentage` are rejected by official recipes
+and ignored by the Ember. Disabling container-aware heap sizing (`-XX:-UseContainerSupport`) is rejected
 the same way so `MaxRAMPercentage` stays bound to the container limit. Java
 argument files (`@flags.txt`, `-XX:VMOptionsFile`) are rejected so they cannot
 inject heap flags after Ember validation. Quoted values such as

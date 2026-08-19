@@ -73,20 +73,4 @@ describe("managed Java startup flags", () => {
       )
     ).toBe("-Xms512M -Xmx1G --nogui")
   })
-
-  it("enables the Vector module in managed flags only for Java 16+", () => {
-    expect(
-      managedJavaStartupFlags(paperEnv, "2G", { java_version: "11" })
-    ).toBe("-Xms512M -Xmx1536M --nogui")
-    expect(
-      managedJavaStartupFlags(paperEnv, "2G", { java_version: "17" })
-    ).toBe(
-      "-Xms512M -Xmx1536M --add-modules=jdk.incubator.vector --nogui"
-    )
-    expect(
-      managedJavaStartupFlags(paperEnv, "2G", { java_version: "21" })
-    ).toBe(
-      "-Xms512M -Xmx1536M --add-modules=jdk.incubator.vector --nogui"
-    )
-  })
 })

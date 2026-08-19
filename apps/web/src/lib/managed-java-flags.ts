@@ -51,21 +51,12 @@ export function managedJavaStartupFlags(
         : `-XX:MaxRAMPercentage=${Number.isFinite(percentage) ? percentage : DEFAULT_MAX_RAM_PERCENTAGE}`
     )
   }
-  if (supportsIncubatorVectorModule(variables.java_version)) {
-    flags.push("--add-modules=jdk.incubator.vector")
-  }
   if (!Object.hasOwn(resolved, "KILN_SERVER_ARGS")) flags.push("--nogui")
   else {
     const serverArgs = resolved.KILN_SERVER_ARGS.trim()
     if (serverArgs) flags.push(serverArgs)
   }
   return flags.join(" ")
-}
-
-function supportsIncubatorVectorModule(javaVersion: unknown): boolean {
-  if (typeof javaVersion !== "string") return false
-  const major = Number.parseInt(javaVersion, 10)
-  return Number.isFinite(major) && major >= 16
 }
 
 function heapBytesFromContainerMemory(
