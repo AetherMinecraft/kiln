@@ -490,17 +490,21 @@ const AccessToolbar = React.memo(function AccessToolbar({
             onFiltersChange({ role: accessRoleFilterFromValue(role) })
           }
         >
-          <option value="">All roles and types</option>
+          <SelectItem value={accessFilterAllValue}>
+            All roles and types
+          </SelectItem>
           {platformAccessVisible ? (
             <>
-              <option value="platform_admin">Platform Admin</option>
-              <option value="relay_creator">Bring Your Own Relays</option>
+              <SelectItem value="platform_admin">Platform Admin</SelectItem>
+              <SelectItem value="relay_creator">
+                Bring Your Own Relays
+              </SelectItem>
             </>
           ) : null}
           {accessRoles.map((role) => (
-            <option key={role} value={role}>
+            <SelectItem key={role} value={role}>
               {accessRoleDetails[role].label}
-            </option>
+            </SelectItem>
           ))}
         </AccessFilterSelect>
 
@@ -514,13 +518,13 @@ const AccessToolbar = React.memo(function AccessToolbar({
             })
           }
         >
-          <option value="">All scopes</option>
+          <SelectItem value={accessFilterAllValue}>All scopes</SelectItem>
           {platformAccessVisible ? (
-            <option value="platform">Platform</option>
+            <SelectItem value="platform">Platform</SelectItem>
           ) : null}
-          <option value="relay">Relays</option>
-          <option value="instance">Servers</option>
-          <option value="database">Databases</option>
+          <SelectItem value="relay">Relays</SelectItem>
+          <SelectItem value="instance">Servers</SelectItem>
+          <SelectItem value="database">Databases</SelectItem>
         </AccessFilterSelect>
 
         {relays.length > 1 ? (
@@ -530,11 +534,11 @@ const AccessToolbar = React.memo(function AccessToolbar({
             value={filters.relayId}
             onChange={(relayId) => onFiltersChange({ relayId })}
           >
-            <option value="">All Relays</option>
+            <SelectItem value={accessFilterAllValue}>All Relays</SelectItem>
             {relays.map((relay) => (
-              <option key={relay.id} value={relay.id}>
+              <SelectItem key={relay.id} value={relay.id}>
                 {relay.name}
-              </option>
+              </SelectItem>
             ))}
           </AccessFilterSelect>
         ) : null}
@@ -621,6 +625,8 @@ const AccessSyncButton = React.memo(function AccessSyncButton() {
   )
 })
 
+const accessFilterAllValue = "__all__"
+
 function AccessFilterSelect({
   ariaLabel,
   children,
@@ -635,24 +641,25 @@ function AccessFilterSelect({
   value: string
 }) {
   return (
-    <label
-      className={`relative inline-flex h-8 min-w-0 items-center border bg-input/20 text-xs text-foreground/90 transition-colors hover:border-primary/35 hover:bg-accent/70 ${
-        value ? "border-primary/35 bg-primary/7" : "border-input/90"
-      }`}
+    <Select
+      value={value || accessFilterAllValue}
+      onValueChange={(nextValue) =>
+        onChange(nextValue === accessFilterAllValue ? "" : nextValue)
+      }
     >
-      <span className="pointer-events-none ml-2 text-muted-foreground [&_svg]:size-3.5">
-        {icon}
-      </span>
-      <select
+      <SelectTrigger
         aria-label={ariaLabel}
-        className="h-full min-w-0 appearance-none bg-transparent py-0 pr-7 pl-1.5 outline-none"
-        value={value}
-        onChange={(event) => onChange(event.currentTarget.value)}
+        className={`h-8 min-w-0 gap-1.5 rounded-none px-2 text-xs hover:border-primary/35 hover:bg-accent/70 [&>svg:last-child]:size-3 ${
+          value ? "border-primary/35 bg-primary/7" : "border-input/90"
+        }`}
       >
+        <span className="text-muted-foreground [&_svg]:size-3.5">{icon}</span>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent className="w-max min-w-(--radix-select-trigger-width)">
         {children}
-      </select>
-      <ChevronDown className="pointer-events-none absolute right-2 size-3 text-muted-foreground" />
-    </label>
+      </SelectContent>
+    </Select>
   )
 }
 
