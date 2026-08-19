@@ -13,6 +13,10 @@ import {
   stringVariableAllows,
   supportedJavaVersions,
   unavailableMinecraftJavaVersion,
+  canPairMinecraftJavaVersionFields,
+  interpolateBrickTemplate,
+  javaVersionSelectOptions,
+  usesLongStringBrickField,
   withRecommendedMinecraftJava,
 } from "./brick-variables.js"
 
@@ -87,6 +91,11 @@ describe("Minecraft Java defaults", () => {
     expect(defaultBrickRuntimeName({ ...paper, source: "paper.yml" })).toBe(
       "Java 21"
     )
+    expect(
+      interpolateBrickTemplate("-Xms{{ variables.min_memory }}", {
+        min_memory: "768M",
+      })
+    ).toBe("-Xms768M")
   })
 
   it("hydrates missing legacy Startup variables without replacing overrides", () => {
@@ -120,6 +129,40 @@ describe("Minecraft Java defaults", () => {
     expect(
       recommendedSupportedJavaVersion("paper", paper.variables.java_version, "1.16.5")
     ).toBe("17")
+    expect(
+      supportedJavaVersions({
+        ...paper.variables.java_version,
+        default: "graal-21",
+        options: undefined,
+        rules: { pattern: "^graal-[0-9]+$", maxLength: 16 },
+      })
+    ).toEqual([])
+  })
+
+  it("keeps valid custom Java versions in the selector", () => {
+    const customJava = {
+      ...paper.variables.java_version,
+      default: "22",
+      options: undefined,
+      rules: { pattern: "^(?:17|22)$", maxLength: 2 },
+    }
+    expect(supportedJavaVersions(customJava)).toEqual(["17"])
+    expect(javaVersionSelectOptions(customJava)).toEqual(["17", "22"])
+    expect(javaVersionSelectOptions(customJava, "22")).toEqual(["17", "22"])
+    expect(javaVersionSelectOptions(customJava, "17")).toEqual(["17", "22"])
+    expect(
+      javaVersionSelectOptions(
+        {
+          ...customJava,
+          default: "graal-21",
+          rules: { pattern: "^graal-[0-9]+$", maxLength: 16 },
+        },
+        "graal-21"
+      )
+    ).toEqual([])
+    expect(recommendedSupportedJavaVersion("paper", customJava, "1.21.11")).toBe(
+      "22"
+    )
   })
 
   it("rejects custom versions that break Brick pattern or length rules", () => {
@@ -131,6 +174,39 @@ describe("Minecraft Java defaults", () => {
     )
     expect(
       stringVariableAllows(paper.variables.version, `${"1".repeat(33)}`)
+    ).toBe(false)
+  })
+
+  it("keeps sensitive long strings out of the plaintext textarea", () => {
+    const longFlags = {
+      ...paper.variables.version,
+      label: "Java arguments",
+      required: false,
+      default: undefined,
+      rules: { maxLength: 2048 },
+    }
+    expect(usesLongStringBrickField(longFlags)).toBe(true)
+    expect(
+      usesLongStringBrickField({
+        ...longFlags,
+        sensitive: true,
+      })
+    ).toBe(false)
+    expect(usesLongStringBrickField(paper.variables.version)).toBe(false)
+  })
+
+  it("only pairs Minecraft and Java fields when both are strings", () => {
+    expect(canPairMinecraftJavaVersionFields(paper.variables)).toBe(true)
+    expect(
+      canPairMinecraftJavaVersionFields({
+        ...paper.variables,
+        version: { ...paper.variables.version, type: "number" },
+      })
+    ).toBe(false)
+    expect(
+      canPairMinecraftJavaVersionFields({
+        version: paper.variables.version,
+      })
     ).toBe(false)
   })
 

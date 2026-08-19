@@ -29,8 +29,10 @@ import {
   BrickCatalogBrowser,
   type BrickSelection,
 } from "@/components/brick-selector"
-import { BrickVersionPicker } from "@/components/brick-version-picker"
-import { brickArtifactCatalog } from "@/lib/brick-artifact"
+import {
+  MinecraftJavaVersionFields,
+  javaVersionDefinition,
+} from "@/components/minecraft-java-version-fields"
 import {
   defaultBrickInstanceName,
   defaultBrickVariables,
@@ -49,7 +51,6 @@ import {
 import type { PersistedRelay } from "@/lib/relay-registry"
 import {
   brickCatalogQueryOptions,
-  brickVersionsQueryOptions,
   queryKeys,
   relayConnectionQueryOptions,
 } from "@/lib/query-options"
@@ -631,45 +632,19 @@ const MinecraftVersionField = React.memo(function MinecraftVersionField({
   disabled: boolean
   selection: BrickSelection | null
 }) {
-  const labelId = React.useId()
+  const brick = selection?.kind === "catalog" ? selection.brick : null
   const defaultVersion =
     definition.default === undefined ? "" : String(definition.default)
-  const [version, setVersion] = React.useState(defaultVersion)
-  const catalog =
-    selection?.kind === "catalog"
-      ? brickArtifactCatalog(selection.brick)
-      : null
-  const versionsQuery = useQuery({
-    ...brickVersionsQueryOptions(catalog?.type ?? "", catalog?.variant ?? ""),
-    enabled: catalog !== null,
-  })
-  const versions = React.useMemo(
-    () =>
-      supportedBrickVersions(
-        versionsQuery.data?.versions ?? [],
-        definition,
-        defaultVersion
-      ),
-    [defaultVersion, definition, versionsQuery.data?.versions]
-  )
-  const usePicker =
-    catalog !== null &&
-    !versionsQuery.isError &&
-    (versionsQuery.isPending || versions.length > 0)
-  const required =
-    definition.required && definition.default === undefined
-  const javaDefinition =
-    selection?.kind === "catalog"
-      ? javaVersionDefinition(selection.brick)
-      : null
+  const javaDefinition = brick ? javaVersionDefinition(brick) : null
   const javaVersions = React.useMemo(
     () => (javaDefinition ? supportedJavaVersions(javaDefinition) : []),
     [javaDefinition]
   )
+  const [version, setVersion] = React.useState(defaultVersion)
   const recommendedJava =
-    selection?.kind === "catalog" && javaDefinition
+    brick && javaDefinition
       ? recommendedSupportedJavaVersion(
-          selection.brick.metadata.id,
+          brick.metadata.id,
           javaDefinition,
           version
         )
@@ -677,103 +652,24 @@ const MinecraftVersionField = React.memo(function MinecraftVersionField({
   const [javaVersion, setJavaVersion] = React.useState(
     recommendedJava ?? javaVersions.at(-1) ?? ""
   )
-  const javaLabelId = React.useId()
-  const changeVersion = React.useCallback(
-    (nextVersion: string) => {
-      setVersion(nextVersion)
-      if (selection?.kind !== "catalog" || !javaDefinition) return
-      const nextJava = recommendedSupportedJavaVersion(
-        selection.brick.metadata.id,
-        javaDefinition,
-        nextVersion
-      )
-      if (nextJava) setJavaVersion(nextJava)
-    },
-    [javaDefinition, selection]
-  )
+
+  if (!brick) return null
 
   return (
-    <div className="flex items-start gap-2">
-      <div className="min-w-0 flex-1 space-y-1.5 text-xs font-medium text-muted-foreground">
-        <span id={labelId}>{definition.label}</span>
-        {usePicker ? (
-          <BrickVersionPicker
-            labelledBy={labelId}
-            name="version"
-            value={version}
-            versions={versions}
-            disabled={disabled}
-            loading={versionsQuery.isPending}
-            maxLength={definition.rules?.maxLength}
-            minLength={definition.rules?.minLength}
-            pattern={definition.rules?.pattern}
-            required={required}
-            onChange={changeVersion}
-          />
-        ) : (
-          <Input
-            aria-labelledby={labelId}
-            name="version"
-            value={version}
-            onChange={(event) => changeVersion(event.currentTarget.value)}
-            placeholder="Enter a version"
-            pattern={definition.rules?.pattern}
-            minLength={definition.rules?.minLength}
-            maxLength={definition.rules?.maxLength}
-            disabled={disabled}
-            className="font-mono tabular-nums"
-            required={required}
-          />
-        )}
-      </div>
-      {javaDefinition && javaVersions.length > 0 ? (
-        <div className="w-[5.75rem] shrink-0 space-y-1.5 text-xs font-medium text-muted-foreground">
-          <span id={javaLabelId}>Java</span>
-          <input type="hidden" name="java_version" value={javaVersion} />
-          <Select
-            value={javaVersion}
-            onValueChange={setJavaVersion}
-            disabled={disabled}
-          >
-            <SelectTrigger
-              aria-labelledby={javaLabelId}
-              className="h-8 w-full px-2.5 font-mono text-xs tabular-nums"
-            >
-              <SelectValue placeholder="Java" />
-            </SelectTrigger>
-            <SelectContent className="z-[70]">
-              {javaVersions.map((option) => (
-                <SelectItem
-                  key={option}
-                  className="font-mono text-xs tabular-nums"
-                  value={option}
-                >
-                  {option}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      ) : null}
-    </div>
+    <MinecraftJavaVersionFields
+      brickId={brick.metadata.id}
+      disabled={disabled}
+      environment={brick.runtime.environment}
+      javaInputName="java_version"
+      javaVersion={javaVersion}
+      onJavaVersionChange={setJavaVersion}
+      onVersionChange={setVersion}
+      variableDefinitions={brick.variables}
+      version={version}
+      versionInputName="version"
+    />
   )
 })
-
-function supportedBrickVersions(
-  versions: ReadonlyArray<string>,
-  definition: BrickVariable,
-  defaultVersion: string
-): Array<string> {
-  const allowed = versions.filter((version) =>
-    stringVariableAllows(definition, version)
-  )
-  if (defaultVersion && !allowed.includes(defaultVersion)) {
-    return stringVariableAllows(definition, defaultVersion)
-      ? [defaultVersion, ...allowed]
-      : allowed
-  }
-  return allowed
-}
 
 function minecraftVersionDefinition(selection: BrickSelection | null) {
   if (
@@ -783,11 +679,6 @@ function minecraftVersionDefinition(selection: BrickSelection | null) {
     return null
   }
   const definition = selection.brick.variables.version
-  return definition?.type === "string" ? definition : null
-}
-
-function javaVersionDefinition(brick: Brick) {
-  const definition = brick.variables.java_version
   return definition?.type === "string" ? definition : null
 }
 

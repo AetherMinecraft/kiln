@@ -9,6 +9,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@workspace/ui/components/select"
+import { Textarea } from "@workspace/ui/components/textarea"
+
+import { usesLongStringBrickField } from "@/lib/brick-variables"
 
 const NOT_SET_SELECT_VALUE = "not-set"
 const optionSelectValue = (index: number) => `option:${index}`
@@ -111,6 +114,17 @@ export const BrickVariableField = React.memo(function BrickVariableField({
             ))}
           </SelectContent>
         </Select>
+      ) : usesLongStringBrickField(definition) ? (
+        <Textarea
+          aria-labelledby={labelId}
+          value={value === undefined ? "" : String(value)}
+          onBlur={(event) => onChange(event.currentTarget.value)}
+          onChange={(event) => onChange(event.target.value)}
+          minLength={definition.rules?.minLength}
+          maxLength={definition.rules?.maxLength}
+          required={definition.required}
+          className="min-h-24 bg-input/18 font-mono text-xs md:text-xs"
+        />
       ) : (
         <Input
           aria-labelledby={labelId}

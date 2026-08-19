@@ -234,6 +234,8 @@ kiln server startup <server> --memory 6GiB
 kiln server startup <server> --disk 40GiB --java-version 25
 kiln server startup <server> --game-version 1.21.11 \
   --variable online_mode=json:false
+kiln server startup <server> \
+  --variable java_args="-XX:+UseG1GC -XX:+AlwaysPreTouch"
 ```
 
 Settings omitted from a startup patch, including the disk quota, are preserved.
