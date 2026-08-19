@@ -7,6 +7,8 @@ import { Database } from "@/effect/database"
 import { BackupLimitError, BackupStorageError } from "@/effect/errors"
 import {
   backupReservation,
+  canReuseBackupExport,
+  clampBackupExportTtlMs,
   effectiveBackupLimit,
   renameBackupEffect,
   reserveBackupCopyEffect,
@@ -32,6 +34,38 @@ describe("backup limits", () => {
     expect(effectiveBackupLimit(10, null)).toBe(10)
     expect(effectiveBackupLimit(null, 8)).toBe(8)
     expect(effectiveBackupLimit(10, 8)).toBe(8)
+  })
+
+  it("clamps incremental export TTLs to the signed-URL bounds", () => {
+    expect(clampBackupExportTtlMs(1_000)).toBe(60_000)
+    expect(clampBackupExportTtlMs(15 * 60_000)).toBe(15 * 60_000)
+    expect(clampBackupExportTtlMs(30 * 24 * 60 * 60 * 1_000)).toBe(
+      7 * 24 * 60 * 60 * 1_000
+    )
+  })
+
+  it("reuses an unexpired export while polling even if remaining is under the requested TTL", () => {
+    expect(
+      canReuseBackupExport({
+        remainingMs: 15 * 60 * 60 * 1_000 - 1_500,
+        requestedTtlMs: 15 * 60 * 60 * 1_000,
+        requireFullTtl: false,
+      })
+    ).toBe(true)
+    expect(
+      canReuseBackupExport({
+        remainingMs: 15 * 60 * 60 * 1_000 - 1_500,
+        requestedTtlMs: 15 * 60 * 60 * 1_000,
+        requireFullTtl: true,
+      })
+    ).toBe(false)
+    expect(
+      canReuseBackupExport({
+        remainingMs: 0,
+        requestedTtlMs: 60_000,
+        requireFullTtl: false,
+      })
+    ).toBe(false)
   })
 
   it("reserves remaining bytes and rejects exhausted limits", () => {

@@ -22,11 +22,11 @@ import {
   reserveBackupRestoreEffect,
   reserveDatabaseBackupEffect,
   reserveInstanceBackupEffect,
-    reservePlatformBackupEffect,
-    updateBackupExcludesEffect,
-    updateBackupLimitsEffect,
-    type BackupCatalogRecord,
-  } from "@/effect/backups"
+  reservePlatformBackupEffect,
+  updateBackupExcludesEffect,
+  updateBackupLimitsEffect,
+  type BackupCatalogRecord,
+} from "@/effect/backups"
 import { listManagedDatabaseRecordsEffect } from "@/effect/managed-databases"
 import {
   loadBackupStorageCredentialEffect,
@@ -841,7 +841,9 @@ async function resticBackupDownload(input: {
       backupId: input.backup.id,
       replaceFailed: !input.poll,
       requestedBy: input.user.id,
+      requireFullTtl: !input.poll,
       taskId: randomUUID(),
+      ttlMs: input.expiresInSeconds * 1_000,
     })
   )
   if (reserved.kind === "dispatch") {

@@ -12,6 +12,8 @@ import type {
 } from "@workspace/contracts"
 import {
   backupArtifactFilename,
+  BACKUP_EXPORT_TTL_MAX_MS,
+  BACKUP_EXPORT_TTL_MIN_MS,
   isArchiveCreateTaskResult,
   isResticCreateTaskResult,
 } from "@workspace/contracts"
@@ -25,7 +27,6 @@ import { betterAuthSecrets, kilnInstallationId } from "@/lib/environment"
 import { backupObjectKey } from "@/lib/backup-storage-s3"
 
 const RESTIC_REPOSITORY_PASSWORD_PURPOSE = "kiln-restic-repository-password"
-const BACKUP_EXPORT_TTL_MS = 5 * 60_000
 
 interface BackupPolicyRow extends RowDataPacket {
   admin_quantity_limit: number | null
@@ -288,12 +289,12 @@ export interface BackupRestoreDispatch {
 
 export interface BackupExportDispatch {
   backupId: string
-  expiresAt: number
   kind: "export"
   repositoryPassword?: string
   snapshotId: string
   target: { id: string; kind: "instance" }
   taskId: string
+  ttlMs: number
 }
 
 export type BackupDispatch =
@@ -1196,13 +1197,14 @@ export const listDispatchableBackupTasksEffect = Effect.fn(
       }
       return {
         backupId: row.backup_id,
-        expiresAt:
-          safeDatabaseNumber(row.task_created_at_ms, "export task time") +
-          BACKUP_EXPORT_TTL_MS,
         kind: "export",
         snapshotId: row.restic_snapshot_id,
         target: { id: row.target_id, kind: "instance" },
         taskId: row.task_id,
+        ttlMs: clampBackupExportTtlMs(
+          nullableDatabaseNumber(row.reserved_bytes, "export ttl") ??
+            BACKUP_EXPORT_TTL_MIN_MS
+        ),
       }
     }
     if (row.task_kind === "delete") {
@@ -1481,9 +1483,12 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
     backupId: string
     replaceFailed?: boolean
     requestedBy: string
+    requireFullTtl?: boolean
     taskId: string
+    ttlMs: number
   }) {
     const database = yield* Database
+    const ttlMs = clampBackupExportTtlMs(input.ttlMs)
     return yield* database.transaction("backup_reserve_export", (transaction) =>
       Effect.gen(function* () {
         const backups = yield* transaction.queryRows<BackupRow>(
@@ -1498,7 +1503,8 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
           [input.backupId]
         )
         const backup = backups[0]
-        if (!backup?.restic_snapshot_id) {
+        const snapshotId = backup?.restic_snapshot_id
+        if (!backup || !snapshotId) {
           return yield* BackupStorageError.make({
             code: "backup_unavailable",
             operation: "backup.export",
@@ -1509,12 +1515,15 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
         const existing = yield* transaction.queryRows<
           {
             created_at_ms: number | string
+            finished_at_ms: number | string | null
             id: string
+            reserved_bytes: number | string | null
             status: BackupRow["task_status"]
           } & RowDataPacket
         >(
-          `SELECT task.id, task.status,
-                  ROUND(UNIX_TIMESTAMP(task.created_at) * 1000) AS created_at_ms
+          `SELECT task.id, task.status, task.reserved_bytes,
+                  ROUND(UNIX_TIMESTAMP(task.created_at) * 1000) AS created_at_ms,
+                  ROUND(UNIX_TIMESTAMP(task.finished_at) * 1000) AS finished_at_ms
              FROM ${databaseTable("backup_task")} task
             WHERE task.backup_id = ? AND task.task_kind = 'export'
             ORDER BY task.created_at DESC, task.id DESC
@@ -1523,26 +1532,49 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
           [input.backupId]
         )
         const latest = existing[0]
-        const expiresAt = latest
-          ? safeDatabaseNumber(latest.created_at_ms, "export task time") +
-            BACKUP_EXPORT_TTL_MS
-          : Date.now() + BACKUP_EXPORT_TTL_MS
-        if (latest?.status === "succeeded" && expiresAt > Date.now()) {
-          return {
-            expiresAt,
-            filename,
-            kind: "ready",
-          } satisfies BackupExportReservation
+        const dispatchFor = (taskId: string): BackupExportDispatch => ({
+          backupId: backup.id,
+          kind: "export",
+          snapshotId,
+          target: { id: backup.target_id, kind: "instance" },
+          taskId,
+          ttlMs,
+        })
+        if (latest?.status === "succeeded") {
+          const storedTtl = clampBackupExportTtlMs(
+            nullableDatabaseNumber(latest.reserved_bytes, "export ttl") ??
+              BACKUP_EXPORT_TTL_MIN_MS
+          )
+          const completedAt = nullableDatabaseNumber(
+            latest.finished_at_ms,
+            "export finished at"
+          )
+          const expiresAt =
+            (completedAt ??
+              safeDatabaseNumber(latest.created_at_ms, "export task time")) +
+            storedTtl
+          if (
+            canReuseBackupExport({
+              remainingMs: expiresAt - Date.now(),
+              requestedTtlMs: ttlMs,
+              requireFullTtl: input.requireFullTtl !== false,
+            })
+          ) {
+            return {
+              expiresAt,
+              filename,
+              kind: "ready",
+            } satisfies BackupExportReservation
+          }
         }
         if (latest && (latest.status === "queued" || latest.status === "running")) {
           return {
             dispatch: {
-              backupId: backup.id,
-              expiresAt,
-              kind: "export",
-              snapshotId: backup.restic_snapshot_id,
-              target: { id: backup.target_id, kind: "instance" },
-              taskId: latest.id,
+              ...dispatchFor(latest.id),
+              ttlMs: clampBackupExportTtlMs(
+                nullableDatabaseNumber(latest.reserved_bytes, "export ttl") ??
+                  ttlMs
+              ),
             },
             kind: "dispatch",
           } satisfies BackupExportReservation
@@ -1560,19 +1592,12 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
         }
         yield* transaction.execute(
           `INSERT INTO ${databaseTable("backup_task")}
-            (id, backup_id, task_kind, status, requested_by)
-           VALUES (?, ?, 'export', 'queued', ?)`,
-          [input.taskId, input.backupId, input.requestedBy]
+            (id, backup_id, task_kind, status, reserved_bytes, requested_by)
+           VALUES (?, ?, 'export', 'queued', ?, ?)`,
+          [input.taskId, input.backupId, ttlMs, input.requestedBy]
         )
         return {
-          dispatch: {
-            backupId: backup.id,
-            expiresAt: Date.now() + BACKUP_EXPORT_TTL_MS,
-            kind: "export",
-            snapshotId: backup.restic_snapshot_id,
-            target: { id: backup.target_id, kind: "instance" },
-            taskId: input.taskId,
-          },
+          dispatch: dispatchFor(input.taskId),
           kind: "dispatch",
         } satisfies BackupExportReservation
       })
@@ -2180,6 +2205,24 @@ function toFinalInstanceDeletion(
     targetId: row.target_id,
     taskError: row.task_error,
   }
+}
+
+export function clampBackupExportTtlMs(ttlMs: number): number {
+  if (!Number.isFinite(ttlMs)) return BACKUP_EXPORT_TTL_MIN_MS
+  return Math.min(
+    BACKUP_EXPORT_TTL_MAX_MS,
+    Math.max(BACKUP_EXPORT_TTL_MIN_MS, Math.trunc(ttlMs))
+  )
+}
+
+export function canReuseBackupExport(input: {
+  remainingMs: number
+  requestedTtlMs: number
+  requireFullTtl: boolean
+}): boolean {
+  if (input.remainingMs <= 0) return false
+  if (!input.requireFullTtl) return true
+  return input.remainingMs >= input.requestedTtlMs
 }
 
 export function effectiveBackupLimit(

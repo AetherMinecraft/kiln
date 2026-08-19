@@ -608,7 +608,9 @@ export const getCliBackupDownloadEffect = Effect.fn("cli.api.backups.download")(
           backupId: backup.id,
           replaceFailed: !input.poll,
           requestedBy: principal.user.id,
+          requireFullTtl: !input.poll,
           taskId: randomUUID(),
+          ttlMs: 300_000,
         }),
         "Hearth could not prepare the snapshot export."
       )
