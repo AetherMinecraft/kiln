@@ -3473,19 +3473,22 @@ function InstanceBackupSettingsEditor({
           <span className="mb-2 block text-xs font-medium">
             Preferred destination
           </span>
-          <select
-            aria-label="Preferred backup destination"
-            className="h-9 w-full rounded-lg border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-            value={storageId}
-            onChange={(event) => setStorageId(event.currentTarget.value)}
-          >
-            <option value="local">Local Relay storage</option>
-            {enabledStorage.map((destination) => (
-              <option key={destination.id} value={destination.id}>
-                {destination.name} · S3
-              </option>
-            ))}
-          </select>
+          <Select value={storageId} onValueChange={setStorageId}>
+            <SelectTrigger
+              aria-label="Preferred backup destination"
+              className="h-9 w-full [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="w-max min-w-(--radix-select-trigger-width)">
+              <SelectItem value="local">Local Relay storage</SelectItem>
+              {enabledStorage.map((destination) => (
+                <SelectItem key={destination.id} value={destination.id}>
+                  {destination.name} · S3
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </label>
         <label className="block sm:col-span-2">
           <span className="mb-2 block text-xs font-medium">
