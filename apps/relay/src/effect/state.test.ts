@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { DatabaseSync } from "node:sqlite"
 import { afterAll, assert, describe, layer } from "@effect/vitest"
 import { Effect } from "effect"
 import type { BackupTaskInput, BackupTaskResult } from "@workspace/contracts"
@@ -8,13 +9,14 @@ import type { BackupTaskInput, BackupTaskResult } from "@workspace/contracts"
 import { makeRelayStateLayer, RelayStateStore } from "./state.js"
 
 const testDirectory = mkdtempSync(join(tmpdir(), "kiln-relay-state-"))
+const stateDatabase = join(testDirectory, "relay.sqlite")
 
 afterAll(() => {
   rmSync(testDirectory, { force: true, recursive: true })
 })
 
 describe("Relay state", () => {
-  layer(makeRelayStateLayer(join(testDirectory, "relay.sqlite")))((it) => {
+  layer(makeRelayStateLayer(stateDatabase))((it) => {
     it.effect("pairs a client exactly once and persists its grant", () =>
       Effect.gen(function* () {
         const store = yield* RelayStateStore
@@ -723,6 +725,102 @@ describe("Relay state", () => {
             : "present",
           undefined
         )
+      })
+    )
+
+    it.effect("lists backup tasks when a journal row fails schema parsing", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const valid: BackupTaskInput = {
+          artifactKind: "restic_snapshot",
+          backupId: "42000000-0000-4000-8000-000000000001",
+          destination: { kind: "restic" },
+          exclude: [],
+          kind: "create",
+          maxBytes: 100,
+          mode: "incremental",
+          reason: "manual",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "42000000-0000-4000-8000-000000000011",
+        }
+        yield* store.enqueueBackupTask(valid, 600)
+        yield* store.claimNextBackupTask(610)
+        yield* store.failBackupTask(valid.taskId, "backup_too_large", 620)
+        yield* Effect.sync(() => {
+          const database = new DatabaseSync(stateDatabase)
+          database.exec(`
+            INSERT INTO relay_backup_tasks (
+              task_id, backup_id, kind, status, input_json, result_json,
+              bytes_completed, created_at, started_at, finished_at, updated_at
+            ) VALUES (
+              '42000000-0000-4000-8000-000000000012',
+              '42000000-0000-4000-8000-000000000002',
+              'export',
+              'succeeded',
+              '{"backupId":"42000000-0000-4000-8000-000000000002","expiresAt":1787136060235,"snapshotId":"abcdef12","target":{"id":"instance-a","kind":"instance"},"taskId":"42000000-0000-4000-8000-000000000012","kind":"export"}',
+              NULL,
+              0,
+              600,
+              610,
+              620,
+              630
+            )
+          `)
+          database.close()
+        })
+
+        const listed = yield* store.listBackupTasks()
+        const listedIds = listed.map((task) => task.taskId)
+        assert.include(listedIds, valid.taskId)
+        const fallback = listed.find(
+          (task) => task.taskId === "42000000-0000-4000-8000-000000000012"
+        )
+        assert.strictEqual(fallback?.status, "failed")
+        assert.strictEqual(fallback?.kind, "export")
+        assert.include(
+          fallback?.error ?? "",
+          "journal row could not be parsed"
+        )
+      })
+    )
+
+    it.effect("prunes superseded succeeded export journal rows", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const first: BackupTaskInput = {
+          backupId: "43000000-0000-4000-8000-000000000001",
+          kind: "export",
+          snapshotId: "abcdef12",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "43000000-0000-4000-8000-000000000011",
+          ttlMs: 60_000,
+        }
+        const second: BackupTaskInput = {
+          ...first,
+          taskId: "43000000-0000-4000-8000-000000000012",
+        }
+        yield* store.enqueueBackupTask(first, 700)
+        yield* store.claimNextBackupTask(710)
+        yield* store.completeBackupTask(
+          first.taskId,
+          {
+            bytes: 12,
+            checksumSha256: "b".repeat(64),
+            expiresAt: 800,
+            filename: "backup-43000000.zip",
+            warnings: [],
+          },
+          720
+        )
+        yield* store.enqueueBackupTask(second, 730)
+        const remaining = (yield* store.listBackupTasks()).filter(
+          (task) => task.backupId === first.backupId && task.kind === "export"
+        )
+        assert.deepStrictEqual(
+          remaining.map((task) => task.taskId),
+          [second.taskId]
+        )
+        yield* store.failBackupTask(second.taskId, "test finished", 740)
       })
     )
   })

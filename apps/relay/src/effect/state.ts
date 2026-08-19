@@ -13,9 +13,13 @@ import type {
   RelayInstanceWebRoute,
 } from "@workspace/contracts"
 import {
+  BACKUP_EXPORT_TTL_MIN_MS,
+  backupTargetSchema,
   backupTaskInputSchema,
   backupTaskResultSchema,
   redactBackupTaskInput,
+  relayBackupTaskSchema,
+  resticSnapshotIdSchema,
 } from "@workspace/contracts"
 
 import { RelayStateError } from "./errors.js"
@@ -823,13 +827,36 @@ const makeRelayStateStore = Effect.gen(function* () {
     }
   )
 
-  const backupTasks = Effect.fn("RelayStateStore.backupTasks")(function* (
+  const backupTaskRows = Effect.fn("RelayStateStore.backupTaskRows")(function* (
     filter:
       | { readonly taskId: string }
       | { readonly updatedAfter?: number } = {}
   ) {
-    const rows =
-      "taskId" in filter
+    return "taskId" in filter
+      ? yield* sql<Record<string, unknown>>`
+          SELECT
+            task_id AS taskId,
+            backup_id AS backupId,
+            kind,
+            status,
+            input_json AS inputJson,
+            input_refresh_required AS inputRefreshRequired,
+            result_json AS resultJson,
+            bytes_completed AS bytesCompleted,
+            bytes_total AS bytesTotal,
+            phase,
+            current_artifact_id AS currentArtifactId,
+            current_path AS currentPath,
+            error,
+            created_at AS createdAt,
+            started_at AS startedAt,
+            finished_at AS finishedAt,
+            updated_at AS updatedAt
+          FROM relay_backup_tasks
+          WHERE task_id = ${filter.taskId}
+          LIMIT 1
+        `
+      : filter.updatedAfter === undefined
         ? yield* sql<Record<string, unknown>>`
             SELECT
               task_id AS taskId,
@@ -850,57 +877,103 @@ const makeRelayStateStore = Effect.gen(function* () {
               finished_at AS finishedAt,
               updated_at AS updatedAt
             FROM relay_backup_tasks
-            WHERE task_id = ${filter.taskId}
-            LIMIT 1
+            ORDER BY updated_at ASC, task_id ASC
           `
-        : filter.updatedAfter === undefined
-          ? yield* sql<Record<string, unknown>>`
-              SELECT
-                task_id AS taskId,
-                backup_id AS backupId,
-                kind,
-                status,
-                input_json AS inputJson,
-                input_refresh_required AS inputRefreshRequired,
-                result_json AS resultJson,
-                bytes_completed AS bytesCompleted,
-                bytes_total AS bytesTotal,
-                phase,
-                current_artifact_id AS currentArtifactId,
-                current_path AS currentPath,
-                error,
-                created_at AS createdAt,
-                started_at AS startedAt,
-                finished_at AS finishedAt,
-                updated_at AS updatedAt
-              FROM relay_backup_tasks
-              ORDER BY updated_at ASC, task_id ASC
-            `
-          : yield* sql<Record<string, unknown>>`
-              SELECT
-                task_id AS taskId,
-                backup_id AS backupId,
-                kind,
-                status,
-                input_json AS inputJson,
-                input_refresh_required AS inputRefreshRequired,
-                result_json AS resultJson,
-                bytes_completed AS bytesCompleted,
-                bytes_total AS bytesTotal,
-                phase,
-                current_artifact_id AS currentArtifactId,
-                current_path AS currentPath,
-                error,
-                created_at AS createdAt,
-                started_at AS startedAt,
-                finished_at AS finishedAt,
-                updated_at AS updatedAt
-              FROM relay_backup_tasks
-              WHERE updated_at > ${filter.updatedAfter}
-              ORDER BY updated_at ASC, task_id ASC
-            `
+        : yield* sql<Record<string, unknown>>`
+            SELECT
+              task_id AS taskId,
+              backup_id AS backupId,
+              kind,
+              status,
+              input_json AS inputJson,
+              input_refresh_required AS inputRefreshRequired,
+              result_json AS resultJson,
+              bytes_completed AS bytesCompleted,
+              bytes_total AS bytesTotal,
+              phase,
+              current_artifact_id AS currentArtifactId,
+              current_path AS currentPath,
+              error,
+              created_at AS createdAt,
+              started_at AS startedAt,
+              finished_at AS finishedAt,
+              updated_at AS updatedAt
+            FROM relay_backup_tasks
+            WHERE updated_at > ${filter.updatedAfter}
+            ORDER BY updated_at ASC, task_id ASC
+          `
+  })
+
+  const backupTasks = Effect.fn("RelayStateStore.backupTasks")(function* (
+    filter:
+      | { readonly taskId: string }
+      | { readonly updatedAfter?: number } = {}
+  ) {
+    const rows = yield* backupTaskRows(filter)
     const decoded = yield* decodeBackupTaskRows(rows)
     return yield* Effect.forEach(decoded, backupTaskFromRow)
+  })
+
+  const warnedUnparseableTaskIds = new Set<string>()
+  const pruneSupersededExportTasks = () => sql`
+    DELETE FROM relay_backup_tasks
+    WHERE kind = 'export'
+      AND status IN ('succeeded', 'failed', 'cancelled')
+      AND EXISTS (
+        SELECT 1
+        FROM relay_backup_tasks AS newer
+        WHERE newer.kind = 'export'
+          AND newer.backup_id = relay_backup_tasks.backup_id
+          AND (
+            newer.updated_at > relay_backup_tasks.updated_at
+            OR (
+              newer.updated_at = relay_backup_tasks.updated_at
+              AND newer.task_id > relay_backup_tasks.task_id
+            )
+          )
+      )
+  `
+
+  const listBackupTasksLenient = Effect.fn(
+    "RelayStateStore.listBackupTasksLenient"
+  )(function* (updatedAfter?: number) {
+    yield* pruneSupersededExportTasks()
+    const rows = yield* backupTaskRows({ updatedAfter })
+    const tasks: RelayBackupTask[] = []
+    for (const row of rows) {
+      const decodedRow = yield* Schema.decodeUnknownEffect(
+        RelayBackupTaskRowSchema
+      )(row).pipe(Effect.result)
+      if (Result.isFailure(decodedRow)) {
+        const taskId = typeof row.taskId === "string" ? row.taskId : undefined
+        if (taskId && !warnedUnparseableTaskIds.has(taskId)) {
+          warnedUnparseableTaskIds.add(taskId)
+          yield* Effect.logWarning("Skipped unparseable backup journal row", {
+            taskId,
+          })
+        }
+        continue
+      }
+      const decodedTask = yield* backupTaskFromRow(decodedRow.success).pipe(
+        Effect.result
+      )
+      if (Result.isSuccess(decodedTask)) {
+        tasks.push(decodedTask.success)
+        continue
+      }
+      if (!warnedUnparseableTaskIds.has(decodedRow.success.taskId)) {
+        warnedUnparseableTaskIds.add(decodedRow.success.taskId)
+        yield* Effect.logWarning("Skipped unparseable backup journal row", {
+          backupId: decodedRow.success.backupId,
+          kind: decodedRow.success.kind,
+          status: decodedRow.success.status,
+          taskId: decodedRow.success.taskId,
+        })
+      }
+      const fallback = fallbackFailedBackupTask(decodedRow.success)
+      if (fallback) tasks.push(fallback)
+    }
+    return tasks
   })
 
   const webRoutes = Effect.fn("RelayStateStore.webRoutes")(function* (
@@ -1104,6 +1177,9 @@ const makeRelayStateStore = Effect.gen(function* () {
                 ${now}
               )
             `
+            if (input.kind === "export") {
+              yield* pruneSupersededExportTasks()
+            }
             const created = (yield* backupTasks({ taskId: input.taskId }))[0]
             return yield* created
               ? Effect.succeed(created)
@@ -1149,7 +1225,7 @@ const makeRelayStateStore = Effect.gen(function* () {
         backupTasks({ taskId }).pipe(Effect.map((tasks) => tasks[0] ?? null))
       ),
     listBackupTasks: (updatedAfter) =>
-      run("list_backup_tasks", backupTasks({ updatedAfter })),
+      run("list_backup_tasks", listBackupTasksLenient(updatedAfter)),
     updateBackupTaskProgress: (
       taskId,
       bytesCompleted,
@@ -1285,6 +1361,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                   updated_at = ${now}
               WHERE task_id = ${taskId} AND status = 'running'
             `
+            yield* pruneSupersededExportTasks()
             return true
           })
         )
@@ -1372,6 +1449,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                 WHERE task_id = ${restore.taskId} AND status = 'running'
               `
             }
+            yield* pruneSupersededExportTasks()
             return count
           })
         )
@@ -1943,4 +2021,124 @@ function decodeBackupTaskResult(value: string) {
     try: () => backupTaskResultSchema.parse(JSON.parse(value)),
     catch: (cause) => RelayStateError.make({ operation: "decode_json", cause }),
   })
+}
+
+const UNPARSEABLE_BACKUP_TASK_ERROR =
+  "The Relay journal row could not be parsed"
+
+function parseBackupTaskInputJson(value: string): unknown {
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
+}
+
+function fallbackBackupTarget(input: unknown): BackupTaskInput["target"] {
+  if (!input || typeof input !== "object" || !("target" in input)) {
+    return { id: "unknown", kind: "instance" }
+  }
+  const parsed = backupTargetSchema.safeParse(input.target)
+  return parsed.success ? parsed.data : { id: "unknown", kind: "instance" }
+}
+
+function fallbackSnapshotId(input: unknown): string {
+  if (!input || typeof input !== "object" || !("snapshotId" in input)) {
+    return "00000000"
+  }
+  const parsed = resticSnapshotIdSchema.safeParse(input.snapshotId)
+  return parsed.success ? parsed.data : "00000000"
+}
+
+function fallbackBackupTaskInput(
+  row: typeof RelayBackupTaskRowSchema.Type
+): BackupTaskInput | null {
+  const parsed = parseBackupTaskInputJson(row.inputJson)
+  const target = fallbackBackupTarget(parsed)
+  const snapshotId = fallbackSnapshotId(parsed)
+  const candidate =
+    row.kind === "export"
+      ? {
+          backupId: row.backupId,
+          kind: "export" as const,
+          snapshotId,
+          target,
+          taskId: row.taskId,
+          ttlMs: BACKUP_EXPORT_TTL_MIN_MS,
+        }
+      : row.kind === "prune"
+        ? {
+            backupId: row.backupId,
+            kind: "prune" as const,
+            target,
+            taskId: row.taskId,
+          }
+        : row.kind === "restore"
+          ? {
+              backupId: row.backupId,
+              kind: "restore" as const,
+              source: {
+                bytes: 0,
+                checksumSha256: "0".repeat(64),
+                kind: "local" as const,
+              },
+              target,
+              taskId: row.taskId,
+            }
+          : row.kind === "delete"
+            ? {
+                backupId: row.backupId,
+                destination: { kind: "local" as const },
+                kind: "delete" as const,
+                target,
+                taskId: row.taskId,
+              }
+            : {
+                artifactKind: "archive" as const,
+                backupId: row.backupId,
+                destination: { kind: "local" as const },
+                exclude: [],
+                kind: "create" as const,
+                maxBytes: null,
+                mode: "full" as const,
+                reason: "manual" as const,
+                target,
+                taskId: row.taskId,
+              }
+  const decoded = backupTaskInputSchema.safeParse(candidate)
+  return decoded.success ? decoded.data : null
+}
+
+function fallbackFailedBackupTask(
+  row: typeof RelayBackupTaskRowSchema.Type
+): RelayBackupTask | null {
+  if (
+    row.status !== "cancelled" &&
+    row.status !== "failed" &&
+    row.status !== "succeeded"
+  ) {
+    return null
+  }
+  const input = fallbackBackupTaskInput(row)
+  if (!input) return null
+  const decoded = relayBackupTaskSchema.safeParse({
+    backupId: row.backupId,
+    bytesCompleted: row.bytesCompleted,
+    bytesTotal: row.bytesTotal,
+    createdAt: row.createdAt,
+    currentArtifactId: null,
+    currentPath: null,
+    error: row.error ?? UNPARSEABLE_BACKUP_TASK_ERROR,
+    finishedAt: row.finishedAt ?? row.updatedAt,
+    input,
+    inputRefreshRequired: false,
+    kind: row.kind,
+    phase: null,
+    result: null,
+    startedAt: row.startedAt,
+    status: "failed",
+    taskId: row.taskId,
+    updatedAt: row.updatedAt,
+  })
+  return decoded.success ? decoded.data : null
 }
