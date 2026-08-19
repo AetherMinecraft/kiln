@@ -6,6 +6,7 @@ import {
   CircleAlert,
   LoaderCircle,
   Play,
+  RefreshCw,
   Rocket,
   Save,
 } from "lucide-react"
@@ -17,6 +18,15 @@ import type {
 
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@workspace/ui/components/dialog"
+import { showToast } from "@workspace/ui/components/sonner"
 
 import {
   BrickSelectDialog,
@@ -155,6 +165,7 @@ const StartupForm = React.memo(function StartupForm({
     () => observedState !== "running"
   )
   const [swapOpen, setSwapOpen] = React.useState(false)
+  const [reinstallOpen, setReinstallOpen] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [saved, setSaved] = React.useState(false)
 
@@ -189,7 +200,37 @@ const StartupForm = React.memo(function StartupForm({
       window.setTimeout(() => setSaved(false), 2_000)
     },
   })
-  const pending = saveMutation.isPending
+  const reinstallMutation = useMutation({
+    mutationFn: updateInstanceStartup,
+    onSuccess: async (updated) => {
+      queryClient.setQueryData<RelayFleetSnapshot>(
+        queryKeys.relay.snapshot,
+        (current) => {
+          const previous = current?.instances.find(
+            (item) => item.id === updated.id && item.relayId === relayId
+          )
+          return replaceRelaySnapshotInstance(current, {
+            ...updated,
+            name: previous?.name ?? updated.name,
+            relayId,
+          })
+        }
+      )
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["relay", relayId, "instances", instanceId, "startup"],
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.relay.snapshot }),
+      ])
+      setReinstallOpen(false)
+      showToast({
+        type: "success",
+        message: "Brick reinstalled",
+        description: "The container was rebuilt from the current Ember image.",
+      })
+    },
+  })
+  const pending = saveMutation.isPending || reinstallMutation.isPending
   const submittingRef = React.useRef(false)
 
   function applyBrickSelection(selection: BrickSelection) {
@@ -289,6 +330,44 @@ const StartupForm = React.memo(function StartupForm({
     )
   }
 
+  async function onReinstall() {
+    if (!canEdit || pending || submittingRef.current) return
+    setError(null)
+    submittingRef.current = true
+    await Effect.runPromise(
+      Effect.tryPromise({
+        try: () =>
+          reinstallMutation.mutateAsync({
+            data: {
+              diskLimitBytes: initialLimits.diskBytes,
+              instanceId,
+              recipe: initialBrickSource,
+              reinstall: true,
+              relayId,
+              start: observedState === "running",
+              variables: initialVariables,
+            },
+          }),
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.sync(() =>
+            setError(
+              cause instanceof Error
+                ? cause.message
+                : "Could not reinstall Brick"
+            )
+          )
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            submittingRef.current = false
+          })
+        )
+      )
+    )
+  }
+
   const configuredMemoryBytes =
     resolvedMemoryBytes(view.memoryTemplate, variables) ??
     initialLimits.memoryBytes
@@ -306,24 +385,11 @@ const StartupForm = React.memo(function StartupForm({
   return (
     <section className="min-h-0 flex-1 overflow-y-auto bg-card">
       <div className="mx-auto max-w-3xl px-5 py-6 sm:px-8 sm:py-8">
-        <div className="flex flex-col gap-1">
-          <p className="font-mono text-[0.5625rem] tracking-[0.18em] text-primary uppercase">
-            Startup
-          </p>
-          <h2 className="font-heading text-xl font-semibold tracking-[-0.03em]">
-            Brick configuration
-          </h2>
-          <p className="max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            These options come from the Brick recipe. Saving rebuilds the
-            container with the same data volume
-            {startAfterSave ? " and starts it" : ""}.
-          </p>
-        </div>
-
         <BrickSummary
           view={view}
           canEdit={canEdit}
           pending={pending}
+          onReinstall={() => setReinstallOpen(true)}
           onSwap={() => setSwapOpen(true)}
         />
 
@@ -332,7 +398,7 @@ const StartupForm = React.memo(function StartupForm({
           canEdit={canEdit}
           configuredMemoryBytes={configuredMemoryBytes}
           diskLimitGiB={diskLimitGiB}
-          error={error}
+          error={reinstallOpen ? null : error}
           pending={pending}
           saved={saved}
           startAfterSave={startAfterSave}
@@ -354,15 +420,31 @@ const StartupForm = React.memo(function StartupForm({
       </div>
 
       {canEdit ? (
-        <StartupBrickSwapDialog
-          open={swapOpen}
-          onOpenChange={setSwapOpen}
-          bricks={catalogQuery.data?.bricks ?? emptyBricks}
-          loading={catalogQuery.isPending}
-          error={catalogQuery.error?.message ?? null}
-          initial={swapInitial}
-          onConfirm={applyBrickSelection}
-        />
+        <>
+          <StartupBrickSwapDialog
+            open={swapOpen}
+            onOpenChange={setSwapOpen}
+            bricks={catalogQuery.data?.bricks ?? emptyBricks}
+            loading={catalogQuery.isPending}
+            error={catalogQuery.error?.message ?? null}
+            initial={swapInitial}
+            onConfirm={applyBrickSelection}
+          />
+          <StartupBrickReinstallDialog
+            brickName={initialBrick.metadata.name}
+            error={reinstallOpen ? error : null}
+            open={reinstallOpen}
+            pending={reinstallMutation.isPending}
+            onOpenChange={(open) => {
+              if (reinstallMutation.isPending) return
+              setReinstallOpen(open)
+              if (open) setError(null)
+            }}
+            onConfirm={() => {
+              void onReinstall()
+            }}
+          />
+        </>
       ) : null}
     </section>
   )
@@ -488,31 +570,44 @@ function BrickSummary({
   view,
   canEdit,
   pending,
+  onReinstall,
   onSwap,
 }: {
   view: BrickView
   canEdit: boolean
   pending: boolean
+  onReinstall: () => void
   onSwap: () => void
 }) {
   return (
     <WorkspaceSummaryCard
       action={
         canEdit ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            disabled={pending}
-            onClick={onSwap}
-          >
-            <ArrowLeftRight />
-            Swap Brick
-          </Button>
+          <div className="flex shrink-0 flex-wrap justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={pending}
+              onClick={onReinstall}
+            >
+              <RefreshCw />
+              Reinstall
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={pending}
+              onClick={onSwap}
+            >
+              <ArrowLeftRight />
+              Swap Brick
+            </Button>
+          </div>
         ) : null
       }
-      className="mt-6 bg-background/45"
+      className="bg-background/45"
       icon={<ServerTypeIcon implementation={view.id} className="size-5" />}
       title={view.name}
       titleAccessory={
@@ -634,3 +729,65 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
     />
   )
 })
+
+const StartupBrickReinstallDialog = React.memo(
+  function StartupBrickReinstallDialog({
+    brickName,
+    error,
+    open,
+    pending,
+    onOpenChange,
+    onConfirm,
+  }: {
+    brickName: string
+    error: string | null
+    open: boolean
+    pending: boolean
+    onOpenChange: (open: boolean) => void
+    onConfirm: () => void
+  }) {
+    return (
+      <Dialog
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (pending) return
+          onOpenChange(nextOpen)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Reinstall {brickName}</DialogTitle>
+            <DialogDescription>
+              Rebuilds the container from the current Ember image. World data and
+              files stay on the volume. Unsaved Startup changes are not applied.
+            </DialogDescription>
+          </DialogHeader>
+          {error ? (
+            <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 text-xs text-destructive">
+              <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+              {error}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={pending}
+              onClick={() => onOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            <Button type="button" disabled={pending} onClick={onConfirm}>
+              {pending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <RefreshCw />
+              )}
+              {pending ? "Reinstalling…" : "Reinstall"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    )
+  }
+)

@@ -440,6 +440,7 @@ export const relayCreateInstanceSchema = z.object({
 export const relayUpdateInstanceStartupSchema = z.object({
   diskLimitBytes: relayRequestedDiskLimitBytesSchema.optional(),
   recipe: brickSourceSchema.optional(),
+  reinstall: z.boolean().optional(),
   tailscale: relayInstanceTailscaleSchema.optional(),
   variables: brickVariableValuesSchema,
   start: z.boolean().default(true),

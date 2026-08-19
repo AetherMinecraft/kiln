@@ -1938,6 +1938,7 @@ export class LifecycleDriver {
       lifecycleOperation(() =>
         this.#provisionManagedInstance({
           diskLimitBytes,
+          forcePull: input.reinstall === true,
           grandfatheredDiskLimitBytes: existing.limits.diskBytes,
           id: existing.id,
           prepareDirectory: false,
@@ -1961,6 +1962,7 @@ export class LifecycleDriver {
 
   async #provisionManagedInstance(input: {
     diskLimitBytes: number
+    forcePull?: boolean
     grandfatheredDiskLimitBytes: number
     id: string
     prepareDirectory: boolean
@@ -2083,11 +2085,15 @@ export class LifecycleDriver {
     }
     if (networking?.enabled) await this.#ensureInfrastructure(networking, false)
     let managedInstallationMarker: string | null = null
-    if (installationMarker) {
+    const pullImage = () =>
+      lifecycleOperation(() =>
+        command("docker", ["pull", image], { timeout: 300_000 })
+      )
+    if (input.forcePull) {
+      await runLifecycle(pullImage())
+    } else if (installationMarker) {
       await runLifecycle(
-        lifecycleOperation(() =>
-          command("docker", ["pull", image], { timeout: 300_000 })
-        ).pipe(
+        pullImage().pipe(
           Effect.catch(() =>
             lifecycleOperation(() =>
               command("docker", ["image", "inspect", image])
@@ -2096,6 +2102,17 @@ export class LifecycleDriver {
           Effect.asVoid
         )
       )
+    } else {
+      await runLifecycle(
+        lifecycleOperation(() =>
+          command("docker", ["image", "inspect", image])
+        ).pipe(
+          Effect.catch(() => pullImage()),
+          Effect.asVoid
+        )
+      )
+    }
+    if (installationMarker) {
       const protocol = await runLifecycle(
         lifecycleOperation(() =>
           command("docker", [
@@ -2110,19 +2127,6 @@ export class LifecycleDriver {
       if (supportsInstallationMarkerProtocol(protocol)) {
         managedInstallationMarker = installationMarker
       }
-    } else {
-      await runLifecycle(
-        lifecycleOperation(() =>
-          command("docker", ["image", "inspect", image])
-        ).pipe(
-          Effect.catch(() =>
-            lifecycleOperation(() =>
-              command("docker", ["pull", image], { timeout: 300_000 })
-            )
-          ),
-          Effect.asVoid
-        )
-      )
     }
 
     const reservedPorts: Array<{
