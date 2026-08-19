@@ -8,6 +8,9 @@ import {
   defaultBrickVariables,
   defaultBrickRuntimeName,
   hydrateBrickVariables,
+  missingRequiredBrickVersion,
+  recommendedSupportedJavaVersion,
+  supportedJavaVersions,
   unavailableMinecraftJavaVersion,
   withRecommendedMinecraftJava,
 } from "./brick-variables.js"
@@ -97,6 +100,38 @@ describe("Minecraft Java defaults", () => {
         { java_version: "21", version: "26.2" }
       )
     ).toEqual({ version: "26.2", java_version: "21" })
+  })
+
+  it("lists only published Java Embers the Brick accepts", () => {
+    expect(supportedJavaVersions(paper.variables.java_version)).toEqual([
+      "11",
+      "17",
+      "21",
+      "25",
+    ])
+    expect(
+      recommendedSupportedJavaVersion("paper", paper.variables.java_version, "1.21.11")
+    ).toBe("21")
+    expect(
+      recommendedSupportedJavaVersion("paper", paper.variables.java_version, "26.2")
+    ).toBe("25")
+    expect(
+      recommendedSupportedJavaVersion("paper", paper.variables.java_version, "1.16.5")
+    ).toBe("17")
+  })
+
+  it("blocks a required version with no default until a value is submitted", () => {
+    const requiredVersion = {
+      ...paper.variables.version,
+      default: undefined,
+    }
+    expect(missingRequiredBrickVersion(requiredVersion, "")).toBe(true)
+    expect(missingRequiredBrickVersion(requiredVersion, "   ")).toBe(true)
+    expect(missingRequiredBrickVersion(requiredVersion, null)).toBe(true)
+    expect(missingRequiredBrickVersion(requiredVersion, "1.21.11")).toBe(false)
+    expect(
+      missingRequiredBrickVersion(paper.variables.version, "")
+    ).toBe(false)
   })
 
   it("reports required Java Embers that are not published", () => {

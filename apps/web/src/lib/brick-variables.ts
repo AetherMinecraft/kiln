@@ -16,6 +16,14 @@ export function updateBrickVariable(
   return updated
 }
 
+export function missingRequiredBrickVersion(
+  definition: Brick["variables"][string] | undefined,
+  submitted: unknown
+): boolean {
+  if (!definition?.required || definition.default !== undefined) return false
+  return typeof submitted !== "string" || submitted.trim() === ""
+}
+
 export function defaultBrickVariables(
   brick: Brick
 ): Record<string, BrickVariableValue> {
@@ -46,6 +54,33 @@ export function hydrateBrickVariables(
         brick.variables,
         variables
       )
+}
+
+const PUBLISHED_JAVA_EMBERS = ["11", "17", "21", "25"] as const
+
+export function supportedJavaVersions(
+  definition: Brick["variables"][string]
+): Array<string> {
+  if (definition.type !== "string") return []
+  const candidates = definition.options?.length
+    ? definition.options.map(String)
+    : PUBLISHED_JAVA_EMBERS
+  return candidates.filter((version) => stringVariableAllows(definition, version))
+}
+
+export function recommendedSupportedJavaVersion(
+  brickId: string,
+  definition: Brick["variables"][string],
+  minecraftVersion: string
+): string | null {
+  const supported = supportedJavaVersions(definition)
+  if (supported.length === 0) return null
+  const required = requiredMinecraftJavaVersion(brickId, minecraftVersion)
+  if (required && supported.includes(required)) return required
+  const fallback =
+    definition.default === undefined ? null : String(definition.default)
+  if (fallback && supported.includes(fallback)) return fallback
+  return supported.at(-1) ?? null
 }
 
 export function withRecommendedMinecraftJava(

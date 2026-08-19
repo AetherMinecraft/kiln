@@ -34,6 +34,9 @@ import { brickArtifactCatalog } from "@/lib/brick-artifact"
 import {
   defaultBrickInstanceName,
   defaultBrickVariables,
+  missingRequiredBrickVersion,
+  recommendedSupportedJavaVersion,
+  supportedJavaVersions,
   unavailableMinecraftJavaVersion,
   withRecommendedMinecraftJava,
 } from "@/lib/brick-variables"
@@ -137,7 +140,7 @@ const AddServerDialog = React.memo(function AddServerDialog({
                 </p>
                 <p className="mt-1 text-[0.6875rem] text-muted-foreground">
                   {catalogQuery.error?.message ??
-                    "Connect a Relay to load official Bricks."}
+                    "Connect a Relay to load verified Bricks."}
                 </p>
               </div>
             )}
@@ -317,9 +320,27 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
       return
     }
     const submittedVersion = formData.get("version")
+    const submittedJavaVersion = formData.get("java_version")
+    if (
+      selection.kind === "catalog" &&
+      missingRequiredBrickVersion(
+        selection.brick.variables.version,
+        submittedVersion
+      )
+    ) {
+      setFailure({
+        selectionIdentity,
+        message: "Select a Minecraft version",
+      })
+      return
+    }
     const configured =
       selection.kind === "catalog"
-        ? catalogVariablesForVersion(selection.brick, submittedVersion)
+        ? catalogVariablesForVersion(
+            selection.brick,
+            submittedVersion,
+            submittedJavaVersion
+          )
         : { unavailableJavaVersion: null, variables: {}, version: null }
     if (configured.unavailableJavaVersion && configured.version) {
       setFailure({
@@ -421,9 +442,6 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
             GiB
           </span>
         </span>
-        <span className="block text-[0.5625rem] leading-relaxed font-normal text-muted-foreground/65">
-          Counts server files only; backups remain outside this allocation.
-        </span>
       </label>
       <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
         <span>Relay</span>
@@ -466,7 +484,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
                       value={relay.id}
                       disabled={!compatible}
                     >
-                      {relay.name} - {relayDisplayHost(relay)}
+                      {relay.name}
                       {compatible
                         ? ""
                         : ` — incompatible (${displayArchitecture(relay.nodeArch)})`}
@@ -545,7 +563,8 @@ function diskLimitBytesFromFormValue(
 
 function catalogVariablesForVersion(
   brick: Brick,
-  value: FormDataEntryValue | null
+  value: FormDataEntryValue | null,
+  javaValue: FormDataEntryValue | null
 ): {
   unavailableJavaVersion: string | null
   variables: Record<string, BrickVariableValue>
@@ -553,33 +572,30 @@ function catalogVariablesForVersion(
 } {
   const variables = defaultBrickVariables(brick)
   const version = typeof value === "string" ? value.trim() : ""
+  const javaVersion = typeof javaValue === "string" ? javaValue.trim() : ""
   if (!version) {
     return { unavailableJavaVersion: null, variables, version: null }
   }
   variables.version = version
+  if (javaVersion) variables.java_version = javaVersion
   const unavailableJavaVersion = unavailableMinecraftJavaVersion(
     brick.metadata.id,
     brick.variables,
-    version
+    version,
+    javaVersion || undefined
   )
   return {
     unavailableJavaVersion,
-    variables: unavailableJavaVersion
-      ? variables
-      : withRecommendedMinecraftJava(
-          brick.metadata.id,
-          brick.variables,
-          variables
-        ),
+    variables:
+      javaVersion || unavailableJavaVersion
+        ? variables
+        : withRecommendedMinecraftJava(
+            brick.metadata.id,
+            brick.variables,
+            variables
+          ),
     version,
   }
-}
-
-function relayDisplayHost(relay: PersistedRelay): string {
-  return Result.getOrElse(
-    Result.try(() => new URL(relay.browserOrigin).hostname || relay.hostname),
-    () => relay.hostname
-  )
 }
 
 function relaySupportsSelection(
@@ -631,46 +647,100 @@ const MinecraftVersionField = React.memo(function MinecraftVersionField({
     (versionsQuery.isPending || versions.length > 0)
   const required =
     definition.required && definition.default === undefined
+  const javaDefinition =
+    selection?.kind === "catalog"
+      ? javaVersionDefinition(selection.brick)
+      : null
+  const javaVersions = React.useMemo(
+    () => (javaDefinition ? supportedJavaVersions(javaDefinition) : []),
+    [javaDefinition]
+  )
+  const recommendedJava =
+    selection?.kind === "catalog" && javaDefinition
+      ? recommendedSupportedJavaVersion(
+          selection.brick.metadata.id,
+          javaDefinition,
+          version
+        )
+      : null
+  const [javaVersion, setJavaVersion] = React.useState(
+    recommendedJava ?? javaVersions.at(-1) ?? ""
+  )
+  const javaLabelId = React.useId()
+  const changeVersion = React.useCallback(
+    (nextVersion: string) => {
+      setVersion(nextVersion)
+      if (selection?.kind !== "catalog" || !javaDefinition) return
+      const nextJava = recommendedSupportedJavaVersion(
+        selection.brick.metadata.id,
+        javaDefinition,
+        nextVersion
+      )
+      if (nextJava) setJavaVersion(nextJava)
+    },
+    [javaDefinition, selection]
+  )
 
   return (
-    <div className="block space-y-1.5 text-xs font-medium text-muted-foreground">
-      <span className="flex items-center justify-between gap-3">
+    <div className="flex items-start gap-2">
+      <div className="min-w-0 flex-1 space-y-1.5 text-xs font-medium text-muted-foreground">
         <span id={labelId}>{definition.label}</span>
-        {definition.default === undefined ? null : (
-          <span className="font-mono text-[0.5625rem] font-normal tracking-[0.06em] text-muted-foreground/60 uppercase">
-            {String(definition.default)} default
-          </span>
+        {usePicker ? (
+          <BrickVersionPicker
+            labelledBy={labelId}
+            name="version"
+            value={version}
+            versions={versions}
+            disabled={disabled}
+            loading={versionsQuery.isPending}
+            required={required}
+            onChange={changeVersion}
+          />
+        ) : (
+          <Input
+            aria-labelledby={labelId}
+            name="version"
+            value={version}
+            onChange={(event) => changeVersion(event.currentTarget.value)}
+            placeholder="Enter a version"
+            pattern={definition.rules?.pattern}
+            minLength={definition.rules?.minLength}
+            maxLength={definition.rules?.maxLength}
+            disabled={disabled}
+            className="font-mono tabular-nums"
+            required={required}
+          />
         )}
-      </span>
-      {usePicker ? (
-        <BrickVersionPicker
-          labelledBy={labelId}
-          name="version"
-          value={version}
-          versions={versions}
-          disabled={disabled}
-          loading={versionsQuery.isPending}
-          required={required}
-          onChange={setVersion}
-        />
-      ) : (
-        <Input
-          aria-labelledby={labelId}
-          name="version"
-          value={version}
-          onChange={(event) => setVersion(event.currentTarget.value)}
-          placeholder="Enter a version"
-          pattern={definition.rules?.pattern}
-          minLength={definition.rules?.minLength}
-          maxLength={definition.rules?.maxLength}
-          disabled={disabled}
-          className="font-mono tabular-nums"
-          required={required}
-        />
-      )}
-      <span className="block text-[0.5625rem] leading-relaxed font-normal text-muted-foreground/65">
-        {definition.description}
-      </span>
+      </div>
+      {javaDefinition && javaVersions.length > 0 ? (
+        <div className="w-[5.75rem] shrink-0 space-y-1.5 text-xs font-medium text-muted-foreground">
+          <span id={javaLabelId}>Java</span>
+          <input type="hidden" name="java_version" value={javaVersion} />
+          <Select
+            value={javaVersion}
+            onValueChange={setJavaVersion}
+            disabled={disabled}
+          >
+            <SelectTrigger
+              aria-labelledby={javaLabelId}
+              className="h-8 w-full px-2.5 font-mono text-xs tabular-nums"
+            >
+              <SelectValue placeholder="Java" />
+            </SelectTrigger>
+            <SelectContent className="z-[70]">
+              {javaVersions.map((option) => (
+                <SelectItem
+                  key={option}
+                  className="font-mono text-xs tabular-nums"
+                  value={option}
+                >
+                  {option}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      ) : null}
     </div>
   )
 })
@@ -725,6 +795,11 @@ function minecraftVersionDefinition(selection: BrickSelection | null) {
     return null
   }
   const definition = selection.brick.variables.version
+  return definition?.type === "string" ? definition : null
+}
+
+function javaVersionDefinition(brick: Brick) {
+  const definition = brick.variables.java_version
   return definition?.type === "string" ? definition : null
 }
 
