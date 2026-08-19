@@ -40,7 +40,6 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
   value: string
   versions: ReadonlyArray<string>
 }) {
-  const inputRef = React.useRef<HTMLInputElement>(null)
   const anchorRef = React.useRef<HTMLDivElement>(null)
   const contentRef = React.useRef<HTMLDivElement>(null)
   const listId = React.useId()
@@ -86,6 +85,8 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
     return () => window.cancelAnimationFrame(frame)
   }, [open, sideLocked])
 
+  const discardEditRef = React.useRef(false)
+
   const resetMenu = React.useCallback(() => {
     setOpen(false)
     setHasTyped(false)
@@ -102,11 +103,14 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
     [onChange, resetMenu]
   )
 
-  const close = React.useCallback(() => {
-    if (typedVersion) onChange(typedVersion)
-    setQuery(typedVersion || value)
-    resetMenu()
-  }, [onChange, resetMenu, typedVersion, value])
+  const closeMenu = React.useCallback(
+    (commit: boolean) => {
+      if (commit && typedVersion) onChange(typedVersion)
+      setQuery(commit ? typedVersion || value : value)
+      resetMenu()
+    },
+    [onChange, resetMenu, typedVersion, value]
+  )
 
   const openMenu = React.useCallback(() => {
     setOpen(true)
@@ -125,15 +129,20 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
   return (
     <Popover
       open={open}
-      onOpenChange={(nextOpen) => {
-        if (nextOpen) openMenu()
-        else close()
+      onOpenChange={(nextOpen, eventDetails) => {
+        if (nextOpen) {
+          openMenu()
+          return
+        }
+        const discard =
+          discardEditRef.current || eventDetails.reason === "escape-key"
+        discardEditRef.current = false
+        closeMenu(!discard)
       }}
     >
       <PopoverAnchor asChild>
         <div ref={anchorRef} className="relative">
           <Input
-            ref={inputRef}
             aria-autocomplete="list"
             aria-controls={open ? listId : undefined}
             aria-expanded={open}
@@ -166,9 +175,9 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
             onKeyDown={(event) => {
               if (event.key === "Escape") {
                 event.preventDefault()
-                setQuery(value)
-                resetMenu()
-                inputRef.current?.blur()
+                event.stopPropagation()
+                discardEditRef.current = true
+                closeMenu(false)
                 return
               }
               if (event.key === "Enter") {
