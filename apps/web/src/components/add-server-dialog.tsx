@@ -16,6 +16,13 @@ import {
   DialogTitle,
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@workspace/ui/components/select"
 
 import {
   BrickCatalogBrowser,
@@ -54,6 +61,7 @@ export interface AddServerDialogStore {
 
 const closedState: AddServerDialogState = { kind: "closed" }
 const GIBIBYTE_BYTES = 1024 ** 3
+const NO_RELAY_OPTION_VALUE = "__no-relay-option__"
 
 export function createAddServerDialogStore(): AddServerDialogStore {
   let state = closedState
@@ -441,38 +449,56 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
       </label>
       <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
         <span>Relay</span>
-        <select
+        <Select
           value={relayId}
-          onChange={(event) => onRelayIdChange(event.target.value)}
+          onValueChange={(value) => {
+            if (value !== NO_RELAY_OPTION_VALUE) onRelayIdChange(value)
+          }}
           disabled={pending}
-          className="h-8 w-full rounded-md border border-input bg-input/18 px-2.5 text-sm transition-[border-color,background-color,box-shadow] duration-150 outline-none hover:bg-input/24 focus-visible:border-ring/75 focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
           required
         >
-          {relays.length === 0 ? (
-            <option value="">No Relays available</option>
-          ) : (
-            <>
-              {compatibleRelays.length === 0 ? (
-                <option value="">No compatible Relays</option>
-              ) : null}
-              {relays.map((relay) => {
-                const compatible = relaySupportsSelection(relay, selection)
-                return (
-                  <option
-                    key={relay.id}
-                    value={relay.id}
-                    disabled={!compatible}
-                  >
-                    {relay.name} - {relayDisplayHost(relay)}
-                    {compatible
-                      ? ""
-                      : ` — incompatible (${displayArchitecture(relay.nodeArch)})`}
-                  </option>
-                )
-              })}
-            </>
-          )}
-        </select>
+          <SelectTrigger className="h-8 w-full [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:overflow-hidden [&_[data-slot=select-value]]:text-left [&_[data-slot=select-value]]:text-ellipsis [&_[data-slot=select-value]]:whitespace-nowrap">
+            <SelectValue
+              placeholder={
+                relays.length === 0
+                  ? "No Relays available"
+                  : compatibleRelays.length === 0
+                    ? "No compatible Relays"
+                    : "Select a Relay"
+              }
+            />
+          </SelectTrigger>
+          <SelectContent>
+            {relays.length === 0 ? (
+              <SelectItem value={NO_RELAY_OPTION_VALUE} disabled>
+                No Relays available
+              </SelectItem>
+            ) : (
+              <>
+                {compatibleRelays.length === 0 ? (
+                  <SelectItem value={NO_RELAY_OPTION_VALUE} disabled>
+                    No compatible Relays
+                  </SelectItem>
+                ) : null}
+                {relays.map((relay) => {
+                  const compatible = relaySupportsSelection(relay, selection)
+                  return (
+                    <SelectItem
+                      key={relay.id}
+                      value={relay.id}
+                      disabled={!compatible}
+                    >
+                      {relay.name} - {relayDisplayHost(relay)}
+                      {compatible
+                        ? ""
+                        : ` — incompatible (${displayArchitecture(relay.nodeArch)})`}
+                    </SelectItem>
+                  )
+                })}
+              </>
+            )}
+          </SelectContent>
+        </Select>
       </label>
 
       {error ? (
