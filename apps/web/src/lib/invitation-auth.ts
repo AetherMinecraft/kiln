@@ -1,3 +1,5 @@
+import { Result } from "effect"
+
 const INVITE_TOKEN_MIN_LENGTH = 32
 
 export function invitePath(token: string): string {
@@ -8,15 +10,13 @@ export function inviteTokenFromRedirect(
   redirectPath: string | undefined
 ): string | null {
   if (!redirectPath?.startsWith("/invite?")) return null
-  try {
-    const token = new URL(redirectPath, "http://kiln.local").searchParams.get(
-      "token"
+  const token = Result.getOrNull(
+    Result.try(() =>
+      new URL(redirectPath, "http://kiln.local").searchParams.get("token")
     )
-    if (!token || token.length < INVITE_TOKEN_MIN_LENGTH) return null
-    return token
-  } catch {
-    return null
-  }
+  )
+  if (!token || token.length < INVITE_TOKEN_MIN_LENGTH) return null
+  return token
 }
 
 export function invitationDestination(invitation: {

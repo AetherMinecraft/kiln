@@ -14,6 +14,7 @@ describe("invitation auth helpers", () => {
     expect(inviteTokenFromRedirect(path)).toBe(token)
     expect(inviteTokenFromRedirect(`/?redirect=${path}`)).toBeNull()
     expect(inviteTokenFromRedirect("/invite?token=short")).toBeNull()
+    expect(inviteTokenFromRedirect("/invite?://")).toBeNull()
   })
 
   it("sends accepted invitations to the invited resource", () => {
