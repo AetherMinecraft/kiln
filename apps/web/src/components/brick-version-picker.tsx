@@ -113,6 +113,7 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
   )
 
   const openMenu = React.useCallback(() => {
+    discardEditRef.current = false
     setOpen(true)
     setHasTyped(false)
     setSideLocked(false)
@@ -178,6 +179,7 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
                 event.stopPropagation()
                 discardEditRef.current = true
                 closeMenu(false)
+                discardEditRef.current = false
                 return
               }
               if (event.key === "Enter") {
