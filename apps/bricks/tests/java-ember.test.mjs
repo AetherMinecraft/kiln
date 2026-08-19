@@ -15,6 +15,15 @@ import { fileURLToPath } from "node:url"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 
+test("the Java Ember jlink runtime includes the Java SE API set", async () => {
+  const dockerfile = await readFile(join(root, "embers/java/Dockerfile"), "utf8")
+  assert.match(dockerfile, /\bjava\.se\b/u)
+  assert.match(dockerfile, /\bjdk\.unsupported\b/u)
+  assert.match(dockerfile, /\bjdk\.incubator\.vector\b/u)
+  assert.match(dockerfile, /\bfontconfig\b/u)
+  assert.match(dockerfile, /\blibfreetype6\b/u)
+})
+
 test("the Java Ember reports a terminal download failure and removes the partial artifact", async (context) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "kiln-java-ember-"))
   context.after(() => rm(temporaryDirectory, { force: true, recursive: true }))
