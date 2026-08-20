@@ -26,8 +26,7 @@ available; do not stop at providing command examples.
   or remove a legacy profile directly. A failed native migration leaves the
   plaintext credential pending so later use can retry. Headless or unsupported
   systems fall back to the owner-only config file and report that fallback
-  during login. Credential writes are non-interactive; do not ask the user to
-  re-enter a saved token or macOS password at a native credential prompt.
+  during login.
 - Do not inspect the saved config file unless authentication or profile
   resolution itself is being debugged. If inspection is necessary, redact the
   complete token value.

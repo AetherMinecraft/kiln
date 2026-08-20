@@ -44,53 +44,39 @@ export function credentialManagersForPlatform(
 export function macosKeychainCredentialManager(
   run: CredentialCommandRunner = runCredentialCommand
 ): CredentialManager {
-  const baseArguments = (account: string) => [
-    "-a",
-    account,
-    "-s",
-    KILN_CREDENTIAL_SERVICE,
-  ]
+  const command = (
+    operation: "delete" | "get" | "set",
+    account: string,
+    password?: string
+  ): CredentialCommand => ({
+    arguments: ["-l", "JavaScript", "-e", MACOS_KEYCHAIN_SCRIPT],
+    executable: "/usr/bin/osascript",
+    input: JSON.stringify({
+      account,
+      operation,
+      password,
+      service: KILN_CREDENTIAL_SERVICE,
+    }),
+  })
   return {
     id: "macos-keychain-v1",
     label: "macOS Keychain",
     deletePassword: async (account, signal) => {
-      const result = await run(
-        {
-          arguments: ["delete-generic-password", ...baseArguments(account)],
-          executable: "/usr/bin/security",
-        },
-        signal
-      )
-      if (result.exitCode === 0) return true
-      if (result.exitCode === 44) return false
-      throw credentialCommandFailure("delete a macOS Keychain credential")
+      const result = await run(command("delete", account), signal)
+      if (result.exitCode !== 0) {
+        throw credentialCommandFailure("delete a macOS Keychain credential")
+      }
+      return parseMacosKeychainResult(result.stdout).deleted === true
     },
     getPassword: async (account, signal) => {
-      const result = await run(
-        {
-          arguments: ["find-generic-password", ...baseArguments(account), "-w"],
-          executable: "/usr/bin/security",
-        },
-        signal
-      )
-      if (result.exitCode === 44) return null
+      const result = await run(command("get", account), signal)
       if (result.exitCode !== 0) {
         throw credentialCommandFailure("read a macOS Keychain credential")
       }
-      return trimTrailingLineBreak(result.stdout)
+      return parseMacosKeychainResult(result.stdout).password ?? null
     },
     setPassword: async (account, password, signal) => {
-      if (/\r|\n/u.test(account) || /\r|\n/u.test(password)) {
-        throw new Error("Kiln credentials cannot contain line breaks")
-      }
-      const result = await run(
-        {
-          arguments: ["-c", macosSetPasswordScript],
-          executable: "/usr/bin/expect",
-          input: `${account}\n${password}`,
-        },
-        signal
-      )
+      const result = await run(command("set", account, password), signal)
       if (result.exitCode !== 0) {
         throw credentialCommandFailure("store a macOS Keychain credential")
       }
@@ -188,39 +174,94 @@ export function runCredentialCommand(
   })
 }
 
-const macosSetPasswordScript = String.raw`
-log_user 0
-set timeout 15
-set account [gets stdin]
-set password [read stdin]
+const MACOS_KEYCHAIN_SCRIPT = String.raw`
+ObjC.import("Foundation")
+ObjC.import("Security")
+ObjC.bindFunction("SecItemAdd", ["int", ["id", "id *"]])
+ObjC.bindFunction("SecItemCopyMatching", ["int", ["id", "id *"]])
 
-proc exit_with_child_status {} {
-  set result [wait]
-  exit [lindex $result 3]
+const inputData = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile
+const inputText = ObjC.unwrap(
+  $.NSString.alloc.initWithDataEncoding(inputData, $.NSUTF8StringEncoding)
+)
+const input = JSON.parse(inputText)
+const itemNotFound = Number($.errSecItemNotFound)
+
+function dictionary() {
+  return $.NSMutableDictionary.dictionary
 }
 
-proc exit_after_timeout {} {
-  close
-  catch wait
-  exit 124
+function itemQuery() {
+  const query = dictionary()
+  query.setObjectForKey($("genp"), $("class"))
+  query.setObjectForKey($(input.account), $("acct"))
+  query.setObjectForKey($(input.service), $("svce"))
+  return query
 }
 
-spawn -noecho /usr/bin/security add-generic-password -U -a $account -s ${KILN_CREDENTIAL_SERVICE} -w
-expect {
-  -exact "password data for new item:" { send -- "$password\r" }
-  eof { exit_with_child_status }
-  timeout { exit_after_timeout }
+function passwordData() {
+  return $(input.password).dataUsingEncoding($.NSUTF8StringEncoding)
 }
-expect {
-  -exact "retype password for new item:" { send -- "$password\r" }
-  eof { exit_with_child_status }
-  timeout { exit_after_timeout }
+
+function ensureSuccess(status) {
+  if (status !== Number($.errSecSuccess)) {
+    throw new Error("Keychain Services failed with status " + status)
+  }
 }
-expect {
-  eof { exit_with_child_status }
-  timeout { exit_after_timeout }
+
+function main() {
+  const query = itemQuery()
+
+  if (input.operation === "set") {
+    const updates = dictionary()
+    updates.setObjectForKey(passwordData(), $("v_Data"))
+    let status = Number($.SecItemUpdate(query, updates))
+    if (status === itemNotFound) {
+      const item = $.NSMutableDictionary.dictionaryWithDictionary(query)
+      item.setObjectForKey(passwordData(), $("v_Data"))
+      status = Number($.SecItemAdd(item, Ref()))
+    }
+    ensureSuccess(status)
+    return JSON.stringify({ stored: true })
+  }
+
+  if (input.operation === "get") {
+    query.setObjectForKey($.NSNumber.numberWithBool(true), $("r_Data"))
+    const result = Ref()
+    const status = Number($.SecItemCopyMatching(query, result))
+    if (status === itemNotFound) return JSON.stringify({ password: null })
+    ensureSuccess(status)
+    const password = ObjC.unwrap(
+      $.NSString.alloc.initWithDataEncoding(result[0], $.NSUTF8StringEncoding)
+    )
+    return JSON.stringify({ password })
+  }
+
+  if (input.operation === "delete") {
+    const status = Number($.SecItemDelete(query))
+    if (status === itemNotFound) return JSON.stringify({ deleted: false })
+    ensureSuccess(status)
+    return JSON.stringify({ deleted: true })
+  }
+
+  throw new Error("Unsupported Keychain operation")
 }
+
+main()
 `
+
+interface MacosKeychainResult {
+  deleted?: boolean
+  password?: string | null
+}
+
+function parseMacosKeychainResult(stdout: string): MacosKeychainResult {
+  try {
+    return JSON.parse(stdout) as MacosKeychainResult
+  } catch {
+    throw credentialCommandFailure("parse a macOS Keychain response")
+  }
+}
 
 function powershellCommand(script: string, input: string): CredentialCommand {
   return {

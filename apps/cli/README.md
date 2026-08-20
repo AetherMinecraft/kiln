@@ -75,8 +75,6 @@ CLI needs their saved credential. Explicit token overrides bypass migration,
 and login or logout can replace or remove a legacy profile directly. If a
 native manager temporarily cannot store a legacy credential, the CLI uses the
 existing token for that command, leaves it pending, and retries on later use.
-Kiln supplies the credential to the native manager itself; login and migration
-do not ask you to re-enter the token in the terminal.
 
 When a supported system credential manager is unavailable, such as on a
 headless Linux host, the CLI falls back to storing the credential in the
