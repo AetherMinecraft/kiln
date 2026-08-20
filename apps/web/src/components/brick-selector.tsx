@@ -1,4 +1,5 @@
 import * as React from "react"
+import { useMutation, useQueryClient } from "@tanstack/react-query"
 import type { Brick } from "@workspace/contracts"
 import { Result } from "effect"
 import {
@@ -6,6 +7,7 @@ import {
   BookOpen,
   Check,
   FileCode2,
+  LoaderCircle,
   PackagePlus,
   Search,
   X,
@@ -20,6 +22,7 @@ import {
   DialogTitle,
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
+import { showToast } from "@workspace/ui/components/sonner"
 import {
   Select,
   SelectContent,
@@ -31,12 +34,15 @@ import { cn } from "@workspace/ui/lib/utils"
 
 import { ServerTypeIcon } from "@/components/server-type-icon"
 import { useKilnGitRepositorySlug } from "@/lib/git-repository"
+import { queryKeys } from "@/lib/query-options"
+import { saveCustomBrick } from "@/server/bricks"
 
 export type BrickSelection =
   | { kind: "catalog"; brick: Brick }
   | { kind: "custom"; source: string }
 
 type BrickCategoryId = "all" | "minecraft" | "steam" | "other"
+type BrickTabId = BrickCategoryId | "custom"
 type BrickSourceFilter = "all" | "verified" | "community"
 type BrickSort = "featured" | "name-asc" | "name-desc"
 
@@ -214,8 +220,121 @@ function filterAndSortBricks(
   })
 }
 
+function filterAndSortCustomBricks(
+  bricks: Array<Brick>,
+  query: string,
+  sort: BrickSort
+): Array<Brick> {
+  const normalized = query.trim().toLowerCase()
+  const filtered = normalized
+    ? bricks.reduce<Array<Brick>>((matches, brick) => {
+        if (brickSearchText(brick).indexOf(normalized) >= 0) matches.push(brick)
+        return matches
+      }, [])
+    : [...bricks]
+
+  if (sort === "name-asc") {
+    return filtered.sort((a, b) =>
+      a.metadata.name.localeCompare(b.metadata.name)
+    )
+  }
+  if (sort === "name-desc") {
+    return filtered.sort((a, b) =>
+      b.metadata.name.localeCompare(a.metadata.name)
+    )
+  }
+  return filtered
+}
+
+const BrickTabSidebar = React.memo(function BrickTabSidebar({
+  disabled,
+  tab,
+  onTabChange,
+}: {
+  disabled: boolean
+  tab: BrickTabId
+  onTabChange: (tab: BrickTabId) => void
+}) {
+  return (
+    <aside className="flex min-h-0 flex-col border-b border-border/60 md:border-r md:border-b-0">
+      <p className="px-3 pt-3 pb-2 font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
+        Categories
+      </p>
+      <nav className="flex gap-1 overflow-x-auto px-2 pb-2 md:flex-col md:overflow-y-auto md:pb-3">
+        {CATEGORIES.map((item) => {
+          const active = tab === item.id
+          return (
+            <button
+              key={item.id}
+              type="button"
+              disabled={disabled}
+              onClick={() => onTabChange(item.id)}
+              className={cn(
+                "relative shrink-0 rounded-md px-2.5 py-2 text-left text-xs transition-colors duration-150",
+                active
+                  ? "bg-primary/12 font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-accent/55 hover:text-foreground",
+                disabled && "pointer-events-none opacity-50"
+              )}
+            >
+              {active ? (
+                <span className="absolute top-1.5 bottom-1.5 left-0 w-0.5 rounded-full bg-primary md:left-0" />
+              ) : null}
+              <span className={cn(active && "pl-1.5")}>{item.label}</span>
+            </button>
+          )
+        })}
+      </nav>
+      <div className="mt-auto border-t border-border/60 p-2">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onTabChange("custom")}
+          className={cn(
+            "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs transition-colors duration-150",
+            tab === "custom"
+              ? "bg-primary/12 font-medium text-foreground"
+              : "text-muted-foreground hover:bg-accent/55 hover:text-foreground",
+            disabled && "pointer-events-none opacity-50"
+          )}
+        >
+          <PackagePlus className="size-3.5 shrink-0 text-primary" />
+          Custom Brick
+        </button>
+      </div>
+    </aside>
+  )
+})
+
+function useSaveCustomBrick(
+  onSelectionChange: (selection: BrickSelection | null) => void
+) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (source: string) => saveCustomBrick({ data: source }),
+    onSuccess: async (brick) => {
+      onSelectionChange({ kind: "catalog", brick })
+      showToast({
+        type: "success",
+        message: `${brick.metadata.name} saved`,
+        description: "This custom Brick is now available in your catalog.",
+      })
+      await queryClient.invalidateQueries({ queryKey: queryKeys.bricks })
+    },
+    onError: (cause) => {
+      showToast({
+        type: "error",
+        message: "Could not save custom Brick",
+        description:
+          cause instanceof Error ? cause.message : "Check the recipe URL.",
+      })
+    },
+  })
+}
+
 export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   bricks,
+  customBricks = EMPTY_BRICKS,
   selection,
   onSelectionChange,
   disabled = false,
@@ -224,6 +343,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   emptyMessage = "No bricks match these filters.",
 }: {
   bricks: Array<Brick>
+  customBricks?: Array<Brick>
   selection: BrickSelection | null
   onSelectionChange: (selection: BrickSelection | null) => void
   disabled?: boolean
@@ -232,27 +352,85 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   emptyMessage?: string
 }) {
   const gitRepositorySlug = useKilnGitRepositorySlug()
-  const [category, setCategory] = React.useState<BrickCategoryId>("all")
+  const customBrickSources = React.useMemo(
+    () => new Set(customBricks.map((brick) => brick.source)),
+    [customBricks]
+  )
+  const [tab, setTab] = React.useState<BrickTabId>(() =>
+    selection?.kind === "custom" ||
+    (selection?.kind === "catalog" &&
+      customBrickSources.has(selection.brick.source))
+      ? "custom"
+      : "all"
+  )
   const [query, setQuery] = React.useState("")
   const [sourceFilter, setSourceFilter] =
     React.useState<BrickSourceFilter>("all")
   const [sort, setSort] = React.useState<BrickSort>("featured")
 
   const catalogBricks = bricks.length > 0 ? bricks : EMPTY_BRICKS
-  const visibleBricks = React.useMemo(
-    () =>
-      filterAndSortBricks(catalogBricks, {
-        category,
-        gitRepositorySlug,
-        query,
-        sort,
-        sourceFilter,
-      }),
-    [catalogBricks, category, gitRepositorySlug, query, sort, sourceFilter]
-  )
+  const visibleBricks = React.useMemo(() => {
+    if (tab === "custom") {
+      return filterAndSortCustomBricks(customBricks, query, sort)
+    }
+    return filterAndSortBricks(catalogBricks, {
+      category: tab,
+      gitRepositorySlug,
+      query,
+      sort,
+      sourceFilter,
+    })
+  }, [
+    catalogBricks,
+    customBricks,
+    gitRepositorySlug,
+    query,
+    sort,
+    sourceFilter,
+    tab,
+  ])
+
+  const saveMutation = useSaveCustomBrick(onSelectionChange)
 
   const selectedCatalog = selection?.kind === "catalog" ? selection.brick : null
-  const customOpen = selection?.kind === "custom"
+  const customOpen = tab === "custom"
+  const selectTab = React.useCallback(
+    (nextTab: BrickTabId) => {
+      setTab(nextTab)
+      if (nextTab === "custom") {
+        const next = customBricks[0]
+        onSelectionChange(
+          next
+            ? { kind: "catalog", brick: next }
+            : {
+                kind: "custom",
+                source: selection?.kind === "custom" ? selection.source : "",
+              }
+        )
+        return
+      }
+
+      const next =
+        filterAndSortBricks(catalogBricks, {
+          category: nextTab,
+          gitRepositorySlug,
+          query,
+          sort,
+          sourceFilter,
+        })[0] ?? catalogBricks[0]
+      onSelectionChange(next ? { kind: "catalog", brick: next } : null)
+    },
+    [
+      catalogBricks,
+      customBricks,
+      gitRepositorySlug,
+      onSelectionChange,
+      query,
+      selection,
+      sort,
+      sourceFilter,
+    ]
+  )
 
   return (
     <div
@@ -261,72 +439,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
         className
       )}
     >
-      <aside className="flex min-h-0 flex-col border-b border-border/60 md:border-r md:border-b-0">
-        <p className="px-3 pt-3 pb-2 font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
-          Categories
-        </p>
-        <nav className="flex gap-1 overflow-x-auto px-2 pb-2 md:flex-col md:overflow-y-auto md:pb-3">
-          {CATEGORIES.map((item) => {
-            const active = !customOpen && category === item.id
-            return (
-              <button
-                key={item.id}
-                type="button"
-                disabled={disabled}
-                onClick={() => {
-                  setCategory(item.id)
-                  if (!customOpen) return
-                  const next =
-                    filterAndSortBricks(catalogBricks, {
-                      category: item.id,
-                      gitRepositorySlug,
-                      query,
-                      sort,
-                      sourceFilter,
-                    })[0] ?? catalogBricks[0]
-                  onSelectionChange(
-                    next ? { kind: "catalog", brick: next } : null
-                  )
-                }}
-                className={cn(
-                  "relative shrink-0 rounded-md px-2.5 py-2 text-left text-xs transition-colors duration-150",
-                  active
-                    ? "bg-primary/12 font-medium text-foreground"
-                    : "text-muted-foreground hover:bg-accent/55 hover:text-foreground",
-                  disabled && "pointer-events-none opacity-50"
-                )}
-              >
-                {active ? (
-                  <span className="absolute top-1.5 bottom-1.5 left-0 w-0.5 rounded-full bg-primary md:left-0" />
-                ) : null}
-                <span className={cn(active && "pl-1.5")}>{item.label}</span>
-              </button>
-            )
-          })}
-        </nav>
-        <div className="mt-auto border-t border-border/60 p-2">
-          <button
-            type="button"
-            disabled={disabled}
-            onClick={() =>
-              onSelectionChange({
-                kind: "custom",
-                source: selection?.kind === "custom" ? selection.source : "",
-              })
-            }
-            className={cn(
-              "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs transition-colors duration-150",
-              customOpen
-                ? "bg-primary/12 font-medium text-foreground"
-                : "text-muted-foreground hover:bg-accent/55 hover:text-foreground",
-              disabled && "pointer-events-none opacity-50"
-            )}
-          >
-            <PackagePlus className="size-3.5 shrink-0 text-primary" />
-            Custom Brick
-          </button>
-        </div>
-      </aside>
+      <BrickTabSidebar disabled={disabled} tab={tab} onTabChange={selectTab} />
 
       <section className="flex min-h-80 min-w-0 flex-col border-b border-border/60 md:min-h-0 md:border-r md:border-b-0">
         <div className="space-y-2 border-b border-border/60 p-3">
@@ -334,89 +447,116 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
             <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               value={query}
-              disabled={disabled || customOpen}
+              disabled={disabled}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search bricks…"
+              placeholder={
+                customOpen ? "Search custom bricks…" : "Search bricks…"
+              }
               className="h-9 pl-8 text-base md:text-sm"
             />
           </label>
-          <div className="grid grid-cols-2 gap-2">
-            <Select
-              value={sourceFilter}
-              disabled={disabled || customOpen}
-              onValueChange={(value) => {
-                const next = SOURCE_FILTERS.find(
-                  (option) => option.id === value
-                )
-                if (next) setSourceFilter(next.id)
-              }}
-            >
-              <SelectTrigger
-                className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
-                aria-label="Filter by source"
+          {customOpen ? (
+            <div className="flex h-8 items-center justify-between gap-2">
+              <span className="font-mono text-[0.625rem] tracking-[0.08em] text-muted-foreground uppercase">
+                {customBricks.length} saved
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-8"
+                disabled={disabled || saveMutation.isPending}
+                onClick={() =>
+                  onSelectionChange({ kind: "custom", source: "" })
+                }
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {SOURCE_FILTERS.map((option) => (
-                  <SelectItem
-                    key={option.id}
-                    value={option.id}
-                    className="whitespace-nowrap"
-                  >
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select
-              value={sort}
-              disabled={disabled || customOpen}
-              onValueChange={(value) => {
-                const next = SORT_OPTIONS.find((option) => option.id === value)
-                if (next) setSort(next.id)
-              }}
-            >
-              <SelectTrigger
-                className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
-                aria-label="Sort bricks"
+                <PackagePlus />
+                Add Brick
+              </Button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-2">
+              <Select
+                value={sourceFilter}
+                disabled={disabled || customOpen}
+                onValueChange={(value) => {
+                  const next = SOURCE_FILTERS.find(
+                    (option) => option.id === value
+                  )
+                  if (next) setSourceFilter(next.id)
+                }}
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {SORT_OPTIONS.map((option) => (
-                  <SelectItem
-                    key={option.id}
-                    value={option.id}
-                    className="whitespace-nowrap"
-                  >
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+                <SelectTrigger
+                  className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
+                  aria-label="Filter by source"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {SOURCE_FILTERS.map((option) => (
+                    <SelectItem
+                      key={option.id}
+                      value={option.id}
+                      className="whitespace-nowrap"
+                    >
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select
+                value={sort}
+                disabled={disabled || customOpen}
+                onValueChange={(value) => {
+                  const next = SORT_OPTIONS.find(
+                    (option) => option.id === value
+                  )
+                  if (next) setSort(next.id)
+                }}
+              >
+                <SelectTrigger
+                  className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
+                  aria-label="Sort bricks"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {SORT_OPTIONS.map((option) => (
+                    <SelectItem
+                      key={option.id}
+                      value={option.id}
+                      className="whitespace-nowrap"
+                    >
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
-          {customOpen ? (
+          {visibleBricks.length === 0 ? (
             <div className="grid h-full place-items-center px-4 py-8 text-center">
               <div className="max-w-xs">
-                <PackagePlus className="mx-auto size-5 text-primary" />
-                <p className="mt-2 text-sm font-medium">Custom recipe</p>
-                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                  Paste an HTTPS Brick recipe URL in the details panel.
+                {customOpen ? (
+                  <PackagePlus className="mx-auto size-5 text-primary" />
+                ) : null}
+                <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                  {customOpen
+                    ? query.trim()
+                      ? "No custom Bricks match your search."
+                      : "Add a recipe URL to save your first custom Brick."
+                    : emptyMessage}
                 </p>
               </div>
-            </div>
-          ) : visibleBricks.length === 0 ? (
-            <div className="grid h-full place-items-center px-4 py-8 text-center text-xs text-muted-foreground">
-              {emptyMessage}
             </div>
           ) : (
             <ul className="flex flex-col gap-0.5">
               {visibleBricks.map((brick) => {
                 const selected = selectedCatalog?.source === brick.source
+                const custom = customBrickSources.has(brick.source)
                 const verified = isVerifiedBrick(brick, gitRepositorySlug)
                 return (
                   <li key={brick.source}>
@@ -445,11 +585,20 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
                           {brick.metadata.name}
                         </span>
                         <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
-                          {sourceLabel(brick, gitRepositorySlug)} ·{" "}
-                          {formatGameLabel(brick)}
+                          {custom
+                            ? "Custom"
+                            : sourceLabel(brick, gitRepositorySlug)}{" "}
+                          · {formatGameLabel(brick)}
                         </span>
                       </span>
-                      {verified ? (
+                      {custom ? (
+                        <Badge
+                          variant="outline"
+                          className="h-5 shrink-0 px-1.5 font-mono text-[0.625rem] text-muted-foreground"
+                        >
+                          Custom
+                        </Badge>
+                      ) : verified ? (
                         <Badge
                           variant="outline"
                           className="h-5 shrink-0 gap-1 border-primary/35 bg-primary/10 px-1.5 font-mono text-[0.625rem] text-primary"
@@ -471,7 +620,10 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
         selection={selection}
         disabled={disabled}
         gitRepositorySlug={gitRepositorySlug}
+        customBrickSources={customBrickSources}
         onSelectionChange={onSelectionChange}
+        onSaveCustomBrick={(source) => saveMutation.mutate(source)}
+        savingCustomBrick={saveMutation.isPending}
         configuration={configuration}
       />
     </div>
@@ -482,19 +634,32 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
   selection,
   disabled,
   gitRepositorySlug,
+  customBrickSources,
   onSelectionChange,
+  onSaveCustomBrick,
+  savingCustomBrick,
   configuration,
 }: {
   selection: BrickSelection | null
   disabled: boolean
   gitRepositorySlug: string
+  customBrickSources: ReadonlySet<string>
   onSelectionChange: (selection: BrickSelection | null) => void
+  onSaveCustomBrick: (source: string) => void
+  savingCustomBrick: boolean
   configuration?: React.ReactNode
 }) {
   if (selection?.kind === "custom") {
     return (
       <aside className="flex min-h-96 flex-col md:min-h-0">
-        <div className="min-h-0 flex-1 overflow-y-auto p-4 pr-11">
+        <form
+          className="min-h-0 flex-1 overflow-y-auto p-4 pr-11"
+          onSubmit={(event) => {
+            event.preventDefault()
+            const source = selection.source.trim()
+            if (source) onSaveCustomBrick(source)
+          }}
+        >
           <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
             Custom recipe
           </p>
@@ -502,8 +667,8 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
             Bring your own Brick
           </h3>
           <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
-            Point Kiln at any HTTPS recipe. Validate it on a Relay before
-            provisioning production servers.
+            Point Kiln at any HTTPS recipe. We’ll validate it on a Relay and
+            keep it in your custom catalog.
           </p>
           <label className="mt-4 block space-y-1.5 text-xs font-medium text-muted-foreground">
             <span>Recipe URL</span>
@@ -521,7 +686,24 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
               required
             />
           </label>
-        </div>
+          <Button
+            type="submit"
+            size="sm"
+            className="mt-3 w-full"
+            disabled={
+              disabled ||
+              savingCustomBrick ||
+              selection.source.trim().length === 0
+            }
+          >
+            {savingCustomBrick ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <PackagePlus />
+            )}
+            Save Brick
+          </Button>
+        </form>
         {configuration ? (
           <div className="shrink-0 border-t border-border/60 p-4">
             {configuration}
@@ -549,6 +731,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
   }
 
   const brick = selection.brick
+  const custom = customBrickSources.has(brick.source)
   const verified = isVerifiedBrick(brick, gitRepositorySlug)
   const supportedArchitectures = new Set(
     (brick.constraints.architectures ?? PLATFORM_ARCHITECTURES).map(
@@ -572,7 +755,14 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
               <h3 className="truncate font-heading text-lg font-semibold tracking-[-0.03em]">
                 {brick.metadata.name}
               </h3>
-              {verified ? (
+              {custom ? (
+                <Badge
+                  variant="outline"
+                  className="h-5 px-1.5 text-[0.625rem] text-muted-foreground"
+                >
+                  Custom
+                </Badge>
+              ) : verified ? (
                 <Badge
                   variant="outline"
                   className="h-5 gap-1 border-primary/35 bg-primary/10 px-1.5 text-[0.625rem] text-primary"
@@ -650,6 +840,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
   open,
   onOpenChange,
   bricks,
+  customBricks = EMPTY_BRICKS,
   initial,
   title = "Select Brick",
   description = "Browse or search bricks from the catalog.",
@@ -659,6 +850,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
   bricks: Array<Brick>
+  customBricks?: Array<Brick>
   initial: BrickSelection | null
   title?: string
   description?: string
@@ -673,9 +865,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
     if (open) setSelection(initial)
   }, [initial, open])
 
-  const canConfirm =
-    selection?.kind === "catalog" ||
-    (selection?.kind === "custom" && selection.source.trim().length > 0)
+  const canConfirm = selection?.kind === "catalog"
   const actions = React.useMemo(
     () => (
       <div className="grid grid-cols-2 gap-2">
@@ -709,6 +899,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
         <DialogDescription className="sr-only">{description}</DialogDescription>
         <BrickCatalogBrowser
           bricks={bricks}
+          customBricks={customBricks}
           selection={selection}
           onSelectionChange={setSelection}
           className="h-full rounded-none border-0 bg-transparent"

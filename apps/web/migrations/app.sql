@@ -35,6 +35,18 @@ CREATE TABLE IF NOT EXISTS kiln_setting (
   UNIQUE KEY kiln_setting_scope_unique (user_id, setting_key)
 );
 
+CREATE TABLE IF NOT EXISTS kiln_custom_brick (
+  id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+  owner_user_id VARCHAR(36) NOT NULL,
+  source_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  source VARCHAR(2048) NOT NULL,
+  recipe JSON NOT NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY kiln_custom_brick_owner_source_unique (owner_user_id, source_hash),
+  KEY kiln_custom_brick_owner_updated_idx (owner_user_id, updated_at)
+);
+
 CREATE TABLE IF NOT EXISTS kiln_instance (
   relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   instance_id CHAR(40) NOT NULL,

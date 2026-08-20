@@ -22,6 +22,10 @@ import {
 } from "@/lib/access-control"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { hydrateBrickVariables } from "@/lib/brick-variables"
+import {
+  listCustomBricksEffect,
+  saveCustomBrickEffect,
+} from "@/effect/custom-bricks"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { listMcJarVersionsEffect } from "@/effect/mcjarfiles"
@@ -60,6 +64,10 @@ const startupInputSchema = relayUpdateInstanceStartupSchema.extend(
 export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
   async () => {
     const user = await requireAuthenticatedUser()
+    const customBricksPromise = runAppEffect(
+      "customBricks.list",
+      listCustomBricksEffect(user.id)
+    )
     const candidates = (await listPersistedRelays()).filter(
       (relay) => relay.enabled && canProvisionOnRelay(user, relay)
     )
@@ -75,7 +83,9 @@ export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
       )
     })
     const relay = relays.at(0)
-    if (!relay) return { relays, bricks: [] }
+    if (!relay) {
+      return { relays, bricks: [], customBricks: await customBricksPromise }
+    }
     const catalog = await runAppEffect(
       "relay.bricks",
       cachedRelayJsonEffect({
@@ -89,6 +99,7 @@ export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
     return {
       relays,
       bricks: catalog.bricks,
+      customBricks: await customBricksPromise,
     }
   }
 )
@@ -309,6 +320,27 @@ export const loadBrickRecipe = createServerFn({ method: "POST" })
         relay,
         `/v1/bricks/recipe?source=${encodeURIComponent(data.source)}`
       )
+    )
+  })
+
+export const saveCustomBrick = createServerFn({ method: "POST" })
+  .validator(brickSourceSchema)
+  .handler(async ({ data: source }) => {
+    const user = await requireAuthenticatedUser()
+    const relay = (await listPersistedRelays()).find(
+      (candidate) => candidate.enabled && canProvisionOnRelay(user, candidate)
+    )
+    if (!relay) throw new Error("Connect a Relay to save a custom Brick")
+
+    const brick = brickSchema.parse(
+      await requestRelay(
+        relay,
+        `/v1/bricks/recipe?source=${encodeURIComponent(source)}`
+      )
+    )
+    return runAppEffect(
+      "customBricks.save",
+      saveCustomBrickEffect(user.id, brick)
     )
   })
 
