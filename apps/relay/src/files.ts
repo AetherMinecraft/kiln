@@ -58,9 +58,22 @@ export class FilesystemDriver {
     this.#config = config
   }
 
-  tree(instance: RelayInstanceConfig) {
+  /**
+   * Lists an instance's files, optionally rooted at one subdirectory.
+   *
+   * The walk starts at the requested subtree rather than filtering a whole-root
+   * walk afterwards. It stops at MAX_TREE_ITEMS, and on a server whose worlds
+   * and logs already exceed that cap, a filtered whole-root walk returns a
+   * listing missing exactly the entries the caller asked for, with nothing but
+   * `truncated` to say so. Returned paths stay relative to the instance root
+   * either way.
+   */
+  tree(instance: RelayInstanceConfig, requestedPath?: string) {
     return Effect.gen({ self: this }, function* () {
       const root = yield* this.#instanceRoot(instance)
+      const start = requestedPath
+        ? yield* this.#existingDirectory(root, requestedPath)
+        : root
       const modifiedAt: Record<string, number> = {}
       const paths: Array<string> = []
       const sizes: Record<string, number> = {}
@@ -128,7 +141,7 @@ export class FilesystemDriver {
           return directorySize
         })
 
-      sizes[""] = yield* visit(root, 0)
+      sizes[""] = yield* visit(start, 0)
       return {
         instanceId: instance.id,
         modifiedAt,
@@ -485,6 +498,28 @@ export class FilesystemDriver {
           "not_a_file",
           "path",
           "Path is not a file"
+        )
+      }
+      return candidate
+    })
+  }
+
+  #existingDirectory(root: string, requestedPath: string) {
+    return Effect.gen(function* () {
+      yield* validateRelativePath(requestedPath)
+      const candidate = yield* filesystemOperation(
+        "path.resolveDirectory",
+        () => realpath(resolve(root, requestedPath))
+      )
+      yield* ensureContained(root, candidate)
+      const metadata = yield* filesystemOperation("path.statDirectory", () =>
+        lstat(candidate)
+      )
+      if (!metadata.isDirectory()) {
+        return yield* filesystemFailure(
+          "not_a_directory",
+          "path",
+          "Path is not a directory"
         )
       }
       return candidate

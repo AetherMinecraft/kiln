@@ -717,6 +717,7 @@ export function isAuditedOperation(operation: RelayControlOperation): boolean {
     operation === "instance.files.write" ||
     operation === "instance.files.upload-url" ||
     operation === "instance.files.mutate" ||
+    operation === "instance.files.sync.activate" ||
     operation === "instance.console.write" ||
     operation === "instance.network.ports.write" ||
     operation === "instance.network.routes.write" ||
@@ -757,6 +758,32 @@ export function auditDetailsForRequest(
     return details
   }
   const payload = Object.fromEntries(Object.entries(request.payload))
+  if (request.operation === "instance.files.sync.activate") {
+    const files = Array.isArray(payload.files) ? payload.files : []
+    const deletions = Array.isArray(payload.deletions) ? payload.deletions : []
+    const directories = Array.isArray(payload.directories)
+      ? payload.directories
+      : []
+    details.affectedPaths = [...directories, ...files, ...deletions]
+      .map((entry) =>
+        typeof entry === "string"
+          ? entry
+          : entry && typeof entry === "object" && !Array.isArray(entry)
+            ? Object.fromEntries(Object.entries(entry)).path
+            : undefined
+      )
+      .filter((path): path is string => typeof path === "string")
+    details.activatedFiles = files.length
+    details.createdDirectories = directories.length
+    details.deletedFiles = deletions.length
+    details.permission =
+      deletions.length === 0
+        ? "instance.files.write"
+        : "instance.files.delete-managed"
+    if (typeof payload.deploymentId === "string") {
+      details.deploymentId = payload.deploymentId
+    }
+  }
   if (typeof payload.instanceId === "string") {
     details.instanceId = payload.instanceId
   }
@@ -940,6 +967,10 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "instance.files.write"
     case "instance.files.upload-url":
       return "instance.files.upload-url"
+    case "instance.files.sync.prepare":
+    case "instance.files.sync.activate":
+    case "instance.files.sync.cleanup":
+      return "instance.files.sync"
     case "instance.console.history":
       return "instance.console.read"
     case "instance.console.write":

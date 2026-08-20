@@ -1,0 +1,16 @@
+# Kiln is written on macOS, Linux and Windows, but everything it produces runs
+# on Linux. A Windows checkout with core.autocrlf=true rewrites shell scripts,
+# Dockerfiles and patches with carriage returns, and a CR that reaches a
+# container arrives as `exec /usr/local/bin/kiln-ember: no such file or
+# directory` - the CR is part of the interpreter path. Normalising the working
+# tree to LF keeps the platform a checkout runs on out of the artifacts it
+# builds.
+* text=auto eol=lf
+
+# Line-ending sensitive: pnpm verifies patches byte for byte, and a shell
+# interpreter reads a CR as part of the shebang.
+*.sh text eol=lf
+*.patch text eol=lf
+
+*.png binary
+*.ico binary

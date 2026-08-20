@@ -89,7 +89,8 @@ export function activityTypeForAudit(audit: RelayAuditRecord): ActivityType {
   if (
     audit.event.startsWith("browser.file.") ||
     operation === "instance.files.write" ||
-    operation === "instance.files.upload-url"
+    operation === "instance.files.upload-url" ||
+    operation === "instance.files.sync.activate"
   ) {
     return "files"
   }
@@ -166,6 +167,9 @@ export function activityLabelForAudit(audit: RelayAuditRecord): string {
   if (operation === "instance.files.write") return "Saved a server file"
   if (operation === "instance.files.upload-url") {
     return "Downloaded a URL to a server"
+  }
+  if (operation === "instance.files.sync.activate") {
+    return "Activated a server file deployment"
   }
   if (operation === "instance.console.write") return "Sent a console command"
   if (operation === "instance.network.ports.write") {
@@ -248,6 +252,11 @@ export function activityPermissionForAudit(
     return "instance.network.write"
   }
   if (operation === "relay.tailscale.stack.remove") return "instance.delete"
+  if (operation === "instance.files.sync.activate") {
+    return audit.details.deletedFiles === 0
+      ? "instance.files.write"
+      : "instance.files.delete-managed"
+  }
   if (
     operation === "relay.pairing.create" ||
     operation === "relay.pairing.revoke" ||

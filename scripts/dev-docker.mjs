@@ -23,11 +23,49 @@ const primaryWorktree = resolve(worktreeRoot) === resolve(primaryRoot)
 const stack = primaryWorktree ? "hearth" : worktreeStack(worktreeRoot)
 const namespace = primaryWorktree ? "" : stack
 const environmentFile = resolve(primaryRoot, ".env")
-const hearthUrl = `https://hearth.${stack}.orb.local`
-const relayUrl = `https://relay.${stack}.orb.local`
+// Read before Compose sees it so a machine-local override - a port already
+// taken, a different domain - produces the same answer in the printed URL and
+// in the containers.
+const environmentValues = existsSync(environmentFile)
+  ? parseEnvironment(readFileSync(environmentFile, "utf8"))
+  : new Map()
+
+// OrbStack answers `*.orb.local` and fronts container ports at 443, which is
+// why the dev overlay publishes nothing. It is macOS-only, so everywhere else
+// the stack publishes its ports and Compose network aliases make the same
+// hostname resolve to the container from inside and to 127.0.0.1 from the
+// host. Identical port numbers on both sides keep one URL correct for Hearth,
+// the browser and the CLI alike.
+const devDomain = devSetting(
+  "KILN_DEV_DOMAIN",
+  process.platform === "darwin" ? "orb.local" : "kiln.localhost"
+)
+const orbstack = devDomain === "orb.local"
+const hearthHost = `hearth.${stack}.${devDomain}`
+const relayHost = `relay.${stack}.${devDomain}`
+// Published host ports, not container ports. A fixed pair would collide with
+// anything else on the box and, worse, with a second Kiln worktree stack -
+// which is a normal thing to be running here.
+const hearthPort = devSetting("KILN_HEARTH_PORT", "3000")
+const relayPort = devSetting("KILN_RELAY_PORT", "4100")
+const relayPublicPort = orbstack ? "443" : relayPort
+// Managed everywhere: Hearth's automatic pairing requires an HTTPS origin, so
+// a Relay on plain HTTP never pairs. The browser reaches the Relay directly for
+// console streams and file transfers and will not trust a self-signed CA, so
+// issue certificates with mkcert and set KILN_RELAY_TLS_MODE=external when
+// those need to work without a per-origin exception.
+const relayTlsMode = devSetting("KILN_RELAY_TLS_MODE", "managed")
+const relayScheme = relayTlsMode === "development" ? "http" : "https"
+const hearthUrl = orbstack
+  ? `https://${hearthHost}`
+  : `http://${hearthHost}:${hearthPort}`
+const relayUrl = orbstack
+  ? `https://${relayHost}`
+  : `${relayScheme}://${relayHost}:${relayPublicPort}`
 const composeFiles = [
   resolve(worktreeRoot, "compose.yaml"),
   resolve(worktreeRoot, "compose.dev.yaml"),
+  ...(orbstack ? [] : [resolve(worktreeRoot, "compose.dev.published.yaml")]),
 ]
 
 if (command === "setup") {
@@ -44,14 +82,17 @@ if (command === "start" || command === "up" || command === "refresh") {
 
 const composeEnvironment = {
   ...process.env,
+  KILN_DEV_DOMAIN: devDomain,
+  KILN_HEARTH_PORT: hearthPort,
   KILN_DEV_ENV_FILE: environmentFile,
   KILN_INSTALLATION_ID: stack,
   KILN_RELAY_GAME_HOST: process.env.KILN_RELAY_GAME_HOST?.trim() || "localhost",
-  KILN_RELAY_HOST: `relay.${stack}.orb.local`,
+  KILN_RELAY_HOST: relayHost,
   KILN_RELAY_NAME: developmentRelayName(worktreeRoot),
   KILN_RELAY_PROXY: "none",
-  KILN_RELAY_PUBLIC_PORT: "443",
+  KILN_RELAY_PUBLIC_PORT: relayPublicPort,
   KILN_RELAY_RESOURCE_NAMESPACE: namespace,
+  KILN_RELAY_TLS_MODE: relayTlsMode,
   KILN_URL: hearthUrl,
 }
 
@@ -82,6 +123,11 @@ switch (command) {
     break
   case "url":
     console.log(hearthUrl)
+    break
+  case "hosts":
+    // Neither Windows nor Linux resolves these names on its own, and the CLI
+    // and SFTP client need them as much as the browser does.
+    console.log(hostsEntry())
     break
   case "list":
     run("docker", ["compose", "ls"], process.env)
@@ -203,7 +249,7 @@ function waitForService(service) {
         fail(`${service} stopped before becoming ready.`)
       }
     }
-    run("sleep", ["2"], process.env)
+    sleepSeconds(2)
   }
   fail(`Timed out waiting for ${service} to become ready.`)
 }
@@ -227,7 +273,13 @@ function captureCompose(arguments_, environment) {
 function printStack() {
   console.log(`Stack:  ${stack}`)
   console.log(`Hearth: ${hearthUrl}`)
-  console.log(`Relay:  ${relayUrl}\n`)
+  console.log(`Relay:  ${relayUrl}`)
+  if (!orbstack) console.log(`Hosts:  ${hostsEntry()}`)
+  console.log("")
+}
+
+function hostsEntry() {
+  return `127.0.0.1 ${hearthHost} ${relayHost}`
 }
 
 function setupEnvironment() {
@@ -372,6 +424,18 @@ function run(executable, arguments_, environment) {
     stdio: "inherit",
   })
   if (result.status !== 0) process.exit(result.status ?? 1)
+}
+
+function devSetting(name, fallback) {
+  return (
+    process.env[name]?.trim() || environmentValues.get(name)?.trim() || fallback
+  )
+}
+
+function sleepSeconds(seconds) {
+  // Synchronous by design: this script is a straight line of Compose calls, and
+  // Windows has no `sleep` binary to shell out to.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000)
 }
 
 function fail(message) {

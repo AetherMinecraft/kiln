@@ -14,6 +14,9 @@ import {
   cliDeleteBackupResponseSchema,
   cliDeleteServerRequestSchema,
   cliFileTargetSchema,
+  cliFileSyncActivateRequestSchema,
+  cliFileSyncCleanupRequestSchema,
+  cliFileSyncPrepareRequestSchema,
   cliFileWriteRequestSchema,
   cliPowerRequestSchema,
   cliPowerResponseSchema,
@@ -34,6 +37,9 @@ import {
   relayConsoleCommandResultSchema,
   relayConsoleSchema,
   relayFileContentSchema,
+  relayFileSyncActivationResultSchema,
+  relayFileSyncCleanupResultSchema,
+  relayFileSyncPrepareResultSchema,
   relayFileTreeSchema,
   relayInstanceSchema,
   relayRemoteFileUploadSchema,
@@ -970,22 +976,19 @@ export const getCliFileTreeEffect = Effect.fn("cli.api.files.list")(function* (
 ) {
   const input = yield* parseInput(cliFileTargetSchema, unknownInput)
   const relay = yield* authorizeTarget(principal, input, "instance.files.read")
+  // Scoped at the Relay rather than filtered here: its walk stops at a fixed
+  // entry cap, so filtering a whole-root listing after the fact returned an
+  // empty subtree on any instance whose worlds and logs reached the cap first.
+  const path = input.path === "." ? undefined : input.path.replace(/\/$/u, "")
   const result = yield* relayRpcEffect(
     relay,
     "instance.files.list",
-    { instanceId: input.instanceId },
+    path
+      ? { instanceId: input.instanceId, path }
+      : { instanceId: input.instanceId },
     principal
   )
-  const tree = relayFileTreeSchema.parse(result)
-  const prefix = input.path === "." ? "" : input.path.replace(/\/$/u, "")
-  return {
-    ...tree,
-    paths: prefix
-      ? tree.paths.filter(
-          (path) => path === prefix || path.startsWith(`${prefix}/`)
-        )
-      : tree.paths,
-  }
+  return relayFileTreeSchema.parse(result)
 })
 
 export const readCliFileEffect = Effect.fn("cli.api.files.read")(function* (
@@ -1024,6 +1027,82 @@ export const writeCliFileEffect = Effect.fn("cli.api.files.write")(function* (
   )
   return relayFileContentSchema.parse(result)
 })
+
+export const prepareCliFileSyncEffect = Effect.fn("cli.api.files.sync.prepare")(
+  function* (principal: CliPrincipal, unknownInput: unknown) {
+    yield* requireCliWrite(principal)
+    const input = yield* parseInput(
+      cliFileSyncPrepareRequestSchema,
+      unknownInput
+    )
+    const relay = yield* authorizeTarget(
+      principal,
+      input,
+      "instance.files.write"
+    )
+    if (input.deleteManaged) {
+      yield* authorizeTarget(principal, input, "instance.files.delete-managed")
+    }
+    const { relayId: _relayId, ...payload } = input
+    void _relayId
+    const result = yield* relayRpcEffect(
+      relay,
+      "instance.files.sync.prepare",
+      payload,
+      principal
+    )
+    return relayFileSyncPrepareResultSchema.parse(result)
+  }
+)
+
+export const activateCliFileSyncEffect = Effect.fn(
+  "cli.api.files.sync.activate"
+)(function* (principal: CliPrincipal, unknownInput: unknown) {
+  yield* requireCliWrite(principal)
+  const input = yield* parseInput(
+    cliFileSyncActivateRequestSchema,
+    unknownInput
+  )
+  const relay = yield* authorizeTarget(principal, input, "instance.files.write")
+  if (input.deletions.length > 0) {
+    yield* authorizeTarget(principal, input, "instance.files.delete-managed")
+  }
+  const { relayId: _relayId, ...payload } = input
+  void _relayId
+  const result = yield* relayRpcEffect(
+    relay,
+    "instance.files.sync.activate",
+    payload,
+    principal,
+    360_000
+  )
+  yield* invalidateRelayCache(relayCachePolicy.tree(relay.id, input.instanceId))
+  return relayFileSyncActivationResultSchema.parse(result)
+})
+
+export const cleanupCliFileSyncEffect = Effect.fn("cli.api.files.sync.cleanup")(
+  function* (principal: CliPrincipal, unknownInput: unknown) {
+    yield* requireCliWrite(principal)
+    const input = yield* parseInput(
+      cliFileSyncCleanupRequestSchema,
+      unknownInput
+    )
+    const relay = yield* authorizeTarget(
+      principal,
+      input,
+      "instance.files.write"
+    )
+    const { relayId: _relayId, ...payload } = input
+    void _relayId
+    const result = yield* relayRpcEffect(
+      relay,
+      "instance.files.sync.cleanup",
+      payload,
+      principal
+    )
+    return relayFileSyncCleanupResultSchema.parse(result)
+  }
+)
 
 export const getCliSftpConnectionEffect = Effect.fn("cli.api.sftp")(function* (
   principal: CliPrincipal,

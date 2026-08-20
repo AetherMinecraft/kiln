@@ -1,0 +1,30 @@
+# Layered over compose.dev.yaml when the development domain is not OrbStack's,
+# which is every host except a Mac running OrbStack.
+#
+# compose.dev.yaml drops every published port because OrbStack reaches
+# containers directly by name. Without it, two things have to be replaced: the
+# ports come back, and the hostname has to resolve. The network alias does the
+# second half - `relay.<stack>.<domain>` resolves to the container inside the
+# Compose network and to 127.0.0.1 on the host once the name is in the hosts
+# file. Because the published port matches the container port, one URL is
+# correct from Hearth, from a browser, and from the kiln CLI over SFTP.
+#
+# Add the hosts entry printed by `pnpm dev:docker` (or `pnpm dev:docker:hosts`)
+# once per machine; no resolver invents these names on its own.
+services:
+  relay:
+    ports:
+      - "127.0.0.1:${KILN_RELAY_PORT:-4100}:${KILN_RELAY_PORT:-4100}"
+      - "127.0.0.1:${KILN_RELAY_SFTP_PORT:-2022}:${KILN_RELAY_SFTP_PORT:-2022}"
+    networks:
+      default:
+        aliases:
+          - "relay.${KILN_INSTALLATION_ID:-hearth}.${KILN_DEV_DOMAIN:-kiln.localhost}"
+
+  hearth:
+    ports:
+      - "${KILN_HEARTH_PORT:-3000}:3000"
+    networks:
+      default:
+        aliases:
+          - "hearth.${KILN_INSTALLATION_ID:-hearth}.${KILN_DEV_DOMAIN:-kiln.localhost}"

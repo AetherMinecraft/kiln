@@ -87,7 +87,11 @@ vi.mock("ssh2", async () => {
 })
 
 import type { KilnSession } from "./config.js"
-import { downloadSftpFileEffect } from "./sftp.js"
+import {
+  downloadSftpFileEffect,
+  resolveRemotePath,
+  withSftpSessionEffect,
+} from "./sftp.js"
 
 const session: KilnSession = {
   profile: "test",
@@ -152,4 +156,35 @@ describe("CLI SFTP cancellation", () => {
       assert.strictEqual(client.endCalls, 1)
     })
   )
+
+  it.effect(
+    "reuses one authenticated connection for a multi-step session",
+    () =>
+      Effect.gen(function* () {
+        ssh2State.mode = "transfer"
+        let operations = 0
+        yield* withSftpSessionEffect(session, connection, () =>
+          Effect.sync(() => {
+            operations += 3
+          })
+        )
+
+        assert.strictEqual(operations, 3)
+        assert.lengthOf(ssh2State.clients, 1)
+        assert.strictEqual(ssh2State.clients[0]?.sftpEndCalls, 1)
+        assert.strictEqual(ssh2State.clients[0]?.endCalls, 1)
+      })
+  )
+})
+
+describe("CLI SFTP paths", () => {
+  it("keeps remote paths inside the advertised server root", () => {
+    assert.strictEqual(
+      resolveRemotePath("/instance", "plugins/example.jar"),
+      "/instance/plugins/example.jar"
+    )
+    assert.throws(() => resolveRemotePath("/instance", "../outside"))
+    assert.throws(() => resolveRemotePath("/instance", "plugins/../outside"))
+    assert.throws(() => resolveRemotePath("/instance", "/absolute"))
+  })
 })

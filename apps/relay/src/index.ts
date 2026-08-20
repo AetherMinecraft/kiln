@@ -31,6 +31,9 @@ import {
   relayNetworkingSchema,
   relayProxySettingsSchema,
   relayFileMutationInputSchema,
+  relayFileSyncActivateSchema,
+  relayFileSyncCleanupSchema,
+  relayFileSyncPrepareSchema,
   relayRemoteFileUploadResultSchema,
   relayRemoteFileUploadSchema,
   relaySaveFileInputSchema,
@@ -66,6 +69,7 @@ import {
   restoreEncryptedPlatformBackup,
 } from "./platform-backups.js"
 import { FilesystemDriver } from "./files.js"
+import { DeploymentFileSyncDriver } from "./file-sync.js"
 import { LifecycleDriver } from "./lifecycle.js"
 import { nodeSnapshot } from "./node.js"
 import { RelayPairingError } from "./effect/errors.js"
@@ -162,6 +166,11 @@ const docker = new DockerDriver(config, runtimeRecovery, bricks)
 const databases = new DatabaseDriver(config, docker)
 const systemUpdates = new SystemUpdateManager(config)
 const filesystem = new FilesystemDriver(config)
+const deploymentFileSync = new DeploymentFileSyncDriver(config)
+await runRelayEffect(
+  "relay.startup.fileSyncRecovery",
+  deploymentFileSync.recover()
+)
 const lifecycle = new LifecycleDriver(config, docker, bricks)
 const startupProxySettings = await lifecycle.proxySettings()
 lifecycle.hydrateProxySettings(startupProxySettings)
@@ -1336,7 +1345,10 @@ async function executeControlRequest(
     case "instance.files.list":
       return runRelayEffect(
         "relay.files.tree",
-        filesystem.tree(await requiredInstance(payload))
+        filesystem.tree(
+          await requiredInstance(payload),
+          optionalString(payload, "path")
+        )
       )
     case "instance.files.read":
       return runRelayEffect(
@@ -1375,6 +1387,36 @@ async function executeControlRequest(
       const input = relayFileMutationInputSchema.parse(payload)
       return serializeInstanceMutation(instance.id, () =>
         runRelayEffect("relay.files.mutate", filesystem.mutate(instance, input))
+      )
+    }
+    case "instance.files.sync.prepare": {
+      const input = relayFileSyncPrepareSchema.parse(request.payload)
+      const instance = await requiredInstance(input)
+      return serializeInstanceMutation(instance.id, () =>
+        runRelayEffect(
+          "relay.files.sync.prepare",
+          deploymentFileSync.prepare(instance, input)
+        )
+      )
+    }
+    case "instance.files.sync.activate": {
+      const input = relayFileSyncActivateSchema.parse(request.payload)
+      const instance = await requiredInstance(input)
+      return serializeInstanceMutation(instance.id, () =>
+        runRelayEffect(
+          "relay.files.sync.activate",
+          deploymentFileSync.activate(instance, input)
+        )
+      )
+    }
+    case "instance.files.sync.cleanup": {
+      const input = relayFileSyncCleanupSchema.parse(request.payload)
+      const instance = await requiredInstance(input)
+      return serializeInstanceMutation(instance.id, () =>
+        runRelayEffect(
+          "relay.files.sync.cleanup",
+          deploymentFileSync.cleanup(instance, input)
+        )
       )
     }
     case "instance.console.history":
@@ -1634,6 +1676,14 @@ function requiredString(
     throw new Error(`${key} is required`)
   }
   return field
+}
+
+function optionalString(
+  value: Readonly<Record<string, unknown>>,
+  key: string
+): string | undefined {
+  const field = value[key]
+  return typeof field === "string" && field ? field : undefined
 }
 
 function systemUpdateTarget(value: unknown): {

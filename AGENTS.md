@@ -30,7 +30,7 @@ Before editing files for a substantial task:
 - Avoid patching framework/library internals unless explicitly given permission.
 - Use Sonner for transient feedback and shared tooltips
 - For user-visible or runtime work, use T3 Code's collaborative Preview against
-  the OrbStack URL printed by `pnpm dev:docker`; never use a local IP for
+  the URL printed by `pnpm dev:docker`; never use a local IP for
   development or validation.
 
 ## Setup
@@ -97,7 +97,7 @@ Do not update the description during review for follow-up commits or fixes unles
 Before making a change to any of Kiln's core components, you'll need to set up the preview/testing environment:
 
 1. In the new worktree, run `pnpm dev:docker`.
-2. Immediately open the printed OrbStack URL in T3 Preview, leave it available
+2. Immediately open the URL printed by `dev:docker` in T3 Preview, leave it available
    for the user, and confirm Hearth loads before making any changes.
 3. Develop and validate using that T3 Preview.
 4. Commit, push, and open a ready-for-review PR. Never merge the PR yourself.

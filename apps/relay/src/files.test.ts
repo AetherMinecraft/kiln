@@ -1,4 +1,5 @@
 import {
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -8,6 +9,7 @@ import {
   truncate,
   writeFile,
 } from "node:fs/promises"
+import { createHash, randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
 import { resolve } from "node:path"
 import type { FileHandle } from "node:fs/promises"
@@ -16,6 +18,7 @@ import { Deferred, Effect, Fiber } from "effect"
 
 import { loadConfig } from "./config.js"
 import { FilesystemDriver, MAX_TRANSFER_BYTES } from "./files.js"
+import { DeploymentFileSyncDriver, settleFileSyncJournal } from "./file-sync.js"
 import { RelayFilesystemError } from "./effect/errors.js"
 import type { RelayInstanceConfig } from "./config.js"
 
@@ -300,8 +303,309 @@ describeLinux("Relay direct file transfers", () => {
   )
 })
 
+describe("Relay file listing", () => {
+  it.effect("lists one subtree without walking the rest of the instance", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        yield* fromPromise(async () => {
+          await mkdir(resolve(root, "plugins", "Nested"), { recursive: true })
+          await writeFile(resolve(root, "plugins", "one.jar"), "jar")
+          await writeFile(resolve(root, "plugins", "Nested", "two.jar"), "jar")
+          await writeFile(resolve(root, "world", "level.dat"), "world")
+          await writeFile(resolve(root, "server.properties"), "port")
+        })
+
+        const scoped = yield* driver.tree(instance, "plugins")
+
+        // Root-relative paths, so a caller can address what it lists.
+        assert.deepEqual(scoped.paths.sort(), [
+          "plugins/Nested/",
+          "plugins/Nested/two.jar",
+          "plugins/one.jar",
+        ])
+
+        const whole = yield* driver.tree(instance)
+        assert.include(whole.paths, "world/level.dat")
+        assert.include(whole.paths, "server.properties")
+      })
+    )
+  )
+
+  it.effect("refuses to list outside the instance or list a file", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        yield* fromPromise(() =>
+          writeFile(resolve(root, "server.properties"), "port")
+        )
+
+        const escaped = yield* driver
+          .tree(instance, "../instance-2")
+          .pipe(Effect.flip)
+        assert.instanceOf(escaped, RelayFilesystemError)
+        assert.strictEqual(escaped.code, "invalid_path")
+
+        const notDirectory = yield* driver
+          .tree(instance, "server.properties")
+          .pipe(Effect.flip)
+        assert.instanceOf(notDirectory, RelayFilesystemError)
+        assert.strictEqual(notDirectory.code, "not_a_directory")
+      })
+    )
+  )
+})
+
+describeLinux("Relay transactional file sync", () => {
+  it.effect("atomically activates uploads and removes managed files", () =>
+    withSetup(({ config, instance, root }) =>
+      Effect.gen(function* () {
+        const driver = new DeploymentFileSyncDriver(config)
+        const deploymentId = randomUUID()
+        const stagingPath = `.kiln/deployments/${deploymentId}`
+        yield* fromPromise(async () => {
+          await mkdir(resolve(root, "plugins"), { recursive: true })
+          await writeFile(resolve(root, "plugins", "server.jar"), "old")
+          await writeFile(resolve(root, "plugins", "removed.jar"), "remove")
+        })
+        yield* driver.prepare(instance, {
+          deleteManaged: true,
+          deploymentId,
+          instanceId: instance.id,
+          stagingPath,
+        })
+        yield* fromPromise(async () => {
+          await mkdir(resolve(root, stagingPath, "files", "plugins"), {
+            recursive: true,
+          })
+          await writeFile(
+            resolve(root, stagingPath, "files", "plugins", "server.jar"),
+            "new"
+          )
+        })
+
+        const result = yield* driver.activate(instance, {
+          deletions: [
+            {
+              path: "plugins/removed.jar",
+              sha256: sha256("remove"),
+              size: 6,
+            },
+          ],
+          deploymentId,
+          directories: ["configs"],
+          files: [
+            {
+              expectedTarget: { sha256: sha256("old"), size: 3 },
+              path: "plugins/server.jar",
+              sha256: sha256("new"),
+              size: 3,
+            },
+          ],
+          instanceId: instance.id,
+          maxDelete: 1,
+          stagingPath,
+        })
+
+        assert.deepEqual(result.activated, ["plugins/server.jar"])
+        assert.deepEqual(result.deleted, ["plugins/removed.jar"])
+        assert.isTrue(
+          yield* fromPromise(() => pathExists(resolve(root, "configs")))
+        )
+        assert.strictEqual(
+          yield* fromPromise(() =>
+            readFile(resolve(root, "plugins", "server.jar"), "utf8")
+          ),
+          "new"
+        )
+        assert.isFalse(
+          yield* fromPromise(() => pathExists(resolve(root, stagingPath)))
+        )
+        assert.isFalse(
+          yield* fromPromise(() =>
+            pathExists(resolve(root, "plugins", "removed.jar"))
+          )
+        )
+      })
+    )
+  )
+
+  it.effect("rejects hash mismatches and safely cleans staging", () =>
+    withSetup(({ config, instance, root }) =>
+      Effect.gen(function* () {
+        const driver = new DeploymentFileSyncDriver(config)
+        const deploymentId = randomUUID()
+        const stagingPath = `.kiln/deployments/${deploymentId}`
+        yield* fromPromise(() =>
+          writeFile(resolve(root, "world", "server.jar"), "old")
+        )
+        yield* driver.prepare(instance, {
+          deleteManaged: false,
+          deploymentId,
+          instanceId: instance.id,
+          stagingPath,
+        })
+        yield* fromPromise(async () => {
+          await mkdir(resolve(root, stagingPath, "files", "world"), {
+            recursive: true,
+          })
+          await writeFile(
+            resolve(root, stagingPath, "files", "world", "server.jar"),
+            "bad"
+          )
+        })
+        const failure = yield* driver
+          .activate(instance, {
+            deletions: [],
+            deploymentId,
+            directories: [],
+            files: [
+              {
+                expectedTarget: { sha256: sha256("old"), size: 3 },
+                path: "world/server.jar",
+                sha256: sha256("new"),
+                size: 3,
+              },
+            ],
+            instanceId: instance.id,
+            maxDelete: 0,
+            stagingPath,
+          })
+          .pipe(Effect.flip)
+        assert.instanceOf(failure, RelayFilesystemError)
+        assert.strictEqual(failure.code, "verification_failed")
+        yield* driver.cleanup(instance, {
+          deploymentId,
+          instanceId: instance.id,
+          stagingPath,
+        })
+        assert.strictEqual(
+          yield* fromPromise(() =>
+            readFile(resolve(root, "world", "server.jar"), "utf8")
+          ),
+          "old"
+        )
+      })
+    )
+  )
+
+  it.effect("recovers a partially activated deployment", () =>
+    withSetup(({ config, root }) =>
+      Effect.gen(function* () {
+        const deploymentId = randomUUID()
+        const stagingPath = `.kiln/deployments/${deploymentId}`
+        yield* fromPromise(async () => {
+          await mkdir(resolve(root, stagingPath, ".rollback", "plugins"), {
+            recursive: true,
+          })
+          await mkdir(resolve(root, "plugins"), { recursive: true })
+          await writeFile(resolve(root, "plugins", "server.jar"), "new")
+          await writeFile(
+            resolve(root, stagingPath, ".rollback", "plugins", "server.jar"),
+            "old"
+          )
+        })
+
+        yield* fromPromise(() =>
+          settleFileSyncJournal(
+            config,
+            {
+              deletions: [],
+              deploymentId,
+              directories: [],
+              files: ["plugins/server.jar"],
+              instanceDirectory: "instance-1",
+              phase: "activating",
+              stagingPath,
+              version: 1,
+            },
+            false
+          )
+        )
+
+        assert.strictEqual(
+          yield* fromPromise(() =>
+            readFile(resolve(root, "plugins", "server.jar"), "utf8")
+          ),
+          "old"
+        )
+      })
+    )
+  )
+
+  it.effect("rejects protected deletion and symlinked staging parents", () =>
+    withSetup(({ config, directory, instance, root }) =>
+      Effect.gen(function* () {
+        const driver = new DeploymentFileSyncDriver(config)
+        const outside = resolve(directory, "outside")
+        const linkedDeployment = randomUUID()
+        yield* fromPromise(async () => {
+          await mkdir(outside)
+          await symlink(outside, resolve(root, "linked"), "junction")
+        })
+        const symlinkFailure = yield* driver
+          .prepare(instance, {
+            deleteManaged: false,
+            deploymentId: linkedDeployment,
+            instanceId: instance.id,
+            stagingPath: `linked/${linkedDeployment}`,
+          })
+          .pipe(Effect.flip)
+        assert.instanceOf(symlinkFailure, RelayFilesystemError)
+
+        const deploymentId = randomUUID()
+        const stagingPath = `.kiln/deployments/${deploymentId}`
+        yield* driver.prepare(instance, {
+          deleteManaged: true,
+          deploymentId,
+          instanceId: instance.id,
+          stagingPath,
+        })
+        const limitFailure = yield* driver
+          .activate(instance, {
+            deletions: [
+              {
+                path: "world/data.txt",
+                sha256: sha256("settings"),
+                size: 8,
+              },
+            ],
+            deploymentId,
+            directories: [],
+            files: [],
+            instanceId: instance.id,
+            maxDelete: 0,
+            stagingPath,
+          })
+          .pipe(Effect.flip)
+        assert.instanceOf(limitFailure, RelayFilesystemError)
+        assert.strictEqual(limitFailure.code, "delete_limit_exceeded")
+
+        const protectedFailure = yield* driver
+          .activate(instance, {
+            deletions: [
+              {
+                path: "world/data.txt",
+                sha256: sha256("settings"),
+                size: 8,
+              },
+            ],
+            deploymentId,
+            directories: [],
+            files: [],
+            instanceId: instance.id,
+            maxDelete: 1,
+            stagingPath,
+          })
+          .pipe(Effect.flip)
+        assert.instanceOf(protectedFailure, RelayFilesystemError)
+        assert.strictEqual(protectedFailure.code, "protected_path")
+      })
+    )
+  )
+})
+
 function withSetup<TResult>(
   use: (setup: {
+    config: ReturnType<typeof loadConfig>
     directory: string
     driver: FilesystemDriver
     instance: RelayInstanceConfig
@@ -322,6 +626,7 @@ function withSetup<TResult>(
           NODE_ENV: "development",
         })
         return yield* use({
+          config,
           directory,
           driver: new FilesystemDriver(config),
           instance: testInstance(),
@@ -333,6 +638,22 @@ function withSetup<TResult>(
         Effect.orDie
       )
   )
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path)
+    return true
+  } catch (cause) {
+    if (cause && typeof cause === "object" && "code" in cause) {
+      if (cause.code === "ENOENT") return false
+    }
+    throw cause
+  }
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex")
 }
 
 async function* chunks(value: string): AsyncIterable<Uint8Array> {

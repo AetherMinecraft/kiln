@@ -55,6 +55,33 @@ Bun compiles the app into `dist/kiln`; Bun does not need to be installed on
 the machine running that executable. Local macOS builds are ad-hoc signed with
 the JavaScript runtime entitlements required by Bun.
 
+## Distribute a fork through GitHub Releases
+
+Publishing a `v0.x.y` GitHub Release runs the `Publish CLI tarball` workflow.
+It builds the CLI's bundled Node package from that tag and attaches
+`kiln-cli-0.x.y.tgz` plus its SHA-256 checksum to the release. The workflow can
+also be dispatched manually with an existing release tag to retry an upload.
+
+Another repository can download and install the package without using the npm
+registry:
+
+```sh
+gh release download "$KILN_CLI_TAG" \
+  --repo your-org/kiln \
+  --pattern 'kiln-cli-*.tgz' \
+  --pattern 'kiln-cli-*.tgz.sha256' \
+  --dir .kiln-cli
+(cd .kiln-cli && sha256sum --check kiln-cli-*.tgz.sha256)
+npm install --global .kiln-cli/kiln-cli-*.tgz
+kiln --version
+```
+
+For a private Kiln fork, authenticate `gh` with a fine-grained token or GitHub
+App token that can read the fork's repository contents. A `GITHUB_TOKEN` issued
+to a different private repository does not automatically have that access.
+Fork installations should be updated by downloading a newer release tarball;
+`kiln update` targets the public npm package.
+
 ## Authenticate
 
 ```sh
@@ -83,6 +110,18 @@ but cannot store the credential, the warning identifies that failure instead.
 `kiln logout` revokes the active credential, removes its profile, and deletes
 its system credential.
 
+For non-interactive automation, set both variables without creating a local
+profile:
+
+```sh
+export KILN_URL=https://hearth.example.com
+export KILN_TOKEN="$DEPLOY_KILN_TOKEN"
+kiln server info <relay-id>:<instance-id>
+```
+
+Hearth still applies the credential mode and the account's Relay/server access
+grants. Supplying a token does not grant administrative access.
+
 ## Discover and operate
 
 ```sh
@@ -103,6 +142,10 @@ kiln files write <relay-id>:<instance-id> server.properties ./server.properties
 kiln files download <relay-id>:<instance-id> logs/latest.log ./latest.log
 kiln files upload <relay-id>:<instance-id> ./plugins/example.jar plugins/example.jar
 kiln files upload <relay-id>:<instance-id> https://example.com/example.jar plugins/example.jar
+kiln files sync <relay-id>:<instance-id> ./server --plan --json
+kiln files sync <relay-id>:<instance-id> ./server --exclude 'logs/**' --exclude '*.tmp'
+kiln files sync <relay-id>:<instance-id> ./server --atomic --json
+kiln files sync <relay-id>:<instance-id> ./server --atomic --delete-managed --manifest ./managed.json --max-delete 5
 kiln backups list --limit 200
 kiln backups create server <relay-id>:<instance-id> --name "Before update"
 kiln backups create server <relay-id>:<instance-id> --storage <destination-uuid>
@@ -123,5 +166,37 @@ network destinations. Other file operations use the versioned CLI API.
 Read-only credentials can discover authorized resources, follow logs, and read
 files, but cannot create or delete servers, change startup settings, power
 servers, send console commands, modify files, or upload.
+
+## Recursive file sync
+
+`kiln files sync <server> <local-directory>` recursively inventories the local
+directory and the authorized server root through one host-key-pinned SFTP
+session. It creates missing remote directories, compares file sizes and
+SHA-256 hashes, uploads only changed files, and reads uploaded files back to
+verify their size and hash.
+
+Use `--plan` to inspect the operation without changing remote files. Repeat
+`--exclude <pattern>` for relative glob patterns such as `logs/**`, `cache`,
+or `*.tmp`; excluded paths are skipped on both sides, and excluding a directory
+by name keeps the remote walk out of it entirely. `--json` emits one versioned
+JSON document containing the plan and result for CI consumers. Local symlinks, unsafe remote names, and a remote
+symlink or directory where a file would be written cause planning to fail.
+
+Use `--atomic` to upload into a deployment-specific staging directory, verify
+each staged file, and have Relay transactionally rename the plan into place.
+Relay retains rollback copies until all renames succeed, journals activation for
+startup recovery, cleans safely marked staging after failures when reachable,
+and records the CLI actor and affected paths in activity.
+
+Managed deletion is opt-in. `--delete-managed` requires a version 1 JSON
+manifest such as `{"version":1,"managed":["plugins/Example.jar"]}`. Only
+missing regular files explicitly named by the manifest are eligible.
+`--max-delete` defaults to zero and refuses a plan over its limit. Excludes,
+undeclared files, directories, worlds, logs, backups, crash reports, and Kiln's
+staging data remain preserved. Managed deletion requires the separate
+`instance.files.delete-managed` permission.
+
+Without `--atomic`, sync retains the Phase 1 direct-upload behavior and never
+deletes files.
 
 Run `kiln help` for the complete command reference.

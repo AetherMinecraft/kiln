@@ -29,6 +29,23 @@ describe("server deletion permissions", () => {
   })
 })
 
+describe("managed deployment deletion permissions", () => {
+  it("allows non-viewer roles to delete explicitly managed files", () => {
+    expect(roleHasPermission("owner", "instance.files.delete-managed")).toBe(
+      true
+    )
+    expect(roleHasPermission("admin", "instance.files.delete-managed")).toBe(
+      true
+    )
+    expect(roleHasPermission("operator", "instance.files.delete-managed")).toBe(
+      true
+    )
+    expect(roleHasPermission("viewer", "instance.files.delete-managed")).toBe(
+      false
+    )
+  })
+})
+
 describe("public port permissions", () => {
   it("reserves public port range overrides for platform administrators", () => {
     expect(

@@ -79,6 +79,21 @@ identify that installer, with npm as the default and fallback. It updates only
 the CLI executable; it does not update Hearth, Relays, or managed servers, and
 it does not require authentication.
 
+For an unpublished fork, do not use `kiln update`. Install the fork's packaged
+GitHub Release asset instead:
+
+```sh
+gh release download "$KILN_CLI_TAG" --repo owner/kiln \
+  --pattern 'kiln-cli-*.tgz' --pattern 'kiln-cli-*.tgz.sha256' \
+  --dir .kiln-cli
+(cd .kiln-cli && sha256sum --check kiln-cli-*.tgz.sha256)
+npm install --global .kiln-cli/kiln-cli-*.tgz
+```
+
+Private cross-repository downloads require a token or GitHub App installation
+with read access to the Kiln fork; the consuming repository's default
+`GITHUB_TOKEN` does not gain that access implicitly.
+
 ## Resolve a server
 
 Discover targets instead of guessing identifiers:
@@ -329,6 +344,38 @@ kiln files upload <server> ./example.jar plugins/example.jar
 If the remote destination is omitted, the CLI uses the local basename in the
 server root. The remote parent directory must already exist. Uploads and
 downloads verify the Relay's advertised SSH host-key fingerprint.
+
+Recursively plan or upload a local directory with one authenticated Relay
+connection:
+
+```sh
+kiln files sync <server> ./server --plan
+kiln files sync <server> ./server --exclude 'logs/**' --exclude '*.tmp'
+kiln files sync <server> ./server --plan --json
+kiln files sync <server> ./server --atomic --json
+kiln files sync <server> ./server --atomic --delete-managed --manifest ./managed.json --max-delete 5
+```
+
+Sync creates missing directories, compares same-size files with SHA-256,
+uploads only changed regular files, and verifies uploaded size and SHA-256.
+`--exclude` accepts a relative glob and may be repeated, and applies to the
+remote walk as well as the local one: excluding a directory outright
+(`--exclude world`) skips it on both sides, while a pattern that only matches
+its contents (`--exclude 'world/**'`) still descends to skip each entry. Prefer
+the former on game servers, where worlds and logs otherwise dominate the walk.
+`--json` emits a versioned machine-readable plan and result. Local symlinks and
+conflicting remote symlinks are refused.
+
+`--atomic` stages changed files below a deployment-specific remote directory,
+verifies them, and asks Relay to transactionally activate the plan with rollback
+and recovery journaling. `--staging-path <remote>` changes the staging base.
+Managed deletion additionally requires `--delete-managed`, a version 1 JSON
+`--manifest` containing an explicit `managed` file array, and a sufficient
+`--max-delete` ceiling (default zero). Protected worlds, logs, backups, crash
+reports, undeclared paths, directories, excluded paths, and `.kiln` data are
+never deletion candidates. Hearth requires `instance.files.write` and, for
+deletion, `instance.files.delete-managed`; Relay requires
+`instance.files.sync`. Omitting `--atomic` retains direct, non-deleting sync.
 
 Ask the Relay to download a file directly from an HTTPS URL:
 

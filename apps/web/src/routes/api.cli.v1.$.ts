@@ -7,6 +7,9 @@ import {
   cliDeleteBackupRequestSchema,
   cliDeleteServerRequestSchema,
   cliFileWriteRequestSchema,
+  cliFileSyncActivateRequestSchema,
+  cliFileSyncCleanupRequestSchema,
+  cliFileSyncPrepareRequestSchema,
   cliPowerRequestSchema,
   cliRemoteFileUploadRequestSchema,
   cliTargetSchema,
@@ -25,6 +28,8 @@ import {
 } from "@/effect/cli-access"
 import {
   authorizeCliConsoleStreamEffect,
+  activateCliFileSyncEffect,
+  cleanupCliFileSyncEffect,
   createCliBackupEffect,
   createCliServerEffect,
   deleteCliBackupEffect,
@@ -41,6 +46,7 @@ import {
   listCliRelaysEffect,
   listCliServersEffect,
   performCliPowerActionEffect,
+  prepareCliFileSyncEffect,
   readCliFileEffect,
   restoreCliBackupEffect,
   sendCliConsoleCommandEffect,
@@ -248,6 +254,36 @@ export const Route = createFileRoute("/api/cli/v1/$")({
             decodeBody(cliRemoteFileUploadRequestSchema, body.value).pipe(
               Effect.flatMap((input) =>
                 uploadCliFileFromUrlEffect(principal, input)
+              )
+            )
+          )
+        }
+        if (endpoint === "files/sync/prepare") {
+          return runCliEffect(
+            "cli.http.files.sync.prepare",
+            decodeBody(cliFileSyncPrepareRequestSchema, body.value).pipe(
+              Effect.flatMap((input) =>
+                prepareCliFileSyncEffect(principal, input)
+              )
+            )
+          )
+        }
+        if (endpoint === "files/sync/activate") {
+          return runCliEffect(
+            "cli.http.files.sync.activate",
+            decodeBody(cliFileSyncActivateRequestSchema, body.value).pipe(
+              Effect.flatMap((input) =>
+                activateCliFileSyncEffect(principal, input)
+              )
+            )
+          )
+        }
+        if (endpoint === "files/sync/cleanup") {
+          return runCliEffect(
+            "cli.http.files.sync.cleanup",
+            decodeBody(cliFileSyncCleanupRequestSchema, body.value).pipe(
+              Effect.flatMap((input) =>
+                cleanupCliFileSyncEffect(principal, input)
               )
             )
           )

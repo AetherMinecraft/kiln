@@ -63,6 +63,9 @@ export const relayControlOperations = [
   "instance.files.write",
   "instance.files.upload-url",
   "instance.files.mutate",
+  "instance.files.sync.prepare",
+  "instance.files.sync.activate",
+  "instance.files.sync.cleanup",
   "instance.console.history",
   "instance.console.write",
   "instance.console.complete",
@@ -98,7 +101,8 @@ export function relayControlDeadlineMs(
   if (
     operation === "instance.create" ||
     operation === "instance.startup.write" ||
-    operation === "instance.files.upload-url"
+    operation === "instance.files.upload-url" ||
+    operation === "instance.files.sync.activate"
   ) {
     return 360_000
   }

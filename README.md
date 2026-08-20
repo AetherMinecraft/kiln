@@ -49,7 +49,8 @@ docker compose up -d
 
 ## Development
 
-Requires Node 20+, pnpm, Docker, and OrbStack.
+Requires Node 20+, pnpm and Docker. On macOS, OrbStack additionally supplies
+the `*.orb.local` names the stack uses.
 
 ```sh
 vp install --frozen-lockfile
@@ -57,7 +58,32 @@ pnpm dev:setup
 pnpm dev:docker
 ```
 
-`dev:setup` only needs to run once per clone. Open the OrbStack URL printed by `dev:docker` to use the panel.
+`dev:setup` only needs to run once per clone. Open the URL printed by
+`dev:docker` to use the panel.
+
+### Windows and Linux
+
+Without OrbStack there is nothing answering `*.orb.local`, so the stack
+publishes its ports and names itself under `kiln.localhost` instead. Add the
+line `pnpm dev:docker:hosts` prints to your hosts file once per machine
+(`C:\Windows\System32\drivers\etc\hosts` or `/etc/hosts`, as
+administrator); the browser, the `kiln` CLI and SFTP all need to resolve it.
+Set `KILN_DEV_DOMAIN` to use a different name.
+
+The Relay keeps managed TLS, because Hearth's automatic pairing requires an
+HTTPS origin. Its certificate is signed by a CA the Relay generates, which the
+browser does not trust, and the browser talks to the Relay directly for console
+streams and file transfers. Either accept the warning once for the Relay
+origin, or issue certificates with mkcert and set `KILN_RELAY_TLS_MODE=external`
+with `KILN_RELAY_TLS_CERT_FILE` and `KILN_RELAY_TLS_KEY_FILE`.
+
+If another service already holds a port, set `KILN_HEARTH_PORT`,
+`KILN_RELAY_PORT` or `KILN_RELAY_SFTP_PORT`; a second worktree stack needs its
+own values.
+
+On Windows, clone into the WSL2 filesystem and enable Docker Desktop's WSL
+integration. The stack works from an NTFS path, but every source read crosses
+the VM boundary, which shows up as slow installs and unreliable file watching.
 
 ## License
 

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import { readFile, readdir } from "node:fs/promises"
 import { test } from "node:test"
 import { dirname, join, resolve } from "node:path"
@@ -142,12 +143,32 @@ test("NanoLimbo uses its release-matched settings and Kiln's reachable port", as
   assert.match(version, /^[0-9]+(?:\.[0-9]+){1,3}$/u)
 })
 
-test("entrypoints pass Bash syntax validation in CI", async () => {
-  const entrypoints = [
-    "embers/java/entrypoint.sh",
-    "embers/steamcmd/entrypoint.sh",
-  ]
-  for (const path of entrypoints) {
+const ENTRYPOINTS = [
+  "embers/java/entrypoint.sh",
+  "embers/steamcmd/entrypoint.sh",
+]
+
+test("entrypoints declare the Bash interpreter", async () => {
+  for (const path of ENTRYPOINTS) {
     assert.match(await readFile(join(root, path), "utf8"), /^#!\/usr\/bin\/env bash/u)
   }
 })
+
+// Run here rather than from the package script so a host without Bash reports
+// one skipped test instead of failing the whole suite. CI runs on Linux, where
+// it always executes.
+test("entrypoints pass Bash syntax validation", { skip: bashUnavailable() }, () => {
+  for (const path of ENTRYPOINTS) {
+    // Relative, with root as the working directory: a Windows absolute path
+    // reaches Bash with backslashes it reads as escapes.
+    const result = spawnSync("bash", ["-n", path], { cwd: root, encoding: "utf8" })
+    assert.equal(result.status, 0, `${path}: ${result.stderr?.trim() ?? ""}`)
+  }
+})
+
+function bashUnavailable() {
+  const probe = spawnSync("bash", ["--version"], { encoding: "utf8" })
+  return probe.error || probe.status !== 0
+    ? "Bash is not available on this host."
+    : false
+}

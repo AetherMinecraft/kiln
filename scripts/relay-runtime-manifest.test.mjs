@@ -43,6 +43,9 @@ async function readPackage(path) {
 }
 
 function runtimeLockSpecifiers(lockfile) {
+  // Scanned by hand rather than parsed, so the markers below have to survive
+  // a checkout that carries CRLF.
+  lockfile = lockfile.replaceAll("\r\n", "\n")
   const marker = "\n  .:\n    dependencies:\n"
   const start = lockfile.indexOf(marker)
   const end = lockfile.indexOf("\n\npackages:", start)
