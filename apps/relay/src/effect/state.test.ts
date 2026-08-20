@@ -2,11 +2,11 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
-import { afterAll, assert, describe, layer } from "@effect/vitest"
+import { afterAll, assert, describe, it, layer } from "@effect/vitest"
 import { Effect } from "effect"
 import type { BackupTaskInput, BackupTaskResult } from "@workspace/contracts"
 
-import { makeRelayStateLayer, RelayStateStore } from "./state.js"
+import { makeRelayStateLayer, RelayStateStore, scrubBackupTaskInputJson } from "./state.js"
 
 const testDirectory = mkdtempSync(join(tmpdir(), "kiln-relay-state-"))
 const stateDatabase = join(testDirectory, "relay.sqlite")
@@ -645,6 +645,7 @@ describe("Relay state", () => {
         const exported: BackupTaskInput = {
           backupId: "40000000-0000-4000-8000-000000000001",
           kind: "export",
+          repository: { kind: "local" },
           repositoryPassword: "export-secret",
           snapshotId: "abcdef12",
           target: { id: "instance-a", kind: "instance" },
@@ -654,6 +655,7 @@ describe("Relay state", () => {
         const prune: BackupTaskInput = {
           backupId: "40000000-0000-4000-8000-000000000002",
           kind: "prune",
+          repository: { kind: "local" },
           repositoryPassword: "prune-secret",
           target: { id: "instance-a", kind: "instance" },
           taskId: "40000000-0000-4000-8000-000000000012",
@@ -693,6 +695,7 @@ describe("Relay state", () => {
           backupId: "41000000-0000-4000-8000-000000000001",
           destination: {
             kind: "restic",
+            repository: { kind: "local" },
             repositoryPassword: "repo-secret",
           },
           exclude: [],
@@ -728,13 +731,117 @@ describe("Relay state", () => {
       })
     )
 
+    it.effect("scrubs S3 keys from terminal journal rows", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const input: BackupTaskInput = {
+          artifactKind: "restic_snapshot",
+          backupId: "41100000-0000-4000-8000-000000000001",
+          destination: {
+            kind: "restic",
+            repository: {
+              accessKeyId: "AKIAEXAMPLE",
+              allowPrivateNetwork: true,
+              bucket: "kiln-backups",
+              endpoint: "https://s3.example.com",
+              forcePathStyle: true,
+              kind: "s3",
+              region: "us-east-1",
+              repositoryPrefix: "team/repo",
+              secretAccessKey: "s3-secret",
+            },
+            repositoryPassword: "repo-secret",
+          },
+          exclude: [],
+          kind: "create",
+          maxBytes: null,
+          mode: "incremental",
+          reason: "manual",
+          target: { id: "instance-a", kind: "instance" },
+          taskId: "41100000-0000-4000-8000-000000000011",
+        }
+        yield* store.enqueueBackupTask(input, 530)
+        yield* store.claimNextBackupTask(540)
+        assert.isTrue(
+          yield* store.completeBackupTask(
+            input.taskId,
+            {
+              bytes: 12,
+              snapshotId: "abcdef12",
+              warnings: [],
+            },
+            550
+          )
+        )
+        const completed = yield* store.getBackupTask(input.taskId)
+        const destination =
+          completed?.input.kind === "create" &&
+          completed.input.destination.kind === "restic"
+            ? completed.input.destination
+            : null
+        assert.isDefined(destination)
+        if (!destination) return
+        assert.strictEqual(destination.repositoryPassword, undefined)
+        assert.strictEqual(
+          destination.repository?.kind === "s3"
+            ? destination.repository.accessKeyId
+            : "present",
+          undefined
+        )
+        assert.strictEqual(
+          destination.repository?.kind === "s3"
+            ? destination.repository.secretAccessKey
+            : "present",
+          undefined
+        )
+      })
+    )
+
+    it.effect("scrubs unparseable terminal journal input to an empty object", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const taskId = "41200000-0000-4000-8000-000000000011"
+        yield* Effect.sync(() => {
+          const database = new DatabaseSync(stateDatabase)
+          database.exec(`
+            INSERT INTO relay_backup_tasks (
+              task_id, backup_id, kind, status, input_json,
+              bytes_completed, created_at, updated_at
+            ) VALUES (
+              '${taskId}',
+              '41200000-0000-4000-8000-000000000001',
+              'export',
+              'queued',
+              'not-json {',
+              0,
+              560,
+              560
+            )
+          `)
+          database.close()
+        })
+        assert.isTrue(yield* store.failBackupTask(taskId, "test finished", 570))
+        const stored = yield* Effect.sync(() => {
+          const database = new DatabaseSync(stateDatabase)
+          const row = database
+            .prepare(
+              "SELECT input_json AS inputJson FROM relay_backup_tasks WHERE task_id = ?"
+            )
+            .get(taskId) as { inputJson: string } | undefined
+          database.close()
+          return row?.inputJson
+        })
+        assert.strictEqual(stored, "{}")
+      })
+    )
+
     it.effect("lists backup tasks when a journal row fails schema parsing", () =>
       Effect.gen(function* () {
         const store = yield* RelayStateStore
         const valid: BackupTaskInput = {
           artifactKind: "restic_snapshot",
           backupId: "42000000-0000-4000-8000-000000000001",
-          destination: { kind: "restic" },
+          destination: { kind: "restic", repository: { kind: "local" } },
           exclude: [],
           kind: "create",
           maxBytes: 100,
@@ -809,6 +916,7 @@ describe("Relay state", () => {
         const valid: BackupTaskInput = {
           backupId: "44000000-0000-4000-8000-000000000002",
           kind: "export",
+          repository: { kind: "local" },
           snapshotId: "abcdef12",
           target: { id: "instance-a", kind: "instance" },
           taskId: "44000000-0000-4000-8000-000000000012",
@@ -833,6 +941,7 @@ describe("Relay state", () => {
         const first: BackupTaskInput = {
           backupId: "43000000-0000-4000-8000-000000000001",
           kind: "export",
+          repository: { kind: "local" },
           snapshotId: "abcdef12",
           target: { id: "instance-a", kind: "instance" },
           taskId: "43000000-0000-4000-8000-000000000011",
@@ -865,6 +974,25 @@ describe("Relay state", () => {
         )
         yield* store.failBackupTask(second.taskId, "test finished", 740)
       })
+    )
+  })
+})
+
+describe("backup task secret scrubbing", () => {
+  it("omits secrets and replaces unparseable JSON with an empty object", () => {
+    assert.strictEqual(scrubBackupTaskInputJson("not-json {"), "{}")
+    assert.deepStrictEqual(
+      JSON.parse(
+        scrubBackupTaskInputJson(
+          JSON.stringify({
+            accessKeyId: "AKIAEXAMPLE",
+            keep: "yes",
+            nested: { repositoryPassword: "repo-secret", value: 1 },
+            secretAccessKey: "s3-secret",
+          })
+        )
+      ),
+      { keep: "yes", nested: { value: 1 } }
     )
   })
 })

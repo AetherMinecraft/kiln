@@ -103,11 +103,15 @@ async function ensureBackupSchema(database) {
       relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
       target_kind ENUM('instance', 'database', 'platform') NOT NULL,
       target_id VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+      storage_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+      storage_key VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'local',
+      object_prefix VARCHAR(1024) NULL,
       password_ciphertext TEXT NOT NULL,
       created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-      UNIQUE KEY ${databaseTable("backup_repository_target_unique")} (relay_id, target_kind, target_id)
+      UNIQUE KEY ${databaseTableName("backup_repository_target_storage_unique")} (relay_id, target_kind, target_id, storage_key)
     )`
   )
+  await ensureBackupResticS3Schema(database)
   const [backupColumns] = await database.query(
     `SHOW COLUMNS FROM ${databaseTable("backup")}`
   )
@@ -150,6 +154,101 @@ async function ensureBackupSchema(database) {
     await database.query(
       `ALTER TABLE ${databaseTable("backup_task")}
        MODIFY task_kind ENUM('create', 'restore', 'delete', 'export') NOT NULL`
+    )
+  }
+}
+
+async function ensureBackupResticS3Schema(database) {
+  const [storageColumns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("backup_storage")}`
+  )
+  const storageColumnNames = new Set(storageColumns.map((column) => column.Field))
+  if (!storageColumnNames.has("deleting")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_storage")}
+       ADD COLUMN deleting BOOLEAN NOT NULL DEFAULT FALSE AFTER enabled`
+    )
+  }
+
+  const [repositoryColumns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("backup_repository")}`
+  )
+  const repositoryColumnNames = new Set(
+    repositoryColumns.map((column) => column.Field)
+  )
+  if (!repositoryColumnNames.has("storage_id")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_repository")}
+       ADD COLUMN storage_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER target_id`
+    )
+  }
+  if (!repositoryColumnNames.has("storage_key")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_repository")}
+       ADD COLUMN storage_key VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'local' AFTER storage_id`
+    )
+  }
+  if (!repositoryColumnNames.has("object_prefix")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_repository")}
+       ADD COLUMN object_prefix VARCHAR(1024) NULL AFTER storage_key`
+    )
+  }
+  await database.query(
+    `UPDATE ${databaseTable("backup_repository")}
+        SET storage_key = IFNULL(storage_id, 'local')
+      WHERE storage_key <> IFNULL(storage_id, 'local')`
+  )
+
+  const [repositoryIndexes] = await database.query(
+    `SHOW INDEX FROM ${databaseTable("backup_repository")}`
+  )
+  const repositoryIndexNames = new Set(
+    repositoryIndexes.map((index) => index.Key_name)
+  )
+  const storageUnique = databaseTableName(
+    "backup_repository_target_storage_unique"
+  )
+  const legacyUnique = databaseTableName("backup_repository_target_unique")
+  if (!repositoryIndexNames.has(storageUnique)) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_repository")}
+       ADD UNIQUE KEY ${databaseTable("backup_repository_target_storage_unique")} (relay_id, target_kind, target_id, storage_key)`
+    )
+  }
+  if (repositoryIndexNames.has(legacyUnique)) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_repository")}
+       DROP INDEX ${databaseTable("backup_repository_target_unique")}`
+    )
+  }
+
+  const storageIndex = databaseTableName("backup_repository_storage_idx")
+  if (!repositoryIndexNames.has(storageIndex)) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_repository")}
+       ADD KEY ${databaseTable("backup_repository_storage_idx")} (storage_id)`
+    )
+  }
+
+  const [createTableRows] = await database.query(
+    `SHOW CREATE TABLE ${databaseTable("backup_repository")}`
+  )
+  const createTable = createTableRows[0]?.["Create Table"] ?? ""
+  const storageFk = databaseTableName("backup_repository_storage_fk")
+  if (!createTable.includes(storageFk)) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_repository")}
+       ADD CONSTRAINT ${databaseTable("backup_repository_storage_fk")}
+         FOREIGN KEY (storage_id) REFERENCES ${databaseTable("backup_storage")} (id) ON DELETE RESTRICT`
+    )
+  }
+  const storageKeyCheck = databaseTableName("backup_repository_storage_key_chk")
+  if (!createTable.includes(storageKeyCheck)) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("backup_repository")}
+       ADD CONSTRAINT ${databaseTable("backup_repository_storage_key_chk")}
+         CHECK (storage_key = IFNULL(storage_id, 'local'))`
     )
   }
 }

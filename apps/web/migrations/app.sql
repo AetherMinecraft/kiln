@@ -230,6 +230,7 @@ CREATE TABLE IF NOT EXISTS kiln_backup_storage (
   access_key_id_ciphertext TEXT NOT NULL,
   secret_access_key_ciphertext TEXT NOT NULL,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  deleting BOOLEAN NOT NULL DEFAULT FALSE,
   last_verified_at TIMESTAMP(3) NULL,
   last_error VARCHAR(512) NULL,
   created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -261,9 +262,17 @@ CREATE TABLE IF NOT EXISTS kiln_backup_repository (
   relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   target_kind ENUM('instance', 'database', 'platform') NOT NULL,
   target_id VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  storage_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  storage_key VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'local',
+  object_prefix VARCHAR(1024) NULL,
   password_ciphertext TEXT NOT NULL,
   created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  UNIQUE KEY kiln_backup_repository_target_unique (relay_id, target_kind, target_id)
+  UNIQUE KEY kiln_backup_repository_target_storage_unique (relay_id, target_kind, target_id, storage_key),
+  KEY kiln_backup_repository_storage_idx (storage_id),
+  CONSTRAINT kiln_backup_repository_storage_fk
+    FOREIGN KEY (storage_id) REFERENCES kiln_backup_storage (id) ON DELETE RESTRICT,
+  CONSTRAINT kiln_backup_repository_storage_key_chk
+    CHECK (storage_key = IFNULL(storage_id, 'local'))
 );
 
 CREATE TABLE IF NOT EXISTS kiln_backup (
