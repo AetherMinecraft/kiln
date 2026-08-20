@@ -589,12 +589,19 @@ const loginEffect = Effect.fn("cli.login")(function* (
     )
   }
   const token = yield* pollForTokenEffect(url, device)
-  yield* saveSessionEffect({
+  const saved = yield* saveSessionEffect({
     profile,
     token: token.accessToken,
     url,
   })
   writeLine(`Logged in to ${url} with profile "${profile}".`)
+  if (saved.protected) {
+    writeLine(`Credential stored in ${saved.credentialManagerLabel}.`)
+  } else {
+    writeLine(
+      "Warning: No system credential manager is available; the credential is stored in the owner-only Kiln config file."
+    )
+  }
 })
 
 const pollForTokenEffect = Effect.fn("cli.login.poll")(function* (
@@ -638,6 +645,11 @@ const logoutEffect = Effect.fn("cli.logout")(function* (args: CliArguments) {
       ? `Logged out of profile "${result.profile}".`
       : `Profile "${result.profile}" was not logged in.`
   )
+  if (result.removed && !result.credentialRemoved) {
+    writeLine(
+      "Warning: The profile was removed, but its system credential could not be deleted."
+    )
+  }
 })
 
 const logsEffect = Effect.fn("cli.logs")(function* (

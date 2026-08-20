@@ -68,8 +68,15 @@ selected with the positional URL or `--url`. Named profiles are available
 through `--profile`.
 
 `KILN_URL` and `KILN_TOKEN` can bypass the saved profile in CI or scripts.
-Saved profiles live under the platform config directory with owner-only file
-permissions.
+Interactive logins store credentials in macOS Keychain or Windows Credential
+Manager. The profile URL and credential reference remain in the owner-only Kiln
+config file. Existing plaintext profiles migrate automatically the next time the
+CLI reads them.
+
+When a supported system credential manager is unavailable, such as on a
+headless Linux host, the CLI falls back to storing the credential in the
+owner-only config file and prints a warning during login. `kiln logout` revokes
+the active credential, removes its profile, and deletes its system credential.
 
 ## Discover and operate
 
