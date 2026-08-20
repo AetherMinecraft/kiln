@@ -44,6 +44,7 @@ import {
 } from "@/lib/release-version"
 import {
   beginSystemUpdateBatch,
+  canStartSystemUpdate,
   inactiveSystemUpdateBatch,
   isHearthUpdateLocked,
   recordHearthUpdateCompletion,
@@ -526,8 +527,10 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       latestVersionName?: string
     ) => {
       if (
-        updateMutationPendingRef.current ||
-        heldHearthUpdateRef.current !== null
+        !canStartSystemUpdate({
+          hearthReloadRequired: heldHearthUpdateRef.current !== null,
+          mutationPending: updateMutationPendingRef.current,
+        })
       ) {
         return
       }
@@ -718,8 +721,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         onConfirm={() => {
           if (
             pending &&
-            !updateMutation.isPending &&
-            !activityStore.getHearthReloadRequiredSnapshot()
+            canStartSystemUpdate({
+              hearthReloadRequired:
+                activityStore.getHearthReloadRequiredSnapshot(),
+              mutationPending: updateMutation.isPending,
+            })
           ) {
             updateMutation.mutate(pending)
           }
