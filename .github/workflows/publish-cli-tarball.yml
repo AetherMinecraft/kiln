@@ -1,0 +1,95 @@
+name: Publish CLI tarball
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Kiln release tag to publish or retry
+        required: true
+        type: string
+
+concurrency:
+  group: kiln-cli-tarball-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Attach kiln-cli npm tarball
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve release
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISHED_TAG: ${{ github.event.release.tag_name }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            tag="$PUBLISHED_TAG"
+          else
+            tag="$REQUESTED_TAG"
+          fi
+          version="${tag#v}"
+          printf '%s\n' "$version" \
+            | grep -Eq '^0\.[0-9]+\.[0-9]+(-nightly\.[0-9]{8}\.[0-9]{6})?$'
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check out release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Verify release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release view "$RELEASE_TAG" >/dev/null
+
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          cache: false
+          node-version-file: .node-version
+          run-install: |
+            - cwd: .
+              args: ["--frozen-lockfile"]
+
+      - name: Build npm package
+        env:
+          KILN_GIT_REPO: https://github.com/${{ github.repository }}
+          KILN_VERSION: ${{ steps.release.outputs.version }}
+        run: vp run -F kiln-cli build:npm
+
+      - name: Pack and verify npm package
+        id: package
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          diff -ru \
+            .agents/skills/kiln-cli \
+            apps/cli/dist/npm/skills/kiln-cli
+          mkdir -p artifacts
+          filename="$(npm pack ./apps/cli/dist/npm \
+            --pack-destination artifacts \
+            --json | jq -er '.[0].filename')"
+          test "$filename" = "kiln-cli-${VERSION}.tgz"
+          (cd artifacts && sha256sum "$filename" > "$filename.sha256")
+          echo "filename=$filename" >> "$GITHUB_OUTPUT"
+
+      - name: Attach package to release
+        env:
+          FILENAME: ${{ steps.package.outputs.filename }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "artifacts/$FILENAME" \
+            "artifacts/$FILENAME.sha256" \
+            --clobber

@@ -55,6 +55,33 @@ Bun compiles the app into `dist/kiln`; Bun does not need to be installed on
 the machine running that executable. Local macOS builds are ad-hoc signed with
 the JavaScript runtime entitlements required by Bun.
 
+## Distribute a fork through GitHub Releases
+
+Publishing a `v0.x.y` GitHub Release runs the `Publish CLI tarball` workflow.
+It builds the CLI's bundled Node package from that tag and attaches
+`kiln-cli-0.x.y.tgz` plus its SHA-256 checksum to the release. The workflow can
+also be dispatched manually with an existing release tag to retry an upload.
+
+Another repository can download and install the package without using the npm
+registry:
+
+```sh
+gh release download "$KILN_CLI_TAG" \
+  --repo your-org/kiln \
+  --pattern 'kiln-cli-*.tgz' \
+  --pattern 'kiln-cli-*.tgz.sha256' \
+  --dir .kiln-cli
+(cd .kiln-cli && sha256sum --check kiln-cli-*.tgz.sha256)
+npm install --global .kiln-cli/kiln-cli-*.tgz
+kiln --version
+```
+
+For a private Kiln fork, authenticate `gh` with a fine-grained token or GitHub
+App token that can read the fork's repository contents. A `GITHUB_TOKEN` issued
+to a different private repository does not automatically have that access.
+Fork installations should be updated by downloading a newer release tarball;
+`kiln update` targets the public npm package.
+
 ## Authenticate
 
 ```sh

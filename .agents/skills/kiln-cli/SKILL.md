@@ -79,6 +79,21 @@ identify that installer, with npm as the default and fallback. It updates only
 the CLI executable; it does not update Hearth, Relays, or managed servers, and
 it does not require authentication.
 
+For an unpublished fork, do not use `kiln update`. Install the fork's packaged
+GitHub Release asset instead:
+
+```sh
+gh release download "$KILN_CLI_TAG" --repo owner/kiln \
+  --pattern 'kiln-cli-*.tgz' --pattern 'kiln-cli-*.tgz.sha256' \
+  --dir .kiln-cli
+(cd .kiln-cli && sha256sum --check kiln-cli-*.tgz.sha256)
+npm install --global .kiln-cli/kiln-cli-*.tgz
+```
+
+Private cross-repository downloads require a token or GitHub App installation
+with read access to the Kiln fork; the consuming repository's default
+`GITHUB_TOKEN` does not gain that access implicitly.
+
 ## Resolve a server
 
 Discover targets instead of guessing identifiers:
