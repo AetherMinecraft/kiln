@@ -20,6 +20,13 @@ available; do not stop at providing command examples.
 - Never print, copy, or commit a Kiln token. Prefer saved profiles. Use
   `KILN_TOKEN` or `--token` only when the user deliberately provides an
   ephemeral credential, and keep it out of reported command output.
+- Interactive login stores credentials in macOS Keychain or Windows Credential
+  Manager. Existing plaintext profiles migrate when their saved credential is
+  next used; explicit tokens bypass migration, and login or logout can replace
+  or remove a legacy profile directly. A failed native migration leaves the
+  plaintext credential pending so later use can retry. Headless or unsupported
+  systems fall back to the owner-only config file and report that fallback
+  during login.
 - Do not inspect the saved config file unless authentication or profile
   resolution itself is being debugged. If inspection is necessary, redact the
   complete token value.
@@ -51,6 +58,9 @@ kiln login https://hearth.example.com --profile staging --name workstation
 `kiln login` targets `https://kiln.site` by default and normally opens a
 browser. Add `--no-open` when the environment cannot launch one. Do not start a
 new login when an authenticated profile already targets the requested Hearth.
+`kiln logout` revokes the credential before removing both the saved profile and
+its system credential. If native credential deletion fails, the CLI reports a
+warning after removing the profile.
 
 Use `--profile <name>` on any command to select a saved profile. `KILN_URL`,
 `KILN_TOKEN`, and `KILN_CONFIG` support isolated automation, but prefer the

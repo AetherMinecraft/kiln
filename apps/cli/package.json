@@ -12,7 +12,8 @@
     "dev": "bun src/main.ts",
     "format": "vp fmt \"src/**/*.ts\"",
     "lint": "vp lint src",
-    "test": "vp test run"
+    "test": "vp test run",
+    "test:credential-store": "pnpm build && node scripts/credential-store-e2e.mjs"
   },
   "dependencies": {
     "@workspace/contracts": "workspace:*",
