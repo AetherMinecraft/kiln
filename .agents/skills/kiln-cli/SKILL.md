@@ -323,15 +323,30 @@ connection:
 kiln files sync <server> ./server --plan
 kiln files sync <server> ./server --exclude 'logs/**' --exclude '*.tmp'
 kiln files sync <server> ./server --plan --json
+kiln files sync <server> ./server --atomic --json
+kiln files sync <server> ./server --atomic --delete-managed --manifest ./managed.json --max-delete 5
 ```
 
 Sync creates missing directories, compares same-size files with SHA-256,
 uploads only changed regular files, and verifies uploaded size and SHA-256.
-`--exclude` accepts a relative glob and may be repeated. `--json` emits a
-versioned machine-readable plan and result. Local symlinks and conflicting
-remote symlinks are refused. This first sync version does not delete remote
-files or stage the complete deployment atomically; an interrupted direct
-upload should be retried after inspecting the destination.
+`--exclude` accepts a relative glob and may be repeated, and applies to the
+remote walk as well as the local one: excluding a directory outright
+(`--exclude world`) skips it on both sides, while a pattern that only matches
+its contents (`--exclude 'world/**'`) still descends to skip each entry. Prefer
+the former on game servers, where worlds and logs otherwise dominate the walk.
+`--json` emits a versioned machine-readable plan and result. Local symlinks and
+conflicting remote symlinks are refused.
+
+`--atomic` stages changed files below a deployment-specific remote directory,
+verifies them, and asks Relay to transactionally activate the plan with rollback
+and recovery journaling. `--staging-path <remote>` changes the staging base.
+Managed deletion additionally requires `--delete-managed`, a version 1 JSON
+`--manifest` containing an explicit `managed` file array, and a sufficient
+`--max-delete` ceiling (default zero). Protected worlds, logs, backups, crash
+reports, undeclared paths, directories, excluded paths, and `.kiln` data are
+never deletion candidates. Hearth requires `instance.files.write` and, for
+deletion, `instance.files.delete-managed`; Relay requires
+`instance.files.sync`. Omitting `--atomic` retains direct, non-deleting sync.
 
 Ask the Relay to download a file directly from an HTTPS URL:
 

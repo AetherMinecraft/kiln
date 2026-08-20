@@ -16,6 +16,9 @@ import {
   cliDeleteServerResponseSchema,
   cliDeviceCodeResponseSchema,
   cliDeviceTokenResponseSchema,
+  relayFileSyncActivationResultSchema,
+  relayFileSyncCleanupResultSchema,
+  relayFileSyncPrepareResultSchema,
   cliPowerActionSchema,
   cliPowerResponseSchema,
   cliRelayInfoResponseSchema,
@@ -53,6 +56,7 @@ import {
   createSftpFileSyncTransport,
   renderFileSyncHuman,
   runFileSyncEffect,
+  type FileSyncController,
 } from "./file-sync.js"
 import {
   apiJsonEffect,
@@ -119,11 +123,18 @@ const runCommandEffect = Effect.fn("cli.command")(function* (
 
   const [group, action, ...rest] = args.command
   if (
-    (args.excludes.length > 0 || args.json || args.plan) &&
+    (args.atomic ||
+      args.deleteManaged ||
+      args.excludes.length > 0 ||
+      args.json ||
+      args.manifest !== undefined ||
+      args.maxDeleteProvided ||
+      args.plan ||
+      args.stagingPath !== undefined) &&
     !(group === "files" && action === "sync")
   ) {
     return yield* invalidUsage(
-      "--exclude, --json, and --plan are only supported by `kiln files sync`."
+      "Deployment sync options are only supported by `kiln files sync`."
     )
   }
   if (group === "login") {
@@ -567,11 +578,7 @@ const runCommandEffect = Effect.fn("cli.command")(function* (
     return
   }
   if (group === "files") {
-    yield* filesEffect(session, action, rest, {
-      excludes: args.excludes,
-      json: args.json,
-      plan: args.plan,
-    })
+    yield* filesEffect(session, action, rest, args)
     return
   }
   return yield* invalidUsage(`Unknown command: ${args.command.join(" ")}`)
@@ -735,7 +742,18 @@ const filesEffect = Effect.fn("cli.files")(function* (
   session: KilnSession,
   action: string | undefined,
   rest: Array<string>,
-  options: Pick<CliArguments, "excludes" | "json" | "plan">
+  options: Pick<
+    CliArguments,
+    | "atomic"
+    | "deleteManaged"
+    | "excludes"
+    | "json"
+    | "manifest"
+    | "maxDelete"
+    | "maxDeleteProvided"
+    | "plan"
+    | "stagingPath"
+  >
 ) {
   const target = yield* parseServerReferenceEffect(rest[0])
   if (action === "list") {
@@ -865,16 +883,67 @@ const filesEffect = Effect.fn("cli.files")(function* (
     const localDirectory = rest[1]
     if (!localDirectory) {
       return yield* invalidUsage(
-        "Usage: kiln files sync <server> <local-directory> [--plan] [--exclude <pattern>] [--json]"
+        "Usage: kiln files sync <server> <local-directory> [--plan] [--atomic] [--delete-managed --manifest <path> --max-delete <count>] [--exclude <pattern>] [--staging-path <remote-path>] [--json]"
       )
     }
+    if (options.deleteManaged && !options.atomic) {
+      return yield* invalidUsage("--delete-managed requires --atomic.")
+    }
+    if (options.deleteManaged && !options.manifest) {
+      return yield* invalidUsage("--delete-managed requires --manifest.")
+    }
+    if (options.manifest && !options.deleteManaged) {
+      return yield* invalidUsage("--manifest requires --delete-managed.")
+    }
+    if (options.maxDeleteProvided && !options.deleteManaged) {
+      return yield* invalidUsage("--max-delete requires --delete-managed.")
+    }
+    if (options.stagingPath && !options.atomic) {
+      return yield* invalidUsage("--staging-path requires --atomic.")
+    }
     const connection = yield* sftpConnectionEffect(session, target)
+    const controller = options.atomic
+      ? {
+          activate: (input: Parameters<FileSyncController["activate"]>[0]) =>
+            apiJsonEffect(
+              session,
+              "/api/cli/v1/files/sync/activate",
+              relayFileSyncActivationResultSchema,
+              jsonRequest(
+                "POST",
+                { ...input, relayId: target.relayId },
+                CLI_LONG_OPERATION_TIMEOUT_MS
+              )
+            ),
+          cleanup: (input: Parameters<FileSyncController["cleanup"]>[0]) =>
+            apiJsonEffect(
+              session,
+              "/api/cli/v1/files/sync/cleanup",
+              relayFileSyncCleanupResultSchema,
+              jsonRequest("POST", { ...input, relayId: target.relayId })
+            ),
+          prepare: (input: Parameters<FileSyncController["prepare"]>[0]) =>
+            apiJsonEffect(
+              session,
+              "/api/cli/v1/files/sync/prepare",
+              relayFileSyncPrepareResultSchema,
+              jsonRequest("POST", { ...input, relayId: target.relayId })
+            ),
+        }
+      : undefined
     const result = yield* withSftpSessionEffect(session, connection, (sftp) =>
       runFileSyncEffect({
+        atomic: options.atomic,
+        controller,
+        deleteManaged: options.deleteManaged,
         excludes: options.excludes,
+        instanceId: target.instanceId,
         localDirectory,
+        ...(options.manifest ? { manifest: options.manifest } : {}),
+        maxDelete: options.maxDelete,
         planOnly: options.plan,
         server: `${target.relayId}:${target.instanceId}`,
+        ...(options.stagingPath ? { stagingBase: options.stagingPath } : {}),
         transport: createSftpFileSyncTransport(sftp, connection.root),
       })
     )
@@ -1218,13 +1287,18 @@ Commands:
   files download <server> <remote> [local] Download a file
   files upload <server> <local|url> [remote]
                                           Upload locally or download HTTPS on Relay
-  files sync <server> <local-directory>    Plan or recursively upload changed files
+  files sync <server> <local-directory>    Plan or synchronize changed files
 
 Options:
       --brick <id|url> Change the Brick recipe
       --confirm <id>   Confirm a destructive server or backup deletion
       --disk <size>    Set disk quota (minimum 0.1GiB), for example 25GiB
       --exclude <glob> Exclude a sync path; may be repeated
+      --atomic         Stage, verify, and transactionally activate uploads
+      --delete-managed Delete missing files declared by --manifest
+      --manifest <path> JSON manifest of explicitly managed remote files
+      --max-delete <n> Refuse more than n managed deletions (default: 0)
+      --staging-path <remote> Remote staging base (default: .kiln/deployments)
   -f, --follow        Follow server logs
       --game-version <version>
                        Set the Brick's version variable

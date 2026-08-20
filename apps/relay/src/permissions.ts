@@ -49,6 +49,7 @@ export const relayActions = [
   "instance.files.download",
   "instance.files.upload",
   "instance.files.upload-url",
+  "instance.files.sync",
   "instance.network.read",
   "instance.network.write",
   "instance.logs.read",

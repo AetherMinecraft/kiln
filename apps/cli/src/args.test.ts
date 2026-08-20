@@ -49,12 +49,23 @@ describe("CLI arguments", () => {
         "--exclude",
         "logs/**",
         "--exclude=*.tmp",
+        "--atomic",
+        "--delete-managed",
+        "--manifest=managed.json",
+        "--max-delete",
+        "4",
+        "--staging-path=.kiln/deployments",
       ])
     ).toMatchObject({
       command: ["files", "sync", "relay:instance", "./server"],
+      atomic: true,
+      deleteManaged: true,
       excludes: ["logs/**", "*.tmp"],
       json: true,
+      manifest: "managed.json",
+      maxDelete: 4,
       plan: true,
+      stagingPath: ".kiln/deployments",
     })
     expect(() => parseArguments(["--output", "human"])).toThrow(
       "Unknown option: --output"

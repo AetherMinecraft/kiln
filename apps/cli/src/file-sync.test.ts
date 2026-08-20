@@ -13,10 +13,11 @@ import { resolve } from "node:path"
 import { assert, describe, it } from "@effect/vitest"
 import { Effect } from "effect"
 
-import { CliCommandError } from "./errors.js"
+import { CliCommandError, commandError } from "./errors.js"
 import {
   buildFileSyncPlanEffect,
   runFileSyncEffect,
+  type FileSyncController,
   type FileSyncTransport,
   type RemoteSyncEntry,
 } from "./file-sync.js"
@@ -207,12 +208,314 @@ describe("CLI file sync", () => {
       })
     )
   )
+
+  it.effect("stages, verifies, and activates atomic uploads", () =>
+    withDirectory((directory) =>
+      Effect.gen(function* () {
+        yield* fromPromise(async () => {
+          await mkdir(resolve(directory, "plugins"))
+          await writeFile(resolve(directory, "plugins", "server.jar"), "new")
+        })
+        const transport = new MemoryTransport({
+          "plugins/server.jar": "old",
+        })
+        const controller = new MemoryController()
+
+        const output = yield* runFileSyncEffect({
+          atomic: true,
+          controller,
+          deleteManaged: false,
+          excludes: [],
+          instanceId: "instance",
+          localDirectory: directory,
+          planOnly: false,
+          server: "relay:instance",
+          transport,
+        })
+
+        assert.strictEqual(output.plan.atomic, true)
+        assert.match(output.plan.deploymentId ?? "", /^[0-9a-f-]{36}$/u)
+        assert.strictEqual(controller.prepared, 1)
+        assert.strictEqual(controller.activated, 1)
+        assert.strictEqual(controller.cleaned, 0)
+        assert.lengthOf(transport.uploaded, 1)
+        assert.strictEqual(
+          transport.uploaded[0],
+          `${output.plan.stagingPath}/files/plugins/server.jar`
+        )
+        assert.deepEqual(output.result.activated, ["plugins/server.jar"])
+        assert.strictEqual(output.version, 2)
+      })
+    )
+  )
+
+  it.effect(
+    "activates empty directories and reserves a custom staging base",
+    () =>
+      withDirectory((directory) =>
+        Effect.gen(function* () {
+          yield* fromPromise(() => mkdir(resolve(directory, "plugins")))
+          const transport = new MemoryTransport()
+          const controller = new MemoryController()
+
+          const output = yield* runFileSyncEffect({
+            atomic: true,
+            controller,
+            excludes: [],
+            instanceId: "instance",
+            localDirectory: directory,
+            planOnly: false,
+            server: "relay:instance",
+            stagingBase: ".deploy",
+            transport,
+          })
+
+          assert.deepEqual(output.plan.createDirectories, ["plugins"])
+          assert.strictEqual(controller.prepared, 1)
+          assert.strictEqual(controller.activated, 1)
+          assert.deepEqual(output.result.createdDirectories, ["plugins"])
+          assert.match(output.plan.stagingPath ?? "", /^\.deploy\//u)
+        })
+      )
+  )
+
+  it.effect("guards managed deletion with a manifest and delete ceiling", () =>
+    withDirectory((directory) =>
+      Effect.gen(function* () {
+        const manifest = resolve(directory, "managed.json")
+        yield* fromPromise(() =>
+          writeFile(
+            manifest,
+            JSON.stringify({
+              managed: ["plugins/old.jar", "plugins/keep.jar"],
+              version: 1,
+            })
+          )
+        )
+        const transport = new MemoryTransport({
+          "plugins/keep.jar": "keep",
+          "plugins/old.jar": "old",
+        })
+
+        const limited = yield* buildFileSyncPlanEffect({
+          atomic: true,
+          deleteManaged: true,
+          excludes: [],
+          localDirectory: directory,
+          manifest,
+          maxDelete: 0,
+          transport,
+        }).pipe(Effect.flip)
+        assert.instanceOf(limited, CliCommandError)
+        assert.strictEqual(limited.exitCode, 10)
+
+        const plan = yield* buildFileSyncPlanEffect({
+          atomic: true,
+          deleteManaged: true,
+          excludes: ["plugins/keep.jar"],
+          localDirectory: directory,
+          manifest,
+          maxDelete: 1,
+          transport,
+        })
+        assert.deepEqual(
+          plan.deletions.map((file) => file.path),
+          ["plugins/old.jar"]
+        )
+        assert.lengthOf(plan.deletions[0]?.sha256 ?? "", 64)
+      })
+    )
+  )
+
+  it.effect("refuses protected managed paths", () =>
+    withDirectory((directory) =>
+      Effect.gen(function* () {
+        const manifest = resolve(directory, "managed.json")
+        yield* fromPromise(() =>
+          writeFile(
+            manifest,
+            JSON.stringify({ managed: ["world/level.dat"], version: 1 })
+          )
+        )
+        const failure = yield* buildFileSyncPlanEffect({
+          atomic: true,
+          deleteManaged: true,
+          excludes: [],
+          localDirectory: directory,
+          manifest,
+          maxDelete: 1,
+          transport: new MemoryTransport({ "world/level.dat": "world" }),
+        }).pipe(Effect.flip)
+        assert.instanceOf(failure, CliCommandError)
+        assert.strictEqual(failure.exitCode, 10)
+
+        yield* fromPromise(() =>
+          writeFile(
+            manifest,
+            JSON.stringify({ managed: ["../outside"], version: 1 })
+          )
+        )
+        const traversal = yield* buildFileSyncPlanEffect({
+          atomic: true,
+          deleteManaged: true,
+          excludes: [],
+          localDirectory: directory,
+          manifest,
+          maxDelete: 1,
+          transport: new MemoryTransport(),
+        }).pipe(Effect.flip)
+        assert.instanceOf(traversal, CliCommandError)
+        assert.strictEqual(traversal.exitCode, 10)
+      })
+    )
+  )
+
+  it.effect("cleans staging after interrupted and corrupt uploads", () =>
+    withDirectory((directory) =>
+      Effect.gen(function* () {
+        yield* fromPromise(() =>
+          writeFile(resolve(directory, "server.jar"), "jar")
+        )
+        const interrupted = new MemoryTransport()
+        interrupted.uploadFailure = new Error("interrupted")
+        const interruptedController = new MemoryController()
+        const transferFailure = yield* runFileSyncEffect({
+          atomic: true,
+          controller: interruptedController,
+          excludes: [],
+          instanceId: "instance",
+          localDirectory: directory,
+          planOnly: false,
+          server: "relay:instance",
+          transport: interrupted,
+        }).pipe(Effect.flip)
+        assert.strictEqual(transferFailure.exitCode, 11)
+        assert.strictEqual(interruptedController.cleaned, 1)
+
+        const corrupt = new MemoryTransport()
+        corrupt.corruptUploads = true
+        const corruptController = new MemoryController()
+        const verificationFailure = yield* runFileSyncEffect({
+          atomic: true,
+          controller: corruptController,
+          excludes: [],
+          instanceId: "instance",
+          localDirectory: directory,
+          planOnly: false,
+          server: "relay:instance",
+          transport: corrupt,
+        }).pipe(Effect.flip)
+        assert.strictEqual(verificationFailure.exitCode, 12)
+        assert.strictEqual(corruptController.cleaned, 1)
+      })
+    )
+  )
+
+  it.effect(
+    "uses the activation exit code and cleans after Relay failure",
+    () =>
+      withDirectory((directory) =>
+        Effect.gen(function* () {
+          yield* fromPromise(() =>
+            writeFile(resolve(directory, "server.jar"), "jar")
+          )
+          const controller = new MemoryController()
+          controller.activationFailure = true
+
+          const failure = yield* runFileSyncEffect({
+            atomic: true,
+            controller,
+            excludes: [],
+            instanceId: "instance",
+            localDirectory: directory,
+            planOnly: false,
+            server: "relay:instance",
+            transport: new MemoryTransport(),
+          }).pipe(Effect.flip)
+
+          assert.strictEqual(failure.exitCode, 13)
+          assert.strictEqual(failure.code, "sync_activation_failed")
+          assert.strictEqual(controller.cleaned, 1)
+        })
+      )
+  )
+
+  it.effect("skips excluded remote directories instead of walking them", () =>
+    withDirectory((directory) =>
+      Effect.gen(function* () {
+        yield* fromPromise(async () => {
+          await mkdir(resolve(directory, "plugins"))
+          await writeFile(resolve(directory, "plugins", "one.jar"), "jar")
+        })
+        const transport = new MemoryTransport({
+          "logs/latest.log": "noise",
+          "plugins/one.jar": "jar",
+          "world/region/r.0.0.mca": "chunks",
+        })
+
+        const output = yield* runFileSyncEffect({
+          excludes: ["logs", "world"],
+          localDirectory: directory,
+          planOnly: true,
+          server: "relay:instance",
+          transport,
+        })
+
+        // A deploy costs what it manages, not what happens to sit beside it.
+        assert.deepEqual(transport.listed, ["", "plugins"])
+        assert.strictEqual(output.plan.summary.remoteFiles, 1)
+        assert.deepEqual(output.plan.upload, [])
+        assert.deepEqual(
+          output.plan.unchanged.map((file) => file.path),
+          ["plugins/one.jar"]
+        )
+      })
+    )
+  )
 })
+
+class MemoryController implements FileSyncController {
+  activated = 0
+  activationFailure = false
+  cleaned = 0
+  prepared = 0
+
+  activate(
+    input: Parameters<FileSyncController["activate"]>[0]
+  ): ReturnType<FileSyncController["activate"]> {
+    this.activated += 1
+    if (this.activationFailure) {
+      return Effect.fail(
+        commandError({
+          code: "relay_operation_failed",
+          message: "Relay activation failed.",
+        })
+      )
+    }
+    return Effect.succeed({
+      activated: input.files.map((file) => file.path),
+      deleted: input.deletions.map((file) => file.path),
+      deploymentId: input.deploymentId,
+      stagingPath: input.stagingPath,
+    })
+  }
+
+  cleanup(): ReturnType<FileSyncController["cleanup"]> {
+    this.cleaned += 1
+    return Effect.succeed({})
+  }
+
+  prepare(): ReturnType<FileSyncController["prepare"]> {
+    this.prepared += 1
+    return Effect.succeed({})
+  }
+}
 
 class MemoryTransport implements FileSyncTransport {
   readonly contents = new Map<string, Buffer>()
   readonly createdDirectories: Array<string> = []
   readonly entries = new Map<string, RemoteSyncEntry>()
+  readonly listed: Array<string> = []
   readonly uploaded: Array<string> = []
   corruptUploads = false
   uploadFailure: Error | null = null
@@ -237,6 +540,7 @@ class MemoryTransport implements FileSyncTransport {
   }
 
   async list(path: string): Promise<ReadonlyArray<RemoteSyncEntry>> {
+    this.listed.push(path)
     const prefix = path ? `${path}/` : ""
     return [...this.entries]
       .filter(([candidate]) => {

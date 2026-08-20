@@ -105,6 +105,8 @@ kiln files upload <relay-id>:<instance-id> ./plugins/example.jar plugins/example
 kiln files upload <relay-id>:<instance-id> https://example.com/example.jar plugins/example.jar
 kiln files sync <relay-id>:<instance-id> ./server --plan --json
 kiln files sync <relay-id>:<instance-id> ./server --exclude 'logs/**' --exclude '*.tmp'
+kiln files sync <relay-id>:<instance-id> ./server --atomic --json
+kiln files sync <relay-id>:<instance-id> ./server --atomic --delete-managed --manifest ./managed.json --max-delete 5
 kiln backups list --limit 200
 kiln backups create server <relay-id>:<instance-id> --name "Before update"
 kiln backups create server <relay-id>:<instance-id> --mode full
@@ -132,15 +134,26 @@ verify their size and hash.
 
 Use `--plan` to inspect the operation without changing remote files. Repeat
 `--exclude <pattern>` for relative glob patterns such as `logs/**`, `cache`,
-or `*.tmp`. `--json` emits one versioned JSON document containing the plan and
-result for CI consumers. Local symlinks, unsafe remote names, and a remote
+or `*.tmp`; excluded paths are skipped on both sides, and excluding a directory
+by name keeps the remote walk out of it entirely. `--json` emits one versioned
+JSON document containing the plan and result for CI consumers. Local symlinks, unsafe remote names, and a remote
 symlink or directory where a file would be written cause planning to fail.
 
-Phase 1 does not delete remote files and therefore preserves every path absent
-from the local directory. Staged activation, atomic multi-file deployment,
-managed deletion and manifests, delete limits, cleanup, and deployment-level
-audit records are deferred to the next deployment phase. Until staged
-activation is added, interruption can leave a directly uploaded destination
-partially written; rerun the sync after resolving the failure.
+Use `--atomic` to upload into a deployment-specific staging directory, verify
+each staged file, and have Relay transactionally rename the plan into place.
+Relay retains rollback copies until all renames succeed, journals activation for
+startup recovery, cleans safely marked staging after failures when reachable,
+and records the CLI actor and affected paths in activity.
+
+Managed deletion is opt-in. `--delete-managed` requires a version 1 JSON
+manifest such as `{"version":1,"managed":["plugins/Example.jar"]}`. Only
+missing regular files explicitly named by the manifest are eligible.
+`--max-delete` defaults to zero and refuses a plan over its limit. Excludes,
+undeclared files, directories, worlds, logs, backups, crash reports, and Kiln's
+staging data remain preserved. Managed deletion requires the separate
+`instance.files.delete-managed` permission.
+
+Without `--atomic`, sync retains the Phase 1 direct-upload behavior and never
+deletes files.
 
 Run `kiln help` for the complete command reference.

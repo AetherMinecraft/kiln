@@ -114,6 +114,21 @@ describe("activity", () => {
     ).toBe("Updated server startup settings")
   })
 
+  it("classifies deployment activation and its managed-delete permission", () => {
+    const record = audit({
+      deletedFiles: 1,
+      instanceId: "server-a",
+      operation: "instance.files.sync.activate",
+    })
+    expect(activityTypeForAudit(record)).toBe("files")
+    expect(activityLabelForAudit(record)).toBe(
+      "Activated a server file deployment"
+    )
+    expect(activityPermissionForAudit(record)).toBe(
+      "instance.files.delete-managed"
+    )
+  })
+
   it("uses the recorded permission when the audit provides one", () => {
     const record = audit(
       {

@@ -11,6 +11,11 @@ import {
 } from "./backups.js"
 import { MINIMUM_INSTANCE_DISK_LIMIT_BYTES } from "./instance-limits.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
+import {
+  relayFileSyncActivateSchema,
+  relayFileSyncCleanupSchema,
+  relayFileSyncPrepareSchema,
+} from "./file-sync.js"
 
 export const cliAccessModes = ["full_access", "read_only"] as const
 export const cliAccessModeSchema = z.enum(cliAccessModes)
@@ -523,6 +528,21 @@ export const cliSftpResponseSchema = z
     username: z.email(),
   })
   .strict()
+
+export const cliFileSyncPrepareRequestSchema =
+  relayFileSyncPrepareSchema.safeExtend({
+    relayId: cliTargetSchema.shape.relayId,
+  })
+
+export const cliFileSyncActivateRequestSchema =
+  relayFileSyncActivateSchema.safeExtend({
+    relayId: cliTargetSchema.shape.relayId,
+  })
+
+export const cliFileSyncCleanupRequestSchema =
+  relayFileSyncCleanupSchema.safeExtend({
+    relayId: cliTargetSchema.shape.relayId,
+  })
 
 export type CliAccessDuration = z.infer<typeof cliAccessDurationSchema>
 export type CliAccessMode = z.infer<typeof cliAccessModeSchema>

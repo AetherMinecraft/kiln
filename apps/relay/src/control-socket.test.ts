@@ -194,6 +194,47 @@ describe("Relay control audit details", () => {
       permission: "instance.files.upload-url",
     })
   })
+
+  it("audits file deployments with their actor and affected paths", () => {
+    const credentialId = "12345678-1234-4123-8123-123456789abc"
+    const instanceId = "a".repeat(40)
+    const deploymentId = "12345678-1234-4123-8123-123456789abd"
+    const request: RelayControlRequest = {
+      deadline: Date.now() + 5_000,
+      id: "request",
+      operation: "instance.files.sync.activate",
+      payload: {
+        deletions: [{ path: "plugins/old.jar" }],
+        deploymentId,
+        directories: ["plugins/config"],
+        files: [{ path: "plugins/server.jar" }],
+        instanceId,
+      },
+      subject: `cli/${credentialId}/user-123`,
+      timeoutMs: 5_000,
+      type: "request",
+      v: 1,
+    }
+
+    expect(isAuditedOperation(request.operation)).toBe(true)
+    expect(auditDetailsForRequest(request, {})).toEqual({
+      activatedFiles: 1,
+      affectedPaths: [
+        "plugins/config",
+        "plugins/server.jar",
+        "plugins/old.jar",
+      ],
+      cliCredentialId: credentialId,
+      createdDirectories: 1,
+      deletedFiles: 1,
+      deploymentId,
+      instanceId,
+      operation: "instance.files.sync.activate",
+      permission: "instance.files.delete-managed",
+      source: "cli",
+      subject: "user-123",
+    })
+  })
 })
 
 describe("Relay control socket", () => {
@@ -376,6 +417,24 @@ describe("Relay control socket", () => {
         expect(consoleFailure.message).toBe("Survival is not running")
         expect(consoleFailure.replyTo).toBe(consoleRequestId)
         expect(consoleFailure.retryable).toBe(false)
+      }
+
+      const syncRequestId = randomBytes(12).toString("hex")
+      socket.send(
+        JSON.stringify({
+          deadline: Date.now() + 5_000,
+          id: syncRequestId,
+          operation: "instance.files.sync.prepare",
+          payload: {},
+          type: "request",
+          v: 1,
+        })
+      )
+      const syncFailure = await inbox.next()
+      expect(syncFailure.type).toBe("error")
+      if (syncFailure.type === "error") {
+        expect(syncFailure.code).toBe("forbidden")
+        expect(syncFailure.replyTo).toBe(syncRequestId)
       }
 
       const reverseResult = control.requestClients(
