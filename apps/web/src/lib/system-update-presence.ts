@@ -13,6 +13,7 @@ const relayOperations = new Map<string, Set<string>>()
 const relayDisconnects = new Set<string>()
 const relayStatusDuringUpdate = new Map<string, "connected" | "unreachable">()
 let hydrated = false
+let systemUpdateOverviewRefetchBlocked = false
 const decodeStoredPresence = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Unknown)
 )
@@ -55,6 +56,21 @@ export function isHearthSystemUpdateActive(): boolean {
 
 export function isRelaySystemUpdateActive(relayId: string): boolean {
   return (relayOperations.get(relayId)?.size ?? 0) > 0
+}
+
+export function canRefetchSystemUpdateOverview(): boolean {
+  return !systemUpdateOverviewRefetchBlocked
+}
+
+export function setSystemUpdateOverviewRefetchBlocked(blocked: boolean): void {
+  systemUpdateOverviewRefetchBlocked = blocked
+}
+
+export const systemUpdateOverviewRefetchPolicy = {
+  enabled: canRefetchSystemUpdateOverview,
+  refetchOnMount: canRefetchSystemUpdateOverview,
+  refetchOnReconnect: canRefetchSystemUpdateOverview,
+  refetchOnWindowFocus: canRefetchSystemUpdateOverview,
 }
 
 export function noteRelayDisconnectedDuringUpdate(relayId: string): void {
