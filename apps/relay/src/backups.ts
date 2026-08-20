@@ -5,7 +5,6 @@ import {
   createWriteStream,
   type ReadStream,
 } from "node:fs"
-import { request as httpsRequest } from "node:https"
 import {
   lstat,
   mkdir,
@@ -20,8 +19,6 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { basename, dirname, relative, resolve, sep } from "node:path"
-import { isIP } from "node:net"
-import { Transform } from "node:stream"
 import { constants as zlibConstants } from "node:zlib"
 import { Effect, Fiber, Queue, Result } from "effect"
 import { minimatch } from "minimatch"
@@ -35,10 +32,13 @@ import {
   type BackupCreateTaskResult,
   type BackupDeleteTaskInput,
   type BackupExportTaskResult,
+  type BackupResticCreateTaskResult,
   type BackupTaskInput,
   type BackupTaskPhase,
   type BackupTaskResult,
   type RelayBackupTask,
+  type RelayInstanceWebRoute,
+  type ResticRepositoryLocation,
 } from "@workspace/contracts"
 
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
@@ -51,7 +51,11 @@ import { createEncryptedPlatformBackup } from "./platform-backups.js"
 import { RelayBackupError } from "./effect/errors.js"
 import { promiseEffect } from "./effect/promise.js"
 import { RelayStateStore } from "./effect/state.js"
-import { isPublicRemoteAddress, secureRemoteLookup } from "./source-policy.js"
+import {
+  backupArchivePath,
+  backupDestinationFor,
+  backupDirectoryPath,
+} from "./backups/destinations/index.js"
 import {
   installPreparedInstanceRestore,
   materializeBackupArtifact,
@@ -64,20 +68,23 @@ import {
 import {
   createResticDriver,
   requiredRepositoryPassword,
+  resticDriverLocation,
   resticRepositoryPath,
   resticSnapshotSelector,
   translateExcludePatterns,
   validateStagingTree,
   type ResticDriver,
+  type ResticDriverLocation,
 } from "./restic.js"
 
 const MAX_BACKUP_ENTRIES = 100_000
 const ZIP_OVERHEAD_RESERVE_BYTES = 64 * 1024 * 1024
-const MAX_S3_SINGLE_PUT_BYTES = 5 * 1024 ** 3
-const BACKUP_TRANSFER_IDLE_TIMEOUT_MS = 30_000
 const BACKUP_TIMEOUT_REASON =
   "Cancelled after reaching the configured backup timeout"
 const EXPORT_SWEEP_INTERVAL = "1 hour"
+const RESTIC_CACHE_CLEANUP_TIMEOUT_MS = 30_000
+const RESTIC_RECOVERY_TIMEOUT_MS = 30_000
+const RESTIC_RECOVERY_PRUNE_TIMEOUT_MS = 30_000
 const DEFAULT_EXCLUDES = [
   ".DS_Store",
   "Thumbs.db",
@@ -167,18 +174,27 @@ export class BackupManager {
         config: options.config,
         createArchive:
           options.createArchive ??
-          ((input, instance, progress, signal) =>
+          (async (input, instance, progress, signal) =>
             createPortableInstanceBackup(
               options.config,
               input,
               instance,
               progress,
-              signal
+              signal,
+              await Effect.runPromise(state.listInstanceRoutes(instance.id))
             )),
         findInstance: options.findInstance,
         isInstanceStopped: options.isInstanceStopped,
         databases: options.databases ?? null,
-        restic: options.restic ?? createResticDriver(),
+        restic:
+          options.restic ??
+          createResticDriver({
+            cacheDirectory: resolve(
+              options.config.dataDirectory,
+              "restic",
+              "cache"
+            ),
+          }),
         state,
         wake,
       })
@@ -220,9 +236,11 @@ export class BackupManager {
   }
 
   list(updatedAfter?: number) {
-    return this.#state.listBackupTasks(updatedAfter).pipe(
-      Effect.map((tasks) => tasks.filter((task) => task.kind !== "prune"))
-    )
+    return this.#state
+      .listBackupTasks(updatedAfter)
+      .pipe(
+        Effect.map((tasks) => tasks.filter((task) => task.kind !== "prune"))
+      )
   }
 
   cancel(taskId: string) {
@@ -273,9 +291,7 @@ export class BackupManager {
               )
             ),
             Effect.tap((stopped) =>
-              stopped
-                ? Effect.sync(() => controller.abort())
-                : Effect.void
+              stopped ? Effect.sync(() => controller.abort()) : Effect.void
             ),
             Effect.asVoid
           )
@@ -485,33 +501,31 @@ export class BackupManager {
             "Stop the server before restoring a backup"
           )
         }
-        const result = yield* (
-          input.source.kind === "restic"
-            ? runResticRestore(
-                this.#config,
-                this.#restic,
-                input,
-                instance,
-                createSignal
-              )
-            : Effect.tryPromise({
-                try: () =>
-                  restorePortableInstanceBackup(
-                    this.#config,
-                    { ...input, kind: "restore" },
-                    instance
-                  ),
-                catch: (cause) =>
-                  cause instanceof RelayBackupError
-                    ? cause
-                    : RelayBackupError.make({
-                        code: "restore_failed",
-                        operation: "restore",
-                        reason: backupErrorMessage(cause),
-                        cause,
-                      }),
-              })
-        )
+        const result = yield* input.source.kind === "restic"
+          ? runResticRestore(
+              this.#config,
+              this.#restic,
+              input,
+              instance,
+              createSignal
+            )
+          : Effect.tryPromise({
+              try: () =>
+                restorePortableInstanceBackup(
+                  this.#config,
+                  { ...input, kind: "restore" },
+                  instance
+                ),
+              catch: (cause) =>
+                cause instanceof RelayBackupError
+                  ? cause
+                  : RelayBackupError.make({
+                      code: "restore_failed",
+                      operation: "restore",
+                      reason: backupErrorMessage(cause),
+                      cause,
+                    }),
+            })
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
           result,
@@ -537,10 +551,19 @@ export class BackupManager {
             ? yield* runResticForget(
                 this.#config,
                 this.#restic,
-                this.#state,
-                this.#wake,
                 task.input,
-                createSignal
+                (progress) =>
+                  this.#state.updateBackupTaskProgress(
+                    task.taskId,
+                    progress.completed,
+                    progress.total || null,
+                    progress.phase,
+                    progress.currentPath,
+                    progress.currentArtifactId,
+                    Date.now()
+                  ),
+                createSignal,
+                () => createSignal
               )
             : yield* deleteBackupArtifacts(
                 this.#config,
@@ -778,32 +801,6 @@ export class BackupManager {
               Date.now()
             ),
           createSignal
-        ).pipe(
-          // An over-limit snapshot was forgotten before this error; enqueue
-          // the same internal prune as user deletes so retried creates do
-          // not accumulate unreferenced packs in the repository.
-          Effect.tapError((error) =>
-            error instanceof RelayBackupError &&
-            error.code === "backup_too_large" &&
-            input.destination.kind === "restic"
-              ? this.#state
-                  .enqueueBackupTask(
-                    {
-                      backupId: randomUUID(),
-                      kind: "prune",
-                      repositoryPassword:
-                        input.destination.repositoryPassword,
-                      target: input.target,
-                      taskId: randomUUID(),
-                    },
-                    Date.now()
-                  )
-                  .pipe(
-                    Effect.andThen(Queue.offer(this.#wake, undefined)),
-                    Effect.ignore
-                  )
-              : Effect.void
-          )
         )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
@@ -811,6 +808,36 @@ export class BackupManager {
           Date.now()
         )
         if (!completed) {
+          const cleaned = yield* Effect.result(
+            runResticForget(
+              this.#config,
+              this.#restic,
+              {
+                backupId: input.backupId,
+                destination: {
+                  ...input.destination,
+                  snapshotId: result.snapshotId,
+                },
+                kind: "delete",
+                target: input.target,
+                taskId: randomUUID(),
+              },
+              () => Effect.succeed(false),
+              AbortSignal.timeout(RESTIC_RECOVERY_TIMEOUT_MS),
+              () => AbortSignal.timeout(RESTIC_RECOVERY_PRUNE_TIMEOUT_MS)
+            )
+          )
+          if (Result.isFailure(cleaned)) {
+            yield* Effect.logError(
+              "Could not forget a restic snapshot completed after cancellation",
+              {
+                backupId: input.backupId,
+                cause: cleaned.failure,
+                snapshotId: result.snapshotId,
+                taskId: task.taskId,
+              }
+            )
+          }
           return yield* backupFailure(
             "task_state_changed",
             "create.complete",
@@ -927,7 +954,8 @@ export async function createPortableInstanceBackup(
   input: BackupCreateTaskInput,
   instance: RelayInstanceConfig,
   progress: BackupProgress,
-  signal: AbortSignal = new AbortController().signal
+  signal: AbortSignal = new AbortController().signal,
+  webRoutes: ReadonlyArray<RelayInstanceWebRoute> = []
 ): Promise<BackupArchiveCreateTaskResult> {
   signal.throwIfAborted()
   const configuredRoot = await realpath(config.rootDirectory)
@@ -938,14 +966,16 @@ export async function createPortableInstanceBackup(
   const backupDirectory = backupDirectoryPath(config)
   await mkdir(backupDirectory, { recursive: true, mode: 0o700 })
   const destination = backupArchivePath(config, input.backupId)
-  const maximumBytes = [input.destination, ...(input.replicas ?? [])].some(
-    (destination) => destination.kind === "s3"
-  )
-    ? Math.min(
-        input.maxBytes ?? MAX_S3_SINGLE_PUT_BYTES,
-        MAX_S3_SINGLE_PUT_BYTES
-      )
-    : input.maxBytes
+  const maximumBytes = [input.destination, ...(input.replicas ?? [])].reduce<
+    number | null
+  >((limit, destination) => {
+    if (destination.kind === "restic") return limit
+    const destinationLimit = backupDestinationFor(
+      destination.kind
+    ).maximumFullBackupBytes
+    if (destinationLimit === null) return limit
+    return Math.min(limit ?? destinationLimit, destinationLimit)
+  }, input.maxBytes)
   const patterns = [...DEFAULT_EXCLUDES, ...input.exclude]
   let warnings: Array<string> = []
 
@@ -984,14 +1014,7 @@ export async function createPortableInstanceBackup(
             maximumBytes,
             progress,
             signal,
-            {
-              artifactKind: "archive",
-              backupId: input.backupId,
-              createdAt: new Date().toISOString(),
-              formatVersion: 1,
-              mode: "full",
-              target: input.target,
-            }
+            instanceBackupManifest(input, instance, webRoutes)
           )
           warnings = [...collected.warnings, ...written.warnings]
           if (written.changed.length > 0 && attempt === 0) {
@@ -1041,6 +1064,51 @@ export async function createPortableInstanceBackup(
   })
 }
 
+function instanceBackupManifest(
+  input: BackupCreateTaskInput,
+  instance: RelayInstanceConfig,
+  webRoutes: ReadonlyArray<RelayInstanceWebRoute>
+): BackupArchiveManifest {
+  return {
+    artifactKind: "archive",
+    backupId: input.backupId,
+    createdAt: new Date().toISOString(),
+    formatVersion: 2,
+    mode: "full",
+    server: {
+      brick: {
+        consoleStopCommands: [...(instance.brickConsoleStopCommands ?? [])],
+        format: instance.brickFormat ?? null,
+        id: instance.brickId ?? null,
+        networkMode: instance.brickNetworkMode ?? null,
+        primaryPort: instance.brickPrimaryPort ?? null,
+        primaryPortProtocol: instance.brickPrimaryPortProtocol ?? null,
+        readiness: instance.brickReadiness ?? null,
+        source: instance.brickSource ?? null,
+        supportsSrv: instance.brickSupportsSrv ?? false,
+      },
+      game: instance.game,
+      implementation: instance.implementation,
+      javaVersion: instance.javaVersion,
+      name: instance.name,
+      network: {
+        connectAddress: instance.connectAddress,
+        ports: instance.ports,
+        publicHost: instance.publicHost ?? null,
+        publicPort: instance.publicPort ?? null,
+        webRoutes: [...webRoutes],
+      },
+      startup: {
+        limits: instance.limits,
+        tailscale: instance.tailscale,
+        variables: instance.variables ?? {},
+      },
+      version: instance.version,
+    },
+    target: input.target,
+  }
+}
+
 export function storeCreatedBackup(
   config: RelayConfig,
   input: BackupCreateTaskInput,
@@ -1056,40 +1124,41 @@ export function storeCreatedBackup(
     const destinations = [input.destination, ...(input.replicas ?? [])]
     progress.completed = 0
     progress.total = result.bytes
-    const outcomes: NonNullable<BackupArchiveCreateTaskResult["artifacts"]> =
-      []
+    const outcomes: NonNullable<BackupArchiveCreateTaskResult["artifacts"]> = []
     let available = 0
     let lastUploadedArtifactId: string | null = null
     for (const destination of destinations) {
       signal.throwIfAborted()
-      if (destination.kind !== "s3") {
-        if (destination.kind === "local") {
-          available += 1
-          if (destination.artifactId) {
-            outcomes.push({
-              artifactId: destination.artifactId,
-              error: null,
-              status: "available",
-            })
-          }
-        }
-        continue
-      }
+      if (destination.kind === "restic") continue
       progress.completed = 0
       progress.currentArtifactId = destination.artifactId ?? null
       const uploaded = yield* Effect.result(
-        uploadArtifact(
-          config,
-          { ...input, destination },
-          result,
-          signal,
-          (bytes) => {
-            progress.completed = Math.min(
-              progress.total,
-              progress.completed + bytes
+        destination.kind === "s3"
+          ? uploadArtifact(
+              config,
+              { ...input, destination },
+              result,
+              signal,
+              (bytes) => {
+                progress.completed = Math.min(
+                  progress.total,
+                  progress.completed + bytes
+                )
+              }
             )
-          }
-        )
+          : backupDestinationFor("local").saveFullBackup({
+              backupId: input.backupId,
+              config,
+              destination,
+              onChunk: (bytes) => {
+                progress.completed = Math.min(
+                  progress.total,
+                  progress.completed + bytes
+                )
+              },
+              result,
+              signal,
+            })
       )
       if (Result.isSuccess(uploaded)) {
         available += 1
@@ -1110,7 +1179,13 @@ export function storeCreatedBackup(
         })
       }
     }
-    if (!destinations.some((destination) => destination.kind === "local")) {
+    if (
+      !destinations.some(
+        (destination) =>
+          destination.kind !== "restic" &&
+          backupDestinationFor(destination.kind).retainsFullBackupLocally
+      )
+    ) {
       yield* promiseEffect(() =>
         rm(backupArchivePath(config, input.backupId), { force: true })
       ).pipe(Effect.ignore)
@@ -1134,39 +1209,18 @@ function uploadBackupArtifact(
   input: BackupCreateTaskInput & {
     destination: Extract<BackupCreateTaskInput["destination"], { kind: "s3" }>
   },
-  result: BackupCreateTaskResult,
+  result: BackupArchiveCreateTaskResult,
   signal: AbortSignal,
   onChunk: (bytes: number) => void
 ) {
-  if (result.bytes > MAX_S3_SINGLE_PUT_BYTES) {
-    return backupFailure(
-      "s3_single_put_too_large",
-      "create.upload",
-      "S3 backups cannot exceed 5 GiB until multipart upload support is enabled"
-    )
-  }
-  return Effect.tryPromise({
-    try: () =>
-      sendSignedBackupRequest({
-        allowPrivateNetwork: input.destination.allowPrivateNetwork,
-        bodyPath: backupArchivePath(config, input.backupId),
-        headers: {
-          ...input.destination.headers,
-          "content-length": String(result.bytes),
-        },
-        method: "PUT",
-        onBodyChunk: onChunk,
-        signal,
-        url: input.destination.uploadUrl,
-      }),
-    catch: (cause) =>
-      RelayBackupError.make({
-        code: "s3_upload_failed",
-        operation: "create.upload",
-        reason: "The backup archive could not be uploaded to S3 storage",
-        cause,
-      }),
-  }).pipe(Effect.as(result))
+  return backupDestinationFor("s3").saveFullBackup({
+    backupId: input.backupId,
+    config,
+    destination: input.destination,
+    onChunk,
+    result,
+    signal,
+  })
 }
 
 export function deleteBackupArtifacts(
@@ -1245,108 +1299,21 @@ function deleteBackupArtifact(
   config: RelayConfig,
   input: BackupDeleteTaskInput & { kind: "delete" }
 ) {
-  if (input.destination.kind === "local") {
-    return promiseEffect(() =>
-      rm(backupArchivePath(config, input.backupId), { force: true })
-    ).pipe(Effect.as({ warnings: [] }))
-  }
   if (input.destination.kind === "restic") {
     return Effect.succeed({ warnings: [] })
   }
   const destination = input.destination
-  return Effect.tryPromise({
-    try: () =>
-      sendSignedBackupRequest({
-        allowPrivateNetwork: destination.allowPrivateNetwork,
-        headers: destination.headers,
-        method: "DELETE",
-        url: destination.deleteUrl,
-      }),
-    catch: (cause) =>
-      RelayBackupError.make({
-        code: "s3_delete_failed",
-        operation: "delete.remote",
-        reason: "The backup archive could not be deleted from S3 storage",
-        cause,
-      }),
-  }).pipe(Effect.as({ warnings: [] }))
-}
-
-function sendSignedBackupRequest(input: {
-  allowPrivateNetwork: boolean
-  bodyPath?: string
-  headers: Readonly<Record<string, string>>
-  method: "DELETE" | "PUT"
-  onBodyChunk?: (bytes: number) => void
-  signal?: AbortSignal
-  url: string
-}): Promise<void> {
-  const url = new URL(input.url)
-  if (url.protocol !== "https:" || url.username || url.password) {
-    return Promise.reject(new Error("Signed backup URLs must use HTTPS"))
-  }
-  const literal = url.hostname.replace(/^\[|\]$/gu, "")
-  if (
-    !input.allowPrivateNetwork &&
-    isIP(literal) !== 0 &&
-    !isPublicRemoteAddress(literal)
-  ) {
-    return Promise.reject(
-      new Error("Signed backup URL resolves to a private or reserved address")
-    )
-  }
-  return new Promise((resolveRequest, rejectRequest) => {
-    const request = httpsRequest(
-      url,
-      {
-        headers: input.headers,
-        lookup: input.allowPrivateNetwork ? undefined : secureRemoteLookup,
-        method: input.method,
-        signal: input.signal,
-      },
-      (response) => {
-        let responseBytes = 0
-        response.on("data", (chunk: Buffer) => {
-          responseBytes += chunk.byteLength
-          if (responseBytes > 64 * 1024) {
-            response.destroy(new Error("S3 storage response was too large"))
-          }
-        })
-        response.once("aborted", () => {
-          rejectRequest(new Error("S3 storage closed the response early"))
-        })
-        response.once("end", () => {
-          const status = response.statusCode ?? 0
-          if (status >= 200 && status < 300) resolveRequest()
-          else rejectRequest(new Error(`S3 storage returned HTTP ${status}`))
-        })
-        response.once("error", rejectRequest)
-      }
-    )
-    request.setTimeout(BACKUP_TRANSFER_IDLE_TIMEOUT_MS, () => {
-      request.destroy(new Error("S3 backup request timed out"))
-    })
-    request.once("error", rejectRequest)
-    if (input.bodyPath) {
-      const body = createReadStream(input.bodyPath, { signal: input.signal })
-      body.once("error", (cause) => request.destroy(cause))
-      const onBodyChunk = input.onBodyChunk
-      if (!onBodyChunk) {
-        body.pipe(request)
-        return
-      }
-      const meter = new Transform({
-        transform(chunk: Buffer, _encoding, callback) {
-          onBodyChunk(chunk.byteLength)
-          callback(null, chunk)
-        },
+  return destination.kind === "local"
+    ? backupDestinationFor("local").deleteFullBackup({
+        backupId: input.backupId,
+        config,
+        destination,
       })
-      meter.once("error", (cause) => request.destroy(cause))
-      body.pipe(meter).pipe(request)
-    } else {
-      request.end()
-    }
-  })
+    : backupDestinationFor("s3").deleteFullBackup({
+        backupId: input.backupId,
+        config,
+        destination,
+      })
 }
 
 function backupExportDirectoryPath(config: RelayConfig): string {
@@ -1422,9 +1389,9 @@ function runResticCreate(
   restic: ResticDriver,
   findInstance: (instanceId: string) => Promise<RelayInstanceConfig | null>,
   input: BackupCreateTaskInput & { kind?: "create" },
-  updateProgress: (progress: BackupProgress) => ReturnType<
-    RelayStateStore["Service"]["updateBackupTaskProgress"]
-  >,
+  updateProgress: (
+    progress: BackupProgress
+  ) => ReturnType<RelayStateStore["Service"]["updateBackupTaskProgress"]>,
   signal: AbortSignal
 ) {
   return Effect.gen(function* () {
@@ -1461,9 +1428,7 @@ function runResticCreate(
     const progressFiber = yield* Effect.forkChild(
       Effect.sleep("500 millis").pipe(
         Effect.andThen(
-          Effect.suspend(() =>
-            updateProgress(progress).pipe(Effect.asVoid)
-          )
+          Effect.suspend(() => updateProgress(progress).pipe(Effect.asVoid))
         ),
         Effect.forever
       )
@@ -1488,7 +1453,19 @@ function runResticCreate(
               reason: backupErrorMessage(cause),
               cause,
             }),
-    }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
+    }).pipe(
+      Effect.ensuring(Fiber.interrupt(progressFiber)),
+      Effect.ensuring(
+        cleanupResticCache(config, restic, {
+          password,
+          repository:
+            input.destination.kind === "restic"
+              ? input.destination.repository
+              : undefined,
+          targetId: input.target.id,
+        })
+      )
+    )
     return result
   })
 }
@@ -1501,33 +1478,41 @@ async function createResticSnapshot(
   password: string,
   progress: BackupProgress,
   signal: AbortSignal
-): Promise<BackupCreateTaskResult> {
-  const repository = resticRepositoryPath(config, input.target.id)
+): Promise<BackupResticCreateTaskResult> {
+  const location = resticDriverLocation(
+    config,
+    input.target.id,
+    input.destination.kind === "restic"
+      ? input.destination.repository
+      : undefined
+  )
   const translated = translateExcludePatterns([
     ...DEFAULT_EXCLUDES,
     ...input.exclude,
   ])
-  const exists = await restic.catConfig({ password, repository, signal })
-  if (!exists) await restic.init({ password, repository, signal })
+  const exists = await restic.catConfig({ location, password, signal })
+  if (exists === "missing") await restic.init({ location, password, signal })
   const existing = await restic.snapshotsByTag({
+    location,
     password,
-    repository,
     signal,
     tag: `task:${input.taskId}`,
   })
   const reuse = existing[0]
   if (reuse) {
     const stats = await restic.stats({
+      location,
       password,
-      repository,
       signal,
       snapshotId: reuse.id,
     })
     await rejectOverLimitSnapshot(restic, {
+      backupId: input.backupId,
+      location,
       maxBytes: input.maxBytes,
       password,
-      repository,
       snapshotId: reuse.id,
+      taskId: input.taskId,
       totalBytes: stats.totalSize,
     })
     progress.completed = stats.totalSize
@@ -1547,17 +1532,19 @@ async function createResticSnapshot(
       warnings: translated.warnings,
     }
   }
-  // Worst case a snapshot stores one full compressed copy of the instance;
-  // deduplicated runs use far less, so this is a conservative preflight.
-  await mkdir(repository, { recursive: true, mode: 0o700 })
-  await requireBackupSpace(
-    repository,
-    await directoryLogicalBytes(
-      resolve(config.rootDirectory, instance.directory),
-      signal
-    ),
-    input.maxBytes
-  )
+  if (location.kind === "local") {
+    // Worst case a snapshot stores one full compressed copy of the instance;
+    // deduplicated runs use far less, so this is a conservative preflight.
+    await mkdir(location.path, { recursive: true, mode: 0o700 })
+    await requireBackupSpace(
+      location.path,
+      await directoryLogicalBytes(
+        resolve(config.rootDirectory, instance.directory),
+        signal
+      ),
+      input.maxBytes
+    )
+  }
   const summary = await Effect.runPromise(
     Effect.result(
       Effect.tryPromise({
@@ -1565,6 +1552,7 @@ async function createResticSnapshot(
           restic.backup({
             cwd: config.rootDirectory,
             excludes: translated.excludes,
+            location,
             onProgress: (update) => {
               progress.completed = update.bytesCompleted
               progress.total = update.bytesTotal ?? progress.total
@@ -1574,7 +1562,6 @@ async function createResticSnapshot(
             },
             password,
             path: instance.directory,
-            repository,
             signal,
             tags: [`task:${input.taskId}`, `backup:${input.backupId}`],
           }),
@@ -1583,24 +1570,41 @@ async function createResticSnapshot(
     )
   )
   if (Result.isFailure(summary)) {
-    await forgetTaggedSnapshotIfOverLimit(restic, {
-      maxBytes: input.maxBytes,
-      password,
-      repository,
-      tag: `task:${input.taskId}`,
-    })
+    await Effect.runPromise(
+      Effect.tryPromise({
+        try: () =>
+          forgetTaskSnapshotsAfterFailedCreate(restic, {
+            backupId: input.backupId,
+            location,
+            password,
+            tag: `task:${input.taskId}`,
+            taskId: input.taskId,
+          }),
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logError(
+            "Could not forget restic snapshots after a failed create",
+            {
+              backupId: input.backupId,
+              cause,
+              taskId: input.taskId,
+            }
+          )
+        )
+      )
+    )
     throw summary.failure
   }
-  await rejectOverLimitSnapshot(
-    restic,
-    {
-      maxBytes: input.maxBytes,
-      password,
-      repository,
-      snapshotId: summary.success.snapshotId,
-      totalBytes: summary.success.totalBytesProcessed,
-    }
-  )
+  await rejectOverLimitSnapshot(restic, {
+    backupId: input.backupId,
+    location,
+    maxBytes: input.maxBytes,
+    password,
+    snapshotId: summary.success.snapshotId,
+    taskId: input.taskId,
+    totalBytes: summary.success.totalBytesProcessed,
+  })
   progress.completed = summary.success.totalBytesProcessed
   progress.total = summary.success.totalBytesProcessed
   return {
@@ -1630,65 +1634,94 @@ function backupTooLarge() {
 async function rejectOverLimitSnapshot(
   restic: ResticDriver,
   input: {
+    backupId: string
+    location: ResticDriverLocation
     maxBytes: number | null
     password: string
-    repository: string
     snapshotId: string
+    taskId: string
     totalBytes?: number
   }
 ): Promise<void> {
   if (input.maxBytes === null) return
+  const signal = AbortSignal.timeout(RESTIC_RECOVERY_TIMEOUT_MS)
   const totalBytes =
     input.totalBytes ??
     (
       await restic.stats({
+        location: input.location,
         password: input.password,
-        repository: input.repository,
-        signal: new AbortController().signal,
+        signal,
         snapshotId: input.snapshotId,
       })
     ).totalSize
   if (totalBytes <= input.maxBytes) return
   await restic.forget({
+    location: input.location,
     password: input.password,
-    repository: input.repository,
-    signal: new AbortController().signal,
+    signal,
     snapshotId: input.snapshotId,
   })
+  await pruneResticAfterRecovery(restic, input)
   throw backupTooLarge()
 }
 
-async function forgetTaggedSnapshotIfOverLimit(
+async function forgetTaskSnapshotsAfterFailedCreate(
   restic: ResticDriver,
   input: {
-    maxBytes: number | null
+    backupId: string
+    location: ResticDriverLocation
     password: string
-    repository: string
     tag: string
+    taskId: string
   }
 ): Promise<void> {
-  if (input.maxBytes === null) return
+  const signal = AbortSignal.timeout(RESTIC_RECOVERY_TIMEOUT_MS)
   const snapshots = await restic.snapshotsByTag({
+    location: input.location,
     password: input.password,
-    repository: input.repository,
-    signal: new AbortController().signal,
+    signal,
     tag: input.tag,
   })
-  const snapshot = snapshots[0]
-  if (!snapshot) return
-  const stats = await restic.stats({
-    password: input.password,
-    repository: input.repository,
-    signal: new AbortController().signal,
-    snapshotId: snapshot.id,
-  })
-  if (stats.totalSize <= input.maxBytes) return
-  await restic.forget({
-    password: input.password,
-    repository: input.repository,
-    signal: new AbortController().signal,
-    snapshotId: snapshot.id,
-  })
+  for (const snapshot of snapshots) {
+    await restic.forget({
+      location: input.location,
+      password: input.password,
+      signal,
+      snapshotId: snapshot.id,
+    })
+  }
+  if (snapshots.length > 0) await pruneResticAfterRecovery(restic, input)
+}
+
+async function pruneResticAfterRecovery(
+  restic: ResticDriver,
+  input: {
+    backupId: string
+    location: ResticDriverLocation
+    password: string
+    taskId: string
+  }
+): Promise<void> {
+  await Effect.runPromise(
+    Effect.tryPromise({
+      try: () =>
+        restic.prune({
+          location: input.location,
+          password: input.password,
+          signal: AbortSignal.timeout(RESTIC_RECOVERY_PRUNE_TIMEOUT_MS),
+        }),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logError("Could not prune restic recovery data", {
+          backupId: input.backupId,
+          cause,
+          taskId: input.taskId,
+        })
+      )
+    )
+  )
 }
 
 function runResticRestore(
@@ -1725,16 +1758,24 @@ function runResticRestore(
                 dirname(prepared.paths.staging),
                 (
                   await restic.stats({
+                    location: resticDriverLocation(
+                      config,
+                      input.target.id,
+                      source.repository
+                    ),
                     password,
-                    repository: resticRepositoryPath(config, input.target.id),
                     signal,
                     snapshotId: source.snapshotId,
                   })
                 ).totalSize
               )
               await restic.restore({
+                location: resticDriverLocation(
+                  config,
+                  input.target.id,
+                  source.repository
+                ),
                 password,
-                repository: resticRepositoryPath(config, input.target.id),
                 selector: resticSnapshotSelector(
                   source.snapshotId,
                   instance.directory
@@ -1771,16 +1812,28 @@ function runResticRestore(
             reason: backupErrorMessage(cause),
             cause,
           }),
-  })
+  }).pipe(
+    Effect.ensuring(
+      input.source.kind === "restic" && input.source.repositoryPassword
+        ? cleanupResticCache(config, restic, {
+            password: input.source.repositoryPassword,
+            repository: input.source.repository,
+            targetId: input.target.id,
+          })
+        : Effect.void
+    )
+  )
 }
 
 function runResticForget(
   config: RelayConfig,
   restic: ResticDriver,
-  state: RelayStateStore["Service"],
-  wake: Queue.Queue<void>,
   input: BackupDeleteTaskInput & { kind: "delete" },
-  signal: AbortSignal
+  updateProgress: (
+    progress: BackupProgress
+  ) => ReturnType<RelayStateStore["Service"]["updateBackupTaskProgress"]>,
+  signal: AbortSignal,
+  pruneSignal: () => AbortSignal
 ) {
   return Effect.gen(function* () {
     const destination = input.destination
@@ -1795,14 +1848,44 @@ function runResticForget(
       destination.repositoryPassword,
       "delete.restic"
     )
+    const location = resticDriverLocation(
+      config,
+      input.target.id,
+      destination.repository
+    )
     yield* Effect.tryPromise({
-      try: () =>
-        restic.forget({
+      try: async () => {
+        if (destination.createTaskId) {
+          const snapshots = await restic.snapshotsByTag({
+            location,
+            password,
+            signal,
+            tag: `task:${destination.createTaskId}`,
+          })
+          for (const snapshot of snapshots) {
+            await restic.forget({
+              location,
+              password,
+              signal,
+              snapshotId: snapshot.id,
+            })
+          }
+          return
+        }
+        if (!destination.snapshotId) {
+          throw RelayBackupError.make({
+            code: "restic_forget_selector_missing",
+            operation: "delete.restic",
+            reason: "Restic deletes require a snapshot or create task id",
+          })
+        }
+        await restic.forget({
+          location,
           password,
-          repository: resticRepositoryPath(config, input.target.id),
           signal,
           snapshotId: destination.snapshotId,
-        }),
+        })
+      },
       catch: (cause) =>
         cause instanceof RelayBackupError
           ? cause
@@ -1814,17 +1897,32 @@ function runResticForget(
             }),
     })
     yield* promiseEffect(() => removeBackupExport(config, input.backupId))
-    yield* state.enqueueBackupTask(
-      {
-        backupId: randomUUID(),
-        kind: "prune",
-        repositoryPassword: password,
-        target: input.target,
-        taskId: randomUUID(),
-      },
-      Date.now()
+    const pruned = yield* Effect.result(
+      runResticPrune(
+        config,
+        restic,
+        {
+          backupId: randomUUID(),
+          kind: "prune",
+          repository: destination.repository,
+          repositoryPassword: password,
+          target: input.target,
+          taskId: randomUUID(),
+        },
+        updateProgress,
+        pruneSignal()
+      )
     )
-    yield* Queue.offer(wake, undefined)
+    if (Result.isFailure(pruned)) {
+      yield* Effect.logError(
+        "Could not prune restic after forgetting a snapshot",
+        {
+          backupId: input.backupId,
+          cause: pruned.failure,
+          taskId: input.taskId,
+        }
+      )
+    }
     return {
       artifacts: input.destination.artifactId
         ? [
@@ -1835,7 +1933,9 @@ function runResticForget(
             },
           ]
         : undefined,
-      warnings: [],
+      warnings: Result.isFailure(pruned)
+        ? ["The snapshot was deleted, but unused repository data remains"]
+        : [],
     }
   })
 }
@@ -1844,9 +1944,9 @@ function runResticPrune(
   config: RelayConfig,
   restic: ResticDriver,
   input: Extract<BackupTaskInput, { kind: "prune" }>,
-  updateProgress: (progress: BackupProgress) => ReturnType<
-    RelayStateStore["Service"]["updateBackupTaskProgress"]
-  >,
+  updateProgress: (
+    progress: BackupProgress
+  ) => ReturnType<RelayStateStore["Service"]["updateBackupTaskProgress"]>,
   signal: AbortSignal
 ) {
   return Effect.gen(function* () {
@@ -1872,12 +1972,16 @@ function runResticPrune(
     yield* Effect.tryPromise({
       try: () =>
         restic.prune({
+          location: resticDriverLocation(
+            config,
+            input.target.id,
+            input.repository
+          ),
           onProgress: (update) => {
             progress.completed = update.bytesCompleted
             progress.total = update.bytesTotal ?? progress.total
           },
           password,
-          repository: resticRepositoryPath(config, input.target.id),
           signal,
         }),
       catch: (cause) =>
@@ -1889,8 +1993,47 @@ function runResticPrune(
               reason: backupErrorMessage(cause),
               cause,
             }),
-    }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
+    }).pipe(
+      Effect.ensuring(Fiber.interrupt(progressFiber)),
+      Effect.ensuring(
+        cleanupResticCache(config, restic, {
+          password,
+          repository: input.repository,
+          targetId: input.target.id,
+        })
+      )
+    )
   })
+}
+
+function cleanupResticCache(
+  config: RelayConfig,
+  restic: ResticDriver,
+  input: {
+    password: string
+    repository: ResticRepositoryLocation | undefined
+    targetId: string
+  }
+) {
+  return Effect.tryPromise({
+    try: () =>
+      restic.cacheCleanup({
+        location: resticDriverLocation(
+          config,
+          input.targetId,
+          input.repository
+        ),
+        password: input.password,
+        signal: AbortSignal.timeout(RESTIC_CACHE_CLEANUP_TIMEOUT_MS),
+      }),
+    catch: (cause) => cause,
+  }).pipe(
+    Effect.catch((cause) =>
+      Effect.sync(() => {
+        console.error("restic cache cleanup failed", cause)
+      })
+    )
+  )
 }
 
 function runResticExport(
@@ -1899,9 +2042,9 @@ function runResticExport(
   findInstance: (instanceId: string) => Promise<RelayInstanceConfig | null>,
   input: Extract<BackupTaskInput, { kind: "export" }>,
   taskId: string,
-  updateProgress: (progress: BackupProgress) => ReturnType<
-    RelayStateStore["Service"]["updateBackupTaskProgress"]
-  >,
+  updateProgress: (
+    progress: BackupProgress
+  ) => ReturnType<RelayStateStore["Service"]["updateBackupTaskProgress"]>,
   signal: AbortSignal
 ) {
   return Effect.gen(function* () {
@@ -1955,8 +2098,12 @@ function runResticExport(
         })
         await rm(partial, { force: true })
         const stats = await restic.stats({
+          location: resticDriverLocation(
+            config,
+            input.target.id,
+            input.repository
+          ),
           password,
-          repository: resticRepositoryPath(config, input.target.id),
           signal,
           snapshotId: input.snapshotId,
         })
@@ -1968,11 +2115,15 @@ function runResticExport(
         )
         const dumped = await restic.dumpZip({
           destination: partial,
+          location: resticDriverLocation(
+            config,
+            input.target.id,
+            input.repository
+          ),
           onProgress: (bytes) => {
             progress.completed = bytes
           },
           password,
-          repository: resticRepositoryPath(config, input.target.id),
           selector: resticSnapshotSelector(
             input.snapshotId,
             instance.directory
@@ -1981,7 +2132,10 @@ function runResticExport(
         })
         await rename(partial, destination)
         const expiresAt = Date.now() + input.ttlMs
-        await writeExportExpiry(backupExportExpiryPath(config, input.backupId), expiresAt)
+        await writeExportExpiry(
+          backupExportExpiryPath(config, input.backupId),
+          expiresAt
+        )
         progress.completed = dumped.bytes
         progress.total = dumped.bytes
         return {
@@ -2005,7 +2159,14 @@ function runResticExport(
       Effect.onError(() =>
         promiseEffect(() => rm(partial, { force: true })).pipe(Effect.ignore)
       ),
-      Effect.ensuring(Fiber.interrupt(progressFiber))
+      Effect.ensuring(Fiber.interrupt(progressFiber)),
+      Effect.ensuring(
+        cleanupResticCache(config, restic, {
+          password,
+          repository: input.repository,
+          targetId: input.target.id,
+        })
+      )
     )
     return result
   })
@@ -2049,7 +2210,10 @@ export async function reuseValidExport(
   if (expiresAt <= Date.now()) return null
   const metadata = await optionalLstat(destination)
   if (!metadata?.isFile() || metadata.isSymbolicLink()) return null
-  const marker = resolve(dirname(destination), `.${basename(destination)}.expires`)
+  const marker = resolve(
+    dirname(destination),
+    `.${basename(destination)}.expires`
+  )
   const existing = await readExportExpiry(marker)
   const nextExpiresAt = Math.max(existing ?? 0, expiresAt)
   if (nextExpiresAt <= Date.now()) return null
@@ -2069,16 +2233,11 @@ export async function reuseValidExport(
   }
 }
 
-async function writeExportExpiry(path: string, expiresAt: number): Promise<void> {
+async function writeExportExpiry(
+  path: string,
+  expiresAt: number
+): Promise<void> {
   await writeFile(path, `${expiresAt}\n`, { mode: 0o600 })
-}
-
-function backupDirectoryPath(config: RelayConfig): string {
-  return resolve(config.dataDirectory, "backups")
-}
-
-function backupArchivePath(config: RelayConfig, backupId: string): string {
-  return resolve(backupDirectoryPath(config), `${backupId}.zip`)
 }
 
 async function cleanupBackupPartials(

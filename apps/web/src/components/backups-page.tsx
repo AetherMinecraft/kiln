@@ -583,7 +583,7 @@ export const BackupsPage = React.memo(function BackupsPage({
     (): Array<BackupAvailabilityDestination> => [
       { enabled: true, id: null, name: "Local", ownerUserId: null },
       ...storage.map((destination) => ({
-        enabled: destination.enabled,
+        enabled: destination.enabled && !destination.deleting,
         id: destination.id,
         name: destination.name,
         ownerUserId: destination.ownerUserId,
@@ -2870,10 +2870,9 @@ function DownloadBackupDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
-          {signDownload.isPending && backup.artifactKind === "restic_snapshot" ? (
-            <p className="text-xs text-muted-foreground">
-              Preparing export…
-            </p>
+          {signDownload.isPending &&
+          backup.artifactKind === "restic_snapshot" ? (
+            <p className="text-xs text-muted-foreground">Preparing export…</p>
           ) : null}
           <label className="block">
             <span className="mb-2 block text-xs font-medium">Source</span>
@@ -3121,13 +3120,26 @@ function CreateBackupDialog({
       storage.filter(
         (destination) =>
           destination.enabled &&
+          !destination.deleting &&
           (target?.kind !== "platform" || destination.ownerUserId === null)
       ),
     [storage, target?.kind]
   )
+  const destinationKeysInUse = React.useMemo(() => {
+    const allowed = new Set([
+      "default",
+      "local",
+      ...availableStorage.map((destination) => destination.id),
+    ])
+    const next = destinationKeys.filter((destination) =>
+      allowed.has(destination)
+    )
+    const usable = next.length > 0 ? next : ["default"]
+    return incremental ? [usable[0] ?? "default"] : usable
+  }, [availableStorage, destinationKeys, incremental])
   const selectedDestinations = React.useMemo(
-    () => new Set(destinationKeys),
-    [destinationKeys]
+    () => new Set(destinationKeysInUse),
+    [destinationKeysInUse]
   )
   const create = useMutation({
     mutationFn: async () => {
@@ -3139,7 +3151,7 @@ function CreateBackupDialog({
         ...(selectedDestinations.has("default")
           ? {}
           : {
-              storageIds: destinationKeys.map((destination) =>
+              storageIds: destinationKeysInUse.map((destination) =>
                 destination === "local" ? null : destination
               ),
             }),
@@ -3150,7 +3162,6 @@ function CreateBackupDialog({
             ...data,
             instanceId: target.id,
             mode: incremental ? "incremental" : "full",
-            ...(incremental ? { storageIds: [null] } : {}),
           },
         })
       }
@@ -3173,20 +3184,12 @@ function CreateBackupDialog({
     },
   })
 
-  React.useEffect(() => {
-    const allowed = new Set([
-      "default",
-      "local",
-      ...availableStorage.map((destination) => destination.id),
-    ])
-    setDestinationKeys((current) => {
-      const next = current.filter((destination) => allowed.has(destination))
-      return next.length > 0 ? next : ["default"]
-    })
-  }, [availableStorage])
-
   const toggleDestination = (destination: string, checked: boolean) => {
     setDestinationKeys((current) => {
+      if (incremental) {
+        if (!checked) return ["default"]
+        return [destination]
+      }
       if (destination === "default") {
         return checked ? ["default"] : ["local"]
       }
@@ -3248,11 +3251,14 @@ function CreateBackupDialog({
               <div className="grid gap-2 sm:grid-cols-2">
                 <BackupDestinationChoice
                   checked={mode === "incremental"}
-                  description="Deduplicated Relay-local snapshots"
+                  description="Deduplicated snapshots on this Relay or S3"
                   icon={Archive}
                   label="Incremental"
                   onCheckedChange={(checked) => {
-                    if (checked) setMode("incremental")
+                    if (checked) {
+                      setMode("incremental")
+                      setDestinationKeys((current) => [current[0] ?? "default"])
+                    }
                   }}
                 />
                 <BackupDestinationChoice
@@ -3267,12 +3273,6 @@ function CreateBackupDialog({
               </div>
             </fieldset>
           ) : null}
-          {incremental ? (
-            <p className="text-[0.625rem] text-muted-foreground">
-              Incremental backups stay on this Relay. Choose full archive to
-              store a zip locally or on S3.
-            </p>
-          ) : (
           <fieldset>
             <legend className="mb-2 text-xs font-medium">Destinations</legend>
             <div className="grid gap-2 sm:grid-cols-2">
@@ -3308,14 +3308,15 @@ function CreateBackupDialog({
               ))}
             </div>
             <span className="mt-1.5 block text-[0.625rem] text-muted-foreground">
-              {target?.kind === "platform"
-                ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
-                : target?.kind === "instance"
-                  ? "Choose one or more copies. Default uses this server’s preferred destination."
-                  : "Choose one or more copies. Default uses Relay-local storage."}
+              {incremental
+                ? "Choose one destination. Incremental snapshots can stay on this Relay or use S3."
+                : target?.kind === "platform"
+                  ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
+                  : target?.kind === "instance"
+                    ? "Choose one or more copies. Default uses this server’s preferred destination."
+                    : "Choose one or more copies. Default uses Relay-local storage."}
             </span>
           </fieldset>
-          )}
           {create.error ? (
             <p className="text-xs text-destructive">{create.error.message}</p>
           ) : null}
@@ -3420,12 +3421,25 @@ function InstanceBackupSettingsEditor({
   const [adminSizeLimit, setAdminSizeLimit] = React.useState(() =>
     bytesToGiBInput(policy.adminSizeLimitBytes)
   )
-  const [storageId, setStorageId] = React.useState(policy.storageId ?? "local")
-  const [exclude, setExclude] = React.useState(() => policy.exclude.join("\n"))
   const enabledStorage = React.useMemo(
-    () => storage.filter((destination) => destination.enabled),
+    () =>
+      storage.filter(
+        (destination) => destination.enabled && !destination.deleting
+      ),
     [storage]
   )
+  const [storageId, setStorageId] = React.useState(() =>
+    policy.storageId &&
+    storage.some(
+      (destination) =>
+        destination.id === policy.storageId &&
+        destination.enabled &&
+        !destination.deleting
+    )
+      ? policy.storageId
+      : "local"
+  )
+  const [exclude, setExclude] = React.useState(() => policy.exclude.join("\n"))
   const save = useMutation({
     mutationFn: async () => {
       const operations: Array<Promise<unknown>> = [
@@ -3654,6 +3668,7 @@ function BackupStorageDialog({
                 {storage.map((destination) => {
                   const canManage =
                     isPlatformAdmin || destination.ownerUserId === currentUserId
+                  const retryDelete = destination.deleting
                   return (
                     <div
                       key={destination.id}
@@ -3672,7 +3687,9 @@ function BackupStorageDialog({
                               ? "Platform"
                               : "Personal"}
                           </Badge>
-                          {!destination.enabled ? (
+                          {destination.deleting ? (
+                            <Badge variant="outline">Deleting</Badge>
+                          ) : !destination.enabled ? (
                             <Badge variant="outline">Disabled</Badge>
                           ) : null}
                         </span>
@@ -3682,6 +3699,11 @@ function BackupStorageDialog({
                             ? ` / ${destination.objectPrefix}`
                             : ""}
                         </span>
+                        {destination.lastError ? (
+                          <span className="mt-1 block text-[0.625rem] leading-4 text-destructive">
+                            {destination.lastError}
+                          </span>
+                        ) : null}
                       </span>
                       {canManage ? (
                         <div className="flex shrink-0 items-center gap-1">
@@ -3689,14 +3711,26 @@ function BackupStorageDialog({
                             disabled={false}
                             icon={Pencil}
                             label={`Edit ${destination.name}`}
-                            tooltip="Edit destination"
+                            tooltip={
+                              destination.deleting
+                                ? "Update credentials to retry delete"
+                                : "Edit destination"
+                            }
                             onClick={() => setEditor(destination)}
                           />
                           <BackupActionButton
                             disabled={false}
                             icon={Trash2}
-                            label={`Delete ${destination.name}`}
-                            tooltip="Delete destination"
+                            label={
+                              retryDelete
+                                ? `Retry deleting ${destination.name}`
+                                : `Delete ${destination.name}`
+                            }
+                            tooltip={
+                              retryDelete
+                                ? "Retry destination delete"
+                                : "Delete destination"
+                            }
                             onClick={() => setDeleteCandidate(destination)}
                           />
                         </div>
@@ -3761,6 +3795,7 @@ function BackupStorageEditor({
   )
   const [enabled, setEnabled] = React.useState(existing?.enabled ?? true)
   const [platform, setPlatform] = React.useState(existing?.ownerUserId === null)
+  const locationLocked = Boolean(existing?.deleting)
   const save = useMutation({
     mutationFn: () =>
       saveBackupStorage({
@@ -3820,13 +3855,15 @@ function BackupStorageEditor({
           </DialogTitle>
         </div>
         <DialogDescription>
-          Credentials are encrypted by Hearth and verified before they are
-          saved. Existing secrets are never sent back to the browser.
+          {locationLocked
+            ? "This destination is still deleting. Update credentials, save, then retry the prefix purge. Location fields stay locked."
+            : "Credentials are encrypted by Hearth and verified before they are saved. Existing secrets are never sent back to the browser."}
         </DialogDescription>
       </DialogHeader>
       <div className="grid gap-4 sm:grid-cols-2">
         <StorageTextField label="Name" value={name} onChange={setName} />
         <StorageTextField
+          disabled={locationLocked}
           label="Region"
           placeholder="us-east-1"
           value={region}
@@ -3834,14 +3871,21 @@ function BackupStorageEditor({
         />
         <div className="sm:col-span-2">
           <StorageTextField
+            disabled={locationLocked}
             label="Endpoint"
             placeholder="https://s3.example.com"
             value={endpoint}
             onChange={setEndpoint}
           />
         </div>
-        <StorageTextField label="Bucket" value={bucket} onChange={setBucket} />
         <StorageTextField
+          disabled={locationLocked}
+          label="Bucket"
+          value={bucket}
+          onChange={setBucket}
+        />
+        <StorageTextField
+          disabled={locationLocked}
           label="Object prefix"
           placeholder="kiln/backups"
           value={objectPrefix}
@@ -3873,6 +3917,7 @@ function BackupStorageEditor({
         <StorageSwitch
           checked={forcePathStyle}
           description="Use endpoint/bucket/object addressing."
+          disabled={locationLocked}
           label="Path-style URLs"
           onCheckedChange={setForcePathStyle}
         />
@@ -3920,6 +3965,7 @@ function BackupStorageEditor({
 
 function StorageTextField({
   autoComplete,
+  disabled = false,
   label,
   onChange,
   placeholder,
@@ -3927,6 +3973,7 @@ function StorageTextField({
   value,
 }: {
   autoComplete?: string
+  disabled?: boolean
   label: string
   onChange: (value: string) => void
   placeholder?: string
@@ -3939,6 +3986,7 @@ function StorageTextField({
       <Input
         aria-label={label}
         autoComplete={autoComplete}
+        disabled={disabled}
         placeholder={placeholder}
         type={type}
         value={value}
@@ -3989,12 +4037,15 @@ function DeleteBackupStorageDialog({
   open: boolean
 }) {
   const queryClient = useQueryClient()
+  const retry = destination.deleting
   const remove = useMutation({
     mutationFn: () => deleteBackupStorage({ data: { id: destination.id } }),
-    onSuccess: async () => {
+    onSettled: async () => {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.backups.storage,
       })
+    },
+    onSuccess: () => {
       showToast({
         message: `${destination.name} deleted`,
         type: "success",
@@ -4007,12 +4058,18 @@ function DeleteBackupStorageDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete destination?</DialogTitle>
+          <DialogTitle>
+            {retry ? "Retry destination delete?" : "Delete destination?"}
+          </DialogTitle>
           <DialogDescription>
-            “{destination.name}” can only be deleted when no retained backups
-            reference it. Objects already in the bucket are not removed.
+            {retry
+              ? `“${destination.name}” is still marked deleting. Retry purges remaining S3 prefixes, then removes the destination.`
+              : `“${destination.name}” can only be deleted when no retained backups reference it. Incremental restic prefixes in this destination are purged; full-archive objects already in the bucket stay.`}
           </DialogDescription>
         </DialogHeader>
+        {destination.lastError ? (
+          <p className="text-xs text-destructive">{destination.lastError}</p>
+        ) : null}
         {remove.error ? (
           <p className="text-xs text-destructive">{remove.error.message}</p>
         ) : null}
@@ -4035,7 +4092,7 @@ function DeleteBackupStorageDialog({
             ) : (
               <Trash2 />
             )}
-            Delete destination
+            {retry ? "Retry delete" : "Delete destination"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -4442,13 +4499,17 @@ function backupAvailabilityTags(
   destinations: ReadonlyArray<BackupAvailabilityDestination>
 ): Array<BackupAvailabilityTagView> {
   const incremental = backup.artifactKind === "restic_snapshot"
+  const incrementalStorageIds = new Set(
+    backup.artifacts.map((artifact) => artifact.storageId)
+  )
   const visibleDestinations = incremental
-    ? destinations.filter((destination) => destination.id === null)
+    ? destinations.filter((destination) =>
+        incrementalStorageIds.has(destination.id)
+      )
     : destinations
   const uploadPercent = backupTaskUploadProgressPercent(backup)
   const artifactsByStorage = new Map<string, Backup["artifacts"][number]>()
   for (const artifact of backup.artifacts) {
-    if (incremental && artifact.storageId !== null) continue
     artifactsByStorage.set(artifact.storageId ?? "local", artifact)
   }
   const tags: Array<BackupAvailabilityTagView> = visibleDestinations.map(
@@ -4475,7 +4536,6 @@ function backupAvailabilityTags(
   )
   const seen = new Set(tags.map((tag) => tag.key))
   for (const artifact of backup.artifacts) {
-    if (incremental && artifact.storageId !== null) continue
     const key = artifact.storageId ?? "local"
     if (seen.has(key)) continue
     const kind = artifact.storageId ? "remote" : "local"

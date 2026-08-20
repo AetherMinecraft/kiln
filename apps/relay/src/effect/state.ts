@@ -17,7 +17,7 @@ import {
   backupTargetSchema,
   backupTaskInputSchema,
   backupTaskResultSchema,
-  redactBackupTaskInput,
+  omitBackupSecrets,
   relayBackupTaskSchema,
   resticSnapshotIdSchema,
 } from "@workspace/contracts"
@@ -673,14 +673,13 @@ const migrations = SqliteMigrator.fromRecord({
   }),
 })
 
-function scrubBackupTaskInputJson(inputJson: string): string {
+export function scrubBackupTaskInputJson(inputJson: string): string {
   return Result.getOrElse(
     Result.try(() => {
-      const parsed = backupTaskInputSchema.safeParse(JSON.parse(inputJson))
-      if (!parsed.success) return inputJson
-      return JSON.stringify(redactBackupTaskInput(parsed.data))
+      const parsed = JSON.parse(inputJson) as unknown
+      return JSON.stringify(omitBackupSecrets(parsed))
     }),
-    () => inputJson
+    () => "{}"
   )
 }
 

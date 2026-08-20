@@ -31,7 +31,7 @@ import { isPublicRemoteAddress, secureRemoteLookup } from "./source-policy.js"
 
 const ARCHIVE_MANIFEST_PATH = ".kiln-backup/manifest.json"
 const MAX_ARCHIVE_ENTRIES = 100_000
-const MAX_MANIFEST_BYTES = 64 * 1024
+const MAX_MANIFEST_BYTES = 1024 * 1024
 const MAX_UNLIMITED_RESTORE_BYTES = 1024 ** 4
 const RESTORE_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
 const RESTORE_TRANSFER_IDLE_TIMEOUT_MS = 30_000

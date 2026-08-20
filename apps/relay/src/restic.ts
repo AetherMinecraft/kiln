@@ -6,10 +6,23 @@ import { dirname, relative, resolve, sep } from "node:path"
 import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 
-import { Effect, Result } from "effect"
+import { Effect, Result, Schedule } from "effect"
 
 import { RelayBackupError } from "./effect/errors.js"
-import type { RelayConfig } from "./config.js"
+import {
+  applyResticDestinationEnvironment,
+  resticDestinationEndpointPort,
+  resticDriverLocation,
+  resticGlobalArgs,
+  resticRepositoryPath,
+  resticRepositoryString,
+  type ResticDriverLocation,
+} from "./backups/destinations/index.js"
+import {
+  resticS3ProxyAllowedHosts,
+  resticS3ProxyToken,
+  withResticS3Proxy,
+} from "./backups/destinations/s3/proxy.js"
 
 const RESTIC_BINARY = "restic"
 const MAX_JSON_LINE_BYTES = 64 * 1024
@@ -18,6 +31,14 @@ const MAX_STAGING_ENTRIES = 100_000
 const MAX_SKIPPED_ENTRY_WARNINGS = 25
 const MAX_UNLIMITED_RESTORE_BYTES = 1024 ** 4
 const RESTIC_TERMINATE_TIMEOUT_MS = 5_000
+const RESTIC_ENV_ALLOWLIST = [
+  "HOME",
+  "PATH",
+  "RESTIC_CACERT",
+  "TMPDIR",
+] as const
+const RESTIC_EXIT_REPOSITORY_MISSING = 10
+const RESTIC_EXIT_WRONG_PASSWORD = 12
 
 export type ResticProgress = {
   bytesCompleted: number
@@ -44,74 +65,75 @@ export type ResticSpawn = (
   }
 ) => ChildProcess
 
+export { resticDriverLocation, resticRepositoryPath, resticRepositoryString }
+export type { ResticDriverLocation }
+
 export type ResticDriver = {
   backup: (input: {
     cwd: string
     excludes: ReadonlyArray<string>
+    location: ResticDriverLocation
     onProgress?: (progress: ResticProgress) => void
     password: string
     path: string
-    repository: string
     signal: AbortSignal
     tags: ReadonlyArray<string>
   }) => Promise<ResticSnapshotSummary>
-  catConfig: (input: {
+  cacheCleanup: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
-  }) => Promise<boolean>
+  }) => Promise<void>
+  catConfig: (input: {
+    location: ResticDriverLocation
+    password: string
+    signal: AbortSignal
+  }) => Promise<"exists" | "missing">
   dumpZip: (input: {
     destination: string
+    location: ResticDriverLocation
     onProgress?: (bytes: number) => void
     password: string
-    repository: string
     selector: string
     signal: AbortSignal
   }) => Promise<{ bytes: number; checksumSha256: string }>
   forget: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
     snapshotId: string
   }) => Promise<void>
   init: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
   }) => Promise<void>
   prune: (input: {
+    location: ResticDriverLocation
     onProgress?: (progress: ResticProgress) => void
     password: string
-    repository: string
     signal: AbortSignal
   }) => Promise<void>
   restore: (input: {
+    location: ResticDriverLocation
     onProgress?: (progress: ResticProgress) => void
     password: string
-    repository: string
     selector: string
     signal: AbortSignal
     target: string
   }) => Promise<void>
   snapshotsByTag: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
     tag: string
   }) => Promise<Array<{ id: string }>>
   stats: (input: {
+    location: ResticDriverLocation
     password: string
-    repository: string
     signal: AbortSignal
     snapshotId: string
   }) => Promise<{ totalSize: number }>
-}
-
-export function resticRepositoryPath(
-  config: RelayConfig,
-  targetId: string
-): string {
-  return resolve(config.dataDirectory, "restic", "instance", targetId)
 }
 
 export function resticSnapshotSelector(
@@ -150,9 +172,7 @@ export function translateExcludePatterns(
     const trimmed = rawPattern.trim()
     if (!trimmed || trimmed.startsWith("#")) continue
     if (trimmed.startsWith("!")) {
-      warnings.push(
-        `Skipped unsupported restic exclude negation: ${trimmed}`
-      )
+      warnings.push(`Skipped unsupported restic exclude negation: ${trimmed}`)
       continue
     }
     if (isUnsupportedExcludePattern(trimmed)) {
@@ -179,7 +199,9 @@ export function parseResticJsonLine(line: string): unknown {
   )
 }
 
-export function progressFromResticStatus(value: unknown): ResticProgress | null {
+export function progressFromResticStatus(
+  value: unknown
+): ResticProgress | null {
   if (!isRecord(value) || value.message_type !== "status") return null
   const bytesDone = integerField(value, "bytes_done")
   const totalBytes = integerField(value, "total_bytes")
@@ -190,7 +212,9 @@ export function progressFromResticStatus(value: unknown): ResticProgress | null 
   }
 }
 
-export function summaryFromResticJson(value: unknown): ResticSnapshotSummary | null {
+export function summaryFromResticJson(
+  value: unknown
+): ResticSnapshotSummary | null {
   if (!isRecord(value) || value.message_type !== "summary") return null
   const snapshotId = stringField(value, "snapshot_id")
   const totalBytesProcessed = integerField(value, "total_bytes_processed")
@@ -200,22 +224,53 @@ export function summaryFromResticJson(value: unknown): ResticSnapshotSummary | n
 
 export function createResticDriver(options?: {
   binary?: string
+  cacheDirectory?: string
   spawn?: ResticSpawn
+  terminateTimeoutMs?: number
 }): ResticDriver {
   const binary = options?.binary ?? RESTIC_BINARY
   const spawnRestic = options?.spawn ?? defaultSpawn
+  const cacheDirectory = options?.cacheDirectory
+  const terminateTimeoutMs =
+    options?.terminateTimeoutMs ?? RESTIC_TERMINATE_TIMEOUT_MS
   const run = (
     args: ReadonlyArray<string>,
     input: {
       cwd?: string
+      location: ResticDriverLocation
+      mutating?: boolean
       onJson?: (value: unknown) => void
       password: string
-      repository: string
+      retryable?: boolean
       signal: AbortSignal
       stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
     }
-  ) =>
-    spawnResticCommand(spawnRestic, binary, args, input)
+  ) => {
+    const execute = async () => {
+      if (input.mutating && input.location.kind === "s3") {
+        await retryResticOperation(() =>
+          spawnResticCommand(spawnRestic, binary, ["unlock"], {
+            cacheDirectory,
+            location: input.location,
+            password: input.password,
+            signal: input.signal,
+            terminateTimeoutMs,
+          })
+        )
+      }
+      return spawnResticCommand(spawnRestic, binary, args, {
+        cacheDirectory,
+        cwd: input.cwd,
+        location: input.location,
+        onJson: input.onJson,
+        password: input.password,
+        signal: input.signal,
+        stdoutPipe: input.stdoutPipe,
+        terminateTimeoutMs,
+      })
+    }
+    return input.retryable ? retryResticOperation(execute) : execute()
+  }
 
   return {
     backup: async (input) => {
@@ -230,8 +285,9 @@ export function createResticDriver(options?: {
         ],
         {
           cwd: input.cwd,
+          location: input.location,
+          mutating: true,
           password: input.password,
-          repository: input.repository,
           signal: input.signal,
           onJson: (value) => {
             const progress = progressFromResticStatus(value)
@@ -250,16 +306,43 @@ export function createResticDriver(options?: {
       }
       return summary
     },
+    cacheCleanup: async (input) => {
+      if (input.location.kind !== "s3") return
+      await run(["cache", "--cleanup"], {
+        location: input.location,
+        password: input.password,
+        signal: input.signal,
+      })
+    },
     catConfig: async (input) => {
       const result = await resultOf(() =>
         run(["cat", "config"], {
+          location: input.location,
           password: input.password,
-          repository: input.repository,
+          retryable: true,
           signal: input.signal,
         })
       )
-      if (Result.isFailure(result)) return false
-      return result.success.exitCode === 0
+      if (Result.isSuccess(result)) return "exists"
+      const failure = result.failure
+      if (
+        failure instanceof RelayBackupError &&
+        failure.exitCode === RESTIC_EXIT_REPOSITORY_MISSING
+      ) {
+        return "missing"
+      }
+      if (
+        failure instanceof RelayBackupError &&
+        failure.exitCode === RESTIC_EXIT_WRONG_PASSWORD
+      ) {
+        throw resticError(
+          "restic_wrong_password",
+          "cat.config",
+          failure.reason,
+          failure.exitCode
+        )
+      }
+      throw failure
     },
     dumpZip: async (input) => {
       await mkdir(dirname(input.destination), { recursive: true, mode: 0o700 })
@@ -281,8 +364,8 @@ export function createResticDriver(options?: {
       })
       const dumped = await resultOf(async () => {
         await run(["dump", "-a", "zip", input.selector, "/"], {
+          location: input.location,
           password: input.password,
-          repository: input.repository,
           signal: input.signal,
           stdoutPipe: (stdout) => pipeline(stdout, hasher, output),
         })
@@ -299,8 +382,10 @@ export function createResticDriver(options?: {
     forget: async (input) => {
       const result = await resultOf(() =>
         run(["forget", input.snapshotId], {
+          location: input.location,
+          mutating: true,
           password: input.password,
-          repository: input.repository,
+          retryable: true,
           signal: input.signal,
         })
       )
@@ -309,17 +394,20 @@ export function createResticDriver(options?: {
       throw result.failure
     },
     init: async (input) => {
-      await mkdir(input.repository, { recursive: true, mode: 0o700 })
+      if (input.location.kind === "local") {
+        await mkdir(input.location.path, { recursive: true, mode: 0o700 })
+      }
       await run(["init"], {
+        location: input.location,
         password: input.password,
-        repository: input.repository,
         signal: input.signal,
       })
     },
     prune: async (input) => {
       await run(["prune", "--json"], {
+        location: input.location,
+        mutating: true,
         password: input.password,
-        repository: input.repository,
         signal: input.signal,
         onJson: (value) => {
           const progress = progressFromResticStatus(value)
@@ -332,24 +420,24 @@ export function createResticDriver(options?: {
       await run(
         ["restore", "--json", input.selector, "--target", input.target],
         {
-        password: input.password,
-        repository: input.repository,
-        signal: input.signal,
-        onJson: (value) => {
-          const progress = progressFromResticStatus(value)
-          if (progress) input.onProgress?.(progress)
-        },
-      })
-    },
-    snapshotsByTag: async (input) => {
-      const result = await run(
-        ["snapshots", "--json", "--tag", input.tag],
-        {
+          location: input.location,
+          mutating: true,
           password: input.password,
-          repository: input.repository,
           signal: input.signal,
+          onJson: (value) => {
+            const progress = progressFromResticStatus(value)
+            if (progress) input.onProgress?.(progress)
+          },
         }
       )
+    },
+    snapshotsByTag: async (input) => {
+      const result = await run(["snapshots", "--json", "--tag", input.tag], {
+        location: input.location,
+        password: input.password,
+        retryable: true,
+        signal: input.signal,
+      })
       const parsed = parseResticJsonLine(result.stdoutText)
       if (!Array.isArray(parsed)) return []
       return parsed.flatMap((entry) => {
@@ -361,13 +449,16 @@ export function createResticDriver(options?: {
       const result = await run(
         ["stats", "--mode", "restore-size", "--json", input.snapshotId],
         {
+          location: input.location,
           password: input.password,
-          repository: input.repository,
+          retryable: true,
           signal: input.signal,
         }
       )
       const parsed = parseResticJsonLine(result.stdoutText)
-      const totalSize = isRecord(parsed) ? integerField(parsed, "total_size") : null
+      const totalSize = isRecord(parsed)
+        ? integerField(parsed, "total_size")
+        : null
       if (totalSize === null) {
         throw resticError(
           "restic_stats_missing",
@@ -432,9 +523,7 @@ export async function validateStagingTree(
   }
   await visit(root)
   if (skipped > warnings.length) {
-    warnings.push(
-      `Skipped ${skipped - warnings.length} more non-regular files`
-    )
+    warnings.push(`Skipped ${skipped - warnings.length} more non-regular files`)
   }
   const maximumBytes =
     limits.diskBytes > 0 ? limits.diskBytes : MAX_UNLIMITED_RESTORE_BYTES
@@ -460,26 +549,62 @@ async function spawnResticCommand(
   binary: string,
   args: ReadonlyArray<string>,
   input: {
+    cacheDirectory?: string
     cwd?: string
+    location: ResticDriverLocation
     onJson?: (value: unknown) => void
     password: string
-    repository: string
     signal: AbortSignal
     stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
+    terminateTimeoutMs: number
+  }
+): Promise<SpawnedRestic> {
+  if (input.location.kind !== "s3") {
+    return spawnResticOnce(spawnRestic, binary, args, input)
+  }
+  const token = resticS3ProxyToken()
+  return withResticS3Proxy(
+    {
+      allowPrivateNetwork: input.location.allowPrivateNetwork,
+      allowedHosts: resticS3ProxyAllowedHosts(input.location),
+      endpointPort: resticDestinationEndpointPort(input.location) ?? 443,
+      token,
+    },
+    (proxyUrl) =>
+      spawnResticOnce(spawnRestic, binary, args, { ...input, proxyUrl })
+  )
+}
+
+async function spawnResticOnce(
+  spawnRestic: ResticSpawn,
+  binary: string,
+  args: ReadonlyArray<string>,
+  input: {
+    cacheDirectory?: string
+    cwd?: string
+    location: ResticDriverLocation
+    onJson?: (value: unknown) => void
+    password: string
+    proxyUrl?: string
+    signal: AbortSignal
+    stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
+    terminateTimeoutMs: number
   }
 ): Promise<SpawnedRestic> {
   input.signal.throwIfAborted()
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    RESTIC_PASSWORD: input.password,
-    RESTIC_REPOSITORY: input.repository,
+  if (input.location.kind === "s3" && input.cacheDirectory) {
+    await mkdir(input.cacheDirectory, { recursive: true, mode: 0o700 })
   }
-  delete env.RESTIC_CACHE_DIR
-  const child = spawnRestic(binary, ["--no-cache", ...args], {
-    cwd: input.cwd,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-  })
+  const env = resticSpawnEnv(input)
+  const child = spawnRestic(
+    binary,
+    [...resticGlobalArgs(input.location), ...args],
+    {
+      cwd: input.cwd,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  )
   if (!child.stdout || !child.stderr) {
     throw resticError(
       "restic_stdio_missing",
@@ -503,33 +628,79 @@ async function spawnResticCommand(
       resolveExit(code ?? 1)
     })
   })
-  const onAbort = () => {
-    child.kill("SIGTERM")
-  }
-  input.signal.addEventListener("abort", onAbort, { once: true })
-  const completed = await resultOf(async () => {
-    const [exitCode] = await Promise.all([
+  let termination: Promise<void> | null = null
+  const terminate = () => {
+    termination ??= terminateResticChild(
+      child,
       waitForExit,
-      input.stdoutPipe
-        ? input.stdoutPipe(stdout)
-        : readStream(stdout, (chunk) => {
-            if (!input.onJson) {
+      () => exited,
+      input.terminateTimeoutMs
+    )
+    return termination
+  }
+  let resolveAborted: (cause: unknown) => void = () => undefined
+  const aborted = new Promise<{ readonly cause: unknown }>((resolve) => {
+    resolveAborted = (cause) => resolve({ cause })
+  })
+  const onAbort = () => {
+    Effect.runFork(
+      Effect.tryPromise({
+        try: terminate,
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.match({
+          onFailure: resolveAborted,
+          onSuccess: () =>
+            resolveAborted(
+              resticError(
+                "restic_command_aborted",
+                args[0] ?? "restic",
+                input.signal.reason instanceof Error
+                  ? input.signal.reason.message
+                  : "The restic command was cancelled"
+              )
+            ),
+        })
+      )
+    )
+  }
+  if (input.signal.aborted) {
+    onAbort()
+  } else {
+    input.signal.addEventListener("abort", onAbort, { once: true })
+  }
+  const completed = await resultOf(async () => {
+    const outcome = await Promise.race([
+      Promise.all([
+        waitForExit,
+        input.stdoutPipe
+          ? input.stdoutPipe(stdout)
+          : readStream(stdout, (chunk) => {
+              if (!input.onJson) {
+                stdoutText = appendBounded(stdoutText, chunk.toString("utf8"))
+                return
+              }
+              stdoutBuffer += chunk.toString("utf8")
               stdoutText = appendBounded(stdoutText, chunk.toString("utf8"))
-              return
-            }
-            stdoutBuffer += chunk.toString("utf8")
-            stdoutText = appendBounded(stdoutText, chunk.toString("utf8"))
-            const lines = stdoutBuffer.split("\n")
-            stdoutBuffer = lines.pop() ?? ""
-            for (const line of lines) {
-              const parsed = parseResticJsonLine(line)
-              if (parsed !== null) input.onJson(parsed)
-            }
-          }),
-      readStream(stderrStream, (chunk) => {
-        stderr = appendBounded(stderr, chunk.toString("utf8"), MAX_STDERR_BYTES)
-      }),
+              const lines = stdoutBuffer.split("\n")
+              stdoutBuffer = lines.pop() ?? ""
+              for (const line of lines) {
+                const parsed = parseResticJsonLine(line)
+                if (parsed !== null) input.onJson(parsed)
+              }
+            }),
+        readStream(stderrStream, (chunk) => {
+          stderr = appendBounded(
+            stderr,
+            chunk.toString("utf8"),
+            MAX_STDERR_BYTES
+          )
+        }),
+      ]),
+      aborted,
     ])
+    if (!Array.isArray(outcome)) throw outcome.cause
+    const [exitCode] = outcome
     if (stdoutBuffer.trim()) {
       const parsed = parseResticJsonLine(stdoutBuffer)
       if (parsed !== null) input.onJson?.(parsed)
@@ -538,14 +709,23 @@ async function spawnResticCommand(
       throw resticError(
         "restic_command_failed",
         args[0] ?? "restic",
-        stderr.trim() || `restic exited with code ${exitCode}`
+        redactResticStderr(
+          stderr.trim() || `restic exited with code ${exitCode}`,
+          input
+        ),
+        exitCode
       )
     }
-    return { exitCode, stderr, stdout, stdoutText }
+    return {
+      exitCode,
+      stderr: redactResticStderr(stderr, input),
+      stdout,
+      stdoutText,
+    }
   })
   input.signal.removeEventListener("abort", onAbort)
   if (Result.isFailure(completed)) {
-    await terminateResticChild(child, waitForExit, () => exited)
+    await terminate()
     throw completed.failure
   }
   return completed.success
@@ -554,7 +734,8 @@ async function spawnResticCommand(
 async function terminateResticChild(
   child: ChildProcess,
   waitForExit: Promise<number>,
-  hasExited: () => boolean
+  hasExited: () => boolean,
+  timeoutMs: number
 ): Promise<void> {
   if (hasExited()) return
   child.kill("SIGTERM")
@@ -563,7 +744,7 @@ async function terminateResticChild(
       Effect.tryPromise({
         try: () => waitForExit,
         catch: (cause) => cause,
-      }).pipe(Effect.timeout(`${RESTIC_TERMINATE_TIMEOUT_MS} millis`))
+      }).pipe(Effect.timeout(`${timeoutMs} millis`))
     )
   )
   if (hasExited() || Result.isSuccess(first)) return
@@ -573,7 +754,7 @@ async function terminateResticChild(
       Effect.tryPromise({
         try: () => waitForExit,
         catch: (cause) => cause,
-      })
+      }).pipe(Effect.timeout(`${timeoutMs} millis`))
     )
   )
 }
@@ -620,15 +801,91 @@ function resultOf<T>(run: () => Promise<T>) {
   )
 }
 
-function resticError(code: string, operation: string, reason: string) {
-  return RelayBackupError.make({ code, operation, reason })
+function resticError(
+  code: string,
+  operation: string,
+  reason: string,
+  exitCode?: number
+) {
+  return RelayBackupError.make({
+    code,
+    operation,
+    reason,
+    ...(exitCode === undefined ? {} : { exitCode }),
+  })
+}
+
+function resticSpawnEnv(input: {
+  cacheDirectory?: string
+  location: ResticDriverLocation
+  password: string
+  proxyUrl?: string
+}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  for (const key of RESTIC_ENV_ALLOWLIST) {
+    const value = process.env[key]
+    if (value) env[key] = value
+  }
+  env.RESTIC_PASSWORD = input.password
+  env.RESTIC_REPOSITORY = resticRepositoryString(input.location)
+  applyResticDestinationEnvironment(env, input.location, {
+    ...(input.cacheDirectory ? { cacheDirectory: input.cacheDirectory } : {}),
+    ...(input.proxyUrl ? { proxyUrl: input.proxyUrl } : {}),
+  })
+  return env
+}
+
+function redactResticStderr(
+  stderr: string,
+  input: { location: ResticDriverLocation; password: string }
+): string {
+  let redacted = stderr.split(input.password).join("[redacted]")
+  if (input.location.kind === "s3") {
+    redacted = redacted
+      .split(input.location.secretAccessKey)
+      .join("[redacted]")
+      .split(input.location.accessKeyId)
+      .join("[redacted]")
+  }
+  return redacted
+}
+
+function retryResticOperation<T>(run: () => Promise<T>): Promise<T> {
+  return Effect.runPromise(
+    Effect.tryPromise({
+      try: run,
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.retry({
+        schedule: Schedule.exponential("200 millis").pipe(Schedule.jittered),
+        times: 2,
+        while: isTransientResticFailure,
+      })
+    )
+  )
+}
+
+function isTransientResticFailure(error: unknown): boolean {
+  if (!(error instanceof RelayBackupError)) return false
+  if (
+    error.exitCode === RESTIC_EXIT_REPOSITORY_MISSING ||
+    error.exitCode === RESTIC_EXIT_WRONG_PASSWORD
+  ) {
+    return false
+  }
+  return /timeout|temporar|connection reset|connection refused|network is unreachable|no such host|tls handshake|i\/o timeout|slow down|throttl|503|502|504/iu.test(
+    error.reason
+  )
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function stringField(value: Record<string, unknown>, key: string): string | null {
+function stringField(
+  value: Record<string, unknown>,
+  key: string
+): string | null {
   const field = value[key]
   return typeof field === "string" && field.length > 0 ? field : null
 }
@@ -643,9 +900,15 @@ function integerField(
     : null
 }
 
-function appendBounded(current: string, next: string, max = MAX_JSON_LINE_BYTES) {
+function appendBounded(
+  current: string,
+  next: string,
+  max = MAX_JSON_LINE_BYTES
+) {
   const combined = current + next
-  return combined.length > max ? combined.slice(combined.length - max) : combined
+  return combined.length > max
+    ? combined.slice(combined.length - max)
+    : combined
 }
 
 function requireContained(root: string, candidate: string, operation: string) {

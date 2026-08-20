@@ -36,6 +36,7 @@ import { dismissToast, showToast } from "@workspace/ui/components/sonner"
 import type { PublicKilnRelease } from "@/effect/github-releases"
 import { useKilnGitRepository } from "@/lib/git-repository"
 import { queryKeys, updateOverviewQueryOptions } from "@/lib/query-options"
+import { replaceRelayUpdateVersion } from "@/lib/system-update-cache"
 import {
   compareLatestReleaseVersion,
   compareReleaseVersions,
@@ -44,6 +45,7 @@ import {
 } from "@/lib/release-version"
 import {
   beginSystemUpdateBatch,
+  canStartSystemUpdate,
   inactiveSystemUpdateBatch,
   isHearthUpdateLocked,
   recordHearthUpdateCompletion,
@@ -60,10 +62,12 @@ import {
   applicationConnectionToastId,
   applicationReconnectedToastId,
   activeSystemUpdateStorageKey,
+  canRefetchSystemUpdateOverview,
   clearSystemUpdateActive,
   markSystemUpdateActive,
   relayDisconnectToastId,
   relayReconnectToastId,
+  setSystemUpdateOverviewRefetchBlocked,
 } from "@/lib/system-update-presence"
 import type { UpdateOverview } from "@/server/updates"
 import { getSystemUpdateStatus, startSystemUpdates } from "@/server/updates"
@@ -274,6 +278,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       return stored ? parseActiveUpdates(JSON.parse(stored) as unknown) : []
     })
     if (Result.isSuccess(restored) && restored.success.length > 0) {
+      setSystemUpdateOverviewRefetchBlocked(true)
+      void queryClient.cancelQueries({
+        exact: true,
+        queryKey: queryKeys.updates,
+      })
       for (const update of restored.success) {
         activityStore.setPhase(update.operationId, update.phase ?? "Preparing")
         registerUpdatePresence(update)
@@ -287,7 +296,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     } else {
       window.localStorage.removeItem(activeSystemUpdateStorageKey)
     }
-  }, [activityStore, replaceActive])
+  }, [activityStore, queryClient, replaceActive])
 
   const registerStartedUpdate = React.useCallback(
     (update: ActiveUpdate) => {
@@ -308,7 +317,12 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         update.latestVersionName,
         registerStartedUpdate
       ),
-    onMutate: (update) => {
+    onMutate: async (update) => {
+      setSystemUpdateOverviewRefetchBlocked(true)
+      await queryClient.cancelQueries({
+        exact: true,
+        queryKey: queryKeys.updates,
+      })
       const preparingUpdates = update.targets.flatMap((target) =>
         isTargetUpdating(activeRef.current, target)
           ? []
@@ -346,7 +360,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       for (const failure of failures) {
         batch.current = recordSystemUpdateFailure(batch.current, failure)
       }
-      void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
     },
     onSettled: () => {
       preparingUpdatesRef.current = []
@@ -391,7 +404,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
           message: `${completed.name}'s saved update operation could not be found. Check the target container before trying again.`,
           target: completed,
         })
-        void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
         return
       }
 
@@ -408,7 +420,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
             "The update failed. The previous container was restored.",
           target: completed,
         })
-        void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
         return
       }
       const disposition = systemUpdateCompletionDisposition(
@@ -426,10 +437,22 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         completedVersion
       )
       setChangelogRevision((revision) => revision + 1)
-      void Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
-      ])
+      if (completed.component === "relay" && completed.relayId) {
+        queryClient.setQueryData<UpdateOverview>(
+          queryKeys.updates,
+          (overview) =>
+            overview
+              ? {
+                  ...overview,
+                  relays: replaceRelayUpdateVersion(
+                    overview.relays,
+                    completed.relayId,
+                    completedVersion
+                  ),
+                }
+              : overview
+        )
+      }
       if (lockUntilReload) {
         const completion = {
           version: completedVersion,
@@ -445,6 +468,8 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
             targetVersion: completedVersion,
             versionName: completion.versionName,
           }
+          activityStore.setHearthReloadRequired(true)
+          setPending(null)
           publishDisplayedActive()
         }
       } else {
@@ -482,6 +507,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       UpdateFailure,
       HearthUpdateCompletion
     >()
+    setSystemUpdateOverviewRefetchBlocked(false)
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
+    ])
     const failures = completedBatch.failures
     const hearth = completedBatch.hearthCompletion
 
@@ -502,6 +532,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     githubIssuesUrl,
     onRetryTarget,
     open,
+    queryClient,
     updateMutation.isPending,
   ])
 
@@ -524,9 +555,10 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       latestVersionName?: string
     ) => {
       if (
-        updateMutationPendingRef.current ||
-        batch.current.active ||
-        heldHearthUpdateRef.current !== null
+        !canStartSystemUpdate({
+          hearthReloadRequired: heldHearthUpdateRef.current !== null,
+          mutationPending: updateMutationPendingRef.current,
+        })
       ) {
         return
       }
@@ -715,7 +747,14 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         pending={updateMutation.isPending}
         targets={pending?.targets ?? []}
         onConfirm={() => {
-          if (pending && !updateMutation.isPending) {
+          if (
+            pending &&
+            canStartSystemUpdate({
+              hearthReloadRequired:
+                activityStore.getHearthReloadRequiredSnapshot(),
+              mutationPending: updateMutation.isPending,
+            })
+          ) {
             updateMutation.mutate(pending)
           }
         }}
@@ -881,7 +920,8 @@ const UpdateDialogData = React.memo(function UpdateDialogData({
   )
   const overviewQuery = useQuery({
     ...updateOverviewQueryOptions(),
-    enabled: open && active.length === 0,
+    enabled: () =>
+      open && active.length === 0 && canRefetchSystemUpdateOverview(),
     notifyOnChangeProps: ["data", "error", "isError", "isPending"],
   })
   const overview = overviewQuery.data
@@ -1085,7 +1125,7 @@ const UpdaterCheckControl = React.memo(function UpdaterCheckControl({
   )
   const overviewQuery = useQuery({
     ...updateOverviewQueryOptions(),
-    enabled: open && !updating,
+    enabled: () => open && !updating && canRefetchSystemUpdateOverview(),
     notifyOnChangeProps: ["dataUpdatedAt", "isFetching"],
   })
   const [lastCheckedAt, setLastCheckedAt] = React.useState("Not yet")
@@ -1346,6 +1386,7 @@ const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
     activityStore.getActivitiesSnapshot
   )
   const activeTargetKeys = new Set(active.map((update) => update.targetKey))
+  const hearthReloadRequired = useHearthReloadRequired(activityStore)
   const availableTargets = latestRelease
     ? targets.filter(
         (target) =>
@@ -1355,12 +1396,10 @@ const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
   const mockableTargets = targets.filter(
     (target) => !activeTargetKeys.has(target.key)
   )
-  const updating = active.length > 0
-
   return (
     <div className="flex shrink-0 items-center gap-2">
       <Button
-        disabled={updating || availableTargets.length === 0}
+        disabled={hearthReloadRequired || availableTargets.length === 0}
         size="sm"
         type="button"
         onClick={() => {
@@ -1378,7 +1417,11 @@ const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
       </Button>
       {import.meta.env.DEV ? (
         <Button
-          disabled={updating || mockableTargets.length === 0}
+          disabled={
+            hearthReloadRequired ||
+            active.length > 0 ||
+            mockableTargets.length === 0
+          }
           size="sm"
           type="button"
           variant="outline"
@@ -1555,6 +1598,14 @@ function useTargetActivity(
   return React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 }
 
+function useHearthReloadRequired(activityStore: SystemUpdateActivityStore) {
+  return React.useSyncExternalStore(
+    activityStore.subscribeHearthReloadRequired,
+    activityStore.getHearthReloadRequiredSnapshot,
+    activityStore.getHearthReloadRequiredSnapshot
+  )
+}
+
 const UpdateTargetIcon = React.memo(function UpdateTargetIcon({
   activityStore,
   target,
@@ -1650,11 +1701,7 @@ const UpdateTargetAction = React.memo(function UpdateTargetAction({
   ) => void
 }) {
   const updating = useTargetActivity(activityStore, target.key) !== undefined
-  const starting = React.useSyncExternalStore(
-    activityStore.subscribeActivities,
-    activityStore.getBusySnapshot,
-    activityStore.getBusySnapshot
-  )
+  const hearthReloadRequired = useHearthReloadRequired(activityStore)
   const comparison = compareLatestReleaseVersion(
     target.currentVersion,
     releases
@@ -1673,7 +1720,9 @@ const UpdateTargetAction = React.memo(function UpdateTargetAction({
       size="sm"
       type="button"
       disabled={
-        starting || (!updateAvailable && !reinstallAvailable) || updating
+        hearthReloadRequired ||
+        (!updateAvailable && !reinstallAvailable) ||
+        updating
       }
       onClick={() =>
         onUpdate(

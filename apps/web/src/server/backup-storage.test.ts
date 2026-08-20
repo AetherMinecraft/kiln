@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 
-import type { BackupStorageRecord } from "@/effect/backup-storage"
+import type { BackupStorageRecord } from "@/backups/destinations/s3"
 
 import { visibleBackupStorage } from "./backup-storage"
 
@@ -33,6 +33,7 @@ function backupStorage(
     allowPrivateNetwork: false,
     bucket: "backups",
     createdAt: "2026-08-10T00:00:00.000Z",
+    deleting: false,
     enabled: true,
     endpoint: "https://s3.example.com",
     forcePathStyle: false,
