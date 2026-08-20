@@ -84,6 +84,7 @@ const BACKUP_TIMEOUT_REASON =
 const EXPORT_SWEEP_INTERVAL = "1 hour"
 const RESTIC_CACHE_CLEANUP_TIMEOUT_MS = 30_000
 const RESTIC_RECOVERY_TIMEOUT_MS = 30_000
+const RESTIC_RECOVERY_PRUNE_TIMEOUT_MS = 30_000
 const DEFAULT_EXCLUDES = [
   ".DS_Store",
   "Thumbs.db",
@@ -560,7 +561,8 @@ export class BackupManager {
                     progress.currentArtifactId,
                     Date.now()
                   ),
-                createSignal
+                createSignal,
+                () => createSignal
               )
             : yield* deleteBackupArtifacts(
                 this.#config,
@@ -798,40 +800,6 @@ export class BackupManager {
               Date.now()
             ),
           createSignal
-        ).pipe(
-          // An over-limit snapshot was forgotten before this error. Reclaim
-          // its unreferenced packs before the task leaves the serial queue.
-          Effect.tapError((error) =>
-            error instanceof RelayBackupError &&
-            error.code === "backup_too_large" &&
-            input.destination.kind === "restic"
-              ? runResticPrune(
-                  this.#config,
-                  this.#restic,
-                  {
-                    backupId: randomUUID(),
-                    kind: "prune",
-                    repository: input.destination.repository,
-                    repositoryPassword: input.destination.repositoryPassword,
-                    target: input.target,
-                    taskId: randomUUID(),
-                  },
-                  () => Effect.succeed(false),
-                  createSignal
-                ).pipe(
-                  Effect.catch((cause) =>
-                    Effect.logError(
-                      "Could not prune an over-limit restic snapshot",
-                      {
-                        backupId: input.backupId,
-                        cause,
-                        taskId: task.taskId,
-                      }
-                    )
-                  )
-                )
-              : Effect.void
-          )
         )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
@@ -854,7 +822,8 @@ export class BackupManager {
                 taskId: randomUUID(),
               },
               () => Effect.succeed(false),
-              AbortSignal.timeout(RESTIC_RECOVERY_TIMEOUT_MS)
+              AbortSignal.timeout(RESTIC_RECOVERY_TIMEOUT_MS),
+              () => AbortSignal.timeout(RESTIC_RECOVERY_PRUNE_TIMEOUT_MS)
             )
           )
           if (Result.isFailure(cleaned)) {
@@ -1596,10 +1565,12 @@ async function createResticSnapshot(
       snapshotId: reuse.id,
     })
     await rejectOverLimitSnapshot(restic, {
+      backupId: input.backupId,
       location,
       maxBytes: input.maxBytes,
       password,
       snapshotId: reuse.id,
+      taskId: input.taskId,
       totalBytes: stats.totalSize,
     })
     progress.completed = stats.totalSize
@@ -1657,19 +1628,39 @@ async function createResticSnapshot(
     )
   )
   if (Result.isFailure(summary)) {
-    await forgetTaggedSnapshotIfOverLimit(restic, {
-      location,
-      maxBytes: input.maxBytes,
-      password,
-      tag: `task:${input.taskId}`,
-    })
+    await Effect.runPromise(
+      Effect.tryPromise({
+        try: () =>
+          forgetTaskSnapshotsAfterFailedCreate(restic, {
+            backupId: input.backupId,
+            location,
+            password,
+            tag: `task:${input.taskId}`,
+            taskId: input.taskId,
+          }),
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logError(
+            "Could not forget restic snapshots after a failed create",
+            {
+              backupId: input.backupId,
+              cause,
+              taskId: input.taskId,
+            }
+          )
+        )
+      )
+    )
     throw summary.failure
   }
   await rejectOverLimitSnapshot(restic, {
+    backupId: input.backupId,
     location,
     maxBytes: input.maxBytes,
     password,
     snapshotId: summary.success.snapshotId,
+    taskId: input.taskId,
     totalBytes: summary.success.totalBytesProcessed,
   })
   progress.completed = summary.success.totalBytesProcessed
@@ -1701,10 +1692,12 @@ function backupTooLarge() {
 async function rejectOverLimitSnapshot(
   restic: ResticDriver,
   input: {
+    backupId: string
     location: ResticDriverLocation
     maxBytes: number | null
     password: string
     snapshotId: string
+    taskId: string
     totalBytes?: number
   }
 ): Promise<void> {
@@ -1727,19 +1720,20 @@ async function rejectOverLimitSnapshot(
     signal,
     snapshotId: input.snapshotId,
   })
+  await pruneResticAfterRecovery(restic, input)
   throw backupTooLarge()
 }
 
-async function forgetTaggedSnapshotIfOverLimit(
+async function forgetTaskSnapshotsAfterFailedCreate(
   restic: ResticDriver,
   input: {
+    backupId: string
     location: ResticDriverLocation
-    maxBytes: number | null
     password: string
     tag: string
+    taskId: string
   }
 ): Promise<void> {
-  if (input.maxBytes === null) return
   const signal = AbortSignal.timeout(RESTIC_RECOVERY_TIMEOUT_MS)
   const snapshots = await restic.snapshotsByTag({
     location: input.location,
@@ -1747,21 +1741,45 @@ async function forgetTaggedSnapshotIfOverLimit(
     signal,
     tag: input.tag,
   })
-  const snapshot = snapshots[0]
-  if (!snapshot) return
-  const stats = await restic.stats({
-    location: input.location,
-    password: input.password,
-    signal,
-    snapshotId: snapshot.id,
-  })
-  if (stats.totalSize <= input.maxBytes) return
-  await restic.forget({
-    location: input.location,
-    password: input.password,
-    signal,
-    snapshotId: snapshot.id,
-  })
+  for (const snapshot of snapshots) {
+    await restic.forget({
+      location: input.location,
+      password: input.password,
+      signal,
+      snapshotId: snapshot.id,
+    })
+  }
+  if (snapshots.length > 0) await pruneResticAfterRecovery(restic, input)
+}
+
+async function pruneResticAfterRecovery(
+  restic: ResticDriver,
+  input: {
+    backupId: string
+    location: ResticDriverLocation
+    password: string
+    taskId: string
+  }
+): Promise<void> {
+  await Effect.runPromise(
+    Effect.tryPromise({
+      try: () =>
+        restic.prune({
+          location: input.location,
+          password: input.password,
+          signal: AbortSignal.timeout(RESTIC_RECOVERY_PRUNE_TIMEOUT_MS),
+        }),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logError("Could not prune restic recovery data", {
+          backupId: input.backupId,
+          cause,
+          taskId: input.taskId,
+        })
+      )
+    )
+  )
 }
 
 function runResticRestore(
@@ -1872,7 +1890,8 @@ function runResticForget(
   updateProgress: (
     progress: BackupProgress
   ) => ReturnType<RelayStateStore["Service"]["updateBackupTaskProgress"]>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  pruneSignal: () => AbortSignal
 ) {
   return Effect.gen(function* () {
     const destination = input.destination
@@ -1949,7 +1968,7 @@ function runResticForget(
           taskId: randomUUID(),
         },
         updateProgress,
-        signal
+        pruneSignal()
       )
     )
     if (Result.isFailure(pruned)) {

@@ -273,6 +273,44 @@ describe("restic driver", () => {
     stderr?.end()
   })
 
+  it("reports abort when it arrives after a successful child exit", async () => {
+    const abort = new AbortController()
+    let killed = 0
+    let stdout: PassThrough | undefined
+    let stderr: PassThrough | undefined
+    const spawn: ResticSpawn = () => {
+      stdout = new PassThrough()
+      stderr = new PassThrough()
+      const child = new EventEmitter() as ReturnType<ResticSpawn>
+      child.stdout = stdout
+      child.stderr = stderr
+      child.stdin = new PassThrough()
+      child.kill = () => {
+        killed += 1
+        return true
+      }
+      queueMicrotask(() => {
+        stdout?.write("{}")
+        child.emit("close", 0)
+        abort.abort()
+      })
+      return child
+    }
+    const driver = createResticDriver({ spawn, terminateTimeoutMs: 10 })
+
+    await rejects(
+      driver.catConfig({
+        location: s3Location,
+        password: "secret",
+        signal: abort.signal,
+      }),
+      RelayBackupError
+    )
+    assert.strictEqual(killed, 0)
+    stdout?.end()
+    stderr?.end()
+  })
+
   it("reuses a snapshot tagged with the task id", async () => {
     const spawn = fakeResticSpawn([
       {

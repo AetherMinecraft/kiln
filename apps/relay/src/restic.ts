@@ -710,9 +710,9 @@ async function spawnResticOnce(
     )
     return termination
   }
-  let rejectAborted: (cause: unknown) => void = () => undefined
-  const aborted = new Promise<never>((_resolve, reject) => {
-    rejectAborted = reject
+  let resolveAborted: (cause: unknown) => void = () => undefined
+  const aborted = new Promise<{ readonly cause: unknown }>((resolve) => {
+    resolveAborted = (cause) => resolve({ cause })
   })
   const onAbort = () => {
     Effect.runFork(
@@ -721,9 +721,9 @@ async function spawnResticOnce(
         catch: (cause) => cause,
       }).pipe(
         Effect.match({
-          onFailure: rejectAborted,
+          onFailure: resolveAborted,
           onSuccess: () =>
-            rejectAborted(
+            resolveAborted(
               resticError(
                 "restic_command_aborted",
                 args[0] ?? "restic",
@@ -742,7 +742,7 @@ async function spawnResticOnce(
     input.signal.addEventListener("abort", onAbort, { once: true })
   }
   const completed = await resultOf(async () => {
-    const [exitCode] = await Promise.race([
+    const outcome = await Promise.race([
       Promise.all([
         waitForExit,
         input.stdoutPipe
@@ -771,6 +771,8 @@ async function spawnResticOnce(
       ]),
       aborted,
     ])
+    if (!Array.isArray(outcome)) throw outcome.cause
+    const [exitCode] = outcome
     if (stdoutBuffer.trim()) {
       const parsed = parseResticJsonLine(stdoutBuffer)
       if (parsed !== null) input.onJson?.(parsed)

@@ -797,8 +797,10 @@ describe("restic backup limits and exports", () => {
         () =>
           Effect.gen(function* () {
             const forgotten: Array<string> = []
+            let forgetSignal: AbortSignal | undefined
             let manager: BackupManager | undefined
             let pruned = 0
+            let pruneSignal: AbortSignal | undefined
             const config = testConfig(
               join(testDirectory, "cancelled-after-restic-summary")
             )
@@ -824,10 +826,12 @@ describe("restic backup limits and exports", () => {
                     totalBytesProcessed: 10,
                   }
                 },
-                forget: async ({ snapshotId }) => {
+                forget: async ({ signal, snapshotId }) => {
+                  forgetSignal = signal
                   forgotten.push(snapshotId)
                 },
-                prune: async () => {
+                prune: async ({ signal }) => {
+                  pruneSignal = signal
                   pruned += 1
                 },
               }),
@@ -839,6 +843,55 @@ describe("restic backup limits and exports", () => {
             const task = yield* manager.get(input.taskId)
             assert.strictEqual(task?.status, "cancelled")
             assert.deepStrictEqual(forgotten, ["cancelled01"])
+            assert.strictEqual(pruned, 1)
+            assert.notStrictEqual(forgetSignal, pruneSignal)
+          })
+      )
+
+      it.effect(
+        "forgets a task-tagged snapshot when backup aborts after commit",
+        () =>
+          Effect.gen(function* () {
+            const forgotten: Array<string> = []
+            let pruned = 0
+            let snapshotLists = 0
+            const config = testConfig(
+              join(testDirectory, "aborted-after-restic-commit")
+            )
+            yield* Effect.promise(() =>
+              mkdir(join(config.rootDirectory, "instance-1"), {
+                recursive: true,
+              })
+            )
+            const manager = yield* BackupManager.make({
+              config,
+              findInstance: async () => testInstance(),
+              isInstanceStopped: async () => true,
+              restic: mockRestic({
+                backup: async () => {
+                  throw new Error("restic aborted while streams were draining")
+                },
+                forget: async ({ snapshotId }) => {
+                  forgotten.push(snapshotId)
+                },
+                prune: async () => {
+                  pruned += 1
+                },
+                snapshotsByTag: async () => {
+                  snapshotLists += 1
+                  return snapshotLists === 1 ? [] : [{ id: "committed01" }]
+                },
+              }),
+            })
+            const input = resticCreateInput("aborted-after-restic-commit", 100)
+            input.maxBytes = null
+
+            yield* manager.enqueue(input)
+            yield* manager.runPending()
+
+            const task = yield* manager.get(input.taskId)
+            assert.strictEqual(task?.status, "failed")
+            assert.deepStrictEqual(forgotten, ["committed01"])
             assert.strictEqual(pruned, 1)
           })
       )
