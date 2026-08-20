@@ -5,7 +5,7 @@ import { Effect } from "effect"
 import { backupDownloadCapabilityPayloadSchema } from "@workspace/contracts"
 
 import type { BackupCatalogRecord } from "@/effect/backups"
-import { loadRelayCredentials, type PersistedRelay } from "@/lib/relay-registry"
+import type { PersistedRelay } from "@/lib/relay-registry"
 
 export async function signLocalBackupDownload(
   relay: PersistedRelay,
@@ -17,6 +17,7 @@ export async function signLocalBackupDownload(
   if (relay.role === "custom" && !relay.actions.includes("backup.download")) {
     throw new Error("This Hearth client cannot download Relay backups")
   }
+  const { loadRelayCredentials } = await import("@/lib/relay-registry")
   const credentials = await loadRelayCredentials(relay.id)
   const now = Date.now()
   const expiresAt = now + expiresInSeconds * 1_000
