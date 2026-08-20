@@ -310,7 +310,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         update.latestVersionName,
         registerStartedUpdate
       ),
-    onMutate: (update) => {
+    onMutate: async (update) => {
+      await queryClient.cancelQueries({
+        exact: true,
+        queryKey: queryKeys.updates,
+      })
       const preparingUpdates = update.targets.flatMap((target) =>
         isTargetUpdating(activeRef.current, target)
           ? []
@@ -348,10 +352,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       for (const failure of failures) {
         batch.current = recordSystemUpdateFailure(batch.current, failure)
       }
-      void queryClient.invalidateQueries({
-        queryKey: queryKeys.updates,
-        refetchType: "none",
-      })
     },
     onSettled: () => {
       preparingUpdatesRef.current = []
