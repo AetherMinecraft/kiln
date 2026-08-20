@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 
-import type { BackupStorageRecord } from "@/effect/backup-storage"
+import type { BackupStorageRecord } from "@/backups/destinations/s3"
 
 import { visibleBackupStorage } from "./backup-storage"
 

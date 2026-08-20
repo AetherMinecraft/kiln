@@ -11,7 +11,7 @@ import {
   normalizeS3Endpoint,
   resticPrefixSegment,
   resticRepositoryObjectPrefix,
-} from "./backup-storage-s3"
+} from "./client"
 import { BackupStorageError } from "@/effect/errors"
 
 describe("S3 backup storage", () => {

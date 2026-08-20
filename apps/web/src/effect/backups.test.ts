@@ -17,7 +17,7 @@ import {
   reconcileBackupTaskEffect,
   shouldApplyRelayBackupTaskSnapshot,
 } from "@/effect/backups"
-import { deleteS3BackupPrefix } from "@/lib/backup-storage-s3"
+import { deleteS3BackupPrefix } from "@/backups/destinations/s3"
 
 vi.mock("../../keyring.mjs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../keyring.mjs")>()
@@ -41,9 +41,9 @@ vi.mock("@/lib/environment", async (importOriginal) => {
   }
 })
 
-vi.mock("@/lib/backup-storage-s3", async (importOriginal) => {
+vi.mock("@/backups/destinations/s3", async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import("@/lib/backup-storage-s3")>()
+    await importOriginal<typeof import("@/backups/destinations/s3")>()
   return {
     ...actual,
     deleteS3BackupPrefix: vi.fn(() => Effect.void),

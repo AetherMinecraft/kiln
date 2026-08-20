@@ -1,7 +1,7 @@
 import type { RowDataPacket } from "mysql2/promise"
 import { Effect, Result } from "effect"
 
-import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
+import { decryptWithKeyring, encryptWithKeyring } from "../../../../keyring.mjs"
 import { Database } from "@/effect/database"
 import { BackupStorageError, CredentialError } from "@/effect/errors"
 import { databaseTable } from "@/lib/database-config"
@@ -9,7 +9,7 @@ import { betterAuthSecrets } from "@/lib/environment"
 import {
   deleteS3BackupPrefix,
   type S3BackupCredential,
-} from "@/lib/backup-storage-s3"
+} from "@/backups/destinations/s3/client"
 
 interface BackupStoragePublicRow extends RowDataPacket {
   allow_private_network: boolean | number

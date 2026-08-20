@@ -102,6 +102,33 @@ An owner ID of `null` makes a destination platform-wide; otherwise only that
 user can select it. Destination removal is blocked while cataloged artifacts
 still depend on it.
 
+Destination implementations are isolated by kind:
+
+```text
+apps/web/src/backups/destinations/<kind>/
+apps/relay/src/backups/destinations/<kind>/
+```
+
+The Hearth registry describes whether a destination implements the complete
+full-backup and Restic standards. Full-backup support includes checking,
+saving, reading, downloading, restoring, and deleting an archive. Restic
+support includes repository checks, snapshots, exported downloads, restores,
+snapshot deletion, and pruning. A destination must implement at least one
+complete standard; it cannot advertise a partial format.
+
+The Relay registry owns execution details such as local retention, artifact
+size ceilings, archive writes/deletes, Restic repository locations, process
+arguments, and credentials. Adding a destination means adding its directory
+and registering its typed definition. Shared orchestration should not grow a
+new destination-specific branch. Wire-contract and persistence migrations are
+still required when a new kind introduces a new task shape or stored
+configuration; Local and S3 retain their existing shapes in this refactor.
+Today, `storageId === null` is also the persisted discriminator for Relay-local
+storage. A third configured kind therefore needs a persistence discriminator
+and updates to the shared selectors that translate stored artifacts into the
+registry kind. The registries centralize destination behavior, but they are not
+dynamic plugin loading.
+
 S3 credentials never go to a game container and are not returned to the
 browser. Full archives still use Hearth-signed, narrowly scoped object
 requests. Incremental restic repositories cannot be driven with presigned

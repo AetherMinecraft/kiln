@@ -11,11 +11,14 @@ import {
   listRunnableBackupCopyTaskIdsEffect,
   type ClaimedBackupCopyTask,
 } from "@/effect/backups"
-import { loadBackupStorageCredentialEffect } from "@/effect/backup-storage"
+import { loadBackupStorageCredentialEffect } from "@/backups/destinations/s3"
 import { BackupStorageError } from "@/effect/errors"
 import { forkAppEffect } from "@/effect/runtime"
-import { signLocalBackupDownload } from "@/lib/backup-download"
-import { putS3BackupObject, withS3BackupObject } from "@/lib/backup-storage-s3"
+import { signLocalBackupDownload } from "@/backups/destinations/local"
+import {
+  putS3BackupObject,
+  withS3BackupObject,
+} from "@/backups/destinations/s3"
 import { relayControlEndpoint } from "@/lib/relay-control-endpoint"
 import {
   listPersistedRelays,

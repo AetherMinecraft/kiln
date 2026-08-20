@@ -58,7 +58,7 @@ import {
 import {
   loadBackupStorageCredentialEffect,
   loadBackupStorageEffect,
-} from "@/effect/backup-storage"
+} from "@/backups/destinations/s3"
 import { CliAccessError, RelayUnavailableError } from "@/effect/errors"
 import {
   allowedInstanceIdsEffect,
@@ -68,8 +68,8 @@ import {
   requireRelayPermissionEffect,
 } from "@/lib/access-control"
 import { hasBackupPermission } from "@/lib/backup-access"
-import { signLocalBackupDownload } from "@/lib/backup-download"
-import { signS3BackupDownload } from "@/lib/backup-storage-s3"
+import { signLocalBackupDownload } from "@/backups/destinations/local"
+import { signS3BackupDownload } from "@/backups/destinations/s3"
 import type { AccessPermission } from "@/lib/permissions"
 import { roleHasPermission } from "@/lib/permissions"
 import { invalidateRelayCache, relayCachePolicy } from "@/lib/relay-client"

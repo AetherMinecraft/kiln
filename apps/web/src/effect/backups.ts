@@ -35,8 +35,8 @@ import {
   deleteS3BackupPrefix,
   isSafeResticObjectPrefix,
   resticRepositoryObjectPrefix,
-} from "@/lib/backup-storage-s3"
-import { loadBackupStorageCredentialEffect } from "@/effect/backup-storage"
+} from "@/backups/destinations/s3"
+import { loadBackupStorageCredentialEffect } from "@/backups/destinations/s3"
 
 const RESTIC_REPOSITORY_PASSWORD_PURPOSE = "kiln-restic-repository-password"
 

@@ -7,20 +7,22 @@ import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 
 import { Effect, Result, Schedule } from "effect"
-import {
-  resticRepositoryPrefixSchema,
-  resticS3BucketSchema,
-  resticS3RegionSchema,
-  type ResticRepositoryLocation,
-} from "@workspace/contracts"
 
 import { RelayBackupError } from "./effect/errors.js"
-import type { RelayConfig } from "./config.js"
+import {
+  applyResticDestinationEnvironment,
+  resticDestinationEndpointPort,
+  resticDriverLocation,
+  resticGlobalArgs,
+  resticRepositoryPath,
+  resticRepositoryString,
+  type ResticDriverLocation,
+} from "./backups/destinations/index.js"
 import {
   resticS3ProxyAllowedHosts,
   resticS3ProxyToken,
   withResticS3Proxy,
-} from "./restic-s3-proxy.js"
+} from "./backups/destinations/s3/proxy.js"
 
 const RESTIC_BINARY = "restic"
 const MAX_JSON_LINE_BYTES = 64 * 1024
@@ -63,19 +65,8 @@ export type ResticSpawn = (
   }
 ) => ChildProcess
 
-export type ResticDriverLocation =
-  | { kind: "local"; path: string }
-  | {
-      accessKeyId: string
-      allowPrivateNetwork: boolean
-      bucket: string
-      endpoint: string
-      forcePathStyle: boolean
-      kind: "s3"
-      region: string
-      repositoryPrefix: string
-      secretAccessKey: string
-    }
+export { resticDriverLocation, resticRepositoryPath, resticRepositoryString }
+export type { ResticDriverLocation }
 
 export type ResticDriver = {
   backup: (input: {
@@ -145,13 +136,6 @@ export type ResticDriver = {
   }) => Promise<{ totalSize: number }>
 }
 
-export function resticRepositoryPath(
-  config: RelayConfig,
-  targetId: string
-): string {
-  return resolve(config.dataDirectory, "restic", "instance", targetId)
-}
-
 export function resticSnapshotSelector(
   snapshotId: string,
   instanceDirectory: string
@@ -171,62 +155,6 @@ export function requiredRepositoryPassword(
     })
   }
   return password
-}
-
-export function resticDriverLocation(
-  config: RelayConfig,
-  targetId: string,
-  location: ResticRepositoryLocation | undefined
-): ResticDriverLocation {
-  if (!location || location.kind === "local") {
-    return { kind: "local", path: resticRepositoryPath(config, targetId) }
-  }
-  if (!location.accessKeyId || !location.secretAccessKey) {
-    throw RelayBackupError.make({
-      code: "repository_credentials_missing",
-      operation: "restic.repository",
-      reason: "The restic S3 repository credentials were not provided to Relay",
-    })
-  }
-  if (!resticS3BucketSchema.safeParse(location.bucket).success) {
-    throw RelayBackupError.make({
-      code: "invalid_restic_repository",
-      operation: "restic.repository",
-      reason: "The restic S3 bucket name is invalid",
-    })
-  }
-  if (!resticS3RegionSchema.safeParse(location.region).success) {
-    throw RelayBackupError.make({
-      code: "invalid_restic_repository",
-      operation: "restic.repository",
-      reason: "The restic S3 region is invalid",
-    })
-  }
-  if (
-    !resticRepositoryPrefixSchema.safeParse(location.repositoryPrefix).success
-  ) {
-    throw RelayBackupError.make({
-      code: "invalid_restic_repository",
-      operation: "restic.repository",
-      reason: "The restic S3 repository prefix is invalid",
-    })
-  }
-  return {
-    accessKeyId: location.accessKeyId,
-    allowPrivateNetwork: location.allowPrivateNetwork,
-    bucket: location.bucket,
-    endpoint: location.endpoint,
-    forcePathStyle: location.forcePathStyle,
-    kind: "s3",
-    region: location.region,
-    repositoryPrefix: location.repositoryPrefix,
-    secretAccessKey: location.secretAccessKey,
-  }
-}
-
-export function resticRepositoryString(location: ResticDriverLocation): string {
-  if (location.kind === "local") return location.path
-  return `s3:${new URL(location.endpoint).origin}/${location.bucket}/${location.repositoryPrefix}`
 }
 
 export function translateExcludePatterns(
@@ -639,7 +567,7 @@ async function spawnResticCommand(
     {
       allowPrivateNetwork: input.location.allowPrivateNetwork,
       allowedHosts: resticS3ProxyAllowedHosts(input.location),
-      endpointPort: resticS3EndpointPort(input.location.endpoint),
+      endpointPort: resticDestinationEndpointPort(input.location) ?? 443,
       token,
     },
     (proxyUrl) =>
@@ -887,16 +815,6 @@ function resticError(
   })
 }
 
-function resticGlobalArgs(location: ResticDriverLocation): Array<string> {
-  const args: Array<string> = []
-  if (location.kind === "local") args.push("--no-cache")
-  if (location.kind === "s3") {
-    args.push("-o", `s3.region=${location.region}`)
-    if (location.forcePathStyle) args.push("-o", "s3.bucket-lookup=path")
-  }
-  return args
-}
-
 function resticSpawnEnv(input: {
   cacheDirectory?: string
   location: ResticDriverLocation
@@ -910,19 +828,11 @@ function resticSpawnEnv(input: {
   }
   env.RESTIC_PASSWORD = input.password
   env.RESTIC_REPOSITORY = resticRepositoryString(input.location)
-  if (input.location.kind === "s3") {
-    env.AWS_ACCESS_KEY_ID = input.location.accessKeyId
-    env.AWS_SECRET_ACCESS_KEY = input.location.secretAccessKey
-    if (input.cacheDirectory) env.RESTIC_CACHE_DIR = input.cacheDirectory
-    if (input.proxyUrl) env.HTTPS_PROXY = input.proxyUrl
-  }
+  applyResticDestinationEnvironment(env, input.location, {
+    ...(input.cacheDirectory ? { cacheDirectory: input.cacheDirectory } : {}),
+    ...(input.proxyUrl ? { proxyUrl: input.proxyUrl } : {}),
+  })
   return env
-}
-
-function resticS3EndpointPort(endpoint: string): number {
-  const parsed = new URL(endpoint)
-  if (parsed.port) return Number(parsed.port)
-  return 443
 }
 
 function redactResticStderr(
