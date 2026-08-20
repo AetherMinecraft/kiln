@@ -486,7 +486,7 @@ export const backupExportTaskResultSchema = z
   })
   .strict()
 
-export const backupArchiveManifestSchema = z
+const backupArchiveManifestV1Schema = z
   .object({
     artifactKind: z.literal("archive"),
     backupId: backupIdSchema,
@@ -498,6 +498,106 @@ export const backupArchiveManifestSchema = z
     }),
   })
   .strict()
+
+const backupArchiveServerConfigurationSchema = z
+  .object({
+    brick: z
+      .object({
+        consoleStopCommands: z.array(z.string().trim().min(1).max(128)).max(8),
+        format: z.string().min(1).nullable(),
+        id: z
+          .string()
+          .regex(/^[a-z0-9][a-z0-9.-]{0,63}$/u)
+          .nullable(),
+        networkMode: z.enum(["direct", "minecraft-backend"]).nullable(),
+        primaryPort: z.number().int().min(1).max(65_535).nullable(),
+        primaryPortProtocol: z.enum(["tcp", "udp", "both"]).nullable(),
+        readiness: z
+          .object({
+            logs: z.array(z.string().trim().min(1).max(256)).min(1).max(8),
+          })
+          .strict()
+          .nullable(),
+        source: z.string().trim().url().max(2_048).nullable(),
+        supportsSrv: z.boolean(),
+      })
+      .strict(),
+    game: z.string().min(1),
+    implementation: z.string().min(1),
+    javaVersion: z.string().min(1),
+    name: z.string().trim().min(1).max(120),
+    network: z
+      .object({
+        connectAddress: z.string().min(1),
+        ports: z
+          .array(
+            z
+              .object({
+                externalPort: z.number().int().min(1).max(65_535),
+                id: z
+                  .string()
+                  .regex(
+                    /^(?:primary|brick-[a-z0-9][a-z0-9-]{0,31}|[a-f0-9]{8})$/u
+                  ),
+                internalPort: z.number().int().min(1).max(65_535),
+                kind: z.enum(["primary", "brick", "custom"]),
+                name: z.string().trim().min(1).max(32),
+                protocol: z.enum(["tcp", "udp", "both"]),
+              })
+              .strict()
+          )
+          .max(16),
+        publicHost: z.string().min(1).max(253).nullable(),
+        publicPort: z.number().int().min(1).max(65_535).nullable(),
+        webRoutes: z
+          .array(
+            z
+              .object({
+                hostname: z.string().trim().toLowerCase().min(1).max(253),
+                id: z.union([z.string().regex(/^[a-f0-9]{8}$/u), z.uuid()]),
+                name: z.string().trim().min(1).max(32),
+                path: z.string().trim().min(1).max(256).nullable(),
+                stripPrefix: z.boolean(),
+                targetPort: z.number().int().min(1).max(65_535),
+              })
+              .strict()
+          )
+          .max(16),
+      })
+      .strict(),
+    startup: z
+      .object({
+        limits: z
+          .object({
+            diskBytes: z.number().int().nonnegative(),
+            memoryBytes: z.number().int().nonnegative(),
+          })
+          .strict(),
+        tailscale: z
+          .object({
+            enabled: z.boolean(),
+            subdomain: z.string().min(1).max(63).optional(),
+          })
+          .strict(),
+        variables: z.record(
+          z.string().regex(/^[a-z][a-z0-9_]{0,47}$/u),
+          z.union([z.string().max(8_192), z.number().finite(), z.boolean()])
+        ),
+      })
+      .strict(),
+    version: z.string().min(1),
+  })
+  .strict()
+
+const backupArchiveManifestV2Schema = backupArchiveManifestV1Schema.extend({
+  formatVersion: z.literal(2),
+  server: backupArchiveServerConfigurationSchema,
+})
+
+export const backupArchiveManifestSchema = z.discriminatedUnion(
+  "formatVersion",
+  [backupArchiveManifestV1Schema, backupArchiveManifestV2Schema]
+)
 
 export const backupDownloadCapabilityPayloadSchema = z
   .object({

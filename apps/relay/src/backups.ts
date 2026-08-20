@@ -37,6 +37,7 @@ import {
   type BackupTaskPhase,
   type BackupTaskResult,
   type RelayBackupTask,
+  type RelayInstanceWebRoute,
   type ResticRepositoryLocation,
 } from "@workspace/contracts"
 
@@ -173,13 +174,14 @@ export class BackupManager {
         config: options.config,
         createArchive:
           options.createArchive ??
-          ((input, instance, progress, signal) =>
+          (async (input, instance, progress, signal) =>
             createPortableInstanceBackup(
               options.config,
               input,
               instance,
               progress,
-              signal
+              signal,
+              await Effect.runPromise(state.listInstanceRoutes(instance.id))
             )),
         findInstance: options.findInstance,
         isInstanceStopped: options.isInstanceStopped,
@@ -952,7 +954,8 @@ export async function createPortableInstanceBackup(
   input: BackupCreateTaskInput,
   instance: RelayInstanceConfig,
   progress: BackupProgress,
-  signal: AbortSignal = new AbortController().signal
+  signal: AbortSignal = new AbortController().signal,
+  webRoutes: ReadonlyArray<RelayInstanceWebRoute> = []
 ): Promise<BackupArchiveCreateTaskResult> {
   signal.throwIfAborted()
   const configuredRoot = await realpath(config.rootDirectory)
@@ -1011,14 +1014,7 @@ export async function createPortableInstanceBackup(
             maximumBytes,
             progress,
             signal,
-            {
-              artifactKind: "archive",
-              backupId: input.backupId,
-              createdAt: new Date().toISOString(),
-              formatVersion: 1,
-              mode: "full",
-              target: input.target,
-            }
+            instanceBackupManifest(input, instance, webRoutes)
           )
           warnings = [...collected.warnings, ...written.warnings]
           if (written.changed.length > 0 && attempt === 0) {
@@ -1066,6 +1062,51 @@ export async function createPortableInstanceBackup(
     operation: "create.archive",
     reason: "The archive could not be completed",
   })
+}
+
+function instanceBackupManifest(
+  input: BackupCreateTaskInput,
+  instance: RelayInstanceConfig,
+  webRoutes: ReadonlyArray<RelayInstanceWebRoute>
+): BackupArchiveManifest {
+  return {
+    artifactKind: "archive",
+    backupId: input.backupId,
+    createdAt: new Date().toISOString(),
+    formatVersion: 2,
+    mode: "full",
+    server: {
+      brick: {
+        consoleStopCommands: [...(instance.brickConsoleStopCommands ?? [])],
+        format: instance.brickFormat ?? null,
+        id: instance.brickId ?? null,
+        networkMode: instance.brickNetworkMode ?? null,
+        primaryPort: instance.brickPrimaryPort ?? null,
+        primaryPortProtocol: instance.brickPrimaryPortProtocol ?? null,
+        readiness: instance.brickReadiness ?? null,
+        source: instance.brickSource ?? null,
+        supportsSrv: instance.brickSupportsSrv ?? false,
+      },
+      game: instance.game,
+      implementation: instance.implementation,
+      javaVersion: instance.javaVersion,
+      name: instance.name,
+      network: {
+        connectAddress: instance.connectAddress,
+        ports: instance.ports,
+        publicHost: instance.publicHost ?? null,
+        publicPort: instance.publicPort ?? null,
+        webRoutes: [...webRoutes],
+      },
+      startup: {
+        limits: instance.limits,
+        tailscale: instance.tailscale,
+        variables: instance.variables ?? {},
+      },
+      version: instance.version,
+    },
+    target: input.target,
+  }
 }
 
 export function storeCreatedBackup(

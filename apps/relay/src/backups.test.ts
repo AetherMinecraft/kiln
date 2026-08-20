@@ -6,10 +6,12 @@ import { join, resolve } from "node:path"
 import { afterAll, assert, describe, it, layer } from "@effect/vitest"
 import { Effect, Fiber } from "effect"
 import { TestClock } from "effect/testing"
+import { openPromise } from "yauzl"
 import ZipStream from "zip-stream"
 
 import type {
   BackupArchiveCreateTaskResult,
+  BackupArchiveManifest,
   BackupCreateTaskInput,
   BackupCreateTaskResult,
   BackupDeleteTaskInput,
@@ -17,7 +19,10 @@ import type {
   BackupTaskPhase,
   BackupTaskResult,
 } from "@workspace/contracts"
-import { relayBackupTaskSchema } from "@workspace/contracts"
+import {
+  backupArchiveManifestSchema,
+  relayBackupTaskSchema,
+} from "@workspace/contracts"
 
 import {
   BackupManager,
@@ -43,6 +48,19 @@ afterAll(() => {
 })
 
 describe("Relay backups", () => {
+  it("keeps v1 archive manifests readable", () => {
+    assert.isTrue(
+      backupArchiveManifestSchema.safeParse({
+        artifactKind: "archive",
+        backupId: "00000000-0000-4000-8000-000000000001",
+        createdAt: "2026-08-20T12:00:00.000Z",
+        formatVersion: 1,
+        mode: "full",
+        target: { id: "instance-1", kind: "instance" },
+      }).success
+    )
+  })
+
   it("rejects inconsistent task envelopes and result kinds", () => {
     const input = backupInput(4)
     const task = {
@@ -429,12 +447,54 @@ describe("Relay backups", () => {
               "stale"
             )
           )
+          const instance: RelayInstanceConfig = {
+            ...testInstance(),
+            brickConsoleStopCommands: ["stop"],
+            brickFormat: "kiln.brick/v1",
+            brickId: "paper",
+            brickNetworkMode: "minecraft-backend",
+            brickPrimaryPort: 25_565,
+            brickPrimaryPortProtocol: "tcp",
+            brickReadiness: { logs: ["Done"] },
+            brickSource: "https://kiln.test/bricks/paper.yml",
+            brickSupportsSrv: true,
+            limits: {
+              diskBytes: 25 * 1024 ** 3,
+              memoryBytes: 4 * 1024 ** 3,
+            },
+            ports: [
+              {
+                externalPort: 25_565,
+                id: "primary",
+                internalPort: 25_565,
+                kind: "primary",
+                name: "Minecraft",
+                protocol: "tcp",
+              },
+            ],
+            publicHost: "play.kiln.test",
+            publicPort: 25_565,
+            tailscale: { enabled: true, subdomain: "survival" },
+            variables: { memory: "4G", online_mode: false },
+          }
+          const webRoutes = [
+            {
+              hostname: "map.kiln.test",
+              id: "deadbeef",
+              name: "Map",
+              path: "/world",
+              stripPrefix: true,
+              targetPort: 8_123,
+            },
+          ]
           const result = yield* Effect.promise(() =>
             createPortableInstanceBackup(
               config,
               input,
-              testInstance(),
-              progress
+              instance,
+              progress,
+              undefined,
+              webRoutes
             )
           )
           assert.strictEqual(
@@ -452,6 +512,42 @@ describe("Relay backups", () => {
             result.checksumSha256,
             createHash("sha256").update(archive).digest("hex")
           )
+          const manifest = yield* Effect.promise(() =>
+            readArchiveManifest(archivePath)
+          )
+          assert.strictEqual(manifest.formatVersion, 2)
+          if (manifest.formatVersion === 2) {
+            assert.deepStrictEqual(manifest.server, {
+              brick: {
+                consoleStopCommands: ["stop"],
+                format: "kiln.brick/v1",
+                id: "paper",
+                networkMode: "minecraft-backend",
+                primaryPort: 25_565,
+                primaryPortProtocol: "tcp",
+                readiness: { logs: ["Done"] },
+                source: "https://kiln.test/bricks/paper.yml",
+                supportsSrv: true,
+              },
+              game: "minecraft",
+              implementation: "paper",
+              javaVersion: "21",
+              name: "Instance One",
+              network: {
+                connectAddress: "relay.test",
+                ports: instance.ports,
+                publicHost: "play.kiln.test",
+                publicPort: 25_565,
+                webRoutes,
+              },
+              startup: {
+                limits: instance.limits,
+                tailscale: instance.tailscale,
+                variables: instance.variables ?? {},
+              },
+              version: "1.21.8",
+            })
+          }
           assert.strictEqual(progress.completed, 5)
           assert.deepStrictEqual(
             (yield* Effect.promise(() =>
@@ -1219,6 +1315,26 @@ function writeTestArchive(path: string, name: string): Promise<void> {
       else archive.finalize()
     })
   })
+}
+
+async function readArchiveManifest(
+  path: string
+): Promise<BackupArchiveManifest> {
+  const archive = await openPromise(path)
+  try {
+    for await (const entry of archive.eachEntry()) {
+      if (entry.fileName !== ".kiln-backup/manifest.json") continue
+      const chunks: Array<Buffer> = []
+      const source = await archive.openReadStreamPromise(entry)
+      for await (const chunk of source) chunks.push(Buffer.from(chunk))
+      return backupArchiveManifestSchema.parse(
+        JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown
+      )
+    }
+  } finally {
+    archive.close()
+  }
+  throw new Error("Backup archive did not contain a manifest")
 }
 
 async function replaceArchiveEntryName(
