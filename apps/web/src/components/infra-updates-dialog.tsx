@@ -525,7 +525,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     ) => {
       if (
         updateMutationPendingRef.current ||
-        batch.current.active ||
         heldHearthUpdateRef.current !== null
       ) {
         return
@@ -1355,12 +1354,10 @@ const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
   const mockableTargets = targets.filter(
     (target) => !activeTargetKeys.has(target.key)
   )
-  const updating = active.length > 0
-
   return (
     <div className="flex shrink-0 items-center gap-2">
       <Button
-        disabled={updating || availableTargets.length === 0}
+        disabled={availableTargets.length === 0}
         size="sm"
         type="button"
         onClick={() => {
@@ -1378,7 +1375,7 @@ const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
       </Button>
       {import.meta.env.DEV ? (
         <Button
-          disabled={updating || mockableTargets.length === 0}
+          disabled={active.length > 0 || mockableTargets.length === 0}
           size="sm"
           type="button"
           variant="outline"
@@ -1650,11 +1647,6 @@ const UpdateTargetAction = React.memo(function UpdateTargetAction({
   ) => void
 }) {
   const updating = useTargetActivity(activityStore, target.key) !== undefined
-  const starting = React.useSyncExternalStore(
-    activityStore.subscribeActivities,
-    activityStore.getBusySnapshot,
-    activityStore.getBusySnapshot
-  )
   const comparison = compareLatestReleaseVersion(
     target.currentVersion,
     releases
@@ -1672,9 +1664,7 @@ const UpdateTargetAction = React.memo(function UpdateTargetAction({
       }
       size="sm"
       type="button"
-      disabled={
-        starting || (!updateAvailable && !reinstallAvailable) || updating
-      }
+      disabled={(!updateAvailable && !reinstallAvailable) || updating}
       onClick={() =>
         onUpdate(
           [target],
