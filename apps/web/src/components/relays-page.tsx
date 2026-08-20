@@ -70,6 +70,7 @@ import {
 import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import { pairingFeedbackFrom } from "@/lib/relay-pairing-errors"
+import { canRefetchSystemUpdateOverview } from "@/lib/system-update-presence"
 import {
   accessCapabilitiesQueryOptions,
   queryKeys,
@@ -436,7 +437,8 @@ const FilteredRelayTable = React.memo(function FilteredRelayTable({
   })
   const { data: updateSummary = noRelayUpdateSummary } = useQuery({
     ...updateOverviewQueryOptions(),
-    enabled: canReviewUpdates,
+    enabled: () =>
+      canReviewUpdates && canRefetchSystemUpdateOverview(),
     retry: false,
     select: selectRelayUpdateSummary,
   })

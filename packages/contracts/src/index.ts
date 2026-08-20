@@ -2,6 +2,11 @@ import { z } from "zod"
 
 import { MINIMUM_INSTANCE_DISK_LIMIT_BYTES } from "./instance-limits.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
+import {
+  relayTailscaleDomainSchema,
+  relayTailscaleHostnameSchema,
+  relayTailscaleSubdomainSchema,
+} from "./tailscale.js"
 
 export * from "./relay-protocol.js"
 export * from "./release-version.js"
@@ -11,6 +16,7 @@ export * from "./instance-limits.js"
 export * from "./instance-state-reason.js"
 export * from "./backups.js"
 export * from "./git-repository.js"
+export * from "./tailscale.js"
 
 export const relayIdSchema = z.string().regex(/^[A-Za-z\d_-]{43}$/u)
 
@@ -374,39 +380,6 @@ export const brickVariableValuesSchema = z.record(
   z.string().regex(/^[a-z][a-z0-9_]{0,47}$/u),
   brickVariableValueSchema
 )
-
-const normalizedDnsNameSchema = (maximumLength: number) =>
-  z
-    .string()
-    .trim()
-    .transform((value) => value.replace(/^[.]+|[.]+$/gu, "").toLowerCase())
-    .pipe(
-      z
-        .string()
-        .min(1)
-        .max(maximumLength)
-        .regex(
-          /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/u,
-          "Use letters, numbers, hyphens, and dots"
-        )
-    )
-
-export const relayTailscaleDomainSchema = normalizedDnsNameSchema(120)
-export const relayTailscaleSubdomainSchema = normalizedDnsNameSchema(120)
-export const relayTailscaleHostnameSchema = z
-  .string()
-  .trim()
-  .transform((value) => value.toLowerCase())
-  .pipe(
-    z
-      .string()
-      .min(1)
-      .max(63)
-      .regex(
-        /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u,
-        "Use letters, numbers, and hyphens"
-      )
-  )
 
 export const relayInstanceTailscaleSchema = z
   .object({
