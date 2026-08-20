@@ -3709,12 +3709,12 @@ function BackupStorageDialog({
                       {canManage ? (
                         <div className="flex shrink-0 items-center gap-1">
                           <BackupActionButton
-                            disabled={destination.deleting}
+                            disabled={false}
                             icon={Pencil}
                             label={`Edit ${destination.name}`}
                             tooltip={
                               destination.deleting
-                                ? "Finish deleting this destination before editing"
+                                ? "Update credentials to retry delete"
                                 : "Edit destination"
                             }
                             onClick={() => setEditor(destination)}
@@ -3796,6 +3796,7 @@ function BackupStorageEditor({
   )
   const [enabled, setEnabled] = React.useState(existing?.enabled ?? true)
   const [platform, setPlatform] = React.useState(existing?.ownerUserId === null)
+  const locationLocked = Boolean(existing?.deleting)
   const save = useMutation({
     mutationFn: () =>
       saveBackupStorage({
@@ -3855,13 +3856,15 @@ function BackupStorageEditor({
           </DialogTitle>
         </div>
         <DialogDescription>
-          Credentials are encrypted by Hearth and verified before they are
-          saved. Existing secrets are never sent back to the browser.
+          {locationLocked
+            ? "This destination is still deleting. Update credentials and save to retry the prefix purge. Location fields stay locked."
+            : "Credentials are encrypted by Hearth and verified before they are saved. Existing secrets are never sent back to the browser."}
         </DialogDescription>
       </DialogHeader>
       <div className="grid gap-4 sm:grid-cols-2">
         <StorageTextField label="Name" value={name} onChange={setName} />
         <StorageTextField
+          disabled={locationLocked}
           label="Region"
           placeholder="us-east-1"
           value={region}
@@ -3869,14 +3872,21 @@ function BackupStorageEditor({
         />
         <div className="sm:col-span-2">
           <StorageTextField
+            disabled={locationLocked}
             label="Endpoint"
             placeholder="https://s3.example.com"
             value={endpoint}
             onChange={setEndpoint}
           />
         </div>
-        <StorageTextField label="Bucket" value={bucket} onChange={setBucket} />
         <StorageTextField
+          disabled={locationLocked}
+          label="Bucket"
+          value={bucket}
+          onChange={setBucket}
+        />
+        <StorageTextField
+          disabled={locationLocked}
           label="Object prefix"
           placeholder="kiln/backups"
           value={objectPrefix}
@@ -3908,6 +3918,7 @@ function BackupStorageEditor({
         <StorageSwitch
           checked={forcePathStyle}
           description="Use endpoint/bucket/object addressing."
+          disabled={locationLocked}
           label="Path-style URLs"
           onCheckedChange={setForcePathStyle}
         />
@@ -3955,6 +3966,7 @@ function BackupStorageEditor({
 
 function StorageTextField({
   autoComplete,
+  disabled = false,
   label,
   onChange,
   placeholder,
@@ -3962,6 +3974,7 @@ function StorageTextField({
   value,
 }: {
   autoComplete?: string
+  disabled?: boolean
   label: string
   onChange: (value: string) => void
   placeholder?: string
@@ -3974,6 +3987,7 @@ function StorageTextField({
       <Input
         aria-label={label}
         autoComplete={autoComplete}
+        disabled={disabled}
         placeholder={placeholder}
         type={type}
         value={value}

@@ -39,6 +39,7 @@ import {
   type BackupTaskPhase,
   type BackupTaskResult,
   type RelayBackupTask,
+  type ResticRepositoryLocation,
 } from "@workspace/contracts"
 
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
@@ -1495,7 +1496,20 @@ function runResticCreate(
               reason: backupErrorMessage(cause),
               cause,
             }),
-    }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
+    }).pipe(
+      Effect.ensuring(Fiber.interrupt(progressFiber)),
+      Effect.ensuring(
+        cleanupResticCache(config, restic, {
+          password,
+          repository:
+            input.destination.kind === "restic"
+              ? input.destination.repository
+              : undefined,
+          signal,
+          targetId: input.target.id,
+        })
+      )
+    )
     return result
   })
 }
@@ -1935,16 +1949,6 @@ function runResticPrune(
           },
           password,
           signal,
-        }).then(async () => {
-          await restic.cacheCleanup({
-            location: resticDriverLocation(
-              config,
-              input.target.id,
-              input.repository
-            ),
-            password,
-            signal,
-          })
         }),
       catch: (cause) =>
         cause instanceof RelayBackupError
@@ -1955,8 +1959,49 @@ function runResticPrune(
               reason: backupErrorMessage(cause),
               cause,
             }),
-    }).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
+    }).pipe(
+      Effect.ensuring(Fiber.interrupt(progressFiber)),
+      Effect.ensuring(
+        cleanupResticCache(config, restic, {
+          password,
+          repository: input.repository,
+          signal,
+          targetId: input.target.id,
+        })
+      )
+    )
   })
+}
+
+function cleanupResticCache(
+  config: RelayConfig,
+  restic: ResticDriver,
+  input: {
+    password: string
+    repository: ResticRepositoryLocation | undefined
+    signal: AbortSignal
+    targetId: string
+  }
+) {
+  return Effect.tryPromise({
+    try: () =>
+      restic.cacheCleanup({
+        location: resticDriverLocation(
+          config,
+          input.targetId,
+          input.repository
+        ),
+        password: input.password,
+        signal: input.signal,
+      }),
+    catch: (cause) => cause,
+  }).pipe(
+    Effect.catch((cause) =>
+      Effect.sync(() => {
+        console.error("restic cache cleanup failed", cause)
+      })
+    )
+  )
 }
 
 function runResticExport(

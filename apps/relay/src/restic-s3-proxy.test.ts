@@ -99,6 +99,42 @@ describe("restic S3 CONNECT proxy", () => {
       upstream.server.close()
     }
   })
+
+  it("retries the next DNS address after an unreachable first answer", async () => {
+    const upstream = await listeningServer()
+    try {
+      const status = await withResticS3Proxy(
+        {
+          allowPrivateNetwork: true,
+          allowedHosts: new Set(["minio"]),
+          connectTimeoutMs: 250,
+          endpointPort: upstream.port,
+          lookup: (_hostname, _options, callback) => {
+            callback(null, [
+              { address: "192.0.2.1", family: 4 },
+              { address: "127.0.0.1", family: 4 },
+            ])
+          },
+          token,
+        },
+        async (proxyUrl) => {
+          const parsed = new URL(proxyUrl)
+          const client = connect({
+            host: parsed.hostname,
+            port: Number(parsed.port),
+          })
+          await once(client, "connect")
+          client.write(connectRequest(`minio:${upstream.port}`, token))
+          const [chunk] = (await once(client, "data")) as [Buffer]
+          client.destroy()
+          return Number(chunk.toString("latin1").split(" ")[1])
+        }
+      )
+      expect(status).toBe(200)
+    } finally {
+      upstream.server.close()
+    }
+  })
 })
 
 function connectRequest(authority: string, proxyToken: string) {

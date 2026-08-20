@@ -3,7 +3,7 @@ import { Effect, Layer } from "effect"
 import type { RowDataPacket } from "mysql2/promise"
 
 import { Database } from "@/effect/database"
-import { prepareBackupTaskEffect } from "@/lib/backup-reconciliation"
+import { prepareBackupTaskEffect } from "@/lib/backup-task-prepare"
 
 vi.mock("../../keyring.mjs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../keyring.mjs")>()
@@ -97,9 +97,32 @@ describe("restic backup dispatch", () => {
       repositoryPrefix: storedPrefix,
     })
   })
+
+  it("refuses incremental create dispatch to a disabled destination", async () => {
+    await expect(
+      Effect.runPromise(
+        prepareBackupTaskEffect({
+          artifactKind: "restic_snapshot",
+          artifacts: [{ artifactId, objectKey: null, storageId }],
+          backupId,
+          exclude: [],
+          kind: "create",
+          maxBytes: null,
+          mode: "incremental",
+          reason: "manual",
+          target: { id: "instance-one", kind: "instance" },
+          taskId,
+        }).pipe(
+          Effect.provide(resticDispatchDatabase({ enabled: false }))
+        )
+      )
+    ).rejects.toThrow("backup destination is unavailable")
+  })
 })
 
-function resticDispatchDatabase() {
+function resticDispatchDatabase(
+  overrides: { enabled?: boolean } = {}
+) {
   return Layer.succeed(Database)({
     execute: () => Effect.die("Unexpected database write"),
     queryRows: <TRow extends RowDataPacket>(operation: string) =>
@@ -114,7 +137,9 @@ function resticDispatchDatabase() {
           ] as unknown as ReadonlyArray<TRow>
         }
         if (operation === "backup_storage_credential") {
-          return [storageCredentialRow()] as unknown as ReadonlyArray<TRow>
+          return [
+            storageCredentialRow(overrides.enabled ?? true),
+          ] as unknown as ReadonlyArray<TRow>
         }
         throw new Error(`Unexpected query ${operation}`)
       }),
@@ -122,14 +147,14 @@ function resticDispatchDatabase() {
   })
 }
 
-function storageCredentialRow() {
+function storageCredentialRow(enabled = true) {
   return {
     access_key_id_ciphertext: "enc:AKIAEXAMPLE",
     allow_private_network: 1,
     bucket: "kiln-backups",
     created_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
     deleting: 0,
-    enabled: 1,
+    enabled: enabled ? 1 : 0,
     endpoint: "https://s3.example.com",
     force_path_style: 1,
     id: storageId,

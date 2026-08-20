@@ -764,6 +764,36 @@ describe("restic backup limits and exports", () => {
       })
     )
 
+    it.effect("cleans the restic cache after an incremental backup", () =>
+      Effect.gen(function* () {
+        let cleaned = 0
+        const config = testConfig(join(testDirectory, "cache-after-backup"))
+        yield* Effect.promise(() =>
+          mkdir(join(config.rootDirectory, "instance-1"), { recursive: true })
+        )
+        const manager = yield* BackupManager.make({
+          config,
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+          restic: mockRestic({
+            backup: async () => ({
+              snapshotId: "a1b2c3d4e5",
+              totalBytesProcessed: 10,
+            }),
+            cacheCleanup: async () => {
+              cleaned += 1
+            },
+          }),
+        })
+        const input = resticCreateInput("cache-after-backup", 100)
+        yield* manager.enqueue(input)
+        yield* manager.runPending()
+        const task = yield* manager.get(input.taskId)
+        assert.strictEqual(task?.status, "succeeded")
+        assert.strictEqual(cleaned, 1)
+      })
+    )
+
     it.effect("forgets a reused over-limit snapshot instead of succeeding", () =>
       Effect.gen(function* () {
         const forgotten: Array<string> = []

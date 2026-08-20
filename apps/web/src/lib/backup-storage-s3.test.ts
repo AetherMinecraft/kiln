@@ -151,6 +151,9 @@ describe("restic S3 prefixes", () => {
     ).toThrow("S3 could not delete 2 objects under this prefix")
     expect(() => failIfS3DeleteObjectsErrored({ Errors: [] })).not.toThrow()
     expect(() => failIfS3DeleteObjectsErrored({})).not.toThrow()
+    expect(() => failIfS3DeleteObjectsErrored({ Errors: [{}] })).toThrow(
+      "S3 could not delete an object under this prefix"
+    )
   })
 
   it("retries transient S3 failures except 4xx, 403, and 404", () => {

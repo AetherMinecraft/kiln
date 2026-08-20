@@ -241,8 +241,7 @@ export function failIfS3DeleteObjectsErrored(result: {
     Message?: string
   }>
 }): void {
-  const errors =
-    result.Errors?.filter((entry) => entry.Key || entry.Code) ?? []
+  const errors = result.Errors ?? []
   if (errors.length === 0) return
   const sample = errors[0]
   const detail = [sample?.Key, sample?.Code, sample?.Message]

@@ -18,10 +18,12 @@ import {
 
 const MAX_CONNECT_HEADER_BYTES = 8_192
 const AWS_SUFFIXES = [".amazonaws.com.cn", ".amazonaws.com"] as const
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
 
 export type ResticS3ProxyOptions = {
   allowPrivateNetwork: boolean
   allowedHosts: ReadonlySet<string>
+  connectTimeoutMs?: number
   endpointPort: number
   lookup?: LookupFunction
   token: string
@@ -195,20 +197,18 @@ function handleConnectClient(
         rejectConnect(client)
         return
       }
-      const address = yield* Effect.promise(() =>
-        resolveConnectAddress(target.hostname, options)
+      const addresses = yield* Effect.promise(() =>
+        resolveConnectAddresses(target.hostname, options)
       )
-      if (!address) {
+      if (addresses.length === 0) {
         rejectConnect(client)
         return
       }
-      const upstream = yield* Effect.tryPromise({
-        try: () => connectUpstream(address, target.port),
-        catch: (cause) =>
-          cause instanceof Error
-            ? cause
-            : new Error("Upstream CONNECT failed", { cause }),
-      })
+      const upstream = yield* connectFirstUpstream(
+        addresses,
+        target.port,
+        options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+      )
       client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
       client.pipe(upstream)
       upstream.pipe(client)
@@ -265,10 +265,10 @@ function rejectConnect(client: Socket): void {
   client.destroy()
 }
 
-function resolveConnectAddress(
+function resolveConnectAddresses(
   hostname: string,
   options: ResticS3ProxyOptions
-): Promise<string | null> {
+): Promise<Array<string>> {
   const lookup = options.lookup ??
     (options.allowPrivateNetwork ? dnsLookup : secureRemoteLookup)
   return new Promise((resolve) => {
@@ -282,32 +282,72 @@ function resolveConnectAddress(
               `Rejected restic S3 CONNECT to ${hostname}: ${error.message}`
             )
           }
-          resolve(null)
+          resolve([])
           return
         }
-        const selected = addresses.find((entry) => {
-          if (options.allowPrivateNetwork) return true
-          return isPublicRemoteAddress(entry.address)
+        const selected = addresses.flatMap((entry) => {
+          if (options.allowPrivateNetwork || isPublicRemoteAddress(entry.address)) {
+            return [entry.address]
+          }
+          return []
         })
-        if (!selected) {
+        if (selected.length === 0) {
           console.error(
             `Rejected restic S3 CONNECT to ${hostname}: private address`
           )
-          resolve(null)
-          return
         }
-        resolve(selected.address)
+        resolve(selected)
       }
     )
   })
 }
 
-function connectUpstream(address: string, port: number): Promise<Socket> {
+function connectFirstUpstream(
+  addresses: ReadonlyArray<string>,
+  port: number,
+  timeoutMs: number
+) {
+  return Effect.gen(function* () {
+    let lastError: Error | null = null
+    for (const address of addresses) {
+      const connected = yield* Effect.result(
+        Effect.tryPromise({
+          try: () => connectUpstream(address, port, timeoutMs),
+          catch: (cause) =>
+            cause instanceof Error
+              ? cause
+              : new Error("Upstream CONNECT failed", { cause }),
+        })
+      )
+      if (Result.isSuccess(connected)) return connected.success
+      lastError = connected.failure
+    }
+    return yield* Effect.fail(
+      lastError ?? new Error("Upstream CONNECT failed")
+    )
+  })
+}
+
+function connectUpstream(
+  address: string,
+  port: number,
+  timeoutMs: number
+): Promise<Socket> {
   return new Promise((resolve, reject) => {
     const socket = connect({ host: address, port })
-    socket.once("error", reject)
+    const timer = setTimeout(() => {
+      socket.destroy()
+      reject(new Error("Upstream CONNECT timed out"))
+    }, timeoutMs)
+    const fail = (cause: Error) => {
+      clearTimeout(timer)
+      socket.destroy()
+      reject(cause)
+    }
+    socket.once("error", fail)
     socket.once("connect", () => {
-      socket.off("error", reject)
+      clearTimeout(timer)
+      socket.off("error", fail)
       resolve(socket)
     })
   })
