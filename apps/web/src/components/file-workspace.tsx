@@ -721,6 +721,44 @@ type SaveFileRevision = (
   expectedModifiedAt: string | undefined
 ) => Promise<RelayFileContent>
 
+interface EditorSaveOptions {
+  canWrite: boolean
+  fileReadOnly: boolean
+  loading: boolean
+  saveFile: SaveFileRevision
+  sessionStore: EditorSessionStore
+}
+
+function canSaveEditor({
+  canWrite,
+  fileReadOnly,
+  loading,
+  sessionStore,
+}: EditorSaveOptions) {
+  return (
+    canWrite &&
+    !fileReadOnly &&
+    !loading &&
+    sessionStore.getDirtySnapshot() &&
+    !sessionStore.getDiskConflictSnapshot() &&
+    !sessionStore.getSavingSnapshot()
+  )
+}
+
+async function saveEditorChanges(options: EditorSaveOptions) {
+  if (!canSaveEditor(options)) return
+
+  const { saveFile, sessionStore } = options
+  sessionStore.setSaving(true)
+  sessionStore.setSaveError(null)
+  await runEditorSave(
+    () =>
+      saveFile(sessionStore.getValue(), sessionStore.getExpectedModifiedAt()),
+    sessionStore,
+    "Save failed"
+  )
+}
+
 function Editor({
   file,
   displayPath,
@@ -761,6 +799,35 @@ function Editor({
     onUploadFiles,
     ref: sectionRef,
   })
+
+  React.useEffect(() => {
+    const saveOptions = {
+      canWrite,
+      fileReadOnly: file.readOnly,
+      loading,
+      saveFile,
+      sessionStore,
+    }
+    function handleSaveShortcut(event: KeyboardEvent) {
+      if (
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.key.toLowerCase() !== "s" ||
+        (!event.ctrlKey && !event.metaKey) ||
+        event.altKey ||
+        event.shiftKey ||
+        !canSaveEditor(saveOptions)
+      ) {
+        return
+      }
+
+      event.preventDefault()
+      void saveEditorChanges(saveOptions)
+    }
+
+    window.addEventListener("keydown", handleSaveShortcut)
+    return () => window.removeEventListener("keydown", handleSaveShortcut)
+  }, [canWrite, file.readOnly, loading, saveFile, sessionStore])
 
   React.useLayoutEffect(() => {
     const section = sectionRef.current
@@ -1027,6 +1094,7 @@ function EditorResponsiveActions({
           sessionStore={sessionStore}
         />
         <EditorSaveButton
+          canWrite={canWrite}
           file={file}
           loading={loading}
           saveFile={saveFile}
@@ -1072,6 +1140,7 @@ function EditorResponsiveActions({
         path={file.path}
       />
       <EditorSaveButton
+        canWrite={canWrite}
         file={file}
         loading={loading}
         saveFile={saveFile}
@@ -2038,11 +2107,13 @@ function useFileSaveAction(
 }
 
 function EditorSaveButton({
+  canWrite,
   file,
   loading,
   saveFile,
   sessionStore,
 }: {
+  canWrite: boolean
   file: RelayFileContent
   loading: boolean
   saveFile: SaveFileRevision
@@ -2063,22 +2134,17 @@ function EditorSaveButton({
     sessionStore.getDiskConflictSnapshot,
     sessionStore.getDiskConflictSnapshot
   )
+  const canSave =
+    canWrite && !file.readOnly && !loading && dirty && !conflicted && !saving
 
-  async function handleSave() {
-    if (
-      sessionStore.getSavingSnapshot() ||
-      sessionStore.getDiskConflictSnapshot()
-    ) {
-      return
-    }
-    sessionStore.setSaving(true)
-    sessionStore.setSaveError(null)
-    await runEditorSave(
-      () =>
-        saveFile(sessionStore.getValue(), sessionStore.getExpectedModifiedAt()),
+  function handleSave() {
+    void saveEditorChanges({
+      canWrite,
+      fileReadOnly: file.readOnly,
+      loading,
+      saveFile,
       sessionStore,
-      "Save failed"
-    )
+    })
   }
 
   return (
@@ -2109,7 +2175,8 @@ function EditorSaveButton({
               ? "Save changes"
               : "Changes saved"
         }
-        disabled={!dirty || conflicted || saving || loading || file.readOnly}
+        aria-keyshortcuts="Control+S Meta+S"
+        disabled={!canSave}
         onClick={handleSave}
       >
         {file.readOnly ? (
