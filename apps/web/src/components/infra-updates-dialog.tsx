@@ -36,6 +36,7 @@ import { dismissToast, showToast } from "@workspace/ui/components/sonner"
 import type { PublicKilnRelease } from "@/effect/github-releases"
 import { useKilnGitRepository } from "@/lib/git-repository"
 import { queryKeys, updateOverviewQueryOptions } from "@/lib/query-options"
+import { replaceRelayUpdateVersion } from "@/lib/system-update-cache"
 import {
   compareLatestReleaseVersion,
   compareReleaseVersions,
@@ -347,7 +348,10 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       for (const failure of failures) {
         batch.current = recordSystemUpdateFailure(batch.current, failure)
       }
-      void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.updates,
+        refetchType: "none",
+      })
     },
     onSettled: () => {
       preparingUpdatesRef.current = []
@@ -392,7 +396,12 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
           message: `${completed.name}'s saved update operation could not be found. Check the target container before trying again.`,
           target: completed,
         })
-        void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
+        if (remainingActive.length === 0) {
+          void Promise.all([
+            queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
+            queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
+          ])
+        }
         return
       }
 
@@ -409,7 +418,12 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
             "The update failed. The previous container was restored.",
           target: completed,
         })
-        void queryClient.invalidateQueries({ queryKey: queryKeys.updates })
+        if (remainingActive.length === 0) {
+          void Promise.all([
+            queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
+            queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
+          ])
+        }
         return
       }
       const disposition = systemUpdateCompletionDisposition(
@@ -427,10 +441,28 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         completedVersion
       )
       setChangelogRevision((revision) => revision + 1)
-      void Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
-      ])
+      if (completed.component === "relay" && completed.relayId) {
+        queryClient.setQueryData<UpdateOverview>(
+          queryKeys.updates,
+          (overview) =>
+            overview
+              ? {
+                  ...overview,
+                  relays: replaceRelayUpdateVersion(
+                    overview.relays,
+                    completed.relayId,
+                    completedVersion
+                  ),
+                }
+              : overview
+        )
+      }
+      if (remainingActive.length === 0) {
+        void Promise.all([
+          queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
+          queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
+        ])
+      }
       if (lockUntilReload) {
         const completion = {
           version: completedVersion,
