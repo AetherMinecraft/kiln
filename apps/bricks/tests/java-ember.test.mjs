@@ -10,10 +10,16 @@ import {
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
-import { test } from "node:test"
+import { test as nodeTest } from "node:test"
 import { fileURLToPath } from "node:url"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
+// The Ember entrypoints are POSIX shell scripts run by the container runtime.
+// Windows has no interpreter for a shebang and no executable bit, so spawning
+// them there fails with EFTYPE rather than testing anything. The Relay's file
+// suite gates on platform for the same reason.
+const test = process.platform === "win32" ? nodeTest.skip : nodeTest
+
 
 const fakeJavaScript = `#!/usr/bin/env bash
 set -eu

@@ -18,7 +18,10 @@ RUN groupadd --gid 1000 kiln \
   && chown kiln:kiln /server
 
 COPY apps/bricks/embers/steamcmd/entrypoint.sh /usr/local/bin/kiln-ember-steamcmd
-RUN chmod 0755 /usr/local/bin/kiln-ember-steamcmd
+# Stripped for the same reason the Java Ember strips it: a checkout made with
+# core.autocrlf leaves a CR the shebang treats as part of the interpreter path.
+RUN sed -i 's/\r$//' /usr/local/bin/kiln-ember-steamcmd \
+  && chmod 0755 /usr/local/bin/kiln-ember-steamcmd
 
 ARG KILN_GIT_REPO=https://github.com/kiln-site/kiln
 LABEL org.opencontainers.image.source="${KILN_GIT_REPO}"

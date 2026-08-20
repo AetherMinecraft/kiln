@@ -10,7 +10,7 @@ services:
     environment:
       NODE_ENV: development
       KILN_BRICKS_CATALOG_URL: file:///workspace/apps/bricks/catalog.yml
-      KILN_RELAY_TLS_MODE: managed
+      KILN_RELAY_TLS_MODE: ${KILN_RELAY_TLS_MODE:-managed}
       KILN_RELAY_NAME: ${KILN_RELAY_NAME:-D001-localdev}
     command:
       - /bin/sh
