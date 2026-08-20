@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process"
 import { win32 as windowsPath } from "node:path"
 
+import { Result } from "effect"
+
 export const KILN_CREDENTIAL_SERVICE = "site.kiln.cli"
 
 export interface CredentialManager {
@@ -256,11 +258,11 @@ interface MacosKeychainResult {
 }
 
 function parseMacosKeychainResult(stdout: string): MacosKeychainResult {
-  try {
-    return JSON.parse(stdout) as MacosKeychainResult
-  } catch {
-    throw credentialCommandFailure("parse a macOS Keychain response")
-  }
+  return Result.try(() => JSON.parse(stdout) as MacosKeychainResult).pipe(
+    Result.getOrThrowWith(() =>
+      credentialCommandFailure("parse a macOS Keychain response")
+    )
+  )
 }
 
 function powershellCommand(script: string, input: string): CredentialCommand {
