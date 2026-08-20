@@ -4610,7 +4610,6 @@ export function FileWorkspace(props: FileWorkspaceProps) {
         .navigate({
           to: "/server/$serverId/files/$",
           params: { serverId: props.serverId, _splat: path },
-          replace: true,
           resetScroll: false,
         })
         .then(() => {
