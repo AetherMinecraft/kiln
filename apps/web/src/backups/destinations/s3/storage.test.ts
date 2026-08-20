@@ -7,12 +7,13 @@ import {
   deleteBackupStorageEffect,
   listBackupStorageEffect,
   setBackupPolicyStorageEffect,
-} from "@/effect/backup-storage"
+} from "@/backups/destinations/s3"
 import { BackupStorageError } from "@/effect/errors"
-import { deleteS3BackupPrefix } from "@/lib/backup-storage-s3"
+import { deleteS3BackupPrefix } from "./client"
 
-vi.mock("../../keyring.mjs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../keyring.mjs")>()
+vi.mock("../../../../keyring.mjs", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../../../keyring.mjs")>()
   return {
     ...actual,
     decryptWithKeyring: (encoded: string) => {
@@ -37,9 +38,8 @@ vi.mock("@/lib/environment", async (importOriginal) => {
   }
 })
 
-vi.mock("@/lib/backup-storage-s3", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("@/lib/backup-storage-s3")>()
+vi.mock("./client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./client")>()
   return {
     ...actual,
     deleteS3BackupPrefix: vi.fn(() => Effect.void),

@@ -1,5 +1,7 @@
 import { randomUUID, sign } from "node:crypto"
 
+import { Effect } from "effect"
+
 import { backupDownloadCapabilityPayloadSchema } from "@workspace/contracts"
 
 import type { BackupCatalogRecord } from "@/effect/backups"
@@ -42,4 +44,30 @@ export async function signLocalBackupDownload(
   )
   url.searchParams.set("token", `${encoded}.${signature}`)
   return { expiresAt: new Date(expiresAt).toISOString(), url: url.toString() }
+}
+
+export function prepareLocalBackupDownload(input: {
+  backup: Pick<BackupCatalogRecord, "id">
+  expiresInSeconds: number
+  filename: string
+  objectKey: string | null
+  relay: PersistedRelay
+  subject: string
+}) {
+  if (input.objectKey !== null) {
+    return Effect.fail(new Error("Local backup metadata is invalid"))
+  }
+  return Effect.tryPromise({
+    try: () =>
+      signLocalBackupDownload(
+        input.relay,
+        input.backup,
+        input.filename,
+        input.subject,
+        input.expiresInSeconds
+      ),
+    catch: (cause) => cause,
+  }).pipe(
+    Effect.map((download) => ({ download, sourceName: input.relay.name }))
+  )
 }

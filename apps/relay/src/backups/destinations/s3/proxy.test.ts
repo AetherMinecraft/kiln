@@ -8,7 +8,7 @@ import {
   parseResticS3ConnectTarget,
   resticS3ProxyAllowedHosts,
   withResticS3Proxy,
-} from "./restic-s3-proxy.js"
+} from "./proxy.js"
 
 const token = "proxy-token"
 

@@ -5,7 +5,6 @@ import {
   createWriteStream,
   type ReadStream,
 } from "node:fs"
-import { request as httpsRequest } from "node:https"
 import {
   lstat,
   mkdir,
@@ -20,8 +19,6 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { basename, dirname, relative, resolve, sep } from "node:path"
-import { isIP } from "node:net"
-import { Transform } from "node:stream"
 import { constants as zlibConstants } from "node:zlib"
 import { Effect, Fiber, Queue, Result } from "effect"
 import { minimatch } from "minimatch"
@@ -53,7 +50,11 @@ import { createEncryptedPlatformBackup } from "./platform-backups.js"
 import { RelayBackupError } from "./effect/errors.js"
 import { promiseEffect } from "./effect/promise.js"
 import { RelayStateStore } from "./effect/state.js"
-import { isPublicRemoteAddress, secureRemoteLookup } from "./source-policy.js"
+import {
+  backupArchivePath,
+  backupDestinationFor,
+  backupDirectoryPath,
+} from "./backups/destinations/index.js"
 import {
   installPreparedInstanceRestore,
   materializeBackupArtifact,
@@ -77,8 +78,6 @@ import {
 
 const MAX_BACKUP_ENTRIES = 100_000
 const ZIP_OVERHEAD_RESERVE_BYTES = 64 * 1024 * 1024
-const MAX_S3_SINGLE_PUT_BYTES = 5 * 1024 ** 3
-const BACKUP_TRANSFER_IDLE_TIMEOUT_MS = 30_000
 const BACKUP_TIMEOUT_REASON =
   "Cancelled after reaching the configured backup timeout"
 const EXPORT_SWEEP_INTERVAL = "1 hour"
@@ -964,14 +963,16 @@ export async function createPortableInstanceBackup(
   const backupDirectory = backupDirectoryPath(config)
   await mkdir(backupDirectory, { recursive: true, mode: 0o700 })
   const destination = backupArchivePath(config, input.backupId)
-  const maximumBytes = [input.destination, ...(input.replicas ?? [])].some(
-    (destination) => destination.kind === "s3"
-  )
-    ? Math.min(
-        input.maxBytes ?? MAX_S3_SINGLE_PUT_BYTES,
-        MAX_S3_SINGLE_PUT_BYTES
-      )
-    : input.maxBytes
+  const maximumBytes = [input.destination, ...(input.replicas ?? [])].reduce<
+    number | null
+  >((limit, destination) => {
+    if (destination.kind === "restic") return limit
+    const destinationLimit = backupDestinationFor(
+      destination.kind
+    ).maximumFullBackupBytes
+    if (destinationLimit === null) return limit
+    return Math.min(limit ?? destinationLimit, destinationLimit)
+  }, input.maxBytes)
   const patterns = [...DEFAULT_EXCLUDES, ...input.exclude]
   let warnings: Array<string> = []
 
@@ -1087,34 +1088,36 @@ export function storeCreatedBackup(
     let lastUploadedArtifactId: string | null = null
     for (const destination of destinations) {
       signal.throwIfAborted()
-      if (destination.kind !== "s3") {
-        if (destination.kind === "local") {
-          available += 1
-          if (destination.artifactId) {
-            outcomes.push({
-              artifactId: destination.artifactId,
-              error: null,
-              status: "available",
-            })
-          }
-        }
-        continue
-      }
+      if (destination.kind === "restic") continue
       progress.completed = 0
       progress.currentArtifactId = destination.artifactId ?? null
       const uploaded = yield* Effect.result(
-        uploadArtifact(
-          config,
-          { ...input, destination },
-          result,
-          signal,
-          (bytes) => {
-            progress.completed = Math.min(
-              progress.total,
-              progress.completed + bytes
+        destination.kind === "s3"
+          ? uploadArtifact(
+              config,
+              { ...input, destination },
+              result,
+              signal,
+              (bytes) => {
+                progress.completed = Math.min(
+                  progress.total,
+                  progress.completed + bytes
+                )
+              }
             )
-          }
-        )
+          : backupDestinationFor("local").saveFullBackup({
+              backupId: input.backupId,
+              config,
+              destination,
+              onChunk: (bytes) => {
+                progress.completed = Math.min(
+                  progress.total,
+                  progress.completed + bytes
+                )
+              },
+              result,
+              signal,
+            })
       )
       if (Result.isSuccess(uploaded)) {
         available += 1
@@ -1135,7 +1138,13 @@ export function storeCreatedBackup(
         })
       }
     }
-    if (!destinations.some((destination) => destination.kind === "local")) {
+    if (
+      !destinations.some(
+        (destination) =>
+          destination.kind !== "restic" &&
+          backupDestinationFor(destination.kind).retainsFullBackupLocally
+      )
+    ) {
       yield* promiseEffect(() =>
         rm(backupArchivePath(config, input.backupId), { force: true })
       ).pipe(Effect.ignore)
@@ -1159,39 +1168,18 @@ function uploadBackupArtifact(
   input: BackupCreateTaskInput & {
     destination: Extract<BackupCreateTaskInput["destination"], { kind: "s3" }>
   },
-  result: BackupCreateTaskResult,
+  result: BackupArchiveCreateTaskResult,
   signal: AbortSignal,
   onChunk: (bytes: number) => void
 ) {
-  if (result.bytes > MAX_S3_SINGLE_PUT_BYTES) {
-    return backupFailure(
-      "s3_single_put_too_large",
-      "create.upload",
-      "S3 backups cannot exceed 5 GiB until multipart upload support is enabled"
-    )
-  }
-  return Effect.tryPromise({
-    try: () =>
-      sendSignedBackupRequest({
-        allowPrivateNetwork: input.destination.allowPrivateNetwork,
-        bodyPath: backupArchivePath(config, input.backupId),
-        headers: {
-          ...input.destination.headers,
-          "content-length": String(result.bytes),
-        },
-        method: "PUT",
-        onBodyChunk: onChunk,
-        signal,
-        url: input.destination.uploadUrl,
-      }),
-    catch: (cause) =>
-      RelayBackupError.make({
-        code: "s3_upload_failed",
-        operation: "create.upload",
-        reason: "The backup archive could not be uploaded to S3 storage",
-        cause,
-      }),
-  }).pipe(Effect.as(result))
+  return backupDestinationFor("s3").saveFullBackup({
+    backupId: input.backupId,
+    config,
+    destination: input.destination,
+    onChunk,
+    result,
+    signal,
+  })
 }
 
 export function deleteBackupArtifacts(
@@ -1270,108 +1258,21 @@ function deleteBackupArtifact(
   config: RelayConfig,
   input: BackupDeleteTaskInput & { kind: "delete" }
 ) {
-  if (input.destination.kind === "local") {
-    return promiseEffect(() =>
-      rm(backupArchivePath(config, input.backupId), { force: true })
-    ).pipe(Effect.as({ warnings: [] }))
-  }
   if (input.destination.kind === "restic") {
     return Effect.succeed({ warnings: [] })
   }
   const destination = input.destination
-  return Effect.tryPromise({
-    try: () =>
-      sendSignedBackupRequest({
-        allowPrivateNetwork: destination.allowPrivateNetwork,
-        headers: destination.headers,
-        method: "DELETE",
-        url: destination.deleteUrl,
-      }),
-    catch: (cause) =>
-      RelayBackupError.make({
-        code: "s3_delete_failed",
-        operation: "delete.remote",
-        reason: "The backup archive could not be deleted from S3 storage",
-        cause,
-      }),
-  }).pipe(Effect.as({ warnings: [] }))
-}
-
-function sendSignedBackupRequest(input: {
-  allowPrivateNetwork: boolean
-  bodyPath?: string
-  headers: Readonly<Record<string, string>>
-  method: "DELETE" | "PUT"
-  onBodyChunk?: (bytes: number) => void
-  signal?: AbortSignal
-  url: string
-}): Promise<void> {
-  const url = new URL(input.url)
-  if (url.protocol !== "https:" || url.username || url.password) {
-    return Promise.reject(new Error("Signed backup URLs must use HTTPS"))
-  }
-  const literal = url.hostname.replace(/^\[|\]$/gu, "")
-  if (
-    !input.allowPrivateNetwork &&
-    isIP(literal) !== 0 &&
-    !isPublicRemoteAddress(literal)
-  ) {
-    return Promise.reject(
-      new Error("Signed backup URL resolves to a private or reserved address")
-    )
-  }
-  return new Promise((resolveRequest, rejectRequest) => {
-    const request = httpsRequest(
-      url,
-      {
-        headers: input.headers,
-        lookup: input.allowPrivateNetwork ? undefined : secureRemoteLookup,
-        method: input.method,
-        signal: input.signal,
-      },
-      (response) => {
-        let responseBytes = 0
-        response.on("data", (chunk: Buffer) => {
-          responseBytes += chunk.byteLength
-          if (responseBytes > 64 * 1024) {
-            response.destroy(new Error("S3 storage response was too large"))
-          }
-        })
-        response.once("aborted", () => {
-          rejectRequest(new Error("S3 storage closed the response early"))
-        })
-        response.once("end", () => {
-          const status = response.statusCode ?? 0
-          if (status >= 200 && status < 300) resolveRequest()
-          else rejectRequest(new Error(`S3 storage returned HTTP ${status}`))
-        })
-        response.once("error", rejectRequest)
-      }
-    )
-    request.setTimeout(BACKUP_TRANSFER_IDLE_TIMEOUT_MS, () => {
-      request.destroy(new Error("S3 backup request timed out"))
-    })
-    request.once("error", rejectRequest)
-    if (input.bodyPath) {
-      const body = createReadStream(input.bodyPath, { signal: input.signal })
-      body.once("error", (cause) => request.destroy(cause))
-      const onBodyChunk = input.onBodyChunk
-      if (!onBodyChunk) {
-        body.pipe(request)
-        return
-      }
-      const meter = new Transform({
-        transform(chunk: Buffer, _encoding, callback) {
-          onBodyChunk(chunk.byteLength)
-          callback(null, chunk)
-        },
+  return destination.kind === "local"
+    ? backupDestinationFor("local").deleteFullBackup({
+        backupId: input.backupId,
+        config,
+        destination,
       })
-      meter.once("error", (cause) => request.destroy(cause))
-      body.pipe(meter).pipe(request)
-    } else {
-      request.end()
-    }
-  })
+    : backupDestinationFor("s3").deleteFullBackup({
+        backupId: input.backupId,
+        config,
+        destination,
+      })
 }
 
 function backupExportDirectoryPath(config: RelayConfig): string {
@@ -2296,14 +2197,6 @@ async function writeExportExpiry(
   expiresAt: number
 ): Promise<void> {
   await writeFile(path, `${expiresAt}\n`, { mode: 0o600 })
-}
-
-function backupDirectoryPath(config: RelayConfig): string {
-  return resolve(config.dataDirectory, "backups")
-}
-
-function backupArchivePath(config: RelayConfig, backupId: string): string {
-  return resolve(backupDirectoryPath(config), `${backupId}.zip`)
 }
 
 async function cleanupBackupPartials(

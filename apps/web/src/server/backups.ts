@@ -28,10 +28,8 @@ import {
   type BackupCatalogRecord,
 } from "@/effect/backups"
 import { listManagedDatabaseRecordsEffect } from "@/effect/managed-databases"
-import {
-  loadBackupStorageCredentialEffect,
-  loadBackupStorageEffect,
-} from "@/effect/backup-storage"
+import { loadBackupStorageEffect } from "@/backups/destinations/s3"
+import { prepareBackupDestinationDownload } from "@/backups/destinations"
 import { runAppEffect } from "@/effect/runtime"
 import {
   hasPlatformPermission,
@@ -42,9 +40,8 @@ import {
 import { hasBackupPermission } from "@/lib/backup-access"
 import { scheduleBackupCopyProcessing } from "@/lib/backup-copy"
 import { selectBackupCopySource } from "@/lib/backup-copy-source"
-import { signLocalBackupDownload } from "@/lib/backup-download"
+import { signLocalBackupDownload } from "@/backups/destinations/local"
 import { relayRpc } from "@/lib/relay-connection"
-import { signS3BackupDownload } from "@/lib/backup-storage-s3"
 import { kilnInstallationId, kilnPublicUrl } from "@/lib/environment"
 import {
   dispatchBackupTask,
@@ -391,7 +388,10 @@ export const cancelBackup = createServerFn({ method: "POST" })
     if (!hasBackupPermission(user, grants, backup, "backup.create")) {
       throw new Error("You do not have permission to cancel this backup")
     }
-    const relay = await requireBackupRelay(backup.relayId)
+    const relay =
+      artifact.storageId === null
+        ? await requireBackupRelay(backup.relayId)
+        : null
     const task = relayBackupTaskSchema.parse(
       await relayRpc(
         relay,
@@ -550,39 +550,19 @@ export const getBackupDownloadUrl = createServerFn({ method: "POST" })
     }
     const filename = artifact.filename ?? backup.filename
     if (!filename) throw new Error("Backup filename is unavailable")
-    let download: { expiresAt: string; url: string }
-    let sourceName: string
-    if (!artifact.storageId) {
-      if (artifact.objectKey)
-        throw new Error("Local backup metadata is invalid")
-      const relay = await requireBackupRelay(backup.relayId)
-      download = await signLocalBackupDownload(
-        relay,
+    const relay = await requireBackupRelay(backup.relayId)
+    const { download, sourceName } = await runAppEffect(
+      "backups.prepareDownload",
+      prepareBackupDestinationDownload({
         backup,
+        expiresInSeconds: data.expiresInSeconds,
         filename,
-        user.id,
-        data.expiresInSeconds
-      )
-      sourceName = relay.name
-    } else {
-      if (!artifact.objectKey)
-        throw new Error("Backup object key is unavailable")
-      const storage = await runAppEffect(
-        "backups.loadDownloadStorage",
-        loadBackupStorageCredentialEffect(artifact.storageId)
-      )
-      if (!storage) throw new Error("Backup destination is unavailable")
-      download = await runAppEffect(
-        "backups.signDownload",
-        signS3BackupDownload(
-          storage,
-          artifact.objectKey,
-          filename,
-          data.expiresInSeconds
-        )
-      )
-      sourceName = storage.name
-    }
+        objectKey: artifact.objectKey,
+        relay,
+        storageId: artifact.storageId,
+        subject: user.id,
+      })
+    )
     if (!data.preview) return download
 
     const id = randomBytes(12).toString("base64url")
@@ -832,8 +812,7 @@ async function resticBackupDownload(input: {
   preview: boolean
   user: AuthenticatedUser
 }): Promise<
-  | { preparing: true; taskId: string }
-  | { expiresAt: string; url: string }
+  { preparing: true; taskId: string } | { expiresAt: string; url: string }
 > {
   const reserved = await runAppEffect(
     "backups.reserveExport",

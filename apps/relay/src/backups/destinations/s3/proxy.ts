@@ -5,7 +5,10 @@ import type { LookupFunction } from "node:net"
 
 import { Effect, Result } from "effect"
 
-import { isPublicRemoteAddress, secureRemoteLookup } from "./source-policy.js"
+import {
+  isPublicRemoteAddress,
+  secureRemoteLookup,
+} from "../../../source-policy.js"
 
 const MAX_CONNECT_HEADER_BYTES = 8_192
 const MAX_CONNECT_ADDRESSES = 8
