@@ -223,6 +223,7 @@ const AddServerForm = React.memo(function AddServerForm({
 
   return (
     <BrickCatalogBrowser
+      relayId={relayId}
       bricks={bricks}
       customBricks={customBricks}
       selection={selection}

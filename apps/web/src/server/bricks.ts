@@ -324,18 +324,16 @@ export const loadBrickRecipe = createServerFn({ method: "POST" })
   })
 
 export const saveCustomBrick = createServerFn({ method: "POST" })
-  .validator(brickSourceSchema)
-  .handler(async ({ data: source }) => {
+  .validator(recipeInputSchema)
+  .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
-    const relay = (await listPersistedRelays()).find(
-      (candidate) => candidate.enabled && canProvisionOnRelay(user, candidate)
-    )
-    if (!relay) throw new Error("Connect a Relay to save a custom Brick")
+    const relay = await requiredRelay(data.relayId)
+    requireRelayProvisionAccess(user, relay)
 
     const brick = brickSchema.parse(
       await requestRelay(
         relay,
-        `/v1/bricks/recipe?source=${encodeURIComponent(source)}`
+        `/v1/bricks/recipe?source=${encodeURIComponent(data.source)}`
       )
     )
     return runAppEffect(

@@ -435,6 +435,7 @@ const StartupForm = React.memo(function StartupForm({
           <StartupBrickSwapDialog
             open={swapOpen}
             onOpenChange={setSwapOpen}
+            relayId={relayId}
             bricks={catalogQuery.data?.bricks ?? emptyBricks}
             customBricks={catalogQuery.data?.customBricks ?? emptyBricks}
             loading={catalogQuery.isPending}
@@ -773,6 +774,7 @@ function bytesToGiBInput(bytes: number): string {
 const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
   open,
   onOpenChange,
+  relayId,
   bricks,
   customBricks,
   loading,
@@ -782,6 +784,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  relayId: string
   bricks: Array<Brick>
   customBricks: Array<Brick>
   loading: boolean
@@ -794,6 +797,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
       <BrickSelectDialog
         open={open}
         onOpenChange={onOpenChange}
+        relayId={relayId}
         bricks={[]}
         customBricks={customBricks}
         initial={null}
@@ -810,6 +814,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
       <BrickSelectDialog
         open={open}
         onOpenChange={onOpenChange}
+        relayId={relayId}
         bricks={[]}
         customBricks={customBricks}
         initial={null}
@@ -827,6 +832,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
     <BrickSelectDialog
       open={open}
       onOpenChange={onOpenChange}
+      relayId={relayId}
       bricks={bricks}
       customBricks={customBricks}
       initial={initial}

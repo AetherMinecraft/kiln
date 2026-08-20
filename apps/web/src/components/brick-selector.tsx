@@ -222,28 +222,15 @@ function filterAndSortBricks(
 
 function filterAndSortCustomBricks(
   bricks: Array<Brick>,
-  query: string,
-  sort: BrickSort
+  query: string
 ): Array<Brick> {
   const normalized = query.trim().toLowerCase()
-  const filtered = normalized
+  return normalized
     ? bricks.reduce<Array<Brick>>((matches, brick) => {
-        if (brickSearchText(brick).indexOf(normalized) >= 0) matches.push(brick)
+        if (brickSearchText(brick).includes(normalized)) matches.push(brick)
         return matches
       }, [])
     : [...bricks]
-
-  if (sort === "name-asc") {
-    return filtered.sort((a, b) =>
-      a.metadata.name.localeCompare(b.metadata.name)
-    )
-  }
-  if (sort === "name-desc") {
-    return filtered.sort((a, b) =>
-      b.metadata.name.localeCompare(a.metadata.name)
-    )
-  }
-  return filtered
 }
 
 const BrickTabSidebar = React.memo(function BrickTabSidebar({
@@ -307,11 +294,13 @@ const BrickTabSidebar = React.memo(function BrickTabSidebar({
 })
 
 function useSaveCustomBrick(
+  relayId: string,
   onSelectionChange: (selection: BrickSelection | null) => void
 ) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (source: string) => saveCustomBrick({ data: source }),
+    mutationFn: (source: string) =>
+      saveCustomBrick({ data: { relayId, source } }),
     onSuccess: async (brick) => {
       onSelectionChange({ kind: "catalog", brick })
       showToast({
@@ -333,6 +322,7 @@ function useSaveCustomBrick(
 }
 
 export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
+  relayId,
   bricks,
   customBricks = EMPTY_BRICKS,
   selection,
@@ -342,6 +332,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   configuration,
   emptyMessage = "No bricks match these filters.",
 }: {
+  relayId: string
   bricks: Array<Brick>
   customBricks?: Array<Brick>
   selection: BrickSelection | null
@@ -371,7 +362,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   const catalogBricks = bricks.length > 0 ? bricks : EMPTY_BRICKS
   const visibleBricks = React.useMemo(() => {
     if (tab === "custom") {
-      return filterAndSortCustomBricks(customBricks, query, sort)
+      return filterAndSortCustomBricks(customBricks, query)
     }
     return filterAndSortBricks(catalogBricks, {
       category: tab,
@@ -390,12 +381,13 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
     tab,
   ])
 
-  const saveMutation = useSaveCustomBrick(onSelectionChange)
+  const saveMutation = useSaveCustomBrick(relayId, onSelectionChange)
 
   const selectedCatalog = selection?.kind === "catalog" ? selection.brick : null
   const customOpen = tab === "custom"
   const selectTab = React.useCallback(
     (nextTab: BrickTabId) => {
+      if (nextTab === "custom" && tab === "custom") return
       setTab(nextTab)
       if (nextTab === "custom") {
         const next = customBricks[0]
@@ -429,6 +421,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
       selection,
       sort,
       sourceFilter,
+      tab,
     ]
   )
 
@@ -623,6 +616,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
         customBrickSources={customBrickSources}
         onSelectionChange={onSelectionChange}
         onSaveCustomBrick={(source) => saveMutation.mutate(source)}
+        saveCustomBrickDisabled={!relayId}
         savingCustomBrick={saveMutation.isPending}
         configuration={configuration}
       />
@@ -637,6 +631,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
   customBrickSources,
   onSelectionChange,
   onSaveCustomBrick,
+  saveCustomBrickDisabled,
   savingCustomBrick,
   configuration,
 }: {
@@ -646,6 +641,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
   customBrickSources: ReadonlySet<string>
   onSelectionChange: (selection: BrickSelection | null) => void
   onSaveCustomBrick: (source: string) => void
+  saveCustomBrickDisabled: boolean
   savingCustomBrick: boolean
   configuration?: React.ReactNode
 }) {
@@ -692,6 +688,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
             className="mt-3 w-full"
             disabled={
               disabled ||
+              saveCustomBrickDisabled ||
               savingCustomBrick ||
               selection.source.trim().length === 0
             }
@@ -839,6 +836,7 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
 export const BrickSelectDialog = React.memo(function BrickSelectDialog({
   open,
   onOpenChange,
+  relayId,
   bricks,
   customBricks = EMPTY_BRICKS,
   initial,
@@ -849,6 +847,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  relayId: string
   bricks: Array<Brick>
   customBricks?: Array<Brick>
   initial: BrickSelection | null
@@ -898,6 +897,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
         <DialogTitle className="sr-only">{title}</DialogTitle>
         <DialogDescription className="sr-only">{description}</DialogDescription>
         <BrickCatalogBrowser
+          relayId={relayId}
           bricks={bricks}
           customBricks={customBricks}
           selection={selection}
