@@ -46,12 +46,15 @@ Planning, transfer, and verification failures use distinct nonzero exit codes.
 Authentication and authorization retain the existing HTTP/SFTP failure codes
 and checks at both Hearth and Relay.
 
-`instance.files.list` takes an optional path and the Relay walks that subtree,
-rather than walking the instance root and having Hearth filter the result. The
-walk stops at a fixed entry ceiling, so a filtered whole-root listing returned
-nothing for the requested directory once anything ahead of it in the walk -
-typically worlds and rotated logs - reached that ceiling first. Listing a
-non-directory now fails instead of returning the single matching entry.
+`instance.files.list` takes an optional path and the Relay walks that subtree
+rather than walking the instance root. The walk stops at a fixed entry ceiling,
+so a listing filtered after the fact returned nothing for the requested
+directory once anything ahead of it in the walk - typically worlds and rotated
+logs - reached that ceiling first. Hearth still narrows the response by prefix,
+because a Relay older than this change ignores the path and answers with the
+whole instance; scoping is what raises the ceiling, and the filter is what keeps
+an unscoped answer from reaching the caller. Listing a non-directory now fails
+instead of returning the single matching entry.
 
 ## Phase 2 transactional activation
 

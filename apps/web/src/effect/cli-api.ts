@@ -988,7 +988,19 @@ export const getCliFileTreeEffect = Effect.fn("cli.api.files.list")(function* (
       : { instanceId: input.instanceId },
     principal
   )
-  return relayFileTreeSchema.parse(result)
+  const tree = relayFileTreeSchema.parse(result)
+  // Narrowed here as well, for a Relay that predates the scoped walk: it
+  // ignores the path and answers with the whole instance, and handing a caller
+  // who asked for one directory a truncated listing of every world region file
+  // is worse than the cap this scoping was meant to escape.
+  return path
+    ? {
+        ...tree,
+        paths: tree.paths.filter(
+          (entry) => entry === path || entry.startsWith(`${path}/`)
+        ),
+      }
+    : tree
 })
 
 export const readCliFileEffect = Effect.fn("cli.api.files.read")(function* (
