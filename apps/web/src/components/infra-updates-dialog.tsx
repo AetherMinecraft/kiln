@@ -62,10 +62,12 @@ import {
   applicationConnectionToastId,
   applicationReconnectedToastId,
   activeSystemUpdateStorageKey,
+  canRefetchSystemUpdateOverview,
   clearSystemUpdateActive,
   markSystemUpdateActive,
   relayDisconnectToastId,
   relayReconnectToastId,
+  setSystemUpdateOverviewRefetchBlocked,
 } from "@/lib/system-update-presence"
 import type { UpdateOverview } from "@/server/updates"
 import { getSystemUpdateStatus, startSystemUpdates } from "@/server/updates"
@@ -276,6 +278,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       return stored ? parseActiveUpdates(JSON.parse(stored) as unknown) : []
     })
     if (Result.isSuccess(restored) && restored.success.length > 0) {
+      setSystemUpdateOverviewRefetchBlocked(true)
+      void queryClient.cancelQueries({
+        exact: true,
+        queryKey: queryKeys.updates,
+      })
       for (const update of restored.success) {
         activityStore.setPhase(update.operationId, update.phase ?? "Preparing")
         registerUpdatePresence(update)
@@ -289,7 +296,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     } else {
       window.localStorage.removeItem(activeSystemUpdateStorageKey)
     }
-  }, [activityStore, replaceActive])
+  }, [activityStore, queryClient, replaceActive])
 
   const registerStartedUpdate = React.useCallback(
     (update: ActiveUpdate) => {
@@ -311,6 +318,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         registerStartedUpdate
       ),
     onMutate: async (update) => {
+      setSystemUpdateOverviewRefetchBlocked(true)
       await queryClient.cancelQueries({
         exact: true,
         queryKey: queryKeys.updates,
@@ -396,12 +404,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
           message: `${completed.name}'s saved update operation could not be found. Check the target container before trying again.`,
           target: completed,
         })
-        if (remainingActive.length === 0) {
-          void Promise.all([
-            queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
-            queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
-          ])
-        }
         return
       }
 
@@ -418,12 +420,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
             "The update failed. The previous container was restored.",
           target: completed,
         })
-        if (remainingActive.length === 0) {
-          void Promise.all([
-            queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
-            queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
-          ])
-        }
         return
       }
       const disposition = systemUpdateCompletionDisposition(
@@ -456,12 +452,6 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
                 }
               : overview
         )
-      }
-      if (remainingActive.length === 0) {
-        void Promise.all([
-          queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
-          queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
-        ])
       }
       if (lockUntilReload) {
         const completion = {
@@ -517,6 +507,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       UpdateFailure,
       HearthUpdateCompletion
     >()
+    setSystemUpdateOverviewRefetchBlocked(false)
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.updates }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.relays }),
+    ])
     const failures = completedBatch.failures
     const hearth = completedBatch.hearthCompletion
 
@@ -537,6 +532,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     githubIssuesUrl,
     onRetryTarget,
     open,
+    queryClient,
     updateMutation.isPending,
   ])
 
@@ -924,7 +920,8 @@ const UpdateDialogData = React.memo(function UpdateDialogData({
   )
   const overviewQuery = useQuery({
     ...updateOverviewQueryOptions(),
-    enabled: open && active.length === 0,
+    enabled: () =>
+      open && active.length === 0 && canRefetchSystemUpdateOverview(),
     notifyOnChangeProps: ["data", "error", "isError", "isPending"],
   })
   const overview = overviewQuery.data
@@ -1128,7 +1125,7 @@ const UpdaterCheckControl = React.memo(function UpdaterCheckControl({
   )
   const overviewQuery = useQuery({
     ...updateOverviewQueryOptions(),
-    enabled: open && !updating,
+    enabled: () => open && !updating && canRefetchSystemUpdateOverview(),
     notifyOnChangeProps: ["dataUpdatedAt", "isFetching"],
   })
   const [lastCheckedAt, setLastCheckedAt] = React.useState("Not yet")

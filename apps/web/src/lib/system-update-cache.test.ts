@@ -1,9 +1,15 @@
-import { describe, expect, it } from "vite-plus/test"
-import { QueryClient } from "@tanstack/react-query"
+import { afterEach, describe, expect, it } from "vite-plus/test"
+import { QueryClient, QueryObserver } from "@tanstack/react-query"
 
 import { replaceRelayUpdateVersion } from "./system-update-cache"
+import {
+  setSystemUpdateOverviewRefetchBlocked,
+  systemUpdateOverviewRefetchPolicy,
+} from "./system-update-presence"
 
 describe("system update cache", () => {
+  afterEach(() => setSystemUpdateOverviewRefetchBlocked(false))
+
   it("updates only the relay that completed", () => {
     const relays = [
       { currentVersion: "0.1.0", relayId: "relay-a" },
@@ -66,5 +72,54 @@ describe("system update cache", () => {
       ],
     })
     expect(queryClient.getQueryState(queryKey)?.isInvalidated).toBe(false)
+  })
+
+  it("blocks automatic overview refetches until the batch finishes", () => {
+    const queryClient = new QueryClient()
+    const queryKey = ["updates", "overview"] as const
+    queryClient.setQueryData(queryKey, { relays: [] })
+    const observer = new QueryObserver(queryClient, {
+      ...systemUpdateOverviewRefetchPolicy,
+      queryFn: async () => ({ relays: [] }),
+      queryKey,
+      staleTime: 0,
+    })
+
+    setSystemUpdateOverviewRefetchBlocked(true)
+    expect(systemUpdateOverviewRefetchPolicy.enabled()).toBe(false)
+    expect(observer.shouldFetchOnWindowFocus()).toBe(false)
+    expect(observer.shouldFetchOnReconnect()).toBe(false)
+    expect(systemUpdateOverviewRefetchPolicy.refetchOnMount()).toBe(false)
+
+    setSystemUpdateOverviewRefetchBlocked(false)
+    expect(systemUpdateOverviewRefetchPolicy.enabled()).toBe(true)
+    expect(observer.shouldFetchOnWindowFocus()).toBe(true)
+    expect(observer.shouldFetchOnReconnect()).toBe(true)
+    expect(systemUpdateOverviewRefetchPolicy.refetchOnMount()).toBe(true)
+    observer.destroy()
+  })
+
+  it("does not load an uncached overview while the batch is active", async () => {
+    const queryClient = new QueryClient()
+    const queryKey = ["updates", "overview"] as const
+    let requests = 0
+    setSystemUpdateOverviewRefetchBlocked(true)
+    const observer = new QueryObserver(queryClient, {
+      ...systemUpdateOverviewRefetchPolicy,
+      queryFn: async () => {
+        requests += 1
+        return { relays: [] }
+      },
+      queryKey,
+    })
+    const unsubscribe = observer.subscribe(() => undefined)
+
+    await Promise.resolve()
+    expect(requests).toBe(0)
+
+    setSystemUpdateOverviewRefetchBlocked(false)
+    await queryClient.invalidateQueries({ queryKey })
+    expect(requests).toBe(1)
+    unsubscribe()
   })
 })
