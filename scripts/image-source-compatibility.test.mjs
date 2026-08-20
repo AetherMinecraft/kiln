@@ -25,6 +25,14 @@ test("workflows publish images for the repository running them", async () => {
     reusableImage,
     /labels: \|\r?\n\s+\$\{\{ inputs\.source_label && format\('org\.opencontainers\.image\.source=\{0\}', inputs\.source_label\) \|\| '' \}\}/u
   )
+  assert.match(reusableImage, /image=\$\{INPUT_IMAGE,,\}/u)
+  assert.match(reusableImage, /ghcr\.io\/\$\{INPUT_OWNER,,\}/u)
+  assert.equal(
+    nightlyRelease.split(
+      'IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"'
+    ).length - 1,
+    3
+  )
   assert.equal(countDynamicSourceLabels(images), 1)
   assert.equal(countDynamicSourceLabels(embers), 2)
   assert.equal(countDynamicSourceLabels(nightlyRelease), 3)

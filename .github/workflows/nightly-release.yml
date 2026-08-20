@@ -169,10 +169,10 @@ jobs:
         id: manifests
         env:
           COMMIT_SHA: ${{ github.sha }}
-          IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           shopt -s nullglob
+          IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
 
           publish_manifest() {
             component="$1"
@@ -211,10 +211,10 @@ jobs:
         env:
           COMMIT_SHA: ${{ github.sha }}
           HEARTH_DIGEST: ${{ steps.manifests.outputs.hearth_digest }}
-          IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
           RELAY_DIGEST: ${{ steps.manifests.outputs.relay_digest }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
           jq -n \
             --arg version "$VERSION" \
             --arg commit "$COMMIT_SHA" \
@@ -278,10 +278,10 @@ jobs:
         if: steps.newest.outputs.advance == 'true'
         env:
           HEARTH_DIGEST: ${{ steps.manifests.outputs.hearth_digest }}
-          IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
           RELAY_DIGEST: ${{ steps.manifests.outputs.relay_digest }}
         run: |
           pids=()
+          IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
 
           docker buildx imagetools create \
             --tag "$IMAGE_PREFIX/hearth:latest-nightly" \
