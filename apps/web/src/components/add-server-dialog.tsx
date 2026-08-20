@@ -150,6 +150,7 @@ const AddServerDialog = React.memo(function AddServerDialog({
         ) : (
           <AddServerForm
             bricks={catalogQuery.data.bricks}
+            customBricks={catalogQuery.data.customBricks}
             relays={catalogQuery.data.relays}
             onClose={() => onOpenChange(false)}
           />
@@ -161,17 +162,22 @@ const AddServerDialog = React.memo(function AddServerDialog({
 
 const AddServerForm = React.memo(function AddServerForm({
   bricks,
+  customBricks,
   relays,
   onClose,
 }: {
   bricks: Array<Brick>
+  customBricks: Array<Brick>
   relays: Array<PersistedRelay>
   onClose: () => void
 }) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [selection, setSelection] = React.useState<BrickSelection | null>(() =>
-    bricks[0] ? { kind: "catalog", brick: bricks[0] } : null
+  const [selection, setSelection] = React.useState<BrickSelection | null>(
+    () => {
+      const brick = bricks[0] ?? customBricks[0]
+      return brick ? { kind: "catalog", brick } : null
+    }
   )
   const [relayId, setRelayId] = React.useState(() => relays[0]?.id ?? "")
 
@@ -217,7 +223,9 @@ const AddServerForm = React.memo(function AddServerForm({
 
   return (
     <BrickCatalogBrowser
+      relayId={relayId}
       bricks={bricks}
+      customBricks={customBricks}
       selection={selection}
       onSelectionChange={changeSelection}
       disabled={pending}
@@ -401,9 +409,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
     relayConnected &&
     Boolean(relayId) &&
     relayCompatible &&
-    Boolean(selection) &&
-    (selection?.kind === "catalog" ||
-      (selection?.kind === "custom" && selection.source.trim().length > 0)) &&
+    selection?.kind === "catalog" &&
     !pending
 
   return (

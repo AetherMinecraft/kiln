@@ -50,6 +50,16 @@ export function isHearthUpdateLocked<Failure, HearthCompletion>(
   return state.active && state.hearthCompletion !== null
 }
 
+export function canStartSystemUpdate({
+  hearthReloadRequired,
+  mutationPending,
+}: {
+  hearthReloadRequired: boolean
+  mutationPending: boolean
+}): boolean {
+  return !hearthReloadRequired && !mutationPending
+}
+
 export function systemUpdateCompletionDisposition(
   component: "hearth" | "relay",
   outcome: "failed" | "succeeded"

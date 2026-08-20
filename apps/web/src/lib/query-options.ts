@@ -25,6 +25,7 @@ import {
 } from "@/server/databases"
 import { getUiPreferences } from "@/server/preferences"
 import { reconcilePendingPowerSnapshot } from "@/lib/instance-power-state"
+import { systemUpdateOverviewRefetchPolicy } from "@/lib/system-update-presence"
 import {
   getRelayConnectionState,
   getRelayFile,
@@ -341,6 +342,7 @@ export function tailscaleStacksQueryOptions() {
 
 export function updateOverviewQueryOptions() {
   return queryOptions({
+    ...systemUpdateOverviewRefetchPolicy,
     queryKey: queryKeys.updates,
     queryFn: () => getUpdateOverview(),
     staleTime: 30_000,

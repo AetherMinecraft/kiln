@@ -68,8 +68,20 @@ selected with the positional URL or `--url`. Named profiles are available
 through `--profile`.
 
 `KILN_URL` and `KILN_TOKEN` can bypass the saved profile in CI or scripts.
-Saved profiles live under the platform config directory with owner-only file
-permissions.
+Interactive logins store credentials in macOS Keychain or Windows Credential
+Manager. The profile URL and credential reference remain in the owner-only Kiln
+config file. Existing plaintext profiles migrate automatically the next time the
+CLI needs their saved credential. Explicit token overrides bypass migration,
+and login or logout can replace or remove a legacy profile directly. If a
+native manager temporarily cannot store a legacy credential, the CLI uses the
+existing token for that command, leaves it pending, and retries on later use.
+
+When a supported system credential manager is unavailable, such as on a
+headless Linux host, the CLI falls back to storing the credential in the
+owner-only config file and prints a warning during login. If a manager exists
+but cannot store the credential, the warning identifies that failure instead.
+`kiln logout` revokes the active credential, removes its profile, and deletes
+its system credential.
 
 For non-interactive automation, set both variables without creating a local
 profile:
@@ -109,12 +121,16 @@ kiln files sync <relay-id>:<instance-id> ./server --atomic --json
 kiln files sync <relay-id>:<instance-id> ./server --atomic --delete-managed --manifest ./managed.json --max-delete 5
 kiln backups list --limit 200
 kiln backups create server <relay-id>:<instance-id> --name "Before update"
+kiln backups create server <relay-id>:<instance-id> --storage <destination-uuid>
 kiln backups create server <relay-id>:<instance-id> --mode full
 kiln backup download <backup-id>
 kiln server delete <relay-id>:<instance-id> --confirm <relay-id>:<instance-id>
 ```
 
 Disk quotas must be at least `0.1GiB`, matching the Relay allocation minimum.
+Server backups default to incremental restic snapshots and accept exactly one
+Relay-local or S3-compatible destination. Full archives can use multiple
+destinations.
 
 Uploads and downloads use the Relay SFTP endpoint and verify its advertised
 SSH host-key fingerprint. HTTPS upload sources are downloaded directly by the

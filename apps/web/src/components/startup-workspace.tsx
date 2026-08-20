@@ -376,7 +376,10 @@ const StartupForm = React.memo(function StartupForm({
     resolvedMemoryBytes(view.memoryTemplate, variables) ??
     initialLimits.memoryBytes
   const catalogBrick =
-    catalogQuery.data?.bricks.find((item) => item.source === view.source) ??
+    [
+      ...(catalogQuery.data?.bricks ?? emptyBricks),
+      ...(catalogQuery.data?.customBricks ?? emptyBricks),
+    ].find((item) => item.source === view.source) ??
     (initialBrick.source === view.source ? initialBrick : null)
   const swapInitial: BrickSelection | null = catalogBrick
     ? { kind: "catalog", brick: catalogBrick }
@@ -432,7 +435,9 @@ const StartupForm = React.memo(function StartupForm({
           <StartupBrickSwapDialog
             open={swapOpen}
             onOpenChange={setSwapOpen}
+            relayId={relayId}
             bricks={catalogQuery.data?.bricks ?? emptyBricks}
+            customBricks={catalogQuery.data?.customBricks ?? emptyBricks}
             loading={catalogQuery.isPending}
             error={catalogQuery.error?.message ?? null}
             initial={swapInitial}
@@ -769,7 +774,9 @@ function bytesToGiBInput(bytes: number): string {
 const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
   open,
   onOpenChange,
+  relayId,
   bricks,
+  customBricks,
   loading,
   error,
   initial,
@@ -777,7 +784,9 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  relayId: string
   bricks: Array<Brick>
+  customBricks: Array<Brick>
   loading: boolean
   error: string | null
   initial: BrickSelection | null
@@ -788,7 +797,9 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
       <BrickSelectDialog
         open={open}
         onOpenChange={onOpenChange}
+        relayId={relayId}
         bricks={[]}
+        customBricks={customBricks}
         initial={null}
         title="Swap Brick"
         description="Loading Brick catalog…"
@@ -798,12 +809,14 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
     )
   }
 
-  if (error || bricks.length === 0) {
+  if (error || (bricks.length === 0 && customBricks.length === 0)) {
     return (
       <BrickSelectDialog
         open={open}
         onOpenChange={onOpenChange}
+        relayId={relayId}
         bricks={[]}
+        customBricks={customBricks}
         initial={null}
         title="Swap Brick"
         description={
@@ -819,7 +832,9 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
     <BrickSelectDialog
       open={open}
       onOpenChange={onOpenChange}
+      relayId={relayId}
       bricks={bricks}
+      customBricks={customBricks}
       initial={initial}
       title="Swap Brick"
       description="Pick another catalog Brick or a custom recipe. Startup options save as you edit; apply to rebuild the container and start it."

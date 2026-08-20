@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test"
 
 import {
   beginSystemUpdateBatch,
+  canStartSystemUpdate,
   inactiveSystemUpdateBatch,
   isHearthUpdateLocked,
   recordHearthUpdateCompletion,
@@ -15,6 +16,27 @@ import {
 } from "./system-update-presence"
 
 describe("system update batch", () => {
+  it("rejects a confirmation after Hearth requires a reload", () => {
+    expect(
+      canStartSystemUpdate({
+        hearthReloadRequired: false,
+        mutationPending: false,
+      })
+    ).toBe(true)
+    expect(
+      canStartSystemUpdate({
+        hearthReloadRequired: true,
+        mutationPending: false,
+      })
+    ).toBe(false)
+    expect(
+      canStartSystemUpdate({
+        hearthReloadRequired: false,
+        mutationPending: true,
+      })
+    ).toBe(false)
+  })
+
   it("preserves mixed-batch completion when another start is attempted", () => {
     let batch = inactiveSystemUpdateBatch<string, { version: string }>()
     batch = beginSystemUpdateBatch(batch, "v0.2.0")
