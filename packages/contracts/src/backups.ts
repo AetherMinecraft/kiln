@@ -1,5 +1,7 @@
 import { z } from "zod"
 
+import { relayTailscaleSubdomainSchema } from "./tailscale.js"
+
 const backupHttpsUrlSchema = z
   .url()
   .max(8_192)
@@ -576,7 +578,7 @@ const backupArchiveServerConfigurationSchema = z
         tailscale: z
           .object({
             enabled: z.boolean(),
-            subdomain: z.string().min(1).max(63).optional(),
+            subdomain: relayTailscaleSubdomainSchema.optional(),
           })
           .strict(),
         variables: z.record(

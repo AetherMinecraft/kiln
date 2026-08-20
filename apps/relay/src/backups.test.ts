@@ -39,7 +39,7 @@ import {
   restorePortableInstanceBackup,
 } from "./backup-restore.js"
 import { loadConfig, type RelayInstanceConfig } from "./config.js"
-import { makeRelayStateLayer } from "./effect/state.js"
+import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
 
 const testDirectory = mkdtempSync(join(tmpdir(), "kiln-backups-"))
 
@@ -394,6 +394,50 @@ describe("Relay backups", () => {
         )
       })
     )
+
+    it.effect("includes persisted web routes in managed archives", () =>
+      Effect.gen(function* () {
+        const config = testConfig(join(testDirectory, "managed-manifest"))
+        const root = resolve(config.rootDirectory, "instance-1")
+        yield* Effect.promise(() => mkdir(root, { recursive: true }))
+        yield* Effect.promise(() =>
+          writeFile(resolve(root, "server.txt"), "data")
+        )
+        const state = yield* RelayStateStore
+        const route = {
+          hostname: "map.kiln.test",
+          id: "a11ce000",
+          name: "Map",
+          path: null,
+          stripPrefix: true,
+          targetPort: 8_123,
+        }
+        yield* state.replaceInstanceRoutes("instance-1", [route])
+        const manager = yield* BackupManager.make({
+          config,
+          findInstance: async () => testInstance(),
+          isInstanceStopped: async () => true,
+        })
+        const input = backupInput(13)
+        yield* manager.enqueue(input)
+        yield* manager.runPending()
+
+        assert.strictEqual(
+          (yield* manager.get(input.taskId))?.status,
+          "succeeded"
+        )
+        const manifest = yield* Effect.promise(() =>
+          readArchiveManifest(
+            resolve(config.dataDirectory, "backups", `${input.backupId}.zip`)
+          )
+        )
+        assert.strictEqual(manifest.formatVersion, 2)
+        if (manifest.formatVersion === 2) {
+          assert.deepStrictEqual(manifest.server.network.webRoutes, [route])
+        }
+        yield* state.replaceInstanceRoutes("instance-1", [])
+      })
+    )
   })
 
   it.effect("creates an atomic, checksummed archive with safe exclusions", () =>
@@ -629,9 +673,14 @@ describe("Relay backups", () => {
           yield* Effect.promise(() =>
             writeFile(resolve(root, "server.txt"), "old")
           )
+          const subdomain = `${"a".repeat(60)}.${"b".repeat(59)}`
+          const instance: RelayInstanceConfig = {
+            ...testInstance(),
+            tailscale: { enabled: true, subdomain },
+          }
           const input = backupInput(6)
           const created = yield* Effect.promise(() =>
-            createPortableInstanceBackup(config, input, testInstance(), {
+            createPortableInstanceBackup(config, input, instance, {
               completed: 0,
               currentArtifactId: null,
               currentPath: null,
@@ -657,7 +706,7 @@ describe("Relay backups", () => {
             taskId: "20000000-0000-4000-8000-000000000006",
           }
           const result = yield* Effect.promise(() =>
-            restorePortableInstanceBackup(config, restore, testInstance())
+            restorePortableInstanceBackup(config, restore, instance)
           )
           assert.deepStrictEqual(result.warnings, [])
           assert.strictEqual(
