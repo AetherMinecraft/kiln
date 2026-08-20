@@ -127,6 +127,28 @@ describe("backup storage deletion", () => {
     expect(vi.mocked(deleteS3BackupPrefix)).not.toHaveBeenCalled()
   })
 
+  it("refuses destinations used by an active final server deletion", async () => {
+    const queries: Array<string> = []
+    await expect(
+      Effect.runPromise(
+        deleteBackupStorageEffect(storageId).pipe(
+          Effect.provide(
+            storageDeleteDatabase({
+              deleting: false,
+              finalDeletion: true,
+              queries,
+              references: 0,
+            })
+          )
+        )
+      )
+    ).rejects.toThrow("being permanently deleted")
+    expect(
+      queries.find((sql) => sql.includes("backup_final_delete"))
+    ).toContain("FOR UPDATE")
+    expect(vi.mocked(deleteS3BackupPrefix)).not.toHaveBeenCalled()
+  })
+
   it("does not mark deleting when destination credentials cannot be decrypted", async () => {
     const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
     await expect(
@@ -295,6 +317,7 @@ describe("backup storage policy", () => {
 function storageDeleteDatabase(input: {
   ciphertext?: string
   deleting: boolean
+  finalDeletion?: boolean
   queries?: Array<string>
   references: number
   writes?: Array<{ sql: string; values?: ReadonlyArray<unknown> }>
@@ -326,6 +349,11 @@ function storageDeleteDatabase(input: {
         queryRows: <TRow extends RowDataPacket>(sql: string) =>
           Effect.sync(() => {
             queries.push(sql)
+            if (sql.includes("backup_final_delete")) {
+              return (input.finalDeletion
+                ? [{ backup_id: "final-backup" }]
+                : []) as unknown as ReadonlyArray<TRow>
+            }
             if (sql.includes("reference_count")) {
               return [
                 { reference_count: input.references },

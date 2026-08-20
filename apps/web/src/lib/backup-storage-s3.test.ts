@@ -119,10 +119,13 @@ describe("restic S3 prefixes", () => {
   it("pages through prefix deletes", async () => {
     const listed: Array<string | undefined> = []
     const deleted: Array<ReadonlyArray<string>> = []
+    let scans = 0
     await deleteS3PrefixObjectPages(
       async (token) => {
         listed.push(token)
         if (!token) {
+          scans += 1
+          if (scans > 1) return { keys: [] }
           return { keys: ["a", "b"], nextToken: "page-2" }
         }
         return { keys: ["c"] }
@@ -131,8 +134,25 @@ describe("restic S3 prefixes", () => {
         deleted.push(keys)
       }
     )
-    expect(listed).toEqual([undefined, "page-2"])
+    expect(listed).toEqual([undefined, "page-2", undefined])
     expect(deleted).toEqual([["a", "b"], ["c"]])
+  })
+
+  it("re-scans a prefix when objects appear after the final page", async () => {
+    const deleted: Array<ReadonlyArray<string>> = []
+    let scans = 0
+    await deleteS3PrefixObjectPages(
+      async () => {
+        scans += 1
+        if (scans === 1) return { keys: ["first"] }
+        if (scans === 2) return { keys: ["late"] }
+        return { keys: [] }
+      },
+      async (keys) => {
+        deleted.push(keys)
+      }
+    )
+    expect(deleted).toEqual([["first"], ["late"]])
   })
 
   it("fails prefix purge when S3 reports per-key delete errors", () => {

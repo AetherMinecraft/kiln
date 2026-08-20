@@ -10,12 +10,14 @@ import {
   canReuseBackupExport,
   clampBackupExportTtlMs,
   effectiveBackupLimit,
+  purgeInstanceBackupRepositoriesEffect,
   renameBackupEffect,
   reserveBackupCopyEffect,
   reserveInstanceBackupEffect,
   reconcileBackupTaskEffect,
   shouldApplyRelayBackupTaskSnapshot,
 } from "@/effect/backups"
+import { deleteS3BackupPrefix } from "@/lib/backup-storage-s3"
 
 vi.mock("../../keyring.mjs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../keyring.mjs")>()
@@ -36,6 +38,15 @@ vi.mock("@/lib/environment", async (importOriginal) => {
     ...actual,
     betterAuthSecrets: () => [{ version: 1, value: "x".repeat(32) }],
     kilnInstallationId: () => "kiln.dev",
+  }
+})
+
+vi.mock("@/lib/backup-storage-s3", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/backup-storage-s3")>()
+  return {
+    ...actual,
+    deleteS3BackupPrefix: vi.fn(() => Effect.void),
   }
 })
 
@@ -547,6 +558,57 @@ describe("backup limits", () => {
   })
 })
 
+describe("final deletion repository purge", () => {
+  it("purges remote data before deleting the incremental catalog", async () => {
+    vi.mocked(deleteS3BackupPrefix).mockClear()
+    vi.mocked(deleteS3BackupPrefix).mockReturnValue(Effect.void)
+    const writes: Array<string> = []
+    await Effect.runPromise(
+      purgeInstanceBackupRepositoriesEffect("relay-one", "instance-one").pipe(
+        Effect.provide(
+          finalDeletionPurgeDatabase({
+            transactionWrites: writes,
+          })
+        )
+      )
+    )
+
+    expect(vi.mocked(deleteS3BackupPrefix)).toHaveBeenCalledOnce()
+    expect(writes[0]).toContain("SET status = 'deleted'")
+    expect(writes[1]).toContain("artifact.status = 'deleted'")
+    expect(writes[2]).toContain("SET repository_id = NULL")
+    expect(writes[3]).toContain("DELETE FROM")
+    expect(writes[3]).toContain("backup_repository")
+  })
+
+  it("retains the incremental catalog when remote purge fails", async () => {
+    vi.mocked(deleteS3BackupPrefix).mockClear()
+    vi.mocked(deleteS3BackupPrefix).mockReturnValueOnce(
+      Effect.fail(
+        BackupStorageError.make({
+          code: "s3_request_failed",
+          operation: "storage.deletePrefix",
+          reason: "purge failed",
+        })
+      )
+    )
+    const writes: Array<string> = []
+
+    await expect(
+      Effect.runPromise(
+        purgeInstanceBackupRepositoriesEffect("relay-one", "instance-one").pipe(
+          Effect.provide(
+            finalDeletionPurgeDatabase({
+              transactionWrites: writes,
+            })
+          )
+        )
+      )
+    ).rejects.toThrow("purge failed")
+    expect(writes).toEqual([])
+  })
+})
+
 describe("backup reconciliation", () => {
   it("does not resurrect a deleted backup from its historical create task", async () => {
     const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
@@ -856,6 +918,58 @@ describe("backup reconciliation", () => {
     ).toBe(false)
   })
 })
+
+function finalDeletionPurgeDatabase(input: {
+  transactionWrites: Array<string>
+}) {
+  return Layer.succeed(Database)({
+    execute: () => Effect.die("Unexpected standalone database write"),
+    queryRows: <TRow extends RowDataPacket>(operation: string) =>
+      Effect.sync(() => {
+        if (operation === "backup_instance_repositories") {
+          return [
+            {
+              id: "repository-one",
+              object_prefix: "team/restic/instance-one/repository-one",
+              storage_id: "storage-one",
+            },
+          ] as unknown as ReadonlyArray<TRow>
+        }
+        if (operation === "backup_storage_credential") {
+          return [
+            {
+              access_key_id_ciphertext: "enc:AKIAEXAMPLE",
+              allow_private_network: 1,
+              bucket: "kiln-backups",
+              created_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
+              deleting: 0,
+              enabled: 1,
+              endpoint: "https://s3.example.com",
+              force_path_style: 1,
+              id: "storage-one",
+              last_error: null,
+              last_verified_at_ms: null,
+              name: "s3",
+              object_prefix: "team",
+              owner_user_id: null,
+              region: "us-east-1",
+              secret_access_key_ciphertext: "enc:s3-secret",
+            },
+          ] as unknown as ReadonlyArray<TRow>
+        }
+        throw new Error(`Unexpected query ${operation}`)
+      }),
+    transaction: (_operation, run) =>
+      run({
+        execute: (sql) =>
+          Effect.sync(() => {
+            input.transactionWrites.push(sql)
+            return emptyResult
+          }),
+        queryRows: () => Effect.die("Unexpected transaction query"),
+      }),
+  })
+}
 
 describe("backup rename", () => {
   it("updates the backup name", async () => {

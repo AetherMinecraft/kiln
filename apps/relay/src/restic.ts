@@ -696,7 +696,11 @@ async function spawnResticOnce(
   const onAbort = () => {
     child.kill("SIGTERM")
   }
-  input.signal.addEventListener("abort", onAbort, { once: true })
+  if (input.signal.aborted) {
+    onAbort()
+  } else {
+    input.signal.addEventListener("abort", onAbort, { once: true })
+  }
   const completed = await resultOf(async () => {
     const [exitCode] = await Promise.all([
       waitForExit,

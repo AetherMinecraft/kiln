@@ -24,6 +24,17 @@ import {
 import { RelayBackupError } from "./effect/errors.js"
 
 const testDirectory = mkdtempSync(join(tmpdir(), "kiln-restic-"))
+const s3Location: ResticDriverLocation = {
+  accessKeyId: "AKIAEXAMPLE",
+  allowPrivateNetwork: true,
+  bucket: "kiln-backups",
+  endpoint: "https://s3.example.com",
+  forcePathStyle: true,
+  kind: "s3",
+  region: "us-east-1",
+  repositoryPrefix: "team/kiln/relay/restic/instance/srv/repo",
+  secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+}
 
 afterAll(() => {
   rmSync(testDirectory, { force: true, recursive: true })
@@ -156,6 +167,42 @@ describe("restic driver", () => {
     assert.isTrue(thrown)
     assert.strictEqual(killed, "SIGTERM")
   })
+
+  it("kills restic when abort wins the spawn-to-listener race", async () => {
+    const abort = new AbortController()
+    let killed: string | undefined
+    const spawn: ResticSpawn = () => {
+      abort.abort()
+      const stdout = new PassThrough()
+      const stderr = new PassThrough()
+      const child = new EventEmitter() as ReturnType<ResticSpawn>
+      child.stdout = stdout
+      child.stderr = stderr
+      child.stdin = new PassThrough()
+      child.kill = (signal) => {
+        killed = String(signal ?? "SIGTERM")
+        queueMicrotask(() => {
+          stdout.end()
+          stderr.end()
+          child.emit("close", 1)
+        })
+        return true
+      }
+      return child
+    }
+    const driver = createResticDriver({ spawn })
+
+    await rejects(
+      driver.catConfig({
+        location: s3Location,
+        password: "secret",
+        signal: abort.signal,
+      }),
+      RelayBackupError
+    )
+    assert.strictEqual(killed, "SIGTERM")
+  })
+
   it("reuses a snapshot tagged with the task id", async () => {
     const spawn = fakeResticSpawn([
       {
@@ -281,18 +328,6 @@ describe("restic path layout", () => {
 })
 
 describe("restic S3 driver", () => {
-  const s3Location: ResticDriverLocation = {
-    accessKeyId: "AKIAEXAMPLE",
-    allowPrivateNetwork: true,
-    bucket: "kiln-backups",
-    endpoint: "https://s3.example.com",
-    forcePathStyle: true,
-    kind: "s3",
-    region: "us-east-1",
-    repositoryPrefix: "team/kiln/relay/restic/instance/srv/repo",
-    secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-  }
-
   it("builds an s3 repository URL from the stored prefix", () => {
     assert.strictEqual(
       resticRepositoryString(s3Location),

@@ -11,6 +11,17 @@ const MAX_CONNECT_HEADER_BYTES = 8_192
 const MAX_CONNECT_ADDRESSES = 8
 const AWS_SUFFIXES = [".amazonaws.com.cn", ".amazonaws.com"] as const
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
+const PROXY_CLOSE_TIMEOUT_MS = 2_000
+
+type ResticS3Proxy = {
+  server: Server
+  state: ResticS3ProxyState
+}
+
+type ResticS3ProxyState = {
+  closing: boolean
+  sockets: Set<Socket>
+}
 
 export type ResticS3ProxyOptions = {
   allowPrivateNetwork: boolean
@@ -115,21 +126,22 @@ export function withResticS3Proxy<T>(
   return Effect.runPromise(
     Effect.acquireUseRelease(
       listenResticS3Proxy(options),
-      (server) =>
+      (proxy) =>
         Effect.tryPromise({
-          try: () => use(resticS3ProxyUrl(server, options.token)),
+          try: () => use(resticS3ProxyUrl(proxy.server, options.token)),
           catch: (cause) =>
             cause instanceof Error
               ? cause
               : new Error("The restic S3 proxy failed", { cause }),
         }),
-      (server) =>
-        Effect.promise(
-          () =>
-            new Promise<void>((resolve) => {
-              server.close(() => resolve())
-            })
-        )
+      (proxy) =>
+        Effect.tryPromise({
+          try: () => closeResticS3Proxy(proxy),
+          catch: (cause) =>
+            cause instanceof Error
+              ? cause
+              : new Error("The restic S3 proxy could not close", { cause }),
+        })
     )
   )
 }
@@ -137,14 +149,24 @@ export function withResticS3Proxy<T>(
 function listenResticS3Proxy(options: ResticS3ProxyOptions) {
   return Effect.tryPromise({
     try: () =>
-      new Promise<Server>((resolve, reject) => {
+      new Promise<ResticS3Proxy>((resolve, reject) => {
+        const state: ResticS3ProxyState = {
+          closing: false,
+          sockets: new Set<Socket>(),
+        }
         const server = createServer((client) => {
-          void handleConnectClient(client, options)
+          if (state.closing) {
+            client.destroy()
+            return
+          }
+          state.sockets.add(client)
+          client.once("close", () => state.sockets.delete(client))
+          void handleConnectClient(client, options, state)
         })
         server.once("error", reject)
         server.listen(0, "127.0.0.1", () => {
           server.off("error", reject)
-          resolve(server)
+          resolve({ server, state })
         })
       }),
     catch: (cause) =>
@@ -164,7 +186,8 @@ function resticS3ProxyUrl(server: Server, token: string): string {
 
 function handleConnectClient(
   client: Socket,
-  options: ResticS3ProxyOptions
+  options: ResticS3ProxyOptions,
+  state: ResticS3ProxyState
 ): Promise<void> {
   return Effect.runPromise(
     Effect.gen(function* () {
@@ -200,6 +223,10 @@ function handleConnectClient(
         target.port,
         timeoutMs
       )
+      if (state.closing || client.destroyed) {
+        upstream.destroy()
+        return
+      }
       client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
       client.pipe(upstream)
       upstream.pipe(client)
@@ -219,6 +246,26 @@ function handleConnectClient(
       )
     )
   )
+}
+
+function closeResticS3Proxy(proxy: ResticS3Proxy): Promise<void> {
+  proxy.state.closing = true
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (error) reject(error)
+      else resolve()
+    }
+    const timer = setTimeout(() => {
+      for (const socket of proxy.state.sockets) socket.destroy()
+      finish(new Error("The restic S3 proxy timed out while closing"))
+    }, PROXY_CLOSE_TIMEOUT_MS)
+    proxy.server.close((error) => finish(error))
+    for (const socket of proxy.state.sockets) socket.destroy()
+  })
 }
 
 function readHttpHead(client: Socket, timeoutMs: number): Promise<string> {

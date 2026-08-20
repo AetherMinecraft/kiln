@@ -366,6 +366,27 @@ export const deleteBackupStorageEffect = Effect.fn("backupStorage.delete")(
               FOR UPDATE`,
             [storageId]
           )
+          const finalDeletions = yield* transaction.queryRows<RowDataPacket>(
+            `SELECT final_delete.backup_id
+                 FROM ${databaseTable("backup_final_delete")} final_delete
+                 JOIN ${databaseTable("backup_repository")} repository
+                   ON repository.relay_id = final_delete.relay_id
+                  AND repository.target_kind = 'instance'
+                  AND repository.target_id = final_delete.target_id
+                WHERE repository.storage_id = ?
+                  AND final_delete.status IN ('backing_up', 'deleting')
+                LIMIT 1
+                FOR UPDATE`,
+            [storageId]
+          )
+          if (finalDeletions[0]?.backup_id) {
+            return yield* BackupStorageError.make({
+              code: "storage_in_use",
+              operation: "storage.delete",
+              reason:
+                "A server using this destination is being permanently deleted",
+            })
+          }
           const rows = yield* transaction.queryRows<BackupStorageRow>(
             `${backupStorageSelect}
               WHERE id = ?

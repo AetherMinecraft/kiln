@@ -162,6 +162,42 @@ describe("restic S3 CONNECT proxy", () => {
     )
     expect(client?.destroyed).toBe(true)
   })
+
+  it("closes an established tunnel when the proxy scope ends", async () => {
+    const upstream = await holdingServer()
+    let client: Socket | undefined
+    try {
+      await withResticS3Proxy(
+        {
+          allowPrivateNetwork: true,
+          allowedHosts: new Set(["minio"]),
+          connectTimeoutMs: 250,
+          endpointPort: upstream.port,
+          lookup: (_hostname, _options, callback) => {
+            callback(null, [{ address: "127.0.0.1", family: 4 }])
+          },
+          token,
+        },
+        async (proxyUrl) => {
+          const parsed = new URL(proxyUrl)
+          client = connect({
+            host: parsed.hostname,
+            port: Number(parsed.port),
+          })
+          client.on("error", () => {})
+          await once(client, "connect")
+          client.write(connectRequest(`minio:${upstream.port}`, token))
+          const [chunk] = (await once(client, "data")) as [Buffer]
+          expect(Number(chunk.toString("latin1").split(" ")[1])).toBe(200)
+        }
+      )
+      if (client && !client.destroyed) await once(client, "close")
+      expect(client?.destroyed).toBe(true)
+    } finally {
+      upstream.server.close()
+      for (const socket of upstream.sockets) socket.destroy()
+    }
+  })
 })
 
 function connectRequest(authority: string, proxyToken: string) {
@@ -231,4 +267,29 @@ async function listeningServer(): Promise<{
     throw new Error("upstream test server did not bind")
   }
   return { port: address.port, server }
+}
+
+async function holdingServer(): Promise<{
+  port: number
+  server: ReturnType<typeof createServer>
+  sockets: Set<Socket>
+}> {
+  const sockets = new Set<Socket>()
+  const server = createServer((socket: Socket) => {
+    sockets.add(socket)
+    socket.once("close", () => sockets.delete(socket))
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject)
+      resolve()
+    })
+  })
+  const address = server.address()
+  if (!address || typeof address === "string") {
+    server.close()
+    throw new Error("upstream test server did not bind")
+  }
+  return { port: address.port, server, sockets }
 }

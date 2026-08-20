@@ -1728,32 +1728,6 @@ export const loadBackupRepositoryPasswordEffect = Effect.fn(
   } satisfies BackupRepositorySecret
 })
 
-export const markIncrementalInstanceBackupsDeletedEffect = Effect.fn(
-  "backups.markIncrementalDeleted"
-)(function* (relayId: string, targetId: string) {
-  const database = yield* Database
-  yield* database.execute(
-    "backup_mark_incremental_deleted",
-    `UPDATE ${databaseTable("backup")}
-        SET status = 'deleted',
-            completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP(3))
-      WHERE relay_id = ? AND target_kind = 'instance' AND target_id = ?
-        AND backup_mode = 'incremental' AND status <> 'deleted'`,
-    [relayId, targetId]
-  )
-  yield* database.execute(
-    "backup_mark_incremental_artifacts_deleted",
-    `UPDATE ${databaseTable("backup_artifact")} artifact
-       JOIN ${databaseTable("backup")} backup ON backup.id = artifact.backup_id
-        SET artifact.status = 'deleted',
-            artifact.deleted_at = COALESCE(artifact.deleted_at, CURRENT_TIMESTAMP(3))
-      WHERE backup.relay_id = ? AND backup.target_kind = 'instance'
-        AND backup.target_id = ? AND backup.backup_mode = 'incremental'
-        AND artifact.status <> 'deleted'`,
-    [relayId, targetId]
-  )
-})
-
 export const purgeInstanceBackupRepositoriesEffect = Effect.fn(
   "backups.purgeInstanceRepositories"
 )(function* (relayId: string, targetId: string) {
@@ -1789,6 +1763,24 @@ export const purgeInstanceBackupRepositoriesEffect = Effect.fn(
     "backup_purge_instance_repositories",
     (transaction) =>
       Effect.gen(function* () {
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("backup")}
+              SET status = 'deleted',
+                  completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP(3))
+            WHERE relay_id = ? AND target_kind = 'instance' AND target_id = ?
+              AND backup_mode = 'incremental' AND status <> 'deleted'`,
+          [relayId, targetId]
+        )
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("backup_artifact")} artifact
+             JOIN ${databaseTable("backup")} backup ON backup.id = artifact.backup_id
+              SET artifact.status = 'deleted',
+                  artifact.deleted_at = COALESCE(artifact.deleted_at, CURRENT_TIMESTAMP(3))
+            WHERE backup.relay_id = ? AND backup.target_kind = 'instance'
+              AND backup.target_id = ? AND backup.backup_mode = 'incremental'
+              AND artifact.status <> 'deleted'`,
+          [relayId, targetId]
+        )
         yield* transaction.execute(
           `UPDATE ${databaseTable("backup")}
             SET repository_id = NULL

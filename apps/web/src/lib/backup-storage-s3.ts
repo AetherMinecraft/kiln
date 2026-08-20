@@ -231,12 +231,19 @@ export async function deleteS3PrefixObjectPages(
   }>,
   deleteKeys: (keys: ReadonlyArray<string>) => Promise<void>
 ): Promise<void> {
-  let token: string | undefined
-  do {
-    const page = await listPage(token)
-    if (page.keys.length > 0) await deleteKeys(page.keys)
-    token = page.nextToken
-  } while (token)
+  while (true) {
+    let deleted = 0
+    let token: string | undefined
+    do {
+      const page = await listPage(token)
+      if (page.keys.length > 0) {
+        await deleteKeys(page.keys)
+        deleted += page.keys.length
+      }
+      token = page.nextToken
+    } while (token)
+    if (deleted === 0) return
+  }
 }
 
 export function failIfS3DeleteObjectsErrored(result: {
