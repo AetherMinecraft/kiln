@@ -24,7 +24,7 @@ jobs:
       matrix:
         include:
           - name: Hearth
-            image: ghcr.io/kiln-site/hearth
+            image: ghcr.io/${{ github.repository_owner }}/hearth
             dockerfile: apps/web/Dockerfile
             cache_scope: hearth
             build_args: |
@@ -34,7 +34,7 @@ jobs:
               VITE_SENTRY_REPLAYS_SESSION_SAMPLE_RATE=${{ vars.VITE_SENTRY_REPLAYS_SESSION_SAMPLE_RATE || '0.05' }}
               VITE_SENTRY_TRACES_SAMPLE_RATE=${{ vars.VITE_SENTRY_TRACES_SAMPLE_RATE || '0.05' }}
           - name: Relay
-            image: ghcr.io/kiln-site/relay
+            image: ghcr.io/${{ github.repository_owner }}/relay
             dockerfile: apps/relay/Dockerfile
             cache_scope: relay
             build_args: |
@@ -47,6 +47,6 @@ jobs:
       dockerfile: ${{ matrix.dockerfile }}
       cache_scope: ${{ matrix.cache_scope }}
       build_args: ${{ matrix.build_args }}
-      source_label: https://github.com/kiln-site/hearth
+      source_label: ${{ github.server_url }}/${{ github.repository }}
       tags: |
         type=sha,prefix=sha-

@@ -133,7 +133,7 @@ jobs:
             ${{ inputs.nightly_version && format('KILN_VERSION={0}', steps.nightly.outputs.version) || '' }}
           platforms: linux/${{ matrix.architecture }}
           outputs: type=local,dest=/tmp/sentry-source-maps
-          cache-from: type=registry,ref=ghcr.io/kiln-site/${{ inputs.cache_scope }}-build-cache:${{ matrix.architecture }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.cache_scope }}-build-cache:${{ matrix.architecture }}
           provenance: false
           sbom: false
 
@@ -153,8 +153,8 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           # PRs refresh the shared dependency cache. Main only imports it so
           # publishing is not delayed by a remote cache export.
-          cache-from: type=registry,ref=ghcr.io/kiln-site/${{ inputs.cache_scope }}-build-cache:${{ matrix.architecture }}
-          cache-to: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && format('type=registry,ref=ghcr.io/kiln-site/{0}-build-cache:{1},mode=max,oci-mediatypes=true,image-manifest=true,compression=zstd', inputs.cache_scope, matrix.architecture) || '' }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.cache_scope }}-build-cache:${{ matrix.architecture }}
+          cache-to: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && format('type=registry,ref=ghcr.io/{0}/{1}-build-cache:{2},mode=max,oci-mediatypes=true,image-manifest=true,compression=zstd', github.repository_owner, inputs.cache_scope, matrix.architecture) || '' }}
           provenance: ${{ github.event_name != 'pull_request' && inputs.publish_provenance || 'false' }}
           sbom: ${{ github.event_name != 'pull_request' && inputs.publish_sbom }}
 

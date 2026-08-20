@@ -4,16 +4,18 @@ import test from "node:test"
 
 const legacySource = "https://github.com/kiln-site/hearth"
 
-test("published Hearth and Relay images retain the legacy source label", async () => {
+test("workflows publish images for the repository running them", async () => {
   const [
     reusableImage,
     images,
+    embers,
     nightlyRelease,
     hearthDockerfile,
     relayDockerfile,
   ] = await Promise.all([
     readFile(".github/workflows/reusable-image.yml", "utf8"),
     readFile(".github/workflows/images.yml", "utf8"),
+    readFile(".github/workflows/embers.yml", "utf8"),
     readFile(".github/workflows/nightly-release.yml", "utf8"),
     readFile("apps/web/Dockerfile", "utf8"),
     readFile("apps/relay/Dockerfile", "utf8"),
@@ -21,24 +23,23 @@ test("published Hearth and Relay images retain the legacy source label", async (
 
   assert.match(
     reusableImage,
-    /labels: \|\n\s+\$\{\{ inputs\.source_label && format\('org\.opencontainers\.image\.source=\{0\}', inputs\.source_label\) \|\| '' \}\}/u
+    /labels: \|\r?\n\s+\$\{\{ inputs\.source_label && format\('org\.opencontainers\.image\.source=\{0\}', inputs\.source_label\) \|\| '' \}\}/u
   )
-  assert.equal(countSourcePins(images), 1)
-  assert.equal(countSourcePins(nightlyRelease), 3)
+  assert.equal(countDynamicSourceLabels(images), 1)
+  assert.equal(countDynamicSourceLabels(embers), 2)
+  assert.equal(countDynamicSourceLabels(nightlyRelease), 3)
   assert.doesNotMatch(
-    images,
-    /source_label: https:\/\/github\.com\/kiln-site\/kiln/u
-  )
-  assert.doesNotMatch(
-    nightlyRelease,
-    /source_label: https:\/\/github\.com\/kiln-site\/kiln/u
+    [reusableImage, images, embers, nightlyRelease].join("\n"),
+    /ghcr\.io\/kiln-site/u
   )
   assert.match(hearthDockerfile, dockerfileSourceLabel())
   assert.match(relayDockerfile, dockerfileSourceLabel())
 })
 
-function countSourcePins(workflow) {
-  return workflow.split(`source_label: ${legacySource}`).length - 1
+function countDynamicSourceLabels(workflow) {
+  return workflow.split(
+    "source_label: ${{ github.server_url }}/${{ github.repository }}"
+  ).length - 1
 }
 
 function dockerfileSourceLabel() {
