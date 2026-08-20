@@ -6,6 +6,7 @@ import { Database } from "@/effect/database"
 import {
   deleteBackupStorageEffect,
   listBackupStorageEffect,
+  setBackupPolicyStorageEffect,
 } from "@/effect/backup-storage"
 import { BackupStorageError } from "@/effect/errors"
 import { deleteS3BackupPrefix } from "@/lib/backup-storage-s3"
@@ -37,7 +38,8 @@ vi.mock("@/lib/environment", async (importOriginal) => {
 })
 
 vi.mock("@/lib/backup-storage-s3", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/backup-storage-s3")>()
+  const actual =
+    await importOriginal<typeof import("@/lib/backup-storage-s3")>()
   return {
     ...actual,
     deleteS3BackupPrefix: vi.fn(() => Effect.void),
@@ -140,7 +142,9 @@ describe("backup storage deletion", () => {
           )
         )
       )
-    ).rejects.toThrow("Credential operation decrypt_backup_storage_credential failed")
+    ).rejects.toThrow(
+      "Credential operation decrypt_backup_storage_credential failed"
+    )
     expect(
       writes.some((write) => write.sql.includes("SET deleting = TRUE"))
     ).toBe(false)
@@ -206,7 +210,11 @@ describe("backup storage deletion", () => {
     ).toBe(true)
     expect(writes.some((write) => write.sql.includes("last_error"))).toBe(true)
     expect(
-      writes.some((write) => write.sql.includes("DELETE FROM") && write.sql.includes("backup_storage"))
+      writes.some(
+        (write) =>
+          write.sql.includes("DELETE FROM") &&
+          write.sql.includes("backup_storage")
+      )
     ).toBe(false)
   })
 
@@ -245,6 +253,42 @@ describe("backup storage deletion", () => {
           write.sql.includes("backup_storage")
       )
     ).toBe(true)
+  })
+})
+
+describe("backup storage policy", () => {
+  it("locks the policy before rejecting a deleting destination", async () => {
+    const queries: Array<string> = []
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: () => Effect.succeed(emptyResult),
+          queryRows: <TRow extends RowDataPacket>(sql: string) =>
+            Effect.sync(() => {
+              queries.push(sql)
+              return (sql.includes("backup_storage")
+                ? [{ deleting: 1, enabled: 1 }]
+                : []) as unknown as ReadonlyArray<TRow>
+            }),
+        }),
+    })
+
+    await expect(
+      Effect.runPromise(
+        setBackupPolicyStorageEffect({
+          relayId: "relay-one",
+          storageId,
+          targetId: "instance-one",
+          targetKind: "instance",
+        }).pipe(Effect.provide(databaseLayer))
+      )
+    ).rejects.toThrow("unavailable")
+    expect(queries[0]).toContain("backup_policy")
+    expect(queries[0]).toContain("FOR UPDATE")
+    expect(queries[1]).toContain("backup_storage")
+    expect(queries[1]).toContain("FOR UPDATE")
   })
 })
 

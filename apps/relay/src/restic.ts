@@ -29,7 +29,12 @@ const MAX_STAGING_ENTRIES = 100_000
 const MAX_SKIPPED_ENTRY_WARNINGS = 25
 const MAX_UNLIMITED_RESTORE_BYTES = 1024 ** 4
 const RESTIC_TERMINATE_TIMEOUT_MS = 5_000
-const RESTIC_ENV_ALLOWLIST = ["HOME", "PATH", "RESTIC_CACERT", "TMPDIR"] as const
+const RESTIC_ENV_ALLOWLIST = [
+  "HOME",
+  "PATH",
+  "RESTIC_CACERT",
+  "TMPDIR",
+] as const
 const RESTIC_EXIT_REPOSITORY_MISSING = 10
 const RESTIC_EXIT_WRONG_PASSWORD = 12
 
@@ -197,7 +202,9 @@ export function resticDriverLocation(
       reason: "The restic S3 region is invalid",
     })
   }
-  if (!resticRepositoryPrefixSchema.safeParse(location.repositoryPrefix).success) {
+  if (
+    !resticRepositoryPrefixSchema.safeParse(location.repositoryPrefix).success
+  ) {
     throw RelayBackupError.make({
       code: "invalid_restic_repository",
       operation: "restic.repository",
@@ -237,9 +244,7 @@ export function translateExcludePatterns(
     const trimmed = rawPattern.trim()
     if (!trimmed || trimmed.startsWith("#")) continue
     if (trimmed.startsWith("!")) {
-      warnings.push(
-        `Skipped unsupported restic exclude negation: ${trimmed}`
-      )
+      warnings.push(`Skipped unsupported restic exclude negation: ${trimmed}`)
       continue
     }
     if (isUnsupportedExcludePattern(trimmed)) {
@@ -266,7 +271,9 @@ export function parseResticJsonLine(line: string): unknown {
   )
 }
 
-export function progressFromResticStatus(value: unknown): ResticProgress | null {
+export function progressFromResticStatus(
+  value: unknown
+): ResticProgress | null {
   if (!isRecord(value) || value.message_type !== "status") return null
   const bytesDone = integerField(value, "bytes_done")
   const totalBytes = integerField(value, "total_bytes")
@@ -277,7 +284,9 @@ export function progressFromResticStatus(value: unknown): ResticProgress | null 
   }
 }
 
-export function summaryFromResticJson(value: unknown): ResticSnapshotSummary | null {
+export function summaryFromResticJson(
+  value: unknown
+): ResticSnapshotSummary | null {
   if (!isRecord(value) || value.message_type !== "summary") return null
   const snapshotId = stringField(value, "snapshot_id")
   const totalBytesProcessed = integerField(value, "total_bytes_processed")
@@ -366,13 +375,11 @@ export function createResticDriver(options?: {
     },
     cacheCleanup: async (input) => {
       if (input.location.kind !== "s3") return
-      await resultOf(() =>
-        run(["cache", "--cleanup"], {
-          location: input.location,
-          password: input.password,
-          signal: input.signal,
-        })
-      )
+      await run(["cache", "--cleanup"], {
+        location: input.location,
+        password: input.password,
+        signal: input.signal,
+      })
     },
     catConfig: async (input) => {
       const result = await resultOf(() =>
@@ -492,15 +499,12 @@ export function createResticDriver(options?: {
       )
     },
     snapshotsByTag: async (input) => {
-      const result = await run(
-        ["snapshots", "--json", "--tag", input.tag],
-        {
-          location: input.location,
-          password: input.password,
-          retryable: true,
-          signal: input.signal,
-        }
-      )
+      const result = await run(["snapshots", "--json", "--tag", input.tag], {
+        location: input.location,
+        password: input.password,
+        retryable: true,
+        signal: input.signal,
+      })
       const parsed = parseResticJsonLine(result.stdoutText)
       if (!Array.isArray(parsed)) return []
       return parsed.flatMap((entry) => {
@@ -519,7 +523,9 @@ export function createResticDriver(options?: {
         }
       )
       const parsed = parseResticJsonLine(result.stdoutText)
-      const totalSize = isRecord(parsed) ? integerField(parsed, "total_size") : null
+      const totalSize = isRecord(parsed)
+        ? integerField(parsed, "total_size")
+        : null
       if (totalSize === null) {
         throw resticError(
           "restic_stats_missing",
@@ -584,9 +590,7 @@ export async function validateStagingTree(
   }
   await visit(root)
   if (skipped > warnings.length) {
-    warnings.push(
-      `Skipped ${skipped - warnings.length} more non-regular files`
-    )
+    warnings.push(`Skipped ${skipped - warnings.length} more non-regular files`)
   }
   const maximumBytes =
     limits.diskBytes > 0 ? limits.diskBytes : MAX_UNLIMITED_RESTORE_BYTES
@@ -657,11 +661,15 @@ async function spawnResticOnce(
     await mkdir(input.cacheDirectory, { recursive: true, mode: 0o700 })
   }
   const env = resticSpawnEnv(input)
-  const child = spawnRestic(binary, [...resticGlobalArgs(input.location), ...args], {
-    cwd: input.cwd,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-  })
+  const child = spawnRestic(
+    binary,
+    [...resticGlobalArgs(input.location), ...args],
+    {
+      cwd: input.cwd,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  )
   if (!child.stdout || !child.stderr) {
     throw resticError(
       "restic_stdio_missing",
@@ -720,11 +728,19 @@ async function spawnResticOnce(
       throw resticError(
         "restic_command_failed",
         args[0] ?? "restic",
-        redactResticStderr(stderr.trim() || `restic exited with code ${exitCode}`, input),
+        redactResticStderr(
+          stderr.trim() || `restic exited with code ${exitCode}`,
+          input
+        ),
         exitCode
       )
     }
-    return { exitCode, stderr: redactResticStderr(stderr, input), stdout, stdoutText }
+    return {
+      exitCode,
+      stderr: redactResticStderr(stderr, input),
+      stdout,
+      stdoutText,
+    }
   })
   input.signal.removeEventListener("abort", onAbort)
   if (Result.isFailure(completed)) {
@@ -902,7 +918,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function stringField(value: Record<string, unknown>, key: string): string | null {
+function stringField(
+  value: Record<string, unknown>,
+  key: string
+): string | null {
   const field = value[key]
   return typeof field === "string" && field.length > 0 ? field : null
 }
@@ -917,9 +936,15 @@ function integerField(
     : null
 }
 
-function appendBounded(current: string, next: string, max = MAX_JSON_LINE_BYTES) {
+function appendBounded(
+  current: string,
+  next: string,
+  max = MAX_JSON_LINE_BYTES
+) {
   const combined = current + next
-  return combined.length > max ? combined.slice(combined.length - max) : combined
+  return combined.length > max
+    ? combined.slice(combined.length - max)
+    : combined
 }
 
 function requireContained(root: string, candidate: string, operation: string) {

@@ -23,10 +23,19 @@ import {
 import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
 import { Database } from "@/effect/database"
 import type { DatabaseTransaction } from "@/effect/database"
-import { BackupLimitError, BackupStorageError, CredentialError } from "@/effect/errors"
+import {
+  BackupLimitError,
+  BackupStorageError,
+  CredentialError,
+} from "@/effect/errors"
 import { databaseTable } from "@/lib/database-config"
 import { betterAuthSecrets, kilnInstallationId } from "@/lib/environment"
-import { backupObjectKey, deleteS3BackupPrefix, isSafeResticObjectPrefix, resticRepositoryObjectPrefix } from "@/lib/backup-storage-s3"
+import {
+  backupObjectKey,
+  deleteS3BackupPrefix,
+  isSafeResticObjectPrefix,
+  resticRepositoryObjectPrefix,
+} from "@/lib/backup-storage-s3"
 import { loadBackupStorageCredentialEffect } from "@/effect/backup-storage"
 
 const RESTIC_REPOSITORY_PASSWORD_PURPOSE = "kiln-restic-repository-password"
@@ -90,7 +99,11 @@ interface BackupUsageRow extends RowDataPacket {
 }
 
 interface BackupRow extends RowDataPacket {
-  artifact_kind: "archive" | "database_dump" | "platform_bundle" | "restic_snapshot"
+  artifact_kind:
+    | "archive"
+    | "database_dump"
+    | "platform_bundle"
+    | "restic_snapshot"
   backup_mode: "full" | "incremental"
   bytes: number | string | null
   checksum_sha256: string | null
@@ -376,6 +389,13 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
                 "Wait for the active restore before deleting this resource",
             })
           }
+        } else {
+          yield* refuseIfFinalDeletionInProgress(transaction, {
+            operation: "backup.reserve",
+            relayId: input.relayId,
+            targetId: input.targetId,
+            targetKind: input.targetKind,
+          })
         }
         const mode =
           input.reason === "pre_restore" ||
@@ -387,9 +407,7 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
           mode === "incremental" ? "restic_snapshot" : input.artifactKind
         const requestedStorageIds = deduplicateStorageIds(
           input.storageIds ?? [
-            input.storageId === undefined
-              ? policy.storage_id
-              : input.storageId,
+            input.storageId === undefined ? policy.storage_id : input.storageId,
           ]
         )
         if (mode === "incremental" && requestedStorageIds.length !== 1) {
@@ -419,7 +437,7 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
           if (
             storageId &&
             (!storage ||
-              !Boolean(storage.enabled) ||
+              !storage.enabled ||
               Boolean(storage.deleting) ||
               (storage.owner_user_id !== null &&
                 storage.owner_user_id !== input.createdBy))
@@ -431,9 +449,8 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
             })
           }
           if (mode === "incremental" && storage) {
-            const incrementalLocationError = incrementalStorageLocationError(
-              storage
-            )
+            const incrementalLocationError =
+              incrementalStorageLocationError(storage)
             if (incrementalLocationError) {
               return yield* BackupStorageError.make({
                 code: "storage_unavailable",
@@ -623,9 +640,7 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
           maxBytes: reservation.maxBytes,
           mode,
           reason: input.reason ?? "manual",
-          ...(repositoryPassword
-            ? { repositoryPassword }
-            : {}),
+          ...(repositoryPassword ? { repositoryPassword } : {}),
           target: { id: input.targetId, kind: input.targetKind },
           taskId: input.taskId,
         } satisfies BackupCreateDispatch
@@ -1458,6 +1473,12 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
             reason: "Only complete or failed backups can be deleted",
           })
         }
+        yield* refuseIfFinalDeletionInProgress(transaction, {
+          operation: "backup.delete",
+          relayId: backup.relay_id,
+          targetId: backup.target_id,
+          targetKind: backup.target_kind,
+        })
         yield* transaction.execute(
           `UPDATE ${databaseTable("backup")}
               SET status = 'deleting'
@@ -1472,16 +1493,14 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
         )
         const createTask = backup.restic_snapshot_id
           ? null
-          : (
-              yield* transaction.queryRows<{ id: string } & RowDataPacket>(
-                `SELECT id
+          : (yield* transaction.queryRows<{ id: string } & RowDataPacket>(
+              `SELECT id
                    FROM ${databaseTable("backup_task")}
                   WHERE backup_id = ? AND task_kind = 'create'
                   ORDER BY created_at ASC, id ASC
                   LIMIT 1`,
-                [input.backupId]
-              )
-            )[0]
+              [input.backupId]
+            ))[0]
         return {
           artifacts: (yield* transaction.queryRows<BackupArtifactRow>(
             `SELECT artifact.id, artifact.backup_id, artifact.storage_id,
@@ -1551,6 +1570,12 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
             reason: "Only available incremental snapshots can be exported",
           })
         }
+        yield* refuseIfFinalDeletionInProgress(transaction, {
+          operation: "backup.export",
+          relayId: backup.relay_id,
+          targetId: backup.target_id,
+          targetKind: backup.target_kind,
+        })
         const filename = backupArtifactFilename(backup.id, "restic_snapshot")
         const existing = yield* transaction.queryRows<
           {
@@ -1617,7 +1642,10 @@ export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
             } satisfies BackupExportReservation
           }
         }
-        if (latest && (latest.status === "queued" || latest.status === "running")) {
+        if (
+          latest &&
+          (latest.status === "queued" || latest.status === "running")
+        ) {
           return {
             dispatch: {
               ...dispatchFor(latest.id),
@@ -1757,21 +1785,23 @@ export const purgeInstanceBackupRepositoriesEffect = Effect.fn(
     }
     yield* deleteS3BackupPrefix(credential, repository.object_prefix)
   }
-  yield* database.transaction("backup_purge_instance_repositories", (transaction) =>
-    Effect.gen(function* () {
-      yield* transaction.execute(
-        `UPDATE ${databaseTable("backup")}
+  yield* database.transaction(
+    "backup_purge_instance_repositories",
+    (transaction) =>
+      Effect.gen(function* () {
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("backup")}
             SET repository_id = NULL
           WHERE relay_id = ? AND target_kind = 'instance' AND target_id = ?
             AND status = 'deleted'`,
-        [relayId, targetId]
-      )
-      yield* transaction.execute(
-        `DELETE FROM ${databaseTable("backup_repository")}
+          [relayId, targetId]
+        )
+        yield* transaction.execute(
+          `DELETE FROM ${databaseTable("backup_repository")}
           WHERE relay_id = ? AND target_kind = 'instance' AND target_id = ?`,
-        [relayId, targetId]
-      )
-    })
+          [relayId, targetId]
+        )
+      })
   )
 })
 
@@ -1790,6 +1820,12 @@ export const reserveBackupCopyEffect = Effect.fn("backups.reserveCopy")(
     const database = yield* Database
     return yield* database.transaction("backup_copy_reserve", (transaction) =>
       Effect.gen(function* () {
+        yield* refuseIfFinalDeletionInProgress(transaction, {
+          operation: "backup.copy",
+          relayId: input.relayId,
+          targetId: input.targetId,
+          targetKind: input.targetKind,
+        })
         const source = (yield* transaction.queryRows<
           { id: string } & RowDataPacket
         >(
@@ -2510,7 +2546,7 @@ function requiredTimestampIso(
   return timestamp
 }
 
-function loadOrCreateBackupRepository(
+const loadOrCreateBackupRepository = Effect.fnUntraced(function* (
   transaction: DatabaseTransaction,
   input: {
     destinationObjectPrefix: string
@@ -2520,87 +2556,115 @@ function loadOrCreateBackupRepository(
     targetKind: string
   }
 ) {
-  return Effect.gen(function* () {
-    const storageKey = input.storageId ?? "local"
-    const existing = yield* transaction.queryRows<
-      {
-        id: string
-        object_prefix: string | null
-        password_ciphertext: string
-        storage_id: string | null
-      } & RowDataPacket
-    >(
-      `SELECT id, password_ciphertext, storage_id, object_prefix
+  const storageKey = input.storageId ?? "local"
+  const existing = yield* transaction.queryRows<
+    {
+      id: string
+      object_prefix: string | null
+      password_ciphertext: string
+      storage_id: string | null
+    } & RowDataPacket
+  >(
+    `SELECT id, password_ciphertext, storage_id, object_prefix
          FROM ${databaseTable("backup_repository")}
         WHERE relay_id = ? AND target_kind = ? AND target_id = ?
           AND storage_key = ?
         FOR UPDATE`,
-      [input.relayId, input.targetKind, input.targetId, storageKey]
+    [input.relayId, input.targetKind, input.targetId, storageKey]
+  )
+  if (existing[0]) {
+    const decrypted = yield* decryptRepositoryPassword(
+      existing[0].password_ciphertext
     )
-    if (existing[0]) {
-      const decrypted = yield* decryptRepositoryPassword(
-        existing[0].password_ciphertext
-      )
-      return {
-        id: existing[0].id,
-        objectPrefix: existing[0].object_prefix,
-        password: decrypted,
-        storageId: existing[0].storage_id,
-      }
+    return {
+      id: existing[0].id,
+      objectPrefix: existing[0].object_prefix,
+      password: decrypted,
+      storageId: existing[0].storage_id,
     }
-    const password = randomBytes(32).toString("base64url")
-    const id = randomUUID()
-    const ciphertext = yield* encryptRepositoryPassword(password)
-    const objectPrefix = input.storageId
-      ? resticRepositoryObjectPrefix({
-          installationId: kilnInstallationId(),
-          objectPrefix: input.destinationObjectPrefix,
-          relayId: input.relayId,
-          repositoryId: id,
-          targetId: input.targetId,
-        })
-      : null
-    yield* transaction.execute(
-      `INSERT INTO ${databaseTable("backup_repository")}
+  }
+  const password = randomBytes(32).toString("base64url")
+  const id = randomUUID()
+  const ciphertext = yield* encryptRepositoryPassword(password)
+  const objectPrefix = input.storageId
+    ? resticRepositoryObjectPrefix({
+        installationId: kilnInstallationId(),
+        objectPrefix: input.destinationObjectPrefix,
+        relayId: input.relayId,
+        repositoryId: id,
+        targetId: input.targetId,
+      })
+    : null
+  yield* transaction.execute(
+    `INSERT INTO ${databaseTable("backup_repository")}
         (id, relay_id, target_kind, target_id, storage_id, storage_key,
          object_prefix, password_ciphertext)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        input.relayId,
-        input.targetKind,
-        input.targetId,
-        input.storageId,
-        storageKey,
-        objectPrefix,
-        ciphertext,
-      ]
-    )
-    return { id, objectPrefix, password, storageId: input.storageId }
-  })
-}
+    [
+      id,
+      input.relayId,
+      input.targetKind,
+      input.targetId,
+      input.storageId,
+      storageKey,
+      objectPrefix,
+      ciphertext,
+    ]
+  )
+  return { id, objectPrefix, password, storageId: input.storageId }
+})
 
-function lockBackupStorageRows(
+const lockBackupStorageRows = Effect.fnUntraced(function* (
   transaction: DatabaseTransaction,
   storageIds: ReadonlyArray<string>
 ) {
-  return Effect.gen(function* () {
-    const ids = [...new Set(storageIds)].sort()
-    const locked = new Map<string, BackupStorageKeyRow>()
-    if (ids.length === 0) return locked
-    const rows = yield* transaction.queryRows<BackupStorageKeyRow>(
-      `SELECT id, object_prefix, owner_user_id, bucket, region, endpoint,
+  const ids = [...new Set(storageIds)].sort()
+  const locked = new Map<string, BackupStorageKeyRow>()
+  if (ids.length === 0) return locked
+  const rows = yield* transaction.queryRows<BackupStorageKeyRow>(
+    `SELECT id, object_prefix, owner_user_id, bucket, region, endpoint,
               enabled, deleting
          FROM ${databaseTable("backup_storage")}
         WHERE id IN (${ids.map(() => "?").join(", ")})
         ORDER BY id
         FOR UPDATE`,
-      ids
-    )
-    for (const row of rows) locked.set(row.id, row)
-    return locked
-  })
-}
+    ids
+  )
+  for (const row of rows) locked.set(row.id, row)
+  return locked
+})
+
+const refuseIfFinalDeletionInProgress = Effect.fnUntraced(function* (
+  transaction: DatabaseTransaction,
+  input: {
+    operation: string
+    relayId: string
+    targetId: string
+    targetKind: "database" | "instance" | "platform"
+  }
+) {
+  if (input.targetKind === "platform") return
+  const table =
+    input.targetKind === "database"
+      ? "backup_final_database_delete"
+      : "backup_final_delete"
+  const rows = yield* transaction.queryRows<RowDataPacket>(
+    `SELECT backup_id
+       FROM ${databaseTable(table)}
+      WHERE relay_id = ? AND target_id = ?
+        AND status IN ('backing_up', 'deleting')
+      LIMIT 1
+      FOR UPDATE`,
+    [input.relayId, input.targetId]
+  )
+  if (rows[0]?.backup_id) {
+    return yield* BackupStorageError.make({
+      code: "final_delete_in_progress",
+      operation: input.operation,
+      reason: "This resource is being permanently deleted",
+    })
+  }
+})
 
 function incrementalStorageLocationError(
   storage: BackupStorageKeyRow

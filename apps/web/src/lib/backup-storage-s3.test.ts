@@ -99,7 +99,11 @@ describe("restic S3 prefixes", () => {
     expect(isSafeResticObjectPrefix("team/foo bar")).toBe(false)
     expect(isSafeResticObjectPrefix("team/../other")).toBe(false)
     expect(resticPrefixSegment("relay-one")).toBe("relay-one")
-    expect(resticPrefixSegment("sha256-already")).toMatch(/^sha256-[a-f0-9]{64}$/u)
+    expect(resticPrefixSegment(".")).toMatch(/^sha256-[a-f0-9]{64}$/u)
+    expect(resticPrefixSegment("..")).toMatch(/^sha256-[a-f0-9]{64}$/u)
+    expect(resticPrefixSegment("sha256-already")).toMatch(
+      /^sha256-[a-f0-9]{64}$/u
+    )
     expect(resticPrefixSegment("relay/id")).toMatch(/^sha256-[a-f0-9]{64}$/u)
     expect(
       resticRepositoryObjectPrefix({
@@ -109,9 +113,7 @@ describe("restic S3 prefixes", () => {
         repositoryId: "repo-one",
         targetId: "instance-one",
       })
-    ).toBe(
-      "team/kiln/kiln.dev/relay-one/restic/instance/instance-one/repo-one"
-    )
+    ).toBe("team/kiln/kiln.dev/relay-one/restic/instance/instance-one/repo-one")
   })
 
   it("pages through prefix deletes", async () => {

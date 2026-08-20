@@ -2870,10 +2870,9 @@ function DownloadBackupDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
-          {signDownload.isPending && backup.artifactKind === "restic_snapshot" ? (
-            <p className="text-xs text-muted-foreground">
-              Preparing export…
-            </p>
+          {signDownload.isPending &&
+          backup.artifactKind === "restic_snapshot" ? (
+            <p className="text-xs text-muted-foreground">Preparing export…</p>
           ) : null}
           <label className="block">
             <span className="mb-2 block text-xs font-medium">Source</span>
@@ -3132,7 +3131,9 @@ function CreateBackupDialog({
       "local",
       ...availableStorage.map((destination) => destination.id),
     ])
-    const next = destinationKeys.filter((destination) => allowed.has(destination))
+    const next = destinationKeys.filter((destination) =>
+      allowed.has(destination)
+    )
     const usable = next.length > 0 ? next : ["default"]
     return incremental ? [usable[0] ?? "default"] : usable
   }, [availableStorage, destinationKeys, incremental])
@@ -3256,9 +3257,7 @@ function CreateBackupDialog({
                   onCheckedChange={(checked) => {
                     if (checked) {
                       setMode("incremental")
-                      setDestinationKeys((current) => [
-                        current[0] ?? "default",
-                      ])
+                      setDestinationKeys((current) => [current[0] ?? "default"])
                     }
                   }}
                 />
@@ -3857,7 +3856,7 @@ function BackupStorageEditor({
         </div>
         <DialogDescription>
           {locationLocked
-            ? "This destination is still deleting. Update credentials and save to retry the prefix purge. Location fields stay locked."
+            ? "This destination is still deleting. Update credentials, save, then retry the prefix purge. Location fields stay locked."
             : "Credentials are encrypted by Hearth and verified before they are saved. Existing secrets are never sent back to the browser."}
         </DialogDescription>
       </DialogHeader>

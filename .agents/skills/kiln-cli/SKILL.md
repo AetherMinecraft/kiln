@@ -169,7 +169,7 @@ The `DEST` column consolidates the logical backup's destinations, such as
 column is `incremental` (restic snapshots, the server default) or `full`
 (portable zip archives).
 
-  Create a manual backup with a reference from `backups targets`. Server backups
+Create a manual backup with a reference from `backups targets`. Server backups
 default to incremental restic snapshots stored on the Relay or an S3
 destination. Pass `--mode full` for a portable zip, which can also use local or
 S3 storage. Incremental mode accepts exactly one destination.

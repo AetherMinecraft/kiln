@@ -39,7 +39,6 @@ vi.mock("@/lib/environment", async (importOriginal) => {
   }
 })
 
-
 const emptyResult: ResultSetHeader = {
   affectedRows: 0,
   changedRows: 0,
@@ -393,7 +392,8 @@ describe("backup limits", () => {
                   },
                 ] as unknown as ReadonlyArray<TRow>
               }
-              if (sql.includes("backup_repository")) return [] as unknown as ReadonlyArray<TRow>
+              if (sql.includes("backup_repository"))
+                return [] as unknown as ReadonlyArray<TRow>
               return [
                 { quantity_used: 0, size_used: 0 },
               ] as unknown as ReadonlyArray<TRow>
@@ -451,10 +451,7 @@ describe("backup limits", () => {
         run({
           execute: (sql, values) =>
             Effect.sync(() => {
-              if (
-                sql.includes("INSERT INTO") &&
-                sql.includes("backup_mode")
-              ) {
+              if (sql.includes("INSERT INTO") && sql.includes("backup_mode")) {
                 artifactKind = values?.[5]
                 backupMode = values?.[6]
               }
@@ -495,6 +492,58 @@ describe("backup limits", () => {
 
     expect(backupMode).toBe("full")
     expect(artifactKind).toBe("archive")
+  })
+
+  it("rejects new backup reservations while final deletion is active", async () => {
+    const queries: Array<string> = []
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: () => Effect.succeed(emptyResult),
+          queryRows: <TRow extends RowDataPacket>(sql: string) =>
+            Effect.sync(() => {
+              queries.push(sql)
+              if (sql.includes("backup_policy")) {
+                return [
+                  {
+                    admin_quantity_limit: null,
+                    admin_size_limit_bytes: null,
+                    exclude_patterns: [],
+                    quantity_limit: null,
+                    size_limit_bytes: null,
+                    storage_id: null,
+                  },
+                ] as unknown as ReadonlyArray<TRow>
+              }
+              if (sql.includes("backup_final_delete")) {
+                return [
+                  { backup_id: "final-backup" },
+                ] as unknown as ReadonlyArray<TRow>
+              }
+              return [] as unknown as ReadonlyArray<TRow>
+            }),
+        }),
+    })
+
+    await expect(
+      Effect.runPromise(
+        reserveInstanceBackupEffect({
+          backupId: "backup-one",
+          createdBy: "user-one",
+          mode: "incremental",
+          name: "Backup one",
+          relayId: "relay-one",
+          requestedMaxBytes: null,
+          targetId: "instance-one",
+          taskId: "task-one",
+        }).pipe(Effect.provide(databaseLayer))
+      )
+    ).rejects.toThrow("being permanently deleted")
+    expect(
+      queries.find((sql) => sql.includes("backup_final_delete"))
+    ).toContain("FOR UPDATE")
   })
 })
 

@@ -211,44 +211,40 @@ function invalidDestination(reason: string) {
   })
 }
 
-function resticRepositoryForBackup(
+const resticRepositoryForBackup = Effect.fnUntraced(function* (
   backupId: string,
   options?: { requireEnabled?: boolean }
 ) {
-  return Effect.gen(function* () {
-    const repository = yield* loadBackupRepositoryPasswordEffect(backupId)
-    if (!repository.storageId) {
-      return {
-        location: { kind: "local" } satisfies ResticRepositoryLocation,
-        password: repository.password,
-      }
-    }
-    if (!repository.objectPrefix) {
-      return yield* invalidDestination("The restic repository is unavailable")
-    }
-    const storage = yield* loadBackupStorageCredentialEffect(
-      repository.storageId
-    )
-    if (
-      !storage ||
-      storage.deleting ||
-      (options?.requireEnabled && !storage.enabled)
-    ) {
-      return yield* invalidDestination("The backup destination is unavailable")
-    }
+  const repository = yield* loadBackupRepositoryPasswordEffect(backupId)
+  if (!repository.storageId) {
     return {
-      location: {
-        accessKeyId: storage.accessKeyId,
-        allowPrivateNetwork: storage.allowPrivateNetwork,
-        bucket: storage.bucket,
-        endpoint: storage.endpoint,
-        forcePathStyle: storage.forcePathStyle,
-        kind: "s3" as const,
-        region: storage.region,
-        repositoryPrefix: repository.objectPrefix,
-        secretAccessKey: storage.secretAccessKey,
-      } satisfies ResticRepositoryLocation,
+      location: { kind: "local" } satisfies ResticRepositoryLocation,
       password: repository.password,
     }
-  })
-}
+  }
+  if (!repository.objectPrefix) {
+    return yield* invalidDestination("The restic repository is unavailable")
+  }
+  const storage = yield* loadBackupStorageCredentialEffect(repository.storageId)
+  if (
+    !storage ||
+    storage.deleting ||
+    (options?.requireEnabled && !storage.enabled)
+  ) {
+    return yield* invalidDestination("The backup destination is unavailable")
+  }
+  return {
+    location: {
+      accessKeyId: storage.accessKeyId,
+      allowPrivateNetwork: storage.allowPrivateNetwork,
+      bucket: storage.bucket,
+      endpoint: storage.endpoint,
+      forcePathStyle: storage.forcePathStyle,
+      kind: "s3" as const,
+      region: storage.region,
+      repositoryPrefix: repository.objectPrefix,
+      secretAccessKey: storage.secretAccessKey,
+    } satisfies ResticRepositoryLocation,
+    password: repository.password,
+  }
+})

@@ -145,7 +145,8 @@ export const resticS3BucketSchema = z
   })
 
 export const resticS3RegionSchema = z.string().regex(/^[a-z0-9-]+$/u, {
-  message: "S3 regions must contain only lowercase letters, digits, and hyphens",
+  message:
+    "S3 regions must contain only lowercase letters, digits, and hyphens",
 })
 
 export const resticRepositoryPrefixSchema = z
@@ -166,19 +167,26 @@ export const resticRepositoryPrefixSchema = z
     message: "Backup object keys cannot contain control characters",
   })
 
-const resticS3EndpointSchema = backupHttpsUrlSchema.refine((value) => {
-  const endpoint = new URL(value)
-  return (
-    !endpoint.username &&
-    !endpoint.password &&
-    !endpoint.search &&
-    !endpoint.hash &&
-    (endpoint.pathname === "/" || endpoint.pathname === "")
-  )
-}, {
-  message:
-    "Restic S3 endpoints must be an HTTPS origin without credentials, a path, query, or fragment",
-})
+const resticS3EndpointSchema = backupHttpsUrlSchema.refine(
+  (value) => {
+    const endpoint = new URL(value)
+    const port = endpoint.port ? Number(endpoint.port) : 443
+    return (
+      !endpoint.username &&
+      !endpoint.password &&
+      !endpoint.search &&
+      !endpoint.hash &&
+      (endpoint.pathname === "/" || endpoint.pathname === "") &&
+      Number.isSafeInteger(port) &&
+      port >= 1 &&
+      port <= 65_535
+    )
+  },
+  {
+    message:
+      "Restic S3 endpoints must be an HTTPS origin without credentials, a path, query, or fragment",
+  }
+)
 
 const resticLocalRepositoryLocationSchema = z
   .object({
@@ -340,8 +348,9 @@ export const backupRestoreTaskInputSchema = z
   })
   .strict()
 
-export const backupS3DeleteDestinationSchema =
-  backupS3UploadDestinationSchema.omit({ uploadUrl: true }).extend({
+export const backupS3DeleteDestinationSchema = backupS3UploadDestinationSchema
+  .omit({ uploadUrl: true })
+  .extend({
     deleteUrl: backupHttpsUrlSchema,
   })
 
@@ -657,7 +666,11 @@ export function backupArtifactFilename(
 export function isArchiveCreateTaskResult(
   result: BackupTaskResult
 ): result is BackupArchiveCreateTaskResult {
-  return "checksumSha256" in result && "filename" in result && !("expiresAt" in result)
+  return (
+    "checksumSha256" in result &&
+    "filename" in result &&
+    !("expiresAt" in result)
+  )
 }
 
 export function isResticCreateTaskResult(

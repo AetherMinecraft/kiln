@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { mkdir, symlink, writeFile } from "node:fs/promises"
+import { rejects } from "node:assert/strict"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PassThrough } from "node:stream"
@@ -298,33 +299,25 @@ describe("restic S3 driver", () => {
       "s3:https://s3.example.com/kiln-backups/team/kiln/relay/restic/instance/srv/repo"
     )
     assert.deepStrictEqual(
-      resticDriverLocation(
-        { dataDirectory: "/data" } as never,
-        "instance-1",
-        {
-          ...s3Location,
-          kind: "s3",
-        }
-      ),
+      resticDriverLocation({ dataDirectory: "/data" } as never, "instance-1", {
+        ...s3Location,
+        kind: "s3",
+      }),
       s3Location
     )
   })
 
   it("fails like a missing password when S3 credentials are absent", () => {
     try {
-      resticDriverLocation(
-        { dataDirectory: "/data" } as never,
-        "instance-1",
-        {
-          allowPrivateNetwork: false,
-          bucket: "kiln-backups",
-          endpoint: "https://s3.example.com",
-          forcePathStyle: true,
-          kind: "s3",
-          region: "us-east-1",
-          repositoryPrefix: "team/repo",
-        }
-      )
+      resticDriverLocation({ dataDirectory: "/data" } as never, "instance-1", {
+        allowPrivateNetwork: false,
+        bucket: "kiln-backups",
+        endpoint: "https://s3.example.com",
+        forcePathStyle: true,
+        kind: "s3",
+        region: "us-east-1",
+        repositoryPrefix: "team/repo",
+      })
       assert.fail("expected missing credentials")
     } catch (cause) {
       assert.isTrue(cause instanceof RelayBackupError)
@@ -387,7 +380,10 @@ describe("restic S3 driver", () => {
       call.env.RESTIC_CACHE_DIR,
       join(testDirectory, "restic-cache")
     )
-    assert.match(call.env.HTTPS_PROXY ?? "", /^http:\/\/user:[^@]+@127\.0\.0\.1:\d+$/u)
+    assert.match(
+      call.env.HTTPS_PROXY ?? "",
+      /^http:\/\/user:[^@]+@127\.0\.0\.1:\d+$/u
+    )
     assert.isUndefined(call.env.HTTP_PROXY)
   })
 
@@ -486,7 +482,9 @@ describe("restic S3 driver", () => {
       assert.isTrue(cause instanceof RelayBackupError)
       const reason = cause instanceof RelayBackupError ? cause.reason : ""
       assert.isFalse(reason.includes("AKIAEXAMPLE"))
-      assert.isFalse(reason.includes("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"))
+      assert.isFalse(
+        reason.includes("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+      )
       assert.isFalse(reason.includes("repo-secret"))
       assert.include(reason, "[redacted]")
     }
@@ -501,6 +499,26 @@ describe("restic S3 driver", () => {
       signal: new AbortController().signal,
     })
     assert.isFalse(existsSync(join(testDirectory, "s3-repo")))
+  })
+
+  it("reports S3 cache cleanup failures to its caller", async () => {
+    const driver = createResticDriver({
+      spawn: fakeResticSpawn([
+        {
+          exitCode: 1,
+          match: (args) => args.includes("cache"),
+          stderr: "cache cleanup failed",
+        },
+      ]),
+    })
+    await rejects(
+      driver.cacheCleanup({
+        location: s3Location,
+        password: "secret",
+        signal: new AbortController().signal,
+      }),
+      RelayBackupError
+    )
   })
 })
 

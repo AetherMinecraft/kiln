@@ -1,22 +1,14 @@
 import { randomBytes } from "node:crypto"
 import { lookup as dnsLookup } from "node:dns"
-import {
-  connect,
-  createServer,
-  isIP,
-  type Server,
-  type Socket,
-} from "node:net"
+import { connect, createServer, isIP, type Server, type Socket } from "node:net"
 import type { LookupFunction } from "node:net"
 
 import { Effect, Result } from "effect"
 
-import {
-  isPublicRemoteAddress,
-  secureRemoteLookup,
-} from "./source-policy.js"
+import { isPublicRemoteAddress, secureRemoteLookup } from "./source-policy.js"
 
 const MAX_CONNECT_HEADER_BYTES = 8_192
+const MAX_CONNECT_ADDRESSES = 8
 const AWS_SUFFIXES = [".amazonaws.com.cn", ".amazonaws.com"] as const
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
 
@@ -108,9 +100,7 @@ export function parseResticS3ConnectRequest(
     if (separator === -1) return false
     const name = header.slice(0, separator).trim().toLowerCase()
     const value = header.slice(separator + 1).trim()
-    return (
-      name === "proxy-authorization" && value === `Basic ${expected}`
-    )
+    return name === "proxy-authorization" && value === `Basic ${expected}`
   })
   if (!authorized) return null
   const target = parseResticS3ConnectTarget(requestLine[1] ?? "")
@@ -178,8 +168,9 @@ function handleConnectClient(
 ): Promise<void> {
   return Effect.runPromise(
     Effect.gen(function* () {
+      const timeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
       const raw = yield* Effect.tryPromise({
-        try: () => readHttpHead(client),
+        try: () => readHttpHead(client, timeoutMs),
         catch: (cause) =>
           cause instanceof Error
             ? cause
@@ -198,7 +189,7 @@ function handleConnectClient(
         return
       }
       const addresses = yield* Effect.promise(() =>
-        resolveConnectAddresses(target.hostname, options)
+        resolveConnectAddresses(target.hostname, options, timeoutMs)
       )
       if (addresses.length === 0) {
         rejectConnect(client)
@@ -207,7 +198,7 @@ function handleConnectClient(
       const upstream = yield* connectFirstUpstream(
         addresses,
         target.port,
-        options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+        timeoutMs
       )
       client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
       client.pipe(upstream)
@@ -230,9 +221,13 @@ function handleConnectClient(
   )
 }
 
-function readHttpHead(client: Socket): Promise<string> {
+function readHttpHead(client: Socket, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let buffer = Buffer.alloc(0)
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error("CONNECT headers timed out"))
+    }, timeoutMs)
     const onData = (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk])
       if (buffer.byteLength > MAX_CONNECT_HEADER_BYTES) {
@@ -250,6 +245,7 @@ function readHttpHead(client: Socket): Promise<string> {
       reject(new Error("CONNECT headers ended before completion"))
     }
     const cleanup = () => {
+      clearTimeout(timer)
       client.off("data", onData)
       client.off("end", onEnd)
       client.off("error", onEnd)
@@ -267,38 +263,47 @@ function rejectConnect(client: Socket): void {
 
 function resolveConnectAddresses(
   hostname: string,
-  options: ResticS3ProxyOptions
+  options: ResticS3ProxyOptions,
+  timeoutMs: number
 ): Promise<Array<string>> {
-  const lookup = options.lookup ??
+  const lookup =
+    options.lookup ??
     (options.allowPrivateNetwork ? dnsLookup : secureRemoteLookup)
   return new Promise((resolve) => {
-    lookup(
-      hostname,
-      { all: true, verbatim: true },
-      (error, addresses) => {
-        if (error || !Array.isArray(addresses) || addresses.length === 0) {
-          if (error && !options.allowPrivateNetwork) {
-            console.error(
-              `Rejected restic S3 CONNECT to ${hostname}: ${error.message}`
-            )
-          }
-          resolve([])
-          return
-        }
-        const selected = addresses.flatMap((entry) => {
-          if (options.allowPrivateNetwork || isPublicRemoteAddress(entry.address)) {
-            return [entry.address]
-          }
-          return []
-        })
-        if (selected.length === 0) {
+    let settled = false
+    const finish = (addresses: Array<string>) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(addresses)
+    }
+    const timer = setTimeout(() => finish([]), timeoutMs)
+    lookup(hostname, { all: true, verbatim: true }, (error, addresses) => {
+      if (error || !Array.isArray(addresses) || addresses.length === 0) {
+        if (error && !options.allowPrivateNetwork) {
           console.error(
-            `Rejected restic S3 CONNECT to ${hostname}: private address`
+            `Rejected restic S3 CONNECT to ${hostname}: ${error.message}`
           )
         }
-        resolve(selected)
+        finish([])
+        return
       }
-    )
+      const selected = addresses.flatMap((entry) => {
+        if (
+          options.allowPrivateNetwork ||
+          isPublicRemoteAddress(entry.address)
+        ) {
+          return [entry.address]
+        }
+        return []
+      })
+      if (selected.length === 0) {
+        console.error(
+          `Rejected restic S3 CONNECT to ${hostname}: private address`
+        )
+      }
+      finish(selected.slice(0, MAX_CONNECT_ADDRESSES))
+    })
   })
 }
 
@@ -309,10 +314,14 @@ function connectFirstUpstream(
 ) {
   return Effect.gen(function* () {
     let lastError: Error | null = null
+    const attemptTimeoutMs = Math.max(
+      1,
+      Math.floor(timeoutMs / Math.max(1, addresses.length))
+    )
     for (const address of addresses) {
       const connected = yield* Effect.result(
         Effect.tryPromise({
-          try: () => connectUpstream(address, port, timeoutMs),
+          try: () => connectUpstream(address, port, attemptTimeoutMs),
           catch: (cause) =>
             cause instanceof Error
               ? cause
@@ -322,9 +331,7 @@ function connectFirstUpstream(
       if (Result.isSuccess(connected)) return connected.success
       lastError = connected.failure
     }
-    return yield* Effect.fail(
-      lastError ?? new Error("Upstream CONNECT failed")
-    )
+    return yield* Effect.fail(lastError ?? new Error("Upstream CONNECT failed"))
   })
 }
 
@@ -367,5 +374,8 @@ function canonicalizeConnectAuthority(authority: string): string | null {
 }
 
 function canonicalizeHostname(hostname: string): string {
-  return hostname.replace(/^\[|\]$/gu, "").toLowerCase().replace(/\.$/u, "")
+  return hostname
+    .replace(/^\[|\]$/gu, "")
+    .toLowerCase()
+    .replace(/\.$/u, "")
 }

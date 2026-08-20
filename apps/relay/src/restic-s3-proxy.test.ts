@@ -50,7 +50,9 @@ describe("restic S3 CONNECT proxy", () => {
       port: 443,
     })
     expect(parseResticS3ConnectTarget("s3.example.com:443/evil")).toBeNull()
-    expect(parseResticS3ConnectTarget("user:pass@s3.example.com:443")).toBeNull()
+    expect(
+      parseResticS3ConnectTarget("user:pass@s3.example.com:443")
+    ).toBeNull()
     expect(parseResticS3ConnectTarget("[")).toBeNull()
     const authorized = connectRequest("s3.example.com:443", token)
     expect(
@@ -134,6 +136,31 @@ describe("restic S3 CONNECT proxy", () => {
     } finally {
       upstream.server.close()
     }
+  })
+
+  it("closes clients that never finish CONNECT headers", async () => {
+    let client: Socket | undefined
+    await withResticS3Proxy(
+      {
+        allowPrivateNetwork: true,
+        allowedHosts: new Set(["minio"]),
+        connectTimeoutMs: 25,
+        endpointPort: 9000,
+        token,
+      },
+      async (proxyUrl) => {
+        const parsed = new URL(proxyUrl)
+        client = connect({
+          host: parsed.hostname,
+          port: Number(parsed.port),
+        })
+        client.on("error", () => {})
+        await once(client, "connect")
+        client.resume()
+        await once(client, "close")
+      }
+    )
+    expect(client?.destroyed).toBe(true)
   })
 })
 

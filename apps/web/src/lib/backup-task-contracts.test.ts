@@ -67,6 +67,12 @@ describe("restic backup contracts", () => {
     expect(() =>
       resticRepositoryLocationSchema.parse({
         ...s3Repository,
+        endpoint: "https://minio:0",
+      })
+    ).toThrow()
+    expect(() =>
+      resticRepositoryLocationSchema.parse({
+        ...s3Repository,
         repositoryPrefix: "../escape",
       })
     ).toThrow()

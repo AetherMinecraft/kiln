@@ -703,10 +703,7 @@ describe("restic backup limits and exports", () => {
     const later = Date.now() + 120_000
     const reused = await reuseValidExport(destination, later)
     assert.strictEqual(reused?.expiresAt, later)
-    assert.strictEqual(
-      Number((await readFile(marker, "utf8")).trim()),
-      later
-    )
+    assert.strictEqual(Number((await readFile(marker, "utf8")).trim()), later)
   })
 
   it("removes the export zip and expiry marker for a forgotten backup", async () => {
@@ -727,227 +724,289 @@ describe("restic backup limits and exports", () => {
     assert.isFalse(existsSync(marker))
   })
 
-  layer(makeRelayStateLayer(join(testDirectory, "restic-relay.sqlite")))((it) => {
-    it.effect("forgets an over-limit snapshot after backup summary", () =>
-      Effect.gen(function* () {
-        const forgotten: Array<string> = []
-        let pruned = 0
-        const config = testConfig(join(testDirectory, "over-limit-summary"))
-        yield* Effect.promise(() =>
-          mkdir(join(config.rootDirectory, "instance-1"), { recursive: true })
-        )
-        const manager = yield* BackupManager.make({
-          config,
-          findInstance: async () => testInstance(),
-          isInstanceStopped: async () => true,
-          restic: mockRestic({
-            backup: async () => ({
-              snapshotId: "oversize01",
-              totalBytesProcessed: 500,
+  layer(makeRelayStateLayer(join(testDirectory, "restic-relay.sqlite")))(
+    (it) => {
+      it.effect("forgets an over-limit snapshot after backup summary", () =>
+        Effect.gen(function* () {
+          const forgotten: Array<string> = []
+          let pruned = 0
+          const config = testConfig(join(testDirectory, "over-limit-summary"))
+          yield* Effect.promise(() =>
+            mkdir(join(config.rootDirectory, "instance-1"), { recursive: true })
+          )
+          const manager = yield* BackupManager.make({
+            config,
+            findInstance: async () => testInstance(),
+            isInstanceStopped: async () => true,
+            restic: mockRestic({
+              backup: async () => ({
+                snapshotId: "oversize01",
+                totalBytesProcessed: 500,
+              }),
+              forget: async ({ snapshotId }) => {
+                forgotten.push(snapshotId)
+              },
+              prune: async () => {
+                pruned += 1
+              },
             }),
-            forget: async ({ snapshotId }) => {
-              forgotten.push(snapshotId)
-            },
-            prune: async () => {
-              pruned += 1
-            },
-          }),
+          })
+          const input = resticCreateInput("over-limit-summary", 100)
+          yield* manager.enqueue(input)
+          yield* manager.runPending()
+          const task = yield* manager.get(input.taskId)
+          assert.strictEqual(task?.status, "failed")
+          assert.include(task?.error ?? "", "exceeds")
+          assert.deepStrictEqual(forgotten, ["oversize01"])
+          assert.strictEqual(pruned, 1)
         })
-        const input = resticCreateInput("over-limit-summary", 100)
-        yield* manager.enqueue(input)
-        yield* manager.runPending()
-        const task = yield* manager.get(input.taskId)
-        assert.strictEqual(task?.status, "failed")
-        assert.include(task?.error ?? "", "exceeds")
-        assert.deepStrictEqual(forgotten, ["oversize01"])
-        assert.strictEqual(pruned, 1)
-      })
-    )
+      )
 
-    it.effect("cleans the restic cache after an incremental backup", () =>
-      Effect.gen(function* () {
-        let cleaned = 0
-        const config = testConfig(join(testDirectory, "cache-after-backup"))
-        yield* Effect.promise(() =>
-          mkdir(join(config.rootDirectory, "instance-1"), { recursive: true })
-        )
-        const manager = yield* BackupManager.make({
-          config,
-          findInstance: async () => testInstance(),
-          isInstanceStopped: async () => true,
-          restic: mockRestic({
-            backup: async () => ({
-              snapshotId: "a1b2c3d4e5",
-              totalBytesProcessed: 10,
+      it.effect("cleans the restic cache after an incremental backup", () =>
+        Effect.gen(function* () {
+          let cleaned = 0
+          const config = testConfig(join(testDirectory, "cache-after-backup"))
+          yield* Effect.promise(() =>
+            mkdir(join(config.rootDirectory, "instance-1"), { recursive: true })
+          )
+          const manager = yield* BackupManager.make({
+            config,
+            findInstance: async () => testInstance(),
+            isInstanceStopped: async () => true,
+            restic: mockRestic({
+              backup: async () => ({
+                snapshotId: "a1b2c3d4e5",
+                totalBytesProcessed: 10,
+              }),
+              cacheCleanup: async () => {
+                cleaned += 1
+              },
             }),
-            cacheCleanup: async () => {
-              cleaned += 1
-            },
-          }),
+          })
+          const input = resticCreateInput("cache-after-backup", 100)
+          yield* manager.enqueue(input)
+          yield* manager.runPending()
+          const task = yield* manager.get(input.taskId)
+          assert.strictEqual(task?.status, "succeeded")
+          assert.strictEqual(cleaned, 1)
         })
-        const input = resticCreateInput("cache-after-backup", 100)
-        yield* manager.enqueue(input)
-        yield* manager.runPending()
-        const task = yield* manager.get(input.taskId)
-        assert.strictEqual(task?.status, "succeeded")
-        assert.strictEqual(cleaned, 1)
-      })
-    )
+      )
 
-    it.effect("forgets a reused over-limit snapshot instead of succeeding", () =>
-      Effect.gen(function* () {
-        const forgotten: Array<string> = []
-        let pruned = 0
-        const manager = yield* BackupManager.make({
-          config: testConfig(join(testDirectory, "over-limit-reuse")),
-          findInstance: async () => testInstance(),
-          isInstanceStopped: async () => true,
-          restic: mockRestic({
-            snapshotsByTag: async () => [{ id: "reused001" }],
-            stats: async () => ({ totalSize: 500 }),
-            forget: async ({ snapshotId }) => {
-              forgotten.push(snapshotId)
-            },
-            prune: async () => {
-              pruned += 1
-            },
-          }),
-        })
-        const input = resticCreateInput("over-limit-reuse", 100)
-        yield* manager.enqueue(input)
-        yield* manager.runPending()
-        const task = yield* manager.get(input.taskId)
-        assert.strictEqual(task?.status, "failed")
-        assert.deepStrictEqual(forgotten, ["reused001"])
-        assert.strictEqual(pruned, 1)
-      })
-    )
-
-    it.effect("forgets a snapshot committed before an over-limit progress abort", () =>
-      Effect.gen(function* () {
-        const forgotten: Array<string> = []
-        let pruned = 0
-        const manager = yield* BackupManager.make({
-          config: testConfig(join(testDirectory, "over-limit-progress")),
-          findInstance: async () => testInstance(),
-          isInstanceStopped: async () => true,
-          restic: mockRestic({
-            backup: async ({ onProgress }) => {
-              onProgress?.({ bytesCompleted: 50, bytesTotal: 500 })
-              throw new Error("restic aborted")
-            },
-            snapshotsByTag: async () => [{ id: "progress1" }],
-            stats: async () => ({ totalSize: 500 }),
-            forget: async ({ snapshotId }) => {
-              forgotten.push(snapshotId)
-            },
-            prune: async () => {
-              pruned += 1
-            },
-          }),
-        })
-        const input = resticCreateInput("over-limit-progress", 100)
-        yield* manager.enqueue(input)
-        yield* manager.runPending()
-        const task = yield* manager.get(input.taskId)
-        assert.strictEqual(task?.status, "failed")
-        assert.deepStrictEqual(forgotten, ["progress1"])
-        assert.strictEqual(pruned, 1)
-      })
-    )
-
-    it.effect("removes staged exports when forgetting a restic snapshot", () =>
-      Effect.gen(function* () {
-        const directory = join(testDirectory, "forget-export")
-        const config = testConfig(directory)
-        const backupId = "cccccccc-dddd-4eee-8fff-000000000001"
-        yield* Effect.promise(() =>
-          mkdir(join(config.dataDirectory, "exports"), { recursive: true })
-        )
-        const zip = join(config.dataDirectory, "exports", `${backupId}.zip`)
-        yield* Effect.promise(() => writeFile(zip, "zip"))
-        const manager = yield* BackupManager.make({
-          config,
-          findInstance: async () => testInstance(),
-          isInstanceStopped: async () => true,
-          restic: mockRestic({
-            forget: async () => undefined,
-            prune: async () => undefined,
-          }),
-        })
-        yield* manager.enqueue({
-          backupId,
-          destination: {
-            kind: "restic",
-            repository: { kind: "local" },
+      it.effect("cleans the restic cache after exporting a snapshot", () =>
+        Effect.gen(function* () {
+          let cleaned = 0
+          const config = testConfig(join(testDirectory, "cache-after-export"))
+          const backupId = "22000000-0000-4000-8000-000000000001"
+          const repository = {
+            accessKeyId: "AKIAEXAMPLE",
+            allowPrivateNetwork: true,
+            bucket: "kiln-backups",
+            endpoint: "https://s3.example.com",
+            forcePathStyle: true,
+            kind: "s3" as const,
+            region: "us-east-1",
+            repositoryPrefix: "team/repo",
+            secretAccessKey: "s3-secret",
+          }
+          const manager = yield* BackupManager.make({
+            config,
+            findInstance: async () => testInstance(),
+            isInstanceStopped: async () => true,
+            restic: mockRestic({
+              cacheCleanup: async () => {
+                cleaned += 1
+              },
+              dumpZip: async ({ destination }) => {
+                await writeFile(destination, "zip")
+                return { bytes: 3, checksumSha256: "a".repeat(64) }
+              },
+              stats: async () => ({ totalSize: 3 }),
+            }),
+          })
+          const input = {
+            backupId,
+            kind: "export" as const,
+            repository,
             repositoryPassword: "secret",
-            snapshotId: "deadbeef",
-          },
-          kind: "delete",
-          target: { id: "instance-1", kind: "instance" },
-          taskId: "10000000-0000-4000-8000-000000000099",
+            snapshotId: "abcdef12",
+            target: { id: "instance-1", kind: "instance" as const },
+            taskId: "22000000-0000-4000-8000-000000000011",
+            ttlMs: 60_000,
+          }
+          yield* manager.enqueue(input)
+          yield* manager.runPending()
+          assert.strictEqual(
+            (yield* manager.get(input.taskId))?.status,
+            "succeeded"
+          )
+          assert.strictEqual(cleaned, 1)
         })
-        yield* manager.runPending()
-        assert.isFalse(existsSync(zip))
-      })
-    )
+      )
 
-    it.effect("forgets snapshots tagged with a failed create task", () =>
-      Effect.gen(function* () {
-        const forgotten: Array<string> = []
-        const tags: Array<string> = []
-        let prunedRepository: unknown
-        const s3Repository = {
-          accessKeyId: "AKIAEXAMPLE",
-          allowPrivateNetwork: true,
-          bucket: "kiln-backups",
-          endpoint: "https://s3.example.com",
-          forcePathStyle: true,
-          kind: "s3" as const,
-          region: "us-east-1",
-          repositoryPrefix: "team/repo",
-          secretAccessKey: "s3-secret",
-        }
-        const manager = yield* BackupManager.make({
-          config: testConfig(join(testDirectory, "forget-tag")),
-          findInstance: async () => testInstance(),
-          isInstanceStopped: async () => true,
-          restic: mockRestic({
-            snapshotsByTag: async ({ tag }) => {
-              tags.push(tag)
-              return [{ id: "tagged001" }]
+      it.effect(
+        "forgets a reused over-limit snapshot instead of succeeding",
+        () =>
+          Effect.gen(function* () {
+            const forgotten: Array<string> = []
+            let pruned = 0
+            const manager = yield* BackupManager.make({
+              config: testConfig(join(testDirectory, "over-limit-reuse")),
+              findInstance: async () => testInstance(),
+              isInstanceStopped: async () => true,
+              restic: mockRestic({
+                snapshotsByTag: async () => [{ id: "reused001" }],
+                stats: async () => ({ totalSize: 500 }),
+                forget: async ({ snapshotId }) => {
+                  forgotten.push(snapshotId)
+                },
+                prune: async () => {
+                  pruned += 1
+                },
+              }),
+            })
+            const input = resticCreateInput("over-limit-reuse", 100)
+            yield* manager.enqueue(input)
+            yield* manager.runPending()
+            const task = yield* manager.get(input.taskId)
+            assert.strictEqual(task?.status, "failed")
+            assert.deepStrictEqual(forgotten, ["reused001"])
+            assert.strictEqual(pruned, 1)
+          })
+      )
+
+      it.effect(
+        "forgets a snapshot committed before an over-limit progress abort",
+        () =>
+          Effect.gen(function* () {
+            const forgotten: Array<string> = []
+            let pruned = 0
+            const manager = yield* BackupManager.make({
+              config: testConfig(join(testDirectory, "over-limit-progress")),
+              findInstance: async () => testInstance(),
+              isInstanceStopped: async () => true,
+              restic: mockRestic({
+                backup: async ({ onProgress }) => {
+                  onProgress?.({ bytesCompleted: 50, bytesTotal: 500 })
+                  throw new Error("restic aborted")
+                },
+                snapshotsByTag: async () => [{ id: "progress1" }],
+                stats: async () => ({ totalSize: 500 }),
+                forget: async ({ snapshotId }) => {
+                  forgotten.push(snapshotId)
+                },
+                prune: async () => {
+                  pruned += 1
+                },
+              }),
+            })
+            const input = resticCreateInput("over-limit-progress", 100)
+            yield* manager.enqueue(input)
+            yield* manager.runPending()
+            const task = yield* manager.get(input.taskId)
+            assert.strictEqual(task?.status, "failed")
+            assert.deepStrictEqual(forgotten, ["progress1"])
+            assert.strictEqual(pruned, 1)
+          })
+      )
+
+      it.effect(
+        "removes staged exports when forgetting a restic snapshot",
+        () =>
+          Effect.gen(function* () {
+            const directory = join(testDirectory, "forget-export")
+            const config = testConfig(directory)
+            const backupId = "cccccccc-dddd-4eee-8fff-000000000001"
+            yield* Effect.promise(() =>
+              mkdir(join(config.dataDirectory, "exports"), { recursive: true })
+            )
+            const zip = join(config.dataDirectory, "exports", `${backupId}.zip`)
+            yield* Effect.promise(() => writeFile(zip, "zip"))
+            const manager = yield* BackupManager.make({
+              config,
+              findInstance: async () => testInstance(),
+              isInstanceStopped: async () => true,
+              restic: mockRestic({
+                forget: async () => undefined,
+                prune: async () => undefined,
+              }),
+            })
+            yield* manager.enqueue({
+              backupId,
+              destination: {
+                kind: "restic",
+                repository: { kind: "local" },
+                repositoryPassword: "secret",
+                snapshotId: "deadbeef",
+              },
+              kind: "delete",
+              target: { id: "instance-1", kind: "instance" },
+              taskId: "10000000-0000-4000-8000-000000000099",
+            })
+            yield* manager.runPending()
+            assert.isFalse(existsSync(zip))
+          })
+      )
+
+      it.effect("forgets snapshots tagged with a failed create task", () =>
+        Effect.gen(function* () {
+          const forgotten: Array<string> = []
+          const tags: Array<string> = []
+          let prunedRepository: unknown
+          const s3Repository = {
+            accessKeyId: "AKIAEXAMPLE",
+            allowPrivateNetwork: true,
+            bucket: "kiln-backups",
+            endpoint: "https://s3.example.com",
+            forcePathStyle: true,
+            kind: "s3" as const,
+            region: "us-east-1",
+            repositoryPrefix: "team/repo",
+            secretAccessKey: "s3-secret",
+          }
+          const manager = yield* BackupManager.make({
+            config: testConfig(join(testDirectory, "forget-tag")),
+            findInstance: async () => testInstance(),
+            isInstanceStopped: async () => true,
+            restic: mockRestic({
+              snapshotsByTag: async ({ tag }) => {
+                tags.push(tag)
+                return [{ id: "tagged001" }]
+              },
+              forget: async ({ snapshotId }) => {
+                forgotten.push(snapshotId)
+              },
+              prune: async ({ location }) => {
+                prunedRepository = location
+              },
+            }),
+          })
+          const createTaskId = "10000000-0000-4000-8000-000000000088"
+          yield* manager.enqueue({
+            backupId: "dddddddd-eeee-4fff-8000-000000000001",
+            destination: {
+              createTaskId,
+              kind: "restic",
+              repository: s3Repository,
+              repositoryPassword: "secret",
             },
-            forget: async ({ snapshotId }) => {
-              forgotten.push(snapshotId)
-            },
-            prune: async ({ location }) => {
-              prunedRepository = location
-            },
-          }),
+            kind: "delete",
+            target: { id: "instance-1", kind: "instance" },
+            taskId: "10000000-0000-4000-8000-000000000098",
+          })
+          yield* manager.runPending()
+          assert.deepStrictEqual(tags, [`task:${createTaskId}`])
+          assert.deepStrictEqual(forgotten, ["tagged001"])
+          assert.deepStrictEqual(prunedRepository, s3Repository)
         })
-        const createTaskId = "10000000-0000-4000-8000-000000000088"
-        yield* manager.enqueue({
-          backupId: "dddddddd-eeee-4fff-8000-000000000001",
-          destination: {
-            createTaskId,
-            kind: "restic",
-            repository: s3Repository,
-            repositoryPassword: "secret",
-          },
-          kind: "delete",
-          target: { id: "instance-1", kind: "instance" },
-          taskId: "10000000-0000-4000-8000-000000000098",
-        })
-        yield* manager.runPending()
-        assert.deepStrictEqual(tags, [`task:${createTaskId}`])
-        assert.deepStrictEqual(forgotten, ["tagged001"])
-        assert.deepStrictEqual(prunedRepository, s3Repository)
-      })
-    )
-  })
+      )
+    }
+  )
 })
 
-function resticCreateInput(label: string, maxBytes: number): BackupCreateTaskInput & {
+function resticCreateInput(
+  label: string,
+  maxBytes: number
+): BackupCreateTaskInput & {
   kind: "create"
 } {
   const suffix = createHash("sha256").update(label).digest("hex").slice(0, 12)

@@ -168,7 +168,12 @@ export function isSafeResticObjectPrefix(value: string): boolean {
 }
 
 export function resticPrefixSegment(value: string): string {
-  if (RESTIC_PREFIX_SAFE_SEGMENT.test(value) && !value.startsWith("sha256-")) {
+  if (
+    RESTIC_PREFIX_SAFE_SEGMENT.test(value) &&
+    value !== "." &&
+    value !== ".." &&
+    !value.startsWith("sha256-")
+  ) {
     return value
   }
   return `sha256-${createHash("sha256").update(value).digest("hex")}`
@@ -636,11 +641,7 @@ function s3Request<TResult>(
   })
 }
 
-function deleteS3PrefixPages(
-  client: S3Client,
-  bucket: string,
-  prefix: string
-) {
+function deleteS3PrefixPages(client: S3Client, bucket: string, prefix: string) {
   return Effect.tryPromise({
     try: () =>
       deleteS3PrefixObjectPages(
@@ -658,7 +659,9 @@ function deleteS3PrefixPages(
               page.Contents?.flatMap((entry) =>
                 entry.Key ? [entry.Key] : []
               ) ?? [],
-            nextToken: page.IsTruncated ? page.NextContinuationToken : undefined,
+            nextToken: page.IsTruncated
+              ? page.NextContinuationToken
+              : undefined,
           }
         },
         async (keys) => {

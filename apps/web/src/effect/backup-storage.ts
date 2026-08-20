@@ -301,13 +301,54 @@ export const setBackupPolicyStorageEffect = Effect.fn(
   targetKind: "database" | "instance" | "platform"
 }) {
   const database = yield* Database
-  yield* database.execute(
-    "backup_storage_set_policy",
-    `INSERT INTO ${databaseTable("backup_policy")}
-      (relay_id, target_kind, target_id, storage_id, exclude_patterns)
-     VALUES (?, ?, ?, ?, JSON_ARRAY())
-     ON DUPLICATE KEY UPDATE storage_id = VALUES(storage_id)`,
-    [input.relayId, input.targetKind, input.targetId, input.storageId]
+  yield* database.transaction("backup_storage_set_policy", (transaction) =>
+    Effect.gen(function* () {
+      yield* transaction.execute(
+        `INSERT IGNORE INTO ${databaseTable("backup_policy")}
+          (relay_id, target_kind, target_id, exclude_patterns)
+         VALUES (?, ?, ?, JSON_ARRAY())`,
+        [input.relayId, input.targetKind, input.targetId]
+      )
+      yield* transaction.queryRows<RowDataPacket>(
+        `SELECT relay_id
+           FROM ${databaseTable("backup_policy")}
+          WHERE relay_id = ? AND target_kind = ? AND target_id = ?
+          FOR UPDATE`,
+        [input.relayId, input.targetKind, input.targetId]
+      )
+      if (input.storageId) {
+        const storage = yield* transaction.queryRows<
+          {
+            deleting: boolean | number
+            enabled: boolean | number
+          } & RowDataPacket
+        >(
+          `SELECT enabled, deleting
+             FROM ${databaseTable("backup_storage")}
+            WHERE id = ?
+            LIMIT 1
+            FOR UPDATE`,
+          [input.storageId]
+        )
+        if (
+          !storage[0] ||
+          !storage[0].enabled ||
+          Boolean(storage[0].deleting)
+        ) {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "storage.setPolicy",
+            reason: "The backup destination is unavailable",
+          })
+        }
+      }
+      yield* transaction.execute(
+        `UPDATE ${databaseTable("backup_policy")}
+            SET storage_id = ?
+          WHERE relay_id = ? AND target_kind = ? AND target_id = ?`,
+        [input.storageId, input.relayId, input.targetKind, input.targetId]
+      )
+    })
   )
 })
 
