@@ -71,6 +71,18 @@ through `--profile`.
 Saved profiles live under the platform config directory with owner-only file
 permissions.
 
+For non-interactive automation, set both variables without creating a local
+profile:
+
+```sh
+export KILN_URL=https://hearth.example.com
+export KILN_TOKEN="$DEPLOY_KILN_TOKEN"
+kiln server info <relay-id>:<instance-id>
+```
+
+Hearth still applies the credential mode and the account's Relay/server access
+grants. Supplying a token does not grant administrative access.
+
 ## Discover and operate
 
 ```sh
@@ -91,6 +103,8 @@ kiln files write <relay-id>:<instance-id> server.properties ./server.properties
 kiln files download <relay-id>:<instance-id> logs/latest.log ./latest.log
 kiln files upload <relay-id>:<instance-id> ./plugins/example.jar plugins/example.jar
 kiln files upload <relay-id>:<instance-id> https://example.com/example.jar plugins/example.jar
+kiln files sync <relay-id>:<instance-id> ./server --plan --json
+kiln files sync <relay-id>:<instance-id> ./server --exclude 'logs/**' --exclude '*.tmp'
 kiln backups list --limit 200
 kiln backups create server <relay-id>:<instance-id> --name "Before update"
 kiln backups create server <relay-id>:<instance-id> --mode full
@@ -107,5 +121,26 @@ network destinations. Other file operations use the versioned CLI API.
 Read-only credentials can discover authorized resources, follow logs, and read
 files, but cannot create or delete servers, change startup settings, power
 servers, send console commands, modify files, or upload.
+
+## Recursive file sync
+
+`kiln files sync <server> <local-directory>` recursively inventories the local
+directory and the authorized server root through one host-key-pinned SFTP
+session. It creates missing remote directories, compares file sizes and
+SHA-256 hashes, uploads only changed files, and reads uploaded files back to
+verify their size and hash.
+
+Use `--plan` to inspect the operation without changing remote files. Repeat
+`--exclude <pattern>` for relative glob patterns such as `logs/**`, `cache`,
+or `*.tmp`. `--json` emits one versioned JSON document containing the plan and
+result for CI consumers. Local symlinks, unsafe remote names, and a remote
+symlink or directory where a file would be written cause planning to fail.
+
+Phase 1 does not delete remote files and therefore preserves every path absent
+from the local directory. Staged activation, atomic multi-file deployment,
+managed deletion and manifests, delete limits, cleanup, and deployment-level
+audit records are deferred to the next deployment phase. Until staged
+activation is added, interruption can leave a directly uploaded destination
+partially written; rerun the sync after resolving the failure.
 
 Run `kiln help` for the complete command reference.

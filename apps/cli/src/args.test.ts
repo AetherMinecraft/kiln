@@ -37,12 +37,30 @@ describe("CLI arguments", () => {
     )
   })
 
-  it("rejects removed output mode flags", () => {
-    expect(() => parseArguments(["servers", "list", "--json"])).toThrow(
-      "Unknown option: --json"
-    )
+  it("parses file sync options and rejects removed output flags", () => {
+    expect(
+      parseArguments([
+        "files",
+        "sync",
+        "relay:instance",
+        "./server",
+        "--plan",
+        "--json",
+        "--exclude",
+        "logs/**",
+        "--exclude=*.tmp",
+      ])
+    ).toMatchObject({
+      command: ["files", "sync", "relay:instance", "./server"],
+      excludes: ["logs/**", "*.tmp"],
+      json: true,
+      plan: true,
+    })
     expect(() => parseArguments(["--output", "human"])).toThrow(
       "Unknown option: --output"
+    )
+    expect(() => parseArguments(["servers", "list", "--json"])).toThrow(
+      "only supported by `kiln files sync`"
     )
     expect(() => parseArguments(["files", "read", "server", "--raw"])).toThrow(
       "Unknown option: --raw"
@@ -100,7 +118,14 @@ describe("CLI arguments", () => {
       storage: "local",
     })
     expect(() =>
-      parseArguments(["backups", "create", "server", "relay:instance", "--mode", "zip"])
+      parseArguments([
+        "backups",
+        "create",
+        "server",
+        "relay:instance",
+        "--mode",
+        "zip",
+      ])
     ).toThrow("--mode must be full or incremental")
   })
 })

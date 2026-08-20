@@ -316,6 +316,23 @@ If the remote destination is omitted, the CLI uses the local basename in the
 server root. The remote parent directory must already exist. Uploads and
 downloads verify the Relay's advertised SSH host-key fingerprint.
 
+Recursively plan or upload a local directory with one authenticated Relay
+connection:
+
+```sh
+kiln files sync <server> ./server --plan
+kiln files sync <server> ./server --exclude 'logs/**' --exclude '*.tmp'
+kiln files sync <server> ./server --plan --json
+```
+
+Sync creates missing directories, compares same-size files with SHA-256,
+uploads only changed regular files, and verifies uploaded size and SHA-256.
+`--exclude` accepts a relative glob and may be repeated. `--json` emits a
+versioned machine-readable plan and result. Local symlinks and conflicting
+remote symlinks are refused. This first sync version does not delete remote
+files or stage the complete deployment atomically; an interrupted direct
+upload should be retried after inspecting the destination.
+
 Ask the Relay to download a file directly from an HTTPS URL:
 
 ```sh

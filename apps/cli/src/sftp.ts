@@ -20,7 +20,7 @@ export const downloadSftpFileEffect = Effect.fn("cli.sftp.download")(
       input.connection.root,
       input.remotePath
     )
-    yield* withSftp(input.session, input.connection, (sftp) =>
+    yield* withSftpSessionEffect(input.session, input.connection, (sftp) =>
       sftpOperation("download", (done) =>
         sftp.fastGet(remotePath, input.localPath, done)
       )
@@ -66,7 +66,7 @@ export const uploadSftpFileEffect = Effect.fn("cli.sftp.upload")(
       input.connection.root,
       input.remotePath || basename(input.localPath)
     )
-    yield* withSftp(input.session, input.connection, (sftp) =>
+    yield* withSftpSessionEffect(input.session, input.connection, (sftp) =>
       sftpOperation("upload", (done) =>
         sftp.fastPut(input.localPath, remotePath, done)
       )
@@ -80,12 +80,10 @@ export const uploadSftpFileEffect = Effect.fn("cli.sftp.upload")(
   }
 )
 
-function withSftp<TResult>(
+export function withSftpSessionEffect<TResult, TError, TRequirements>(
   session: KilnSession,
   connection: CliSftpResponse,
-  use: (
-    sftp: SFTPWrapper
-  ) => Effect.Effect<TResult, ReturnType<typeof sftpError>>
+  use: (sftp: SFTPWrapper) => Effect.Effect<TResult, TError, TRequirements>
 ) {
   return Effect.acquireUseRelease(
     Effect.interruptible(connectEffect(session, connection)),
@@ -170,10 +168,12 @@ function sftpOperation(
   })
 }
 
-function resolveRemotePath(root: string, remotePath: string): string {
+export function resolveRemotePath(root: string, remotePath: string): string {
   const segments = remotePath.replace(/^\/+|\/+$/gu, "").split("/")
   if (
     !remotePath.trim() ||
+    remotePath.startsWith("/") ||
+    remotePath.includes("\\") ||
     segments.some(
       (segment) =>
         !segment ||

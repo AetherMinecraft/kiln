@@ -50,6 +50,11 @@ import {
 import { CliCommandError, commandError } from "./errors.js"
 import { downloadBackupEffect } from "./downloads.js"
 import {
+  createSftpFileSyncTransport,
+  renderFileSyncHuman,
+  runFileSyncEffect,
+} from "./file-sync.js"
+import {
   apiJsonEffect,
   apiResponseEffect,
   CLI_LONG_OPERATION_TIMEOUT_MS,
@@ -65,7 +70,11 @@ import {
 } from "./inputs.js"
 import { formatBytes, writeLine, writeTable, writeText } from "./output.js"
 import { formatPowerResponse } from "./power.js"
-import { downloadSftpFileEffect, uploadSftpFileEffect } from "./sftp.js"
+import {
+  downloadSftpFileEffect,
+  uploadSftpFileEffect,
+  withSftpSessionEffect,
+} from "./sftp.js"
 import { runCliProgram } from "./runtime.js"
 import { updateCliEffect } from "./update.js"
 import release from "../../../release.json" with { type: "json" }
@@ -109,6 +118,14 @@ const runCommandEffect = Effect.fn("cli.command")(function* (
   }
 
   const [group, action, ...rest] = args.command
+  if (
+    (args.excludes.length > 0 || args.json || args.plan) &&
+    !(group === "files" && action === "sync")
+  ) {
+    return yield* invalidUsage(
+      "--exclude, --json, and --plan are only supported by `kiln files sync`."
+    )
+  }
   if (group === "login") {
     yield* loginEffect(args, action)
     return
@@ -550,7 +567,11 @@ const runCommandEffect = Effect.fn("cli.command")(function* (
     return
   }
   if (group === "files") {
-    yield* filesEffect(session, action, rest)
+    yield* filesEffect(session, action, rest, {
+      excludes: args.excludes,
+      json: args.json,
+      plan: args.plan,
+    })
     return
   }
   return yield* invalidUsage(`Unknown command: ${args.command.join(" ")}`)
@@ -713,7 +734,8 @@ const logsEffect = Effect.fn("cli.logs")(function* (
 const filesEffect = Effect.fn("cli.files")(function* (
   session: KilnSession,
   action: string | undefined,
-  rest: Array<string>
+  rest: Array<string>,
+  options: Pick<CliArguments, "excludes" | "json" | "plan">
 ) {
   const target = yield* parseServerReferenceEffect(rest[0])
   if (action === "list") {
@@ -839,8 +861,29 @@ const filesEffect = Effect.fn("cli.files")(function* (
     )
     return
   }
+  if (action === "sync") {
+    const localDirectory = rest[1]
+    if (!localDirectory) {
+      return yield* invalidUsage(
+        "Usage: kiln files sync <server> <local-directory> [--plan] [--exclude <pattern>] [--json]"
+      )
+    }
+    const connection = yield* sftpConnectionEffect(session, target)
+    const result = yield* withSftpSessionEffect(session, connection, (sftp) =>
+      runFileSyncEffect({
+        excludes: options.excludes,
+        localDirectory,
+        planOnly: options.plan,
+        server: `${target.relayId}:${target.instanceId}`,
+        transport: createSftpFileSyncTransport(sftp, connection.root),
+      })
+    )
+    if (options.json) writeLine(JSON.stringify(result))
+    else renderFileSyncHuman(result)
+    return
+  }
   return yield* invalidUsage(
-    "Usage: kiln files <list|read|write|download|upload> <server> ..."
+    "Usage: kiln files <list|read|write|download|upload|sync> <server> ..."
   )
 })
 
@@ -1175,17 +1218,20 @@ Commands:
   files download <server> <remote> [local] Download a file
   files upload <server> <local|url> [remote]
                                           Upload locally or download HTTPS on Relay
+  files sync <server> <local-directory>    Plan or recursively upload changed files
 
 Options:
       --brick <id|url> Change the Brick recipe
       --confirm <id>   Confirm a destructive server or backup deletion
       --disk <size>    Set disk quota (minimum 0.1GiB), for example 25GiB
+      --exclude <glob> Exclude a sync path; may be repeated
   -f, --follow        Follow server logs
       --game-version <version>
                        Set the Brick's version variable
   -h, --help          Show help
       --java-version <version>
                        Set the Brick's java_version variable
+      --json           Emit a machine-readable file-sync result
       --limit <n>     Limit log, activity, or backup history (1-10000)
       --memory <size> Set the Brick's memory variable, for example 4GiB
       --mode <full|incremental>
@@ -1196,6 +1242,7 @@ Options:
                        Restore without taking a full backup first
       --no-start      Leave a created or reconfigured server stopped
       --profile <id>  Use a named profile
+      --plan          Plan a file sync without changing remote files
       --storage <default|local|id>
                        Select a backup destination
       --token <token> Use a token without saving it

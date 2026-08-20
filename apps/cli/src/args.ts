@@ -7,15 +7,18 @@ export interface CliArguments {
   command: Array<string>
   confirm?: string
   disk?: string
+  excludes: Array<string>
   follow: boolean
   gameVersion?: string
   help: boolean
   javaVersion?: string
+  json: boolean
   limit: number
   memory?: string
   mode?: "full" | "incremental"
   name?: string
   noOpen: boolean
+  plan: boolean
   profile?: string
   safetyBackup: boolean
   storage?: string
@@ -31,15 +34,18 @@ export function parseArguments(argv: Array<string>): CliArguments {
   let brick: string | undefined
   let confirm: string | undefined
   let disk: string | undefined
+  const excludes: Array<string> = []
   let follow = false
   let gameVersion: string | undefined
   let help = false
   let limit = 2_000
   let javaVersion: string | undefined
+  let json = false
   let memory: string | undefined
   let mode: "full" | "incremental" | undefined
   let name: string | undefined
   let noOpen = false
+  let plan = false
   let profile: string | undefined
   let safetyBackup = true
   let storage: string | undefined
@@ -69,10 +75,12 @@ export function parseArguments(argv: Array<string>): CliArguments {
     if (flag === "--brick") brick = value()
     else if (flag === "--confirm") confirm = value()
     else if (flag === "--disk") disk = value()
+    else if (flag === "--exclude") excludes.push(value())
     else if (flag === "--follow" || flag === "-f") follow = true
     else if (flag === "--game-version") gameVersion = value()
     else if (flag === "--help" || flag === "-h") help = true
     else if (flag === "--java-version") javaVersion = value()
+    else if (flag === "--json") json = true
     else if (flag === "--memory") memory = value()
     else if (flag === "--mode") {
       const parsed = z.enum(["full", "incremental"]).safeParse(value())
@@ -84,8 +92,8 @@ export function parseArguments(argv: Array<string>): CliArguments {
         })
       }
       mode = parsed.data
-    }
-    else if (flag === "--no-open") noOpen = true
+    } else if (flag === "--no-open") noOpen = true
+    else if (flag === "--plan") plan = true
     else if (flag === "--no-safety-backup") safetyBackup = false
     else if (flag === "--no-start") start = false
     else if (flag === "--version" || flag === "-v") version = true
@@ -118,20 +126,34 @@ export function parseArguments(argv: Array<string>): CliArguments {
       })
     } else command.push(argument)
   }
+  if (
+    (excludes.length > 0 || json || plan) &&
+    !(command[0] === "files" && command[1] === "sync")
+  ) {
+    throw commandError({
+      code: "invalid_arguments",
+      exitCode: 2,
+      message:
+        "--exclude, --json, and --plan are only supported by `kiln files sync`.",
+    })
+  }
   return {
     ...(brick ? { brick } : {}),
     command,
     ...(confirm ? { confirm } : {}),
     ...(disk ? { disk } : {}),
+    excludes,
     follow,
     ...(gameVersion ? { gameVersion } : {}),
     help,
     ...(javaVersion ? { javaVersion } : {}),
+    json,
     limit,
     ...(memory ? { memory } : {}),
     ...(mode ? { mode } : {}),
     ...(name ? { name } : {}),
     noOpen,
+    plan,
     ...(profile ? { profile } : {}),
     safetyBackup,
     ...(storage ? { storage } : {}),
