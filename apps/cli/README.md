@@ -71,13 +71,17 @@ through `--profile`.
 Interactive logins store credentials in macOS Keychain or Windows Credential
 Manager. The profile URL and credential reference remain in the owner-only Kiln
 config file. Existing plaintext profiles migrate automatically the next time the
-CLI reads them. If a native manager is present but temporarily cannot store the
-credential, the CLI leaves the version 1 config unchanged and asks you to retry.
+CLI needs their saved credential. Explicit token overrides bypass migration,
+and login or logout can replace or remove a legacy profile directly. If a
+native manager temporarily cannot store a legacy credential, the CLI uses the
+existing token for that command, leaves it pending, and retries on later use.
 
 When a supported system credential manager is unavailable, such as on a
 headless Linux host, the CLI falls back to storing the credential in the
-owner-only config file and prints a warning during login. `kiln logout` revokes
-the active credential, removes its profile, and deletes its system credential.
+owner-only config file and prints a warning during login. If a manager exists
+but cannot store the credential, the warning identifies that failure instead.
+`kiln logout` revokes the active credential, removes its profile, and deletes
+its system credential.
 
 ## Discover and operate
 

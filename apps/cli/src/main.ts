@@ -597,6 +597,10 @@ const loginEffect = Effect.fn("cli.login")(function* (
   writeLine(`Logged in to ${url} with profile "${profile}".`)
   if (saved.protected) {
     writeLine(`Credential stored in ${saved.credentialManagerLabel}.`)
+  } else if (saved.fallbackReason === "manager-failed") {
+    writeLine(
+      `Warning: ${saved.credentialManagerLabel} could not store the credential; it is stored in the owner-only Kiln config file.`
+    )
   } else {
     writeLine(
       "Warning: No system credential manager is available; the credential is stored in the owner-only Kiln config file."
@@ -630,7 +634,10 @@ const pollForTokenEffect = Effect.fn("cli.login.poll")(function* (
 })
 
 const logoutEffect = Effect.fn("cli.logout")(function* (args: CliArguments) {
-  const session = yield* resolveSessionEffect(args).pipe(Effect.option)
+  const session = yield* resolveSessionEffect({
+    ...args,
+    migrateStoredCredential: false,
+  }).pipe(Effect.option)
   if (session._tag === "Some") {
     yield* apiJsonEffect(
       session.value,

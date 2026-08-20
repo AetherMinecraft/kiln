@@ -66,10 +66,20 @@ describe("CLI credential persistence", () => {
       )
       const manager = memoryCredentialManager()
 
+      const before = await Effect.runPromise(
+        loadConfigEffect(fixture.options([manager]))
+      )
+      assert.strictEqual(before.version, 1)
+      assert.strictEqual(manager.passwords.size, 0)
+
+      const session = await Effect.runPromise(
+        resolveSessionEffect({}, fixture.options([manager]))
+      )
       const config = await Effect.runPromise(
         loadConfigEffect(fixture.options([manager]))
       )
 
+      assert.strictEqual(session.token, "kiln_cli_legacy_secret")
       assert.strictEqual(config.version, 2)
       const encoded = await readFile(fixture.path, "utf8")
       assert.notInclude(encoded, "kiln_cli_legacy_secret")
@@ -99,23 +109,25 @@ describe("CLI credential persistence", () => {
       await writeFile(fixture.path, `${JSON.stringify(legacy)}\n`, {
         mode: 0o600,
       })
-      const unavailable = failingCredentialManager()
+      const failing = failingCredentialManager()
 
-      await expect(
-        Effect.runPromise(loadConfigEffect(fixture.options([unavailable])))
-      ).rejects.toMatchObject({
-        code: "credential_store_failed",
-        retryable: true,
-      })
+      const session = await Effect.runPromise(
+        resolveSessionEffect({}, fixture.options([failing]))
+      )
 
+      assert.strictEqual(session.token, "kiln_cli_retry_secret")
+      assert.strictEqual(failing.setCalls, 1)
       assert.deepStrictEqual(
         JSON.parse(await readFile(fixture.path, "utf8")),
         legacy
       )
 
       const recovered = memoryCredentialManager()
+      await Effect.runPromise(
+        resolveSessionEffect({}, fixture.options([recovered]))
+      )
       const config = await Effect.runPromise(
-        loadConfigEffect(fixture.options([recovered]))
+        loadConfigEffect(fixture.options([]))
       )
       assert.strictEqual(config.version, 2)
       assert.notInclude(await readFile(fixture.path, "utf8"), "retry_secret")
@@ -146,11 +158,15 @@ describe("CLI credential persistence", () => {
         { mode: 0o600 }
       )
 
+      const session = await Effect.runPromise(
+        resolveSessionEffect({}, fixture.options([]))
+      )
       const config = await Effect.runPromise(
         loadConfigEffect(fixture.options([]))
       )
 
-      assert.strictEqual(config.version, 2)
+      assert.strictEqual(session.token, "kiln_cli_headless_secret")
+      if (config.version !== 2) throw new Error("Expected version 2 config")
       assert.deepStrictEqual(config.profiles.headless?.credential, {
         kind: "file",
         token: "kiln_cli_headless_secret",
@@ -215,9 +231,9 @@ describe("CLI credential persistence", () => {
   it("uses an owner-only file fallback during explicit session save", async () => {
     const fixture = await configFixture()
     try {
-      const unavailable: CredentialManager = {
-        id: "unavailable",
-        label: "Unavailable manager",
+      const failed: CredentialManager = {
+        id: "failing",
+        label: "Failing manager",
         deletePassword: async () => false,
         getPassword: async () => null,
         setPassword: async () => {
@@ -231,15 +247,251 @@ describe("CLI credential persistence", () => {
             token: "kiln_cli_file_secret",
             url: "https://kiln.example.test",
           },
-          fixture.options([unavailable])
+          fixture.options([failed])
         )
       )
 
       assert.isFalse(saved.protected)
+      assert.strictEqual(saved.fallbackReason, "manager-failed")
+      assert.strictEqual(saved.credentialManagerLabel, "Failing manager")
       const encoded = await readFile(fixture.path, "utf8")
       assert.include(encoded, "kiln_cli_file_secret")
       assert.include(encoded, '"kind": "file"')
       assert.strictEqual((await stat(fixture.path)).mode & 0o777, 0o600)
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  it("reports when no native credential manager is available", async () => {
+    const fixture = await configFixture()
+    try {
+      const saved = await Effect.runPromise(
+        saveSessionEffect(
+          {
+            profile: "headless",
+            token: "kiln_cli_headless_login_secret",
+            url: "https://kiln.example.test",
+          },
+          fixture.options([])
+        )
+      )
+
+      assert.isFalse(saved.protected)
+      assert.strictEqual(saved.fallbackReason, "manager-unavailable")
+      assert.strictEqual(saved.credentialManagerLabel, "the Kiln config file")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  it("bypasses legacy migration for explicit token sources", async () => {
+    const fixture = await configFixture()
+    try {
+      const legacy = {
+        activeProfile: "legacy",
+        profiles: {
+          legacy: {
+            token: "kiln_cli_stored_secret",
+            url: "https://kiln.example.test",
+          },
+        },
+        version: 1,
+      } as const
+      await writeFile(fixture.path, `${JSON.stringify(legacy)}\n`, {
+        mode: 0o600,
+      })
+      const manager = failingCredentialManager()
+
+      const fromFlag = await Effect.runPromise(
+        resolveSessionEffect(
+          { token: "kiln_cli_flag_secret" },
+          fixture.options([manager])
+        )
+      )
+      const fromEnvironment = await Effect.runPromise(
+        resolveSessionEffect(
+          {},
+          fixture.options([manager], {
+            KILN_TOKEN: "kiln_cli_environment_secret",
+          })
+        )
+      )
+
+      assert.strictEqual(fromFlag.token, "kiln_cli_flag_secret")
+      assert.strictEqual(fromEnvironment.token, "kiln_cli_environment_secret")
+      assert.strictEqual(manager.setCalls, 0)
+      assert.deepStrictEqual(
+        JSON.parse(await readFile(fixture.path, "utf8")),
+        legacy
+      )
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  it("stores a new login without first migrating the replaced token", async () => {
+    const fixture = await configFixture()
+    try {
+      await writeFile(
+        fixture.path,
+        `${JSON.stringify({
+          activeProfile: "replace",
+          profiles: {
+            replace: {
+              token: "kiln_cli_old_login_secret",
+              url: "https://old.example.test",
+            },
+          },
+          version: 1,
+        })}\n`,
+        { mode: 0o600 }
+      )
+      const manager = memoryCredentialManager()
+
+      const saved = await Effect.runPromise(
+        saveSessionEffect(
+          {
+            profile: "replace",
+            token: "kiln_cli_new_login_secret",
+            url: "https://new.example.test",
+          },
+          fixture.options([manager])
+        )
+      )
+      const encoded = await readFile(fixture.path, "utf8")
+
+      assert.isTrue(saved.protected)
+      assert.deepStrictEqual(
+        [...manager.passwords.values()],
+        ["kiln_cli_new_login_secret"]
+      )
+      assert.notInclude(encoded, "old_login_secret")
+      assert.notInclude(encoded, "new_login_secret")
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  it("replaces a legacy profile without migrating its old credential", async () => {
+    const fixture = await configFixture()
+    try {
+      await writeFile(
+        fixture.path,
+        `${JSON.stringify({
+          activeProfile: "replace",
+          profiles: {
+            keep: {
+              token: "kiln_cli_keep_secret",
+              url: "https://keep.example.test",
+            },
+            replace: {
+              token: "kiln_cli_old_secret",
+              url: "https://old.example.test",
+            },
+          },
+          version: 1,
+        })}\n`,
+        { mode: 0o600 }
+      )
+      const manager = failingCredentialManager()
+
+      const saved = await Effect.runPromise(
+        saveSessionEffect(
+          {
+            profile: "replace",
+            token: "kiln_cli_new_secret",
+            url: "https://new.example.test",
+          },
+          fixture.options([manager])
+        )
+      )
+      const config = await Effect.runPromise(
+        loadConfigEffect(fixture.options([]))
+      )
+
+      assert.strictEqual(saved.fallbackReason, "manager-failed")
+      assert.strictEqual(manager.setCalls, 1)
+      if (config.version !== 1) throw new Error("Expected version 1 config")
+      assert.deepStrictEqual(config.profiles.replace, {
+        token: "kiln_cli_new_secret",
+        url: "https://new.example.test",
+      })
+      assert.deepStrictEqual(config.profiles.keep, {
+        token: "kiln_cli_keep_secret",
+        url: "https://keep.example.test",
+      })
+      assert.notInclude(await readFile(fixture.path, "utf8"), "old_secret")
+
+      const recovered = memoryCredentialManager()
+      const session = await Effect.runPromise(
+        resolveSessionEffect({ profile: "keep" }, fixture.options([recovered]))
+      )
+      const migrated = await Effect.runPromise(
+        loadConfigEffect(fixture.options([]))
+      )
+
+      assert.strictEqual(session.token, "kiln_cli_keep_secret")
+      if (migrated.version !== 2) throw new Error("Expected version 2 config")
+      assert.strictEqual(migrated.profiles.keep?.credential.kind, "external")
+      assert.deepStrictEqual(migrated.profiles.replace?.credential, {
+        kind: "legacy-file",
+        token: "kiln_cli_new_secret",
+      })
+      assert.notInclude(
+        await readFile(fixture.path, "utf8"),
+        "kiln_cli_keep_secret"
+      )
+    } finally {
+      await fixture.cleanup()
+    }
+  })
+
+  it("removes a legacy profile without migrating any credential", async () => {
+    const fixture = await configFixture()
+    try {
+      await writeFile(
+        fixture.path,
+        `${JSON.stringify({
+          activeProfile: "remove",
+          profiles: {
+            keep: {
+              token: "kiln_cli_keep_secret",
+              url: "https://keep.example.test",
+            },
+            remove: {
+              token: "kiln_cli_remove_secret",
+              url: "https://remove.example.test",
+            },
+          },
+          version: 1,
+        })}\n`,
+        { mode: 0o600 }
+      )
+      const manager = failingCredentialManager()
+
+      const session = await Effect.runPromise(
+        resolveSessionEffect(
+          { migrateStoredCredential: false },
+          fixture.options([manager])
+        )
+      )
+      const removed = await Effect.runPromise(
+        removeSessionEffect("remove", fixture.options([manager]))
+      )
+      const config = await Effect.runPromise(
+        loadConfigEffect(fixture.options([]))
+      )
+
+      assert.strictEqual(session.token, "kiln_cli_remove_secret")
+      assert.isTrue(removed.removed)
+      assert.strictEqual(manager.setCalls, 0)
+      if (config.version !== 1) throw new Error("Expected version 1 config")
+      assert.isUndefined(config.profiles.remove)
+      assert.deepStrictEqual(config.profiles.keep, {
+        token: "kiln_cli_keep_secret",
+        url: "https://keep.example.test",
+      })
     } finally {
       await fixture.cleanup()
     }
@@ -291,16 +543,19 @@ function memoryCredentialManager(): CredentialManager & {
   }
 }
 
-function failingCredentialManager(): CredentialManager {
-  return {
-    id: "unavailable",
-    label: "Unavailable manager",
+function failingCredentialManager(): CredentialManager & { setCalls: number } {
+  const manager: CredentialManager & { setCalls: number } = {
+    id: "failing",
+    label: "Failing manager",
+    setCalls: 0,
     deletePassword: async () => false,
     getPassword: async () => null,
     setPassword: async () => {
+      manager.setCalls += 1
       throw new Error("unavailable")
     },
   }
+  return manager
 }
 
 async function configFixture() {
@@ -309,10 +564,11 @@ async function configFixture() {
   return {
     cleanup: () => rm(directory, { force: true, recursive: true }),
     options: (
-      credentialManagers: ReadonlyArray<CredentialManager>
+      credentialManagers: ReadonlyArray<CredentialManager>,
+      environment: NodeJS.ProcessEnv = {}
     ): ConfigOptions => ({
       credentialManagers,
-      environment: { KILN_CONFIG: path },
+      environment: { ...environment, KILN_CONFIG: path },
     }),
     path,
   }

@@ -21,10 +21,12 @@ available; do not stop at providing command examples.
   `KILN_TOKEN` or `--token` only when the user deliberately provides an
   ephemeral credential, and keep it out of reported command output.
 - Interactive login stores credentials in macOS Keychain or Windows Credential
-  Manager. Existing plaintext profiles migrate when the CLI next reads them.
-  A failed native migration leaves the version 1 config unchanged so a later
-  command can retry. Headless or unsupported systems fall back to the
-  owner-only config file and report that fallback during login.
+  Manager. Existing plaintext profiles migrate when their saved credential is
+  next used; explicit tokens bypass migration, and login or logout can replace
+  or remove a legacy profile directly. A failed native migration leaves the
+  plaintext credential pending so later use can retry. Headless or unsupported
+  systems fall back to the owner-only config file and report that fallback
+  during login.
 - Do not inspect the saved config file unless authentication or profile
   resolution itself is being debugged. If inspection is necessary, redact the
   complete token value.
