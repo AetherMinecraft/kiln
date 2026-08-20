@@ -20,6 +20,13 @@ available; do not stop at providing command examples.
 - Never print, copy, or commit a Kiln token. Prefer saved profiles. Use
   `KILN_TOKEN` or `--token` only when the user deliberately provides an
   ephemeral credential, and keep it out of reported command output.
+- Interactive login stores credentials in macOS Keychain or Windows Credential
+  Manager. Existing plaintext profiles migrate when their saved credential is
+  next used; explicit tokens bypass migration, and login or logout can replace
+  or remove a legacy profile directly. A failed native migration leaves the
+  plaintext credential pending so later use can retry. Headless or unsupported
+  systems fall back to the owner-only config file and report that fallback
+  during login.
 - Do not inspect the saved config file unless authentication or profile
   resolution itself is being debugged. If inspection is necessary, redact the
   complete token value.
@@ -51,6 +58,9 @@ kiln login https://hearth.example.com --profile staging --name workstation
 `kiln login` targets `https://kiln.site` by default and normally opens a
 browser. Add `--no-open` when the environment cannot launch one. Do not start a
 new login when an authenticated profile already targets the requested Hearth.
+`kiln logout` revokes the credential before removing both the saved profile and
+its system credential. If native credential deletion fails, the CLI reports a
+warning after removing the profile.
 
 Use `--profile <name>` on any command to select a saved profile. `KILN_URL`,
 `KILN_TOKEN`, and `KILN_CONFIG` support isolated automation, but prefer the
@@ -170,20 +180,24 @@ column is `incremental` (restic snapshots, the server default) or `full`
 (portable zip archives).
 
 Create a manual backup with a reference from `backups targets`. Server backups
-default to incremental restic snapshots stored on the Relay. Pass `--mode full`
-for a portable zip, which can also use S3. Incremental mode cannot use S3.
+default to incremental restic snapshots stored on the Relay or an S3
+destination. Pass `--mode full` for a portable zip, which can also use local or
+S3 storage. Incremental mode accepts exactly one destination.
 
 ```sh
 kiln backups create server <relay-id>:<instance-id> --name "Before update"
+kiln backups create server <relay-id>:<instance-id> --storage <destination-uuid>
 kiln backups create server <relay-id>:<instance-id> --mode full --storage local
 kiln backups create database <relay-id>:<database-id> --name "Before migration"
 kiln backups create platform <relay-id> --name "Before Hearth update"
 ```
 
-The default destination for full archives follows the server backup policy and
-otherwise uses Relay-local storage. Override it explicitly when needed:
+The default destination follows the server backup policy and otherwise uses
+Relay-local storage. Override it explicitly when needed:
 
 ```sh
+kiln backups create server <server> --storage local
+kiln backups create server <server> --storage <destination-uuid>
 kiln backups create server <server> --mode full --storage local
 kiln backups create server <server> --mode full --storage <destination-uuid>
 ```

@@ -13,7 +13,7 @@ import {
   saveBackupStorageEffect,
   setBackupPolicyStorageEffect,
   type BackupStorageRecord,
-} from "@/effect/backup-storage"
+} from "@/backups/destinations/s3"
 import { runAppEffect } from "@/effect/runtime"
 import {
   hasPlatformPermission,
@@ -24,7 +24,7 @@ import {
   normalizeS3Endpoint,
   verifyS3BackupCredential,
   type S3BackupCredential,
-} from "@/lib/backup-storage-s3"
+} from "@/backups/destinations/s3"
 import { requireAuthenticatedUser } from "@/server/auth"
 
 const backupStorageIdSchema = z.uuid()
@@ -182,7 +182,12 @@ export const setPreferredBackupStorage = createServerFn({ method: "POST" })
         "backupStorage.loadPreferred",
         loadBackupStorageEffect(data.storageId)
       )
-      if (!storage || !canUseStorage(storage, user.id) || !storage.enabled) {
+      if (
+        !storage ||
+        !canUseStorage(storage, user.id) ||
+        !storage.enabled ||
+        storage.deleting
+      ) {
         throw new Error("Backup destination is unavailable")
       }
     }

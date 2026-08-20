@@ -12,7 +12,7 @@ import {
   clearFailedFinalInstanceDeletionEffect,
   getFinalInstanceDeletionEffect,
   listPendingFinalInstanceDeletionsEffect,
-  markIncrementalInstanceBackupsDeletedEffect,
+  purgeInstanceBackupRepositoriesEffect,
   reserveInstanceBackupEffect,
   updateFinalInstanceDeletionEffect,
   type FinalInstanceDeletion,
@@ -199,13 +199,6 @@ async function deleteFinalizedInstanceAttempt(
     "domains.instance.finalDelete",
     deleteInstanceDomainEffect(relay.id, deletion.targetId)
   )
-  await runAppEffect(
-    "backups.finalDelete.markIncremental",
-    markIncrementalInstanceBackupsDeletedEffect(
-      relay.id,
-      deletion.targetId
-    )
-  )
   const relayDeletion = await Effect.runPromise(
     Effect.result(
       Effect.tryPromise({
@@ -233,6 +226,10 @@ async function deleteFinalizedInstanceAttempt(
       throw relayDeletion.failure
     }
   }
+  await runAppEffect(
+    "backups.finalDelete.purgeRepositories",
+    purgeInstanceBackupRepositoriesEffect(relay.id, deletion.targetId)
+  )
   await runAppEffect(
     "instances.finalDelete.finalize",
     finalizeInstanceDeletionEffect(relay.id, deletion.targetId)
