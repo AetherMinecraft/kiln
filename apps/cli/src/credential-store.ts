@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process"
 import { win32 as windowsPath } from "node:path"
 
+import { Result } from "effect"
+
 export const KILN_CREDENTIAL_SERVICE = "site.kiln.cli"
 
 export interface CredentialManager {
@@ -19,10 +21,6 @@ export interface CredentialCommand {
   arguments: ReadonlyArray<string>
   executable: string
   input?: string
-  promptResponses?: ReadonlyArray<{
-    prompt: string
-    response: string
-  }>
 }
 
 export interface CredentialCommandResult {
@@ -48,67 +46,39 @@ export function credentialManagersForPlatform(
 export function macosKeychainCredentialManager(
   run: CredentialCommandRunner = runCredentialCommand
 ): CredentialManager {
-  const baseArguments = (account: string) => [
-    "-a",
-    account,
-    "-s",
-    KILN_CREDENTIAL_SERVICE,
-  ]
+  const command = (
+    operation: "delete" | "get" | "set",
+    account: string,
+    password?: string
+  ): CredentialCommand => ({
+    arguments: ["-l", "JavaScript", "-e", MACOS_KEYCHAIN_SCRIPT],
+    executable: "/usr/bin/osascript",
+    input: JSON.stringify({
+      account,
+      operation,
+      password,
+      service: KILN_CREDENTIAL_SERVICE,
+    }),
+  })
   return {
     id: "macos-keychain-v1",
     label: "macOS Keychain",
     deletePassword: async (account, signal) => {
-      const result = await run(
-        {
-          arguments: ["delete-generic-password", ...baseArguments(account)],
-          executable: "/usr/bin/security",
-        },
-        signal
-      )
-      if (result.exitCode === 0) return true
-      if (result.exitCode === 44) return false
-      throw credentialCommandFailure("delete a macOS Keychain credential")
+      const result = await run(command("delete", account), signal)
+      if (result.exitCode !== 0) {
+        throw credentialCommandFailure("delete a macOS Keychain credential")
+      }
+      return parseMacosKeychainResult(result.stdout).deleted === true
     },
     getPassword: async (account, signal) => {
-      const result = await run(
-        {
-          arguments: ["find-generic-password", ...baseArguments(account), "-w"],
-          executable: "/usr/bin/security",
-        },
-        signal
-      )
-      if (result.exitCode === 44) return null
+      const result = await run(command("get", account), signal)
       if (result.exitCode !== 0) {
         throw credentialCommandFailure("read a macOS Keychain credential")
       }
-      return trimTrailingLineBreak(result.stdout)
+      return parseMacosKeychainResult(result.stdout).password ?? null
     },
     setPassword: async (account, password, signal) => {
-      if (/\r|\n/u.test(password)) {
-        throw new Error("Kiln credentials cannot contain line breaks")
-      }
-      const result = await run(
-        {
-          arguments: [
-            "add-generic-password",
-            "-U",
-            ...baseArguments(account),
-            "-w",
-          ],
-          executable: "/usr/bin/security",
-          promptResponses: [
-            {
-              prompt: "password data for new item:",
-              response: `${password}\n`,
-            },
-            {
-              prompt: "retype password for new item:",
-              response: `${password}\n`,
-            },
-          ],
-        },
-        signal
-      )
+      const result = await run(command("set", account, password), signal)
       if (result.exitCode !== 0) {
         throw credentialCommandFailure("store a macOS Keychain credential")
       }
@@ -182,9 +152,6 @@ export function runCredentialCommand(
     })
     const stdout: Array<Buffer> = []
     const stderr: Array<Buffer> = []
-    const promptResponses = command.promptResponses ?? []
-    let nextPrompt = 0
-    let promptBuffer = ""
     let settled = false
     const finish = (result: CredentialCommandResult) => {
       if (settled) return
@@ -192,23 +159,7 @@ export function runCredentialCommand(
       resolvePromise(result)
     }
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr.push(chunk)
-      if (nextPrompt >= promptResponses.length) return
-      promptBuffer += chunk.toString("utf8")
-      while (nextPrompt < promptResponses.length) {
-        const promptResponse = promptResponses[nextPrompt]
-        if (promptResponse === undefined) break
-        const promptIndex = promptBuffer.indexOf(promptResponse.prompt)
-        if (promptIndex === -1) break
-        promptBuffer = promptBuffer.slice(
-          promptIndex + promptResponse.prompt.length
-        )
-        child.stdin.write(promptResponse.response)
-        nextPrompt += 1
-        if (nextPrompt === promptResponses.length) child.stdin.end()
-      }
-    })
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
     child.once("error", (cause) => {
       if (settled) return
       settled = true
@@ -221,8 +172,97 @@ export function runCredentialCommand(
         stdout: Buffer.concat(stdout).toString("utf8"),
       })
     )
-    if (promptResponses.length === 0) child.stdin.end(command.input ?? "")
+    child.stdin.end(command.input ?? "")
   })
+}
+
+const MACOS_KEYCHAIN_SCRIPT = String.raw`
+ObjC.import("Foundation")
+ObjC.import("Security")
+ObjC.bindFunction("SecItemAdd", ["int", ["id", "id *"]])
+ObjC.bindFunction("SecItemCopyMatching", ["int", ["id", "id *"]])
+
+const inputData = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile
+const inputText = ObjC.unwrap(
+  $.NSString.alloc.initWithDataEncoding(inputData, $.NSUTF8StringEncoding)
+)
+const input = JSON.parse(inputText)
+const itemNotFound = Number($.errSecItemNotFound)
+
+function dictionary() {
+  return $.NSMutableDictionary.dictionary
+}
+
+function itemQuery() {
+  const query = dictionary()
+  query.setObjectForKey($("genp"), $("class"))
+  query.setObjectForKey($(input.account), $("acct"))
+  query.setObjectForKey($(input.service), $("svce"))
+  return query
+}
+
+function passwordData() {
+  return $(input.password).dataUsingEncoding($.NSUTF8StringEncoding)
+}
+
+function ensureSuccess(status) {
+  if (status !== Number($.errSecSuccess)) {
+    throw new Error("Keychain Services failed with status " + status)
+  }
+}
+
+function main() {
+  const query = itemQuery()
+
+  if (input.operation === "set") {
+    const updates = dictionary()
+    updates.setObjectForKey(passwordData(), $("v_Data"))
+    let status = Number($.SecItemUpdate(query, updates))
+    if (status === itemNotFound) {
+      const item = $.NSMutableDictionary.dictionaryWithDictionary(query)
+      item.setObjectForKey(passwordData(), $("v_Data"))
+      status = Number($.SecItemAdd(item, Ref()))
+    }
+    ensureSuccess(status)
+    return JSON.stringify({ stored: true })
+  }
+
+  if (input.operation === "get") {
+    query.setObjectForKey($.NSNumber.numberWithBool(true), $("r_Data"))
+    const result = Ref()
+    const status = Number($.SecItemCopyMatching(query, result))
+    if (status === itemNotFound) return JSON.stringify({ password: null })
+    ensureSuccess(status)
+    const password = ObjC.unwrap(
+      $.NSString.alloc.initWithDataEncoding(result[0], $.NSUTF8StringEncoding)
+    )
+    return JSON.stringify({ password })
+  }
+
+  if (input.operation === "delete") {
+    const status = Number($.SecItemDelete(query))
+    if (status === itemNotFound) return JSON.stringify({ deleted: false })
+    ensureSuccess(status)
+    return JSON.stringify({ deleted: true })
+  }
+
+  throw new Error("Unsupported Keychain operation")
+}
+
+main()
+`
+
+interface MacosKeychainResult {
+  deleted?: boolean
+  password?: string | null
+}
+
+function parseMacosKeychainResult(stdout: string): MacosKeychainResult {
+  return Result.try(() => JSON.parse(stdout) as MacosKeychainResult).pipe(
+    Result.getOrThrowWith(() =>
+      credentialCommandFailure("parse a macOS Keychain response")
+    )
+  )
 }
 
 function powershellCommand(script: string, input: string): CredentialCommand {

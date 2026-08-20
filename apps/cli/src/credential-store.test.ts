@@ -45,24 +45,36 @@ describe("CLI credential managers", () => {
     await manager.setPassword("profile-account", "kiln_cli_secret")
 
     assert.strictEqual(commands.length, 1)
-    assert.strictEqual(commands[0]?.executable, "/usr/bin/security")
+    assert.strictEqual(commands[0]?.executable, "/usr/bin/osascript")
     assert.notInclude(commands[0]?.arguments, "kiln_cli_secret")
-    assert.deepStrictEqual(commands[0]?.promptResponses, [
-      {
-        prompt: "password data for new item:",
-        response: "kiln_cli_secret\n",
-      },
-      {
-        prompt: "retype password for new item:",
-        response: "kiln_cli_secret\n",
-      },
+    assert.notInclude(commands[0]?.arguments, "profile-account")
+    assert.deepStrictEqual(commands[0]?.arguments.slice(0, 3), [
+      "-l",
+      "JavaScript",
+      "-e",
     ])
-    assert.strictEqual(commands[0]?.arguments.at(-1), "-w")
+    assert.include(
+      commands[0]?.arguments[3] ?? "",
+      'ObjC.bindFunction("SecItemAdd"'
+    )
+    assert.include(
+      commands[0]?.arguments[3] ?? "",
+      "$.SecItemUpdate(query, updates)"
+    )
+    assert.deepStrictEqual(JSON.parse(commands[0]?.input ?? ""), {
+      account: "profile-account",
+      operation: "set",
+      password: "kiln_cli_secret",
+      service: "site.kiln.cli",
+    })
   })
 
   it("reads and deletes macOS Keychain credentials", async () => {
     const commands: Array<CredentialCommand> = []
-    const results = [success("kiln_cli_secret\n"), success()]
+    const results = [
+      success('{"password":"kiln_cli_secret"}\n'),
+      success('{"deleted":true}\n'),
+    ]
     const manager = macosKeychainCredentialManager(async (command) => {
       commands.push(command)
       return results.shift() ?? success()
@@ -73,8 +85,8 @@ describe("CLI credential managers", () => {
       "kiln_cli_secret"
     )
     assert.isTrue(await manager.deletePassword("profile-account"))
-    assert.strictEqual(commands[0]?.arguments[0], "find-generic-password")
-    assert.strictEqual(commands[1]?.arguments[0], "delete-generic-password")
+    assert.strictEqual(JSON.parse(commands[0]?.input ?? "").operation, "get")
+    assert.strictEqual(JSON.parse(commands[1]?.input ?? "").operation, "delete")
   })
 
   it("treats missing native credentials as absent", async () => {
@@ -85,7 +97,9 @@ describe("CLI credential managers", () => {
     })
 
     assert.isNull(
-      await macosKeychainCredentialManager(missing).getPassword("missing")
+      await macosKeychainCredentialManager(async () =>
+        success('{"password":null}\n')
+      ).getPassword("missing")
     )
     assert.isFalse(
       await windowsCredentialManager(missing).deletePassword("missing")
@@ -129,5 +143,23 @@ describe("CLI credential managers", () => {
 
     assert.strictEqual(result.exitCode, 0)
     assert.strictEqual(result.stdout, "complete")
+  })
+
+  it("passes command input through stdin without user interaction", async () => {
+    const readInput = [
+      `process.stdin.setEncoding("utf8")`,
+      `let input = ""`,
+      `process.stdin.on("data", (chunk) => { input += chunk })`,
+      `process.stdin.on("end", () => process.stdout.write(String(input.length)))`,
+    ].join(";")
+
+    const result = await runCredentialCommand({
+      arguments: ["-e", readInput],
+      executable: process.execPath,
+      input: "credential-data",
+    })
+
+    assert.strictEqual(result.exitCode, 0)
+    assert.strictEqual(result.stdout, "15")
   })
 })
