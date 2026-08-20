@@ -10,7 +10,7 @@ import {
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 
-import { Effect, Exit } from "effect"
+import { Effect } from "effect"
 import { z } from "zod"
 
 import {
@@ -59,6 +59,7 @@ const legacyConfigSchema = z.object({
 type KilnConfig = z.infer<typeof configSchema>
 type KilnCredential = z.infer<typeof profileSchema>["credential"]
 type LegacyKilnConfig = z.infer<typeof legacyConfigSchema>
+type CredentialFallbackPolicy = "allow-on-failure" | "unavailable-only"
 
 export interface KilnSession {
   profile: string
@@ -168,7 +169,12 @@ export const saveSessionEffect = Effect.fn("cli.config.saveSession")(function* (
     existing && existing.kind === "external"
       ? existing.account
       : credentialAccount(configPath(options), session.profile)
-  const saved = yield* saveCredentialEffect(account, session.token, options)
+  const saved = yield* saveCredentialEffect(
+    account,
+    session.token,
+    options,
+    "allow-on-failure"
+  )
   const next: KilnConfig = {
     activeProfile: session.profile,
     profiles: {
@@ -255,7 +261,8 @@ function migrateLegacyConfigEffect(
       const saved = yield* saveCredentialEffect(
         credentialAccount(path, profile),
         value.token,
-        options
+        options,
+        "unavailable-only"
       )
       profiles[profile] = { credential: saved.credential, url: value.url }
     }
@@ -313,16 +320,23 @@ function loadCredentialEffect(
 function saveCredentialEffect(
   account: string,
   token: string,
-  options: ConfigOptions
+  options: ConfigOptions,
+  fallbackPolicy: CredentialFallbackPolicy
 ) {
   return Effect.gen(function* () {
-    for (const manager of credentialManagers(options)) {
-      const stored = yield* Effect.exit(
-        Effect.tryPromise((signal) =>
-          manager.setPassword(account, token, signal)
-        )
+    const managers = credentialManagers(options)
+    let lastFailure: unknown
+    for (const manager of managers) {
+      const stored = yield* Effect.tryPromise((signal) =>
+        manager.setPassword(account, token, signal)
+      ).pipe(
+        Effect.as(true),
+        Effect.catch((cause) => {
+          lastFailure = cause
+          return Effect.succeed(false)
+        })
       )
-      if (Exit.isSuccess(stored)) {
+      if (stored) {
         return {
           credential: {
             account,
@@ -336,6 +350,15 @@ function saveCredentialEffect(
           } satisfies SavedSession,
         }
       }
+    }
+    if (managers.length > 0 && fallbackPolicy === "unavailable-only") {
+      const labels = managers.map((manager) => manager.label).join(" or ")
+      return yield* commandError({
+        cause: lastFailure,
+        code: "credential_store_failed",
+        message: `Could not migrate the saved Kiln credential to ${labels}. The existing config was not changed; unlock the credential manager and retry.`,
+        retryable: true,
+      })
     }
     return {
       credential: { kind: "file", token } satisfies KilnCredential,

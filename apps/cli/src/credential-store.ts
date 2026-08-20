@@ -151,7 +151,7 @@ export function windowsCredentialManager(
           "read a Windows Credential Manager entry"
         )
       }
-      return result.stdout
+      return trimTrailingLineBreak(result.stdout)
     },
     setPassword: async (account, password, signal) => {
       const result = await run(
@@ -214,7 +214,7 @@ export function runCredentialCommand(
       settled = true
       rejectPromise(cause)
     })
-    child.once("exit", (code) =>
+    child.once("close", (code) =>
       finish({
         exitCode: code ?? 1,
         stderr: Buffer.concat(stderr).toString("utf8"),

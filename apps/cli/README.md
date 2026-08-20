@@ -71,7 +71,8 @@ through `--profile`.
 Interactive logins store credentials in macOS Keychain or Windows Credential
 Manager. The profile URL and credential reference remain in the owner-only Kiln
 config file. Existing plaintext profiles migrate automatically the next time the
-CLI reads them.
+CLI reads them. If a native manager is present but temporarily cannot store the
+credential, the CLI leaves the version 1 config unchanged and asks you to retry.
 
 When a supported system credential manager is unavailable, such as on a
 headless Linux host, the CLI falls back to storing the credential in the

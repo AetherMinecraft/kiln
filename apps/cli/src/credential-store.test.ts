@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest"
 import {
   credentialManagersForPlatform,
   macosKeychainCredentialManager,
+  runCredentialCommand,
   windowsCredentialManager,
   type CredentialCommand,
   type CredentialCommandResult,
@@ -112,5 +113,21 @@ describe("CLI credential managers", () => {
       password: "kiln_cli_secret",
       target: "site.kiln.cli:profile-account",
     })
+  })
+
+  it("waits for inherited command output to close", async () => {
+    const delayedOutput = [
+      `const { spawn } = require("node:child_process")`,
+      `const child = spawn(process.execPath, ["-e", "setTimeout(() => process.stdout.write('complete'), 25)"], { stdio: ["ignore", process.stdout, "ignore"] })`,
+      `child.unref()`,
+    ].join(";")
+
+    const result = await runCredentialCommand({
+      arguments: ["-e", delayedOutput],
+      executable: process.execPath,
+    })
+
+    assert.strictEqual(result.exitCode, 0)
+    assert.strictEqual(result.stdout, "complete")
   })
 })
