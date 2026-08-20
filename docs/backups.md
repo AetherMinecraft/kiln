@@ -123,6 +123,11 @@ and registering its typed definition. Shared orchestration should not grow a
 new destination-specific branch. Wire-contract and persistence migrations are
 still required when a new kind introduces a new task shape or stored
 configuration; Local and S3 retain their existing shapes in this refactor.
+Today, `storageId === null` is also the persisted discriminator for Relay-local
+storage. A third configured kind therefore needs a persistence discriminator
+and updates to the shared selectors that translate stored artifacts into the
+registry kind. The registries centralize destination behavior, but they are not
+dynamic plugin loading.
 
 S3 credentials never go to a game container and are not returned to the
 browser. Full archives still use Hearth-signed, narrowly scoped object

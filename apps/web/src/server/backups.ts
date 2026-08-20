@@ -29,7 +29,10 @@ import {
 } from "@/effect/backups"
 import { listManagedDatabaseRecordsEffect } from "@/effect/managed-databases"
 import { loadBackupStorageEffect } from "@/backups/destinations/s3"
-import { prepareBackupDestinationDownload } from "@/backups/destinations"
+import {
+  prepareBackupDestinationDownload,
+  resolveBackupRelayForOperation,
+} from "@/backups/destinations"
 import { runAppEffect } from "@/effect/runtime"
 import {
   hasPlatformPermission,
@@ -388,10 +391,10 @@ export const cancelBackup = createServerFn({ method: "POST" })
     if (!hasBackupPermission(user, grants, backup, "backup.create")) {
       throw new Error("You do not have permission to cancel this backup")
     }
-    const relay =
-      artifact.storageId === null
-        ? await requireBackupRelay(backup.relayId)
-        : null
+    const relay = await resolveBackupRelayForOperation(
+      { operation: "cancel", relayId: backup.relayId },
+      requireBackupRelay
+    )
     const task = relayBackupTaskSchema.parse(
       await relayRpc(
         relay,
@@ -550,7 +553,14 @@ export const getBackupDownloadUrl = createServerFn({ method: "POST" })
     }
     const filename = artifact.filename ?? backup.filename
     if (!filename) throw new Error("Backup filename is unavailable")
-    const relay = await requireBackupRelay(backup.relayId)
+    const relay = await resolveBackupRelayForOperation(
+      {
+        operation: "download",
+        relayId: backup.relayId,
+        storageId: artifact.storageId,
+      },
+      requireBackupRelay
+    )
     const { download, sourceName } = await runAppEffect(
       "backups.prepareDownload",
       prepareBackupDestinationDownload({
