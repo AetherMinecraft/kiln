@@ -45,19 +45,19 @@ describe("CLI credential managers", () => {
     await manager.setPassword("profile-account", "kiln_cli_secret")
 
     assert.strictEqual(commands.length, 1)
-    assert.strictEqual(commands[0]?.executable, "/usr/bin/security")
+    assert.strictEqual(commands[0]?.executable, "/usr/bin/expect")
     assert.notInclude(commands[0]?.arguments, "kiln_cli_secret")
-    assert.deepStrictEqual(commands[0]?.promptResponses, [
-      {
-        prompt: "password data for new item:",
-        response: "kiln_cli_secret\n",
-      },
-      {
-        prompt: "retype password for new item:",
-        response: "kiln_cli_secret\n",
-      },
-    ])
-    assert.strictEqual(commands[0]?.arguments.at(-1), "-w")
+    assert.notInclude(commands[0]?.arguments, "profile-account")
+    assert.strictEqual(commands[0]?.arguments[0], "-c")
+    assert.include(
+      commands[0]?.arguments[1] ?? "",
+      "/usr/bin/security add-generic-password"
+    )
+    assert.include(
+      commands[0]?.arguments[1] ?? "",
+      "password data for new item:"
+    )
+    assert.strictEqual(commands[0]?.input, "profile-account\nkiln_cli_secret")
   })
 
   it("reads and deletes macOS Keychain credentials", async () => {
@@ -129,5 +129,23 @@ describe("CLI credential managers", () => {
 
     assert.strictEqual(result.exitCode, 0)
     assert.strictEqual(result.stdout, "complete")
+  })
+
+  it("passes command input through stdin without user interaction", async () => {
+    const readInput = [
+      `process.stdin.setEncoding("utf8")`,
+      `let input = ""`,
+      `process.stdin.on("data", (chunk) => { input += chunk })`,
+      `process.stdin.on("end", () => process.stdout.write(String(input.length)))`,
+    ].join(";")
+
+    const result = await runCredentialCommand({
+      arguments: ["-e", readInput],
+      executable: process.execPath,
+      input: "credential-data",
+    })
+
+    assert.strictEqual(result.exitCode, 0)
+    assert.strictEqual(result.stdout, "15")
   })
 })

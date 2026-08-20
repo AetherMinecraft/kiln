@@ -19,10 +19,6 @@ export interface CredentialCommand {
   arguments: ReadonlyArray<string>
   executable: string
   input?: string
-  promptResponses?: ReadonlyArray<{
-    prompt: string
-    response: string
-  }>
 }
 
 export interface CredentialCommandResult {
@@ -84,28 +80,14 @@ export function macosKeychainCredentialManager(
       return trimTrailingLineBreak(result.stdout)
     },
     setPassword: async (account, password, signal) => {
-      if (/\r|\n/u.test(password)) {
+      if (/\r|\n/u.test(account) || /\r|\n/u.test(password)) {
         throw new Error("Kiln credentials cannot contain line breaks")
       }
       const result = await run(
         {
-          arguments: [
-            "add-generic-password",
-            "-U",
-            ...baseArguments(account),
-            "-w",
-          ],
-          executable: "/usr/bin/security",
-          promptResponses: [
-            {
-              prompt: "password data for new item:",
-              response: `${password}\n`,
-            },
-            {
-              prompt: "retype password for new item:",
-              response: `${password}\n`,
-            },
-          ],
+          arguments: ["-c", macosSetPasswordScript],
+          executable: "/usr/bin/expect",
+          input: `${account}\n${password}`,
         },
         signal
       )
@@ -182,9 +164,6 @@ export function runCredentialCommand(
     })
     const stdout: Array<Buffer> = []
     const stderr: Array<Buffer> = []
-    const promptResponses = command.promptResponses ?? []
-    let nextPrompt = 0
-    let promptBuffer = ""
     let settled = false
     const finish = (result: CredentialCommandResult) => {
       if (settled) return
@@ -192,23 +171,7 @@ export function runCredentialCommand(
       resolvePromise(result)
     }
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr.push(chunk)
-      if (nextPrompt >= promptResponses.length) return
-      promptBuffer += chunk.toString("utf8")
-      while (nextPrompt < promptResponses.length) {
-        const promptResponse = promptResponses[nextPrompt]
-        if (promptResponse === undefined) break
-        const promptIndex = promptBuffer.indexOf(promptResponse.prompt)
-        if (promptIndex === -1) break
-        promptBuffer = promptBuffer.slice(
-          promptIndex + promptResponse.prompt.length
-        )
-        child.stdin.write(promptResponse.response)
-        nextPrompt += 1
-        if (nextPrompt === promptResponses.length) child.stdin.end()
-      }
-    })
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
     child.once("error", (cause) => {
       if (settled) return
       settled = true
@@ -221,9 +184,43 @@ export function runCredentialCommand(
         stdout: Buffer.concat(stdout).toString("utf8"),
       })
     )
-    if (promptResponses.length === 0) child.stdin.end(command.input ?? "")
+    child.stdin.end(command.input ?? "")
   })
 }
+
+const macosSetPasswordScript = String.raw`
+log_user 0
+set timeout 15
+set account [gets stdin]
+set password [read stdin]
+
+proc exit_with_child_status {} {
+  set result [wait]
+  exit [lindex $result 3]
+}
+
+proc exit_after_timeout {} {
+  close
+  catch wait
+  exit 124
+}
+
+spawn -noecho /usr/bin/security add-generic-password -U -a $account -s ${KILN_CREDENTIAL_SERVICE} -w
+expect {
+  -exact "password data for new item:" { send -- "$password\r" }
+  eof { exit_with_child_status }
+  timeout { exit_after_timeout }
+}
+expect {
+  -exact "retype password for new item:" { send -- "$password\r" }
+  eof { exit_with_child_status }
+  timeout { exit_after_timeout }
+}
+expect {
+  eof { exit_with_child_status }
+  timeout { exit_after_timeout }
+}
+`
 
 function powershellCommand(script: string, input: string): CredentialCommand {
   return {
