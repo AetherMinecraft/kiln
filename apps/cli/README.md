@@ -91,6 +91,10 @@ kiln files write <relay-id>:<instance-id> server.properties ./server.properties
 kiln files download <relay-id>:<instance-id> logs/latest.log ./latest.log
 kiln files upload <relay-id>:<instance-id> ./plugins/example.jar plugins/example.jar
 kiln files upload <relay-id>:<instance-id> https://example.com/example.jar plugins/example.jar
+kiln backups list --limit 200
+kiln backups create server <relay-id>:<instance-id> --name "Before update"
+kiln backups create server <relay-id>:<instance-id> --mode full
+kiln backup download <backup-id>
 kiln server delete <relay-id>:<instance-id> --confirm <relay-id>:<instance-id>
 ```
 

@@ -7,6 +7,8 @@ import { Database } from "@/effect/database"
 import { BackupLimitError, BackupStorageError } from "@/effect/errors"
 import {
   backupReservation,
+  canReuseBackupExport,
+  clampBackupExportTtlMs,
   effectiveBackupLimit,
   renameBackupEffect,
   reserveBackupCopyEffect,
@@ -32,6 +34,52 @@ describe("backup limits", () => {
     expect(effectiveBackupLimit(10, null)).toBe(10)
     expect(effectiveBackupLimit(null, 8)).toBe(8)
     expect(effectiveBackupLimit(10, 8)).toBe(8)
+  })
+
+  it("clamps incremental export TTLs to the signed-URL bounds", () => {
+    expect(clampBackupExportTtlMs(1_000)).toBe(60_000)
+    expect(clampBackupExportTtlMs(15 * 60_000)).toBe(15 * 60_000)
+    expect(clampBackupExportTtlMs(30 * 24 * 60 * 60 * 1_000)).toBe(
+      7 * 24 * 60 * 60 * 1_000
+    )
+  })
+
+  it("reuses an unexpired export while polling even if remaining is under the requested TTL", () => {
+    expect(
+      canReuseBackupExport({
+        remainingMs: 15 * 60 * 60 * 1_000 - 1_500,
+        requestedTtlMs: 15 * 60 * 60 * 1_000,
+        requireFullTtl: false,
+      })
+    ).toBe(true)
+    expect(
+      canReuseBackupExport({
+        remainingMs: 15 * 60 * 60 * 1_000 - 1_500,
+        requestedTtlMs: 15 * 60 * 60 * 1_000,
+        requireFullTtl: true,
+      })
+    ).toBe(true)
+    expect(
+      canReuseBackupExport({
+        remainingMs: 60_000,
+        requestedTtlMs: 15 * 60 * 60 * 1_000,
+        requireFullTtl: true,
+      })
+    ).toBe(true)
+    expect(
+      canReuseBackupExport({
+        remainingMs: 59_000,
+        requestedTtlMs: 15 * 60 * 60 * 1_000,
+        requireFullTtl: true,
+      })
+    ).toBe(false)
+    expect(
+      canReuseBackupExport({
+        remainingMs: 0,
+        requestedTtlMs: 60_000,
+        requireFullTtl: false,
+      })
+    ).toBe(false)
   })
 
   it("reserves remaining bytes and rejects exhausted limits", () => {
@@ -96,6 +144,7 @@ describe("backup limits", () => {
       reserveInstanceBackupEffect({
         backupId: "backup-one",
         createdBy: "user-one",
+        mode: "full",
         name: "Backup one",
         relayId: "relay-one",
         requestedMaxBytes: null,
@@ -161,6 +210,105 @@ describe("backup limits", () => {
 
     expect(reservation.maxBytes).toBe(1_024)
     expect(reservedBytes).toBe(1_024)
+  })
+
+  it("rejects incremental backups that target S3", async () => {
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: () => Effect.succeed(emptyResult),
+          queryRows: <TRow extends RowDataPacket>(sql: string) =>
+            Effect.sync(() => {
+              const rows = sql.includes("backup_policy")
+                ? [
+                    {
+                      admin_quantity_limit: null,
+                      admin_size_limit_bytes: null,
+                      exclude_patterns: [],
+                      quantity_limit: 2,
+                      size_limit_bytes: 2_048,
+                      storage_id: "11111111-1111-4111-8111-111111111111",
+                    },
+                  ]
+                : []
+              return rows as unknown as ReadonlyArray<TRow>
+            }),
+        }),
+    })
+
+    await expect(
+      Effect.runPromise(
+        reserveInstanceBackupEffect({
+          backupId: "backup-one",
+          createdBy: "user-one",
+          mode: "incremental",
+          name: "Backup one",
+          relayId: "relay-one",
+          requestedMaxBytes: null,
+          storageIds: ["11111111-1111-4111-8111-111111111111"],
+          targetId: "instance-one",
+          taskId: "task-one",
+        }).pipe(Effect.provide(databaseLayer))
+      )
+    ).rejects.toThrow("cannot use S3")
+  })
+
+  it("keeps pre-restore safety backups as full archives", async () => {
+    let backupMode: unknown
+    let artifactKind: unknown
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: (sql, values) =>
+            Effect.sync(() => {
+              if (
+                sql.includes("INSERT INTO") &&
+                sql.includes("backup_mode")
+              ) {
+                artifactKind = values?.[5]
+                backupMode = values?.[6]
+              }
+              return emptyResult
+            }),
+          queryRows: <TRow extends RowDataPacket>(sql: string) =>
+            Effect.sync(() => {
+              const rows = sql.includes("backup_policy")
+                ? [
+                    {
+                      admin_quantity_limit: null,
+                      admin_size_limit_bytes: null,
+                      exclude_patterns: [],
+                      quantity_limit: 2,
+                      size_limit_bytes: 2_048,
+                      storage_id: null,
+                    },
+                  ]
+                : [{ quantity_used: 0, size_used: 0 }]
+              return rows as unknown as ReadonlyArray<TRow>
+            }),
+        }),
+    })
+
+    await Effect.runPromise(
+      reserveInstanceBackupEffect({
+        backupId: "safety-backup",
+        createdBy: "user-one",
+        mode: "incremental",
+        name: "Before restore",
+        reason: "pre_restore",
+        relayId: "relay-one",
+        requestedMaxBytes: null,
+        targetId: "instance-one",
+        taskId: "safety-task",
+      }).pipe(Effect.provide(databaseLayer))
+    )
+
+    expect(backupMode).toBe("full")
+    expect(artifactKind).toBe("archive")
   })
 })
 

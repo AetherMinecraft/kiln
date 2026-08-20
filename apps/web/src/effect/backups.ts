@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 import type { RowDataPacket } from "mysql2/promise"
 import { Effect } from "effect"
 
@@ -10,12 +10,23 @@ import type {
   BackupTaskStatus,
   RelayBackupTask,
 } from "@workspace/contracts"
+import {
+  backupArtifactFilename,
+  BACKUP_EXPORT_TTL_MAX_MS,
+  BACKUP_EXPORT_TTL_MIN_MS,
+  isArchiveCreateTaskResult,
+  isResticCreateTaskResult,
+} from "@workspace/contracts"
 
+import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
 import { Database } from "@/effect/database"
-import { BackupLimitError, BackupStorageError } from "@/effect/errors"
+import type { DatabaseTransaction } from "@/effect/database"
+import { BackupLimitError, BackupStorageError, CredentialError } from "@/effect/errors"
 import { databaseTable } from "@/lib/database-config"
-import { kilnInstallationId } from "@/lib/environment"
+import { betterAuthSecrets, kilnInstallationId } from "@/lib/environment"
 import { backupObjectKey } from "@/lib/backup-storage-s3"
+
+const RESTIC_REPOSITORY_PASSWORD_PURPOSE = "kiln-restic-repository-password"
 
 interface BackupPolicyRow extends RowDataPacket {
   admin_quantity_limit: number | null
@@ -71,7 +82,7 @@ interface BackupUsageRow extends RowDataPacket {
 }
 
 interface BackupRow extends RowDataPacket {
-  artifact_kind: "archive" | "database_dump" | "platform_bundle"
+  artifact_kind: "archive" | "database_dump" | "platform_bundle" | "restic_snapshot"
   backup_mode: "full" | "incremental"
   bytes: number | string | null
   checksum_sha256: string | null
@@ -84,6 +95,8 @@ interface BackupRow extends RowDataPacket {
   reason: "final_delete" | "manual" | "pre_restore" | "scheduled"
   relay_id: string
   object_key: string | null
+  repository_id: string | null
+  restic_snapshot_id: string | null
   storage_id: string | null
   status: "available" | "deleted" | "deleting" | "failed" | "queued" | "running"
   target_id: string
@@ -94,7 +107,7 @@ interface BackupRow extends RowDataPacket {
   task_current_artifact_id: string | null
   task_current_path: string | null
   task_id: string
-  task_kind: "create" | "delete" | "restore"
+  task_kind: "create" | "delete" | "export" | "restore"
   task_phase: BackupTaskPhase | null
   task_started_at_ms: number | string | null
   task_status: "cancelled" | "failed" | "queued" | "running" | "succeeded"
@@ -105,18 +118,21 @@ interface BackupRow extends RowDataPacket {
 interface DispatchableBackupRow extends RowDataPacket {
   artifact_kind: BackupRow["artifact_kind"]
   backup_id: string
-  backup_mode: "full"
+  backup_mode: BackupRow["backup_mode"]
   bytes: number | string | null
   checksum_sha256: string | null
   exclude_patterns: unknown
   object_key: string | null
   reason: BackupCreateTaskInput["reason"]
+  repository_id: string | null
   reserved_bytes: number | string | null
+  restic_snapshot_id: string | null
   storage_id: string | null
   target_id: string
   target_kind: BackupRow["target_kind"]
+  task_created_at_ms: number | string
   task_id: string
-  task_kind: "create" | "delete" | "restore"
+  task_kind: "create" | "delete" | "export" | "restore"
 }
 
 interface KnownBackupTaskRow extends RowDataPacket {
@@ -174,6 +190,7 @@ export interface BackupCatalogRecord {
   objectKey: string | null
   reason: BackupRow["reason"]
   relayId: string
+  resticSnapshotId: string | null
   status: BackupRow["status"]
   storageId: string | null
   targetId: string
@@ -243,6 +260,7 @@ export interface BackupCreateDispatch extends Omit<
 > {
   artifacts: Array<BackupDispatchArtifact>
   kind: "create"
+  repositoryPassword?: string
 }
 
 export interface BackupDeleteDispatch extends Omit<
@@ -251,21 +269,38 @@ export interface BackupDeleteDispatch extends Omit<
 > {
   artifacts: Array<BackupDispatchArtifact>
   kind: "delete"
+  repositoryPassword?: string
+  snapshotId?: string
 }
 
-export interface BackupRestoreDispatch extends Omit<
-  BackupRestoreTaskInput,
-  "source"
-> {
+export interface BackupRestoreDispatch {
   artifactId: string
+  backupId: string
+  bytes?: number
+  checksumSha256?: string
   kind: "restore"
   objectKey: string | null
+  repositoryPassword?: string
+  snapshotId?: string
   storageId: string | null
+  target: BackupRestoreTaskInput["target"]
+  taskId: string
+}
+
+export interface BackupExportDispatch {
+  backupId: string
+  kind: "export"
+  repositoryPassword?: string
+  snapshotId: string
+  target: { id: string; kind: "instance" }
+  taskId: string
+  ttlMs: number
 }
 
 export type BackupDispatch =
   | BackupCreateDispatch
   | BackupDeleteDispatch
+  | BackupExportDispatch
   | BackupRestoreDispatch
 
 const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
@@ -274,6 +309,7 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
     backupId: string
     createdBy: string
     exclude: ReadonlyArray<string>
+    mode?: BackupCreateTaskInput["mode"]
     name: string
     reason?: BackupCreateTaskInput["reason"]
     relayId: string
@@ -331,11 +367,41 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
             })
           }
         }
-        const selectedStorageIds = deduplicateStorageIds(
-          input.storageIds ?? [
-            input.storageId === undefined ? policy.storage_id : input.storageId,
-          ]
-        )
+        const mode =
+          input.reason === "pre_restore" ||
+          input.reason === "final_delete" ||
+          input.targetKind !== "instance"
+            ? "full"
+            : (input.mode ?? "incremental")
+        const artifactKind =
+          mode === "incremental" ? "restic_snapshot" : input.artifactKind
+        if (mode === "incremental") {
+          const requestedStorageIds = deduplicateStorageIds(
+            input.storageIds ?? [
+              input.storageId === undefined
+                ? policy.storage_id
+                : input.storageId,
+            ]
+          )
+          if (requestedStorageIds.some((storageId) => storageId !== null)) {
+            return yield* BackupStorageError.make({
+              code: "storage_unavailable",
+              operation: "backup.reserve",
+              reason:
+                "Incremental backups are stored on the Relay and cannot use S3",
+            })
+          }
+        }
+        const selectedStorageIds =
+          mode === "incremental"
+            ? [null]
+            : deduplicateStorageIds(
+                input.storageIds ?? [
+                  input.storageId === undefined
+                    ? policy.storage_id
+                    : input.storageId,
+                ]
+              )
         if (selectedStorageIds.length === 0) {
           return yield* BackupStorageError.make({
             code: "storage_unavailable",
@@ -370,7 +436,7 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
             artifactId: randomUUID(),
             objectKey: storage
               ? backupObjectKey({
-                  artifactKind: input.artifactKind,
+                  artifactKind,
                   backupId: input.backupId,
                   installationId: kilnInstallationId(),
                   objectPrefix: storage.object_prefix,
@@ -384,6 +450,18 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
         }
         const primaryArtifact = artifacts[0]
         if (!primaryArtifact) return yield* Effect.die("Backup has no artifact")
+        let repositoryId: string | null = null
+        let repositoryPassword: string | undefined
+        if (mode === "incremental") {
+          const repository = yield* loadOrCreateBackupRepository(
+            transaction,
+            input.relayId,
+            input.targetKind,
+            input.targetId
+          )
+          repositoryId = repository.id
+          repositoryPassword = repository.password
+        }
         const usageRows = yield* transaction.queryRows<BackupUsageRow>(
           `SELECT COUNT(*) AS quantity_used,
                   COALESCE(SUM(
@@ -458,19 +536,22 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
         yield* transaction.execute(
           `INSERT INTO ${databaseTable("backup")}
             (id, relay_id, target_kind, target_id, storage_id, artifact_kind,
-             backup_mode, reason, status, name, object_key, warnings, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, 'full', ?,
-                   'queued', ?, ?, JSON_ARRAY(), ?)`,
+             backup_mode, reason, status, name, object_key, repository_id,
+             warnings, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                   'queued', ?, ?, ?, JSON_ARRAY(), ?)`,
           [
             input.backupId,
             input.relayId,
             input.targetKind,
             input.targetId,
             primaryArtifact.storageId,
-            input.artifactKind,
+            artifactKind,
+            mode,
             input.reason ?? "manual",
             input.name,
             primaryArtifact.objectKey,
+            repositoryId,
             input.createdBy,
           ]
         )
@@ -482,7 +563,9 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
             [
               artifact.artifactId,
               input.backupId,
-              artifact.storageId ?? "local",
+              mode === "incremental"
+                ? "restic"
+                : (artifact.storageId ?? "local"),
               artifact.storageId,
               artifact.objectKey,
             ]
@@ -518,13 +601,16 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
         }
         return {
           artifacts,
-          artifactKind: input.artifactKind,
+          artifactKind,
           backupId: input.backupId,
           exclude: parseExcludes(policy.exclude_patterns),
           kind: "create",
           maxBytes: reservation.maxBytes,
-          mode: "full",
+          mode,
           reason: input.reason ?? "manual",
+          ...(repositoryPassword
+            ? { repositoryPassword }
+            : {}),
           target: { id: input.targetId, kind: input.targetKind },
           taskId: input.taskId,
         } satisfies BackupCreateDispatch
@@ -537,6 +623,7 @@ export const reserveInstanceBackupEffect = Effect.fn("backups.reserve")(
   (input: {
     backupId: string
     createdBy: string
+    mode?: BackupCreateTaskInput["mode"]
     name: string
     reason?: BackupCreateTaskInput["reason"]
     relayId: string
@@ -788,8 +875,19 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
         if (
           task.status === "succeeded" &&
           task.result &&
-          "bytes" in task.result
+          (isResticCreateTaskResult(task.result) ||
+            isArchiveCreateTaskResult(task.result))
         ) {
+          const resticResult = isResticCreateTaskResult(task.result)
+            ? task.result
+            : null
+          const archiveResult = isArchiveCreateTaskResult(task.result)
+            ? task.result
+            : null
+          if (!resticResult && !archiveResult) return
+          const filename = archiveResult?.filename ?? null
+          const checksum = archiveResult?.checksumSha256 ?? null
+          const snapshotId = resticResult?.snapshotId ?? null
           const outcomes = task.result.artifacts ?? []
           if (outcomes.length === 0) {
             yield* transaction.execute(
@@ -799,9 +897,9 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
                       completed_at = FROM_UNIXTIME(? / 1000)
                 WHERE backup_id = ?`,
               [
-                task.result.filename,
+                filename,
                 task.result.bytes,
-                task.result.checksumSha256,
+                checksum,
                 task.finishedAt ?? Date.now(),
                 task.backupId,
               ]
@@ -817,11 +915,11 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
                   WHERE id = ? AND backup_id = ?`,
                 [
                   outcome.status,
-                  task.result.filename,
+                  filename,
                   outcome.status,
                   task.result.bytes,
                   outcome.status,
-                  task.result.checksumSha256,
+                  checksum,
                   outcome.error,
                   task.finishedAt ?? Date.now(),
                   outcome.artifactId,
@@ -838,14 +936,15 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
           yield* transaction.execute(
             `UPDATE ${databaseTable("backup")}
                 SET status = ?, filename = ?, bytes = ?,
-                    checksum_sha256 = ?, warnings = ?,
+                    checksum_sha256 = ?, restic_snapshot_id = ?, warnings = ?,
                     completed_at = FROM_UNIXTIME(? / 1000)
               WHERE id = ?`,
             [
               available[0] ? "available" : "failed",
-              task.result.filename,
+              filename,
               task.result.bytes,
-              task.result.checksumSha256,
+              checksum,
+              snapshotId,
               JSON.stringify(task.result.warnings),
               task.finishedAt ?? Date.now(),
               task.backupId,
@@ -881,9 +980,8 @@ export const listBackupCatalogEffect = Effect.fn("backups.list")(function* () {
     `SELECT backup.id, backup.relay_id, backup.target_kind, backup.target_id,
             backup.artifact_kind, backup.backup_mode, backup.reason,
             backup.status, backup.name, backup.filename, backup.bytes,
-            backup.checksum_sha256, backup.warnings, backup.created_by,
-            backup.storage_id,
-            backup.object_key,
+            backup.checksum_sha256, backup.restic_snapshot_id, backup.warnings,
+            backup.created_by, backup.storage_id, backup.object_key,
             ROUND(UNIX_TIMESTAMP(backup.completed_at) * 1000) AS completed_at_ms,
             ROUND(UNIX_TIMESTAMP(backup.created_at) * 1000) AS created_at_ms,
             task.id AS task_id, task.task_kind AS task_kind,
@@ -944,6 +1042,7 @@ export const listBackupCatalogEffect = Effect.fn("backups.list")(function* () {
     objectKey: row.object_key,
     reason: row.reason,
     relayId: row.relay_id,
+    resticSnapshotId: row.restic_snapshot_id,
     status: row.status,
     storageId: row.storage_id,
     targetId: row.target_id,
@@ -995,26 +1094,34 @@ export const listDispatchableBackupTasksEffect = Effect.fn(
     "backup_dispatchable_list",
     `SELECT backup.id AS backup_id, backup.target_kind, backup.target_id,
             backup.artifact_kind, backup.backup_mode, backup.reason,
-            backup.bytes, backup.checksum_sha256,
+            backup.bytes, backup.checksum_sha256, backup.restic_snapshot_id,
+            backup.repository_id,
             task.id AS task_id, task.task_kind, task.reserved_bytes,
+            ROUND(UNIX_TIMESTAMP(task.created_at) * 1000) AS task_created_at_ms,
             backup.storage_id, backup.object_key,
             COALESCE(policy.exclude_patterns, JSON_ARRAY()) AS exclude_patterns
        FROM ${databaseTable("backup")} backup
        JOIN ${databaseTable("backup_task")} task
          ON task.backup_id = backup.id
-        AND task.task_kind IN ('create', 'restore', 'delete')
+        AND task.task_kind IN ('create', 'restore', 'delete', 'export')
        LEFT JOIN ${databaseTable("backup_policy")} policy
          ON policy.relay_id = backup.relay_id
         AND policy.target_kind = backup.target_kind
         AND policy.target_id = backup.target_id
       WHERE backup.relay_id = ?
-        AND backup.backup_mode = 'full'
-        AND ((backup.target_kind = 'instance' AND backup.artifact_kind = 'archive')
-          OR (backup.target_kind = 'database' AND backup.artifact_kind = 'database_dump')
-          OR (backup.target_kind = 'platform' AND backup.artifact_kind = 'platform_bundle'))
+        AND (
+          (backup.backup_mode = 'full'
+            AND ((backup.target_kind = 'instance' AND backup.artifact_kind = 'archive')
+              OR (backup.target_kind = 'database' AND backup.artifact_kind = 'database_dump')
+              OR (backup.target_kind = 'platform' AND backup.artifact_kind = 'platform_bundle')))
+          OR (backup.backup_mode = 'incremental'
+            AND backup.target_kind = 'instance'
+            AND backup.artifact_kind = 'restic_snapshot')
+        )
         AND ((task.task_kind = 'create' AND backup.status = 'queued')
           OR (task.task_kind = 'restore' AND backup.status = 'available')
-          OR (task.task_kind = 'delete' AND backup.status = 'deleting'))
+          OR (task.task_kind = 'delete' AND backup.status = 'deleting')
+          OR (task.task_kind = 'export' AND backup.status = 'available'))
         AND task.status = 'queued'
         AND (task.depends_on_task_id IS NULL OR EXISTS (
           SELECT 1
@@ -1048,6 +1155,21 @@ export const listDispatchableBackupTasksEffect = Effect.fn(
       const artifact = artifacts.find(
         (candidate) => candidate.status === "available"
       )
+      if (row.backup_mode === "incremental") {
+        if (!artifact || !row.restic_snapshot_id) {
+          throw new Error("Available snapshot is missing restore metadata")
+        }
+        return {
+          artifactId: artifact.id,
+          backupId: row.backup_id,
+          kind: "restore",
+          objectKey: null,
+          snapshotId: row.restic_snapshot_id,
+          storageId: null,
+          target: { id: row.target_id, kind: row.target_kind },
+          taskId: row.task_id,
+        }
+      }
       const bytes = nullableDatabaseNumber(
         artifact?.bytes ?? null,
         "backup artifact bytes"
@@ -1069,11 +1191,31 @@ export const listDispatchableBackupTasksEffect = Effect.fn(
         taskId: row.task_id,
       }
     }
+    if (row.task_kind === "export") {
+      if (!row.restic_snapshot_id) {
+        throw new Error("Available snapshot is missing export metadata")
+      }
+      return {
+        backupId: row.backup_id,
+        kind: "export",
+        snapshotId: row.restic_snapshot_id,
+        target: { id: row.target_id, kind: "instance" },
+        taskId: row.task_id,
+        ttlMs: clampBackupExportTtlMs(
+          // Export tasks store the requested TTL (ms) in reserved_bytes.
+          nullableDatabaseNumber(row.reserved_bytes, "export ttl") ??
+            BACKUP_EXPORT_TTL_MIN_MS
+        ),
+      }
+    }
     if (row.task_kind === "delete") {
       return {
         artifacts: artifacts.map(dispatchArtifact),
         backupId: row.backup_id,
         kind: "delete",
+        ...(row.restic_snapshot_id
+          ? { snapshotId: row.restic_snapshot_id }
+          : {}),
         target: { id: row.target_id, kind: row.target_kind },
         taskId: row.task_id,
       }
@@ -1111,12 +1253,20 @@ export const reserveBackupRestoreEffect = Effect.fn("backups.reserveRestore")(
           const rows = yield* transaction.queryRows<BackupRow>(
             `SELECT backup.id, backup.relay_id, backup.target_kind,
                     backup.target_id, backup.storage_id, backup.object_key,
-                    backup.bytes, backup.checksum_sha256
+                    backup.bytes, backup.checksum_sha256, backup.backup_mode,
+                    backup.artifact_kind, backup.restic_snapshot_id,
+                    backup.repository_id
                FROM ${databaseTable("backup")} backup
               WHERE backup.id = ? AND backup.status = 'available'
-                AND backup.backup_mode = 'full'
-                AND ((backup.target_kind = 'instance' AND backup.artifact_kind = 'archive')
-                  OR (backup.target_kind = 'database' AND backup.artifact_kind = 'database_dump'))
+                AND (
+                  (backup.backup_mode = 'full'
+                    AND ((backup.target_kind = 'instance' AND backup.artifact_kind = 'archive')
+                      OR (backup.target_kind = 'database' AND backup.artifact_kind = 'database_dump')))
+                  OR (backup.backup_mode = 'incremental'
+                    AND backup.target_kind = 'instance'
+                    AND backup.artifact_kind = 'restic_snapshot'
+                    AND backup.restic_snapshot_id IS NOT NULL)
+                )
                 AND NOT EXISTS (
                   SELECT 1
                     FROM ${databaseTable("backup_task")} active_task
@@ -1141,6 +1291,9 @@ export const reserveBackupRestoreEffect = Effect.fn("backups.reserveRestore")(
               )
             : []
           const artifact = artifacts[0]
+          const resticRestore =
+            backup?.backup_mode === "incremental" &&
+            Boolean(backup.restic_snapshot_id)
           const bytes = nullableDatabaseNumber(
             artifact?.bytes ?? null,
             "backup artifact bytes"
@@ -1148,8 +1301,7 @@ export const reserveBackupRestoreEffect = Effect.fn("backups.reserveRestore")(
           if (
             !backup ||
             !artifact ||
-            bytes === null ||
-            !artifact.checksum_sha256
+            (!resticRestore && (bytes === null || !artifact.checksum_sha256))
           ) {
             return yield* BackupStorageError.make({
               code: "backup_unavailable",
@@ -1229,11 +1381,15 @@ export const reserveBackupRestoreEffect = Effect.fn("backups.reserveRestore")(
           return {
             artifactId: artifact.id,
             backupId: input.backupId,
-            bytes,
-            checksumSha256: artifact.checksum_sha256,
+            ...(resticRestore
+              ? { snapshotId: backup.restic_snapshot_id ?? undefined }
+              : {
+                  bytes: bytes ?? undefined,
+                  checksumSha256: artifact.checksum_sha256 ?? undefined,
+                }),
             kind: "restore",
-            objectKey: artifact.object_key,
-            storageId: artifact.storage_id,
+            objectKey: resticRestore ? null : artifact.object_key,
+            storageId: resticRestore ? null : artifact.storage_id,
             target: { id: backup.target_id, kind: backup.target_kind },
             taskId: input.taskId,
           } satisfies BackupRestoreDispatch
@@ -1249,7 +1405,8 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
       Effect.gen(function* () {
         const rows = yield* transaction.queryRows<BackupRow>(
           `SELECT backup.id, backup.relay_id, backup.target_kind,
-                  backup.target_id, backup.storage_id, backup.object_key
+                  backup.target_id, backup.storage_id, backup.object_key,
+                  backup.restic_snapshot_id
              FROM ${databaseTable("backup")} backup
             WHERE backup.id = ? AND backup.status IN ('available', 'failed')
               AND NOT EXISTS (
@@ -1300,6 +1457,9 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
           )).map(dispatchArtifact),
           backupId: input.backupId,
           kind: "delete",
+          ...(backup.restic_snapshot_id
+            ? { snapshotId: backup.restic_snapshot_id }
+            : {}),
           target: { id: backup.target_id, kind: backup.target_kind },
           taskId: input.taskId,
         } satisfies BackupDeleteDispatch
@@ -1307,6 +1467,210 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
     )
   }
 )
+
+export type BackupExportReservation =
+  | {
+      expiresAt: number
+      filename: string
+      kind: "ready"
+    }
+  | {
+      dispatch: BackupExportDispatch
+      kind: "dispatch"
+    }
+
+export const reserveBackupExportEffect = Effect.fn("backups.reserveExport")(
+  function* (input: {
+    backupId: string
+    replaceFailed?: boolean
+    requestedBy: string
+    requireFullTtl?: boolean
+    taskId: string
+    ttlMs: number
+  }) {
+    const database = yield* Database
+    const ttlMs = clampBackupExportTtlMs(input.ttlMs)
+    return yield* database.transaction("backup_reserve_export", (transaction) =>
+      Effect.gen(function* () {
+        const backups = yield* transaction.queryRows<BackupRow>(
+          `SELECT backup.id, backup.relay_id, backup.target_kind,
+                  backup.target_id, backup.restic_snapshot_id
+             FROM ${databaseTable("backup")} backup
+            WHERE backup.id = ? AND backup.status = 'available'
+              AND backup.backup_mode = 'incremental'
+              AND backup.artifact_kind = 'restic_snapshot'
+              AND backup.restic_snapshot_id IS NOT NULL
+            FOR UPDATE`,
+          [input.backupId]
+        )
+        const backup = backups[0]
+        const snapshotId = backup?.restic_snapshot_id
+        if (!backup || !snapshotId) {
+          return yield* BackupStorageError.make({
+            code: "backup_unavailable",
+            operation: "backup.export",
+            reason: "Only available incremental snapshots can be exported",
+          })
+        }
+        const filename = backupArtifactFilename(backup.id, "restic_snapshot")
+        const existing = yield* transaction.queryRows<
+          {
+            created_at_ms: number | string
+            finished_at_ms: number | string | null
+            id: string
+            reserved_bytes: number | string | null
+            status: BackupRow["task_status"]
+          } & RowDataPacket
+        >(
+          `SELECT task.id, task.status, task.reserved_bytes,
+                  ROUND(UNIX_TIMESTAMP(task.created_at) * 1000) AS created_at_ms,
+                  ROUND(UNIX_TIMESTAMP(task.finished_at) * 1000) AS finished_at_ms
+             FROM ${databaseTable("backup_task")} task
+            WHERE task.backup_id = ? AND task.task_kind = 'export'
+            ORDER BY task.created_at DESC, task.id DESC
+            LIMIT 1
+            FOR UPDATE`,
+          [input.backupId]
+        )
+        const latest = existing[0]
+        const dispatchFor = (taskId: string): BackupExportDispatch => ({
+          backupId: backup.id,
+          kind: "export",
+          snapshotId,
+          target: { id: backup.target_id, kind: "instance" },
+          taskId,
+          ttlMs,
+        })
+        const pruneOlderExportTasks = (keepTaskId: string) =>
+          transaction.execute(
+            `DELETE FROM ${databaseTable("backup_task")}
+              WHERE backup_id = ? AND task_kind = 'export'
+                AND status IN ('succeeded', 'failed', 'cancelled')
+                AND id <> ?`,
+            [input.backupId, keepTaskId]
+          )
+        if (latest?.status === "succeeded") {
+          const storedTtl = clampBackupExportTtlMs(
+            // Export tasks store the requested TTL (ms) in reserved_bytes.
+            nullableDatabaseNumber(latest.reserved_bytes, "export ttl") ??
+              BACKUP_EXPORT_TTL_MIN_MS
+          )
+          const completedAt = nullableDatabaseNumber(
+            latest.finished_at_ms,
+            "export finished at"
+          )
+          const expiresAt =
+            (completedAt ??
+              safeDatabaseNumber(latest.created_at_ms, "export task time")) +
+            storedTtl
+          if (
+            canReuseBackupExport({
+              remainingMs: expiresAt - Date.now(),
+              requestedTtlMs: ttlMs,
+              requireFullTtl: input.requireFullTtl !== false,
+            })
+          ) {
+            yield* pruneOlderExportTasks(latest.id)
+            return {
+              expiresAt,
+              filename,
+              kind: "ready",
+            } satisfies BackupExportReservation
+          }
+        }
+        if (latest && (latest.status === "queued" || latest.status === "running")) {
+          return {
+            dispatch: {
+              ...dispatchFor(latest.id),
+              ttlMs: clampBackupExportTtlMs(
+                // Export tasks store the requested TTL (ms) in reserved_bytes.
+                nullableDatabaseNumber(latest.reserved_bytes, "export ttl") ??
+                  ttlMs
+              ),
+            },
+            kind: "dispatch",
+          } satisfies BackupExportReservation
+        }
+        if (
+          latest &&
+          (latest.status === "failed" || latest.status === "cancelled") &&
+          input.replaceFailed === false
+        ) {
+          return yield* BackupStorageError.make({
+            code: "backup_unavailable",
+            operation: "backup.export",
+            reason: "The snapshot export failed",
+          })
+        }
+        yield* pruneOlderExportTasks(input.taskId)
+        yield* transaction.execute(
+          `INSERT INTO ${databaseTable("backup_task")}
+            (id, backup_id, task_kind, status, reserved_bytes, requested_by)
+           VALUES (?, ?, 'export', 'queued', ?, ?)`,
+          // reserved_bytes holds the export TTL in milliseconds, not a byte count.
+          [input.taskId, input.backupId, ttlMs, input.requestedBy]
+        )
+        return {
+          dispatch: dispatchFor(input.taskId),
+          kind: "dispatch",
+        } satisfies BackupExportReservation
+      })
+    )
+  }
+)
+
+export const loadBackupRepositoryPasswordEffect = Effect.fn(
+  "backups.repositoryPassword"
+)(function* (backupId: string) {
+  const database = yield* Database
+  const rows = yield* database.queryRows<
+    { password_ciphertext: string } & RowDataPacket
+  >(
+    "backup_repository_password",
+    `SELECT repository.password_ciphertext
+       FROM ${databaseTable("backup")} backup
+       JOIN ${databaseTable("backup_repository")} repository
+         ON repository.id = backup.repository_id
+      WHERE backup.id = ?
+      LIMIT 1`,
+    [backupId]
+  )
+  const row = rows[0]
+  if (!row) {
+    return yield* BackupStorageError.make({
+      code: "invalid_backup_destination",
+      operation: "backup.dispatch",
+      reason: "The restic repository is unavailable",
+    })
+  }
+  return yield* decryptRepositoryPassword(row.password_ciphertext)
+})
+
+export const markIncrementalInstanceBackupsDeletedEffect = Effect.fn(
+  "backups.markIncrementalDeleted"
+)(function* (relayId: string, targetId: string) {
+  const database = yield* Database
+  yield* database.execute(
+    "backup_mark_incremental_deleted",
+    `UPDATE ${databaseTable("backup")}
+        SET status = 'deleted',
+            completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP(3))
+      WHERE relay_id = ? AND target_kind = 'instance' AND target_id = ?
+        AND backup_mode = 'incremental' AND status <> 'deleted'`,
+    [relayId, targetId]
+  )
+  yield* database.execute(
+    "backup_mark_incremental_artifacts_deleted",
+    `UPDATE ${databaseTable("backup_artifact")} artifact
+       JOIN ${databaseTable("backup")} backup ON backup.id = artifact.backup_id
+        SET artifact.status = 'deleted',
+            artifact.deleted_at = COALESCE(artifact.deleted_at, CURRENT_TIMESTAMP(3))
+      WHERE backup.relay_id = ? AND backup.target_kind = 'instance'
+        AND backup.target_id = ? AND backup.backup_mode = 'incremental'
+        AND artifact.status <> 'deleted'`,
+    [relayId, targetId]
+  )
+})
 
 export const reserveBackupCopyEffect = Effect.fn("backups.reserveCopy")(
   function* (input: {
@@ -1341,6 +1705,13 @@ export const reserveBackupCopyEffect = Effect.fn("backups.reserveCopy")(
             code: "backup_unavailable",
             operation: "backup.copy",
             reason: "A successful backup file is required before copying",
+          })
+        }
+        if (input.artifactKind === "restic_snapshot") {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "backup.copy",
+            reason: "Incremental snapshots cannot be copied to S3",
           })
         }
         const storage = (yield* transaction.queryRows<BackupStorageKeyRow>(
@@ -1850,6 +2221,30 @@ function toFinalInstanceDeletion(
   }
 }
 
+export function clampBackupExportTtlMs(ttlMs: number): number {
+  if (!Number.isFinite(ttlMs)) return BACKUP_EXPORT_TTL_MIN_MS
+  return Math.min(
+    BACKUP_EXPORT_TTL_MAX_MS,
+    Math.max(BACKUP_EXPORT_TTL_MIN_MS, Math.trunc(ttlMs))
+  )
+}
+
+export function canReuseBackupExport(input: {
+  remainingMs: number
+  requestedTtlMs: number
+  requireFullTtl: boolean
+}): boolean {
+  if (input.remainingMs <= 0) return false
+  if (!input.requireFullTtl) return true
+  // Completion-anchored expiry is almost always slightly under the requested
+  // TTL, and Relay reuse already extends the staged zip. Accept remaining time
+  // at or above the signed-URL floor instead of requiring a full TTL.
+  return (
+    input.remainingMs >=
+    Math.min(input.requestedTtlMs, BACKUP_EXPORT_TTL_MIN_MS)
+  )
+}
+
 export function effectiveBackupLimit(
   userLimit: number | null,
   adminLimit: number | null
@@ -2009,4 +2404,71 @@ function requiredTimestampIso(
   const timestamp = timestampIso(value, label)
   if (timestamp === null) throw new Error(`${label} is missing`)
   return timestamp
+}
+
+function loadOrCreateBackupRepository(
+  transaction: DatabaseTransaction,
+  relayId: string,
+  targetKind: string,
+  targetId: string
+) {
+  return Effect.gen(function* () {
+    const existing = yield* transaction.queryRows<
+      { id: string; password_ciphertext: string } & RowDataPacket
+    >(
+      `SELECT id, password_ciphertext
+         FROM ${databaseTable("backup_repository")}
+        WHERE relay_id = ? AND target_kind = ? AND target_id = ?
+        FOR UPDATE`,
+      [relayId, targetKind, targetId]
+    )
+    if (existing[0]) {
+      const decrypted = yield* decryptRepositoryPassword(
+        existing[0].password_ciphertext
+      )
+      return { id: existing[0].id, password: decrypted }
+    }
+    const password = randomBytes(32).toString("base64url")
+    const id = randomUUID()
+    const ciphertext = yield* encryptRepositoryPassword(password)
+    yield* transaction.execute(
+      `INSERT INTO ${databaseTable("backup_repository")}
+        (id, relay_id, target_kind, target_id, password_ciphertext)
+       VALUES (?, ?, ?, ?, ?)`,
+      [id, relayId, targetKind, targetId, ciphertext]
+    )
+    return { id, password }
+  })
+}
+
+function encryptRepositoryPassword(password: string) {
+  return Effect.try({
+    try: () =>
+      encryptWithKeyring(
+        password,
+        betterAuthSecrets(),
+        RESTIC_REPOSITORY_PASSWORD_PURPOSE
+      ),
+    catch: (cause) =>
+      CredentialError.make({
+        operation: "encrypt_restic_repository_password",
+        cause,
+      }),
+  })
+}
+
+function decryptRepositoryPassword(ciphertext: string) {
+  return Effect.try({
+    try: () =>
+      decryptWithKeyring(
+        ciphertext,
+        betterAuthSecrets(),
+        RESTIC_REPOSITORY_PASSWORD_PURPOSE
+      ).plaintext,
+    catch: (cause) =>
+      CredentialError.make({
+        operation: "decrypt_restic_repository_password",
+        cause,
+      }),
+  })
 }

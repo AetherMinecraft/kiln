@@ -6,6 +6,7 @@ import type { BackupTaskInput } from "@workspace/contracts"
 
 import {
   listDispatchableBackupTasksEffect,
+  loadBackupRepositoryPasswordEffect,
   reconcileBackupTaskEffect,
   type BackupDispatch,
 } from "@/effect/backups"
@@ -92,6 +93,52 @@ export async function dispatchBackupTask(
 const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
   input: BackupDispatch
 ) {
+  if (input.kind === "export") {
+    const { repositoryPassword: _, ...task } = input
+    return {
+      ...task,
+      repositoryPassword: yield* loadBackupRepositoryPasswordEffect(
+        input.backupId
+      ),
+    } satisfies BackupTaskInput
+  }
+  if (input.kind === "create" && input.mode === "incremental") {
+    const artifact = input.artifacts[0]
+    if (!artifact) {
+      return yield* invalidDestination("The backup has no stored artifacts")
+    }
+    const { artifacts: _, repositoryPassword: __, ...task } = input
+    return {
+      ...task,
+      destination: {
+        artifactId: artifact.artifactId,
+        kind: "restic" as const,
+        repositoryPassword: yield* loadBackupRepositoryPasswordEffect(
+          input.backupId
+        ),
+      },
+      replicas: [],
+    } satisfies BackupTaskInput
+  }
+  if (input.kind === "delete" && input.snapshotId) {
+    const artifact = input.artifacts[0]
+    if (!artifact) {
+      return yield* invalidDestination("The backup has no stored artifacts")
+    }
+    const { artifacts: _, repositoryPassword: __, snapshotId, ...task } = input
+    return {
+      ...task,
+      destination: {
+        artifactId: artifact.artifactId,
+        kind: "restic" as const,
+        repositoryPassword: yield* loadBackupRepositoryPasswordEffect(
+          input.backupId
+        ),
+        snapshotId,
+      },
+      replicas: [],
+    } satisfies BackupTaskInput
+  }
   if (input.kind === "create" || input.kind === "delete") {
     if (input.artifacts.length === 0) {
       return yield* invalidDestination("The backup has no stored artifacts")
@@ -145,6 +192,26 @@ const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
       replicas,
     } as BackupTaskInput
   }
+  if (input.snapshotId) {
+    const {
+      artifactId: _,
+      objectKey: __,
+      repositoryPassword: ___,
+      snapshotId,
+      storageId: ____,
+      ...task
+    } = input
+    return {
+      ...task,
+      source: {
+        kind: "restic" as const,
+        repositoryPassword: yield* loadBackupRepositoryPasswordEffect(
+          input.backupId
+        ),
+        snapshotId,
+      },
+    } satisfies BackupTaskInput
+  }
   if (input.storageId === null) {
     if (input.objectKey !== null) {
       return yield* invalidDestination(
@@ -152,9 +219,18 @@ const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
       )
     }
     const { artifactId: _, objectKey: __, storageId: ___, ...task } = input
+    if (input.bytes === undefined || !input.checksumSha256) {
+      return yield* invalidDestination(
+        "Available backup is missing restore integrity metadata"
+      )
+    }
     return {
       ...task,
-      source: { kind: "local" as const },
+      source: {
+        bytes: input.bytes,
+        checksumSha256: input.checksumSha256,
+        kind: "local" as const,
+      },
     } satisfies BackupTaskInput
   }
   if (!input.objectKey) {
@@ -166,9 +242,21 @@ const prepareBackupTaskEffect = Effect.fn("backups.prepareTask")(function* (
   if (!storage) {
     return yield* invalidDestination("The backup destination is unavailable")
   }
-  const source = yield* signS3BackupRestore(storage, input.objectKey)
+  const signed = yield* signS3BackupRestore(storage, input.objectKey)
   const { artifactId: _, objectKey: __, storageId: ___, ...task } = input
-  return { ...task, source } satisfies BackupTaskInput
+  if (input.bytes === undefined || !input.checksumSha256) {
+    return yield* invalidDestination(
+      "Available backup is missing restore integrity metadata"
+    )
+  }
+  return {
+    ...task,
+    source: {
+      ...signed,
+      bytes: input.bytes,
+      checksumSha256: input.checksumSha256,
+    },
+  } satisfies BackupTaskInput
 })
 
 function invalidDestination(reason: string) {
