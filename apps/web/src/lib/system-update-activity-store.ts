@@ -8,13 +8,16 @@ export interface SystemUpdateActivity {
 export interface SystemUpdateActivityStore {
   getActivitiesSnapshot: () => ReadonlyArray<SystemUpdateActivity>
   getBusySnapshot: () => boolean
+  getHearthReloadRequiredSnapshot: () => boolean
   getPhaseSnapshot: (operationId: string) => string | undefined
   getTargetActivitySnapshot: (
     targetKey: string
   ) => SystemUpdateActivity | undefined
   setActivities: (activities: ReadonlyArray<SystemUpdateActivity>) => void
+  setHearthReloadRequired: (required: boolean) => void
   setPhase: (operationId: string, phase: string) => void
   subscribeActivities: (listener: () => void) => () => void
+  subscribeHearthReloadRequired: (listener: () => void) => () => void
   subscribePhase: (operationId: string, listener: () => void) => () => void
   subscribeTargetActivity: (
     targetKey: string,
@@ -24,8 +27,10 @@ export interface SystemUpdateActivityStore {
 
 export function createSystemUpdateActivityStore(): SystemUpdateActivityStore {
   let activities: ReadonlyArray<SystemUpdateActivity> = []
+  let hearthReloadRequired = false
   const phases = new Map<string, string>()
   const activityListeners = new Set<() => void>()
+  const hearthReloadRequiredListeners = new Set<() => void>()
   const phaseListeners = new Map<string, Set<() => void>>()
   const targetListeners = new Map<string, Set<() => void>>()
 
@@ -46,6 +51,7 @@ export function createSystemUpdateActivityStore(): SystemUpdateActivityStore {
   return {
     getActivitiesSnapshot: () => activities,
     getBusySnapshot: () => activities.length > 0,
+    getHearthReloadRequiredSnapshot: () => hearthReloadRequired,
     getPhaseSnapshot: (operationId) => phases.get(operationId),
     getTargetActivitySnapshot: (targetKey) =>
       activities.find((activity) => activity.targetKey === targetKey),
@@ -81,6 +87,11 @@ export function createSystemUpdateActivityStore(): SystemUpdateActivityStore {
         for (const listener of targetListeners.get(targetKey) ?? []) listener()
       }
     },
+    setHearthReloadRequired: (required) => {
+      if (hearthReloadRequired === required) return
+      hearthReloadRequired = required
+      for (const listener of hearthReloadRequiredListeners) listener()
+    },
     setPhase: (operationId, phase) => {
       if (phases.get(operationId) === phase) return
       phases.set(operationId, phase)
@@ -89,6 +100,10 @@ export function createSystemUpdateActivityStore(): SystemUpdateActivityStore {
     subscribeActivities: (listener) => {
       activityListeners.add(listener)
       return () => activityListeners.delete(listener)
+    },
+    subscribeHearthReloadRequired: (listener) => {
+      hearthReloadRequiredListeners.add(listener)
+      return () => hearthReloadRequiredListeners.delete(listener)
     },
     subscribePhase: (operationId, listener) =>
       subscribeKeyed(phaseListeners, operationId, listener),

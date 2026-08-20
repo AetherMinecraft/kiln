@@ -44,6 +44,7 @@ import {
 } from "@/lib/release-version"
 import {
   beginSystemUpdateBatch,
+  canStartSystemUpdate,
   inactiveSystemUpdateBatch,
   isHearthUpdateLocked,
   recordHearthUpdateCompletion,
@@ -445,6 +446,8 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
             targetVersion: completedVersion,
             versionName: completion.versionName,
           }
+          activityStore.setHearthReloadRequired(true)
+          setPending(null)
           publishDisplayedActive()
         }
       } else {
@@ -524,9 +527,10 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
       latestVersionName?: string
     ) => {
       if (
-        updateMutationPendingRef.current ||
-        batch.current.active ||
-        heldHearthUpdateRef.current !== null
+        !canStartSystemUpdate({
+          hearthReloadRequired: heldHearthUpdateRef.current !== null,
+          mutationPending: updateMutationPendingRef.current,
+        })
       ) {
         return
       }
@@ -715,7 +719,14 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         pending={updateMutation.isPending}
         targets={pending?.targets ?? []}
         onConfirm={() => {
-          if (pending && !updateMutation.isPending) {
+          if (
+            pending &&
+            canStartSystemUpdate({
+              hearthReloadRequired:
+                activityStore.getHearthReloadRequiredSnapshot(),
+              mutationPending: updateMutation.isPending,
+            })
+          ) {
             updateMutation.mutate(pending)
           }
         }}
@@ -1346,6 +1357,7 @@ const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
     activityStore.getActivitiesSnapshot
   )
   const activeTargetKeys = new Set(active.map((update) => update.targetKey))
+  const hearthReloadRequired = useHearthReloadRequired(activityStore)
   const availableTargets = latestRelease
     ? targets.filter(
         (target) =>
@@ -1355,12 +1367,10 @@ const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
   const mockableTargets = targets.filter(
     (target) => !activeTargetKeys.has(target.key)
   )
-  const updating = active.length > 0
-
   return (
     <div className="flex shrink-0 items-center gap-2">
       <Button
-        disabled={updating || availableTargets.length === 0}
+        disabled={hearthReloadRequired || availableTargets.length === 0}
         size="sm"
         type="button"
         onClick={() => {
@@ -1378,7 +1388,11 @@ const UpdateOverviewControls = React.memo(function UpdateOverviewControls({
       </Button>
       {import.meta.env.DEV ? (
         <Button
-          disabled={updating || mockableTargets.length === 0}
+          disabled={
+            hearthReloadRequired ||
+            active.length > 0 ||
+            mockableTargets.length === 0
+          }
           size="sm"
           type="button"
           variant="outline"
@@ -1555,6 +1569,14 @@ function useTargetActivity(
   return React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 }
 
+function useHearthReloadRequired(activityStore: SystemUpdateActivityStore) {
+  return React.useSyncExternalStore(
+    activityStore.subscribeHearthReloadRequired,
+    activityStore.getHearthReloadRequiredSnapshot,
+    activityStore.getHearthReloadRequiredSnapshot
+  )
+}
+
 const UpdateTargetIcon = React.memo(function UpdateTargetIcon({
   activityStore,
   target,
@@ -1650,11 +1672,7 @@ const UpdateTargetAction = React.memo(function UpdateTargetAction({
   ) => void
 }) {
   const updating = useTargetActivity(activityStore, target.key) !== undefined
-  const starting = React.useSyncExternalStore(
-    activityStore.subscribeActivities,
-    activityStore.getBusySnapshot,
-    activityStore.getBusySnapshot
-  )
+  const hearthReloadRequired = useHearthReloadRequired(activityStore)
   const comparison = compareLatestReleaseVersion(
     target.currentVersion,
     releases
@@ -1673,7 +1691,9 @@ const UpdateTargetAction = React.memo(function UpdateTargetAction({
       size="sm"
       type="button"
       disabled={
-        starting || (!updateAvailable && !reinstallAvailable) || updating
+        hearthReloadRequired ||
+        (!updateAvailable && !reinstallAvailable) ||
+        updating
       }
       onClick={() =>
         onUpdate(

@@ -61,4 +61,16 @@ describe("system update activity store", () => {
     expect(store.getBusySnapshot()).toBe(false)
     expect(firstListener).toHaveBeenCalledTimes(2)
   })
+
+  it("notifies controls once when Hearth requires a reload", () => {
+    const store = createSystemUpdateActivityStore()
+    const listener = vi.fn()
+    store.subscribeHearthReloadRequired(listener)
+
+    store.setHearthReloadRequired(true)
+    store.setHearthReloadRequired(true)
+
+    expect(store.getHearthReloadRequiredSnapshot()).toBe(true)
+    expect(listener).toHaveBeenCalledTimes(1)
+  })
 })
