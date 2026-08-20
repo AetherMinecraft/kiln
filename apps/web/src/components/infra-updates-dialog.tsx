@@ -446,6 +446,7 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
             versionName: completion.versionName,
           }
           activityStore.setHearthReloadRequired(true)
+          setPending(null)
           publishDisplayedActive()
         }
       } else {
@@ -715,7 +716,11 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
         pending={updateMutation.isPending}
         targets={pending?.targets ?? []}
         onConfirm={() => {
-          if (pending && !updateMutation.isPending) {
+          if (
+            pending &&
+            !updateMutation.isPending &&
+            !activityStore.getHearthReloadRequiredSnapshot()
+          ) {
             updateMutation.mutate(pending)
           }
         }}
