@@ -792,6 +792,57 @@ describe("restic backup limits and exports", () => {
         })
       )
 
+      it.effect(
+        "forgets a snapshot that completes after its create was cancelled",
+        () =>
+          Effect.gen(function* () {
+            const forgotten: Array<string> = []
+            let manager: BackupManager | undefined
+            let pruned = 0
+            const config = testConfig(
+              join(testDirectory, "cancelled-after-restic-summary")
+            )
+            yield* Effect.promise(() =>
+              mkdir(join(config.rootDirectory, "instance-1"), {
+                recursive: true,
+              })
+            )
+            const input = resticCreateInput(
+              "cancelled-after-restic-summary",
+              100
+            )
+            manager = yield* BackupManager.make({
+              config,
+              findInstance: async () => testInstance(),
+              isInstanceStopped: async () => true,
+              restic: mockRestic({
+                backup: async () => {
+                  if (!manager) throw new Error("manager was not initialized")
+                  await Effect.runPromise(manager.cancel(input.taskId))
+                  return {
+                    snapshotId: "cancelled01",
+                    totalBytesProcessed: 10,
+                  }
+                },
+                forget: async ({ snapshotId }) => {
+                  forgotten.push(snapshotId)
+                },
+                prune: async () => {
+                  pruned += 1
+                },
+              }),
+            })
+
+            yield* manager.enqueue(input)
+            yield* manager.runPending()
+
+            const task = yield* manager.get(input.taskId)
+            assert.strictEqual(task?.status, "cancelled")
+            assert.deepStrictEqual(forgotten, ["cancelled01"])
+            assert.strictEqual(pruned, 1)
+          })
+      )
+
       it.effect("cleans the restic cache after exporting a snapshot", () =>
         Effect.gen(function* () {
           let cleaned = 0
@@ -945,6 +996,41 @@ describe("restic backup limits and exports", () => {
             yield* manager.runPending()
             assert.isFalse(existsSync(zip))
           })
+      )
+
+      it.effect("prunes before completing a restic delete", () =>
+        Effect.gen(function* () {
+          const config = testConfig(join(testDirectory, "synchronous-prune"))
+          const taskId = "10000000-0000-4000-8000-000000000097"
+          let manager: BackupManager | undefined
+          manager = yield* BackupManager.make({
+            config,
+            findInstance: async () => testInstance(),
+            isInstanceStopped: async () => true,
+            restic: mockRestic({
+              forget: async () => undefined,
+              prune: async () => {
+                if (!manager) throw new Error("manager was not initialized")
+                const task = await Effect.runPromise(manager.get(taskId))
+                assert.strictEqual(task?.status, "running")
+              },
+            }),
+          })
+          yield* manager.enqueue({
+            backupId: "cccccccc-dddd-4eee-8fff-000000000002",
+            destination: {
+              kind: "restic",
+              repository: { kind: "local" },
+              repositoryPassword: "secret",
+              snapshotId: "deadbeef",
+            },
+            kind: "delete",
+            target: { id: "instance-1", kind: "instance" },
+            taskId,
+          })
+          yield* manager.runPending()
+          assert.strictEqual((yield* manager.get(taskId))?.status, "succeeded")
+        })
       )
 
       it.effect("forgets snapshots tagged with a failed create task", () =>

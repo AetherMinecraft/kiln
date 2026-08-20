@@ -298,10 +298,13 @@ export function createResticDriver(options?: {
   binary?: string
   cacheDirectory?: string
   spawn?: ResticSpawn
+  terminateTimeoutMs?: number
 }): ResticDriver {
   const binary = options?.binary ?? RESTIC_BINARY
   const spawnRestic = options?.spawn ?? defaultSpawn
   const cacheDirectory = options?.cacheDirectory
+  const terminateTimeoutMs =
+    options?.terminateTimeoutMs ?? RESTIC_TERMINATE_TIMEOUT_MS
   const run = (
     args: ReadonlyArray<string>,
     input: {
@@ -323,6 +326,7 @@ export function createResticDriver(options?: {
             location: input.location,
             password: input.password,
             signal: input.signal,
+            terminateTimeoutMs,
           })
         )
       }
@@ -334,6 +338,7 @@ export function createResticDriver(options?: {
         password: input.password,
         signal: input.signal,
         stdoutPipe: input.stdoutPipe,
+        terminateTimeoutMs,
       })
     }
     return input.retryable ? retryResticOperation(execute) : execute()
@@ -623,6 +628,7 @@ async function spawnResticCommand(
     password: string
     signal: AbortSignal
     stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
+    terminateTimeoutMs: number
   }
 ): Promise<SpawnedRestic> {
   if (input.location.kind !== "s3") {
@@ -654,6 +660,7 @@ async function spawnResticOnce(
     proxyUrl?: string
     signal: AbortSignal
     stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
+    terminateTimeoutMs: number
   }
 ): Promise<SpawnedRestic> {
   input.signal.throwIfAborted()
@@ -693,8 +700,41 @@ async function spawnResticOnce(
       resolveExit(code ?? 1)
     })
   })
+  let termination: Promise<void> | null = null
+  const terminate = () => {
+    termination ??= terminateResticChild(
+      child,
+      waitForExit,
+      () => exited,
+      input.terminateTimeoutMs
+    )
+    return termination
+  }
+  let rejectAborted: (cause: unknown) => void = () => undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAborted = reject
+  })
   const onAbort = () => {
-    child.kill("SIGTERM")
+    Effect.runFork(
+      Effect.tryPromise({
+        try: terminate,
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.match({
+          onFailure: rejectAborted,
+          onSuccess: () =>
+            rejectAborted(
+              resticError(
+                "restic_command_aborted",
+                args[0] ?? "restic",
+                input.signal.reason instanceof Error
+                  ? input.signal.reason.message
+                  : "The restic command was cancelled"
+              )
+            ),
+        })
+      )
+    )
   }
   if (input.signal.aborted) {
     onAbort()
@@ -702,27 +742,34 @@ async function spawnResticOnce(
     input.signal.addEventListener("abort", onAbort, { once: true })
   }
   const completed = await resultOf(async () => {
-    const [exitCode] = await Promise.all([
-      waitForExit,
-      input.stdoutPipe
-        ? input.stdoutPipe(stdout)
-        : readStream(stdout, (chunk) => {
-            if (!input.onJson) {
+    const [exitCode] = await Promise.race([
+      Promise.all([
+        waitForExit,
+        input.stdoutPipe
+          ? input.stdoutPipe(stdout)
+          : readStream(stdout, (chunk) => {
+              if (!input.onJson) {
+                stdoutText = appendBounded(stdoutText, chunk.toString("utf8"))
+                return
+              }
+              stdoutBuffer += chunk.toString("utf8")
               stdoutText = appendBounded(stdoutText, chunk.toString("utf8"))
-              return
-            }
-            stdoutBuffer += chunk.toString("utf8")
-            stdoutText = appendBounded(stdoutText, chunk.toString("utf8"))
-            const lines = stdoutBuffer.split("\n")
-            stdoutBuffer = lines.pop() ?? ""
-            for (const line of lines) {
-              const parsed = parseResticJsonLine(line)
-              if (parsed !== null) input.onJson(parsed)
-            }
-          }),
-      readStream(stderrStream, (chunk) => {
-        stderr = appendBounded(stderr, chunk.toString("utf8"), MAX_STDERR_BYTES)
-      }),
+              const lines = stdoutBuffer.split("\n")
+              stdoutBuffer = lines.pop() ?? ""
+              for (const line of lines) {
+                const parsed = parseResticJsonLine(line)
+                if (parsed !== null) input.onJson(parsed)
+              }
+            }),
+        readStream(stderrStream, (chunk) => {
+          stderr = appendBounded(
+            stderr,
+            chunk.toString("utf8"),
+            MAX_STDERR_BYTES
+          )
+        }),
+      ]),
+      aborted,
     ])
     if (stdoutBuffer.trim()) {
       const parsed = parseResticJsonLine(stdoutBuffer)
@@ -748,7 +795,7 @@ async function spawnResticOnce(
   })
   input.signal.removeEventListener("abort", onAbort)
   if (Result.isFailure(completed)) {
-    await terminateResticChild(child, waitForExit, () => exited)
+    await terminate()
     throw completed.failure
   }
   return completed.success
@@ -757,7 +804,8 @@ async function spawnResticOnce(
 async function terminateResticChild(
   child: ChildProcess,
   waitForExit: Promise<number>,
-  hasExited: () => boolean
+  hasExited: () => boolean,
+  timeoutMs: number
 ): Promise<void> {
   if (hasExited()) return
   child.kill("SIGTERM")
@@ -766,7 +814,7 @@ async function terminateResticChild(
       Effect.tryPromise({
         try: () => waitForExit,
         catch: (cause) => cause,
-      }).pipe(Effect.timeout(`${RESTIC_TERMINATE_TIMEOUT_MS} millis`))
+      }).pipe(Effect.timeout(`${timeoutMs} millis`))
     )
   )
   if (hasExited() || Result.isSuccess(first)) return
@@ -776,7 +824,7 @@ async function terminateResticChild(
       Effect.tryPromise({
         try: () => waitForExit,
         catch: (cause) => cause,
-      })
+      }).pipe(Effect.timeout(`${timeoutMs} millis`))
     )
   )
 }

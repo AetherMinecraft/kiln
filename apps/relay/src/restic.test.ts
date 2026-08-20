@@ -203,6 +203,76 @@ describe("restic driver", () => {
     assert.strictEqual(killed, "SIGTERM")
   })
 
+  it("escalates an ignored abort to SIGKILL", async () => {
+    const abort = new AbortController()
+    const signals: Array<string> = []
+    const spawn: ResticSpawn = () => {
+      abort.abort()
+      const stdout = new PassThrough()
+      const stderr = new PassThrough()
+      const child = new EventEmitter() as ReturnType<ResticSpawn>
+      child.stdout = stdout
+      child.stderr = stderr
+      child.stdin = new PassThrough()
+      child.kill = (signal) => {
+        const received = String(signal ?? "SIGTERM")
+        signals.push(received)
+        if (received === "SIGKILL") {
+          queueMicrotask(() => {
+            stdout.end()
+            stderr.end()
+            child.emit("close", 1)
+          })
+        }
+        return true
+      }
+      return child
+    }
+    const driver = createResticDriver({ spawn, terminateTimeoutMs: 10 })
+
+    await rejects(
+      driver.catConfig({
+        location: s3Location,
+        password: "secret",
+        signal: abort.signal,
+      }),
+      RelayBackupError
+    )
+    assert.deepStrictEqual(signals, ["SIGTERM", "SIGKILL"])
+  })
+
+  it("does not wait for restic streams to reach EOF after abort", async () => {
+    const abort = new AbortController()
+    let stdout: PassThrough | undefined
+    let stderr: PassThrough | undefined
+    const spawn: ResticSpawn = () => {
+      abort.abort()
+      stdout = new PassThrough()
+      stderr = new PassThrough()
+      const child = new EventEmitter() as ReturnType<ResticSpawn>
+      child.stdout = stdout
+      child.stderr = stderr
+      child.stdin = new PassThrough()
+      child.kill = () => {
+        queueMicrotask(() => child.emit("close", 1))
+        return true
+      }
+      return child
+    }
+    const driver = createResticDriver({ spawn, terminateTimeoutMs: 10 })
+
+    await rejects(
+      driver.catConfig({
+        location: s3Location,
+        password: "secret",
+        signal: abort.signal,
+      }),
+      RelayBackupError
+    )
+    stdout?.end()
+    stderr?.end()
+  })
+
   it("reuses a snapshot tagged with the task id", async () => {
     const spawn = fakeResticSpawn([
       {
