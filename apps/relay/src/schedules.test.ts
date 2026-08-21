@@ -17,6 +17,7 @@ import { ScheduleManager } from "./schedules.js"
 const directories: Array<string> = []
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all(
     directories
       .splice(0)
@@ -87,6 +88,17 @@ const projection: RelayScheduleProjection = {
 }
 
 describe("Relay schedule persistence", () => {
+  it("does not clone retained state during idle ticks", async () => {
+    const schedules = await manager({ tickIntervalMs: 5 })
+    const clone = vi.spyOn(globalThis, "structuredClone")
+
+    const fiber = Effect.runFork(schedules.run())
+    await Effect.runPromise(Effect.sleep("30 millis"))
+    fiber.interruptUnsafe()
+
+    expect(clone).not.toHaveBeenCalled()
+  })
+
   it("keeps the scheduler fiber alive when a tick fails", async () => {
     const reportError = vi.fn()
     const schedules = await manager({

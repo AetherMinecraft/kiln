@@ -309,9 +309,25 @@ export class ScheduleManager {
 
   async #tick() {
     const due = await this.#serialized(async () => {
-      const previousState = structuredClone(this.#state)
-      const previousHeartbeatPersistedAt = this.#lastHeartbeatPersistedAt
       const now = Date.now()
+      const persistHeartbeat =
+        now - this.#lastHeartbeatPersistedAt >= heartbeatPersistenceIntervalMs
+      const hasDueSchedule = this.#state.schedules.some(
+        (schedule) =>
+          schedule.enabled &&
+          schedule.nextRunAt !== null &&
+          schedule.nextRunAt <= now
+      )
+      if (!hasDueSchedule && !persistHeartbeat) {
+        this.#state.lastHeartbeatAt = now
+        return []
+      }
+
+      const previousState = hasDueSchedule
+        ? structuredClone(this.#state)
+        : null
+      const previousHeartbeatAt = this.#state.lastHeartbeatAt
+      const previousHeartbeatPersistedAt = this.#lastHeartbeatPersistedAt
       const claimed: Array<{
         definition: RelayScheduleProjection
         scheduledAt: number
@@ -351,9 +367,6 @@ export class ScheduleManager {
               })
               this.#upsertRun(running)
             }
-            const persistHeartbeat =
-              now - this.#lastHeartbeatPersistedAt >=
-              heartbeatPersistenceIntervalMs
             this.#state.lastHeartbeatAt = now
             if (claimed.length > 0 || persistHeartbeat) {
               await this.#persist()
@@ -364,7 +377,8 @@ export class ScheduleManager {
         )
       )
       if (Result.isFailure(result)) {
-        this.#state = previousState
+        if (previousState) this.#state = previousState
+        else this.#state.lastHeartbeatAt = previousHeartbeatAt
         this.#lastHeartbeatPersistedAt = previousHeartbeatPersistedAt
         throw result.failure
       }
