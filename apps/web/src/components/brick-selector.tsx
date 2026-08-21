@@ -848,15 +848,9 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                           </span>
                           <CatalogTrustBadge catalog={catalog} />
                         </span>
-                        {catalog.author ||
-                        (catalogsQuery.data?.isPlatformAdmin &&
-                          catalog.ownerUserId) ? (
+                        {catalog.author ? (
                           <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
-                            {catalog.author ? `By ${catalog.author}` : ""}
-                            {catalogsQuery.data?.isPlatformAdmin &&
-                            catalog.ownerUserId
-                              ? `${catalog.author ? " · " : ""}Added by ${catalog.ownerEmail ?? catalog.ownerName ?? catalog.ownerUserId}`
-                              : ""}
+                            By {catalog.author}
                           </span>
                         ) : null}
                       </span>
@@ -926,6 +920,15 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                     </h3>
                     <CatalogTrustBadge catalog={selected} />
                   </div>
+                  {catalogsQuery.data?.isPlatformAdmin &&
+                  selected.ownerUserId ? (
+                    <p className="mt-1 truncate text-[0.6875rem] text-muted-foreground">
+                      Owner:{" "}
+                      {selected.ownerEmail ??
+                        selected.ownerName ??
+                        selected.ownerUserId}
+                    </p>
+                  ) : null}
                 </div>
               </div>
               {selected.revisionUrl && selected.revisionSha ? (
