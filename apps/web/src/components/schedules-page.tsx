@@ -1,6 +1,7 @@
 import * as React from "react"
 import {
   useMutation,
+  useQuery,
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query"
@@ -10,6 +11,8 @@ import {
   Check,
   CirclePause,
   CirclePlay,
+  CircleCheck,
+  CircleX,
   ClipboardCopy,
   Code2,
   Copy,
@@ -22,6 +25,7 @@ import {
   Play,
   Plus,
   Power,
+  RefreshCw,
   Search,
   Server,
   Trash2,
@@ -95,6 +99,8 @@ import {
 type Schedule = Awaited<ReturnType<typeof getSchedules>>[number]
 type ScheduleOption = Awaited<ReturnType<typeof getScheduleOptions>>[number]
 type EditorMode = { kind: "create" } | { kind: "edit"; schedule: Schedule }
+type ScheduleRun = Schedule["runs"][number]
+type ScheduleRunWithRelay = ScheduleRun & { relayId: string }
 
 const relativeFormatter = new Intl.RelativeTimeFormat("en-US", {
   numeric: "auto",
@@ -102,14 +108,24 @@ const relativeFormatter = new Intl.RelativeTimeFormat("en-US", {
 })
 
 export const SchedulesPage = React.memo(function SchedulesPage() {
-  const { data: schedules } = useSuspenseQuery(schedulesQueryOptions())
-  const { data: options } = useSuspenseQuery(scheduleOptionsQueryOptions())
+  const { data: schedules } = useSuspenseQuery({
+    ...schedulesQueryOptions(),
+    notifyOnChangeProps: ["data"],
+  })
+  const { data: options } = useSuspenseQuery({
+    ...scheduleOptionsQueryOptions(),
+    notifyOnChangeProps: ["data"],
+  })
   const navigate = useNavigate({ from: "/schedules" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
   const [deleting, setDeleting] = React.useState<Schedule | null>(null)
   const canCreate = options.some((option) => option.canCreate)
+  const optionMap = React.useMemo(
+    () => new Map(options.map((option) => [targetKey(option), option])),
+    [options]
+  )
   const scopedSchedules = React.useMemo(
     () =>
       selectedScope
@@ -127,11 +143,31 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
     (schedule: Schedule) => setDeleting(schedule),
     []
   )
+  const openCreate = React.useCallback(() => setEditor({ kind: "create" }), [])
   const viewHistory = React.useCallback(
     (schedule: Schedule) => {
       void navigate({
         to: "/schedules/history",
-        search: (previous) => ({ ...previous, schedule: schedule.id }),
+        search: (previous) => ({
+          ...previous,
+          run: undefined,
+          runRelay: undefined,
+          schedule: schedule.id,
+        }),
+      })
+    },
+    [navigate]
+  )
+  const viewRun = React.useCallback(
+    (schedule: Schedule, run: ScheduleRunWithRelay) => {
+      void navigate({
+        to: "/schedules/history",
+        search: (previous) => ({
+          ...previous,
+          run: run.id,
+          runRelay: run.relayId,
+          schedule: schedule.id,
+        }),
       })
     },
     [navigate]
@@ -143,18 +179,19 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
         <ScheduleToolbar
           canCreate={canCreate}
           searchStore={searchStore}
-          onCreate={() => setEditor({ kind: "create" })}
+          onCreate={openCreate}
         />
         <ScheduleTable
           canCreate={canCreate}
-          options={options}
+          optionMap={optionMap}
           schedules={scopedSchedules}
-          scopeActive={selectedScope !== null}
+          scope={selectedScope}
           searchStore={searchStore}
-          onCreate={() => setEditor({ kind: "create" })}
+          onCreate={openCreate}
           onDelete={openDelete}
           onEdit={openEdit}
           onViewHistory={viewHistory}
+          onViewRun={viewRun}
         />
       </section>
 
@@ -188,6 +225,7 @@ const ScheduleToolbar = React.memo(function ScheduleToolbar({
 
   return (
     <div className="flex min-w-0 items-center gap-2 border-b bg-background/25 p-3">
+      <ScheduleSyncButton />
       <div className="relative min-w-0 flex-1 sm:max-w-md">
         <Search className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted-foreground" />
         <Input
@@ -210,49 +248,82 @@ const ScheduleToolbar = React.memo(function ScheduleToolbar({
   )
 })
 
+const ScheduleSyncButton = React.memo(function ScheduleSyncButton() {
+  const { fetchStatus, refetch } = useQuery({
+    ...schedulesQueryOptions(),
+    notifyOnChangeProps: ["fetchStatus"],
+  })
+  const syncing = fetchStatus === "fetching"
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          size="icon"
+          variant="outline"
+          aria-label="Sync schedules"
+          aria-busy={syncing}
+          disabled={syncing}
+          onClick={() => void refetch()}
+        >
+          <RefreshCw className={syncing ? "animate-spin" : ""} />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={6}>
+        Sync schedules
+      </TooltipContent>
+    </Tooltip>
+  )
+})
+
 const ScheduleTable = React.memo(function ScheduleTable({
   canCreate,
-  options,
+  optionMap,
   schedules,
-  scopeActive,
+  scope,
   searchStore,
   onCreate,
   onDelete,
   onEdit,
   onViewHistory,
+  onViewRun,
 }: {
   canCreate: boolean
-  options: ReadonlyArray<ScheduleOption>
+  optionMap: ReadonlyMap<string, ScheduleOption>
   schedules: Array<Schedule>
-  scopeActive: boolean
+  scope: ServerPickerOption | null
   searchStore: WorkspaceTableSearchStore
   onCreate: () => void
   onDelete: (schedule: Schedule) => void
   onEdit: (schedule: Schedule) => void
   onViewHistory: (schedule: Schedule) => void
+  onViewRun: (schedule: Schedule, run: ScheduleRunWithRelay) => void
 }) {
   const renderRow = React.useCallback(
     (schedule: Schedule) => (
       <ScheduleTableRow
-        options={options}
+        optionMap={optionMap}
         schedule={schedule}
-        onDelete={() => onDelete(schedule)}
-        onEdit={() => onEdit(schedule)}
-        onViewHistory={() => onViewHistory(schedule)}
+        scope={scope}
+        onDelete={onDelete}
+        onEdit={onEdit}
+        onViewHistory={onViewHistory}
+        onViewRun={onViewRun}
       />
     ),
-    [onDelete, onEdit, onViewHistory, options]
+    [onDelete, onEdit, onViewHistory, onViewRun, optionMap, scope]
   )
   const renderEmpty = React.useCallback(
     (searchActive: boolean) => (
       <EmptyScheduleTable
         canCreate={canCreate}
-        scopeActive={scopeActive}
+        scopeActive={scope !== null}
         searchActive={searchActive}
         onCreate={onCreate}
       />
     ),
-    [canCreate, onCreate, scopeActive]
+    [canCreate, onCreate, scope]
   )
 
   return (
@@ -280,7 +351,10 @@ const ScheduleTableHead = React.memo(function ScheduleTableHead() {
       <WorkspaceTableHeading className="hidden w-[20%] md:table-cell">
         Timing
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[20%] lg:table-cell">
+      <WorkspaceTableHeading className="hidden w-[16%] lg:table-cell">
+        Last run
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[16%] xl:table-cell">
         Next run
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="w-48 px-1 text-right sm:w-64 sm:px-3">
@@ -291,23 +365,23 @@ const ScheduleTableHead = React.memo(function ScheduleTableHead() {
 })
 
 const ScheduleTableRow = React.memo(function ScheduleTableRow({
-  options,
+  optionMap,
   schedule,
+  scope,
   onDelete,
   onEdit,
   onViewHistory,
+  onViewRun,
 }: {
-  options: ReadonlyArray<ScheduleOption>
+  optionMap: ReadonlyMap<string, ScheduleOption>
   schedule: Schedule
-  onDelete: () => void
-  onEdit: () => void
-  onViewHistory: () => void
+  scope: ServerPickerOption | null
+  onDelete: (schedule: Schedule) => void
+  onEdit: (schedule: Schedule) => void
+  onViewHistory: (schedule: Schedule) => void
+  onViewRun: (schedule: Schedule, run: ScheduleRunWithRelay) => void
 }) {
   const queryClient = useQueryClient()
-  const optionMap = React.useMemo(
-    () => new Map(options.map((option) => [targetKey(option), option])),
-    [options]
-  )
   const canEdit = canOperateSchedule(schedule, optionMap, "canUpdate")
   const canDelete = schedule.targets.every(
     (target) => optionMap.get(targetKey(target))?.canDelete
@@ -364,6 +438,7 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
       showToast({ message: errorMessage(cause), type: "error" }),
   })
   const nextRun = scheduleNextRun(schedule)
+  const lastRun = scheduleLastRun(schedule, scope)
   const status = scheduleStatus(schedule)
   const copyScheduleId = React.useCallback(() => {
     forkPromise(
@@ -389,6 +464,13 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
         <ScheduleTiming cron={schedule.cron} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden lg:table-cell">
+        <ScheduleLastRun
+          run={lastRun}
+          timezone={schedule.timezone}
+          onView={() => lastRun && onViewRun(schedule, lastRun)}
+        />
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden xl:table-cell">
         <ScheduleNextRun nextRun={nextRun} timezone={schedule.timezone} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="px-1 sm:px-3">
@@ -417,7 +499,7 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
                   size="icon-sm"
                   variant="ghost"
                   aria-label={`Edit ${schedule.name}`}
-                  onClick={onEdit}
+                  onClick={() => onEdit(schedule)}
                 >
                   <Pencil />
                 </Button>
@@ -432,9 +514,9 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
                   type="button"
                   size="icon-sm"
                   variant="ghost"
-                  className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                  className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                   aria-label={`Delete ${schedule.name}`}
-                  onClick={onDelete}
+                  onClick={() => onDelete(schedule)}
                 >
                   <Trash2 />
                 </Button>
@@ -475,7 +557,7 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
                   Duplicate schedule
                 </DropdownMenuItem>
               ) : null}
-              <DropdownMenuItem onSelect={onViewHistory}>
+              <DropdownMenuItem onSelect={() => onViewHistory(schedule)}>
                 <History /> View history
               </DropdownMenuItem>
               {canEdit ? (
@@ -561,6 +643,44 @@ function ScheduleNextRun({
   )
 }
 
+function ScheduleLastRun({
+  run,
+  timezone,
+  onView,
+}: {
+  run: ScheduleRunWithRelay | null
+  timezone: string
+  onView: () => void
+}) {
+  if (!run) {
+    return <span className="text-[0.625rem] text-muted-foreground">Never</span>
+  }
+  const succeeded = run.status === "succeeded"
+  const Icon = succeeded ? CircleCheck : CircleX
+  const finishedAt = new Date(run.finishedAt)
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className="inline-flex items-center gap-1.5 rounded-sm text-[0.625rem] text-foreground outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring/40"
+          onClick={onView}
+        >
+          <Icon
+            className={`size-3.5 shrink-0 ${succeeded ? "text-emerald-400" : "text-destructive"}`}
+          />
+          <time dateTime={finishedAt.toISOString()} suppressHydrationWarning>
+            {relativeTime(finishedAt)}
+          </time>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">
+        {fullTimestampLabel(finishedAt, timezone)}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 function EmptyScheduleTable({
   canCreate,
   scopeActive,
@@ -599,7 +719,10 @@ function EmptyScheduleTable({
 }
 
 export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
-  const { data: schedules } = useSuspenseQuery(schedulesQueryOptions())
+  const { data: schedules } = useSuspenseQuery({
+    ...schedulesQueryOptions(),
+    notifyOnChangeProps: ["data"],
+  })
   const search = useSearch({ from: "/_app/schedules" })
   const navigate = useNavigate({ from: "/schedules/history" })
   const selectedScope = useScheduleScope()
@@ -616,14 +739,53 @@ export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
     () => scheduleHistoryRuns(schedules, selectedScope, search.schedule),
     [schedules, search.schedule, selectedScope]
   )
+  const selectedRun = React.useMemo(
+    () =>
+      search.run
+        ? (runs.find(
+            (run) =>
+              run.id === search.run &&
+              (!search.runRelay || run.relayId === search.runRelay)
+          ) ?? null)
+        : null,
+    [runs, search.run, search.runRelay]
+  )
   const clearScheduleFilter = React.useCallback(
     () =>
       void navigate({
         replace: true,
-        search: (previous) => ({ ...previous, schedule: undefined }),
+        search: (previous) => ({
+          ...previous,
+          run: undefined,
+          runRelay: undefined,
+          schedule: undefined,
+        }),
       }),
     [navigate]
   )
+  const openRun = React.useCallback(
+    (run: ScheduleHistoryRun) => {
+      void navigate({
+        replace: true,
+        search: (previous) => ({
+          ...previous,
+          run: run.id,
+          runRelay: run.relayId,
+        }),
+      })
+    },
+    [navigate]
+  )
+  const closeRun = React.useCallback(() => {
+    void navigate({
+      replace: true,
+      search: (previous) => ({
+        ...previous,
+        run: undefined,
+        runRelay: undefined,
+      }),
+    })
+  }, [navigate])
 
   return (
     <div className="mx-auto w-full max-w-[90rem] px-3 pb-10 sm:px-5">
@@ -642,13 +804,16 @@ export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
           runs={runs}
           scopeActive={selectedScope !== null}
           searchStore={searchStore}
+          onOpenRun={openRun}
         />
       </section>
+      <ScheduleRunDialog run={selectedRun} onClose={closeRun} />
     </div>
   )
 })
 
 type ScheduleHistoryRun = Schedule["runs"][number] & {
+  definitionActions: Schedule["actions"]
   scheduleName: string
   timezone: string
 }
@@ -672,6 +837,7 @@ function scheduleHistoryRuns(
       }
       runs.push({
         ...run,
+        definitionActions: schedule.actions,
         scheduleName: schedule.name,
         timezone: schedule.timezone,
       })
@@ -680,7 +846,7 @@ function scheduleHistoryRuns(
   return runs.sort((left, right) => right.scheduledAt - left.scheduledAt)
 }
 
-function HistoryToolbar({
+const HistoryToolbar = React.memo(function HistoryToolbar({
   filteredScheduleName,
   runCount,
   searchStore,
@@ -695,6 +861,7 @@ function HistoryToolbar({
   useWorkspaceTableSearchInput(inputRef, searchStore)
   return (
     <div className="flex min-w-0 items-center gap-2 border-b bg-background/25 p-3">
+      <ScheduleSyncButton />
       <div className="relative min-w-0 flex-1 sm:max-w-md">
         <Search className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted-foreground" />
         <Input
@@ -725,20 +892,24 @@ function HistoryToolbar({
       </Badge>
     </div>
   )
-}
+})
 
 const ScheduleHistoryTable = React.memo(function ScheduleHistoryTable({
   runs,
   scopeActive,
   searchStore,
+  onOpenRun,
 }: {
   runs: Array<ScheduleHistoryRun>
   scopeActive: boolean
   searchStore: WorkspaceTableSearchStore
+  onOpenRun: (run: ScheduleHistoryRun) => void
 }) {
   const renderRow = React.useCallback(
-    (run: ScheduleHistoryRun) => <ScheduleHistoryRow run={run} />,
-    []
+    (run: ScheduleHistoryRun) => (
+      <ScheduleHistoryRow run={run} onOpen={onOpenRun} />
+    ),
+    [onOpenRun]
   )
   const renderEmpty = React.useCallback(
     (searchActive: boolean) => (
@@ -800,11 +971,26 @@ const ScheduleHistoryHead = React.memo(function ScheduleHistoryHead() {
 
 const ScheduleHistoryRow = React.memo(function ScheduleHistoryRow({
   run,
+  onOpen,
 }: {
   run: ScheduleHistoryRun
+  onOpen: (run: ScheduleHistoryRun) => void
 }) {
+  const open = React.useCallback(() => onOpen(run), [onOpen, run])
   return (
-    <tr className="transition-colors hover:bg-accent/25">
+    <tr
+      role="button"
+      tabIndex={0}
+      aria-label={`View ${run.scheduleName} run from ${timestampLabel(new Date(run.startedAt), run.timezone)} details`}
+      className="cursor-pointer transition-colors hover:bg-accent/25 focus-visible:bg-accent/30 focus-visible:outline-none"
+      onClick={open}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault()
+          open()
+        }
+      }}
+    >
       <WorkspaceTableCell className="px-2 sm:px-3">
         <RunStatusDot status={run.status} />
       </WorkspaceTableCell>
@@ -847,6 +1033,301 @@ const ScheduleHistoryRow = React.memo(function ScheduleHistoryRow({
   )
 })
 
+const ScheduleRunDialog = React.memo(function ScheduleRunDialog({
+  run,
+  onClose,
+}: {
+  run: ScheduleHistoryRun | null
+  onClose: () => void
+}) {
+  const actionsById = React.useMemo(
+    () => new Map(run?.definitionActions.map((action) => [action.id, action])),
+    [run]
+  )
+
+  return (
+    <Dialog open={run !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="grid max-h-[min(90dvh,52rem)] grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:max-w-3xl">
+        {run ? (
+          <>
+            <DialogHeader className="border-b px-5 py-4 pr-12">
+              <div className="flex items-start gap-3">
+                <RunResultIcon
+                  status={run.status}
+                  className="mt-0.5 size-5 shrink-0"
+                />
+                <div className="min-w-0">
+                  <DialogTitle className="truncate text-base">
+                    {run.scheduleName}
+                  </DialogTitle>
+                  <DialogDescription className="mt-1">
+                    Run details and ordered action audit history
+                  </DialogDescription>
+                </div>
+              </div>
+            </DialogHeader>
+
+            <div className="min-h-0 overflow-y-auto">
+              <section className="grid gap-px border-b bg-border sm:grid-cols-2 lg:grid-cols-4">
+                <RunMetadataItem
+                  label="Status"
+                  value={runStatusLabel(run.status)}
+                />
+                <RunMetadataItem
+                  label="Started"
+                  value={timestampLabel(new Date(run.startedAt), run.timezone)}
+                  detail={relativeTime(new Date(run.startedAt))}
+                />
+                <RunMetadataItem
+                  label="Duration"
+                  value={
+                    run.status === "running"
+                      ? "In progress"
+                      : durationLabel(run.finishedAt - run.startedAt)
+                  }
+                />
+                <RunMetadataItem label="Relay" value={run.relayId} mono />
+              </section>
+
+              <section className="border-b px-5 py-4">
+                <h3 className="text-xs font-semibold">Run metadata</h3>
+                <dl className="mt-3 grid gap-x-6 gap-y-3 text-[0.625rem] sm:grid-cols-2">
+                  <RunMetadataRow label="Run ID" value={run.id} mono />
+                  <RunMetadataRow
+                    label="Schedule ID"
+                    value={run.scheduleId}
+                    mono
+                  />
+                  <RunMetadataRow
+                    label="Revision"
+                    value={`r${run.revision}`}
+                    mono
+                  />
+                  <RunMetadataRow
+                    label="Scheduled for"
+                    value={fullTimestampLabel(
+                      new Date(run.scheduledAt),
+                      run.timezone
+                    )}
+                  />
+                  <RunMetadataRow
+                    label="Completed"
+                    value={
+                      run.status === "running"
+                        ? "Not completed"
+                        : fullTimestampLabel(
+                            new Date(run.finishedAt),
+                            run.timezone
+                          )
+                    }
+                  />
+                  <RunMetadataRow
+                    label="Targets"
+                    value={`${run.targetRuns.length}`}
+                    mono
+                  />
+                </dl>
+              </section>
+
+              <section className="px-5 py-4">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <h3 className="text-xs font-semibold">Target activity</h3>
+                    <p className="mt-0.5 text-[0.625rem] text-muted-foreground">
+                      Actions are shown in the order the Relay attempted them.
+                    </p>
+                  </div>
+                  <Badge
+                    variant="outline"
+                    className="font-mono text-[0.5625rem]"
+                  >
+                    {run.targetRuns.reduce(
+                      (count, targetRun) => count + targetRun.attempts.length,
+                      0
+                    )}{" "}
+                    attempts
+                  </Badge>
+                </div>
+
+                {run.targetRuns.length === 0 ? (
+                  <div className="mt-4 rounded-lg border border-dashed px-4 py-8 text-center text-xs text-muted-foreground">
+                    No targets were attempted for this run.
+                  </div>
+                ) : (
+                  <div className="mt-4 space-y-3">
+                    {run.targetRuns.map((targetRun) => (
+                      <TargetRunAudit
+                        key={targetRun.id}
+                        actionsById={actionsById}
+                        run={targetRun}
+                        timezone={run.timezone}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
+            </div>
+          </>
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  )
+})
+
+function RunMetadataItem({
+  label,
+  value,
+  detail,
+  mono = false,
+}: {
+  label: string
+  value: string
+  detail?: string
+  mono?: boolean
+}) {
+  return (
+    <div className="min-w-0 bg-background px-5 py-3.5">
+      <p className="font-mono text-[0.5rem] tracking-[0.12em] text-muted-foreground uppercase">
+        {label}
+      </p>
+      <p
+        className={`mt-1 truncate text-xs font-medium text-foreground ${mono ? "font-mono" : ""}`}
+        title={value}
+      >
+        {value}
+      </p>
+      {detail ? (
+        <p className="mt-0.5 text-[0.5625rem] text-muted-foreground">
+          {detail}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+function RunMetadataRow({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+}) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd
+        className={`mt-0.5 truncate text-foreground ${mono ? "font-mono text-[0.5625rem]" : ""}`}
+        title={value}
+      >
+        {value}
+      </dd>
+    </div>
+  )
+}
+
+function TargetRunAudit({
+  actionsById,
+  run,
+  timezone,
+}: {
+  actionsById: ReadonlyMap<string, ScheduleAction>
+  run: ScheduleHistoryRun["targetRuns"][number]
+  timezone: string
+}) {
+  return (
+    <article className="overflow-hidden rounded-lg border bg-background/35">
+      <header className="flex items-center gap-3 border-b bg-muted/15 px-3 py-2.5">
+        <TargetIcon
+          kind={run.target.kind}
+          className="size-3.5 shrink-0 text-muted-foreground"
+        />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-xs font-semibold">{run.target.name}</p>
+          <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
+            {run.target.kind} · {run.target.id}
+          </p>
+        </div>
+        <span className="text-[0.5625rem] text-muted-foreground">
+          {durationLabel(run.finishedAt - run.startedAt)}
+        </span>
+        <RunResultIcon status={run.status} className="size-4 shrink-0" />
+      </header>
+      {run.error ? (
+        <p className="border-b border-destructive/20 bg-destructive/5 px-3 py-2 text-[0.625rem] text-destructive">
+          {run.error}
+        </p>
+      ) : null}
+      {run.attempts.length === 0 ? (
+        <p className="px-3 py-4 text-[0.625rem] text-muted-foreground">
+          No actions were attempted.
+        </p>
+      ) : (
+        <ol className="divide-y divide-border/70">
+          {run.attempts.map((attempt, index) => {
+            const action = actionsById.get(attempt.actionId)
+            return (
+              <li key={attempt.id} className="flex gap-3 px-3 py-3">
+                <span className="relative mt-0.5 grid size-5 shrink-0 place-items-center rounded-full border bg-background font-mono text-[0.5rem] text-muted-foreground">
+                  {index + 1}
+                </span>
+                <ActionIcon
+                  type={attempt.actionType}
+                  className="mt-1 size-3.5 shrink-0 text-primary"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <p className="text-[0.6875rem] font-semibold">
+                      {actionLabel(attempt.actionType)}
+                    </p>
+                    <AttemptStatus status={attempt.status} />
+                  </div>
+                  <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
+                    {actionAuditSummary(action, attempt.actionId)}
+                  </p>
+                  <p className="mt-1 text-[0.5625rem] text-muted-foreground">
+                    {timestampLabel(new Date(attempt.startedAt), timezone)} ·{" "}
+                    {durationLabel(attempt.finishedAt - attempt.startedAt)}
+                  </p>
+                  {attempt.error ? (
+                    <p className="mt-2 rounded-md border border-destructive/20 bg-destructive/5 px-2.5 py-2 text-[0.625rem] leading-4 text-destructive">
+                      {attempt.error}
+                    </p>
+                  ) : null}
+                </div>
+              </li>
+            )
+          })}
+        </ol>
+      )}
+    </article>
+  )
+}
+
+function AttemptStatus({
+  status,
+}: {
+  status: ScheduleHistoryRun["targetRuns"][number]["attempts"][number]["status"]
+}) {
+  const succeeded = status === "succeeded"
+  const failed = status === "failed" || status === "interrupted"
+  return (
+    <span
+      className={`inline-flex items-center gap-1 text-[0.5625rem] font-medium capitalize ${succeeded ? "text-emerald-400" : failed ? "text-destructive" : "text-muted-foreground"}`}
+    >
+      {succeeded ? (
+        <Check className="size-3" />
+      ) : failed ? (
+        <X className="size-3" />
+      ) : (
+        <CirclePause className="size-3" />
+      )}
+      {status.replaceAll("_", " ")}
+    </span>
+  )
+}
+
 function ScheduleEditorDialog({
   mode,
   options,
@@ -872,10 +1353,23 @@ function ScheduleEditorDialog({
   const [actions, setActions] = React.useState<Array<ScheduleAction>>(
     existing?.actions ?? []
   )
-  const selectedOptions = options.filter((option) =>
-    selectedTargets.has(targetKey(option))
-  )
   const permissionKey = mode.kind === "create" ? "canCreate" : "canUpdate"
+  const selectedOptions = React.useMemo(
+    () => options.filter((option) => selectedTargets.has(targetKey(option))),
+    [options, selectedTargets]
+  )
+  const actionPermissions = React.useMemo(
+    () => ({
+      backup: scheduleActionAllowed("backup", selectedOptions, permissionKey),
+      console_command: scheduleActionAllowed(
+        "console_command",
+        selectedOptions,
+        permissionKey
+      ),
+      power: scheduleActionAllowed("power", selectedOptions, permissionKey),
+    }),
+    [permissionKey, selectedOptions]
+  )
   const canSave =
     name.trim().length > 0 &&
     cron.trim().length > 0 &&
@@ -920,36 +1414,51 @@ function ScheduleEditorDialog({
       showToast({ message: errorMessage(cause), type: "error" }),
   })
 
-  const actionAllowed = (type: ScheduleAction["type"]) => {
-    const compatible = selectedOptions.filter((target) =>
-      scheduleActionSupportsTarget({ type }, target)
+  const addAction = React.useCallback(
+    (type: ScheduleAction["type"]) => {
+      if (!actionPermissions[type]) return
+      const id = crypto.randomUUID()
+      setActions((current) => [
+        ...current,
+        type === "console_command"
+          ? { command: "", id, type }
+          : type === "backup"
+            ? {
+                destination: { kind: "local" },
+                id,
+                name: "Scheduled backup",
+                type,
+              }
+            : { action: "restart", id, type },
+      ])
+    },
+    [actionPermissions]
+  )
+  const updateAction = React.useCallback((next: ScheduleAction) => {
+    setActions((current) =>
+      current.map((item) => (item.id === next.id ? next : item))
     )
-    return (
-      compatible.length > 0 &&
-      compatible.every(
-        (target) =>
-          target[permissionKey] && target.permittedActions.includes(type)
-      )
-    )
-  }
-
-  const addAction = (type: ScheduleAction["type"]) => {
-    if (!actionAllowed(type)) return
-    const id = crypto.randomUUID()
-    setActions((current) => [
-      ...current,
-      type === "console_command"
-        ? { command: "", id, type }
-        : type === "backup"
-          ? {
-              destination: { kind: "local" },
-              id,
-              name: "Scheduled backup",
-              type,
-            }
-          : { action: "restart", id, type },
-    ])
-  }
+  }, [])
+  const moveEditorAction = React.useCallback(
+    (actionId: string, direction: -1 | 1) => {
+      setActions((current) => {
+        const index = current.findIndex((action) => action.id === actionId)
+        return index < 0 ? current : moveAction(current, index, direction)
+      })
+    },
+    []
+  )
+  const removeAction = React.useCallback((actionId: string) => {
+    setActions((current) => current.filter((action) => action.id !== actionId))
+  }, [])
+  const toggleTarget = React.useCallback((key: string, checked: boolean) => {
+    setSelectedTargets((current) => {
+      const next = new Set(current)
+      if (checked) next.add(key)
+      else next.delete(key)
+      return next
+    })
+  }, [])
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -1025,122 +1534,22 @@ function ScheduleEditorDialog({
             ) : null}
           </div>
 
-          <div>
-            <div className="flex items-end justify-between gap-4">
-              <div>
-                <h3 className="text-sm font-semibold">Targets</h3>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  Select every server, database, or Relay this schedule applies
-                  to.
-                </p>
-              </div>
-              <span className="font-mono text-[0.625rem] text-muted-foreground">
-                {selectedOptions.length} selected
-              </span>
-            </div>
-            <div className="mt-3 grid max-h-52 gap-2 overflow-y-auto rounded-lg border p-2 sm:grid-cols-2">
-              {options.map((option) => {
-                const key = targetKey(option)
-                const checked = selectedTargets.has(key)
-                const disabled = !option[permissionKey]
-                return (
-                  <label
-                    key={key}
-                    className={`flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-xs ${disabled ? "cursor-not-allowed opacity-45" : "cursor-pointer hover:bg-accent/40"}`}
-                  >
-                    <input
-                      type="checkbox"
-                      className="size-3.5 accent-primary"
-                      checked={checked}
-                      disabled={disabled}
-                      onChange={(event) => {
-                        setSelectedTargets((current) => {
-                          const next = new Set(current)
-                          if (event.target.checked) next.add(key)
-                          else next.delete(key)
-                          return next
-                        })
-                      }}
-                    />
-                    <TargetIcon
-                      kind={option.kind}
-                      className="size-3.5 text-muted-foreground"
-                    />
-                    <span className="min-w-0 flex-1 truncate font-medium">
-                      {option.name}
-                    </span>
-                    <span className="font-mono text-[0.5625rem] text-muted-foreground">
-                      {option.kind}
-                    </span>
-                  </label>
-                )
-              })}
-            </div>
-          </div>
+          <ScheduleTargetSelector
+            options={options}
+            permissionKey={permissionKey}
+            selectedOptionsCount={selectedOptions.length}
+            selectedTargets={selectedTargets}
+            onToggle={toggleTarget}
+          />
 
-          <div>
-            <div className="flex flex-wrap items-end justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-semibold">Ordered actions</h3>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  Only actions you are permitted to schedule are available.
-                </p>
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                <AddActionButton
-                  icon={Code2}
-                  label="Command"
-                  disabled={!actionAllowed("console_command")}
-                  onClick={() => addAction("console_command")}
-                />
-                <AddActionButton
-                  icon={HardDriveDownload}
-                  label="Backup"
-                  disabled={!actionAllowed("backup")}
-                  onClick={() => addAction("backup")}
-                />
-                <AddActionButton
-                  icon={Power}
-                  label="Power"
-                  disabled={!actionAllowed("power")}
-                  onClick={() => addAction("power")}
-                />
-              </div>
-            </div>
-            {actions.length === 0 ? (
-              <div className="mt-3 rounded-lg border border-dashed p-6 text-center text-xs text-muted-foreground">
-                Select a target, then add the first action.
-              </div>
-            ) : (
-              <div className="relative mt-3 space-y-2 before:absolute before:top-6 before:bottom-6 before:left-[1.3rem] before:w-px before:bg-border">
-                {actions.map((action, index) => (
-                  <ActionEditor
-                    key={action.id}
-                    action={action}
-                    index={index}
-                    total={actions.length}
-                    onChange={(next) =>
-                      setActions((current) =>
-                        current.map((item) =>
-                          item.id === next.id ? next : item
-                        )
-                      )
-                    }
-                    onMove={(direction) =>
-                      setActions((current) =>
-                        moveAction(current, index, direction)
-                      )
-                    }
-                    onRemove={() =>
-                      setActions((current) =>
-                        current.filter((item) => item.id !== action.id)
-                      )
-                    }
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+          <ScheduleActionsEditor
+            actions={actions}
+            allowed={actionPermissions}
+            onAdd={addAction}
+            onChange={updateAction}
+            onMove={moveEditorAction}
+            onRemove={removeAction}
+          />
 
           <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-background/30 px-3 py-3">
             <span>
@@ -1178,6 +1587,155 @@ function ScheduleEditorDialog({
   )
 }
 
+const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
+  options,
+  permissionKey,
+  selectedOptionsCount,
+  selectedTargets,
+  onToggle,
+}: {
+  options: ReadonlyArray<ScheduleOption>
+  permissionKey: "canCreate" | "canUpdate"
+  selectedOptionsCount: number
+  selectedTargets: ReadonlySet<string>
+  onToggle: (key: string, checked: boolean) => void
+}) {
+  return (
+    <div>
+      <div className="flex items-end justify-between gap-4">
+        <div>
+          <h3 className="text-sm font-semibold">Targets</h3>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            Select every server, database, or Relay this schedule applies to.
+          </p>
+        </div>
+        <span className="font-mono text-[0.625rem] text-muted-foreground">
+          {selectedOptionsCount} selected
+        </span>
+      </div>
+      <div className="mt-3 grid max-h-52 gap-2 overflow-y-auto rounded-lg border p-2 sm:grid-cols-2">
+        {options.map((option) => {
+          const key = targetKey(option)
+          return (
+            <ScheduleTargetOption
+              key={key}
+              option={option}
+              optionKey={key}
+              checked={selectedTargets.has(key)}
+              disabled={!option[permissionKey]}
+              onToggle={onToggle}
+            />
+          )
+        })}
+      </div>
+    </div>
+  )
+})
+
+const ScheduleTargetOption = React.memo(function ScheduleTargetOption({
+  option,
+  optionKey,
+  checked,
+  disabled,
+  onToggle,
+}: {
+  option: ScheduleOption
+  optionKey: string
+  checked: boolean
+  disabled: boolean
+  onToggle: (key: string, checked: boolean) => void
+}) {
+  return (
+    <label
+      className={`flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-xs ${disabled ? "cursor-not-allowed opacity-45" : "cursor-pointer hover:bg-accent/40"}`}
+    >
+      <input
+        type="checkbox"
+        className="size-3.5 accent-primary"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onToggle(optionKey, event.target.checked)}
+      />
+      <TargetIcon
+        kind={option.kind}
+        className="size-3.5 text-muted-foreground"
+      />
+      <span className="min-w-0 flex-1 truncate font-medium">{option.name}</span>
+      <span className="font-mono text-[0.5625rem] text-muted-foreground">
+        {option.kind}
+      </span>
+    </label>
+  )
+})
+
+const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
+  actions,
+  allowed,
+  onAdd,
+  onChange,
+  onMove,
+  onRemove,
+}: {
+  actions: ReadonlyArray<ScheduleAction>
+  allowed: Readonly<Record<ScheduleAction["type"], boolean>>
+  onAdd: (type: ScheduleAction["type"]) => void
+  onChange: (action: ScheduleAction) => void
+  onMove: (actionId: string, direction: -1 | 1) => void
+  onRemove: (actionId: string) => void
+}) {
+  return (
+    <div>
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold">Ordered actions</h3>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            Only actions you are permitted to schedule are available.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <AddActionButton
+            icon={Code2}
+            label="Command"
+            disabled={!allowed.console_command}
+            onClick={() => onAdd("console_command")}
+          />
+          <AddActionButton
+            icon={HardDriveDownload}
+            label="Backup"
+            disabled={!allowed.backup}
+            onClick={() => onAdd("backup")}
+          />
+          <AddActionButton
+            icon={Power}
+            label="Power"
+            disabled={!allowed.power}
+            onClick={() => onAdd("power")}
+          />
+        </div>
+      </div>
+      {actions.length === 0 ? (
+        <div className="mt-3 rounded-lg border border-dashed p-6 text-center text-xs text-muted-foreground">
+          Select a target, then add the first action.
+        </div>
+      ) : (
+        <div className="relative mt-3 space-y-2 before:absolute before:top-6 before:bottom-6 before:left-[1.3rem] before:w-px before:bg-border">
+          {actions.map((action, index) => (
+            <ActionEditor
+              key={action.id}
+              action={action}
+              index={index}
+              total={actions.length}
+              onChange={onChange}
+              onMove={onMove}
+              onRemove={onRemove}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+})
+
 function Field({
   label,
   hint,
@@ -1202,7 +1760,7 @@ function Field({
   )
 }
 
-function AddActionButton({
+const AddActionButton = React.memo(function AddActionButton({
   icon: Icon,
   label,
   disabled,
@@ -1225,9 +1783,9 @@ function AddActionButton({
       {label}
     </Button>
   )
-}
+})
 
-function ActionEditor({
+const ActionEditor = React.memo(function ActionEditor({
   action,
   index,
   total,
@@ -1239,8 +1797,8 @@ function ActionEditor({
   index: number
   total: number
   onChange: (action: ScheduleAction) => void
-  onMove: (direction: -1 | 1) => void
-  onRemove: () => void
+  onMove: (actionId: string, direction: -1 | 1) => void
+  onRemove: (actionId: string) => void
 }) {
   return (
     <div className="relative rounded-lg border bg-background/45 py-3 pr-3 pl-11">
@@ -1303,7 +1861,7 @@ function ActionEditor({
             variant="ghost"
             size="icon-sm"
             disabled={index === 0}
-            onClick={() => onMove(-1)}
+            onClick={() => onMove(action.id, -1)}
             aria-label="Move action up"
           >
             <ArrowUp className="size-3.5" />
@@ -1313,7 +1871,7 @@ function ActionEditor({
             variant="ghost"
             size="icon-sm"
             disabled={index === total - 1}
-            onClick={() => onMove(1)}
+            onClick={() => onMove(action.id, 1)}
             aria-label="Move action down"
           >
             <ArrowDown className="size-3.5" />
@@ -1322,7 +1880,7 @@ function ActionEditor({
             type="button"
             variant="ghost"
             size="icon-sm"
-            onClick={onRemove}
+            onClick={() => onRemove(action.id)}
             aria-label="Remove action"
           >
             <X className="size-3.5" />
@@ -1331,7 +1889,7 @@ function ActionEditor({
       </div>
     </div>
   )
-}
+})
 
 function DeleteScheduleDialog({
   schedule,
@@ -1392,20 +1950,20 @@ function DeleteScheduleDialog({
 function ScheduleState({
   state,
 }: {
-  state: "deployed" | "disabled" | "running"
+  state: "enabled" | "disabled" | "running"
 }) {
   const label =
-    state === "deployed"
-      ? "Deployed"
+    state === "enabled"
+      ? "Enabled"
       : state === "running"
         ? "Running"
         : "Disabled"
   return (
     <span
-      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium ${state === "deployed" ? "text-emerald-400" : state === "running" ? "text-amber-300" : "text-muted-foreground"}`}
+      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium ${state === "enabled" ? "text-emerald-400" : state === "running" ? "text-amber-300" : "text-muted-foreground"}`}
     >
       <span
-        className={`size-1.5 shrink-0 rounded-full ${state === "deployed" ? "bg-emerald-400" : state === "running" ? "animate-pulse bg-amber-400" : "bg-muted-foreground"}`}
+        className={`size-1.5 shrink-0 rounded-full ${state === "enabled" ? "bg-emerald-400" : state === "running" ? "animate-pulse bg-amber-400" : "bg-muted-foreground"}`}
       />
       <span>{label}</span>
     </span>
@@ -1428,6 +1986,34 @@ function RunStatusDot({
       <span className="hidden sm:inline">{label}</span>
     </span>
   )
+}
+
+function RunResultIcon({
+  status,
+  className,
+}: {
+  status: string
+  className?: string
+}) {
+  if (status === "succeeded") {
+    return <CircleCheck className={`${className ?? ""} text-emerald-400`} />
+  }
+  if (status === "running") {
+    return (
+      <LoaderCircle
+        className={`${className ?? ""} animate-spin text-amber-300`}
+      />
+    )
+  }
+  if (status === "partial") {
+    return <CircleX className={`${className ?? ""} text-amber-300`} />
+  }
+  if (status === "noop" || status.startsWith("skipped")) {
+    return (
+      <CirclePause className={`${className ?? ""} text-muted-foreground`} />
+    )
+  }
+  return <CircleX className={`${className ?? ""} text-destructive`} />
 }
 
 function TargetIcon({
@@ -1468,6 +2054,22 @@ function actionLabel(type: ScheduleAction["type"]) {
   return "Power action"
 }
 
+function actionAuditSummary(
+  action: ScheduleAction | undefined,
+  actionId: string
+) {
+  if (!action) return `Action ${actionId}`
+  if (action.type === "console_command") return action.command
+  if (action.type === "backup") return action.name
+  return action.action
+}
+
+function runStatusLabel(status: string) {
+  return status
+    .replaceAll("_", " ")
+    .replace(/^./u, (value) => value.toUpperCase())
+}
+
 function targetKey(target: Pick<ScheduleTarget, "id" | "kind" | "relayId">) {
   return `${target.relayId}:${target.kind}:${target.id}`
 }
@@ -1487,6 +2089,22 @@ function canOperateSchedule(
         permittedActions.has(action.type)
     )
   })
+}
+
+function scheduleActionAllowed(
+  type: ScheduleAction["type"],
+  targets: ReadonlyArray<ScheduleOption>,
+  permission: "canCreate" | "canUpdate"
+) {
+  const compatible = targets.filter((target) =>
+    scheduleActionSupportsTarget({ type }, target)
+  )
+  return (
+    compatible.length > 0 &&
+    compatible.every(
+      (target) => target[permission] && target.permittedActions.includes(type)
+    )
+  )
 }
 
 function moveAction(
@@ -1641,20 +2259,50 @@ function scheduleNextRun(schedule: Schedule) {
   )
 }
 
+function scheduleLastRun(
+  schedule: Schedule,
+  scope: ServerPickerOption | null
+): ScheduleRunWithRelay | null {
+  let latest: ScheduleRunWithRelay | null = null
+  for (const run of schedule.runs) {
+    if (run.status === "running") continue
+    if (
+      scope &&
+      !run.targetRuns.some((targetRun) =>
+        scheduleTargetMatchesScope(targetRun.target, scope)
+      )
+    ) {
+      continue
+    }
+    if (!latest || run.finishedAt > latest.finishedAt) latest = run
+  }
+  return latest
+}
+
 function scheduleStatus(
   schedule: Schedule
-): "deployed" | "disabled" | "running" {
+): "enabled" | "disabled" | "running" {
   if (schedule.runs.some((run) => run.status === "running")) return "running"
-  return schedule.enabled ? "deployed" : "disabled"
+  return schedule.enabled ? "enabled" : "disabled"
 }
 
 function relativeTime(date: Date) {
   const difference = date.getTime() - Date.now()
   const minutes = Math.round(difference / 60_000)
-  if (Math.abs(minutes) < 60) return relativeFormatter.format(minutes, "minute")
+  if (Math.abs(minutes) < 60) {
+    return stripTrailingPeriod(relativeFormatter.format(minutes, "minute"))
+  }
   const hours = Math.round(difference / 3_600_000)
-  if (Math.abs(hours) < 48) return relativeFormatter.format(hours, "hour")
-  return relativeFormatter.format(Math.round(difference / 86_400_000), "day")
+  if (Math.abs(hours) < 48) {
+    return stripTrailingPeriod(relativeFormatter.format(hours, "hour"))
+  }
+  return stripTrailingPeriod(
+    relativeFormatter.format(Math.round(difference / 86_400_000), "day")
+  )
+}
+
+function stripTrailingPeriod(value: string) {
+  return value.endsWith(".") ? value.slice(0, -1) : value
 }
 
 function errorMessage(cause: unknown) {

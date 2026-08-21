@@ -714,7 +714,7 @@ function AccountNavigation({
           <SidebarMenuButton asChild tooltip="Schedules">
             <Link
               to="/schedules"
-              activeOptions={{ exact: true, includeSearch: false }}
+              activeOptions={{ includeSearch: false }}
               activeProps={{ "data-active": true }}
               preload="intent"
             >
@@ -889,6 +889,9 @@ function statusBorderTone(state: SidebarInstance["observedState"]): string {
 
 function globalSectionFromPathname(pathname: string): GlobalSection {
   if (pathname === "/infra" || pathname.startsWith("/infra/")) return "infra"
+  if (pathname === "/schedules" || pathname.startsWith("/schedules/")) {
+    return "schedules"
+  }
   if (pathname === "/backups") return "backups"
   if (pathname === "/access") return "access"
   if (pathname === "/settings" || pathname.startsWith("/settings/")) {

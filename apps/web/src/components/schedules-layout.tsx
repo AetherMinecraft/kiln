@@ -37,13 +37,27 @@ export const SchedulesShell = React.memo(function SchedulesShell({
 }: {
   children: React.ReactNode
 }) {
-  const { data: targets } = useSuspenseQuery(scheduleOptionsQueryOptions())
+  const { data: targets } = useSuspenseQuery({
+    ...scheduleOptionsQueryOptions(),
+    notifyOnChangeProps: ["data"],
+  })
   const { data: instances } = useSuspenseQuery({
     ...relaySnapshotQueryOptions(),
     notifyOnChangeProps: ["data"],
     select: selectScheduleScopeInstances,
   })
-  const search = useSearch({ from: "/_app/schedules" })
+  const kind = useSearch({
+    from: "/_app/schedules",
+    select: (search) => search.kind,
+  })
+  const relay = useSearch({
+    from: "/_app/schedules",
+    select: (search) => search.relay,
+  })
+  const target = useSearch({
+    from: "/_app/schedules",
+    select: (search) => search.target,
+  })
   const navigate = useNavigate({ from: "/schedules" })
   const options = React.useMemo(
     () => scheduleScopeOptions(targets, instances),
@@ -53,11 +67,11 @@ export const SchedulesShell = React.memo(function SchedulesShell({
     () =>
       options.find(
         (option) =>
-          option.id === search.target &&
-          option.kind === search.kind &&
-          option.relayId === search.relay
+          option.id === target &&
+          option.kind === kind &&
+          option.relayId === relay
       ) ?? null,
-    [options, search.kind, search.relay, search.target]
+    [kind, options, relay, target]
   )
   const selectScope = React.useCallback(
     (option: ServerPickerOption | null) => {
