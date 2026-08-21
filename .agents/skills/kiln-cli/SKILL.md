@@ -80,7 +80,8 @@ the CLI executable; it does not update Hearth, Relays, or managed servers, and
 it does not require authentication.
 
 For an unpublished fork, do not use `kiln update`. Install the fork's packaged
-GitHub Release asset instead:
+GitHub Release asset instead. Nightly release tags include matching versioned
+tarballs automatically; use the tarball workflow for other existing releases:
 
 ```sh
 gh release download "$KILN_CLI_TAG" --repo owner/kiln \

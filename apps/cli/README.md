@@ -61,6 +61,9 @@ Publishing a `v0.x.y` GitHub Release runs the `Publish CLI tarball` workflow.
 It builds the CLI's bundled Node package from that tag and attaches
 `kiln-cli-0.x.y.tgz` plus its SHA-256 checksum to the release. The workflow can
 also be dispatched manually with an existing release tag to retry an upload.
+Every Kiln nightly release also builds and attaches the matching
+`kiln-cli-0.x.y-nightly.YYYYMMDD.HHMMSS.tgz` package and checksum directly in
+the nightly release job.
 
 Another repository can download and install the package without using the npm
 registry:
