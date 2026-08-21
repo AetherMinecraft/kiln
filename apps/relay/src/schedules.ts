@@ -49,6 +49,7 @@ const scheduledBackupWaitTimeoutMs = 6 * 60 * 60 * 1_000
 const targetExecutionConcurrency = 8
 const scheduleTickIntervalMs = 1_000
 const scheduleTickRetryBaseMs = 100
+const relayTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
 
 class ScheduleTickError extends Data.TaggedError("ScheduleTickError")<{
   readonly cause: unknown
@@ -178,7 +179,7 @@ export class ScheduleManager {
       const nextRunAt = input.enabled
         ? nextScheduleOccurrence(
             input.cron,
-            input.timezone,
+            relayTimezone,
             Date.now()
           ).getTime()
         : null
@@ -299,7 +300,7 @@ export class ScheduleManager {
       this.#upsertRun(run)
       schedule.nextRunAt = nextScheduleOccurrence(
         schedule.cron,
-        schedule.timezone,
+        relayTimezone,
         now
       ).getTime()
     }
@@ -323,9 +324,7 @@ export class ScheduleManager {
         return []
       }
 
-      const previousState = hasDueSchedule
-        ? structuredClone(this.#state)
-        : null
+      const previousState = hasDueSchedule ? structuredClone(this.#state) : null
       const previousHeartbeatAt = this.#state.lastHeartbeatAt
       const previousHeartbeatPersistedAt = this.#lastHeartbeatPersistedAt
       const claimed: Array<{
@@ -348,7 +347,7 @@ export class ScheduleManager {
               claimed.push({ definition, scheduledAt })
               schedule.nextRunAt = nextScheduleOccurrence(
                 schedule.cron,
-                schedule.timezone,
+                relayTimezone,
                 now
               ).getTime()
               const running = scheduleRunSchema.parse({
