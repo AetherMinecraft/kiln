@@ -19,6 +19,7 @@ import { command } from "./command.js"
 import { directoryApparentSizeEffect } from "./disk-usage.js"
 import { recoverPromise, tapPromiseError } from "./effect/promise.js"
 import type {
+  BrickRecipe,
   RelayCreateInstance,
   RelayInstance,
   RelayInstancePendingPrimaryPort,
@@ -270,6 +271,8 @@ export function resolveInstanceStartupReconfigure(
   diskLimitBytes: number
   forcePull: boolean
   recipe: string
+  recipeDefinition?: BrickRecipe
+  snapshotSha256?: string
   start: boolean
   tailscale: RelayInstanceTailscale
   variables: NonNullable<RelayInstance["variables"]>
@@ -289,12 +292,20 @@ export function resolveInstanceStartupReconfigure(
         : "Enter startup variables"
     )
   }
+  const snapshotSha256 =
+    input.recipeDefinition || input.recipe
+      ? undefined
+      : existing.brickSnapshotSha256
   return {
     diskLimitBytes: reinstall
       ? existing.limits.diskBytes
       : (input.diskLimitBytes ?? existing.limits.diskBytes),
     forcePull: reinstall,
     recipe,
+    ...(input.recipeDefinition
+      ? { recipeDefinition: input.recipeDefinition }
+      : {}),
+    ...(snapshotSha256 ? { snapshotSha256 } : {}),
     start: reinstall ? existing.desiredState === "running" : input.start,
     tailscale: reinstall
       ? existing.tailscale
@@ -1897,6 +1908,7 @@ export class LifecycleDriver {
       id,
       prepareDirectory: true,
       recipe: input.recipe,
+      recipeDefinition: input.recipeDefinition,
       start: input.start,
       tailscale: input.tailscale ?? { enabled: false },
       variables: input.variables,
@@ -1923,8 +1935,16 @@ export class LifecycleDriver {
         "This server does not have a recoverable primary port. Recreate it before changing startup settings."
       )
     }
-    const { diskLimitBytes, forcePull, recipe, start, tailscale, variables } =
-      resolveInstanceStartupReconfigure(existing, input)
+    const {
+      diskLimitBytes,
+      forcePull,
+      recipe,
+      recipeDefinition,
+      snapshotSha256,
+      start,
+      tailscale,
+      variables,
+    } = resolveInstanceStartupReconfigure(existing, input)
     if (tailscale.enabled) {
       const duplicate = inspected.find(
         (instance) =>
@@ -1939,7 +1959,8 @@ export class LifecycleDriver {
         )
       }
     }
-    const definition = await this.#bricks.recipe(recipe)
+    const definition =
+      recipeDefinition ?? (await this.#bricks.recipe(recipe, snapshotSha256))
     const resolved = resolveBrick(definition, variables, recipe)
     await this.#assertAllocationAvailable({
       checkExistingUsage: true,
@@ -1986,6 +2007,7 @@ export class LifecycleDriver {
           prepareDirectory: false,
           ports: existing.ports,
           recipe,
+          recipeDefinition: definition,
           skipImagePull: forcePull,
           start,
           tailscale,
@@ -2010,12 +2032,17 @@ export class LifecycleDriver {
     prepareDirectory: boolean
     ports?: ReadonlyArray<RelayInstancePortAllocation>
     recipe: string
+    recipeDefinition?: BrickRecipe
+    snapshotSha256?: string
     skipImagePull?: boolean
     start: boolean
     tailscale: RelayInstanceTailscale
     variables: RelayCreateInstance["variables"]
   }): Promise<RelayInstance> {
-    const definition = await this.#bricks.recipe(input.recipe)
+    const definition =
+      input.recipeDefinition ??
+      (await this.#bricks.recipe(input.recipe, input.snapshotSha256))
+    const snapshotSha256 = await this.#bricks.saveSnapshot(definition)
     const resolved = resolveBrick(definition, input.variables, input.recipe)
     const installationMarkerValue =
       resolved.environment[INSTALLATION_MARKER_ENV]
@@ -2252,6 +2279,8 @@ export class LifecycleDriver {
       `kiln.brick.format=${definition.format}`,
       "--label",
       `kiln.brick.source=${input.recipe}`,
+      "--label",
+      `kiln.brick.snapshot-sha256=${snapshotSha256}`,
       "--label",
       `kiln.brick.variables=${variablesLabel}`,
       "--label",

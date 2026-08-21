@@ -42,6 +42,7 @@ import {
 } from "@workspace/contracts"
 
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
+import { brickSnapshotDirectory, readBrickSnapshot } from "./bricks.js"
 import type { DatabaseDriver } from "./databases.js"
 import {
   createCompressedDatabaseBackup,
@@ -1008,13 +1009,19 @@ export async function createPortableInstanceBackup(
             progress.total,
             maximumBytes
           )
+          const manifest = await instanceBackupManifest(
+            config,
+            input,
+            instance,
+            webRoutes
+          )
           const written = await writeBackupArchive(
             temporary,
             collected.entries,
             maximumBytes,
             progress,
             signal,
-            instanceBackupManifest(input, instance, webRoutes)
+            manifest
           )
           warnings = [...collected.warnings, ...written.warnings]
           if (written.changed.length > 0 && attempt === 0) {
@@ -1064,16 +1071,23 @@ export async function createPortableInstanceBackup(
   })
 }
 
-function instanceBackupManifest(
+async function instanceBackupManifest(
+  config: RelayConfig,
   input: BackupCreateTaskInput,
   instance: RelayInstanceConfig,
   webRoutes: ReadonlyArray<RelayInstanceWebRoute>
-): BackupArchiveManifest {
+): Promise<BackupArchiveManifest> {
+  const recipe = instance.brickSnapshotSha256
+    ? await readBrickSnapshot(
+        brickSnapshotDirectory(config.dataDirectory),
+        instance.brickSnapshotSha256
+      )
+    : null
   return {
     artifactKind: "archive",
     backupId: input.backupId,
     createdAt: new Date().toISOString(),
-    formatVersion: 2,
+    formatVersion: 3,
     mode: "full",
     server: {
       brick: {
@@ -1084,6 +1098,8 @@ function instanceBackupManifest(
         primaryPort: instance.brickPrimaryPort ?? null,
         primaryPortProtocol: instance.brickPrimaryPortProtocol ?? null,
         readiness: instance.brickReadiness ?? null,
+        recipe,
+        snapshotSha256: instance.brickSnapshotSha256 ?? null,
         source: instance.brickSource ?? null,
         supportsSrv: instance.brickSupportsSrv ?? false,
       },

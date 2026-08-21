@@ -403,6 +403,7 @@ export const relayCreateInstanceSchema = z.object({
   ),
   name: relayInstanceNameSchema.optional(),
   recipe: brickSourceSchema,
+  recipeDefinition: brickRecipeSchema.optional(),
   tailscale: relayInstanceTailscaleSchema
     .default({ enabled: false })
     .optional(),
@@ -414,6 +415,7 @@ export const relayUpdateInstanceStartupSchema = z
   .object({
     diskLimitBytes: relayRequestedDiskLimitBytesSchema.optional(),
     recipe: brickSourceSchema.optional(),
+    recipeDefinition: brickRecipeSchema.optional(),
     reinstall: z.boolean().optional(),
     tailscale: relayInstanceTailscaleSchema.optional(),
     variables: brickVariableValuesSchema.optional(),
@@ -902,6 +904,10 @@ export const relayInstanceSchema = z.object({
   brickPrimaryPortProtocol: relayInstancePortProtocolSchema.optional(),
   brickSupportsSrv: z.boolean().default(false),
   brickSource: brickSourceSchema.optional(),
+  brickSnapshotSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .optional(),
   publicHost: z.string().min(1).max(253).optional(),
   publicPort: z.number().int().min(1).max(65_535).optional(),
   pendingPrimaryPort: relayInstancePendingPrimaryPortSchema.optional(),

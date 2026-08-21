@@ -12,6 +12,7 @@ import {
 } from "lucide-react"
 import type {
   Brick,
+  BrickRecipe,
   BrickVariableValue,
   RelayInstanceLimits,
 } from "@workspace/contracts"
@@ -76,11 +77,13 @@ type BrickView = {
   id: string
   memoryTemplate: string
   name: string
+  recipeDefinition?: BrickRecipe
   source: string
   variables: Brick["variables"]
 }
 
 function brickViewFromBrick(brick: Brick, source = brick.source): BrickView {
+  const { source: _source, ...recipeDefinition } = brick
   return {
     description: brick.metadata.description,
     environment: brick.runtime.environment,
@@ -88,6 +91,7 @@ function brickViewFromBrick(brick: Brick, source = brick.source): BrickView {
     id: brick.metadata.id,
     memoryTemplate: brick.runtime.resources.memory,
     name: brick.metadata.name,
+    recipeDefinition,
     source,
     variables: brick.variables,
   }
@@ -315,6 +319,7 @@ const StartupForm = React.memo(function StartupForm({
               diskLimitBytes,
               instanceId,
               recipe: view.source,
+              recipeDefinition: view.recipeDefinition,
               relayId,
               start: true,
               variables,
@@ -872,8 +877,9 @@ const StartupBrickReinstallDialog = React.memo(
           <DialogHeader>
             <DialogTitle>Reinstall {brickName}</DialogTitle>
             <DialogDescription>
-              Rebuilds the container from the current Ember image. World data and
-              files stay on the volume. Unsaved Startup changes are not applied.
+              Rebuilds the container from the current Ember image. World data
+              and files stay on the volume. Unsaved Startup changes are not
+              applied.
             </DialogDescription>
           </DialogHeader>
           {error ? (

@@ -21,9 +21,12 @@ import { openPromise, type Entry, type ZipFile } from "yauzl"
 
 import {
   backupArchiveManifestSchema,
+  brickRecipeSchema,
+  type BackupArchiveManifest,
   type BackupRestoreTaskInput,
 } from "@workspace/contracts"
 
+import { brickSnapshotDirectory, saveBrickSnapshot } from "./bricks.js"
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
 import { writeFileAtomic } from "./effect/atomic-file.js"
 import { RelayBackupError } from "./effect/errors.js"
@@ -31,7 +34,8 @@ import { isPublicRemoteAddress, secureRemoteLookup } from "./source-policy.js"
 
 const ARCHIVE_MANIFEST_PATH = ".kiln-backup/manifest.json"
 const MAX_ARCHIVE_ENTRIES = 100_000
-const MAX_MANIFEST_BYTES = 1024 * 1024
+// V3 manifests embed the exact Brick recipe used to provision the server.
+const MAX_MANIFEST_BYTES = 10 * 1024 * 1024
 const MAX_UNLIMITED_RESTORE_BYTES = 1024 ** 4
 const RESTORE_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
 const RESTORE_TRANSFER_IDLE_TIMEOUT_MS = 30_000
@@ -74,6 +78,7 @@ export async function restorePortableInstanceBackup(
           prepared.paths.archive
         )
         warnings = await extractBackupArchive(
+          config,
           archive,
           prepared.paths.staging,
           input,
@@ -172,6 +177,7 @@ export async function recoverInterruptedRestores(
 }
 
 async function extractBackupArchive(
+  config: RelayConfig,
   archivePath: string,
   stagingRoot: string,
   input: BackupRestoreTaskInput,
@@ -218,10 +224,10 @@ async function extractBackupArchive(
         await requireRestoreSpace(dirname(stagingRoot), logicalBytes)
         await mkdir(stagingRoot, { mode: 0o700, recursive: false })
 
-        let manifestFound = false
+        let manifest: BackupArchiveManifest | null = null
         for (const entry of entries) {
           if (entry.fileName === ARCHIVE_MANIFEST_PATH) {
-            const manifest = await readManifest(zip, entry)
+            manifest = await readManifest(zip, entry)
             if (
               manifest.backupId !== input.backupId ||
               manifest.target.kind !== "instance" ||
@@ -233,12 +239,30 @@ async function extractBackupArchive(
                 "The archive manifest does not match this backup and server"
               )
             }
-            manifestFound = true
             continue
           }
           await extractEntry(zip, entry, stagingRoot)
         }
-        return manifestFound
+        if (
+          manifest?.formatVersion === 3 &&
+          manifest.server.brick.recipe !== null
+        ) {
+          const snapshotSha256 = await saveBrickSnapshot(
+            brickSnapshotDirectory(config.dataDirectory),
+            brickRecipeSchema.parse(manifest.server.brick.recipe)
+          )
+          if (
+            manifest.server.brick.snapshotSha256 &&
+            manifest.server.brick.snapshotSha256 !== snapshotSha256
+          ) {
+            throw restoreError(
+              "manifest_mismatch",
+              "restore.validate",
+              "The embedded Brick recipe does not match its snapshot checksum"
+            )
+          }
+        }
+        return manifest
           ? []
           : ["Restored a legacy archive without an embedded Kiln manifest"]
       },

@@ -1,0 +1,99 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
+
+import { afterEach, describe, expect, it } from "vite-plus/test"
+
+import { loadBrickCatalogSource } from "./brick-catalog-source.server"
+
+const directories: Array<string> = []
+
+afterEach(async () => {
+  await Promise.all(
+    directories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true }))
+  )
+})
+
+describe("Hearth Brick catalogs", () => {
+  it("resolves, validates, and snapshots relative recipes", async () => {
+    const directory = await temporaryDirectory()
+    await writeFile(
+      resolve(directory, "catalog.yml"),
+      "format: kiln.catalog/v1\nrecipes: [paper.yml]\n"
+    )
+    await writeFile(resolve(directory, "paper.yml"), recipe("paper", "Paper"))
+
+    const loaded = await loadBrickCatalogSource(
+      pathToFileURL(resolve(directory, "catalog.yml")).href,
+      { allowFile: true }
+    )
+
+    expect(loaded.snapshot.bricks).toHaveLength(1)
+    expect(loaded.snapshot.bricks[0]?.metadata.id).toBe("paper")
+    expect(loaded.snapshot.bricks[0]?.source).toBe(
+      pathToFileURL(resolve(directory, "paper.yml")).href
+    )
+    expect(loaded.snapshotSha256).toMatch(/^[a-f0-9]{64}$/u)
+  })
+
+  it("rejects duplicate Brick ids within one catalog", async () => {
+    const directory = await temporaryDirectory()
+    await writeFile(
+      resolve(directory, "catalog.yml"),
+      "format: kiln.catalog/v1\nrecipes: [one.yml, two.yml]\n"
+    )
+    await writeFile(resolve(directory, "one.yml"), recipe("paper", "One"))
+    await writeFile(resolve(directory, "two.yml"), recipe("paper", "Two"))
+
+    await expect(
+      loadBrickCatalogSource(
+        pathToFileURL(resolve(directory, "catalog.yml")).href,
+        { allowFile: true }
+      )
+    ).rejects.toThrow("duplicate Brick id paper")
+  })
+
+  it("does not allow personal file catalogs", async () => {
+    await expect(
+      loadBrickCatalogSource("file:///tmp/catalog.yml")
+    ).rejects.toThrow("Personal catalogs must use HTTPS")
+  })
+
+  it("blocks IPv4-mapped private catalog addresses", async () => {
+    await expect(
+      loadBrickCatalogSource("https://[::ffff:7f00:1]/catalog.yml")
+    ).rejects.toThrow("private or reserved address")
+  })
+})
+
+async function temporaryDirectory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "kiln-hearth-catalog-"))
+  directories.push(directory)
+  return directory
+}
+
+function recipe(id: string, name: string): string {
+  return `format: kiln.brick/v1
+metadata:
+  id: ${id}
+  name: ${name}
+  description: Test recipe
+  game: Minecraft
+  author: Kiln
+variables: {}
+runtime:
+  image: example.test/server:latest
+  name: Test
+  environment: {}
+  resources: { memory: 1G, pids: 128 }
+  storage: { mount: /server }
+network:
+  mode: direct
+  primaryPort: game
+  ports:
+    - { name: game, container: 25565, protocol: tcp }
+`
+}

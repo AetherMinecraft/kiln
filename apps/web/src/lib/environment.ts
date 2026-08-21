@@ -1,6 +1,9 @@
 import { Option, Schema } from "effect"
 
-import { resolveKilnGitRepository } from "@workspace/contracts"
+import {
+  kilnGitRepositoryRawUrl,
+  resolveKilnGitRepository,
+} from "@workspace/contracts"
 
 import { parseSecretKeyring } from "../../keyring.mjs"
 import type { VersionedSecret } from "../../keyring.mjs"
@@ -26,6 +29,13 @@ export function kilnEnvironment(): KilnEnvironment {
 
 export function kilnGitRepository(): string {
   return resolveKilnGitRepository(process.env.KILN_GIT_REPO)
+}
+
+export function kilnBrickCatalogUrl(): string {
+  return (
+    process.env.KILN_BRICKS_CATALOG_URL?.trim() ||
+    kilnGitRepositoryRawUrl(kilnGitRepository(), "apps/bricks/catalog.yml")
+  )
 }
 
 export function kilnInstallationId(): string {

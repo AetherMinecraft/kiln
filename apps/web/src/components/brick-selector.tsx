@@ -1,15 +1,20 @@
 import * as React from "react"
-import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import type { Brick } from "@workspace/contracts"
 import { Result } from "effect"
 import {
   BadgeCheck,
   BookOpen,
   Check,
+  ExternalLink,
   FileCode2,
+  Globe2,
+  Library,
   LoaderCircle,
+  LockKeyhole,
   PackagePlus,
   Search,
+  Trash2,
   X,
 } from "lucide-react"
 
@@ -34,15 +39,24 @@ import { cn } from "@workspace/ui/lib/utils"
 
 import { ServerTypeIcon } from "@/components/server-type-icon"
 import { useKilnGitRepositorySlug } from "@/lib/git-repository"
-import { queryKeys } from "@/lib/query-options"
+import {
+  brickCatalogDetailsQueryOptions,
+  brickCatalogsQueryOptions,
+  queryKeys,
+} from "@/lib/query-options"
 import { saveCustomBrick } from "@/server/bricks"
+import {
+  addBrickCatalog,
+  deleteBrickCatalog,
+  setBrickCatalogCommunity,
+} from "@/server/brick-catalogs"
 
 export type BrickSelection =
   | { kind: "catalog"; brick: Brick }
   | { kind: "custom"; source: string }
 
 type BrickCategoryId = "all" | "minecraft" | "steam" | "other"
-type BrickTabId = BrickCategoryId | "custom"
+type BrickTabId = BrickCategoryId | "catalogs" | "custom"
 type BrickSourceFilter = "all" | "verified" | "community"
 type BrickSort = "featured" | "name-asc" | "name-desc"
 
@@ -70,15 +84,24 @@ const SORT_OPTIONS: ReadonlyArray<{ id: BrickSort; label: string }> = [
 
 const EMPTY_BRICKS: Array<Brick> = []
 
-function isVerifiedBrick(brick: Brick, gitRepositorySlug: string): boolean {
-  if (brick.metadata.author.trim().toLowerCase() === "kiln") return true
+export function isVerifiedBrick(
+  brick: Brick,
+  gitRepositorySlug: string
+): boolean {
   return Result.getOrElse(
-    Result.try(
-      () =>
-        new URL(brick.source).hostname.toLowerCase() ===
-          "raw.githubusercontent.com" &&
-        brick.source.includes(`/${gitRepositorySlug}/main/apps/bricks/`)
-    ),
+    Result.try(() => {
+      const url = new URL(brick.source)
+      const [owner, repository, reference, ...path] = url.pathname
+        .split("/")
+        .filter(Boolean)
+      return (
+        url.hostname.toLowerCase() === "raw.githubusercontent.com" &&
+        `${owner}/${repository}`.toLowerCase() ===
+          gitRepositorySlug.toLowerCase() &&
+        (reference === "main" || /^[a-f0-9]{40}$/u.test(reference ?? "")) &&
+        path.join("/").startsWith("apps/bricks/")
+      )
+    }),
     () => false
   )
 }
@@ -272,7 +295,22 @@ const BrickTabSidebar = React.memo(function BrickTabSidebar({
           )
         })}
       </nav>
-      <div className="mt-auto border-t border-border/60 p-2">
+      <div className="mt-auto space-y-1 border-t border-border/60 p-2">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onTabChange("catalogs")}
+          className={cn(
+            "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs transition-colors duration-150",
+            tab === "catalogs"
+              ? "bg-primary/12 font-medium text-foreground"
+              : "text-muted-foreground hover:bg-accent/55 hover:text-foreground",
+            disabled && "pointer-events-none opacity-50"
+          )}
+        >
+          <Library className="size-3.5 shrink-0 text-primary" />
+          Catalogs
+        </button>
         <button
           type="button"
           disabled={disabled}
@@ -361,6 +399,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
 
   const catalogBricks = bricks.length > 0 ? bricks : EMPTY_BRICKS
   const visibleBricks = React.useMemo(() => {
+    if (tab === "catalogs") return EMPTY_BRICKS
     if (tab === "custom") {
       return filterAndSortCustomBricks(customBricks, query)
     }
@@ -387,6 +426,11 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   const customOpen = tab === "custom"
   const selectTab = React.useCallback(
     (nextTab: BrickTabId) => {
+      if (nextTab === "catalogs") {
+        setTab(nextTab)
+        onSelectionChange(null)
+        return
+      }
       if (nextTab === "custom" && tab === "custom") return
       setTab(nextTab)
       if (nextTab === "custom") {
@@ -434,195 +478,565 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
     >
       <BrickTabSidebar disabled={disabled} tab={tab} onTabChange={selectTab} />
 
-      <section className="flex min-h-80 min-w-0 flex-col border-b border-border/60 md:min-h-0 md:border-r md:border-b-0">
-        <div className="space-y-2 border-b border-border/60 p-3">
-          <label className="relative block">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={query}
-              disabled={disabled}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={
-                customOpen ? "Search custom bricks…" : "Search bricks…"
-              }
-              className="h-9 pl-8 text-base md:text-sm"
-            />
-          </label>
-          {customOpen ? (
-            <div className="flex h-8 items-center justify-between gap-2">
-              <span className="font-mono text-[0.625rem] tracking-[0.08em] text-muted-foreground uppercase">
-                {customBricks.length} saved
-              </span>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="h-8"
-                disabled={disabled || saveMutation.isPending}
-                onClick={() =>
-                  onSelectionChange({ kind: "custom", source: "" })
-                }
-              >
-                <PackagePlus />
-                Add Brick
-              </Button>
-            </div>
-          ) : (
-            <div className="grid grid-cols-2 gap-2">
-              <Select
-                value={sourceFilter}
-                disabled={disabled || customOpen}
-                onValueChange={(value) => {
-                  const next = SOURCE_FILTERS.find(
-                    (option) => option.id === value
-                  )
-                  if (next) setSourceFilter(next.id)
-                }}
-              >
-                <SelectTrigger
-                  className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
-                  aria-label="Filter by source"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {SOURCE_FILTERS.map((option) => (
-                    <SelectItem
-                      key={option.id}
-                      value={option.id}
-                      className="whitespace-nowrap"
+      {tab === "catalogs" ? (
+        <BrickCatalogManager disabled={disabled} />
+      ) : (
+        <>
+          <section className="flex min-h-80 min-w-0 flex-col border-b border-border/60 md:min-h-0 md:border-r md:border-b-0">
+            <div className="space-y-2 border-b border-border/60 p-3">
+              <label className="relative block">
+                <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={query}
+                  disabled={disabled}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder={
+                    customOpen ? "Search custom bricks…" : "Search bricks…"
+                  }
+                  className="h-9 pl-8 text-base md:text-sm"
+                />
+              </label>
+              {customOpen ? (
+                <div className="flex h-8 items-center justify-between gap-2">
+                  <span className="font-mono text-[0.625rem] tracking-[0.08em] text-muted-foreground uppercase">
+                    {customBricks.length} saved
+                  </span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-8"
+                    disabled={disabled || saveMutation.isPending}
+                    onClick={() =>
+                      onSelectionChange({ kind: "custom", source: "" })
+                    }
+                  >
+                    <PackagePlus />
+                    Add Brick
+                  </Button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  <Select
+                    value={sourceFilter}
+                    disabled={disabled || customOpen}
+                    onValueChange={(value) => {
+                      const next = SOURCE_FILTERS.find(
+                        (option) => option.id === value
+                      )
+                      if (next) setSourceFilter(next.id)
+                    }}
+                  >
+                    <SelectTrigger
+                      className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
+                      aria-label="Filter by source"
                     >
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Select
-                value={sort}
-                disabled={disabled || customOpen}
-                onValueChange={(value) => {
-                  const next = SORT_OPTIONS.find(
-                    (option) => option.id === value
-                  )
-                  if (next) setSort(next.id)
-                }}
-              >
-                <SelectTrigger
-                  className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
-                  aria-label="Sort bricks"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {SORT_OPTIONS.map((option) => (
-                    <SelectItem
-                      key={option.id}
-                      value={option.id}
-                      className="whitespace-nowrap"
-                    >
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
-          {visibleBricks.length === 0 ? (
-            <div className="grid h-full place-items-center px-4 py-8 text-center">
-              <div className="max-w-xs">
-                {customOpen ? (
-                  <PackagePlus className="mx-auto size-5 text-primary" />
-                ) : null}
-                <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                  {customOpen
-                    ? query.trim()
-                      ? "No custom Bricks match your search."
-                      : "Add a recipe URL to save your first custom Brick."
-                    : emptyMessage}
-                </p>
-              </div>
-            </div>
-          ) : (
-            <ul className="flex flex-col gap-0.5">
-              {visibleBricks.map((brick) => {
-                const selected = selectedCatalog?.source === brick.source
-                const custom = customBrickSources.has(brick.source)
-                const verified = isVerifiedBrick(brick, gitRepositorySlug)
-                return (
-                  <li key={brick.source}>
-                    <button
-                      type="button"
-                      disabled={disabled}
-                      onClick={() =>
-                        onSelectionChange({ kind: "catalog", brick })
-                      }
-                      className={cn(
-                        "flex w-full items-center gap-3 rounded-lg px-2.5 py-2.5 text-left transition-colors duration-150",
-                        selected
-                          ? "bg-primary/14 ring-1 ring-primary/35"
-                          : "hover:bg-accent/55",
-                        disabled && "pointer-events-none opacity-50"
-                      )}
-                    >
-                      <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-muted-foreground">
-                        <ServerTypeIcon
-                          implementation={brick.metadata.id}
-                          className="size-4"
-                        />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-semibold tracking-tight">
-                          {brick.metadata.name}
-                        </span>
-                        <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
-                          {custom
-                            ? "Custom"
-                            : sourceLabel(brick, gitRepositorySlug)}{" "}
-                          · {formatGameLabel(brick)}
-                        </span>
-                      </span>
-                      {custom ? (
-                        <Badge
-                          variant="outline"
-                          className="h-5 shrink-0 px-1.5 font-mono text-[0.625rem] text-muted-foreground"
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {SOURCE_FILTERS.map((option) => (
+                        <SelectItem
+                          key={option.id}
+                          value={option.id}
+                          className="whitespace-nowrap"
                         >
-                          Custom
-                        </Badge>
-                      ) : verified ? (
-                        <Badge
-                          variant="outline"
-                          className="h-5 shrink-0 gap-1 border-primary/35 bg-primary/10 px-1.5 font-mono text-[0.625rem] text-primary"
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Select
+                    value={sort}
+                    disabled={disabled || customOpen}
+                    onValueChange={(value) => {
+                      const next = SORT_OPTIONS.find(
+                        (option) => option.id === value
+                      )
+                      if (next) setSort(next.id)
+                    }}
+                  >
+                    <SelectTrigger
+                      className="h-8 w-full text-xs [&_[data-slot=select-value]]:whitespace-nowrap"
+                      aria-label="Sort bricks"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {SORT_OPTIONS.map((option) => (
+                        <SelectItem
+                          key={option.id}
+                          value={option.id}
+                          className="whitespace-nowrap"
                         >
-                          <BadgeCheck className="size-3" />
-                          Verified
-                        </Badge>
-                      ) : null}
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
-        </div>
-      </section>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+            </div>
 
-      <BrickDetailsPanel
-        selection={selection}
-        disabled={disabled}
-        gitRepositorySlug={gitRepositorySlug}
-        customBrickSources={customBrickSources}
-        onSelectionChange={onSelectionChange}
-        onSaveCustomBrick={(source) => saveMutation.mutate(source)}
-        saveCustomBrickDisabled={!relayId}
-        savingCustomBrick={saveMutation.isPending}
-        configuration={configuration}
-      />
+            <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+              {visibleBricks.length === 0 ? (
+                <div className="grid h-full place-items-center px-4 py-8 text-center">
+                  <div className="max-w-xs">
+                    {customOpen ? (
+                      <PackagePlus className="mx-auto size-5 text-primary" />
+                    ) : null}
+                    <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                      {customOpen
+                        ? query.trim()
+                          ? "No custom Bricks match your search."
+                          : "Add a recipe URL to save your first custom Brick."
+                        : emptyMessage}
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <ul className="flex flex-col gap-0.5">
+                  {visibleBricks.map((brick) => {
+                    const selected = selectedCatalog?.source === brick.source
+                    const custom = customBrickSources.has(brick.source)
+                    const verified = isVerifiedBrick(brick, gitRepositorySlug)
+                    return (
+                      <li key={brick.source}>
+                        <button
+                          type="button"
+                          disabled={disabled}
+                          onClick={() =>
+                            onSelectionChange({ kind: "catalog", brick })
+                          }
+                          className={cn(
+                            "flex w-full items-center gap-3 rounded-lg px-2.5 py-2.5 text-left transition-colors duration-150",
+                            selected
+                              ? "bg-primary/14 ring-1 ring-primary/35"
+                              : "hover:bg-accent/55",
+                            disabled && "pointer-events-none opacity-50"
+                          )}
+                        >
+                          <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-muted-foreground">
+                            <ServerTypeIcon
+                              implementation={brick.metadata.id}
+                              className="size-4"
+                            />
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-sm font-semibold tracking-tight">
+                              {brick.metadata.name}
+                            </span>
+                            <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
+                              {custom
+                                ? "Custom"
+                                : sourceLabel(brick, gitRepositorySlug)}{" "}
+                              · {formatGameLabel(brick)}
+                            </span>
+                          </span>
+                          {custom ? (
+                            <Badge
+                              variant="outline"
+                              className="h-5 shrink-0 px-1.5 font-mono text-[0.625rem] text-muted-foreground"
+                            >
+                              Custom
+                            </Badge>
+                          ) : verified ? (
+                            <Badge
+                              variant="outline"
+                              className="h-5 shrink-0 gap-1 border-primary/35 bg-primary/10 px-1.5 font-mono text-[0.625rem] text-primary"
+                            >
+                              <BadgeCheck className="size-3" />
+                              Verified
+                            </Badge>
+                          ) : null}
+                        </button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+            </div>
+          </section>
+
+          <BrickDetailsPanel
+            selection={selection}
+            disabled={disabled}
+            gitRepositorySlug={gitRepositorySlug}
+            customBrickSources={customBrickSources}
+            onSelectionChange={onSelectionChange}
+            onSaveCustomBrick={(source) => saveMutation.mutate(source)}
+            saveCustomBrickDisabled={!relayId}
+            savingCustomBrick={saveMutation.isPending}
+            configuration={configuration}
+          />
+        </>
+      )}
     </div>
   )
 })
+
+const BrickCatalogManager = React.memo(function BrickCatalogManager({
+  disabled,
+}: {
+  disabled: boolean
+}) {
+  const queryClient = useQueryClient()
+  const catalogsQuery = useQuery(brickCatalogsQueryOptions())
+  const [selectedId, setSelectedId] = React.useState("default")
+  const [source, setSource] = React.useState("")
+  const detailsQuery = useQuery({
+    ...brickCatalogDetailsQueryOptions(selectedId),
+    enabled: selectedId.length > 0,
+  })
+  const refreshCatalogQueries = React.useCallback(async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.brickCatalogs.all }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.bricks }),
+    ])
+  }, [queryClient])
+  const addMutation = useMutation({
+    mutationFn: (nextSource: string) =>
+      addBrickCatalog({ data: { source: nextSource } }),
+    onSuccess: async (catalog) => {
+      setSource("")
+      setSelectedId(catalog.id)
+      showToast({
+        type: "success",
+        message: "Catalog added",
+        description: `${catalog.brickCount} Brick${catalog.brickCount === 1 ? "" : "s"} saved in this snapshot.`,
+      })
+      await refreshCatalogQueries()
+    },
+    onError: (cause) =>
+      showToast({
+        type: "error",
+        message: "Could not add catalog",
+        description:
+          cause instanceof Error ? cause.message : "Check the catalog source.",
+      }),
+  })
+  const visibilityMutation = useMutation({
+    mutationFn: (input: { catalogId: string; community: boolean }) =>
+      setBrickCatalogCommunity({ data: input }),
+    onSuccess: async (catalog) => {
+      showToast({
+        type: "success",
+        message:
+          catalog.visibility === "community"
+            ? "Catalog published"
+            : "Catalog unpublished",
+        description:
+          catalog.visibility === "community"
+            ? "Every account can now use this immutable snapshot."
+            : "Only its owner can use this catalog now.",
+      })
+      await refreshCatalogQueries()
+    },
+    onError: catalogMutationError,
+  })
+  const deleteMutation = useMutation({
+    mutationFn: (catalogId: string) =>
+      deleteBrickCatalog({ data: { catalogId } }),
+    onSuccess: async () => {
+      setSelectedId("default")
+      showToast({ type: "success", message: "Catalog deleted" })
+      await refreshCatalogQueries()
+    },
+    onError: catalogMutationError,
+  })
+  const catalogs = catalogsQuery.data?.catalogs ?? []
+  const selected = catalogs.find((catalog) => catalog.id === selectedId)
+  const pending =
+    disabled ||
+    addMutation.isPending ||
+    visibilityMutation.isPending ||
+    deleteMutation.isPending
+
+  return (
+    <section className="grid min-h-[32rem] min-w-0 grid-cols-[minmax(0,1fr)] md:col-span-2 md:min-h-0 md:grid-cols-[minmax(0,1fr)_20rem]">
+      <div className="flex min-h-0 min-w-0 flex-col border-b border-border/60 md:border-r md:border-b-0">
+        <form
+          className="border-b border-border/60 p-3"
+          onSubmit={(event) => {
+            event.preventDefault()
+            const value = source.trim()
+            if (value) addMutation.mutate(value)
+          }}
+        >
+          <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
+            Catalog sources
+          </p>
+          <div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+            <Input
+              value={source}
+              disabled={pending}
+              onChange={(event) => setSource(event.target.value)}
+              placeholder="owner/repo or https://…/catalog.yml"
+              aria-label="Catalog URL or repository"
+              className="h-9 min-w-0 flex-1 text-base md:text-sm"
+            />
+            <Button
+              type="submit"
+              size="sm"
+              className="h-9 shrink-0"
+              disabled={pending || source.trim().length === 0}
+            >
+              {addMutation.isPending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <PackagePlus />
+              )}
+              Add
+            </Button>
+          </div>
+          <p className="mt-2 text-[0.6875rem] leading-relaxed text-muted-foreground">
+            Repository shorthand reads catalog.yml from the repository root.
+            Catalogs are validated and stored as snapshots.
+          </p>
+        </form>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+          {catalogsQuery.isPending ? (
+            <div className="grid h-full place-items-center">
+              <LoaderCircle className="size-5 animate-spin text-primary" />
+            </div>
+          ) : catalogs.length === 0 ? (
+            <div className="grid h-full place-items-center p-6 text-center text-xs text-muted-foreground">
+              No catalogs are available.
+            </div>
+          ) : (
+            <ul className="space-y-0.5">
+              {catalogs.map((catalog) => (
+                <li key={catalog.id}>
+                  <button
+                    type="button"
+                    disabled={disabled}
+                    onClick={() => setSelectedId(catalog.id)}
+                    className={cn(
+                      "flex w-full items-center gap-3 rounded-lg px-2.5 py-2.5 text-left transition-colors duration-150",
+                      selectedId === catalog.id
+                        ? "bg-primary/14 ring-1 ring-primary/35"
+                        : "hover:bg-accent/55",
+                      disabled && "pointer-events-none opacity-50"
+                    )}
+                  >
+                    <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-primary">
+                      {catalog.visibility === "community" ? (
+                        <Globe2 className="size-4" />
+                      ) : catalog.isDefault ? (
+                        <Library className="size-4" />
+                      ) : (
+                        <LockKeyhole className="size-4" />
+                      )}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-semibold tracking-tight">
+                        {catalogSourceLabel(catalog.source)}
+                      </span>
+                      <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
+                        {catalogVisibilityLabel(catalog.visibility)} ·{" "}
+                        {catalog.brickCount} Brick
+                        {catalog.brickCount === 1 ? "" : "s"}
+                        {catalogsQuery.data?.isPlatformAdmin &&
+                        catalog.ownerUserId
+                          ? ` · ${catalog.ownerEmail ?? catalog.ownerName ?? catalog.ownerUserId}`
+                          : ""}
+                      </span>
+                    </span>
+                    {catalog.statusError ? (
+                      <Badge variant="destructive">Unavailable</Badge>
+                    ) : null}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      <aside className="flex min-h-0 flex-col">
+        {!selected ? (
+          <div className="grid flex-1 place-items-center p-6 text-center text-xs text-muted-foreground">
+            Select a catalog to inspect its snapshot.
+          </div>
+        ) : (
+          <>
+            <div className="border-b border-border/60 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
+                    {catalogVisibilityLabel(selected.visibility)}
+                  </p>
+                  <h3 className="mt-1.5 truncate font-heading text-base font-semibold tracking-tight">
+                    {catalogSourceLabel(selected.source)}
+                  </h3>
+                </div>
+                <Badge variant="outline" className="shrink-0">
+                  {selected.brickCount} Brick
+                  {selected.brickCount === 1 ? "" : "s"}
+                </Badge>
+              </div>
+              <a
+                href={selected.source}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-2 flex items-center gap-1 truncate text-[0.6875rem] text-muted-foreground hover:text-foreground"
+              >
+                <span className="truncate">{selected.source}</span>
+                <ExternalLink className="size-3 shrink-0" />
+              </a>
+              {selected.revisionUrl && selected.revisionSha ? (
+                <a
+                  href={selected.revisionUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-3 flex items-center justify-between gap-3 rounded-md border border-primary/25 bg-primary/7 px-2.5 py-2 text-xs hover:bg-primary/10"
+                >
+                  <span>
+                    <span className="block font-medium">
+                      {selected.visibility === "community"
+                        ? "Published snapshot"
+                        : "Source snapshot"}
+                    </span>
+                    <span className="font-mono text-[0.625rem] text-muted-foreground">
+                      commit {selected.revisionSha.slice(0, 10)}
+                    </span>
+                  </span>
+                  <ExternalLink className="size-3.5 text-primary" />
+                </a>
+              ) : selected.snapshotSha256 ? (
+                <div className="mt-3 rounded-md border border-border/70 bg-muted/30 px-2.5 py-2">
+                  <span className="block text-xs font-medium">
+                    Saved snapshot
+                  </span>
+                  <span className="font-mono text-[0.625rem] text-muted-foreground">
+                    sha256:{selected.snapshotSha256.slice(0, 12)}
+                  </span>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+              {detailsQuery.isPending ? (
+                <div className="grid h-full place-items-center">
+                  <LoaderCircle className="size-4 animate-spin text-primary" />
+                </div>
+              ) : detailsQuery.isError ? (
+                <p className="text-xs text-destructive">
+                  {detailsQuery.error instanceof Error
+                    ? detailsQuery.error.message
+                    : "Could not load this catalog snapshot."}
+                </p>
+              ) : detailsQuery.data?.bricks.length ? (
+                <ul className="space-y-1">
+                  {detailsQuery.data.bricks.map((brick) => (
+                    <li
+                      key={brick.source}
+                      className="flex items-center gap-2 rounded-md border border-border/60 px-2.5 py-2"
+                    >
+                      <ServerTypeIcon
+                        implementation={brick.metadata.id}
+                        className="size-3.5 shrink-0 text-muted-foreground"
+                      />
+                      <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                        {brick.metadata.name}
+                      </span>
+                      <span className="font-mono text-[0.5625rem] text-muted-foreground">
+                        {brick.metadata.id}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  {selected.statusError ?? "This snapshot contains no Bricks."}
+                </p>
+              )}
+            </div>
+
+            {!selected.isDefault ? (
+              <div className="grid grid-cols-2 gap-2 border-t border-border/60 p-3">
+                {catalogsQuery.data?.isPlatformAdmin ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={pending}
+                    onClick={() =>
+                      visibilityMutation.mutate({
+                        catalogId: selected.id,
+                        community: selected.visibility !== "community",
+                      })
+                    }
+                  >
+                    <Globe2 />
+                    {selected.visibility === "community"
+                      ? "Unpublish"
+                      : "Publish"}
+                  </Button>
+                ) : (
+                  <span />
+                )}
+                {catalogsQuery.data?.isPlatformAdmin ||
+                (selected.ownerUserId === catalogsQuery.data?.userId &&
+                  selected.visibility !== "community") ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="destructive"
+                    disabled={pending}
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          `Delete ${catalogSourceLabel(selected.source)}?`
+                        )
+                      ) {
+                        deleteMutation.mutate(selected.id)
+                      }
+                    }}
+                  >
+                    <Trash2 />
+                    Delete
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+          </>
+        )}
+      </aside>
+    </section>
+  )
+})
+
+function catalogMutationError(cause: unknown): void {
+  showToast({
+    type: "error",
+    message: "Could not update catalog",
+    description:
+      cause instanceof Error ? cause.message : "Try this action again.",
+  })
+}
+
+function catalogSourceLabel(source: string): string {
+  return Result.getOrElse(
+    Result.try(() => {
+      const url = new URL(source)
+      if (url.hostname.toLowerCase() === "github.com") {
+        return url.pathname.replace(/^\/+|\/+$/gu, "")
+      }
+      const filename = url.pathname.split("/").filter(Boolean).at(-1)
+      return filename ? `${url.hostname}/${filename}` : url.hostname
+    }),
+    () => source
+  )
+}
+
+function catalogVisibilityLabel(
+  visibility: "community" | "default" | "personal"
+): string {
+  if (visibility === "community") return "Community"
+  if (visibility === "default") return "Default"
+  return "Personal"
+}
 
 const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
   selection,

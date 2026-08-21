@@ -3,7 +3,6 @@ import {
   brickSchema,
   brickSourceSchema,
   brickVariableValuesSchema,
-  relayCatalogSchema,
   relayCreateInstanceSchema,
   relayInstanceNameSchema,
   relayInstanceSchema,
@@ -31,13 +30,13 @@ import { listPersistedRelays } from "@/lib/relay-registry"
 import { listMcJarVersionsEffect } from "@/effect/mcjarfiles"
 import { runAppEffect } from "@/effect/runtime"
 import {
-  cachedRelayJsonEffect,
   invalidateRelayCache,
   relayCachePolicy,
   relayJsonEffect,
   writeRelayCache,
 } from "@/lib/relay-client"
 import { requireAuthenticatedUser } from "@/server/auth"
+import { visibleBrickCatalogs } from "@/server/brick-catalogs.server"
 import { provisionInstanceDomainBestEffort } from "@/server/domains.server"
 
 const brickVersionCatalogSchema = z.object({
@@ -68,6 +67,7 @@ export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
       "customBricks.list",
       listCustomBricksEffect(user.id)
     )
+    const catalogsPromise = visibleBrickCatalogs(user)
     const candidates = (await listPersistedRelays()).filter(
       (relay) => relay.enabled && canProvisionOnRelay(user, relay)
     )
@@ -82,23 +82,18 @@ export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
           .canProvisionInstances === true
       )
     })
-    const relay = relays.at(0)
-    if (!relay) {
-      return { relays, bricks: [], customBricks: await customBricksPromise }
-    }
-    const catalog = await runAppEffect(
-      "relay.bricks",
-      cachedRelayJsonEffect({
-        decode: relayCatalogSchema.parse,
-        fallbackOnError: true,
-        path: "/v1/bricks",
-        policy: relayCachePolicy.brickCatalog(relay.id),
-        relay,
+    const catalogs = await catalogsPromise
+    const sources = new Set<string>()
+    const bricks = catalogs.flatMap((catalog) =>
+      catalog.bricks.filter((brick) => {
+        if (sources.has(brick.source)) return false
+        sources.add(brick.source)
+        return true
       })
     )
     return {
       relays,
-      bricks: catalog.bricks,
+      bricks,
       customBricks: await customBricksPromise,
     }
   }
@@ -262,21 +257,17 @@ async function loadInstanceRecipe(
   instance: z.infer<typeof relayInstanceSchema>
 ) {
   let brickSource = instance.brickSource
-  if (!brickSource && instance.brickId) {
-    const catalog = relayCatalogSchema.parse(
-      await requestRelay(relay, "/v1/bricks")
-    )
-    brickSource = catalog.bricks.find(
-      (candidate) => candidate.metadata.id === instance.brickId
-    )?.source
-  }
   if (!brickSource) {
     throw new Error("This server has no Brick recipe")
   }
   const brick = brickSchema.parse(
     await requestRelay(
       relay,
-      `/v1/bricks/recipe?source=${encodeURIComponent(brickSource)}`
+      `/v1/bricks/recipe?source=${encodeURIComponent(brickSource)}${
+        instance.brickSnapshotSha256
+          ? `&snapshotSha256=${encodeURIComponent(instance.brickSnapshotSha256)}`
+          : ""
+      }`
     )
   )
   return { brick, brickSource }

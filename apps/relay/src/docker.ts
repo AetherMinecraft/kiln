@@ -1433,7 +1433,8 @@ export class DockerDriver {
         instanceId: instance.id,
         load: bricks
           ? async (source) =>
-              (await bricks.recipe(source)).console?.stopCommands ?? []
+              (await bricks.recipe(source, instance.brickSnapshotSha256))
+                .console?.stopCommands ?? []
           : null,
         source: instance.brickSource,
       })
@@ -2393,6 +2394,11 @@ export class DockerDriver {
       brickReadiness,
       brickSupportsSrv: labels["kiln.brick.supports-srv"] === "true",
       brickSource: labels["kiln.brick.source"],
+      brickSnapshotSha256: /^[a-f0-9]{64}$/u.test(
+        labels["kiln.brick.snapshot-sha256"] ?? ""
+      )
+        ? labels["kiln.brick.snapshot-sha256"]
+        : undefined,
       connectAddress: instanceConnectAddress({
         discoveredPublicIp: this.#config.discoveredPublicIp,
         gameHost: publicHost,

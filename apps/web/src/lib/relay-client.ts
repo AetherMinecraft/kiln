@@ -195,7 +195,10 @@ function relayControlRequest(path: string, init?: RequestInit) {
   if (url.pathname === "/v1/bricks/recipe" && method === "GET") {
     return {
       operation: "brick.recipe" as const,
-      payload: { source: url.searchParams.get("source") },
+      payload: {
+        snapshotSha256: url.searchParams.get("snapshotSha256"),
+        source: url.searchParams.get("source"),
+      },
     }
   }
   if (url.pathname === "/v1/networking") {

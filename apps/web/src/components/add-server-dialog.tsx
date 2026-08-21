@@ -380,6 +380,10 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
               diskLimitBytes,
               name: name.trim() || "New server",
               recipe,
+              recipeDefinition:
+                selection.kind === "catalog"
+                  ? withoutBrickSource(selection.brick)
+                  : undefined,
               relayId,
               start: false,
               variables,
@@ -699,6 +703,11 @@ function normalizeArchitecture(architecture: string): string {
     default:
       return architecture.trim().toLowerCase()
   }
+}
+
+function withoutBrickSource(brick: Brick) {
+  const { source: _source, ...recipe } = brick
+  return recipe
 }
 
 function displayArchitecture(architecture: string | null): string {
