@@ -1802,7 +1802,7 @@ const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
           />
         </Field>
         <div
-          className={`flex min-h-9 items-center rounded-lg border px-3 text-xs leading-5 ${description ? "bg-muted/25 text-foreground" : "border-destructive/35 bg-destructive/5 text-destructive"}`}
+          className={`flex min-h-8 items-center rounded-lg border px-3 py-1 text-xs leading-5 ${description ? "bg-muted/25 text-foreground" : "border-destructive/35 bg-destructive/5 text-destructive"}`}
           role={description ? undefined : "alert"}
         >
           {description ?? "Enter a valid five-part cron expression."}
@@ -2773,9 +2773,16 @@ function cronPreset(cron: string) {
 
 function cronDescription(cron: string) {
   try {
-    return cronstrue.toString(normalizeScheduleCron(cron), {
+    const normalizedCron = normalizeScheduleCron(cron)
+    const description = cronstrue.toString(normalizedCron, {
       throwExceptionOnParseError: true,
     })
+    const [, , dayOfMonth, month, dayOfWeek] = normalizedCron.split(/\s+/u)
+    const runsEveryDay =
+      dayOfMonth === "*" && month === "*" && dayOfWeek === "*"
+    return runsEveryDay && description.startsWith("At ")
+      ? `Every day at ${description.slice(3)}`
+      : description
   } catch {
     return null
   }
