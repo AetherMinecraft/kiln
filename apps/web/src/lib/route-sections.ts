@@ -12,7 +12,7 @@ export function globalSectionFromRouteId(
 ): GlobalSection {
   if (routeId?.startsWith("/_app/infra")) return "infra"
   if (routeId === "/_app/backups") return "backups"
-  if (routeId === "/_app/schedules") return "schedules"
+  if (routeId?.startsWith("/_app/schedules")) return "schedules"
   if (routeId === "/_app/activity") return "activity"
   if (routeId === "/_app/access") return "access"
   if (routeId?.startsWith("/_app/settings")) return "settings"

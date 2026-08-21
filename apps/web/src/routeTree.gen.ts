@@ -43,6 +43,9 @@ import { Route as AppInfraRelaysRouteImport } from './routes/_app.infra.relays'
 import { Route as AppInfraServersRouteImport } from './routes/_app.infra.servers'
 import { Route as AppInfraSetupRouteImport } from './routes/_app.infra.setup'
 import { Route as AppInfraTailscaleRouteImport } from './routes/_app.infra.tailscale'
+import { Route as AppSchedulesIndexRouteImport } from './routes/_app.schedules.index'
+import { Route as AppSchedulesCalendarRouteImport } from './routes/_app.schedules.calendar'
+import { Route as AppSchedulesHistoryRouteImport } from './routes/_app.schedules.history'
 import { Route as AppServerServerIdRouteImport } from './routes/_app/server/$serverId'
 import { Route as AppSettingsIndexRouteImport } from './routes/_app.settings.index'
 import { Route as AppSettingsAccountRouteImport } from './routes/_app.settings.account'
@@ -233,6 +236,21 @@ const AppInfraTailscaleRoute = AppInfraTailscaleRouteImport.update({
   path: '/tailscale',
   getParentRoute: () => AppInfraRoute,
 } as any)
+const AppSchedulesIndexRoute = AppSchedulesIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppSchedulesRoute,
+} as any)
+const AppSchedulesCalendarRoute = AppSchedulesCalendarRouteImport.update({
+  id: '/calendar',
+  path: '/calendar',
+  getParentRoute: () => AppSchedulesRoute,
+} as any)
+const AppSchedulesHistoryRoute = AppSchedulesHistoryRouteImport.update({
+  id: '/history',
+  path: '/history',
+  getParentRoute: () => AppSchedulesRoute,
+} as any)
 const AppServerServerIdRoute = AppServerServerIdRouteImport.update({
   id: '/server/$serverId',
   path: '/server/$serverId',
@@ -358,7 +376,7 @@ export interface FileRoutesByFullPath {
   '/backups': typeof AppBackupsRoute
   '/infra': typeof AppInfraRouteWithChildren
   '/operations': typeof AppOperationsRoute
-  '/schedules': typeof AppSchedulesRoute
+  '/schedules': typeof AppSchedulesRouteWithChildren
   '/servers': typeof AppServersRoute
   '/settings': typeof AppSettingsRouteWithChildren
   '/api/health': typeof ApiHealthRoute
@@ -371,6 +389,8 @@ export interface FileRoutesByFullPath {
   '/infra/servers': typeof AppInfraServersRoute
   '/infra/setup': typeof AppInfraSetupRoute
   '/infra/tailscale': typeof AppInfraTailscaleRoute
+  '/schedules/calendar': typeof AppSchedulesCalendarRoute
+  '/schedules/history': typeof AppSchedulesHistoryRoute
   '/server/$serverId': typeof AppServerServerIdRouteWithChildren
   '/settings/account': typeof AppSettingsAccountRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
@@ -380,6 +400,7 @@ export interface FileRoutesByFullPath {
   '/api/auth/$': typeof ApiAuthSplatRoute
   '/api/console/$instanceId': typeof ApiConsoleInstanceIdRoute
   '/infra/': typeof AppInfraIndexRoute
+  '/schedules/': typeof AppSchedulesIndexRoute
   '/settings/': typeof AppSettingsIndexRoute
   '/server/$serverId/$': typeof AppServerServerIdSplatRoute
   '/server/$serverId/console': typeof AppServerServerIdConsoleRoute
@@ -412,7 +433,6 @@ export interface FileRoutesByTo {
   '/activity': typeof AppActivityRoute
   '/backups': typeof AppBackupsRoute
   '/operations': typeof AppOperationsRoute
-  '/schedules': typeof AppSchedulesRoute
   '/servers': typeof AppServersRoute
   '/api/health': typeof ApiHealthRoute
   '/api/sentry-check': typeof ApiSentryCheckRoute
@@ -424,6 +444,8 @@ export interface FileRoutesByTo {
   '/infra/servers': typeof AppInfraServersRoute
   '/infra/setup': typeof AppInfraSetupRoute
   '/infra/tailscale': typeof AppInfraTailscaleRoute
+  '/schedules/calendar': typeof AppSchedulesCalendarRoute
+  '/schedules/history': typeof AppSchedulesHistoryRoute
   '/settings/account': typeof AppSettingsAccountRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
   '/settings/billing': typeof AppSettingsBillingRoute
@@ -432,6 +454,7 @@ export interface FileRoutesByTo {
   '/api/auth/$': typeof ApiAuthSplatRoute
   '/api/console/$instanceId': typeof ApiConsoleInstanceIdRoute
   '/infra': typeof AppInfraIndexRoute
+  '/schedules': typeof AppSchedulesIndexRoute
   '/settings': typeof AppSettingsIndexRoute
   '/server/$serverId/$': typeof AppServerServerIdSplatRoute
   '/server/$serverId/console': typeof AppServerServerIdConsoleRoute
@@ -467,7 +490,7 @@ export interface FileRoutesById {
   '/_app/backups': typeof AppBackupsRoute
   '/_app/infra': typeof AppInfraRouteWithChildren
   '/_app/operations': typeof AppOperationsRoute
-  '/_app/schedules': typeof AppSchedulesRoute
+  '/_app/schedules': typeof AppSchedulesRouteWithChildren
   '/_app/servers': typeof AppServersRoute
   '/_app/settings': typeof AppSettingsRouteWithChildren
   '/api/health': typeof ApiHealthRoute
@@ -480,6 +503,8 @@ export interface FileRoutesById {
   '/_app/infra/servers': typeof AppInfraServersRoute
   '/_app/infra/setup': typeof AppInfraSetupRoute
   '/_app/infra/tailscale': typeof AppInfraTailscaleRoute
+  '/_app/schedules/calendar': typeof AppSchedulesCalendarRoute
+  '/_app/schedules/history': typeof AppSchedulesHistoryRoute
   '/_app/server/$serverId': typeof AppServerServerIdRouteWithChildren
   '/_app/settings/account': typeof AppSettingsAccountRoute
   '/_app/settings/appearance': typeof AppSettingsAppearanceRoute
@@ -489,6 +514,7 @@ export interface FileRoutesById {
   '/api/auth/$': typeof ApiAuthSplatRoute
   '/api/console/$instanceId': typeof ApiConsoleInstanceIdRoute
   '/_app/infra/': typeof AppInfraIndexRoute
+  '/_app/schedules/': typeof AppSchedulesIndexRoute
   '/_app/settings/': typeof AppSettingsIndexRoute
   '/_app/server/$serverId/$': typeof AppServerServerIdSplatRoute
   '/_app/server/$serverId/console': typeof AppServerServerIdConsoleRoute
@@ -537,6 +563,8 @@ export interface FileRouteTypes {
     | '/infra/servers'
     | '/infra/setup'
     | '/infra/tailscale'
+    | '/schedules/calendar'
+    | '/schedules/history'
     | '/server/$serverId'
     | '/settings/account'
     | '/settings/appearance'
@@ -546,6 +574,7 @@ export interface FileRouteTypes {
     | '/api/auth/$'
     | '/api/console/$instanceId'
     | '/infra/'
+    | '/schedules/'
     | '/settings/'
     | '/server/$serverId/$'
     | '/server/$serverId/console'
@@ -578,7 +607,6 @@ export interface FileRouteTypes {
     | '/activity'
     | '/backups'
     | '/operations'
-    | '/schedules'
     | '/servers'
     | '/api/health'
     | '/api/sentry-check'
@@ -590,6 +618,8 @@ export interface FileRouteTypes {
     | '/infra/servers'
     | '/infra/setup'
     | '/infra/tailscale'
+    | '/schedules/calendar'
+    | '/schedules/history'
     | '/settings/account'
     | '/settings/appearance'
     | '/settings/billing'
@@ -598,6 +628,7 @@ export interface FileRouteTypes {
     | '/api/auth/$'
     | '/api/console/$instanceId'
     | '/infra'
+    | '/schedules'
     | '/settings'
     | '/server/$serverId/$'
     | '/server/$serverId/console'
@@ -645,6 +676,8 @@ export interface FileRouteTypes {
     | '/_app/infra/servers'
     | '/_app/infra/setup'
     | '/_app/infra/tailscale'
+    | '/_app/schedules/calendar'
+    | '/_app/schedules/history'
     | '/_app/server/$serverId'
     | '/_app/settings/account'
     | '/_app/settings/appearance'
@@ -654,6 +687,7 @@ export interface FileRouteTypes {
     | '/api/auth/$'
     | '/api/console/$instanceId'
     | '/_app/infra/'
+    | '/_app/schedules/'
     | '/_app/settings/'
     | '/_app/server/$serverId/$'
     | '/_app/server/$serverId/console'
@@ -934,6 +968,27 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppInfraTailscaleRouteImport
       parentRoute: typeof AppInfraRoute
     }
+    '/_app/schedules/': {
+      id: '/_app/schedules/'
+      path: '/'
+      fullPath: '/schedules/'
+      preLoaderRoute: typeof AppSchedulesIndexRouteImport
+      parentRoute: typeof AppSchedulesRoute
+    }
+    '/_app/schedules/calendar': {
+      id: '/_app/schedules/calendar'
+      path: '/calendar'
+      fullPath: '/schedules/calendar'
+      preLoaderRoute: typeof AppSchedulesCalendarRouteImport
+      parentRoute: typeof AppSchedulesRoute
+    }
+    '/_app/schedules/history': {
+      id: '/_app/schedules/history'
+      path: '/history'
+      fullPath: '/schedules/history'
+      preLoaderRoute: typeof AppSchedulesHistoryRouteImport
+      parentRoute: typeof AppSchedulesRoute
+    }
     '/_app/server/$serverId': {
       id: '/_app/server/$serverId'
       path: '/server/$serverId'
@@ -1101,6 +1156,22 @@ const AppInfraRouteWithChildren = AppInfraRoute._addFileChildren(
   AppInfraRouteChildren,
 )
 
+interface AppSchedulesRouteChildren {
+  AppSchedulesCalendarRoute: typeof AppSchedulesCalendarRoute
+  AppSchedulesHistoryRoute: typeof AppSchedulesHistoryRoute
+  AppSchedulesIndexRoute: typeof AppSchedulesIndexRoute
+}
+
+const AppSchedulesRouteChildren: AppSchedulesRouteChildren = {
+  AppSchedulesCalendarRoute: AppSchedulesCalendarRoute,
+  AppSchedulesHistoryRoute: AppSchedulesHistoryRoute,
+  AppSchedulesIndexRoute: AppSchedulesIndexRoute,
+}
+
+const AppSchedulesRouteWithChildren = AppSchedulesRoute._addFileChildren(
+  AppSchedulesRouteChildren,
+)
+
 interface AppSettingsRouteChildren {
   AppSettingsAccountRoute: typeof AppSettingsAccountRoute
   AppSettingsAppearanceRoute: typeof AppSettingsAppearanceRoute
@@ -1167,7 +1238,7 @@ interface AppRouteChildren {
   AppBackupsRoute: typeof AppBackupsRoute
   AppInfraRoute: typeof AppInfraRouteWithChildren
   AppOperationsRoute: typeof AppOperationsRoute
-  AppSchedulesRoute: typeof AppSchedulesRoute
+  AppSchedulesRoute: typeof AppSchedulesRouteWithChildren
   AppServersRoute: typeof AppServersRoute
   AppSettingsRoute: typeof AppSettingsRouteWithChildren
   AppServerServerIdRoute: typeof AppServerServerIdRouteWithChildren
@@ -1180,7 +1251,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppBackupsRoute: AppBackupsRoute,
   AppInfraRoute: AppInfraRouteWithChildren,
   AppOperationsRoute: AppOperationsRoute,
-  AppSchedulesRoute: AppSchedulesRoute,
+  AppSchedulesRoute: AppSchedulesRouteWithChildren,
   AppServersRoute: AppServersRoute,
   AppSettingsRoute: AppSettingsRouteWithChildren,
   AppServerServerIdRoute: AppServerServerIdRouteWithChildren,

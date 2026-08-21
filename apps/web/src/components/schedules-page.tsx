@@ -7,19 +7,16 @@ import {
 import {
   ArrowDown,
   ArrowUp,
-  CalendarClock,
   Check,
-  ChevronRight,
-  Clock3,
   Code2,
   Database,
   HardDriveDownload,
-  History,
   LoaderCircle,
   Pencil,
   Play,
   Plus,
   Power,
+  Search,
   Server,
   Trash2,
   X,
@@ -49,7 +46,21 @@ import {
   SelectValue,
 } from "@workspace/ui/components/select"
 import { showToast } from "@workspace/ui/components/sonner"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@workspace/ui/components/tooltip"
 
+import {
+  WorkspaceDataTable,
+  WorkspaceTableCell,
+  WorkspaceTableHead,
+  WorkspaceTableHeading,
+  createWorkspaceTableSearchStore,
+  useWorkspaceTableSearchInput,
+} from "@/components/workspace-data-table"
+import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
 import {
   queryKeys,
   scheduleOptionsQueryOptions,
@@ -68,12 +79,7 @@ type Schedule = Awaited<ReturnType<typeof getSchedules>>[number]
 type ScheduleOption = Awaited<ReturnType<typeof getScheduleOptions>>[number]
 type EditorMode = { kind: "create" } | { kind: "edit"; schedule: Schedule }
 
-const timestampFormatter = new Intl.DateTimeFormat(undefined, {
-  dateStyle: "medium",
-  timeStyle: "short",
-})
-
-const relativeFormatter = new Intl.RelativeTimeFormat(undefined, {
+const relativeFormatter = new Intl.RelativeTimeFormat("en-US", {
   numeric: "auto",
   style: "short",
 })
@@ -81,56 +87,36 @@ const relativeFormatter = new Intl.RelativeTimeFormat(undefined, {
 export const SchedulesPage = React.memo(function SchedulesPage() {
   const { data: schedules } = useSuspenseQuery(schedulesQueryOptions())
   const { data: options } = useSuspenseQuery(scheduleOptionsQueryOptions())
-  const [selectedId, setSelectedId] = React.useState<string | null>(null)
+  const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
   const [deleting, setDeleting] = React.useState<Schedule | null>(null)
-  const selected =
-    schedules.find((schedule) => schedule.id === selectedId) ??
-    schedules[0] ??
-    null
   const canCreate = options.some((option) => option.canCreate)
-
-  React.useEffect(() => {
-    if (
-      selectedId &&
-      !schedules.some((schedule) => schedule.id === selectedId)
-    ) {
-      setSelectedId(null)
-    }
-  }, [schedules, selectedId])
+  const openEdit = React.useCallback(
+    (schedule: Schedule) => setEditor({ kind: "edit", schedule }),
+    []
+  )
+  const openDelete = React.useCallback(
+    (schedule: Schedule) => setDeleting(schedule),
+    []
+  )
 
   return (
-    <div className="mx-auto flex h-full min-h-0 w-full max-w-[96rem] flex-col px-3 pb-8 sm:px-5">
-      <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border bg-card/45">
+    <div className="mx-auto w-full max-w-[90rem] px-3 pb-10 sm:px-5">
+      <section className="overflow-hidden rounded-xl border bg-card/45 [contain:paint]">
         <ScheduleToolbar
           canCreate={canCreate}
-          scheduleCount={schedules.length}
+          searchStore={searchStore}
           onCreate={() => setEditor({ kind: "create" })}
         />
-
-        {schedules.length === 0 ? (
-          <ScheduleEmptyState
-            canCreate={canCreate}
-            onCreate={() => setEditor({ kind: "create" })}
-          />
-        ) : (
-          <div className="grid min-h-0 flex-1 lg:grid-cols-[20rem_minmax(0,1fr)]">
-            <ScheduleList
-              schedules={schedules}
-              selectedId={selected?.id ?? null}
-              onSelect={setSelectedId}
-            />
-            {selected ? (
-              <ScheduleDetail
-                key={selected.id}
-                options={options}
-                schedule={selected}
-                onDelete={() => setDeleting(selected)}
-                onEdit={() => setEditor({ kind: "edit", schedule: selected })}
-              />
-            ) : null}
-          </div>
-        )}
+        <ScheduleTable
+          canCreate={canCreate}
+          options={options}
+          schedules={schedules}
+          searchStore={searchStore}
+          onCreate={() => setEditor({ kind: "create" })}
+          onDelete={openDelete}
+          onEdit={openEdit}
+        />
       </section>
 
       {editor ? (
@@ -138,10 +124,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
           mode={editor}
           options={options}
           onClose={() => setEditor(null)}
-          onSaved={(scheduleId) => {
-            setSelectedId(scheduleId)
-            setEditor(null)
-          }}
+          onSaved={() => setEditor(null)}
         />
       ) : null}
       <DeleteScheduleDialog
@@ -154,32 +137,33 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
 
 const ScheduleToolbar = React.memo(function ScheduleToolbar({
   canCreate,
-  scheduleCount,
+  searchStore,
   onCreate,
 }: {
   canCreate: boolean
-  scheduleCount: number
+  searchStore: WorkspaceTableSearchStore
   onCreate: () => void
 }) {
+  const inputRef = React.useRef<HTMLInputElement>(null)
+  useWorkspaceTableSearchInput(inputRef, searchStore)
+
   return (
-    <div className="flex min-h-16 shrink-0 items-center justify-between gap-4 border-b px-4 py-3 sm:px-5">
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <CalendarClock className="size-4 text-primary" aria-hidden="true" />
-          <h2 className="font-heading text-base font-semibold tracking-[-0.025em]">
-            Schedules
-          </h2>
-          <Badge variant="outline" className="font-mono text-[0.625rem]">
-            {scheduleCount}
-          </Badge>
-        </div>
-        <p className="mt-0.5 text-xs text-muted-foreground">
-          Relay-owned automation that keeps running without Hearth.
-        </p>
+    <div className="flex min-w-0 items-center gap-2 border-b bg-background/25 p-3">
+      <div className="relative min-w-0 flex-1 sm:max-w-md">
+        <Search className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          ref={inputRef}
+          id="schedule-search"
+          type="search"
+          className="pl-9"
+          defaultValue={searchStore.getServerSnapshot()}
+          placeholder="Search schedules"
+          onChange={(event) => searchStore.set(event.currentTarget.value)}
+        />
       </div>
       {canCreate ? (
-        <Button size="sm" onClick={onCreate}>
-          <Plus className="size-3.5" />
+        <Button className="ml-auto shrink-0" size="sm" onClick={onCreate}>
+          <Plus />
           Create schedule
         </Button>
       ) : null}
@@ -187,88 +171,84 @@ const ScheduleToolbar = React.memo(function ScheduleToolbar({
   )
 })
 
-function ScheduleEmptyState({
+const ScheduleTable = React.memo(function ScheduleTable({
   canCreate,
+  options,
+  schedules,
+  searchStore,
   onCreate,
+  onDelete,
+  onEdit,
 }: {
   canCreate: boolean
+  options: ReadonlyArray<ScheduleOption>
+  schedules: Array<Schedule>
+  searchStore: WorkspaceTableSearchStore
   onCreate: () => void
+  onDelete: (schedule: Schedule) => void
+  onEdit: (schedule: Schedule) => void
 }) {
-  return (
-    <div className="grid min-h-[24rem] flex-1 place-items-center p-8 text-center">
-      <div className="max-w-sm">
-        <div className="mx-auto grid size-11 place-items-center rounded-lg border bg-background/70">
-          <Clock3 className="size-5 text-primary" />
-        </div>
-        <h3 className="mt-4 font-heading text-lg font-semibold">
-          No schedules yet
-        </h3>
-        <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
-          Chain commands, backups, and power actions across one or many targets.
-          The Relay owns the clock and execution.
-        </p>
-        {canCreate ? (
-          <Button className="mt-5" onClick={onCreate}>
-            <Plus className="size-4" />
-            Create your first schedule
-          </Button>
-        ) : (
-          <p className="mt-4 text-xs text-muted-foreground">
-            You have read access, but not permission to create schedules.
-          </p>
-        )}
-      </div>
-    </div>
+  const renderRow = React.useCallback(
+    (schedule: Schedule) => (
+      <ScheduleTableRow
+        options={options}
+        schedule={schedule}
+        onDelete={() => onDelete(schedule)}
+        onEdit={() => onEdit(schedule)}
+      />
+    ),
+    [onDelete, onEdit, options]
   )
-}
+  const renderEmpty = React.useCallback(
+    (searchActive: boolean) => (
+      <EmptyScheduleTable
+        canCreate={canCreate}
+        searchActive={searchActive}
+        onCreate={onCreate}
+      />
+    ),
+    [canCreate, onCreate]
+  )
 
-const ScheduleList = React.memo(function ScheduleList({
-  schedules,
-  selectedId,
-  onSelect,
-}: {
-  schedules: ReadonlyArray<Schedule>
-  selectedId: string | null
-  onSelect: (id: string) => void
-}) {
   return (
-    <div className="min-h-0 overflow-y-auto border-b bg-background/25 p-2 lg:border-r lg:border-b-0">
-      {schedules.map((schedule) => {
-        const nextRun = scheduleNextRun(schedule)
-        const state = deploymentState(schedule)
-        return (
-          <button
-            key={schedule.id}
-            type="button"
-            aria-pressed={schedule.id === selectedId}
-            className="group mb-1 flex w-full items-start gap-3 rounded-lg border border-transparent px-3 py-3 text-left transition-colors outline-none hover:bg-accent/50 focus-visible:border-ring data-[active=true]:border-border data-[active=true]:bg-background/80"
-            data-active={schedule.id === selectedId}
-            onClick={() => onSelect(schedule.id)}
-          >
-            <span
-              className={`mt-1 size-2 shrink-0 rounded-full ${state === "error" ? "bg-destructive" : state === "pending" ? "bg-amber-400" : "bg-emerald-400"}`}
-              aria-label={`Deployment ${state}`}
-            />
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-sm font-semibold">
-                {schedule.name}
-              </span>
-              <span className="mt-1 block truncate font-mono text-[0.625rem] text-muted-foreground">
-                {schedule.cron} · {schedule.timezone}
-              </span>
-              <span className="mt-1.5 block text-[0.6875rem] text-muted-foreground">
-                {nextRun ? `Next ${relativeTime(nextRun)}` : "No next run"}
-              </span>
-            </span>
-            <ChevronRight className="mt-1 size-3.5 shrink-0 text-muted-foreground/50 group-data-[active=true]:text-primary" />
-          </button>
-        )
-      })}
-    </div>
+    <WorkspaceDataTable
+      getRowKey={scheduleRowKey}
+      getSearchText={scheduleSearchText}
+      head={<ScheduleTableHead />}
+      items={schedules}
+      renderEmpty={renderEmpty}
+      renderRow={renderRow}
+      searchStore={searchStore}
+    />
   )
 })
 
-const ScheduleDetail = React.memo(function ScheduleDetail({
+const ScheduleTableHead = React.memo(function ScheduleTableHead() {
+  return (
+    <WorkspaceTableHead>
+      <WorkspaceTableHeading className="w-20 px-2 sm:w-28 sm:px-3">
+        Status
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="w-auto sm:w-[27%]">
+        Schedule
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[24%] md:table-cell">
+        Timing
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[22%] lg:table-cell">
+        Next run
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[12%] xl:table-cell">
+        Targets
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="w-36 px-1 text-right sm:w-40 sm:px-3">
+        Actions
+      </WorkspaceTableHeading>
+    </WorkspaceTableHead>
+  )
+})
+
+const ScheduleTableRow = React.memo(function ScheduleTableRow({
   options,
   schedule,
   onDelete,
@@ -304,248 +284,341 @@ const ScheduleDetail = React.memo(function ScheduleDetail({
       showToast({ message: errorMessage(cause), type: "error" }),
   })
   const nextRun = scheduleNextRun(schedule)
-  const state = deploymentState(schedule)
 
   return (
-    <div className="min-h-0 overflow-y-auto">
-      <div className="border-b px-4 py-5 sm:px-6">
-        <div className="flex flex-wrap items-start justify-between gap-4">
+    <tr className="group transition-colors hover:bg-accent/25">
+      <WorkspaceTableCell className="px-2 sm:px-3">
+        <ScheduleState state={deploymentState(schedule)} />
+      </WorkspaceTableCell>
+      <WorkspaceTableCell>
+        <div className="min-w-0">
+          <p className="truncate text-xs font-semibold text-foreground">
+            {schedule.name}
+          </p>
+          <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
+            {schedule.actions.length} action
+            {schedule.actions.length === 1 ? "" : "s"}
+            {!schedule.enabled ? " · paused" : ""}
+          </p>
+        </div>
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden md:table-cell">
+        <div className="min-w-0">
+          <p className="truncate text-[0.625rem] font-medium text-foreground">
+            {cronLabel(schedule.cron)}
+          </p>
+          <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
+            {schedule.cron} · {schedule.timezone}
+          </p>
+        </div>
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden lg:table-cell">
+        {nextRun ? (
           <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="font-heading text-xl font-semibold tracking-[-0.035em]">
-                {schedule.name}
-              </h2>
-              <ScheduleStateBadge state={state} />
-              {!schedule.enabled ? (
-                <Badge variant="outline">Paused</Badge>
-              ) : null}
-            </div>
-            <p className="mt-1 font-mono text-xs text-muted-foreground">
-              {schedule.cron} · {schedule.timezone}
+            <p className="truncate text-[0.625rem] text-foreground">
+              {timestampLabel(nextRun, schedule.timezone)}
+            </p>
+            <p className="truncate text-[0.5rem] text-muted-foreground">
+              {relativeTime(nextRun)}
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            {canRun ? (
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={runMutation.isPending}
-                onClick={() => runMutation.mutate()}
-              >
-                {runMutation.isPending ? (
-                  <LoaderCircle className="size-3.5 animate-spin" />
-                ) : (
-                  <Play className="size-3.5" />
-                )}
-                Run now
-              </Button>
-            ) : null}
-            {canEdit ? (
-              <Button variant="outline" size="sm" onClick={onEdit}>
-                <Pencil className="size-3.5" />
-                Edit
-              </Button>
-            ) : null}
-            {canDelete ? (
-              <Button
-                variant="outline"
-                size="icon-sm"
-                onClick={onDelete}
-                aria-label="Delete schedule"
-              >
-                <Trash2 className="size-3.5" />
-              </Button>
-            ) : null}
-          </div>
+        ) : (
+          <span className="text-[0.625rem] text-muted-foreground">
+            Not scheduled
+          </span>
+        )}
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden xl:table-cell">
+        <div className="min-w-0">
+          <p className="text-[0.625rem] text-foreground">
+            {schedule.targets.length} target
+            {schedule.targets.length === 1 ? "" : "s"}
+          </p>
+          <p className="truncate text-[0.5rem] text-muted-foreground">
+            {relayCountLabel(schedule)}
+          </p>
         </div>
-
-        <div className="mt-5 grid gap-3 sm:grid-cols-3">
-          <SummaryMetric
-            label="Next run"
-            value={
-              nextRun ? timestampFormatter.format(nextRun) : "Not scheduled"
-            }
-            detail={nextRun ? relativeTime(nextRun) : "Waiting for a Relay"}
-          />
-          <SummaryMetric
-            label="Targets"
-            value={String(schedule.targets.length)}
-            detail={`${new Set(schedule.targets.map((target) => target.relayId)).size} Relay${new Set(schedule.targets.map((target) => target.relayId)).size === 1 ? "" : "s"}`}
-          />
-          <SummaryMetric
-            label="Revision"
-            value={`r${schedule.revision}`}
-            detail={`${schedule.deployments.filter((item) => item.status === "applied").length}/${schedule.deployments.length} acknowledged`}
-          />
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="px-1 sm:px-3">
+        <div className="flex items-center justify-end gap-1">
+          {canRun ? (
+            <ScheduleActionButton
+              disabled={runMutation.isPending}
+              icon={runMutation.isPending ? LoaderCircle : Play}
+              label={`Run ${schedule.name} now`}
+              spinning={runMutation.isPending}
+              tooltip="Run now"
+              onClick={() => runMutation.mutate()}
+            />
+          ) : null}
+          {canEdit ? (
+            <ScheduleActionButton
+              icon={Pencil}
+              label={`Edit ${schedule.name}`}
+              tooltip="Edit"
+              onClick={onEdit}
+            />
+          ) : null}
+          {canDelete ? (
+            <ScheduleActionButton
+              destructive
+              icon={Trash2}
+              label={`Delete ${schedule.name}`}
+              tooltip="Delete"
+              onClick={onDelete}
+            />
+          ) : null}
         </div>
-      </div>
+      </WorkspaceTableCell>
+    </tr>
+  )
+})
 
-      <div className="space-y-7 px-4 py-6 sm:px-6">
-        <section>
-          <SectionHeading icon={Play} title="Ordered actions" />
-          <div className="relative mt-3 space-y-2 before:absolute before:top-5 before:bottom-5 before:left-[1.15rem] before:w-px before:bg-border">
-            {schedule.actions.map((action, index) => (
-              <ActionSummary key={action.id} action={action} index={index} />
-            ))}
-          </div>
-        </section>
+function ScheduleActionButton({
+  destructive = false,
+  disabled = false,
+  icon: Icon,
+  label,
+  spinning = false,
+  tooltip,
+  onClick,
+}: {
+  destructive?: boolean
+  disabled?: boolean
+  icon: typeof Play
+  label: string
+  spinning?: boolean
+  tooltip: string
+  onClick: () => void
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          size="icon-sm"
+          variant="ghost"
+          aria-label={label}
+          className={
+            destructive
+              ? "text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+              : "text-muted-foreground"
+          }
+          disabled={disabled}
+          onClick={onClick}
+        >
+          <Icon className={spinning ? "animate-spin" : undefined} />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={6}>
+        {tooltip}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
 
-        <section>
-          <SectionHeading icon={Server} title="Targets" />
-          <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-            {schedule.targets.map((target) => (
-              <div
-                key={targetKey(target)}
-                className="flex items-center gap-2.5 rounded-lg border bg-background/40 px-3 py-2.5"
-              >
-                <TargetIcon
-                  kind={target.kind}
-                  className="size-4 text-muted-foreground"
-                />
-                <span className="min-w-0">
-                  <span className="block truncate text-xs font-medium">
-                    {target.name}
-                  </span>
-                  <span className="block truncate font-mono text-[0.5625rem] text-muted-foreground">
-                    {target.kind}
-                  </span>
-                </span>
-              </div>
-            ))}
-          </div>
-        </section>
+function EmptyScheduleTable({
+  canCreate,
+  searchActive,
+  onCreate,
+}: {
+  canCreate: boolean
+  searchActive: boolean
+  onCreate: () => void
+}) {
+  return (
+    <div className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center">
+      <Play className="size-6 text-muted-foreground/45" />
+      <p className="mt-3 text-sm font-semibold">
+        {searchActive ? "No schedules match your search" : "No schedules yet"}
+      </p>
+      <p className="mt-1 max-w-sm text-[0.625rem] leading-4 text-muted-foreground">
+        {searchActive
+          ? "Try a schedule name, cron expression, timezone, action, or target."
+          : "Create Relay-owned automation that keeps running when Hearth is offline."}
+      </p>
+      {!searchActive && canCreate ? (
+        <Button type="button" size="sm" className="mt-4" onClick={onCreate}>
+          <Plus /> Create schedule
+        </Button>
+      ) : null}
+    </div>
+  )
+}
 
-        <section>
-          <SectionHeading icon={History} title="Run history" />
-          {schedule.runs.length === 0 ? (
-            <div className="mt-3 rounded-lg border border-dashed p-5 text-center text-xs text-muted-foreground">
-              No runs have been reported yet.
-            </div>
-          ) : (
-            <div className="mt-3 divide-y rounded-lg border bg-background/30">
-              {schedule.runs.slice(0, 50).map((run) => (
-                <details
-                  key={`${run.relayId}:${run.id}`}
-                  className="group px-3 py-3"
-                >
-                  <summary className="flex cursor-pointer list-none items-center gap-3 outline-none">
-                    <RunStatusDot status={run.status} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-xs font-medium capitalize">
-                        {run.status.replaceAll("_", " ")}
-                      </span>
-                      <span className="block text-[0.625rem] text-muted-foreground">
-                        {timestampFormatter.format(new Date(run.scheduledAt))}
-                      </span>
-                    </span>
-                    <span className="font-mono text-[0.5625rem] text-muted-foreground">
-                      {run.targetRuns.length} targets
-                    </span>
-                    <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-open:rotate-90" />
-                  </summary>
-                  <div className="mt-3 space-y-2 border-t pt-3">
-                    {run.targetRuns.map((targetRun) => (
-                      <div
-                        key={targetRun.id}
-                        className="rounded-md bg-muted/30 px-3 py-2"
-                      >
-                        <div className="flex items-center justify-between gap-3 text-xs">
-                          <span className="font-medium">
-                            {targetRun.target.name}
-                          </span>
-                          <span className="text-muted-foreground capitalize">
-                            {targetRun.status.replaceAll("_", " ")}
-                          </span>
-                        </div>
-                        {targetRun.attempts.length > 0 ? (
-                          <div className="mt-2 space-y-1">
-                            {targetRun.attempts.map((attempt) => (
-                              <div
-                                key={attempt.id}
-                                className="flex items-center justify-between gap-3 font-mono text-[0.5625rem] text-muted-foreground"
-                              >
-                                <span>{actionLabel(attempt.actionType)}</span>
-                                <span>
-                                  {attempt.status.replaceAll("_", " ")}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                </details>
-              ))}
-            </div>
-          )}
-        </section>
-      </div>
+export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
+  const { data: schedules } = useSuspenseQuery(schedulesQueryOptions())
+  const [searchStore] = React.useState(createWorkspaceTableSearchStore)
+  const runs = React.useMemo(
+    () =>
+      schedules
+        .flatMap((schedule) =>
+          schedule.runs.map((run) => ({
+            ...run,
+            scheduleName: schedule.name,
+            timezone: schedule.timezone,
+          }))
+        )
+        .sort((left, right) => right.scheduledAt - left.scheduledAt),
+    [schedules]
+  )
+
+  return (
+    <div className="mx-auto w-full max-w-[90rem] px-3 pb-10 sm:px-5">
+      <section className="overflow-hidden rounded-xl border bg-card/45 [contain:paint]">
+        <HistoryToolbar searchStore={searchStore} runCount={runs.length} />
+        <ScheduleHistoryTable runs={runs} searchStore={searchStore} />
+      </section>
     </div>
   )
 })
 
-function SummaryMetric({
-  label,
-  value,
-  detail,
+type ScheduleHistoryRun = Schedule["runs"][number] & {
+  scheduleName: string
+  timezone: string
+}
+
+function HistoryToolbar({
+  runCount,
+  searchStore,
 }: {
-  label: string
-  value: string
-  detail: string
+  runCount: number
+  searchStore: WorkspaceTableSearchStore
 }) {
+  const inputRef = React.useRef<HTMLInputElement>(null)
+  useWorkspaceTableSearchInput(inputRef, searchStore)
   return (
-    <div className="rounded-lg border bg-background/35 px-3 py-3">
-      <p className="font-mono text-[0.5625rem] tracking-[0.12em] text-muted-foreground uppercase">
-        {label}
-      </p>
-      <p className="mt-1 truncate text-sm font-semibold">{value}</p>
-      <p className="mt-0.5 truncate text-[0.625rem] text-muted-foreground">
-        {detail}
-      </p>
+    <div className="flex min-w-0 items-center gap-3 border-b bg-background/25 p-3">
+      <div className="relative min-w-0 flex-1 sm:max-w-md">
+        <Search className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          ref={inputRef}
+          id="schedule-history-search"
+          type="search"
+          className="pl-9"
+          defaultValue={searchStore.getServerSnapshot()}
+          placeholder="Search run history"
+          onChange={(event) => searchStore.set(event.currentTarget.value)}
+        />
+      </div>
+      <Badge variant="outline" className="font-mono text-[0.625rem]">
+        {runCount} run{runCount === 1 ? "" : "s"}
+      </Badge>
     </div>
   )
 }
 
-function SectionHeading({
-  icon: Icon,
-  title,
+const ScheduleHistoryTable = React.memo(function ScheduleHistoryTable({
+  runs,
+  searchStore,
 }: {
-  icon: typeof Play
-  title: string
+  runs: Array<ScheduleHistoryRun>
+  searchStore: WorkspaceTableSearchStore
 }) {
-  return (
-    <h3 className="flex items-center gap-2 text-sm font-semibold">
-      <Icon className="size-3.5 text-primary" />
-      {title}
-    </h3>
+  const renderRow = React.useCallback(
+    (run: ScheduleHistoryRun) => <ScheduleHistoryRow run={run} />,
+    []
   )
-}
+  const renderEmpty = React.useCallback(
+    (searchActive: boolean) => (
+      <div className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center">
+        <Play className="size-6 text-muted-foreground/45" />
+        <p className="mt-3 text-sm font-semibold">
+          {searchActive ? "No runs match your search" : "No schedule runs yet"}
+        </p>
+        <p className="mt-1 max-w-sm text-[0.625rem] leading-4 text-muted-foreground">
+          Completed and attempted schedule runs will appear here.
+        </p>
+      </div>
+    ),
+    []
+  )
+  return (
+    <WorkspaceDataTable
+      getRowKey={historyRowKey}
+      getSearchText={historySearchText}
+      head={<ScheduleHistoryHead />}
+      items={runs}
+      renderEmpty={renderEmpty}
+      renderRow={renderRow}
+      searchStore={searchStore}
+    />
+  )
+})
 
-function ActionSummary({
-  action,
-  index,
+const ScheduleHistoryHead = React.memo(function ScheduleHistoryHead() {
+  return (
+    <WorkspaceTableHead>
+      <WorkspaceTableHeading className="w-24 px-2 sm:w-32 sm:px-3">
+        Status
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="w-auto sm:w-[30%]">
+        Schedule
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[24%] md:table-cell">
+        Started
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[16%] lg:table-cell">
+        Duration
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[14%] xl:table-cell">
+        Targets
+      </WorkspaceTableHeading>
+      <WorkspaceTableHeading className="hidden w-[18%] sm:table-cell">
+        Relay
+      </WorkspaceTableHeading>
+    </WorkspaceTableHead>
+  )
+})
+
+const ScheduleHistoryRow = React.memo(function ScheduleHistoryRow({
+  run,
 }: {
-  action: ScheduleAction
-  index: number
+  run: ScheduleHistoryRun
 }) {
   return (
-    <div className="relative flex items-center gap-3 rounded-lg border bg-background/45 px-3 py-3 pl-11">
-      <span className="absolute left-2.5 z-10 grid size-5 place-items-center rounded-full border bg-background font-mono text-[0.5625rem] text-muted-foreground">
-        {index + 1}
-      </span>
-      <ActionIcon type={action.type} className="size-4 shrink-0 text-primary" />
-      <span className="min-w-0">
-        <span className="block text-xs font-semibold">
-          {actionLabel(action.type)}
+    <tr className="transition-colors hover:bg-accent/25">
+      <WorkspaceTableCell className="px-2 sm:px-3">
+        <RunStatusDot status={run.status} />
+      </WorkspaceTableCell>
+      <WorkspaceTableCell>
+        <div className="min-w-0">
+          <p className="truncate text-xs font-semibold text-foreground">
+            {run.scheduleName}
+          </p>
+          <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
+            r{run.revision} · {run.status.replaceAll("_", " ")}
+          </p>
+        </div>
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden md:table-cell">
+        <div className="min-w-0">
+          <p className="truncate text-[0.625rem] text-foreground">
+            {timestampLabel(new Date(run.startedAt), run.timezone)}
+          </p>
+          <p className="truncate text-[0.5rem] text-muted-foreground">
+            {relativeTime(new Date(run.startedAt))}
+          </p>
+        </div>
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden lg:table-cell">
+        <span className="font-mono text-[0.5625rem] text-foreground">
+          {durationLabel(run.finishedAt - run.startedAt)}
         </span>
-        <span className="block truncate font-mono text-[0.625rem] text-muted-foreground">
-          {actionDescription(action)}
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden xl:table-cell">
+        <span className="text-[0.625rem] text-foreground">
+          {run.targetRuns.length}
         </span>
-      </span>
-    </div>
+      </WorkspaceTableCell>
+      <WorkspaceTableCell className="hidden sm:table-cell">
+        <span className="block truncate font-mono text-[0.5625rem] text-muted-foreground">
+          {run.relayId}
+        </span>
+      </WorkspaceTableCell>
+    </tr>
   )
-}
+})
 
 function ScheduleEditorDialog({
   mode,
@@ -1088,23 +1161,18 @@ function DeleteScheduleDialog({
   )
 }
 
-function ScheduleStateBadge({
-  state,
-}: {
-  state: "applied" | "error" | "pending"
-}) {
-  return state === "applied" ? (
-    <Badge className="border-emerald-500/25 bg-emerald-500/10 text-emerald-400">
-      Deployed
-    </Badge>
-  ) : state === "error" ? (
-    <Badge className="border-destructive/25 bg-destructive/10 text-destructive">
-      Deployment error
-    </Badge>
-  ) : (
-    <Badge className="border-amber-400/25 bg-amber-400/10 text-amber-300">
-      Pending
-    </Badge>
+function ScheduleState({ state }: { state: "applied" | "error" | "pending" }) {
+  const label =
+    state === "applied" ? "Deployed" : state === "error" ? "Error" : "Pending"
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium ${state === "applied" ? "text-emerald-400" : state === "error" ? "text-destructive" : "text-amber-300"}`}
+    >
+      <span
+        className={`size-1.5 shrink-0 rounded-full ${state === "applied" ? "bg-emerald-400" : state === "error" ? "bg-destructive" : "bg-amber-400"}`}
+      />
+      <span className="hidden sm:inline">{label}</span>
+    </span>
   )
 }
 
@@ -1113,11 +1181,16 @@ function RunStatusDot({
 }: {
   status: Schedule["runs"][number]["status"]
 }) {
+  const label = status.replaceAll("_", " ")
   return (
     <span
-      className={`size-2 shrink-0 rounded-full ${status === "succeeded" ? "bg-emerald-400" : status === "failed" || status === "interrupted" ? "bg-destructive" : status === "partial" ? "bg-amber-400" : "bg-muted-foreground"}`}
-      aria-hidden="true"
-    />
+      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium capitalize ${status === "succeeded" ? "text-emerald-400" : status === "failed" || status === "interrupted" ? "text-destructive" : status === "partial" ? "text-amber-300" : "text-muted-foreground"}`}
+    >
+      <span
+        className={`size-1.5 shrink-0 rounded-full ${status === "succeeded" ? "bg-emerald-400" : status === "failed" || status === "interrupted" ? "bg-destructive" : status === "partial" ? "bg-amber-400" : "bg-muted-foreground"}`}
+      />
+      <span className="hidden sm:inline">{label}</span>
+    </span>
   )
 }
 
@@ -1157,12 +1230,6 @@ function actionLabel(type: ScheduleAction["type"]) {
   if (type === "console_command") return "Console command"
   if (type === "backup") return "Trigger backup"
   return "Power action"
-}
-
-function actionDescription(action: ScheduleAction) {
-  if (action.type === "console_command") return action.command
-  if (action.type === "backup") return `${action.name} · Local Relay storage`
-  return action.action
 }
 
 function targetKey(target: Pick<ScheduleTarget, "id" | "kind" | "relayId">) {
@@ -1216,6 +1283,77 @@ function cronPreset(cron: string) {
     "0 0 1 * *": "monthly",
   }
   return presets[cron] ?? "custom"
+}
+
+function cronLabel(cron: string) {
+  const preset = cronPreset(cron)
+  return preset === "custom"
+    ? "Custom schedule"
+    : `${preset[0]?.toUpperCase()}${preset.slice(1)}`
+}
+
+function scheduleRowKey(schedule: Schedule) {
+  return schedule.id
+}
+
+function scheduleSearchText(schedule: Schedule) {
+  return [
+    schedule.name,
+    schedule.cron,
+    schedule.timezone,
+    ...schedule.actions.flatMap((action) => [
+      actionLabel(action.type),
+      action.type === "console_command"
+        ? action.command
+        : action.type === "backup"
+          ? action.name
+          : action.action,
+    ]),
+    ...schedule.targets.flatMap((target) => [
+      target.name,
+      target.kind,
+      target.id,
+    ]),
+  ].join(" ")
+}
+
+function relayCountLabel(schedule: Schedule) {
+  const count = new Set(schedule.targets.map((target) => target.relayId)).size
+  return `${count} Relay${count === 1 ? "" : "s"}`
+}
+
+function historyRowKey(run: ScheduleHistoryRun) {
+  return `${run.relayId}:${run.id}`
+}
+
+function historySearchText(run: ScheduleHistoryRun) {
+  return [
+    run.scheduleName,
+    run.status,
+    run.relayId,
+    ...run.targetRuns.flatMap((targetRun) => [
+      targetRun.target.name,
+      targetRun.target.kind,
+      targetRun.status,
+    ]),
+  ].join(" ")
+}
+
+function durationLabel(durationMs: number) {
+  const safeDuration = Math.max(0, durationMs)
+  if (safeDuration < 1_000) return `${safeDuration} ms`
+  if (safeDuration < 60_000) return `${(safeDuration / 1_000).toFixed(1)} s`
+  const minutes = Math.floor(safeDuration / 60_000)
+  const seconds = Math.round((safeDuration % 60_000) / 1_000)
+  return `${minutes}m ${seconds}s`
+}
+
+function timestampLabel(date: Date, timeZone: string) {
+  return new Intl.DateTimeFormat("en-US", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone,
+  }).format(date)
 }
 
 function localTimezone() {
