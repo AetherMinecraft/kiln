@@ -1540,7 +1540,7 @@ function ScheduleEditorDialog({
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[min(90dvh,56rem)] gap-4 overflow-y-auto sm:max-w-3xl">
+      <DialogContent className="max-h-[min(90dvh,56rem)] gap-4 overflow-x-hidden overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>
             {existing ? "Edit schedule" : "Create schedule"}
@@ -1578,36 +1578,45 @@ function ScheduleEditorDialog({
             onTargetToggle={toggleTarget}
           />
 
-          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-background/30 px-3 py-2.5">
-            <span>
-              <span className="block text-xs font-semibold">
-                Schedule enabled
-              </span>
-              <span className="block text-[0.625rem] text-muted-foreground">
-                Disabled schedules remain deployed but do not run.
-              </span>
-            </span>
-            <input
-              aria-label="Schedule enabled"
-              type="checkbox"
-              className="size-4 accent-primary"
-              checked={enabled}
-              onChange={(event) => setEnabled(event.target.checked)}
-            />
-          </label>
-
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={!canSave || mutation.isPending}>
-              {mutation.isPending ? (
-                <LoaderCircle className="size-4 animate-spin" />
+          <DialogFooter className="flex-row flex-nowrap items-center">
+            <Button
+              aria-label={`Schedule is ${enabled ? "enabled" : "disabled"}. Click to ${enabled ? "disable" : "enable"}.`}
+              aria-pressed={enabled}
+              className={`mr-auto ${enabled ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15 hover:text-emerald-300" : "text-muted-foreground"}`}
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => setEnabled((current) => !current)}
+            >
+              {enabled ? (
+                <CircleCheck className="size-4" />
               ) : (
-                <Check className="size-4" />
+                <CirclePause className="size-4" />
               )}
-              {existing ? "Save changes" : "Create schedule"}
+              {enabled ? "Enabled" : "Disabled"}
             </Button>
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                size="sm"
+                type="button"
+                variant="outline"
+                onClick={onClose}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                type="submit"
+                disabled={!canSave || mutation.isPending}
+              >
+                {mutation.isPending ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <Check className="size-4" />
+                )}
+                {existing ? "Save changes" : "Create schedule"}
+              </Button>
+            </div>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -1978,7 +1987,7 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
       <div
         ref={actionViewportRef}
         aria-label="Schedule actions"
-        className={`${hideHeader ? "" : "mt-3"} h-[24.5rem] [scrollbar-gutter:stable] overflow-y-auto overscroll-contain pr-1`}
+        className={`${hideHeader ? "" : "mt-3"} h-80 [scrollbar-gutter:stable] overflow-y-auto overscroll-contain pr-1`}
         role="region"
       >
         {actions.length === 0 ? (
