@@ -8,6 +8,7 @@ import {
 } from "@/effect/github-releases"
 import { runAppEffect } from "@/effect/runtime"
 import { isPlatformAdmin, isRelayCreator } from "@/lib/access-control"
+import { kilnGitRepository } from "@/lib/environment"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import {
@@ -174,6 +175,7 @@ export const startSystemUpdates = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const user = await requireUpdateAccess()
     const platformAdmin = isPlatformAdmin(user)
+    const gitRepository = kilnGitRepository()
     if (
       !platformAdmin &&
       data.targets.some((target) => target.component === "hearth")
@@ -210,7 +212,8 @@ export const startSystemUpdates = createServerFn({ method: "POST" })
               validateUpdateManifest(
                 manifest,
                 latestRelease.version,
-                requested.component
+                requested.component,
+                gitRepository
               )
               const relay =
                 requested.component === "relay"

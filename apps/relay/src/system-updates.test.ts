@@ -23,6 +23,7 @@ import type { CommandOptions, CommandResult } from "./command.js"
 
 const targetImage = `ghcr.io/kiln-site/relay@sha256:${"a".repeat(64)}`
 const hearthImage = `ghcr.io/kiln-site/hearth@sha256:${"b".repeat(64)}`
+const forkTargetImage = `ghcr.io/example/relay@sha256:${"d".repeat(64)}`
 
 const relayContainer = {
   Config: {
@@ -54,9 +55,11 @@ const hearthContainer = {
 
 class FakeCommand {
   readonly calls: Array<Array<string>> = []
+  containerImageSource = KILN_IMAGE_SOURCE
   currentVersion = "0.1.0-nightly.1"
   imageSource = KILN_IMAGE_SOURCE
   imageVersion = "0.1.0-nightly.18"
+  relayImage = relayContainer.Config.Image
   helperRunning = true
   holdPull = false
   pullStarted: Promise<void>
@@ -80,7 +83,7 @@ class FakeCommand {
       return emptyResult()
     }
     if (arguments_[0] === "image" && arguments_[1] === "inspect") {
-      const component = arguments_[2] === hearthImage ? "hearth" : "relay"
+      const component = arguments_[2]?.includes("/hearth@") ? "hearth" : "relay"
       return jsonResult([
         {
           Config: {
@@ -108,8 +111,10 @@ class FakeCommand {
             ...relayContainer,
             Config: {
               ...relayContainer.Config,
+              Image: this.relayImage,
               Labels: {
                 ...relayContainer.Config.Labels,
+                "org.opencontainers.image.source": this.containerImageSource,
                 "org.opencontainers.image.version": this.currentVersion,
               },
             },
@@ -176,20 +181,53 @@ describe("release image versions", () => {
     withTemporaryDataDirectory((dataDirectory) =>
       Effect.gen(function* () {
         const docker = new FakeCommand()
-        docker.imageSource = "https://github.com/example/kiln-fork"
+        const gitRepository = "https://github.com/example/kiln-fork"
+        docker.containerImageSource = gitRepository
+        docker.imageSource = gitRepository
+        docker.relayImage = "ghcr.io/example/relay:latest"
         const manager = new SystemUpdateManager(
-          { dataDirectory, gitRepository: docker.imageSource },
+          { dataDirectory, gitRepository },
           docker.run
         )
 
         const operation = yield* manager.start({
-          helperImage: targetImage,
+          helperImage: forkTargetImage,
           targetContainer: "kiln-relay",
-          targetImage,
+          targetImage: forkTargetImage,
           version: "0.1.0",
         })
 
         expect(operation.status).toBe("running")
+        expect(operation.targetReference).toBe("ghcr.io/example/relay:latest")
+      })
+    )
+  )
+
+  effectIt.effect("rejects helper images from another repository owner", () =>
+    withTemporaryDataDirectory((dataDirectory) =>
+      Effect.gen(function* () {
+        const docker = new FakeCommand()
+        const manager = new SystemUpdateManager(
+          {
+            dataDirectory,
+            gitRepository: "https://github.com/example/kiln-fork",
+          },
+          docker.run
+        )
+
+        const failure = yield* manager
+          .start({
+            helperImage: targetImage,
+            targetContainer: "kiln-relay",
+            targetImage: forkTargetImage,
+            version: "0.1.0",
+          })
+          .pipe(Effect.flip)
+
+        expect(failure.message).toContain("configured Kiln repository")
+        expect(
+          docker.calls.some((arguments_) => arguments_[0] === "pull")
+        ).toBe(false)
       })
     )
   )

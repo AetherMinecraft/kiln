@@ -42,6 +42,11 @@ export function kilnGitRepositorySlug(value?: string): string {
   return new URL(resolveKilnGitRepository(value)).pathname.slice(1)
 }
 
+export function kilnGitHubContainerRegistry(value?: string): string {
+  const slug = kilnGitRepositorySlug(value)
+  return `ghcr.io/${slug.slice(0, slug.indexOf("/")).toLowerCase()}`
+}
+
 export function kilnGitRepositoryApiUrl(
   value: string | undefined,
   path: string

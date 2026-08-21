@@ -122,6 +122,25 @@ describe("managed update channels", () => {
       managedImageChannel("ghcr.io/kiln-site/relay:latest", "hearth")
     ).toBeNull()
   })
+
+  it("derives fork channels from the configured repository owner", () => {
+    const gitRepository = "https://github.com/Example/Kiln-Fork"
+
+    expect(
+      managedImageChannel(
+        "ghcr.io/example/relay:latest-nightly",
+        "relay",
+        gitRepository
+      )
+    ).toBe("ghcr.io/example/relay:latest-nightly")
+    expect(
+      managedImageChannel(
+        "ghcr.io/kiln-site/relay:latest-nightly",
+        "relay",
+        gitRepository
+      )
+    ).toBeNull()
+  })
 })
 
 describe("container replacement", () => {

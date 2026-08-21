@@ -17,6 +17,7 @@ import {
   isKilnGitRepositorySource,
   isKilnNightlyVersion,
   isKilnReleaseVersion,
+  kilnGitHubContainerRegistry,
   kilnReleaseVersionCore,
 } from "@workspace/contracts"
 import { Effect, Semaphore } from "effect"
@@ -31,8 +32,6 @@ import {
   type KilnComponent,
 } from "./update-container.js"
 
-const RELEASE_IMAGE =
-  /^ghcr\.io\/kiln-site\/(hearth|relay)@sha256:[a-f0-9]{64}$/u
 const STALE_UPDATE_MS = 10 * 60_000
 const ORPHAN_LOCK_MS = 30_000
 
@@ -163,10 +162,12 @@ export class SystemUpdateManager {
     return this.#batchSemaphore.withPermit(
       Effect.gen({ self: this }, function* () {
         yield* ensureNotAbortedEffect(signal)
-        if (releaseImageComponent(input.helperImage) !== "relay") {
+        if (
+          releaseImageComponent(input.helperImage, gitRepository) !== "relay"
+        ) {
           return yield* systemUpdateFailure(
             "start.validate",
-            "The update helper must be an official Relay digest"
+            "The update helper must be a Relay digest from the configured Kiln repository"
           )
         }
         if (input.targets.length === 0) {
@@ -418,7 +419,10 @@ const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
   gitRepository: string,
   runCommand: RunCommand
 ) {
-  const targetComponent = releaseImageComponent(input.targetImage)
+  const targetComponent = releaseImageComponent(
+    input.targetImage,
+    gitRepository
+  )
   const container = yield* inspectContainerEffect(
     input.targetContainer,
     runCommand
@@ -457,7 +461,8 @@ const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
   }
   const targetReference = managedImageChannel(
     container.Config.Image,
-    targetComponent
+    targetComponent,
+    gitRepository
   )
   if (!targetReference) {
     return yield* systemUpdateFailure(
@@ -741,7 +746,7 @@ function updateEligibility(
     gitRepository
   )
   const eligibleTag = component
-    ? managedImageChannel(currentImage, component)
+    ? managedImageChannel(currentImage, component, gitRepository)
     : null
 
   return {
@@ -756,7 +761,7 @@ function updateEligibility(
       : !component
         ? "The container is not a Hearth or Relay image."
         : !official
-          ? "Only official public Kiln images can be updated."
+          ? "Only images from the configured public Kiln repository can be updated."
           : !eligibleTag
             ? "This container is pinned. Change it to :latest or :latest-nightly to enable one-click updates."
             : null,
@@ -879,11 +884,21 @@ function pullAndVerifyImageEffect(
   })
 }
 
-function releaseImageComponent(image: string): KilnComponent | null {
-  if (!RELEASE_IMAGE.test(image)) {
-    return null
+function releaseImageComponent(
+  image: string,
+  gitRepository: string
+): KilnComponent | null {
+  const registry = kilnGitHubContainerRegistry(gitRepository)
+  for (const component of ["hearth", "relay"] as const) {
+    const prefix = `${registry}/${component}@sha256:`
+    if (
+      image.startsWith(prefix) &&
+      /^[a-f0-9]{64}$/u.test(image.slice(prefix.length))
+    ) {
+      return component
+    }
   }
-  return image.startsWith("ghcr.io/kiln-site/hearth@") ? "hearth" : "relay"
+  return null
 }
 
 function acquireTargetLockEffect(
