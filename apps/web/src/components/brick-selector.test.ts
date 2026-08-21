@@ -29,6 +29,16 @@ describe("Brick catalog trust badges", () => {
 })
 
 describe("Brick catalog names", () => {
+  it("uses the catalog name when one is provided", () => {
+    expect(
+      catalogDisplayName({
+        isDefault: false,
+        name: "Cool Bricks",
+        source: "https://github.com/cool-user/cool-bricks",
+      })
+    ).toBe("Cool Bricks")
+  })
+
   it("names the default catalog Kiln", () => {
     expect(
       catalogDisplayName({

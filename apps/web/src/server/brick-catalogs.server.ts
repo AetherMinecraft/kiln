@@ -19,9 +19,12 @@ const DEFAULT_CATALOG_ID = "default"
 const DEFAULT_CACHE_TTL_MS = 5 * 60_000
 
 export interface BrickCatalogSummary {
+  author: string | null
   brickCount: number
+  docs: string | null
   id: string
   isDefault: boolean
+  name: string | null
   ownerEmail: string | null
   ownerName: string | null
   ownerUserId: string | null
@@ -31,6 +34,7 @@ export interface BrickCatalogSummary {
   snapshotSha256: string | null
   source: string
   statusError: string | null
+  support: string | null
   updatedAt: string | null
   visibility: "community" | "default" | "personal"
 }
@@ -172,9 +176,12 @@ function catalogSummary(
   includeOwnerDetails: boolean
 ): BrickCatalogSummary {
   return {
+    author: catalog.snapshot.author ?? null,
     brickCount: catalog.snapshot.bricks.length,
+    docs: catalog.snapshot.docs ?? null,
     id: catalog.id,
     isDefault: false,
+    name: catalog.snapshot.name ?? null,
     ownerEmail: includeOwnerDetails ? catalog.ownerEmail : null,
     ownerName: includeOwnerDetails ? catalog.ownerName : null,
     ownerUserId: catalog.ownerUserId,
@@ -184,6 +191,7 @@ function catalogSummary(
     snapshotSha256: catalog.snapshotSha256,
     source: catalog.source,
     statusError: null,
+    support: catalog.snapshot.support ?? null,
     updatedAt: catalog.updatedAt,
     visibility: catalog.visibility,
   }
@@ -194,9 +202,12 @@ function defaultSummary(
   error: string | null
 ): BrickCatalogSummary {
   return {
+    author: catalog?.snapshot.author ?? null,
     brickCount: catalog?.snapshot.bricks.length ?? 0,
+    docs: catalog?.snapshot.docs ?? null,
     id: DEFAULT_CATALOG_ID,
     isDefault: true,
+    name: catalog?.snapshot.name ?? null,
     ownerEmail: null,
     ownerName: null,
     ownerUserId: null,
@@ -206,6 +217,7 @@ function defaultSummary(
     snapshotSha256: catalog?.snapshotSha256 ?? null,
     source: catalog?.source ?? kilnBrickCatalogUrl(),
     statusError: error,
+    support: catalog?.snapshot.support ?? null,
     updatedAt: null,
     visibility: "default",
   }

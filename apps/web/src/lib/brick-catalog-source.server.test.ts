@@ -25,7 +25,13 @@ describe("Hearth Brick catalogs", () => {
     const directory = await temporaryDirectory()
     await writeFile(
       resolve(directory, "catalog.yml"),
-      "format: kiln.catalog/v1\nrecipes: [paper.yml]\n"
+      `format: kiln.catalog/v1
+name: Example Catalog
+author: Example Author
+docs: https://example.com/docs
+support: https://example.com/support
+recipes: [paper.yml]
+`
     )
     await writeFile(resolve(directory, "paper.yml"), recipe("paper", "Paper"))
 
@@ -35,6 +41,12 @@ describe("Hearth Brick catalogs", () => {
     )
 
     expect(loaded.snapshot.bricks).toHaveLength(1)
+    expect(loaded.snapshot).toMatchObject({
+      name: "Example Catalog",
+      author: "Example Author",
+      docs: "https://example.com/docs",
+      support: "https://example.com/support",
+    })
     expect(loaded.snapshot.bricks[0]?.metadata.id).toBe("paper")
     expect(loaded.snapshot.bricks[0]?.source).toBe(
       pathToFileURL(resolve(directory, "paper.yml")).href

@@ -94,6 +94,10 @@ export class BrickCatalog {
     }
     const value = relayCatalogSchema.parse({
       format: "kiln.catalog/v1",
+      name: document.name,
+      author: document.author,
+      docs: document.docs,
+      support: document.support,
       bricks,
     })
     this.#cache = { expiresAt: Date.now() + CACHE_TTL_MS, value }

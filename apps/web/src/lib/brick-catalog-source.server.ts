@@ -84,6 +84,10 @@ export async function loadBrickCatalogSource(
   }
   const snapshot = relayCatalogSchema.parse({
     format: "kiln.catalog/v1",
+    name: document.name,
+    author: document.author,
+    docs: document.docs,
+    support: document.support,
     bricks,
   })
   const encoded = JSON.stringify(snapshot)

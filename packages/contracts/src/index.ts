@@ -1283,14 +1283,31 @@ export const relayErrorSchema = z.object({
   code: z.string(),
 })
 
+const brickCatalogMetadataShape = {
+  name: z.string().trim().min(1).max(80).optional(),
+  author: z.string().trim().min(1).max(80).optional(),
+  docs: z
+    .url()
+    .max(2_048)
+    .regex(/^https?:\/\//iu, "Catalog docs must use HTTP or HTTPS")
+    .optional(),
+  support: z
+    .url()
+    .max(2_048)
+    .regex(/^https?:\/\//iu, "Catalog support must use HTTP or HTTPS")
+    .optional(),
+}
+
 export const relayCatalogSchema = z.object({
   format: z.literal("kiln.catalog/v1"),
+  ...brickCatalogMetadataShape,
   bricks: z.array(brickSchema),
 })
 
 export const brickCatalogDocumentSchema = z
   .object({
     format: z.literal("kiln.catalog/v1"),
+    ...brickCatalogMetadataShape,
     recipes: z.array(z.string().min(1).max(2_048)).min(1).max(256),
   })
   .strict()

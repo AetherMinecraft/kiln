@@ -10,6 +10,7 @@ import {
   FileCode2,
   Globe2,
   Library,
+  LifeBuoy,
   LoaderCircle,
   LockKeyhole,
   PackagePlus,
@@ -794,6 +795,7 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
               href="https://github.com/kiln-site/kiln/blob/main/apps/bricks/catalog.yml"
               target="_blank"
               rel="noreferrer"
+              aria-label="View the example catalog on GitHub"
               className="text-foreground underline underline-offset-2 hover:text-primary"
             >
               here
@@ -844,6 +846,7 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                         <CatalogTrustBadge catalog={catalog} />
                       </span>
                       <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
+                        {catalog.author ? `By ${catalog.author} · ` : ""}
                         {catalog.isDefault
                           ? ""
                           : `${catalogVisibilityLabel(catalog.visibility)} · `}
@@ -892,8 +895,41 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                     </h3>
                     <CatalogTrustBadge catalog={selected} />
                   </div>
+                  {selected.author ? (
+                    <p className="mt-1 truncate text-xs text-muted-foreground">
+                      by {selected.author}
+                    </p>
+                  ) : null}
                 </div>
               </div>
+              {selected.docs || selected.support ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {selected.docs ? (
+                    <a
+                      href={selected.docs}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border/70 bg-muted/25 px-2 text-[0.6875rem] font-medium transition-colors hover:border-primary/35 hover:bg-primary/8 hover:text-primary"
+                    >
+                      <BookOpen className="size-3" />
+                      Docs
+                      <ExternalLink className="size-2.5 text-muted-foreground" />
+                    </a>
+                  ) : null}
+                  {selected.support ? (
+                    <a
+                      href={selected.support}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border/70 bg-muted/25 px-2 text-[0.6875rem] font-medium transition-colors hover:border-primary/35 hover:bg-primary/8 hover:text-primary"
+                    >
+                      <LifeBuoy className="size-3" />
+                      Support
+                      <ExternalLink className="size-2.5 text-muted-foreground" />
+                    </a>
+                  ) : null}
+                </div>
+              ) : null}
               {selected.revisionUrl && selected.revisionSha ? (
                 <a
                   href={selected.revisionUrl}
@@ -1028,8 +1064,10 @@ function catalogMutationError(cause: unknown): void {
 
 export function catalogDisplayName(catalog: {
   isDefault: boolean
+  name?: string | null
   source: string
 }): string {
+  if (catalog.name) return catalog.name
   if (catalog.isDefault) return "Kiln"
   return catalogSourceLabel(catalog.source)
 }
