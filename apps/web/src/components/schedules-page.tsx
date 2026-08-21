@@ -42,6 +42,7 @@ import {
   normalizeScheduleCron,
   scheduleActionSupportsTarget,
   scheduleCronAliases,
+  validateScheduleCron,
 } from "@workspace/contracts"
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
@@ -1435,6 +1436,7 @@ function ScheduleEditorDialog({
   const [actions, setActions] = React.useState<Array<ScheduleActionDraft>>(
     existing?.actions ?? []
   )
+  const cronSummary = React.useMemo(() => cronDescription(cron), [cron])
   const permissionKey = mode.kind === "create" ? "canCreate" : "canUpdate"
   const selectedOptions = React.useMemo(
     () => options.filter((option) => selectedTargets.has(targetKey(option))),
@@ -1449,7 +1451,7 @@ function ScheduleEditorDialog({
   )
   const canSave =
     name.trim().length > 0 &&
-    cron.trim().length > 0 &&
+    cronSummary !== null &&
     selectedOptions.length > 0 &&
     selectedOptions.every((option) => option[permissionKey]) &&
     actions.length > 0 &&
@@ -1561,6 +1563,7 @@ function ScheduleEditorDialog({
             actionSelectionValid={actionSelectionValid}
             actions={actions}
             cron={cron}
+            cronSummary={cronSummary}
             name={name}
             options={options}
             permissionKey={permissionKey}
@@ -1628,6 +1631,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   actionSelectionValid,
   actions,
   cron,
+  cronSummary,
   name,
   options,
   permissionKey,
@@ -1647,6 +1651,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   actionSelectionValid: boolean
   actions: ReadonlyArray<ScheduleActionDraft>
   cron: string
+  cronSummary: string | null
   name: string
   options: ReadonlyArray<ScheduleOption>
   permissionKey: "canCreate" | "canUpdate"
@@ -1668,6 +1673,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
       <EditorSection title="Details">
         <ScheduleDetailsFields
           cron={cron}
+          cronSummary={cronSummary}
           name={name}
           onCronChange={onCronChange}
           onNameChange={onNameChange}
@@ -1740,17 +1746,18 @@ function ScheduleActionValidationMessage({
 
 const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
   cron,
+  cronSummary,
   name,
   onCronChange,
   onNameChange,
 }: {
   cron: string
+  cronSummary: string | null
   name: string
   onCronChange: React.Dispatch<React.SetStateAction<string>>
   onNameChange: React.Dispatch<React.SetStateAction<string>>
 }) {
   const [timing, setTiming] = React.useState(() => cronPreset(cron))
-  const description = cronDescription(cron)
   return (
     <div className="space-y-2.5">
       <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem]">
@@ -1802,10 +1809,10 @@ const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
           />
         </Field>
         <div
-          className={`flex min-h-8 items-center rounded-lg border px-3 py-1 text-xs leading-5 ${description ? "bg-muted/25 text-foreground" : "border-destructive/35 bg-destructive/5 text-destructive"}`}
-          role={description ? undefined : "alert"}
+          className={`flex min-h-8 items-center rounded-lg border px-3 py-1 text-xs leading-5 ${cronSummary !== null ? "bg-muted/25 text-foreground" : "border-destructive/35 bg-destructive/5 text-destructive"}`}
+          role={cronSummary === null ? "alert" : undefined}
         >
-          {description ?? "Enter a valid five-part cron expression."}
+          {cronSummary ?? "Enter a valid five-part cron expression."}
         </div>
       </div>
     </div>
@@ -2744,7 +2751,6 @@ function isCompleteScheduleAction(
 
 function scheduleActionIsConfigured(action: ScheduleAction) {
   if (action.type === "console_command") return action.command.trim().length > 0
-  if (action.type === "backup") return action.name.trim().length > 0
   return true
 }
 
@@ -2773,16 +2779,24 @@ function cronPreset(cron: string) {
 
 function cronDescription(cron: string) {
   try {
+    if (!validateScheduleCron(cron, "UTC")) return null
     const normalizedCron = normalizeScheduleCron(cron)
-    const description = cronstrue.toString(normalizedCron, {
+    const [minute = "", hour = "", dayOfMonth, month, dayOfWeek] =
+      normalizedCron.split(/\s+/u)
+    if (
+      /^\d+$/u.test(minute) &&
+      /^\d+$/u.test(hour) &&
+      dayOfMonth === "*" &&
+      month === "*" &&
+      dayOfWeek === "*"
+    ) {
+      const hourNumber = Number(hour)
+      const displayHour = hourNumber % 12 || 12
+      return `Every day at ${displayHour}:${minute.padStart(2, "0")} ${hourNumber >= 12 ? "PM" : "AM"}`
+    }
+    return cronstrue.toString(normalizedCron, {
       throwExceptionOnParseError: true,
     })
-    const [, , dayOfMonth, month, dayOfWeek] = normalizedCron.split(/\s+/u)
-    const runsEveryDay =
-      dayOfMonth === "*" && month === "*" && dayOfWeek === "*"
-    return runsEveryDay && description.startsWith("At ")
-      ? `Every day at ${description.slice(3)}`
-      : description
   } catch {
     return null
   }

@@ -41,7 +41,12 @@ export const scheduleBackupActionSchema = z
       .default({ kind: "local" }),
     id: scheduleActionIdSchema,
     mode: backupModeSchema.default("full"),
-    name: z.string().trim().min(1).max(120).default("Scheduled backup"),
+    name: z
+      .string()
+      .trim()
+      .max(120)
+      .transform((name) => name || "Scheduled backup")
+      .default("Scheduled backup"),
     type: z.literal("backup"),
   })
   .strict()

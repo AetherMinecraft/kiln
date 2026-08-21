@@ -12,6 +12,7 @@ import type {
 } from "@workspace/contracts"
 import {
   nextScheduleOccurrence,
+  scheduleActionSchema,
   scheduleActionSupportsTarget,
 } from "@workspace/contracts"
 
@@ -140,6 +141,8 @@ describe("Relay schedule persistence", () => {
     vi.setSystemTime(now)
     const schedules = await manager()
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+    // Keep the persisted zone different from the host Relay zone so the
+    // negative assertion cannot collapse into the Relay-timezone assertion.
     const storedTimezone =
       timezone === "Pacific/Honolulu" ? "UTC" : "Pacific/Honolulu"
 
@@ -307,6 +310,20 @@ describe("Relay schedule persistence", () => {
         "Scheduled backup timed out"
       )
     })
+  })
+})
+
+describe("schedule action schema", () => {
+  it("normalizes a blank legacy backup name", () => {
+    expect(
+      scheduleActionSchema.parse({
+        destination: { kind: "local" },
+        id: "6cc00681-a2cd-40c7-a036-7c9bd09b269b",
+        mode: "full",
+        name: "   ",
+        type: "backup",
+      })
+    ).toMatchObject({ name: "Scheduled backup" })
   })
 })
 
