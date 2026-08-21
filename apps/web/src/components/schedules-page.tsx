@@ -19,6 +19,7 @@ import {
   Copy,
   Database,
   EllipsisVertical,
+  GripVertical,
   HardDriveDownload,
   History,
   LoaderCircle,
@@ -1519,6 +1520,12 @@ function ScheduleEditorDialog({
     },
     []
   )
+  const reorderEditorAction = React.useCallback(
+    (actionId: string, targetId: string) => {
+      setActions((current) => reorderAction(current, actionId, targetId))
+    },
+    []
+  )
   const removeAction = React.useCallback((actionId: string) => {
     setActions((current) => current.filter((action) => action.id !== actionId))
   }, [])
@@ -1565,6 +1572,7 @@ function ScheduleEditorDialog({
             onActionChange={updateAction}
             onActionMove={moveEditorAction}
             onActionRemove={removeAction}
+            onActionReorder={reorderEditorAction}
             onCronChange={setCron}
             onNameChange={setName}
             onTargetToggle={toggleTarget}
@@ -1622,6 +1630,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   onActionChange,
   onActionMove,
   onActionRemove,
+  onActionReorder,
   onCronChange,
   onNameChange,
   onTargetToggle,
@@ -1640,6 +1649,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   onActionChange: (action: ScheduleActionDraft) => void
   onActionMove: (actionId: string, direction: -1 | 1) => void
   onActionRemove: (actionId: string) => void
+  onActionReorder: (actionId: string, targetId: string) => void
   onCronChange: React.Dispatch<React.SetStateAction<string>>
   onNameChange: React.Dispatch<React.SetStateAction<string>>
   onTargetToggle: (key: string, checked: boolean) => void
@@ -1695,6 +1705,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
           onChange={onActionChange}
           onMove={onActionMove}
           onRemove={onActionRemove}
+          onReorder={onActionReorder}
         />
         <ScheduleActionValidationMessage
           actions={actions}
@@ -1913,6 +1924,7 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
   onChange,
   onMove,
   onRemove,
+  onReorder,
 }: {
   actions: ReadonlyArray<ScheduleActionDraft>
   hideBackupName?: boolean
@@ -1923,7 +1935,27 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
   onChange: (action: ScheduleActionDraft) => void
   onMove: (actionId: string, direction: -1 | 1) => void
   onRemove: (actionId: string) => void
+  onReorder: (actionId: string, targetId: string) => void
 }) {
+  const [draggedActionId, setDraggedActionId] = React.useState<string | null>(
+    null
+  )
+  const draggedActionIdRef = React.useRef<string | null>(null)
+  const startDragging = React.useCallback((actionId: string) => {
+    draggedActionIdRef.current = actionId
+    setDraggedActionId(actionId)
+  }, [])
+  const stopDragging = React.useCallback(() => {
+    draggedActionIdRef.current = null
+    setDraggedActionId(null)
+  }, [])
+  const dragOverAction = React.useCallback(
+    (targetId: string) => {
+      const actionId = draggedActionIdRef.current
+      if (actionId && actionId !== targetId) onReorder(actionId, targetId)
+    },
+    [onReorder]
+  )
   return (
     <div>
       {hideHeader ? null : <h3 className="text-sm font-semibold">Actions</h3>}
@@ -1937,6 +1969,7 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
             <ActionEditor
               key={action.id}
               action={action}
+              dragging={draggedActionId === action.id}
               hideBackupName={hideBackupName}
               index={index}
               permissionKey={permissionKey}
@@ -1944,6 +1977,9 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
               storage={storage}
               total={actions.length}
               onChange={onChange}
+              onDragEnd={stopDragging}
+              onDragOver={dragOverAction}
+              onDragStart={startDragging}
               onMove={onMove}
               onRemove={onRemove}
             />
@@ -2005,6 +2041,7 @@ function Field({
 
 const ActionEditor = React.memo(function ActionEditor({
   action,
+  dragging,
   hideBackupName = false,
   index,
   permissionKey,
@@ -2012,10 +2049,14 @@ const ActionEditor = React.memo(function ActionEditor({
   storage,
   total,
   onChange,
+  onDragEnd,
+  onDragOver,
+  onDragStart,
   onMove,
   onRemove,
 }: {
   action: ScheduleActionDraft
+  dragging: boolean
   hideBackupName?: boolean
   index: number
   permissionKey: "canCreate" | "canUpdate"
@@ -2023,6 +2064,9 @@ const ActionEditor = React.memo(function ActionEditor({
   storage: ReadonlyArray<BackupStorage>
   total: number
   onChange: (action: ScheduleActionDraft) => void
+  onDragEnd: () => void
+  onDragOver: (actionId: string) => void
+  onDragStart: (actionId: string) => void
   onMove: (actionId: string, direction: -1 | 1) => void
   onRemove: (actionId: string) => void
 }) {
@@ -2043,8 +2087,44 @@ const ActionEditor = React.memo(function ActionEditor({
         )
 
   return (
-    <div className="rounded-lg border bg-background/45 p-2.5">
+    <div
+      className={`rounded-lg border bg-background/45 p-2.5 transition-[border-color,opacity] ${dragging ? "border-primary/40 opacity-55" : ""}`}
+      onDragOver={(event) => {
+        event.preventDefault()
+        onDragOver(action.id)
+      }}
+      onDrop={(event) => event.preventDefault()}
+    >
       <div className="flex items-start gap-3">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
+              className="grid size-7 shrink-0 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing"
+              draggable
+              type="button"
+              onDragEnd={onDragEnd}
+              onDragStart={(event) => {
+                event.dataTransfer.effectAllowed = "move"
+                event.dataTransfer.setData("text/plain", action.id)
+                onDragStart(action.id)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowUp" && index > 0) {
+                  event.preventDefault()
+                  onMove(action.id, -1)
+                }
+                if (event.key === "ArrowDown" && index < total - 1) {
+                  event.preventDefault()
+                  onMove(action.id, 1)
+                }
+              }}
+            >
+              <GripVertical className="size-4" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="left">Drag to reorder</TooltipContent>
+        </Tooltip>
         <div className="min-w-0 flex-1">
           <div className="mb-2 flex items-center gap-2">
             {action.type === null ? null : (
@@ -2616,6 +2696,23 @@ function moveAction(
   if (!current || !other) return actions
   next[index] = other
   next[nextIndex] = current
+  return next
+}
+
+function reorderAction(
+  actions: Array<ScheduleActionDraft>,
+  actionId: string,
+  targetId: string
+) {
+  const sourceIndex = actions.findIndex((action) => action.id === actionId)
+  const targetIndex = actions.findIndex((action) => action.id === targetId)
+  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) {
+    return actions
+  }
+  const next = [...actions]
+  const [action] = next.splice(sourceIndex, 1)
+  if (!action) return actions
+  next.splice(targetIndex, 0, action)
   return next
 }
 
