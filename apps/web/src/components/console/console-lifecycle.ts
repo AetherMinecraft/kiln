@@ -65,6 +65,25 @@ export function mergeConsoleHistory(
   return [...current, ...history].sort(compareConsoleLineOrder)
 }
 
+export function retimestampConsoleStateLine(
+  lines: ReadonlyArray<RelayConsoleLine>,
+  state: RelayObservedState,
+  timestamp: string
+): Array<RelayConsoleLine> | null {
+  const stateLines = lines.filter((line) => isConsoleStateLineFor(line, state))
+  if (
+    stateLines.length === 0 ||
+    (stateLines.length === 1 && stateLines[0]?.timestamp === timestamp)
+  ) {
+    return null
+  }
+
+  return mergeConsoleHistory(
+    lines.filter((line) => !isConsoleStateLineFor(line, state)),
+    [consoleStateLine(state, timestamp)]
+  )
+}
+
 export function consoleStateLine(
   state: RelayObservedState,
   timestamp: string | null
@@ -96,6 +115,13 @@ export function consoleStateLine(
 
 export function isConsoleStateLine(line: Pick<RelayConsoleLine, "id">) {
   return line.id.startsWith("kiln-state:")
+}
+
+export function isConsoleStateLineFor(
+  line: Pick<RelayConsoleLine, "id">,
+  state: RelayObservedState
+) {
+  return isConsoleStateLine(line) && line.id.endsWith(`:${state}`)
 }
 
 export function isConsoleRecoveryLine(line: Pick<RelayConsoleLine, "id">) {
