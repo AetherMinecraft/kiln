@@ -817,51 +817,82 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
             <ul className="space-y-0.5">
               {catalogs.map((catalog) => (
                 <li key={catalog.id}>
-                  <button
-                    type="button"
-                    disabled={disabled}
-                    onClick={() => setSelectedId(catalog.id)}
+                  <div
                     className={cn(
-                      "flex w-full items-center gap-3 rounded-lg px-2.5 py-2.5 text-left transition-colors duration-150",
+                      "flex w-full items-center gap-2 rounded-lg px-2.5 py-2.5 transition-colors duration-150",
                       selectedId === catalog.id
                         ? "bg-primary/14 ring-1 ring-primary/35"
                         : "hover:bg-accent/55",
                       disabled && "pointer-events-none opacity-50"
                     )}
                   >
-                    <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-primary">
-                      {catalog.visibility === "community" ? (
-                        <Globe2 className="size-4" />
-                      ) : catalog.isDefault ? (
-                        <Library className="size-4" />
-                      ) : (
-                        <LockKeyhole className="size-4" />
-                      )}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="flex min-w-0 items-center gap-1.5 text-sm font-semibold tracking-tight">
-                        <span className="truncate">
-                          {catalogDisplayName(catalog)}
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => setSelectedId(catalog.id)}
+                      className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                    >
+                      <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-primary">
+                        {catalog.visibility === "community" ? (
+                          <Globe2 className="size-4" />
+                        ) : catalog.isDefault ? (
+                          <Library className="size-4" />
+                        ) : (
+                          <LockKeyhole className="size-4" />
+                        )}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="flex min-w-0 items-center gap-1.5 text-sm font-semibold tracking-tight">
+                          <span className="truncate">
+                            {catalogDisplayName(catalog)}
+                          </span>
+                          <CatalogTrustBadge catalog={catalog} />
                         </span>
-                        <CatalogTrustBadge catalog={catalog} />
+                        {catalog.author ||
+                        (catalogsQuery.data?.isPlatformAdmin &&
+                          catalog.ownerUserId) ? (
+                          <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
+                            {catalog.author ? `By ${catalog.author}` : ""}
+                            {catalogsQuery.data?.isPlatformAdmin &&
+                            catalog.ownerUserId
+                              ? `${catalog.author ? " · " : ""}Added by ${catalog.ownerEmail ?? catalog.ownerName ?? catalog.ownerUserId}`
+                              : ""}
+                          </span>
+                        ) : null}
                       </span>
-                      <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
-                        {catalog.author ? `By ${catalog.author} · ` : ""}
-                        {catalog.isDefault
-                          ? ""
-                          : `${catalogVisibilityLabel(catalog.visibility)} · `}
-                        {catalog.brickCount} Brick
-                        {catalog.brickCount === 1 ? "" : "s"}
-                        {catalogsQuery.data?.isPlatformAdmin &&
-                        catalog.ownerUserId
-                          ? ` · ${catalog.ownerEmail ?? catalog.ownerName ?? catalog.ownerUserId}`
-                          : ""}
-                      </span>
-                    </span>
+                    </button>
                     {catalog.statusError ? (
                       <Badge variant="destructive">Unavailable</Badge>
                     ) : null}
-                  </button>
+                    {catalog.docs || catalog.support ? (
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        {catalog.docs ? (
+                          <a
+                            href={catalog.docs}
+                            target="_blank"
+                            rel="noreferrer"
+                            aria-label={`Open ${catalogDisplayName(catalog)} documentation`}
+                            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border/70 bg-muted/25 px-2 text-[0.6875rem] font-medium transition-colors hover:border-primary/35 hover:bg-primary/8 hover:text-primary"
+                          >
+                            <BookOpen className="size-3" />
+                            Docs
+                          </a>
+                        ) : null}
+                        {catalog.support ? (
+                          <a
+                            href={catalog.support}
+                            target="_blank"
+                            rel="noreferrer"
+                            aria-label={`Open ${catalogDisplayName(catalog)} support`}
+                            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border/70 bg-muted/25 px-2 text-[0.6875rem] font-medium transition-colors hover:border-primary/35 hover:bg-primary/8 hover:text-primary"
+                          >
+                            <LifeBuoy className="size-3" />
+                            Support
+                          </a>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
                 </li>
               ))}
             </ul>
@@ -895,41 +926,8 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                     </h3>
                     <CatalogTrustBadge catalog={selected} />
                   </div>
-                  {selected.author ? (
-                    <p className="mt-1 truncate text-xs text-muted-foreground">
-                      by {selected.author}
-                    </p>
-                  ) : null}
                 </div>
               </div>
-              {selected.docs || selected.support ? (
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {selected.docs ? (
-                    <a
-                      href={selected.docs}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border/70 bg-muted/25 px-2 text-[0.6875rem] font-medium transition-colors hover:border-primary/35 hover:bg-primary/8 hover:text-primary"
-                    >
-                      <BookOpen className="size-3" />
-                      Docs
-                      <ExternalLink className="size-2.5 text-muted-foreground" />
-                    </a>
-                  ) : null}
-                  {selected.support ? (
-                    <a
-                      href={selected.support}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border/70 bg-muted/25 px-2 text-[0.6875rem] font-medium transition-colors hover:border-primary/35 hover:bg-primary/8 hover:text-primary"
-                    >
-                      <LifeBuoy className="size-3" />
-                      Support
-                      <ExternalLink className="size-2.5 text-muted-foreground" />
-                    </a>
-                  ) : null}
-                </div>
-              ) : null}
               {selected.revisionUrl && selected.revisionSha ? (
                 <a
                   href={selected.revisionUrl}
