@@ -225,9 +225,17 @@ async function pinGithubCatalog(
       `https://raw.githubusercontent.com/${slug}/${sha}/${path.replace(/^\/+/, "")}`
     ),
     revisionSha: sha,
-    revisionUrl: `${repository}/commit/${sha}`,
+    revisionUrl: githubCatalogRevisionUrl(repository, sha, path),
     source: repository,
   }
+}
+
+export function githubCatalogRevisionUrl(
+  repository: string,
+  sha: string,
+  path: string
+): string {
+  return `${resolveKilnGitRepository(repository)}/blob/${sha}/${path.replace(/^\/+/, "")}`
 }
 
 function parseYaml(text: string, source: URL): unknown {

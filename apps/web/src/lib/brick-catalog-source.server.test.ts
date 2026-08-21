@@ -5,7 +5,10 @@ import { pathToFileURL } from "node:url"
 
 import { afterEach, describe, expect, it } from "vite-plus/test"
 
-import { loadBrickCatalogSource } from "./brick-catalog-source.server"
+import {
+  githubCatalogRevisionUrl,
+  loadBrickCatalogSource,
+} from "./brick-catalog-source.server"
 
 const directories: Array<string> = []
 
@@ -66,6 +69,18 @@ describe("Hearth Brick catalogs", () => {
     await expect(
       loadBrickCatalogSource("https://[::ffff:7f00:1]/catalog.yml")
     ).rejects.toThrow("private or reserved address")
+  })
+
+  it("links GitHub snapshots to the catalog file at the pinned commit", () => {
+    expect(
+      githubCatalogRevisionUrl(
+        "https://github.com/kiln-site/kiln",
+        "4d64d6d2b24162440655b822bb907f76fdda73c3",
+        "apps/bricks/catalog.yml"
+      )
+    ).toBe(
+      "https://github.com/kiln-site/kiln/blob/4d64d6d2b24162440655b822bb907f76fdda73c3/apps/bricks/catalog.yml"
+    )
   })
 })
 
