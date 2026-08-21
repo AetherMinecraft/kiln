@@ -244,6 +244,9 @@ importers:
       codemirror:
         specifier: ^6.0.2
         version: 6.0.2
+      cronstrue:
+        specifier: ^3.24.0
+        version: 3.24.0
       d3-scale:
         specifier: ^4.0.2
         version: 4.0.2
@@ -4239,6 +4242,10 @@ packages:
   cookie@0.7.2:
     resolution: {integrity: sha512-yki5XnKuf750l50uGTllt6kKILY4nQ1eNIQatoXEByZ5dWgnKqbnqmTrBE5B4N7lrMJKQ2ytWMiTO2o0v6Ew/w==}
     engines: {node: '>= 0.6'}
+
+  cronstrue@3.24.0:
+    resolution: {integrity: sha512-t/Ji3Ur2c/pzhIAWNwC0ftl3JAE4dLfCjAdZoTZXmPDZwcispnS1PaMcMS4OmIIXyIVouAz+yw+mfQiE3hz5OQ==}
+    hasBin: true
 
   cors@2.8.6:
     resolution: {integrity: sha512-tJtZBBHA6vjIAaF6EnIaq6laBBP9aq/Y3ouVJjEfoHbRBcHBAHYcMh/w8LDrk2PvIMMq8gmopa5D4V8RmbrxGw==}
@@ -10209,6 +10216,8 @@ snapshots:
   cron-parser@5.10.0:
     dependencies:
       luxon: 3.7.2
+
+  cronstrue@3.24.0: {}
 
   cross-spawn@7.0.6:
     dependencies:

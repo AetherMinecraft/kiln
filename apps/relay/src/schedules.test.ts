@@ -10,13 +10,18 @@ import type {
   RelayBackupTask,
   RelayScheduleProjection,
 } from "@workspace/contracts"
-import { scheduleActionSupportsTarget } from "@workspace/contracts"
+import {
+  nextScheduleOccurrence,
+  scheduleActionSchema,
+  scheduleActionSupportsTarget,
+} from "@workspace/contracts"
 
 import { ScheduleManager } from "./schedules.js"
 
 const directories: Array<string> = []
 
 afterEach(async () => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
   await Promise.all(
     directories
@@ -128,6 +133,31 @@ describe("Relay schedule persistence", () => {
     expect(applied.acknowledgedRevision).toBe(1)
     expect(applied.nextRunAt).toBeTypeOf("number")
     expect(schedules.overview([projection.id]).deployments).toEqual([applied])
+  })
+
+  it("evaluates cron in the Relay timezone", async () => {
+    const now = new Date("2026-01-15T12:00:00.000Z")
+    vi.useFakeTimers()
+    vi.setSystemTime(now)
+    const schedules = await manager()
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+    // Keep the persisted zone different from the host Relay zone so the
+    // negative assertion cannot collapse into the Relay-timezone assertion.
+    const storedTimezone =
+      timezone === "Pacific/Honolulu" ? "UTC" : "Pacific/Honolulu"
+
+    const applied = await schedules.apply({
+      ...projection,
+      cron: "0 0 * * *",
+      timezone: storedTimezone,
+    })
+
+    expect(applied.nextRunAt).toBe(
+      nextScheduleOccurrence("0 0 * * *", timezone, now).getTime()
+    )
+    expect(applied.nextRunAt).not.toBe(
+      nextScheduleOccurrence("0 0 * * *", storedTimezone, now).getTime()
+    )
   })
 
   it("keeps a tombstone from being replaced by an older revision", async () => {
@@ -280,6 +310,20 @@ describe("Relay schedule persistence", () => {
         "Scheduled backup timed out"
       )
     })
+  })
+})
+
+describe("schedule action schema", () => {
+  it("normalizes a blank legacy backup name", () => {
+    expect(
+      scheduleActionSchema.parse({
+        destination: { kind: "local" },
+        id: "6cc00681-a2cd-40c7-a036-7c9bd09b269b",
+        mode: "full",
+        name: "   ",
+        type: "backup",
+      })
+    ).toMatchObject({ name: "Scheduled backup" })
   })
 })
 
