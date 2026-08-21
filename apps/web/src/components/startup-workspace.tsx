@@ -12,7 +12,6 @@ import {
 } from "lucide-react"
 import type {
   Brick,
-  BrickRecipe,
   BrickVariableValue,
   RelayInstanceLimits,
 } from "@workspace/contracts"
@@ -77,13 +76,11 @@ type BrickView = {
   id: string
   memoryTemplate: string
   name: string
-  recipeDefinition?: BrickRecipe
   source: string
   variables: Brick["variables"]
 }
 
 function brickViewFromBrick(brick: Brick, source = brick.source): BrickView {
-  const { source: _source, ...recipeDefinition } = brick
   return {
     description: brick.metadata.description,
     environment: brick.runtime.environment,
@@ -91,7 +88,6 @@ function brickViewFromBrick(brick: Brick, source = brick.source): BrickView {
     id: brick.metadata.id,
     memoryTemplate: brick.runtime.resources.memory,
     name: brick.metadata.name,
-    recipeDefinition,
     source,
     variables: brick.variables,
   }
@@ -319,7 +315,6 @@ const StartupForm = React.memo(function StartupForm({
               diskLimitBytes,
               instanceId,
               recipe: view.source,
-              recipeDefinition: view.recipeDefinition,
               relayId,
               start: true,
               variables,
@@ -442,6 +437,7 @@ const StartupForm = React.memo(function StartupForm({
             onOpenChange={setSwapOpen}
             relayId={relayId}
             bricks={catalogQuery.data?.bricks ?? emptyBricks}
+            canAddCustomBrick={catalogQuery.data?.canAddCustomBrick ?? false}
             customBricks={catalogQuery.data?.customBricks ?? emptyBricks}
             loading={catalogQuery.isPending}
             error={catalogQuery.error?.message ?? null}
@@ -781,6 +777,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
   onOpenChange,
   relayId,
   bricks,
+  canAddCustomBrick,
   customBricks,
   loading,
   error,
@@ -791,6 +788,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
   onOpenChange: (open: boolean) => void
   relayId: string
   bricks: Array<Brick>
+  canAddCustomBrick: boolean
   customBricks: Array<Brick>
   loading: boolean
   error: string | null
@@ -804,6 +802,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
         onOpenChange={onOpenChange}
         relayId={relayId}
         bricks={[]}
+        canAddCustomBrick={canAddCustomBrick}
         customBricks={customBricks}
         initial={null}
         title="Swap Brick"
@@ -821,6 +820,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
         onOpenChange={onOpenChange}
         relayId={relayId}
         bricks={[]}
+        canAddCustomBrick={canAddCustomBrick}
         customBricks={customBricks}
         initial={null}
         title="Swap Brick"
@@ -839,6 +839,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
       onOpenChange={onOpenChange}
       relayId={relayId}
       bricks={bricks}
+      canAddCustomBrick={canAddCustomBrick}
       customBricks={customBricks}
       initial={initial}
       title="Swap Brick"

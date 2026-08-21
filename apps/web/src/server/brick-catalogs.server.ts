@@ -6,7 +6,7 @@ import {
   setBrickCatalogVisibilityEffect,
 } from "@/effect/brick-catalogs"
 import type { BrickCatalogRecord } from "@/effect/brick-catalogs"
-import { isPlatformAdmin } from "@/lib/access-control"
+import { hasPlatformPermission, isPlatformAdmin } from "@/lib/access-control"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { loadBrickCatalogSource } from "@/lib/brick-catalog-source.server"
 import { kilnBrickCatalogUrl } from "@/lib/environment"
@@ -54,6 +54,7 @@ export async function listBrickCatalogsHandler() {
       defaultSummary(defaultResult.catalog, defaultResult.error),
       ...records.map((catalog) => catalogSummary(catalog, platformAdmin)),
     ],
+    canAddCatalog: hasPlatformPermission(user, "platform.bricks.add-catalog"),
     isPlatformAdmin: platformAdmin,
     userId: user.id,
   }
@@ -74,12 +75,15 @@ export async function getBrickCatalogDetailsHandler(data: {
   requireCatalogView(user, catalog)
   return {
     ...catalogSummary(catalog, isPlatformAdmin(user)),
-    bricks: catalog.snapshot.bricks,
+    bricks: catalog.snapshot?.bricks ?? [],
   }
 }
 
 export async function addBrickCatalogHandler(data: { source: string }) {
   const user = await requireAuthenticatedUser()
+  if (!hasPlatformPermission(user, "platform.bricks.add-catalog")) {
+    throw new Error("Adding catalogs requires Bring your own Relay access")
+  }
   const loaded = await loadBrickCatalogSource(data.source)
   const catalogId = await runAppEffect(
     "brickCatalogs.save",
@@ -119,7 +123,10 @@ export async function setBrickCatalogCommunityHandler(data: {
   if (!isPlatformAdmin(user)) {
     throw new Error("Only platform admins can publish catalogs")
   }
-  await requiredCatalog(data.catalogId)
+  const catalog = await requiredCatalog(data.catalogId)
+  if (data.community && !catalog.snapshot) {
+    throw new Error("Invalid catalog snapshots cannot be published")
+  }
   const updated = await runAppEffect(
     "brickCatalogs.setVisibility",
     setBrickCatalogVisibilityEffect({
@@ -145,7 +152,7 @@ export async function visibleBrickCatalogs(user: AuthenticatedUser) {
   ])
   return [
     ...(defaultCatalog ? [defaultCatalog.snapshot] : []),
-    ...records.map((record) => record.snapshot),
+    ...records.flatMap((record) => (record.snapshot ? [record.snapshot] : [])),
   ]
 }
 
@@ -176,12 +183,12 @@ function catalogSummary(
   includeOwnerDetails: boolean
 ): BrickCatalogSummary {
   return {
-    author: catalog.snapshot.author ?? null,
-    brickCount: catalog.snapshot.bricks.length,
-    docs: catalog.snapshot.docs ?? null,
+    author: catalog.snapshot?.author ?? null,
+    brickCount: catalog.snapshot?.bricks.length ?? 0,
+    docs: catalog.snapshot?.docs ?? null,
     id: catalog.id,
     isDefault: false,
-    name: catalog.snapshot.name ?? null,
+    name: catalog.snapshot?.name ?? null,
     ownerEmail: includeOwnerDetails ? catalog.ownerEmail : null,
     ownerName: includeOwnerDetails ? catalog.ownerName : null,
     ownerUserId: catalog.ownerUserId,
@@ -190,8 +197,8 @@ function catalogSummary(
     revisionUrl: catalog.revisionUrl,
     snapshotSha256: catalog.snapshotSha256,
     source: catalog.source,
-    statusError: null,
-    support: catalog.snapshot.support ?? null,
+    statusError: catalog.statusError,
+    support: catalog.snapshot?.support ?? null,
     updatedAt: catalog.updatedAt,
     visibility: catalog.visibility,
   }

@@ -15,6 +15,7 @@ import {
 import { z } from "zod"
 
 import {
+  hasPlatformPermission,
   isPlatformAdmin,
   isRelayCreator,
   requireRelayPermission,
@@ -45,10 +46,13 @@ const brickVersionCatalogSchema = z.object({
 })
 
 const relayInputSchema = z.object({ relayId: relayIdSchema })
-const createInputSchema = relayCreateInstanceSchema.extend({
-  ...relayInputSchema.shape,
-  name: relayInstanceNameSchema,
-})
+export const hearthCreateInstanceInputSchema = relayCreateInstanceSchema
+  .omit({ recipeDefinition: true })
+  .extend({
+    ...relayInputSchema.shape,
+    name: relayInstanceNameSchema,
+  })
+  .strict()
 const networkingInputSchema = relayNetworkingSchema.extend(
   relayInputSchema.shape
 )
@@ -56,17 +60,30 @@ const recipeInputSchema = relayInputSchema.extend({ source: brickSourceSchema })
 const instanceInputSchema = relayInputSchema.extend({
   instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
 })
-const startupInputSchema = relayUpdateInstanceStartupSchema.extend(
-  instanceInputSchema.shape
-)
+export const hearthUpdateInstanceStartupInputSchema =
+  relayUpdateInstanceStartupSchema
+    .extend(instanceInputSchema.shape)
+    .strict()
+    .superRefine((value, context) => {
+      if (value.recipeDefinition !== undefined) {
+        context.addIssue({
+          code: "custom",
+          message: "Brick definitions are resolved by Hearth",
+          path: ["recipeDefinition"],
+        })
+      }
+    })
 
 export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
   async () => {
     const user = await requireAuthenticatedUser()
-    const customBricksPromise = runAppEffect(
-      "customBricks.list",
-      listCustomBricksEffect(user.id)
+    const canAddCustomBrick = hasPlatformPermission(
+      user,
+      "platform.bricks.add-custom"
     )
+    const customBricksPromise = canAddCustomBrick
+      ? runAppEffect("customBricks.list", listCustomBricksEffect(user.id))
+      : Promise.resolve([])
     const catalogsPromise = visibleBrickCatalogs(user)
     const candidates = (await listPersistedRelays()).filter(
       (relay) => relay.enabled && canProvisionOnRelay(user, relay)
@@ -94,6 +111,7 @@ export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
     return {
       relays,
       bricks,
+      canAddCustomBrick,
       customBricks: await customBricksPromise,
     }
   }
@@ -110,12 +128,19 @@ export const getBrickVersions = createServerFn({ method: "GET" })
   })
 
 export const createBrickInstance = createServerFn({ method: "POST" })
-  .validator(createInputSchema)
+  .validator(hearthCreateInstanceInputSchema)
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
     const relay = await requiredRelay(data.relayId)
     requireRelayProvisionAccess(user, relay)
-    const input = relayCreateInstanceSchema.parse(data)
+    const recipeDefinition = await requiredVisibleRecipeDefinition(
+      user,
+      data.recipe
+    )
+    const input = relayCreateInstanceSchema.parse({
+      ...data,
+      recipeDefinition,
+    })
     const instance = relayInstanceSchema.parse(
       await requestRelay(
         relay,
@@ -221,7 +246,7 @@ export const getInstanceStartup = createServerFn({ method: "GET" })
   })
 
 export const updateInstanceStartup = createServerFn({ method: "POST" })
-  .validator(startupInputSchema)
+  .validator(hearthUpdateInstanceStartupInputSchema)
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
     const relay = await requiredRelay(data.relayId)
@@ -231,7 +256,20 @@ export const updateInstanceStartup = createServerFn({ method: "POST" })
       permission: "instance.settings",
       instanceId: data.instanceId,
     })
-    const input = relayUpdateInstanceStartupSchema.parse(data)
+    const existing = await requiredRelayInstance(relay, data.instanceId)
+    const submittedRecipe = data.recipe
+    const recipeDefinition = isBrickSourceChange(
+      existing.brickSource,
+      submittedRecipe
+    )
+      ? await requiredVisibleRecipeDefinition(user, submittedRecipe)
+      : null
+    const { recipeDefinition: _untrustedRecipeDefinition, ...trustedData } =
+      data
+    const input = relayUpdateInstanceStartupSchema.parse({
+      ...trustedData,
+      ...(recipeDefinition ? { recipeDefinition } : {}),
+    })
     const instance = relayInstanceSchema.parse(
       await requestRelay(
         relay,
@@ -304,6 +342,7 @@ export const loadBrickRecipe = createServerFn({ method: "POST" })
   .validator(recipeInputSchema)
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
+    requireBrickSourcePermission(user, "platform.bricks.add-custom")
     const relay = await requiredRelay(data.relayId)
     requireRelayProvisionAccess(user, relay)
     return brickSchema.parse(
@@ -318,6 +357,7 @@ export const saveCustomBrick = createServerFn({ method: "POST" })
   .validator(recipeInputSchema)
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
+    requireBrickSourcePermission(user, "platform.bricks.add-custom")
     const relay = await requiredRelay(data.relayId)
     requireRelayProvisionAccess(user, relay)
 
@@ -384,6 +424,70 @@ function requireRelayProvisionAccess(
   if (!canProvisionOnRelay(user, relay)) {
     throw new Error("You can only provision on Relays you created")
   }
+}
+
+function requireBrickSourcePermission(
+  user: AuthenticatedUser,
+  permission: "platform.bricks.add-custom"
+): void {
+  if (!hasPlatformPermission(user, permission)) {
+    throw new Error("This action requires Bring your own Relay access")
+  }
+}
+
+export function isBrickSourceChange(
+  existingSource: string | null | undefined,
+  submittedSource: string | undefined
+): submittedSource is string {
+  return submittedSource !== undefined && submittedSource !== existingSource
+}
+
+async function requiredVisibleRecipeDefinition(
+  user: AuthenticatedUser,
+  source: string
+) {
+  const definition = await visibleRecipeDefinition(user, source)
+  if (!definition) {
+    throw new Error("This Brick is not available in your catalogs")
+  }
+  return definition
+}
+
+async function visibleRecipeDefinition(
+  user: AuthenticatedUser,
+  source: string
+) {
+  const canUseCustomBricks = hasPlatformPermission(
+    user,
+    "platform.bricks.add-custom"
+  )
+  const [catalogs, customBricks] = await Promise.all([
+    visibleBrickCatalogs(user),
+    canUseCustomBricks
+      ? runAppEffect("customBricks.list", listCustomBricksEffect(user.id))
+      : Promise.resolve([]),
+  ])
+  const brick = [
+    ...catalogs.flatMap((catalog) => catalog.bricks),
+    ...customBricks,
+  ].find((candidate) => candidate.source === source)
+  if (!brick) return null
+  const { source: _source, ...definition } = brick
+  return definition
+}
+
+async function requiredRelayInstance(
+  relay: PersistedRelay,
+  instanceId: string
+) {
+  const snapshot = relaySnapshotSchema.parse(
+    await requestRelay(relay, "/v1/snapshot")
+  )
+  const instance = snapshot.instances.find(
+    (candidate) => candidate.id === instanceId
+  )
+  if (!instance) throw new Error("Instance not found")
+  return instance
 }
 
 async function requestRelay(

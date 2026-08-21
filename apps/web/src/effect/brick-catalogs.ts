@@ -35,9 +35,10 @@ export interface BrickCatalogRecord {
   publishedBy: string | null
   revisionSha: string | null
   revisionUrl: string | null
-  snapshot: RelayCatalog
+  snapshot: RelayCatalog | null
   snapshotSha256: string
   source: string
+  statusError: string | null
   updatedAt: string
   visibility: "community" | "personal"
 }
@@ -59,10 +60,12 @@ export const listBrickCatalogsEffect = Effect.fn("brickCatalogs.list")(
            ON auth_user.id = catalog.owner_user_id
         ${includeAll ? "" : "WHERE catalog.visibility = 'community' OR catalog.owner_user_id = ?"}
         ORDER BY catalog.visibility = 'community' DESC,
-                 catalog.updated_at DESC`,
+                 catalog.published_at DESC,
+                 catalog.updated_at DESC,
+                 catalog.id ASC`,
       includeAll ? [] : [userId]
     )
-    return rows.flatMap(decodeCatalogRow)
+    return yield* decodeCatalogRows(rows)
   }
 )
 
@@ -86,7 +89,7 @@ export const getBrickCatalogEffect = Effect.fn("brickCatalogs.get")(function* (
         LIMIT 1`,
     [catalogId]
   )
-  return rows.flatMap(decodeCatalogRow)[0] ?? null
+  return (yield* decodeCatalogRows(rows))[0] ?? null
 })
 
 export const saveBrickCatalogEffect = Effect.fn("brickCatalogs.save")(
@@ -103,6 +106,16 @@ export const saveBrickCatalogEffect = Effect.fn("brickCatalogs.save")(
     const id = randomUUID()
     return yield* database.transaction("brickCatalogs.save", (transaction) =>
       Effect.gen(function* () {
+        const owners = yield* transaction.queryRows<
+          RowDataPacket & { id: string }
+        >(
+          `SELECT id FROM ${databaseTable("user")}
+            WHERE id = ? LIMIT 1 FOR UPDATE`,
+          [input.ownerUserId]
+        )
+        if (!owners[0]) {
+          return yield* Effect.fail(new Error("Catalog owner not found"))
+        }
         const existing = yield* transaction.queryRows<CatalogRow>(
           `SELECT catalog.id, catalog.owner_user_id, catalog.source,
                   catalog.snapshot, catalog.snapshot_sha256,
@@ -115,7 +128,10 @@ export const saveBrickCatalogEffect = Effect.fn("brickCatalogs.save")(
             LIMIT 1 FOR UPDATE`,
           [input.ownerUserId, sourceHash]
         )
-        const current = existing.flatMap(decodeCatalogRow)[0]
+        const decodedCurrent = existing[0]
+          ? decodeCatalogRow(existing[0])
+          : null
+        const current = decodedCurrent?.record
         if (current?.visibility === "community") {
           return yield* Effect.fail(
             new Error("Unpublish this catalog before replacing its snapshot")
@@ -200,27 +216,55 @@ export const deleteBrickCatalogEffect = Effect.fn("brickCatalogs.delete")(
   }
 )
 
-function decodeCatalogRow(row: CatalogRow): Array<BrickCatalogRecord> {
+function decodeCatalogRows(rows: ReadonlyArray<CatalogRow>) {
+  return Effect.gen(function* () {
+    const records: Array<BrickCatalogRecord> = []
+    for (const row of rows) {
+      const decoded = decodeCatalogRow(row)
+      if (decoded.success) {
+        records.push(decoded.record)
+      } else {
+        yield* Effect.logWarning(
+          "Loaded invalid Brick catalog snapshot",
+          decoded.error
+        ).pipe(
+          Effect.annotateLogs({
+            "kiln.catalog_id": row.id,
+            "kiln.catalog_owner_user_id": row.owner_user_id,
+          })
+        )
+        records.push(decoded.record)
+      }
+    }
+    return records
+  })
+}
+
+function decodeCatalogRow(row: CatalogRow) {
   const snapshot = relayCatalogSchema.safeParse(decodeJson(row.snapshot))
-  return snapshot.success
-    ? [
-        {
-          id: row.id,
-          ownerEmail: row.owner_email,
-          ownerName: row.owner_name,
-          ownerUserId: row.owner_user_id,
-          publishedAt: row.published_at?.toISOString() ?? null,
-          publishedBy: row.published_by,
-          revisionSha: row.revision_sha,
-          revisionUrl: row.revision_url,
-          snapshot: snapshot.data,
-          snapshotSha256: row.snapshot_sha256,
-          source: row.source,
-          updatedAt: row.updated_at.toISOString(),
-          visibility: row.visibility,
-        },
-      ]
-    : []
+  const record = {
+    id: row.id,
+    ownerEmail: row.owner_email,
+    ownerName: row.owner_name,
+    ownerUserId: row.owner_user_id,
+    publishedAt: row.published_at?.toISOString() ?? null,
+    publishedBy: row.published_by,
+    revisionSha: row.revision_sha,
+    revisionUrl: row.revision_url,
+    snapshot: snapshot.success ? snapshot.data : null,
+    snapshotSha256: row.snapshot_sha256,
+    source: row.source,
+    statusError: snapshot.success ? null : "Stored catalog snapshot is invalid",
+    updatedAt: row.updated_at.toISOString(),
+    visibility: row.visibility,
+  } satisfies BrickCatalogRecord
+  if (!snapshot.success) {
+    return { error: snapshot.error, record, success: false } as const
+  }
+  return {
+    record,
+    success: true,
+  } as const
 }
 
 function decodeJson(value: unknown): unknown {

@@ -25,6 +25,8 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
+  DialogHeader,
   DialogTitle,
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
@@ -258,10 +260,12 @@ function filterAndSortCustomBricks(
 }
 
 const BrickTabSidebar = React.memo(function BrickTabSidebar({
+  canAddCustomBrick,
   disabled,
   tab,
   onTabChange,
 }: {
+  canAddCustomBrick: boolean
   disabled: boolean
   tab: BrickTabId
   onTabChange: (tab: BrickTabId) => void
@@ -312,21 +316,23 @@ const BrickTabSidebar = React.memo(function BrickTabSidebar({
           <Library className="size-3.5 shrink-0 text-primary" />
           Catalogs
         </button>
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={() => onTabChange("custom")}
-          className={cn(
-            "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs transition-colors duration-150",
-            tab === "custom"
-              ? "bg-primary/12 font-medium text-foreground"
-              : "text-muted-foreground hover:bg-accent/55 hover:text-foreground",
-            disabled && "pointer-events-none opacity-50"
-          )}
-        >
-          <PackagePlus className="size-3.5 shrink-0 text-primary" />
-          Custom Brick
-        </button>
+        {canAddCustomBrick ? (
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onTabChange("custom")}
+            className={cn(
+              "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs transition-colors duration-150",
+              tab === "custom"
+                ? "bg-primary/12 font-medium text-foreground"
+                : "text-muted-foreground hover:bg-accent/55 hover:text-foreground",
+              disabled && "pointer-events-none opacity-50"
+            )}
+          >
+            <PackagePlus className="size-3.5 shrink-0 text-primary" />
+            Custom Brick
+          </button>
+        ) : null}
       </div>
     </aside>
   )
@@ -363,6 +369,7 @@ function useSaveCustomBrick(
 export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   relayId,
   bricks,
+  canAddCustomBrick,
   customBricks = EMPTY_BRICKS,
   selection,
   onSelectionChange,
@@ -373,6 +380,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
 }: {
   relayId: string
   bricks: Array<Brick>
+  canAddCustomBrick: boolean
   customBricks?: Array<Brick>
   selection: BrickSelection | null
   onSelectionChange: (selection: BrickSelection | null) => void
@@ -477,7 +485,12 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
         className
       )}
     >
-      <BrickTabSidebar disabled={disabled} tab={tab} onTabChange={selectTab} />
+      <BrickTabSidebar
+        canAddCustomBrick={canAddCustomBrick}
+        disabled={disabled}
+        tab={tab}
+        onTabChange={selectTab}
+      />
 
       {tab === "catalogs" ? (
         <BrickCatalogManager disabled={disabled} />
@@ -683,6 +696,9 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
   const queryClient = useQueryClient()
   const catalogsQuery = useQuery(brickCatalogsQueryOptions())
   const [selectedId, setSelectedId] = React.useState("default")
+  const [deleteCandidateId, setDeleteCandidateId] = React.useState<
+    string | null
+  >(null)
   const [source, setSource] = React.useState("")
   const detailsQuery = useQuery({
     ...brickCatalogDetailsQueryOptions(selectedId),
@@ -738,6 +754,7 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
     mutationFn: (catalogId: string) =>
       deleteBrickCatalog({ data: { catalogId } }),
     onSuccess: async () => {
+      setDeleteCandidateId(null)
       setSelectedId("default")
       showToast({ type: "success", message: "Catalog deleted" })
       await refreshCatalogQueries()
@@ -746,6 +763,9 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
   })
   const catalogs = catalogsQuery.data?.catalogs ?? []
   const selected = catalogs.find((catalog) => catalog.id === selectedId)
+  const deleteCandidate = catalogs.find(
+    (catalog) => catalog.id === deleteCandidateId
+  )
   const pending =
     disabled ||
     addMutation.isPending ||
@@ -755,54 +775,56 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
   return (
     <section className="grid min-h-[32rem] min-w-0 grid-cols-[minmax(0,1fr)] md:col-span-2 md:min-h-0 md:grid-cols-[minmax(0,1fr)_20rem]">
       <div className="flex min-h-0 min-w-0 flex-col border-b border-border/60 md:border-r md:border-b-0">
-        <form
-          className="border-b border-border/60 p-3"
-          onSubmit={(event) => {
-            event.preventDefault()
-            const value = source.trim()
-            if (value) addMutation.mutate(value)
-          }}
-        >
-          <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
-            Catalog sources
-          </p>
-          <div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-            <Input
-              value={source}
-              disabled={pending}
-              onChange={(event) => setSource(event.target.value)}
-              placeholder="owner/repo or https://…/catalog.yml"
-              aria-label="Catalog URL or repository"
-              className="h-9 min-w-0 flex-1 text-base md:text-sm"
-            />
-            <Button
-              type="submit"
-              size="sm"
-              className="h-9 shrink-0"
-              disabled={pending || source.trim().length === 0}
-            >
-              {addMutation.isPending ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <PackagePlus />
-              )}
-              Add
-            </Button>
-          </div>
-          <p className="mt-2 text-[0.6875rem] leading-relaxed text-muted-foreground">
-            Example catalog can be found{" "}
-            <a
-              href="https://github.com/kiln-site/kiln/blob/main/apps/bricks/catalog.yml"
-              target="_blank"
-              rel="noreferrer"
-              aria-label="View the example catalog on GitHub"
-              className="text-foreground underline underline-offset-2 hover:text-primary"
-            >
-              here
-            </a>
-            .
-          </p>
-        </form>
+        {catalogsQuery.data?.canAddCatalog ? (
+          <form
+            className="border-b border-border/60 p-3"
+            onSubmit={(event) => {
+              event.preventDefault()
+              const value = source.trim()
+              if (value) addMutation.mutate(value)
+            }}
+          >
+            <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
+              Catalog sources
+            </p>
+            <div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+              <Input
+                value={source}
+                disabled={pending}
+                onChange={(event) => setSource(event.target.value)}
+                placeholder="owner/repo or https://…/catalog.yml"
+                aria-label="Catalog URL or repository"
+                className="h-9 min-w-0 flex-1 text-base md:text-sm"
+              />
+              <Button
+                type="submit"
+                size="sm"
+                className="h-9 shrink-0"
+                disabled={pending || source.trim().length === 0}
+              >
+                {addMutation.isPending ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : (
+                  <PackagePlus />
+                )}
+                Add
+              </Button>
+            </div>
+            <p className="mt-2 text-[0.6875rem] leading-relaxed text-muted-foreground">
+              Example catalog can be found{" "}
+              <a
+                href="https://github.com/kiln-site/kiln/blob/main/apps/bricks/catalog.yml"
+                target="_blank"
+                rel="noreferrer"
+                aria-label="View the example catalog on GitHub"
+                className="text-foreground underline underline-offset-2 hover:text-primary"
+              >
+                here
+              </a>
+              .
+            </p>
+          </form>
+        ) : null}
 
         <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
           {catalogsQuery.isPending ? (
@@ -1031,15 +1053,7 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                     size="sm"
                     variant="destructive"
                     disabled={pending}
-                    onClick={() => {
-                      if (
-                        window.confirm(
-                          `Delete ${catalogDisplayName(selected)}?`
-                        )
-                      ) {
-                        deleteMutation.mutate(selected.id)
-                      }
-                    }}
+                    onClick={() => setDeleteCandidateId(selected.id)}
                   >
                     <Trash2 />
                     Delete
@@ -1050,6 +1064,48 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
           </>
         )}
       </aside>
+      <Dialog
+        open={deleteCandidate !== undefined}
+        onOpenChange={(open) => {
+          if (!open && !deleteMutation.isPending) setDeleteCandidateId(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete catalog?</DialogTitle>
+            <DialogDescription>
+              {deleteCandidate
+                ? `${catalogDisplayName(deleteCandidate)} will be removed from this Hearth account.`
+                : "This catalog will be removed from this Hearth account."}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={deleteMutation.isPending}
+              onClick={() => setDeleteCandidateId(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={!deleteCandidate || deleteMutation.isPending}
+              onClick={() => {
+                if (deleteCandidate) deleteMutation.mutate(deleteCandidate.id)
+              }}
+            >
+              {deleteMutation.isPending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Trash2 />
+              )}
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </section>
   )
 })
@@ -1344,6 +1400,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
   onOpenChange,
   relayId,
   bricks,
+  canAddCustomBrick,
   customBricks = EMPTY_BRICKS,
   initial,
   title = "Select Brick",
@@ -1355,6 +1412,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
   onOpenChange: (open: boolean) => void
   relayId: string
   bricks: Array<Brick>
+  canAddCustomBrick: boolean
   customBricks?: Array<Brick>
   initial: BrickSelection | null
   title?: string
@@ -1405,6 +1463,7 @@ export const BrickSelectDialog = React.memo(function BrickSelectDialog({
         <BrickCatalogBrowser
           relayId={relayId}
           bricks={bricks}
+          canAddCustomBrick={canAddCustomBrick}
           customBricks={customBricks}
           selection={selection}
           onSelectionChange={setSelection}

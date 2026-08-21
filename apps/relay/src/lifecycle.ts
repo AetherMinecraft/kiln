@@ -292,8 +292,13 @@ export function resolveInstanceStartupReconfigure(
         : "Enter startup variables"
     )
   }
+  const recipeChanged =
+    !reinstall &&
+    input.recipe !== undefined &&
+    input.recipe !== existing.brickSource
+  const definitionChanged = !reinstall && input.recipeDefinition !== undefined
   const snapshotSha256 =
-    input.recipeDefinition || input.recipe
+    recipeChanged || definitionChanged
       ? undefined
       : existing.brickSnapshotSha256
   return {

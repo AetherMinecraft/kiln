@@ -23,6 +23,7 @@ const MAX_DOCUMENT_BYTES = 1024 * 1024
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 const MAX_REDIRECTS = 5
 const FETCH_CONCURRENCY = 8
+const CATALOG_LOAD_TIMEOUT_MS = 60_000
 
 export interface LoadedBrickCatalog {
   revisionSha: string | null
@@ -41,15 +42,23 @@ interface ResolvedCatalogSource {
 
 export async function loadBrickCatalogSource(
   input: string,
-  options: { allowFile?: boolean } = {}
+  options: { allowFile?: boolean; timeoutMs?: number } = {}
 ): Promise<LoadedBrickCatalog> {
-  const resolvedSource = await resolveCatalogSource(input, options.allowFile)
+  const deadline = AbortSignal.timeout(
+    options.timeoutMs ?? CATALOG_LOAD_TIMEOUT_MS
+  )
+  const resolvedSource = await resolveCatalogSource(
+    input,
+    options.allowFile,
+    deadline
+  )
   const document = brickCatalogDocumentSchema.parse(
     parseYaml(
       await readDocument(
         resolvedSource.catalogUrl,
         resolvedSource.catalogUrl,
-        options.allowFile === true
+        options.allowFile === true,
+        deadline
       ),
       resolvedSource.catalogUrl
     )
@@ -64,7 +73,8 @@ export async function loadBrickCatalogSource(
           await readDocument(
             source,
             resolvedSource.catalogUrl,
-            options.allowFile === true
+            options.allowFile === true,
+            deadline
           ),
           source
         )
@@ -103,14 +113,20 @@ export async function loadBrickCatalogSource(
 
 async function resolveCatalogSource(
   input: string,
-  allowFile = false
+  allowFile = false,
+  signal: AbortSignal
 ): Promise<ResolvedCatalogSource> {
   const value = input.trim()
   if (!value) throw new Error("Enter a catalog URL or GitHub repository")
 
   const repository = githubRepositoryInput(value)
   if (repository) {
-    return pinGithubCatalog(repository.repository, "HEAD", "catalog.yml")
+    return pinGithubCatalog(
+      repository.repository,
+      "HEAD",
+      "catalog.yml",
+      signal
+    )
   }
 
   const parsedUrl = Result.try(() => new URL(value))
@@ -136,7 +152,8 @@ async function resolveCatalogSource(
       ...(await pinGithubCatalog(
         github.repository,
         github.reference,
-        github.path
+        github.path,
+        signal
       )),
       source: url.href,
     }
@@ -201,7 +218,8 @@ function githubCatalogUrl(
 async function pinGithubCatalog(
   repository: string,
   reference: string,
-  path: string
+  path: string,
+  signal: AbortSignal
 ): Promise<ResolvedCatalogSource> {
   const parsed = new URL(resolveKilnGitRepository(repository))
   const slug = parsed.pathname.slice(1)
@@ -209,7 +227,7 @@ async function pinGithubCatalog(
     `https://api.github.com/repos/${slug}/commits/${encodeURIComponent(reference)}`
   )
   const commit = JSON.parse(
-    await readHttpsDocument(commitUrl, commitUrl, 0, {
+    await readHttpsDocument(commitUrl, commitUrl, 0, signal, {
       Accept: "application/vnd.github+json",
       "User-Agent": "Kiln-Hearth",
       "X-GitHub-Api-Version": "2022-11-28",
@@ -258,7 +276,8 @@ function parseYaml(text: string, source: URL): unknown {
 async function readDocument(
   source: URL,
   catalog: URL,
-  allowFile: boolean
+  allowFile: boolean,
+  signal: AbortSignal
 ): Promise<string> {
   if (source.protocol === "file:") {
     if (!allowFile || catalog.protocol !== "file:") {
@@ -278,13 +297,14 @@ async function readDocument(
   if (source.protocol !== "https:") {
     throw new Error("Brick documents must use HTTPS")
   }
-  return readHttpsDocument(source, source, 0)
+  return readHttpsDocument(source, source, 0, signal)
 }
 
 function readHttpsDocument(
   source: URL,
   originalSource: URL,
   redirects: number,
+  signal: AbortSignal,
   headers: Readonly<Record<string, string>> = {
     Accept: "application/yaml, text/yaml, application/json",
   }
@@ -304,7 +324,7 @@ function readHttpsDocument(
       {
         headers,
         lookup: secureRemoteLookup,
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
       },
       (response) => {
         const status = response.statusCode ?? 0
@@ -328,6 +348,7 @@ function readHttpsDocument(
                 redirected.success,
                 originalSource,
                 redirects + 1,
+                signal,
                 headers
               )
             ).pipe(

@@ -150,6 +150,7 @@ const AddServerDialog = React.memo(function AddServerDialog({
         ) : (
           <AddServerForm
             bricks={catalogQuery.data.bricks}
+            canAddCustomBrick={catalogQuery.data.canAddCustomBrick}
             customBricks={catalogQuery.data.customBricks}
             relays={catalogQuery.data.relays}
             onClose={() => onOpenChange(false)}
@@ -162,11 +163,13 @@ const AddServerDialog = React.memo(function AddServerDialog({
 
 const AddServerForm = React.memo(function AddServerForm({
   bricks,
+  canAddCustomBrick,
   customBricks,
   relays,
   onClose,
 }: {
   bricks: Array<Brick>
+  canAddCustomBrick: boolean
   customBricks: Array<Brick>
   relays: Array<PersistedRelay>
   onClose: () => void
@@ -225,6 +228,7 @@ const AddServerForm = React.memo(function AddServerForm({
     <BrickCatalogBrowser
       relayId={relayId}
       bricks={bricks}
+      canAddCustomBrick={canAddCustomBrick}
       customBricks={customBricks}
       selection={selection}
       onSelectionChange={changeSelection}
@@ -380,10 +384,6 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
               diskLimitBytes,
               name: name.trim() || "New server",
               recipe,
-              recipeDefinition:
-                selection.kind === "catalog"
-                  ? withoutBrickSource(selection.brick)
-                  : undefined,
               relayId,
               start: false,
               variables,
@@ -703,11 +703,6 @@ function normalizeArchitecture(architecture: string): string {
     default:
       return architecture.trim().toLowerCase()
   }
-}
-
-function withoutBrickSource(brick: Brick) {
-  const { source: _source, ...recipe } = brick
-  return recipe
 }
 
 function displayArchitecture(architecture: string | null): string {

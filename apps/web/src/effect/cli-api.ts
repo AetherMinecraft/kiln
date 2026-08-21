@@ -61,6 +61,7 @@ import {
 import { CliAccessError, RelayUnavailableError } from "@/effect/errors"
 import {
   allowedInstanceIdsEffect,
+  hasPlatformPermission,
   isPlatformAdmin,
   isRelayCreator,
   listUserGrantsEffect,
@@ -1406,7 +1407,16 @@ const resolveBrickSource = Effect.fn("cli.api.brick.resolve")(function* (
   brick: string,
   principal: CliPrincipal
 ) {
-  if (/^https:\/\//iu.test(brick)) return { source: brick }
+  if (/^https:\/\//iu.test(brick)) {
+    if (!hasPlatformPermission(principal.user, "platform.bricks.add-custom")) {
+      return yield* CliAccessError.make({
+        code: "forbidden",
+        message: "Custom Bricks require Bring your own Relay access.",
+        retryable: false,
+      })
+    }
+    return { source: brick }
+  }
   const catalogs = yield* Effect.tryPromise({
     try: () => visibleBrickCatalogs(principal.user),
     catch: (cause) =>
