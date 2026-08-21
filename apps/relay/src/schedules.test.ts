@@ -4,7 +4,11 @@ import { join } from "node:path"
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 
-import type { RelayScheduleProjection } from "@workspace/contracts"
+import type {
+  BackupTaskInput,
+  RelayBackupTask,
+  RelayScheduleProjection,
+} from "@workspace/contracts"
 
 import { ScheduleManager } from "./schedules.js"
 
@@ -20,6 +24,7 @@ afterEach(async () => {
 
 async function manager(
   overrides: Partial<{
+    enqueueBackup: (input: BackupTaskInput) => Promise<RelayBackupTask>
     findInstance: (instanceId: string) => Promise<object | null>
     sendConsoleCommand: (instanceId: string, command: string) => Promise<void>
   }> = {}
@@ -27,9 +32,11 @@ async function manager(
   const directory = await mkdtemp(join(tmpdir(), "kiln-schedules-"))
   directories.push(directory)
   return ScheduleManager.make({
-    enqueueBackup: async () => {
-      throw new Error("not used")
-    },
+    enqueueBackup:
+      overrides.enqueueBackup ??
+      (async () => {
+        throw new Error("not used")
+      }),
     findInstance: overrides.findInstance ?? (async () => null),
     getBackup: async () => null,
     listDatabaseIds: async () => new Set(),
@@ -115,6 +122,64 @@ describe("Relay schedule persistence", () => {
       expect(schedules.overview([projection.id]).runs[0]?.status).toBe(
         "succeeded"
       )
+    })
+  })
+
+  it("runs a deployed incremental backup with its prepared destination", async () => {
+    const inputs: Array<BackupTaskInput> = []
+    const schedules = await manager({
+      enqueueBackup: async (input) => {
+        inputs.push(input)
+        return {
+          status: "succeeded",
+          taskId: input.taskId,
+        } as RelayBackupTask
+      },
+      findInstance: async () => ({}),
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        {
+          destination: {
+            kind: "storage",
+            storageId: "87949dc0-3b2a-4b57-999c-f9bfaf487880",
+          },
+          executions: [
+            {
+              destination: {
+                kind: "restic",
+                repository: { kind: "local" },
+                repositoryPassword: "repository-secret",
+              },
+              mode: "incremental",
+              targetId: "server-a",
+              targetKind: "instance",
+            },
+          ],
+          id: "6cc00681-a2cd-40c7-a036-7c9bd09b269b",
+          mode: "incremental",
+          name: "Scheduled snapshot",
+          type: "backup",
+        },
+      ],
+    })
+
+    await schedules.runNow({
+      revision: projection.revision,
+      scheduleId: projection.id,
+    })
+
+    await vi.waitFor(() => {
+      expect(inputs).toHaveLength(1)
+      expect(inputs[0]).toMatchObject({
+        artifactKind: "restic_snapshot",
+        destination: {
+          kind: "restic",
+          repositoryPassword: "repository-secret",
+        },
+        mode: "incremental",
+      })
     })
   })
 })

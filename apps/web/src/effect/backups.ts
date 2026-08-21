@@ -1692,6 +1692,49 @@ export interface BackupRepositorySecret {
   storageId: string | null
 }
 
+export const ensureBackupRepositoryEffect = Effect.fn(
+  "backups.ensureRepository"
+)(function* (input: {
+  relayId: string
+  storageId: string | null
+  targetId: string
+}) {
+  const database = yield* Database
+  return yield* database.transaction(
+    "backup_repository_ensure",
+    (transaction) =>
+      Effect.gen(function* () {
+        const storage = input.storageId
+          ? (yield* lockBackupStorageRows(transaction, [input.storageId])).get(
+              input.storageId
+            )
+          : undefined
+        if (
+          input.storageId &&
+          (!storage || !storage.enabled || Boolean(storage.deleting))
+        ) {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "backup.repository.ensure",
+            reason: "The selected backup destination is unavailable",
+          })
+        }
+        const repository = yield* loadOrCreateBackupRepository(transaction, {
+          destinationObjectPrefix: storage?.object_prefix ?? "",
+          relayId: input.relayId,
+          storageId: input.storageId,
+          targetId: input.targetId,
+          targetKind: "instance",
+        })
+        return {
+          objectPrefix: repository.objectPrefix,
+          password: repository.password,
+          storageId: repository.storageId,
+        } satisfies BackupRepositorySecret
+      })
+  )
+})
+
 export const loadBackupRepositoryPasswordEffect = Effect.fn(
   "backups.repositoryPassword"
 )(function* (backupId: string) {

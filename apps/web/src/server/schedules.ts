@@ -8,6 +8,7 @@ import { z } from "zod"
 import {
   normalizeScheduleCron,
   relayScheduleOverviewSchema,
+  scheduleActionSupportsTarget,
   scheduleActionSchema,
   scheduleDefinitionSchema,
   scheduleInputSchema,
@@ -20,9 +21,14 @@ import {
   type ScheduleTarget,
 } from "@workspace/contracts"
 
+import { prepareResticRepositoryLocation } from "@/backups/destinations"
+import { loadBackupStorageEffect } from "@/backups/destinations/s3"
+import { ensureBackupRepositoryEffect } from "@/effect/backups"
+import { runAppEffect } from "@/effect/runtime"
 import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import {
+  hasPlatformPermission,
   isPlatformAdmin,
   listUserGrants,
   type AccessGrant,
@@ -205,6 +211,7 @@ export const createSchedule = createServerFn({ method: "POST" })
       targets: definition.targets,
       user,
     })
+    await requireScheduleBackupDestinations(definition.actions, user)
     await saveNewSchedule(definition, user.id)
     await deploySchedule(definition, user.id)
     return (await loadSchedules()).find(
@@ -231,6 +238,7 @@ export const updateSchedule = createServerFn({ method: "POST" })
       targets: existing.targets,
       user,
     })
+    await requireScheduleBackupDestinations(existing.actions, user)
     const definition = scheduleDefinitionSchema.parse({
       ...data,
       cron: normalizeScheduleCron(data.cron),
@@ -244,6 +252,7 @@ export const updateSchedule = createServerFn({ method: "POST" })
       targets: definition.targets,
       user,
     })
+    await requireScheduleBackupDestinations(definition.actions, user)
     const previousRelayIds = new Set(
       existing.targets.map((target) => target.relayId)
     )
@@ -643,6 +652,30 @@ async function deployScheduleToRelay(
   const deployed = await promiseResult(async () => {
     const projection: RelayScheduleProjection = {
       ...schedule,
+      actions: await Promise.all(
+        schedule.actions.map(async (action) => {
+          if (action.type !== "backup") return action
+          const executions = []
+          for (const target of targets) {
+            if (!scheduleActionSupportsTarget(action, target)) continue
+            executions.push(
+              (async () => ({
+                destination:
+                  action.mode === "full"
+                    ? ({ kind: "local" } as const)
+                    : await scheduledResticDestination(action, target),
+                mode: action.mode,
+                targetId: target.id,
+                targetKind: target.kind,
+              }))()
+            )
+          }
+          return {
+            ...action,
+            executions: await Promise.all(executions),
+          }
+        })
+      ),
       targets: [...targets],
     }
     const result = z
@@ -670,6 +703,84 @@ async function deployScheduleToRelay(
       errorMessage(deployed.failure)
     )
   }
+}
+
+async function scheduledResticDestination(
+  action: Extract<ScheduleAction, { type: "backup" }>,
+  target: ScheduleTarget
+) {
+  const storageId =
+    action.destination.kind === "storage" ? action.destination.storageId : null
+  const repository = await runAppEffect(
+    "schedules.ensureBackupRepository",
+    ensureBackupRepositoryEffect({
+      relayId: target.relayId,
+      storageId,
+      targetId: target.id,
+    })
+  )
+  const location = await runAppEffect(
+    "schedules.prepareBackupRepository",
+    Effect.suspend(() =>
+      prepareResticRepositoryLocation({
+        objectPrefix: repository.objectPrefix,
+        requireEnabled: true,
+        storageId: repository.storageId,
+      })
+    )
+  )
+  return {
+    kind: "restic" as const,
+    repository: location,
+    repositoryPassword: repository.password,
+  }
+}
+
+async function requireScheduleBackupDestinations(
+  actions: ReadonlyArray<ScheduleAction>,
+  user: AuthenticatedUser
+) {
+  const backupActions = actions.filter(
+    (action): action is Extract<ScheduleAction, { type: "backup" }> =>
+      action.type === "backup"
+  )
+  if (
+    backupActions.some(
+      (action) =>
+        action.mode === "full" && action.destination.kind === "storage"
+    )
+  ) {
+    throw new Error(
+      "Full scheduled backups must use Relay-local storage so they can run while Hearth is offline"
+    )
+  }
+  const storageIds = [
+    ...new Set(
+      backupActions.flatMap((action) =>
+        action.destination.kind === "storage"
+          ? [action.destination.storageId]
+          : []
+      )
+    ),
+  ]
+  await Promise.all(
+    storageIds.map(async (storageId) => {
+      const storage = await runAppEffect(
+        "schedules.loadBackupStorage",
+        loadBackupStorageEffect(storageId)
+      )
+      if (
+        !storage ||
+        !storage.enabled ||
+        storage.deleting ||
+        (storage.ownerUserId !== null &&
+          storage.ownerUserId !== user.id &&
+          !hasPlatformPermission(user, "platform.backups.manage-storage"))
+      ) {
+        throw new Error("Backup destination is unavailable")
+      }
+    })
+  )
 }
 
 async function removeRelayProjections(

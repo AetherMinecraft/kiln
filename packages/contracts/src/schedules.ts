@@ -2,6 +2,12 @@ import { CronExpressionParser } from "cron-parser"
 import { Result } from "effect"
 import { z } from "zod"
 
+import {
+  backupLocalDestinationSchema,
+  backupModeSchema,
+  backupResticDestinationSchema,
+} from "./backups.js"
+
 export const scheduleActionTypeSchema = z.enum([
   "console_command",
   "backup",
@@ -23,10 +29,18 @@ export const scheduleConsoleCommandActionSchema = z
 export const scheduleBackupActionSchema = z
   .object({
     destination: z
-      .object({ kind: z.literal("local") })
-      .strict()
+      .discriminatedUnion("kind", [
+        z.object({ kind: z.literal("local") }).strict(),
+        z
+          .object({
+            kind: z.literal("storage"),
+            storageId: z.uuid(),
+          })
+          .strict(),
+      ])
       .default({ kind: "local" }),
     id: scheduleActionIdSchema,
+    mode: backupModeSchema.default("full"),
     name: z.string().trim().min(1).max(120).default("Scheduled backup"),
     type: z.literal("backup"),
   })
@@ -162,7 +176,40 @@ export const scheduleDefinitionSchema = scheduleInputSchema
 
 export type ScheduleDefinition = z.infer<typeof scheduleDefinitionSchema>
 
+const relayScheduleBackupExecutionSchema = z
+  .object({
+    destination: z.discriminatedUnion("kind", [
+      backupLocalDestinationSchema,
+      backupResticDestinationSchema,
+    ]),
+    mode: backupModeSchema,
+    targetId: z.string().min(1).max(120),
+    targetKind: z.enum(["instance", "database", "relay"]),
+  })
+  .strict()
+
+export const relayScheduleBackupActionSchema = scheduleBackupActionSchema
+  .safeExtend({
+    executions: z
+      .array(relayScheduleBackupExecutionSchema)
+      .max(2_000)
+      .default([]),
+  })
+  .strict()
+
+export const relayScheduleActionSchema = z.discriminatedUnion("type", [
+  scheduleConsoleCommandActionSchema,
+  relayScheduleBackupActionSchema,
+  schedulePowerActionSchema,
+])
+
+export type RelayScheduleAction = z.infer<typeof relayScheduleActionSchema>
+
 export const relayScheduleProjectionSchema = scheduleDefinitionSchema
+  .safeExtend({
+    actions: z.array(relayScheduleActionSchema).min(1).max(32),
+  })
+  .strict()
 
 export type RelayScheduleProjection = z.infer<
   typeof relayScheduleProjectionSchema
@@ -279,10 +326,11 @@ export function scheduleDeterministicUuid(
 }
 
 export function scheduleActionSupportsTarget(
-  action: Pick<ScheduleAction, "type">,
+  action: { mode?: "full" | "incremental"; type: ScheduleActionType },
   target: Pick<ScheduleTarget, "kind">
 ): boolean {
   if (action.type === "console_command") return target.kind === "instance"
   if (action.type === "power") return target.kind !== "relay"
+  if (action.mode === "incremental") return target.kind === "instance"
   return true
 }

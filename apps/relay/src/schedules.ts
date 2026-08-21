@@ -14,8 +14,8 @@ import {
   type BackupTaskInput,
   type RelayBackupTask,
   type RelayScheduleDeployment,
+  type RelayScheduleAction,
   type RelayScheduleProjection,
-  type ScheduleAction,
   type ScheduleActionType,
   type ScheduleRun,
   type ScheduleTarget,
@@ -482,7 +482,7 @@ export class ScheduleManager {
 
   async #executeAction(
     schedule: RelayScheduleProjection,
-    action: ScheduleAction,
+    action: RelayScheduleAction,
     target: ScheduleTarget,
     scheduledAt: number
   ) {
@@ -504,6 +504,19 @@ export class ScheduleManager {
       }
     }
     if (action.type === "backup") {
+      const execution = action.executions.find(
+        (candidate) =>
+          candidate.targetId === target.id &&
+          candidate.targetKind === target.kind
+      )
+      const destination =
+        execution?.destination ??
+        (action.mode === "full" && action.destination.kind === "local"
+          ? ({ kind: "local" } as const)
+          : null)
+      if (!destination) {
+        throw new Error("Scheduled backup destination is not deployed")
+      }
       const backupId = scheduleDeterministicUuid(
         "schedule-backup",
         schedule.id,
@@ -516,17 +529,19 @@ export class ScheduleManager {
       const targetKind = target.kind === "relay" ? "platform" : target.kind
       const input: BackupTaskInput = {
         artifactKind:
-          targetKind === "instance"
-            ? "archive"
-            : targetKind === "database"
-              ? "database_dump"
-              : "platform_bundle",
+          action.mode === "incremental"
+            ? "restic_snapshot"
+            : targetKind === "instance"
+              ? "archive"
+              : targetKind === "database"
+                ? "database_dump"
+                : "platform_bundle",
         backupId,
-        destination: { kind: "local" },
+        destination,
         exclude: [],
         kind: "create",
         maxBytes: null,
-        mode: "full",
+        mode: action.mode,
         reason: "scheduled",
         target: {
           id:
@@ -587,7 +602,7 @@ function deployment(
 }
 
 function attempt(input: {
-  action: Pick<ScheduleAction, "id" | "type">
+  action: Pick<RelayScheduleAction, "id" | "type">
   error: string | null
   scheduledAt: number
   scheduleId: string

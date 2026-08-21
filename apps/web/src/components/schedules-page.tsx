@@ -6,9 +6,8 @@ import {
   useSuspenseQuery,
 } from "@tanstack/react-query"
 import {
-  ArrowDown,
-  ArrowUp,
   Check,
+  ChevronDown,
   CirclePause,
   CirclePlay,
   CircleCheck,
@@ -20,6 +19,7 @@ import {
   EllipsisVertical,
   HardDriveDownload,
   History,
+  GripVertical,
   LoaderCircle,
   Pencil,
   Play,
@@ -37,6 +37,7 @@ import type { ScheduleAction, ScheduleTarget } from "@workspace/contracts"
 import {
   normalizeScheduleCron,
   scheduleActionSupportsTarget,
+  scheduleCronAliases,
 } from "@workspace/contracts"
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
@@ -56,6 +57,11 @@ import {
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@workspace/ui/components/popover"
 import {
   Select,
   SelectContent,
@@ -78,15 +84,22 @@ import {
   createWorkspaceTableSearchStore,
   useWorkspaceTableSearchInput,
 } from "@/components/workspace-data-table"
+import { BrickVersionPicker } from "@/components/brick-version-picker"
 import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
-import type { ServerPickerOption } from "@/components/server-picker-list"
+import {
+  ServerPickerList,
+  serverPickerOptionKey,
+  type ServerPickerOption,
+} from "@/components/server-picker-list"
 import { useScheduleScope } from "@/components/schedule-scope"
 import { forkPromise } from "@/effect/promise"
 import {
+  backupStorageQueryOptions,
   queryKeys,
   scheduleOptionsQueryOptions,
   schedulesQueryOptions,
 } from "@/lib/query-options"
+import { getBackupStorage } from "@/server/backup-storage"
 import {
   createSchedule,
   deleteSchedule,
@@ -98,6 +111,7 @@ import {
 
 type Schedule = Awaited<ReturnType<typeof getSchedules>>[number]
 type ScheduleOption = Awaited<ReturnType<typeof getScheduleOptions>>[number]
+type BackupStorage = Awaited<ReturnType<typeof getBackupStorage>>[number]
 type EditorMode = { kind: "create" } | { kind: "edit"; schedule: Schedule }
 type ScheduleRun = Schedule["runs"][number]
 type ScheduleRunWithRelay = ScheduleRun & { relayId: string }
@@ -107,6 +121,8 @@ const relativeFormatter = new Intl.RelativeTimeFormat("en-US", {
   style: "short",
 })
 
+const timezones = Intl.supportedValuesOf("timeZone")
+
 export const SchedulesPage = React.memo(function SchedulesPage() {
   const { data: schedules } = useSuspenseQuery({
     ...schedulesQueryOptions(),
@@ -114,6 +130,10 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   })
   const { data: options } = useSuspenseQuery({
     ...scheduleOptionsQueryOptions(),
+    notifyOnChangeProps: ["data"],
+  })
+  const { data: storage } = useSuspenseQuery({
+    ...backupStorageQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
   const navigate = useNavigate({ from: "/schedules" })
@@ -199,6 +219,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
         <ScheduleEditorDialog
           mode={editor}
           options={options}
+          storage={storage}
           onClose={() => setEditor(null)}
           onSaved={() => setEditor(null)}
         />
@@ -346,13 +367,13 @@ const ScheduleTableHead = React.memo(function ScheduleTableHead() {
         Status
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="w-auto sm:w-[34%]">
-        Schedule
+        Name
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[20%] md:table-cell">
         Timing
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[16%] lg:table-cell">
-        Last run
+        Latest run
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[16%] xl:table-cell">
         Next run
@@ -590,7 +611,9 @@ function ScheduleTiming({ cron }: { cron: string }) {
   const alias = cronAliasLabel(cron)
   if (!alias) {
     return (
-      <span className="font-mono text-[0.625rem] text-foreground">{cron}</span>
+      <span className="-my-1 inline-flex h-7 items-center px-1 font-mono text-[0.625rem] leading-none text-foreground">
+        {cron}
+      </span>
     )
   }
   return (
@@ -598,7 +621,7 @@ function ScheduleTiming({ cron }: { cron: string }) {
       <TooltipTrigger asChild>
         <span
           tabIndex={0}
-          className="inline-flex cursor-default text-[0.625rem] font-medium text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          className="-my-1 inline-flex h-7 cursor-default items-center rounded-sm px-1 text-[0.625rem] leading-none font-medium text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
         >
           {alias}
         </span>
@@ -619,7 +642,7 @@ function ScheduleNextRun({
 }) {
   if (!nextRun) {
     return (
-      <span className="text-[0.625rem] text-muted-foreground">
+      <span className="-my-1 inline-flex h-7 items-center px-1 text-[0.625rem] leading-none text-muted-foreground">
         Not scheduled
       </span>
     )
@@ -630,7 +653,7 @@ function ScheduleNextRun({
         <time
           dateTime={nextRun.toISOString()}
           tabIndex={0}
-          className="inline-flex cursor-default text-[0.625rem] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          className="-my-1 inline-flex h-7 cursor-default items-center rounded-sm px-1 text-[0.625rem] leading-none text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           suppressHydrationWarning
         >
           {relativeTime(nextRun)}
@@ -653,25 +676,28 @@ function ScheduleLastRun({
   onView: () => void
 }) {
   if (!run) {
-    return <span className="text-[0.625rem] text-muted-foreground">Never</span>
+    return (
+      <span className="-my-1 inline-flex h-7 items-center px-1 text-[0.625rem] leading-none text-muted-foreground">
+        Never
+      </span>
+    )
   }
-  const succeeded = run.status === "succeeded"
-  const Icon = succeeded ? CircleCheck : CircleX
+  const result = latestRunResult(run)
   const finishedAt = new Date(run.finishedAt)
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1.5 rounded-sm text-[0.625rem] text-foreground outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring/40"
+          className="-my-1 inline-flex h-7 items-center px-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 hover:[&_[data-slot=badge]]:brightness-110"
           onClick={onView}
         >
-          <Icon
-            className={`size-3.5 shrink-0 ${succeeded ? "text-emerald-400" : "text-destructive"}`}
-          />
-          <time dateTime={finishedAt.toISOString()} suppressHydrationWarning>
-            {relativeTime(finishedAt)}
-          </time>
+          <Badge
+            variant="outline"
+            className={`px-1.5 py-0 text-[0.625rem] ${result === "Success" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : result === "Errored" ? "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300" : "border-destructive/30 bg-destructive/10 text-destructive"}`}
+          >
+            {result}
+          </Badge>
         </button>
       </TooltipTrigger>
       <TooltipContent side="bottom">
@@ -679,6 +705,17 @@ function ScheduleLastRun({
       </TooltipContent>
     </Tooltip>
   )
+}
+
+function latestRunResult(run: ScheduleRunWithRelay) {
+  const attempts = run.targetRuns.flatMap((targetRun) => targetRun.attempts)
+  const passed = attempts.filter((attempt) => attempt.status === "succeeded")
+  const failed = attempts.filter((attempt) =>
+    ["failed", "interrupted", "not_run"].includes(attempt.status)
+  )
+  if (passed.length === 0) return "Failed" as const
+  if (failed.length > 0) return "Errored" as const
+  return "Success" as const
 }
 
 function EmptyScheduleTable({
@@ -1331,21 +1368,26 @@ function AttemptStatus({
 function ScheduleEditorDialog({
   mode,
   options,
+  storage,
   onClose,
   onSaved,
 }: {
   mode: EditorMode
   options: ReadonlyArray<ScheduleOption>
+  storage: ReadonlyArray<BackupStorage>
   onClose: () => void
   onSaved: (scheduleId: string) => void
 }) {
   const queryClient = useQueryClient()
   const existing = mode.kind === "edit" ? mode.schedule : null
   const [name, setName] = React.useState(existing?.name ?? "")
-  const [cron, setCron] = React.useState(existing?.cron ?? "daily")
+  const [cron, setCron] = React.useState(() =>
+    normalizeScheduleCron(existing?.cron ?? "daily")
+  )
   const [timezone, setTimezone] = React.useState(
     existing?.timezone ?? localTimezone()
   )
+  const timezoneLabelId = React.useId()
   const [enabled, setEnabled] = React.useState(existing?.enabled ?? true)
   const [selectedTargets, setSelectedTargets] = React.useState(
     () => new Set(existing?.targets.map(targetKey) ?? [])
@@ -1426,6 +1468,7 @@ function ScheduleEditorDialog({
             ? {
                 destination: { kind: "local" },
                 id,
+                mode: "full",
                 name: "Scheduled backup",
                 type,
               }
@@ -1445,6 +1488,12 @@ function ScheduleEditorDialog({
         const index = current.findIndex((action) => action.id === actionId)
         return index < 0 ? current : moveAction(current, index, direction)
       })
+    },
+    []
+  )
+  const reorderEditorAction = React.useCallback(
+    (actionId: string, targetId: string) => {
+      setActions((current) => reorderAction(current, actionId, targetId))
     },
     []
   )
@@ -1480,58 +1529,63 @@ function ScheduleEditorDialog({
             if (canSave && !mutation.isPending) mutation.mutate()
           }}
         >
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Name" className="sm:col-span-2">
+          <div className="space-y-4">
+            <Field label="Name">
               <Input
+                aria-label="Schedule name"
                 value={name}
                 maxLength={120}
                 placeholder="Backup My Server Daily"
                 onChange={(event) => setName(event.target.value)}
               />
             </Field>
-            <Field label="Timing">
-              <Select
-                value={cronPreset(cron)}
-                onValueChange={(value) => value !== "custom" && setCron(value)}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="hourly">Hourly</SelectItem>
-                  <SelectItem value="daily">Daily</SelectItem>
-                  <SelectItem value="weekly">Weekly</SelectItem>
-                  <SelectItem value="monthly">Monthly</SelectItem>
-                  <SelectItem value="custom">Custom cron</SelectItem>
-                </SelectContent>
-              </Select>
-              <p className="mt-1.5 font-mono text-[0.625rem] text-muted-foreground">
-                Cron · {normalizeScheduleCron(cron)}
-              </p>
-            </Field>
-            <Field label="Timezone">
-              <Input
-                value={timezone}
-                maxLength={120}
-                placeholder="America/New_York"
-                onChange={(event) => setTimezone(event.target.value)}
-              />
-            </Field>
-            {cronPreset(cron) === "custom" ? (
-              <Field
-                label="Cron expression"
-                hint="Five fields: minute hour day month weekday"
-                className="sm:col-span-2"
-              >
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field label="Timing">
+                <Select
+                  value={cronPreset(cron)}
+                  onValueChange={(value) => {
+                    if (value === "custom") return
+                    setCron(
+                      scheduleCronAliases[
+                        value as keyof typeof scheduleCronAliases
+                      ]
+                    )
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="hourly">Hourly</SelectItem>
+                    <SelectItem value="daily">Daily</SelectItem>
+                    <SelectItem value="weekly">Weekly</SelectItem>
+                    <SelectItem value="monthly">Monthly</SelectItem>
+                    <SelectItem value="custom">Custom</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field label="Cron">
                 <Input
-                  className="font-mono"
+                  aria-label="Cron expression"
+                  className="font-mono text-xs"
                   value={cron}
                   maxLength={120}
                   placeholder="0 0 * * *"
                   onChange={(event) => setCron(event.target.value)}
                 />
               </Field>
-            ) : null}
+              <Field label="Timezone" labelId={timezoneLabelId}>
+                <BrickVersionPicker
+                  labelledBy={timezoneLabelId}
+                  maxLength={120}
+                  name="timezone"
+                  placeholder="Search timezones…"
+                  value={timezone}
+                  versions={timezones}
+                  onChange={setTimezone}
+                />
+              </Field>
+            </div>
           </div>
 
           <ScheduleTargetSelector
@@ -1545,9 +1599,11 @@ function ScheduleEditorDialog({
           <ScheduleActionsEditor
             actions={actions}
             allowed={actionPermissions}
+            storage={storage}
             onAdd={addAction}
             onChange={updateAction}
             onMove={moveEditorAction}
+            onReorder={reorderEditorAction}
             onRemove={removeAction}
           />
 
@@ -1561,6 +1617,7 @@ function ScheduleEditorDialog({
               </span>
             </span>
             <input
+              aria-label="Schedule enabled"
               type="checkbox"
               className="size-4 accent-primary"
               checked={enabled}
@@ -1600,6 +1657,50 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
   selectedTargets: ReadonlySet<string>
   onToggle: (key: string, checked: boolean) => void
 }) {
+  const [open, setOpen] = React.useState(false)
+  const pickerOptions = React.useMemo(
+    () =>
+      options.map(
+        (option): ServerPickerOption => ({
+          description: `${option.relayName} · ${option.kind}`,
+          disabled: !option[permissionKey],
+          id: option.id,
+          kind:
+            option.kind === "instance"
+              ? "server"
+              : option.kind === "database"
+                ? "database"
+                : "relay",
+          name: option.name,
+          relayId: option.relayId,
+          relayName: option.relayName,
+        })
+      ),
+    [options, permissionKey]
+  )
+  const selectedPickerKeys = React.useMemo(() => {
+    const keys = new Set<string>()
+    for (const option of pickerOptions) {
+      if (selectedTargets.has(scheduleTargetKey(option))) {
+        keys.add(serverPickerOptionKey(option))
+      }
+    }
+    return keys
+  }, [pickerOptions, selectedTargets])
+  const selectedNames = React.useMemo(() => {
+    const names: Array<string> = []
+    for (const option of options) {
+      if (selectedTargets.has(targetKey(option))) names.push(option.name)
+    }
+    return names
+  }, [options, selectedTargets])
+  const selectTarget = React.useCallback(
+    (option: ServerPickerOption) => {
+      const key = scheduleTargetKey(option)
+      onToggle(key, !selectedTargets.has(key))
+    },
+    [onToggle, selectedTargets]
+  )
   return (
     <div>
       <div className="flex items-end justify-between gap-4">
@@ -1613,84 +1714,85 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
           {selectedOptionsCount} selected
         </span>
       </div>
-      <div className="mt-3 grid max-h-52 gap-2 overflow-y-auto rounded-lg border p-2 sm:grid-cols-2">
-        {options.map((option) => {
-          const key = targetKey(option)
-          return (
-            <ScheduleTargetOption
-              key={key}
-              option={option}
-              optionKey={key}
-              checked={selectedTargets.has(key)}
-              disabled={!option[permissionKey]}
-              onToggle={onToggle}
-            />
-          )
-        })}
-      </div>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="outline"
+            role="combobox"
+            aria-expanded={open}
+            className="mt-3 h-auto min-h-10 w-full justify-between gap-3 px-3 py-2 font-normal"
+          >
+            <span className="min-w-0 truncate text-left text-xs">
+              {selectedNames.length === 0
+                ? "Select servers, databases, or Relays"
+                : selectedNames.slice(0, 3).join(", ")}
+              {selectedNames.length > 3 ? ` +${selectedNames.length - 3}` : ""}
+            </span>
+            <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent
+          align="start"
+          className="z-[70] w-[min(34rem,calc(100vw-2rem))] p-1.5"
+        >
+          <ServerPickerList
+            multiple
+            ariaLabel="Schedule targets"
+            emptyMessage="No accessible schedule targets found."
+            selectedKeys={selectedPickerKeys}
+            servers={pickerOptions}
+            onSelect={selectTarget}
+          />
+        </PopoverContent>
+      </Popover>
     </div>
-  )
-})
-
-const ScheduleTargetOption = React.memo(function ScheduleTargetOption({
-  option,
-  optionKey,
-  checked,
-  disabled,
-  onToggle,
-}: {
-  option: ScheduleOption
-  optionKey: string
-  checked: boolean
-  disabled: boolean
-  onToggle: (key: string, checked: boolean) => void
-}) {
-  return (
-    <label
-      className={`flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-xs ${disabled ? "cursor-not-allowed opacity-45" : "cursor-pointer hover:bg-accent/40"}`}
-    >
-      <input
-        type="checkbox"
-        className="size-3.5 accent-primary"
-        checked={checked}
-        disabled={disabled}
-        onChange={(event) => onToggle(optionKey, event.target.checked)}
-      />
-      <TargetIcon
-        kind={option.kind}
-        className="size-3.5 text-muted-foreground"
-      />
-      <span className="min-w-0 flex-1 truncate font-medium">{option.name}</span>
-      <span className="font-mono text-[0.5625rem] text-muted-foreground">
-        {option.kind}
-      </span>
-    </label>
   )
 })
 
 const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
   actions,
   allowed,
+  storage,
   onAdd,
   onChange,
   onMove,
+  onReorder,
   onRemove,
 }: {
   actions: ReadonlyArray<ScheduleAction>
   allowed: Readonly<Record<ScheduleAction["type"], boolean>>
+  storage: ReadonlyArray<BackupStorage>
   onAdd: (type: ScheduleAction["type"]) => void
   onChange: (action: ScheduleAction) => void
   onMove: (actionId: string, direction: -1 | 1) => void
+  onReorder: (actionId: string, targetId: string) => void
   onRemove: (actionId: string) => void
 }) {
+  const [draggedActionId, setDraggedActionId] = React.useState<string | null>(
+    null
+  )
+  const draggedActionIdRef = React.useRef<string | null>(null)
+  const startDragging = React.useCallback((actionId: string) => {
+    draggedActionIdRef.current = actionId
+    setDraggedActionId(actionId)
+  }, [])
+  const stopDragging = React.useCallback(() => {
+    draggedActionIdRef.current = null
+    setDraggedActionId(null)
+  }, [])
+  const dragOverAction = React.useCallback(
+    (targetId: string) => {
+      const actionId = draggedActionIdRef.current
+      if (actionId && actionId !== targetId) onReorder(actionId, targetId)
+    },
+    [onReorder]
+  )
   return (
     <div>
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold">Ordered actions</h3>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            Only actions you are permitted to schedule are available.
-          </p>
         </div>
         <div className="flex flex-wrap gap-1.5">
           <AddActionButton
@@ -1723,9 +1825,14 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
             <ActionEditor
               key={action.id}
               action={action}
+              dragging={draggedActionId === action.id}
               index={index}
+              storage={storage}
               total={actions.length}
               onChange={onChange}
+              onDragEnd={stopDragging}
+              onDragStart={startDragging}
+              onDragOver={dragOverAction}
               onMove={onMove}
               onRemove={onRemove}
             />
@@ -1738,18 +1845,23 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
 
 function Field({
   label,
+  labelId,
   hint,
   className,
   children,
 }: {
   label: string
+  labelId?: string
   hint?: string
   className?: string
   children: React.ReactNode
 }) {
   return (
     <label className={className}>
-      <span className="mb-1.5 flex items-center justify-between gap-3 text-xs font-medium">
+      <span
+        id={labelId}
+        className="mb-1.5 flex items-center justify-between gap-3 text-xs font-medium"
+      >
         {label}
         {hint ? (
           <span className="font-normal text-muted-foreground">{hint}</span>
@@ -1787,24 +1899,67 @@ const AddActionButton = React.memo(function AddActionButton({
 
 const ActionEditor = React.memo(function ActionEditor({
   action,
+  dragging,
   index,
+  storage,
   total,
   onChange,
+  onDragEnd,
+  onDragOver,
+  onDragStart,
   onMove,
   onRemove,
 }: {
   action: ScheduleAction
+  dragging: boolean
   index: number
+  storage: ReadonlyArray<BackupStorage>
   total: number
   onChange: (action: ScheduleAction) => void
+  onDragEnd: () => void
+  onDragOver: (actionId: string) => void
+  onDragStart: (actionId: string) => void
   onMove: (actionId: string, direction: -1 | 1) => void
   onRemove: (actionId: string) => void
 }) {
   return (
-    <div className="relative rounded-lg border bg-background/45 py-3 pr-3 pl-11">
-      <span className="absolute top-3.5 left-3 z-10 grid size-5 place-items-center rounded-full border bg-background font-mono text-[0.5625rem] text-muted-foreground">
-        {index + 1}
-      </span>
+    <div
+      className={`relative rounded-lg border bg-background/45 py-3 pr-3 pl-12 transition-opacity ${dragging ? "opacity-55" : ""}`}
+      onDragOver={(event) => {
+        event.preventDefault()
+        onDragOver(action.id)
+      }}
+      onDrop={(event) => event.preventDefault()}
+    >
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            draggable
+            aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
+            className="absolute top-3 left-2.5 z-10 grid size-7 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing"
+            onDragEnd={onDragEnd}
+            onDragStart={(event) => {
+              event.dataTransfer.effectAllowed = "move"
+              event.dataTransfer.setData("text/plain", action.id)
+              onDragStart(action.id)
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowUp" && index > 0) {
+                event.preventDefault()
+                onMove(action.id, -1)
+              }
+              if (event.key === "ArrowDown" && index < total - 1) {
+                event.preventDefault()
+                onMove(action.id, 1)
+              }
+            }}
+          >
+            <GripVertical className="size-4" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="left">Drag to reorder</TooltipContent>
+      </Tooltip>
       <div className="flex items-start gap-3">
         <ActionIcon
           type={action.type}
@@ -1825,8 +1980,9 @@ const ActionEditor = React.memo(function ActionEditor({
               }
             />
           ) : action.type === "backup" ? (
-            <div className="grid gap-2 sm:grid-cols-2">
+            <div className="grid gap-2 sm:grid-cols-3">
               <Input
+                aria-label="Backup name"
                 value={action.name}
                 maxLength={120}
                 placeholder="Scheduled backup"
@@ -1834,7 +1990,63 @@ const ActionEditor = React.memo(function ActionEditor({
                   onChange({ ...action, name: event.target.value })
                 }
               />
-              <Input value="Local Relay storage" disabled />
+              <Select
+                value={action.mode}
+                onValueChange={(value) => {
+                  const mode = value as typeof action.mode
+                  onChange({
+                    ...action,
+                    destination:
+                      mode === "full" ? { kind: "local" } : action.destination,
+                    mode,
+                  })
+                }}
+              >
+                <SelectTrigger aria-label="Backup mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="incremental">Incremental</SelectItem>
+                  <SelectItem value="full">Full archive</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select
+                value={
+                  action.destination.kind === "storage"
+                    ? action.destination.storageId
+                    : "local"
+                }
+                onValueChange={(value) =>
+                  onChange({
+                    ...action,
+                    destination:
+                      value === "local"
+                        ? { kind: "local" }
+                        : { kind: "storage", storageId: value },
+                  })
+                }
+              >
+                <SelectTrigger aria-label="Backup destination">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="local">Local Relay</SelectItem>
+                  {action.mode === "incremental"
+                    ? storage.flatMap((destination) =>
+                        destination.enabled && !destination.deleting
+                          ? [
+                              <SelectItem
+                                key={destination.id}
+                                value={destination.id}
+                              >
+                                {destination.name}
+                              </SelectItem>,
+                            ]
+                          : []
+                      )
+                    : null}
+                </SelectContent>
+              </Select>
             </div>
           ) : (
             <Select
@@ -1856,26 +2068,6 @@ const ActionEditor = React.memo(function ActionEditor({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            disabled={index === 0}
-            onClick={() => onMove(action.id, -1)}
-            aria-label="Move action up"
-          >
-            <ArrowUp className="size-3.5" />
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            disabled={index === total - 1}
-            onClick={() => onMove(action.id, 1)}
-            aria-label="Move action down"
-          >
-            <ArrowDown className="size-3.5" />
-          </Button>
           <Button
             type="button"
             variant="ghost"
@@ -2074,6 +2266,11 @@ function targetKey(target: Pick<ScheduleTarget, "id" | "kind" | "relayId">) {
   return `${target.relayId}:${target.kind}:${target.id}`
 }
 
+function scheduleTargetKey(target: ServerPickerOption) {
+  const kind = target.kind === "server" ? "instance" : target.kind
+  return `${target.relayId}:${kind ?? "instance"}:${target.id}`
+}
+
 function canOperateSchedule(
   schedule: Pick<Schedule, "actions" | "targets">,
   options: ReadonlyMap<string, ScheduleOption>,
@@ -2123,6 +2320,23 @@ function moveAction(
   return next
 }
 
+function reorderAction(
+  actions: Array<ScheduleAction>,
+  actionId: string,
+  targetId: string
+) {
+  const sourceIndex = actions.findIndex((action) => action.id === actionId)
+  const targetIndex = actions.findIndex((action) => action.id === targetId)
+  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) {
+    return actions
+  }
+  const next = [...actions]
+  const [action] = next.splice(sourceIndex, 1)
+  if (!action) return actions
+  next.splice(targetIndex, 0, action)
+  return next
+}
+
 function cronPreset(cron: string) {
   const presets: Partial<
     Record<string, "daily" | "hourly" | "monthly" | "weekly">
@@ -2136,7 +2350,7 @@ function cronPreset(cron: string) {
     "0 0 * * 0": "weekly",
     "0 0 1 * *": "monthly",
   }
-  return presets[cron] ?? "custom"
+  return presets[cron.trim().toLowerCase().replace(/\s+/gu, " ")] ?? "custom"
 }
 
 function cronAliasLabel(cron: string) {
