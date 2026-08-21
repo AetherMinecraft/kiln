@@ -1225,6 +1225,11 @@ async function executeControlRequest(
       return scheduleManager.apply(
         relayScheduleProjectionSchema.parse(request.payload)
       )
+    case "schedule.run":
+      return scheduleManager.runNow({
+        revision: requiredPositiveInteger(payload, "revision"),
+        scheduleId: requiredString(payload, "scheduleId"),
+      })
     case "schedule.remove":
       return scheduleManager.remove({
         revision: requiredPositiveInteger(payload, "revision"),

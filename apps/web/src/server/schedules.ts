@@ -139,6 +139,12 @@ export const getScheduleOptions = createServerFn({ method: "GET" }).handler(
             target,
             user,
           }),
+          canExecute: hasScheduleTargetPermission({
+            grants,
+            permission: "schedule.execute",
+            target,
+            user,
+          }),
           canUpdate: hasScheduleTargetPermission({
             grants,
             permission: "schedule.update",
@@ -284,10 +290,70 @@ export const deleteSchedule = createServerFn({ method: "POST" })
     return { deleted: true, id: schedule.id }
   })
 
+export const runScheduleNow = createServerFn({ method: "POST" })
+  .validator(scheduleIdSchema)
+  .handler(async ({ data }) => {
+    const user = await requireAuthenticatedUser()
+    const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+    const schedule = (await loadSchedules()).find(
+      (candidate) => candidate.id === data.id
+    )
+    if (!schedule) throw new Error("Schedule not found")
+    requireScheduleAuthorization({
+      actions: schedule.actions,
+      grants,
+      schedulePermission: "schedule.execute",
+      targets: schedule.targets,
+      user,
+    })
+
+    const relays = new Map(
+      (await listPersistedRelays()).map((relay) => [relay.id, relay])
+    )
+    const relayIds = [
+      ...new Set(schedule.targets.map((target) => target.relayId)),
+    ]
+    const results = await Promise.all(
+      relayIds.map(async (relayId) => {
+        const relay = relays.get(relayId)
+        if (!relay?.enabled) {
+          return { error: "Relay is unavailable", relayId, started: false }
+        }
+        const started = await promiseResult(() =>
+          Promise.resolve(
+            relayRpc(
+              relay,
+              "schedule.run",
+              { revision: schedule.revision, scheduleId: schedule.id },
+              15_000,
+              user.id
+            )
+          ).then((value) => scheduleRunSchema.parse(value))
+        )
+        return Result.isSuccess(started)
+          ? { error: null, relayId, started: true }
+          : {
+              error: errorMessage(started.failure),
+              relayId,
+              started: false,
+            }
+      })
+    )
+    return {
+      relays: results,
+      started: results.filter((result) => result.started).length,
+      total: results.length,
+    }
+  })
+
 function requireScheduleAuthorization(input: {
   actions: ReadonlyArray<ScheduleAction>
   grants: ReadonlyArray<AccessGrant>
-  schedulePermission: "schedule.create" | "schedule.delete" | "schedule.update"
+  schedulePermission:
+    | "schedule.create"
+    | "schedule.delete"
+    | "schedule.execute"
+    | "schedule.update"
   targets: ReadonlyArray<ScheduleTarget>
   user: AuthenticatedUser
 }) {

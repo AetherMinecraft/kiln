@@ -147,6 +147,44 @@ export class ScheduleManager {
     })
   }
 
+  async runNow(input: { revision: number; scheduleId: string }) {
+    const occurrence = await this.#serialized(async () => {
+      const scheduleId = z.uuid().parse(input.scheduleId)
+      const revision = z.number().int().positive().parse(input.revision)
+      const schedule = this.#state.schedules.find(
+        (candidate) => candidate.id === scheduleId
+      )
+      if (!schedule) throw new Error("Schedule is not deployed on this Relay")
+      if (schedule.revision !== revision) {
+        throw new Error("Schedule deployment is out of date")
+      }
+      const latestScheduledAt = this.#state.runs.reduce(
+        (latest, run) =>
+          run.scheduleId === scheduleId
+            ? Math.max(latest, run.scheduledAt)
+            : latest,
+        0
+      )
+      const scheduledAt = Math.max(Date.now(), latestScheduledAt + 1)
+      const { nextRunAt: _, ...definition } = schedule
+      const run = scheduleRunSchema.parse({
+        finishedAt: scheduledAt,
+        id: scheduleStableId(schedule.id, scheduledAt, this.#options.relayId),
+        revision: schedule.revision,
+        scheduleId: schedule.id,
+        scheduledAt,
+        startedAt: scheduledAt,
+        status: "interrupted",
+        targetRuns: [],
+      })
+      this.#upsertRun(run)
+      await this.#persist()
+      return { definition, run, scheduledAt }
+    })
+    this.#launchOccurrence(occurrence.definition, occurrence.scheduledAt)
+    return occurrence.run
+  }
+
   overview(scheduleIds?: ReadonlyArray<string>) {
     const allowed = scheduleIds
       ? new Set(scheduleIds.map((id) => z.uuid().parse(id)))
@@ -242,26 +280,23 @@ export class ScheduleManager {
       return claimed
     })
     for (const occurrence of due) {
-      Effect.runFork(
-        Effect.tryPromise({
-          try: () =>
-            this.#executeOccurrence(
-              occurrence.definition,
-              occurrence.scheduledAt
-            ),
-          catch: (cause) => cause,
-        }).pipe(
-          Effect.catch((cause) =>
-            Effect.sync(() =>
-              console.error(
-                `Scheduled occurrence ${occurrence.definition.id} failed`,
-                cause
-              )
-            )
+      this.#launchOccurrence(occurrence.definition, occurrence.scheduledAt)
+    }
+  }
+
+  #launchOccurrence(definition: RelayScheduleProjection, scheduledAt: number) {
+    Effect.runFork(
+      Effect.tryPromise({
+        try: () => this.#executeOccurrence(definition, scheduledAt),
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.sync(() =>
+            console.error(`Scheduled occurrence ${definition.id} failed`, cause)
           )
         )
       )
-    }
+    )
   }
 
   async #executeOccurrence(

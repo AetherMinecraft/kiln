@@ -26,7 +26,10 @@ import {
 } from "lucide-react"
 
 import type { ScheduleAction, ScheduleTarget } from "@workspace/contracts"
-import { scheduleActionSupportsTarget } from "@workspace/contracts"
+import {
+  normalizeScheduleCron,
+  scheduleActionSupportsTarget,
+} from "@workspace/contracts"
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
 import {
@@ -57,6 +60,7 @@ import {
   deleteSchedule,
   getScheduleOptions,
   getSchedules,
+  runScheduleNow,
   updateSchedule,
 } from "@/server/schedules"
 
@@ -275,20 +279,30 @@ const ScheduleDetail = React.memo(function ScheduleDetail({
   onDelete: () => void
   onEdit: () => void
 }) {
+  const queryClient = useQueryClient()
   const optionMap = new Map(
     options.map((option) => [targetKey(option), option])
   )
-  const canEdit = schedule.targets.every((target) => {
-    const option = optionMap.get(targetKey(target))
-    if (!option?.canUpdate) return false
-    return schedule.actions.every((action) => {
-      if (!scheduleActionSupportsTarget(action, target)) return true
-      return option.permittedActions.includes(action.type)
-    })
-  })
+  const canEdit = canOperateSchedule(schedule, optionMap, "canUpdate")
   const canDelete = schedule.targets.every(
     (target) => optionMap.get(targetKey(target))?.canDelete
   )
+  const canRun = canOperateSchedule(schedule, optionMap, "canExecute")
+  const runMutation = useMutation({
+    mutationFn: () => runScheduleNow({ data: { id: schedule.id } }),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
+      showToast({
+        message:
+          result.started === result.total
+            ? "Schedule started"
+            : `Schedule started on ${result.started} of ${result.total} Relays`,
+        type: result.started === result.total ? "success" : "warning",
+      })
+    },
+    onError: (cause) =>
+      showToast({ message: errorMessage(cause), type: "error" }),
+  })
   const nextRun = scheduleNextRun(schedule)
   const state = deploymentState(schedule)
 
@@ -311,6 +325,21 @@ const ScheduleDetail = React.memo(function ScheduleDetail({
             </p>
           </div>
           <div className="flex items-center gap-2">
+            {canRun ? (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={runMutation.isPending}
+                onClick={() => runMutation.mutate()}
+              >
+                {runMutation.isPending ? (
+                  <LoaderCircle className="size-3.5 animate-spin" />
+                ) : (
+                  <Play className="size-3.5" />
+                )}
+                Run now
+              </Button>
+            ) : null}
             {canEdit ? (
               <Button variant="outline" size="sm" onClick={onEdit}>
                 <Pencil className="size-3.5" />
@@ -566,8 +595,9 @@ function ScheduleEditorDialog({
           ({
             canCreate: _,
             canDelete: __,
-            canUpdate: ___,
-            permittedActions: ____,
+            canExecute: ___,
+            canUpdate: ____,
+            permittedActions: _____,
             ...target
           }) => target
         ),
@@ -665,6 +695,9 @@ function ScheduleEditorDialog({
                   <SelectItem value="custom">Custom cron</SelectItem>
                 </SelectContent>
               </Select>
+              <p className="mt-1.5 font-mono text-[0.625rem] text-muted-foreground">
+                Cron · {normalizeScheduleCron(cron)}
+              </p>
             </Field>
             <Field label="Timezone">
               <Input
@@ -1134,6 +1167,23 @@ function actionDescription(action: ScheduleAction) {
 
 function targetKey(target: Pick<ScheduleTarget, "id" | "kind" | "relayId">) {
   return `${target.relayId}:${target.kind}:${target.id}`
+}
+
+function canOperateSchedule(
+  schedule: Pick<Schedule, "actions" | "targets">,
+  options: ReadonlyMap<string, ScheduleOption>,
+  permission: "canExecute" | "canUpdate"
+) {
+  return schedule.targets.every((target) => {
+    const option = options.get(targetKey(target))
+    if (!option?.[permission]) return false
+    const permittedActions = new Set(option.permittedActions)
+    return schedule.actions.every(
+      (action) =>
+        !scheduleActionSupportsTarget(action, target) ||
+        permittedActions.has(action.type)
+    )
+  })
 }
 
 function moveAction(

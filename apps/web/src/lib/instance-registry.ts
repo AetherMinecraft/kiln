@@ -15,6 +15,37 @@ export function syncInstanceRegistry(
   )
 }
 
+export function registerInstance(
+  relayId: string,
+  instance: Pick<RelayInstance, "id">,
+  ownerId: string
+): Promise<void> {
+  return runAppEffect(
+    "instances.registry.register",
+    registerInstanceEffect(relayId, instance, ownerId)
+  )
+}
+
+export const registerInstanceEffect = Effect.fn("instances.registry.register")(
+  function* (
+    relayId: string,
+    instance: Pick<RelayInstance, "id">,
+    ownerId: string
+  ) {
+    const database = yield* Database
+    yield* database.execute(
+      "instances.registry.register",
+      `INSERT INTO ${databaseTable("instance")}
+         (relay_id, instance_id, display_name, owner_id)
+       VALUES (?, ?, NULL, ?)
+       ON DUPLICATE KEY UPDATE
+         owner_id = COALESCE(owner_id, VALUES(owner_id)),
+         updated_at = CURRENT_TIMESTAMP(3)`,
+      [relayId, instance.id, ownerId]
+    )
+  }
+)
+
 export const syncInstanceRegistryEffect = Effect.fn("instances.registry.sync")(
   function* (
     relayId: string,

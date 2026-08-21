@@ -730,6 +730,7 @@ export function isAuditedOperation(operation: RelayControlOperation): boolean {
     operation === "backup.task.enqueue" ||
     operation === "backup.task.cancel" ||
     operation === "schedule.apply" ||
+    operation === "schedule.run" ||
     operation === "schedule.remove"
   )
 }
@@ -917,6 +918,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "backup.task.list":
       return "backup.read"
     case "schedule.apply":
+    case "schedule.run":
     case "schedule.remove":
       return "schedule.write"
     case "schedule.overview":

@@ -80,4 +80,25 @@ describe("schedule authorization", () => {
       })
     ).not.toBeNull()
   })
+
+  it("requires execute and action permissions to run now", () => {
+    expect(
+      scheduleAuthorizationFailure({
+        actions: [consoleAction],
+        grants: [grant("operator")],
+        schedulePermission: "schedule.execute",
+        targets: [target],
+        user,
+      })
+    ).toBeNull()
+    expect(
+      scheduleAuthorizationFailure({
+        actions: [consoleAction],
+        grants: [grant("viewer")],
+        schedulePermission: "schedule.execute",
+        targets: [target],
+        user,
+      })
+    ).toContain("schedule.execute")
+  })
 })

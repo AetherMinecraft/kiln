@@ -62,6 +62,7 @@ export const accessPermissions = [
   "backup.delete",
   "schedule.read",
   "schedule.create",
+  "schedule.execute",
   "schedule.update",
   "schedule.delete",
 ] as const
@@ -109,6 +110,7 @@ const rolePermissions: Record<AccessRole, ReadonlySet<AccessPermission>> = {
     "backup.delete",
     "schedule.read",
     "schedule.create",
+    "schedule.execute",
     "schedule.update",
     "schedule.delete",
   ]),
