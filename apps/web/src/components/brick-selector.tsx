@@ -789,8 +789,16 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
             </Button>
           </div>
           <p className="mt-2 text-[0.6875rem] leading-relaxed text-muted-foreground">
-            Repository shorthand reads catalog.yml from the repository root.
-            Catalogs are validated and stored as snapshots.
+            Example catalog can be found{" "}
+            <a
+              href="https://github.com/kiln-site/kiln/blob/main/apps/bricks/catalog.yml"
+              target="_blank"
+              rel="noreferrer"
+              className="text-foreground underline underline-offset-2 hover:text-primary"
+            >
+              here
+            </a>
+            .
           </p>
         </form>
 
