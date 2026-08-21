@@ -41,6 +41,7 @@ import { getRelays, getRelayTailscale } from "@/server/relays"
 import { getTailscaleStacks } from "@/server/tailscale"
 import { getAuthState } from "@/server/auth"
 import { getUpdateOverview } from "@/server/updates"
+import { getScheduleOptions, getSchedules } from "@/server/schedules"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 
 export type UiPreferences = Awaited<ReturnType<typeof getUiPreferences>>
@@ -113,11 +114,33 @@ export const queryKeys = {
     tree: (relayId: string, instanceId: string) =>
       ["relay", relayId, "instances", instanceId, "files", "tree"] as const,
   },
+  schedules: {
+    all: ["schedules"] as const,
+    options: ["schedules", "options"] as const,
+  },
   relays: ["relays"] as const,
   tailscale: (relayId: string) => ["relays", relayId, "tailscale"] as const,
   tailscaleStacks: ["tailscale", "stacks"] as const,
   updates: ["updates", "overview"] as const,
   uiPreferences: ["ui", "preferences"] as const,
+}
+
+export function schedulesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.schedules.all,
+    queryFn: () => getSchedules(),
+    refetchInterval: 15_000,
+    refetchOnWindowFocus: "always",
+    staleTime: 5_000,
+  })
+}
+
+export function scheduleOptionsQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.schedules.options,
+    queryFn: () => getScheduleOptions(),
+    staleTime: 30_000,
+  })
 }
 
 export function replaceRelaySnapshotInstance(

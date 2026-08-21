@@ -45,6 +45,7 @@ import {
   relayRotateDatabaseCredentialsSchema,
   relayUpdateInstanceStartupSchema,
   relayBootstrapDiscoveryTranscript,
+  relayScheduleProjectionSchema,
 } from "@workspace/contracts"
 import type {
   RelayControlOperation,
@@ -110,6 +111,7 @@ import { RelaySnapshotHub } from "./snapshot-hub.js"
 import { retainProvisioningInstances } from "./instance-mutation-snapshot.js"
 import { RuntimeRecoveryManager } from "./runtime-recovery.js"
 import { SystemUpdateManager } from "./system-updates.js"
+import { ScheduleManager } from "./schedules.js"
 import { assignRelayWebRouteIds } from "./web-route-ids.js"
 import { planWebRouteRecovery } from "./web-route-labels.js"
 import type {
@@ -273,6 +275,69 @@ const backupManager = await runRelayEffect(
   })
 )
 const backupFiber = forkRelayEffect("relay.backups.worker", backupManager.run())
+const scheduleManager = await ScheduleManager.make({
+  enqueueBackup: (input) =>
+    runRelayEffect(
+      "relay.schedules.backup.enqueue",
+      backupManager.enqueue(input)
+    ),
+  findInstance: (instanceId) => docker.findInstance(instanceId),
+  forkEffect: (name, effect) => forkRelayEffect(name, effect),
+  getBackup: (taskId) =>
+    runRelayEffect("relay.schedules.backup.get", backupManager.get(taskId)),
+  listDatabaseIds: async () =>
+    new Set((await databases.list()).map((database) => database.id)),
+  platformTargetId: config.installationId ?? relayIdentity.fingerprint,
+  relayId: relayIdentity.fingerprint,
+  reportError: (message, cause) => {
+    Sentry.captureException(
+      cause instanceof Error ? cause : new Error(message, { cause }),
+      { tags: { "kiln.operation": "schedule.occurrence" } }
+    )
+  },
+  runDatabasePower: async (databaseId, action) => {
+    await databases.action({ action, databaseId })
+  },
+  runInstancePower: async (instanceId, action) => {
+    const instance = await docker.findInstance(instanceId)
+    if (!instance) throw new Error("Instance not found")
+    const runAction = async () => {
+      const [routes, pendingPrimaryPort] = await Effect.runPromise(
+        Effect.all(
+          [
+            startup.state.listInstanceRoutes(instance.id),
+            startup.state.getPendingPrimaryPort(instance.id),
+          ] as const,
+          { concurrency: 2 }
+        )
+      )
+      await serializeInstanceMutation(instance.id, () =>
+        lifecycle.runInstanceAction(
+          instance,
+          action,
+          routes,
+          pendingPrimaryPort
+        )
+      )
+      await snapshotHub.refresh()
+    }
+    if (action === "start" || action === "restart") {
+      await serializeWebRouteMutation(runAction)
+    } else {
+      await runAction()
+    }
+  },
+  sendConsoleCommand: async (instanceId, command) => {
+    const instance = await docker.findInstance(instanceId)
+    if (!instance) throw new Error("Instance not found")
+    await docker.sendCommand(instance, command)
+  },
+  stateDirectory: `${config.dataDirectory}/schedules`,
+})
+const scheduleFiber = forkRelayEffect(
+  "relay.schedules.worker",
+  scheduleManager.run()
+)
 const backupDownloads = new BackupDownloadServer({
   config,
   identity: relayIdentity,
@@ -555,6 +620,8 @@ const sftpServer = await Effect.runPromise(
       Effect.sync(() => {
         tailscaleFirewallFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
+        scheduleFiber.interruptUnsafe()
+        scheduleManager.close()
         lifecycle.close()
         snapshotHub.close()
       }).pipe(
@@ -777,6 +844,8 @@ function shutdownRelay(signal: NodeJS.Signals): Promise<void> {
         tailscaleFirewallFiber.interruptUnsafe()
         tlsRefreshFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
+        scheduleFiber.interruptUnsafe()
+        scheduleManager.close()
         lifecycle.close()
         snapshotHub.close()
       })
@@ -1169,6 +1238,31 @@ async function executeControlRequest(
           .list(updatedAfter === undefined ? undefined : Number(updatedAfter))
           .pipe(Effect.map((tasks) => tasks.map(redactRelayBackupTask)))
       )
+    }
+    case "schedule.apply":
+      return scheduleManager.apply(
+        relayScheduleProjectionSchema.parse(request.payload)
+      )
+    case "schedule.run":
+      return scheduleManager.runNow({
+        revision: requiredPositiveInteger(payload, "revision"),
+        scheduleId: requiredString(payload, "scheduleId"),
+      })
+    case "schedule.remove":
+      return scheduleManager.remove({
+        revision: requiredPositiveInteger(payload, "revision"),
+        scheduleId: requiredString(payload, "scheduleId"),
+      })
+    case "schedule.overview": {
+      const scheduleIds = Array.isArray(payload.scheduleIds)
+        ? payload.scheduleIds.map((value) => {
+            if (typeof value !== "string") {
+              throw new Error("scheduleIds must contain strings")
+            }
+            return value
+          })
+        : undefined
+      return scheduleManager.overview(scheduleIds)
     }
     case "instance.create": {
       if (!config.canProvisionInstances) {
@@ -1685,6 +1779,17 @@ function optionalString(
 ): string | undefined {
   const field = value[key]
   return typeof field === "string" && field ? field : undefined
+}
+
+function requiredPositiveInteger(
+  value: Readonly<Record<string, unknown>>,
+  key: string
+): number {
+  const field = value[key]
+  if (!Number.isSafeInteger(field) || Number(field) <= 0) {
+    throw new Error(`${key} must be a positive integer`)
+  }
+  return Number(field)
 }
 
 function systemUpdateTarget(value: unknown): {

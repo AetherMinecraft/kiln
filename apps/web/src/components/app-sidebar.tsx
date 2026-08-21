@@ -6,6 +6,7 @@ import {
 } from "@tanstack/react-query"
 import {
   Archive,
+  CalendarClock,
   ChevronsUpDown,
   Database,
   Folder,
@@ -710,6 +711,19 @@ function AccountNavigation({
     <SidebarFooter>
       <SidebarMenu>
         <SidebarMenuItem>
+          <SidebarMenuButton asChild tooltip="Schedules">
+            <Link
+              to="/schedules"
+              activeOptions={{ includeSearch: false }}
+              activeProps={{ "data-active": true }}
+              preload="intent"
+            >
+              <CalendarClock />
+              <span>Schedules</span>
+            </Link>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+        <SidebarMenuItem>
           <SidebarMenuButton asChild tooltip="Backups">
             <Link
               to="/backups"
@@ -875,6 +889,9 @@ function statusBorderTone(state: SidebarInstance["observedState"]): string {
 
 function globalSectionFromPathname(pathname: string): GlobalSection {
   if (pathname === "/infra" || pathname.startsWith("/infra/")) return "infra"
+  if (pathname === "/schedules" || pathname.startsWith("/schedules/")) {
+    return "schedules"
+  }
   if (pathname === "/backups") return "backups"
   if (pathname === "/access") return "access"
   if (pathname === "/settings" || pathname.startsWith("/settings/")) {

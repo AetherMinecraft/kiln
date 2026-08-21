@@ -1,3 +1,5 @@
+import { Effect } from "effect"
+
 import {
   localBackupDestination,
   localBackupDestinationTaskDriver,
@@ -71,9 +73,14 @@ export function prepareResticRepositoryLocation(input: {
   requireEnabled: boolean
   storageId: string | null
 }) {
-  return input.storageId === null
-    ? backupDestinationTaskDrivers.local.prepareResticRepository(input)
-    : backupDestinationTaskDrivers.s3.prepareResticRepository(input)
+  return Effect.gen(function* () {
+    if (input.storageId === null) {
+      return yield* backupDestinationTaskDrivers.local.prepareResticRepository(
+        input
+      )
+    }
+    return yield* backupDestinationTaskDrivers.s3.prepareResticRepository(input)
+  })
 }
 
 export function prepareBackupDestinationDownload(input: {

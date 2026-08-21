@@ -139,3 +139,10 @@ describe("backup permissions", () => {
     ).toBe(false)
   })
 })
+
+describe("schedule permissions", () => {
+  it("allows operators, but not viewers, to run schedules", () => {
+    expect(roleHasPermission("operator", "schedule.execute")).toBe(true)
+    expect(roleHasPermission("viewer", "schedule.execute")).toBe(false)
+  })
+})

@@ -3,7 +3,10 @@ import { Effect, Layer } from "effect"
 import type { ResultSetHeader } from "mysql2/promise"
 
 import { Database } from "@/effect/database"
-import { syncInstanceRegistryEffect } from "@/lib/instance-registry"
+import {
+  registerInstanceEffect,
+  syncInstanceRegistryEffect,
+} from "@/lib/instance-registry"
 
 const emptyResult: ResultSetHeader = {
   affectedRows: 0,
@@ -17,6 +20,38 @@ const emptyResult: ResultSetHeader = {
 }
 
 describe("instance registry sync", () => {
+  it.effect("registers a newly created instance immediately", () => {
+    const statements: Array<{
+      sql: string
+      values: ReadonlyArray<unknown>
+    }> = []
+    const databaseLayer = Layer.succeed(Database)({
+      execute: (_operation, sql, values) =>
+        Effect.sync(() => {
+          statements.push({ sql, values: values ?? [] })
+          return emptyResult
+        }),
+      queryRows: () => Effect.die("Unexpected database query"),
+      transaction: () => Effect.die("Unexpected transaction"),
+    })
+
+    return Effect.gen(function* () {
+      yield* registerInstanceEffect(
+        "relay-one",
+        { id: "instance-one" },
+        "user-one"
+      )
+
+      assert.lengthOf(statements, 1)
+      assert.include(statements[0]?.sql ?? "", "owner_id")
+      assert.deepEqual(statements[0]?.values, [
+        "relay-one",
+        "instance-one",
+        "user-one",
+      ])
+    }).pipe(Effect.provide(databaseLayer))
+  })
+
   it.effect(
     "does not write non-unique Relay names into the registry key",
     () => {

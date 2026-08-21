@@ -61,6 +61,11 @@ export const accessPermissions = [
   "backup.download",
   "backup.restore",
   "backup.delete",
+  "schedule.read",
+  "schedule.create",
+  "schedule.execute",
+  "schedule.update",
+  "schedule.delete",
 ] as const
 
 export type AccessPermission = (typeof accessPermissions)[number]
@@ -105,6 +110,11 @@ const rolePermissions: Record<AccessRole, ReadonlySet<AccessPermission>> = {
     "backup.download",
     "backup.restore",
     "backup.delete",
+    "schedule.read",
+    "schedule.create",
+    "schedule.execute",
+    "schedule.update",
+    "schedule.delete",
   ]),
   viewer: new Set([
     "relay.read",
@@ -118,6 +128,7 @@ const rolePermissions: Record<AccessRole, ReadonlySet<AccessPermission>> = {
     "database.network.read",
     "backup.read",
     "backup.download",
+    "schedule.read",
   ]),
 }
 

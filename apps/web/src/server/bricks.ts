@@ -30,6 +30,7 @@ import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { listMcJarVersionsEffect } from "@/effect/mcjarfiles"
 import { runAppEffect } from "@/effect/runtime"
+import { registerInstance } from "@/lib/instance-registry"
 import {
   invalidateRelayCache,
   relayCachePolicy,
@@ -153,6 +154,7 @@ export const createBrickInstance = createServerFn({ method: "POST" })
         user.id
       )
     )
+    await registerInstance(relay.id, instance, user.id)
     await provisionInstanceDomainBestEffort(instance, relay.id)
     await runAppEffect(
       "relay.snapshot.invalidate",
