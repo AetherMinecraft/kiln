@@ -1697,7 +1697,6 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
       >
         <ScheduleActionsEditor
           actions={actions}
-          hideBackupName
           hideHeader
           permissionKey={permissionKey}
           selectedOptions={selectedOptions}
@@ -1916,7 +1915,6 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
 
 const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
   actions,
-  hideBackupName = true,
   hideHeader = false,
   permissionKey,
   selectedOptions,
@@ -1927,7 +1925,6 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
   onReorder,
 }: {
   actions: ReadonlyArray<ScheduleActionDraft>
-  hideBackupName?: boolean
   hideHeader?: boolean
   permissionKey: "canCreate" | "canUpdate"
   selectedOptions: ReadonlyArray<ScheduleOption>
@@ -1970,7 +1967,6 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
               key={action.id}
               action={action}
               dragging={draggedActionId === action.id}
-              hideBackupName={hideBackupName}
               index={index}
               permissionKey={permissionKey}
               selectedOptions={selectedOptions}
@@ -2042,7 +2038,6 @@ function Field({
 const ActionEditor = React.memo(function ActionEditor({
   action,
   dragging,
-  hideBackupName = false,
   index,
   permissionKey,
   selectedOptions,
@@ -2057,7 +2052,6 @@ const ActionEditor = React.memo(function ActionEditor({
 }: {
   action: ScheduleActionDraft
   dragging: boolean
-  hideBackupName?: boolean
   index: number
   permissionKey: "canCreate" | "canUpdate"
   selectedOptions: ReadonlyArray<ScheduleOption>
@@ -2088,19 +2082,19 @@ const ActionEditor = React.memo(function ActionEditor({
 
   return (
     <div
-      className={`h-44 rounded-lg border bg-background/45 p-2.5 transition-[border-color,opacity] sm:h-32 ${dragging ? "border-primary/40 opacity-55" : ""}`}
+      className={`h-16 rounded-lg border bg-background/45 p-2 transition-[border-color,opacity] ${dragging ? "border-primary/40 opacity-55" : ""}`}
       onDragOver={(event) => {
         event.preventDefault()
         onDragOver(action.id)
       }}
       onDrop={(event) => event.preventDefault()}
     >
-      <div className="flex h-full items-start gap-3">
+      <div className="grid h-full grid-cols-[2rem_minmax(0,0.85fr)_minmax(0,1.15fr)_auto] items-center gap-2">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
-              className="grid h-full w-8 shrink-0 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing"
+              className="-my-2 grid h-[calc(100%+1rem)] w-8 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing"
               draggable
               type="button"
               onDragEnd={onDragEnd}
@@ -2125,132 +2119,109 @@ const ActionEditor = React.memo(function ActionEditor({
           </TooltipTrigger>
           <TooltipContent side="left">Drag to reorder</TooltipContent>
         </Tooltip>
-        <div className="min-w-0 flex-1">
-          <div className="mb-2 flex items-center gap-2">
-            {action.type === null ? null : (
-              <ActionIcon
-                type={action.type}
-                className="size-4 shrink-0 text-primary"
-              />
-            )}
-            <Select
-              value={action.type ?? ""}
-              onValueChange={(value) =>
-                onChange(
-                  createScheduleAction(
-                    value as ScheduleAction["type"],
-                    action.id
-                  )
-                )
-              }
+        <div className="flex min-w-0 items-center gap-2">
+          <Select
+            value={action.type ?? ""}
+            onValueChange={(value) =>
+              onChange(
+                createScheduleAction(value as ScheduleAction["type"], action.id)
+              )
+            }
+          >
+            <SelectTrigger
+              aria-label={`Action ${index + 1} type`}
+              className="h-8 min-w-0 flex-1 justify-start text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:text-left"
             >
-              <SelectTrigger
-                aria-label={`Action ${index + 1} type`}
-                className="h-8 w-full text-xs"
-              >
-                <SelectValue placeholder="Select action type" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="console_command">Run command</SelectItem>
-                <SelectItem value="backup">Create backup</SelectItem>
-                <SelectItem value="power">Power action</SelectItem>
-              </SelectContent>
-            </Select>
-            <ActionCompatibilityWarning
-              restrictedTargets={restrictedTargets}
-              unsupportedTargets={unsupportedTargets}
-            />
-          </div>
+              {action.type === null ? null : (
+                <ActionIcon
+                  type={action.type}
+                  className="size-4 shrink-0 text-primary"
+                />
+              )}
+              <SelectValue placeholder="Select action type" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="console_command">Run command</SelectItem>
+              <SelectItem value="backup">Create backup</SelectItem>
+              <SelectItem value="power">Power action</SelectItem>
+            </SelectContent>
+          </Select>
+          <ActionCompatibilityWarning
+            restrictedTargets={restrictedTargets}
+            unsupportedTargets={unsupportedTargets}
+          />
+        </div>
+        <div className="min-w-0">
           {action.type === "console_command" ? (
             <CommandEditorField
               value={action.command}
               onChange={(command) => onChange({ ...action, command })}
             />
           ) : action.type === "backup" ? (
-            <div>
-              <div
-                className={`grid gap-2 ${hideBackupName ? "sm:grid-cols-2" : "sm:grid-cols-3"}`}
+            <div className="grid min-w-0 grid-cols-2 gap-2">
+              <Select
+                value={action.mode}
+                onValueChange={(value) => {
+                  const mode = value as typeof action.mode
+                  onChange({
+                    ...action,
+                    destination:
+                      mode === "full" ? { kind: "local" } : action.destination,
+                    mode,
+                  })
+                }}
               >
-                {hideBackupName ? null : (
-                  <Input
-                    aria-label="Backup name"
-                    value={action.name}
-                    maxLength={120}
-                    placeholder="Scheduled backup"
-                    onChange={(event) =>
-                      onChange({ ...action, name: event.target.value })
-                    }
-                  />
-                )}
-                <Select
-                  value={action.mode}
-                  onValueChange={(value) => {
-                    const mode = value as typeof action.mode
-                    onChange({
-                      ...action,
-                      destination:
-                        mode === "full"
-                          ? { kind: "local" }
-                          : action.destination,
-                      mode,
-                    })
-                  }}
+                <SelectTrigger
+                  aria-label="Backup mode"
+                  className="w-full min-w-0 [&_[data-slot=select-value]]:truncate"
                 >
-                  <SelectTrigger aria-label="Backup mode" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="incremental">Incremental</SelectItem>
-                    <SelectItem value="full">Full archive</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Select
-                  value={
-                    action.destination.kind === "storage"
-                      ? action.destination.storageId
-                      : "local"
-                  }
-                  onValueChange={(value) =>
-                    onChange({
-                      ...action,
-                      destination:
-                        value === "local"
-                          ? { kind: "local" }
-                          : { kind: "storage", storageId: value },
-                    })
-                  }
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="incremental">Incremental</SelectItem>
+                  <SelectItem value="full">Full archive</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select
+                value={
+                  action.destination.kind === "storage"
+                    ? action.destination.storageId
+                    : "local"
+                }
+                onValueChange={(value) =>
+                  onChange({
+                    ...action,
+                    destination:
+                      value === "local"
+                        ? { kind: "local" }
+                        : { kind: "storage", storageId: value },
+                  })
+                }
+              >
+                <SelectTrigger
+                  aria-label="Backup destination"
+                  className="w-full min-w-0 [&_[data-slot=select-value]]:truncate"
                 >
-                  <SelectTrigger
-                    aria-label="Backup destination"
-                    className="w-full"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="local">Local Relay</SelectItem>
-                    {action.mode === "incremental"
-                      ? storage.flatMap((destination) =>
-                          destination.enabled && !destination.deleting
-                            ? [
-                                <SelectItem
-                                  key={destination.id}
-                                  value={destination.id}
-                                >
-                                  {destination.name}
-                                </SelectItem>,
-                              ]
-                            : []
-                        )
-                      : null}
-                  </SelectContent>
-                </Select>
-              </div>
-              {hideBackupName ? (
-                <p className="mt-2 text-[0.625rem] leading-4 text-muted-foreground">
-                  Backups are named automatically
-                  (scheduled-YYYY.MM.DD-HH.mm.ssZ).
-                </p>
-              ) : null}
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="local">Local Relay</SelectItem>
+                  {action.mode === "incremental"
+                    ? storage.flatMap((destination) =>
+                        destination.enabled && !destination.deleting
+                          ? [
+                              <SelectItem
+                                key={destination.id}
+                                value={destination.id}
+                              >
+                                {destination.name}
+                              </SelectItem>,
+                            ]
+                          : []
+                      )
+                    : null}
+                </SelectContent>
+              </Select>
             </div>
           ) : action.type === "power" ? (
             <Select
@@ -2259,7 +2230,7 @@ const ActionEditor = React.memo(function ActionEditor({
                 onChange({ ...action, action: value as typeof action.action })
               }
             >
-              <SelectTrigger className="w-full">
+              <SelectTrigger className="w-full min-w-0 [&_[data-slot=select-value]]:truncate">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -2269,11 +2240,7 @@ const ActionEditor = React.memo(function ActionEditor({
                 <SelectItem value="kill">Kill</SelectItem>
               </SelectContent>
             </Select>
-          ) : (
-            <p className="py-1 text-xs text-muted-foreground">
-              Choose what this action should do.
-            </p>
-          )}
+          ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
           <ActionRowButton
