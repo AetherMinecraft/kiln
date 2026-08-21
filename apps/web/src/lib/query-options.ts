@@ -17,6 +17,10 @@ import {
   getInstanceRecipe,
   getInstanceStartup,
 } from "@/server/bricks"
+import {
+  getBrickCatalogDetails,
+  listBrickCatalogs,
+} from "@/server/brick-catalogs"
 import { getDomainSettings, getInstanceDomain } from "@/server/domains"
 import {
   getManagedDatabaseCredential,
@@ -68,6 +72,10 @@ export const queryKeys = {
     storage: ["backups", "storage"] as const,
   },
   bricks: ["bricks", "catalog"] as const,
+  brickCatalogs: {
+    all: ["bricks", "catalogs"] as const,
+    detail: (catalogId: string) => ["bricks", "catalogs", catalogId] as const,
+  },
   brickVersions: (type: string, variant: string) =>
     ["bricks", "versions", type, variant] as const,
   domains: {
@@ -353,6 +361,20 @@ export function brickCatalogQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.bricks,
     queryFn: () => getBrickCatalog(),
+  })
+}
+
+export function brickCatalogsQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.brickCatalogs.all,
+    queryFn: () => listBrickCatalogs(),
+  })
+}
+
+export function brickCatalogDetailsQueryOptions(catalogId: string) {
+  return queryOptions({
+    queryKey: queryKeys.brickCatalogs.detail(catalogId),
+    queryFn: () => getBrickCatalogDetails({ data: { catalogId } }),
   })
 }
 

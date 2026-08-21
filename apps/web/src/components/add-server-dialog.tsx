@@ -150,6 +150,7 @@ const AddServerDialog = React.memo(function AddServerDialog({
         ) : (
           <AddServerForm
             bricks={catalogQuery.data.bricks}
+            canAddCustomBrick={catalogQuery.data.canAddCustomBrick}
             customBricks={catalogQuery.data.customBricks}
             relays={catalogQuery.data.relays}
             onClose={() => onOpenChange(false)}
@@ -162,11 +163,13 @@ const AddServerDialog = React.memo(function AddServerDialog({
 
 const AddServerForm = React.memo(function AddServerForm({
   bricks,
+  canAddCustomBrick,
   customBricks,
   relays,
   onClose,
 }: {
   bricks: Array<Brick>
+  canAddCustomBrick: boolean
   customBricks: Array<Brick>
   relays: Array<PersistedRelay>
   onClose: () => void
@@ -225,6 +228,7 @@ const AddServerForm = React.memo(function AddServerForm({
     <BrickCatalogBrowser
       relayId={relayId}
       bricks={bricks}
+      canAddCustomBrick={canAddCustomBrick}
       customBricks={customBricks}
       selection={selection}
       onSelectionChange={changeSelection}

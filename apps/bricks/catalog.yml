@@ -1,4 +1,8 @@
 format: kiln.catalog/v1
+name: Kiln
+author: QarthO
+docs: "https://kiln.site/docs"
+support: "https://discord.gg/gu76VAtSK5"
 recipes:
   - recipes/paper.yml
   - recipes/folia.yml

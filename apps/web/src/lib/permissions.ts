@@ -5,6 +5,8 @@ export const platformPermissions = [
   "platform.appearance.manage-default",
   "platform.backups.manage-storage",
   "platform.backups.manage-limits",
+  "platform.bricks.add-catalog",
+  "platform.bricks.add-custom",
   "platform.network.override-public-port-range",
 ] as const
 export type PlatformPermission = (typeof platformPermissions)[number]
@@ -14,7 +16,10 @@ const platformRolePermissions: Record<
   ReadonlySet<PlatformPermission>
 > = {
   admin: new Set(platformPermissions),
-  relay_creator: new Set(),
+  relay_creator: new Set([
+    "platform.bricks.add-catalog",
+    "platform.bricks.add-custom",
+  ]),
   user: new Set(),
 }
 

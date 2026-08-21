@@ -156,7 +156,7 @@ const cliArguments = process.argv.slice(2)
 let relayIdentity = startupCore.identity
 config.nodeId = relayIdentity.fingerprint
 config.nodeName = relayIdentity.name
-const bricks = new BrickCatalog(config.brickCatalogUrl)
+const bricks = new BrickCatalog(config.brickCatalogUrl, config.dataDirectory)
 const runtimeRecovery = new RuntimeRecoveryManager(config, startupCore.state)
 await runRelayEffect(
   "relay.startup.runtimeRecovery",
@@ -1100,7 +1100,10 @@ async function executeControlRequest(
       return bricks.catalog()
     case "brick.recipe":
       return {
-        ...(await bricks.recipe(requiredString(payload, "source"))),
+        ...(await bricks.recipe(
+          requiredString(payload, "source"),
+          optionalString(payload, "snapshotSha256")
+        )),
         source: requiredString(payload, "source"),
       }
     case "database.list":
@@ -1138,9 +1141,7 @@ async function executeControlRequest(
       return runRelayEffect(
         "relay.backups.cancel",
         backupManager
-          .cancel(
-            backupTaskIdSchema.parse(requiredString(payload, "taskId"))
-          )
+          .cancel(backupTaskIdSchema.parse(requiredString(payload, "taskId")))
           .pipe(
             Effect.map((task) => (task ? redactRelayBackupTask(task) : task))
           )

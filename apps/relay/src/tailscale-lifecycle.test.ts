@@ -123,7 +123,7 @@ describe("Tailscale pending removal recovery", () => {
     const lifecycle = new LifecycleDriver(
       config,
       new DockerDriver(config),
-      new BrickCatalog(config.brickCatalogUrl)
+      new BrickCatalog(config.brickCatalogUrl, config.dataDirectory)
     )
 
     await expect(lifecycle.removeTailscaleStack(id)).rejects.toThrow(
@@ -251,7 +251,7 @@ describe("Tailscale pending removal recovery", () => {
     const lifecycle = new LifecycleDriver(
       config,
       new DockerDriver(config),
-      new BrickCatalog(config.brickCatalogUrl)
+      new BrickCatalog(config.brickCatalogUrl, config.dataDirectory)
     )
 
     await expect(lifecycle.removeTailscaleStack(id)).rejects.toThrow(
@@ -350,7 +350,7 @@ describe("Tailscale pending removal recovery", () => {
     const lifecycle = new LifecycleDriver(
       config,
       new DockerDriver(config),
-      new BrickCatalog(config.brickCatalogUrl)
+      new BrickCatalog(config.brickCatalogUrl, config.dataDirectory)
     )
 
     await lifecycle.reconcileTailscaleStackFirewalls()

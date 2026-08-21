@@ -18,6 +18,7 @@ describe("loadConfig", () => {
     )
 
     const fork = loadConfig({
+      KILN_BRICKS_CATALOG_URL: "https://attacker.test/catalog.yml",
       KILN_GIT_REPO: "example/kiln-fork",
       NODE_ENV: "development",
     })
@@ -25,6 +26,13 @@ describe("loadConfig", () => {
     expect(fork.brickCatalogUrl).toBe(
       "https://raw.githubusercontent.com/example/kiln-fork/main/apps/bricks/catalog.yml"
     )
+
+    expect(
+      loadConfig({
+        KILN_BRICKS_CATALOG_URL: "file:///opt/kiln/catalog.yml",
+        NODE_ENV: "development",
+      }).brickCatalogUrl
+    ).toBe("file:///opt/kiln/catalog.yml")
   })
 
   it("defaults the Relay and SFTP ports", () => {

@@ -33,7 +33,6 @@ import {
   cliSftpResponseSchema,
   cliUpdateServerStartupRequestSchema,
   databaseEngineSupportsLogicalBackups,
-  relayCatalogSchema,
   relayConsoleCommandResultSchema,
   relayConsoleSchema,
   relayFileContentSchema,
@@ -68,6 +67,7 @@ import {
 import { CliAccessError, RelayUnavailableError } from "@/effect/errors"
 import {
   allowedInstanceIdsEffect,
+  hasPlatformPermission,
   isPlatformAdmin,
   isRelayCreator,
   listUserGrantsEffect,
@@ -94,6 +94,7 @@ import {
 import { listManagedDatabaseRecordsEffect } from "@/effect/managed-databases"
 import { getActivityForUser } from "@/server/activity-data.server"
 import { provisionInstanceDomainBestEffort } from "@/server/domains.server"
+import { visibleBrickCatalogs } from "@/server/brick-catalogs.server"
 
 const CLI_RELAY_LONG_OPERATION_TIMEOUT_MS = 180_000
 
@@ -720,14 +721,17 @@ export const createCliServerEffect = Effect.fn("cli.api.servers.create")(
         "You can only create servers on Relays you manage."
       )
     }
-    const recipe = yield* resolveBrickSource(relay, input.brick, principal)
+    const brick = yield* resolveBrickSource(input.brick, principal)
     const result = yield* relayRpcEffect(
       relay,
       "instance.create",
       {
         diskLimitBytes: input.diskLimitBytes,
         name: input.name,
-        recipe,
+        recipe: brick.source,
+        ...(brick.recipeDefinition
+          ? { recipeDefinition: brick.recipeDefinition }
+          : {}),
         start: input.start,
         variables: input.variables,
       },
@@ -770,10 +774,10 @@ export const updateCliServerStartupEffect = Effect.fn(
     input,
     "instance.settings"
   )
-  const recipe = input.brick
-    ? yield* resolveBrickSource(relay, input.brick, principal)
+  const brick = input.brick
+    ? yield* resolveBrickSource(input.brick, principal)
     : undefined
-  const variables = recipe
+  const variables = brick
     ? input.variables
     : { ...instance.variables, ...input.variables }
   const result = yield* relayRpcEffect(
@@ -784,7 +788,14 @@ export const updateCliServerStartupEffect = Effect.fn(
         ? {}
         : { diskLimitBytes: input.diskLimitBytes }),
       instanceId: instance.id,
-      ...(recipe ? { recipe } : {}),
+      ...(brick
+        ? {
+            recipe: brick.source,
+            ...(brick.recipeDefinition
+              ? { recipeDefinition: brick.recipeDefinition }
+              : {}),
+          }
+        : {}),
       start: input.start,
       variables,
     },
@@ -1484,29 +1495,49 @@ const loadAuthorizedInstance = Effect.fn("cli.api.instance.load")(function* (
 })
 
 const resolveBrickSource = Effect.fn("cli.api.brick.resolve")(function* (
-  relay: PersistedRelay,
   brick: string,
   principal: CliPrincipal
 ) {
-  if (/^https:\/\//iu.test(brick)) return brick
-  const catalogValue = yield* relayRpcEffect(
-    relay,
-    "brick.catalog",
-    {},
-    principal
+  if (/^https:\/\//iu.test(brick)) {
+    if (!hasPlatformPermission(principal.user, "platform.bricks.add-custom")) {
+      return yield* CliAccessError.make({
+        code: "forbidden",
+        message: "Custom Bricks require Bring your own Relay access.",
+        retryable: false,
+      })
+    }
+    return { source: brick }
+  }
+  const catalogs = yield* Effect.tryPromise({
+    try: () => visibleBrickCatalogs(principal.user),
+    catch: (cause) =>
+      CliAccessError.make({
+        code: "unexpected_error",
+        message: "Hearth could not load the Brick catalogs.",
+        retryable: true,
+        cause,
+      }),
+  })
+  const matches = catalogs.flatMap((catalog) =>
+    catalog.bricks.filter((candidate) => candidate.metadata.id === brick)
   )
-  const catalog = relayCatalogSchema.parse(catalogValue)
-  const source = catalog.bricks.find(
-    (candidate) => candidate.metadata.id === brick
-  )?.source
-  if (!source) {
+  if (matches.length === 0) {
     return yield* CliAccessError.make({
       code: "not_found",
-      message: `Brick ${brick} is not available on this Relay.`,
+      message: `Brick ${brick} is not available in your Hearth catalogs.`,
       retryable: false,
     })
   }
-  return source
+  if (matches.length > 1) {
+    return yield* CliAccessError.make({
+      code: "conflict",
+      message: `Brick ${brick} is provided by more than one catalog. Use its HTTPS recipe URL.`,
+      retryable: false,
+    })
+  }
+  const selected = matches[0]!
+  const { source, ...recipeDefinition } = selected
+  return { recipeDefinition, source }
 })
 
 function cliRelaySummary(

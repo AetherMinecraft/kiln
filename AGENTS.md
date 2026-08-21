@@ -107,6 +107,7 @@ Before making a change to any of Kiln's core components, you'll need to set up t
 1. Run `pnpm dev:docker:destroy` in the merged worktree.
 2. Switch to `main` and run `git pull --ff-only`.
 3. Delete the merged worktree and local branch.
+4. Delete the merged branch from `origin` with `git push origin --delete <branch>`.
 
 # Reference Repos
 

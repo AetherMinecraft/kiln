@@ -437,6 +437,7 @@ const StartupForm = React.memo(function StartupForm({
             onOpenChange={setSwapOpen}
             relayId={relayId}
             bricks={catalogQuery.data?.bricks ?? emptyBricks}
+            canAddCustomBrick={catalogQuery.data?.canAddCustomBrick ?? false}
             customBricks={catalogQuery.data?.customBricks ?? emptyBricks}
             loading={catalogQuery.isPending}
             error={catalogQuery.error?.message ?? null}
@@ -776,6 +777,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
   onOpenChange,
   relayId,
   bricks,
+  canAddCustomBrick,
   customBricks,
   loading,
   error,
@@ -786,6 +788,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
   onOpenChange: (open: boolean) => void
   relayId: string
   bricks: Array<Brick>
+  canAddCustomBrick: boolean
   customBricks: Array<Brick>
   loading: boolean
   error: string | null
@@ -799,6 +802,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
         onOpenChange={onOpenChange}
         relayId={relayId}
         bricks={[]}
+        canAddCustomBrick={canAddCustomBrick}
         customBricks={customBricks}
         initial={null}
         title="Swap Brick"
@@ -816,6 +820,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
         onOpenChange={onOpenChange}
         relayId={relayId}
         bricks={[]}
+        canAddCustomBrick={canAddCustomBrick}
         customBricks={customBricks}
         initial={null}
         title="Swap Brick"
@@ -834,6 +839,7 @@ const StartupBrickSwapDialog = React.memo(function StartupBrickSwapDialog({
       onOpenChange={onOpenChange}
       relayId={relayId}
       bricks={bricks}
+      canAddCustomBrick={canAddCustomBrick}
       customBricks={customBricks}
       initial={initial}
       title="Swap Brick"
@@ -872,8 +878,9 @@ const StartupBrickReinstallDialog = React.memo(
           <DialogHeader>
             <DialogTitle>Reinstall {brickName}</DialogTitle>
             <DialogDescription>
-              Rebuilds the container from the current Ember image. World data and
-              files stay on the volume. Unsaved Startup changes are not applied.
+              Rebuilds the container from the current Ember image. World data
+              and files stay on the volume. Unsaved Startup changes are not
+              applied.
             </DialogDescription>
           </DialogHeader>
           {error ? (
