@@ -1938,6 +1938,25 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
     null
   )
   const draggedActionIdRef = React.useRef<string | null>(null)
+  const actionViewportRef = React.useRef<HTMLDivElement>(null)
+  const previousActionCountRef = React.useRef(actions.length)
+  React.useEffect(() => {
+    const actionAdded = actions.length > previousActionCountRef.current
+    previousActionCountRef.current = actions.length
+    if (actionAdded && actionViewportRef.current) {
+      const viewport = actionViewportRef.current
+      const rows = viewport.querySelectorAll<HTMLElement>(
+        "[data-schedule-action-row]"
+      )
+      const lastRow = rows.item(rows.length - 1)
+      const revealThrough = lastRow
+        ? lastRow.offsetTop - viewport.offsetTop + lastRow.offsetHeight / 2
+        : 0
+      if (revealThrough > viewport.scrollTop + viewport.clientHeight) {
+        viewport.scrollTop = revealThrough - viewport.clientHeight
+      }
+    }
+  }, [actions.length])
   const startDragging = React.useCallback((actionId: string) => {
     draggedActionIdRef.current = actionId
     setDraggedActionId(actionId)
@@ -1956,32 +1975,39 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
   return (
     <div>
       {hideHeader ? null : <h3 className="text-sm font-semibold">Actions</h3>}
-      {actions.length === 0 ? (
-        <div className="rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground">
-          Add an action to build this schedule.
-        </div>
-      ) : (
-        <div className="space-y-2">
-          {actions.map((action, index) => (
-            <ActionEditor
-              key={action.id}
-              action={action}
-              dragging={draggedActionId === action.id}
-              index={index}
-              permissionKey={permissionKey}
-              selectedOptions={selectedOptions}
-              storage={storage}
-              total={actions.length}
-              onChange={onChange}
-              onDragEnd={stopDragging}
-              onDragOver={dragOverAction}
-              onDragStart={startDragging}
-              onMove={onMove}
-              onRemove={onRemove}
-            />
-          ))}
-        </div>
-      )}
+      <div
+        ref={actionViewportRef}
+        aria-label="Schedule actions"
+        className={`${hideHeader ? "" : "mt-3"} h-[24.5rem] [scrollbar-gutter:stable] overflow-y-auto overscroll-contain pr-1`}
+        role="region"
+      >
+        {actions.length === 0 ? (
+          <div className="grid h-full place-items-center rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground">
+            Add an action to build this schedule.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {actions.map((action, index) => (
+              <ActionEditor
+                key={action.id}
+                action={action}
+                dragging={draggedActionId === action.id}
+                index={index}
+                permissionKey={permissionKey}
+                selectedOptions={selectedOptions}
+                storage={storage}
+                total={actions.length}
+                onChange={onChange}
+                onDragEnd={stopDragging}
+                onDragOver={dragOverAction}
+                onDragStart={startDragging}
+                onMove={onMove}
+                onRemove={onRemove}
+              />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 })
@@ -2082,6 +2108,7 @@ const ActionEditor = React.memo(function ActionEditor({
 
   return (
     <div
+      data-schedule-action-row
       className={`h-16 rounded-lg border bg-background/45 p-2 transition-[border-color,opacity] ${dragging ? "border-primary/40 opacity-55" : ""}`}
       onDragOver={(event) => {
         event.preventDefault()
