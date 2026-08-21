@@ -65,6 +65,29 @@ export function mergeConsoleHistory(
   return [...current, ...history].sort(compareConsoleLineOrder)
 }
 
+export function retimestampConsoleStateLine(
+  lines: ReadonlyArray<RelayConsoleLine>,
+  state: RelayObservedState,
+  timestamp: string
+): Array<RelayConsoleLine> | null {
+  const stateLines = lines.filter(
+    (line) => isConsoleStateLine(line) && line.id.endsWith(`:${state}`)
+  )
+  if (
+    stateLines.length === 0 ||
+    (stateLines.length === 1 && stateLines[0]?.timestamp === timestamp)
+  ) {
+    return null
+  }
+
+  return mergeConsoleHistory(
+    lines.filter(
+      (line) => !isConsoleStateLine(line) || !line.id.endsWith(`:${state}`)
+    ),
+    [consoleStateLine(state, timestamp)]
+  )
+}
+
 export function consoleStateLine(
   state: RelayObservedState,
   timestamp: string | null
