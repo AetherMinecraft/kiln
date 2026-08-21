@@ -9,6 +9,7 @@ services:
     working_dir: /workspace
     environment:
       NODE_ENV: development
+      # Upgrade-only read path for instances created from the old Relay catalog.
       KILN_BRICKS_CATALOG_URL: file:///workspace/apps/bricks/catalog.yml
       KILN_RELAY_TLS_MODE: managed
       KILN_RELAY_NAME: ${KILN_RELAY_NAME:-D001-localdev}
@@ -89,6 +90,7 @@ services:
     environment:
       NODE_ENV: development
       KILN_ENVIRONMENT: dev
+      KILN_BRICKS_CATALOG_URL: file:///workspace/apps/bricks/catalog.yml
       KILN_SENTRY_VERIFICATION_TOKEN: ${KILN_SENTRY_VERIFICATION_TOKEN:-}
       NODE_EXTRA_CA_CERTS: /minio-certs/public.crt
     command:
@@ -157,7 +159,8 @@ services:
     depends_on:
       minio-certs:
         condition: service_completed_successfully
-    command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+    command:
+      ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: kiln
       MINIO_ROOT_PASSWORD: kilnminiodevpassword

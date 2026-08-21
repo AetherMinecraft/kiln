@@ -1,11 +1,16 @@
 import { IncomingMessage } from "node:http"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { Socket } from "node:net"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { pathToFileURL } from "node:url"
 
 import { describe, expect, it } from "vite-plus/test"
 import { brickRecipeSchema } from "@workspace/contracts"
 
 import { BrickRecipeError } from "./effect/errors.js"
 import {
+  BrickCatalog,
   interpolateTemplate,
   isPublicRecipeAddress,
   readResponseDocument,
@@ -265,5 +270,30 @@ describe("Brick recipes", () => {
       source: "https://example.com/recipe.yml",
       reason: "socket reset during response",
     })
+  })
+
+  it("keeps legacy file-backed catalog recipes readable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "kiln-brick-catalog-"))
+    try {
+      const catalogPath = join(directory, "catalog.yml")
+      const recipePath = join(directory, "recipe.yml")
+      await Promise.all([
+        writeFile(
+          catalogPath,
+          "format: kiln.catalog/v1\nrecipes: [recipe.yml]\n"
+        ),
+        writeFile(recipePath, JSON.stringify(recipe)),
+      ])
+      const catalog = new BrickCatalog(
+        pathToFileURL(catalogPath).href,
+        join(directory, "data")
+      )
+
+      await expect(
+        catalog.recipe(pathToFileURL(recipePath).href)
+      ).resolves.toEqual(recipe)
+    } finally {
+      await rm(directory, { force: true, recursive: true })
+    }
   })
 })

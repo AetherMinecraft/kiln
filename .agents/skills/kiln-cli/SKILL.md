@@ -136,8 +136,8 @@ The response omits Brick variables, container identifiers, and internal paths.
 For custom Brick sources, credentials, query parameters, and fragments are
 removed from the displayed URL.
 
-Create a server on a provisioning-enabled Relay with a catalog Brick ID or a
-custom HTTPS recipe:
+Create a server on a provisioning-enabled Relay with a Brick ID from the
+account's Hearth catalogs or a custom HTTPS recipe:
 
 ```sh
 kiln servers create <relay-id> paper --name survival --memory 4GiB --disk 25GiB
@@ -236,7 +236,8 @@ CLI restore command.
 
 ## Bricks and startup settings
 
-Change a server's Brick with a catalog ID or custom HTTPS recipe:
+Change a server's Brick with an ID from the account's Hearth catalogs or a
+custom HTTPS recipe:
 
 ```sh
 kiln server brick <server> paper --memory 4GiB --game-version 1.21.11

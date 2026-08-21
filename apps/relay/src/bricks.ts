@@ -1,7 +1,8 @@
-import { readFile } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { readFile, mkdir } from "node:fs/promises"
 import { get } from "node:https"
 import { isIP } from "node:net"
-import { dirname, resolve, sep } from "node:path"
+import { dirname, join, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { parseDocument } from "yaml"
@@ -16,6 +17,7 @@ import {
 } from "@workspace/contracts"
 
 import { BrickRecipeError } from "./effect/errors.js"
+import { writeFileAtomic } from "./effect/atomic-file.js"
 import { promiseEffect } from "./effect/promise.js"
 import type { IncomingMessage } from "node:http"
 import type {
@@ -54,11 +56,13 @@ export interface ResolvedBrick {
 
 export class BrickCatalog {
   readonly #catalogUrl: URL
+  readonly #snapshotDirectory: string
   #cache: CachedCatalog | null = null
 
-  constructor(catalogUrl: string) {
+  constructor(catalogUrl: string, dataDirectory: string) {
     this.#catalogUrl = parseUrl(catalogUrl, "configured catalog")
     validateCatalogProtocol(this.#catalogUrl)
+    this.#snapshotDirectory = brickSnapshotDirectory(dataDirectory)
   }
 
   async catalog(): Promise<RelayCatalog> {
@@ -90,24 +94,27 @@ export class BrickCatalog {
     }
     const value = relayCatalogSchema.parse({
       format: "kiln.catalog/v1",
+      name: document.name,
+      author: document.author,
+      docs: document.docs,
+      support: document.support,
       bricks,
     })
     this.#cache = { expiresAt: Date.now() + CACHE_TTL_MS, value }
     return value
   }
 
-  async recipe(source: string): Promise<BrickRecipe> {
+  async recipe(source: string, snapshotSha256?: string): Promise<BrickRecipe> {
     if (source === builtinTailscaleBrickSource) {
       const { source: _source, ...recipe } = builtinTailscaleBrick
       return recipe
     }
+    if (snapshotSha256) {
+      return readBrickSnapshot(this.#snapshotDirectory, snapshotSha256)
+    }
     const url = parseUrl(source, "recipe source")
-    const official = (await this.catalog()).bricks.find(
-      (brick) => brick.source === url.href
-    )
-    if (official) {
-      const { source: _source, ...recipe } = official
-      return recipe
+    if (url.protocol === "file:") {
+      return this.#loadRecipe(url, true)
     }
     if (url.protocol !== "https:") {
       throw recipeError(
@@ -117,6 +124,10 @@ export class BrickCatalog {
       )
     }
     return this.#loadRecipe(url, false)
+  }
+
+  async saveSnapshot(recipe: BrickRecipe): Promise<string> {
+    return saveBrickSnapshot(this.#snapshotDirectory, recipe)
   }
 
   async #loadRecipe(source: URL, fromCatalog: boolean): Promise<BrickRecipe> {
@@ -147,6 +158,42 @@ export class BrickCatalog {
     validateRecipeSemantics(parsed.data, source)
     return parsed.data
   }
+}
+
+export function brickSnapshotDirectory(dataDirectory: string): string {
+  return join(dataDirectory, "brick-snapshots")
+}
+
+export async function saveBrickSnapshot(
+  snapshotDirectory: string,
+  recipe: BrickRecipe
+): Promise<string> {
+  const parsed = brickRecipeSchema.parse(recipe)
+  validateRecipeSemantics(parsed, new URL("https://snapshot.invalid/brick.yml"))
+  const content = JSON.stringify(parsed)
+  const sha256 = createHash("sha256").update(content).digest("hex")
+  await mkdir(snapshotDirectory, { mode: 0o700, recursive: true })
+  const destination = brickSnapshotPath(snapshotDirectory, sha256)
+  await Effect.runPromise(writeFileAtomic(destination, content, 0o600))
+  return sha256
+}
+
+export async function readBrickSnapshot(
+  directory: string,
+  sha256: string
+): Promise<BrickRecipe> {
+  const path = brickSnapshotPath(directory, sha256)
+  const content = await readFile(path, "utf8")
+  const actual = createHash("sha256").update(content).digest("hex")
+  if (actual !== sha256) throw new Error("Brick snapshot checksum is invalid")
+  return brickRecipeSchema.parse(JSON.parse(content) as unknown)
+}
+
+function brickSnapshotPath(directory: string, sha256: string): string {
+  if (!/^[a-f0-9]{64}$/u.test(sha256)) {
+    throw new Error("Brick snapshot checksum is invalid")
+  }
+  return join(directory, `${sha256}.json`)
 }
 
 export function resolveBrick(

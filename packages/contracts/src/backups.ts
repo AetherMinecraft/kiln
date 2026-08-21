@@ -596,9 +596,26 @@ const backupArchiveManifestV2Schema = backupArchiveManifestV1Schema.extend({
   server: backupArchiveServerConfigurationSchema,
 })
 
+const backupArchiveManifestV3Schema = backupArchiveManifestV1Schema.extend({
+  formatVersion: z.literal(3),
+  server: backupArchiveServerConfigurationSchema.extend({
+    brick: backupArchiveServerConfigurationSchema.shape.brick.extend({
+      recipe: z.unknown().nullable(),
+      snapshotSha256: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/u)
+        .nullable(),
+    }),
+  }),
+})
+
 export const backupArchiveManifestSchema = z.discriminatedUnion(
   "formatVersion",
-  [backupArchiveManifestV1Schema, backupArchiveManifestV2Schema]
+  [
+    backupArchiveManifestV1Schema,
+    backupArchiveManifestV2Schema,
+    backupArchiveManifestV3Schema,
+  ]
 )
 
 export const backupDownloadCapabilityPayloadSchema = z

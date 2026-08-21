@@ -140,9 +140,14 @@ function instance(overrides: Partial<RelayInstance> = {}): RelayInstance {
 }
 
 describe("startup reinstall resolution", () => {
+  const snapshotSha256 = "b".repeat(64)
+
   it("ignores stale client Brick, variables, limits, and start on reinstall", () => {
     const resolved = resolveInstanceStartupReconfigure(
-      instance({ observedState: "running" }),
+      instance({
+        brickSnapshotSha256: snapshotSha256,
+        observedState: "running",
+      }),
       relayUpdateInstanceStartupSchema.parse({
         diskLimitBytes: 40 * 1024 ** 3,
         recipe: "https://example.com/other.yml",
@@ -160,6 +165,7 @@ describe("startup reinstall resolution", () => {
       diskLimitBytes: 25 * 1024 ** 3,
       forcePull: true,
       recipe: recipeSource,
+      snapshotSha256,
       start: true,
       tailscale: { enabled: false },
       variables: appliedVariables,
@@ -215,6 +221,20 @@ describe("startup reinstall resolution", () => {
         version: "1.2.3",
       },
     })
+    expect(resolved.snapshotSha256).toBeUndefined()
+  })
+
+  it("reuses the stored snapshot when the submitted source is unchanged", () => {
+    const resolved = resolveInstanceStartupReconfigure(
+      instance({ brickSnapshotSha256: snapshotSha256 }),
+      relayUpdateInstanceStartupSchema.parse({
+        recipe: recipeSource,
+        start: true,
+        variables: appliedVariables,
+      })
+    )
+
+    expect(resolved.snapshotSha256).toBe(snapshotSha256)
   })
 })
 

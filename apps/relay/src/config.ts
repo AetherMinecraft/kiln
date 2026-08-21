@@ -24,6 +24,7 @@ export interface RelayInstanceConfig {
   brickReadiness?: BrickReadiness
   brickSupportsSrv?: boolean
   brickSource?: string
+  brickSnapshotSha256?: string
   connectAddress: string
   directory: string
   game: string
@@ -160,6 +161,11 @@ export function loadConfig(
     directPublicPort
   )
   const gitRepository = resolveKilnGitRepository(environment.KILN_GIT_REPO)
+  // Hearth owns active catalogs. Preserve only the old local file URL so
+  // already-provisioned file-backed instances can be read during upgrades.
+  const legacyFileCatalogUrl = Result.getOrNull(
+    Result.try(() => new URL(environment.KILN_BRICKS_CATALOG_URL?.trim() ?? ""))
+  )
   return {
     advertisedHost,
     advertisedHostInferred:
@@ -168,8 +174,9 @@ export function loadConfig(
       positiveIntegerEnvironment(environment, "KILN_BACKUP_TIMEOUT", 60) *
       60_000,
     brickCatalogUrl:
-      environment.KILN_BRICKS_CATALOG_URL?.trim() ||
-      kilnGitRepositoryRawUrl(gitRepository, "apps/bricks/catalog.yml"),
+      legacyFileCatalogUrl?.protocol === "file:"
+        ? legacyFileCatalogUrl.href
+        : kilnGitRepositoryRawUrl(gitRepository, "apps/bricks/catalog.yml"),
     bootstrapToken: bootstrapToken(environment),
     browserOrigin:
       proxyMode === "traefik"

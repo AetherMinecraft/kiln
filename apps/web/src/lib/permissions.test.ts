@@ -17,6 +17,19 @@ describe("platform appearance permissions", () => {
   })
 })
 
+describe("Brick source permissions", () => {
+  it("allows platform administrators and Relay creators to add sources", () => {
+    for (const permission of [
+      "platform.bricks.add-catalog",
+      "platform.bricks.add-custom",
+    ] as const) {
+      expect(platformRoleHasPermission("admin", permission)).toBe(true)
+      expect(platformRoleHasPermission("relay_creator", permission)).toBe(true)
+      expect(platformRoleHasPermission("user", permission)).toBe(false)
+    }
+  })
+})
+
 describe("server deletion permissions", () => {
   it("allows owners and administrators to delete servers", () => {
     expect(roleHasPermission("owner", "instance.delete")).toBe(true)

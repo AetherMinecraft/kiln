@@ -21,6 +21,7 @@ import type {
 } from "@workspace/contracts"
 import {
   backupArchiveManifestSchema,
+  brickRecipeSchema,
   relayBackupTaskSchema,
 } from "@workspace/contracts"
 
@@ -39,6 +40,7 @@ import {
   restorePortableInstanceBackup,
 } from "./backup-restore.js"
 import { loadConfig, type RelayInstanceConfig } from "./config.js"
+import { BrickCatalog, brickSnapshotDirectory } from "./bricks.js"
 import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
 
 const testDirectory = mkdtempSync(join(tmpdir(), "kiln-backups-"))
@@ -431,8 +433,8 @@ describe("Relay backups", () => {
             resolve(config.dataDirectory, "backups", `${input.backupId}.zip`)
           )
         )
-        assert.strictEqual(manifest.formatVersion, 2)
-        if (manifest.formatVersion === 2) {
+        assert.strictEqual(manifest.formatVersion, 3)
+        if (manifest.formatVersion === 3) {
           assert.deepStrictEqual(manifest.server.network.webRoutes, [route])
         }
         yield* state.replaceInstanceRoutes("instance-1", [])
@@ -491,6 +493,13 @@ describe("Relay backups", () => {
               "stale"
             )
           )
+          const snapshotRecipe = testBrickRecipe()
+          const snapshotSha256 = yield* Effect.promise(() =>
+            new BrickCatalog(
+              config.brickCatalogUrl,
+              config.dataDirectory
+            ).saveSnapshot(snapshotRecipe)
+          )
           const instance: RelayInstanceConfig = {
             ...testInstance(),
             brickConsoleStopCommands: ["stop"],
@@ -501,6 +510,7 @@ describe("Relay backups", () => {
             brickPrimaryPortProtocol: "tcp",
             brickReadiness: { logs: ["Done"] },
             brickSource: "https://kiln.test/bricks/paper.yml",
+            brickSnapshotSha256: snapshotSha256,
             brickSupportsSrv: true,
             limits: {
               diskBytes: 25 * 1024 ** 3,
@@ -559,8 +569,8 @@ describe("Relay backups", () => {
           const manifest = yield* Effect.promise(() =>
             readArchiveManifest(archivePath)
           )
-          assert.strictEqual(manifest.formatVersion, 2)
-          if (manifest.formatVersion === 2) {
+          assert.strictEqual(manifest.formatVersion, 3)
+          if (manifest.formatVersion === 3) {
             assert.deepStrictEqual(manifest.server, {
               brick: {
                 consoleStopCommands: ["stop"],
@@ -570,6 +580,8 @@ describe("Relay backups", () => {
                 primaryPort: 25_565,
                 primaryPortProtocol: "tcp",
                 readiness: { logs: ["Done"] },
+                recipe: snapshotRecipe,
+                snapshotSha256,
                 source: "https://kiln.test/bricks/paper.yml",
                 supportsSrv: true,
               },
@@ -676,6 +688,13 @@ describe("Relay backups", () => {
           const subdomain = `${"a".repeat(60)}.${"b".repeat(59)}`
           const instance: RelayInstanceConfig = {
             ...testInstance(),
+            brickSource: "https://kiln.test/bricks/paper.yml",
+            brickSnapshotSha256: yield* Effect.promise(() =>
+              new BrickCatalog(
+                config.brickCatalogUrl,
+                config.dataDirectory
+              ).saveSnapshot(testBrickRecipe())
+            ),
             tailscale: { enabled: true, subdomain },
           }
           const input = backupInput(6)
@@ -686,6 +705,12 @@ describe("Relay backups", () => {
               currentPath: null,
               phase: "preparing",
               total: 0,
+            })
+          )
+          yield* Effect.sync(() =>
+            rmSync(brickSnapshotDirectory(config.dataDirectory), {
+              force: true,
+              recursive: true,
             })
           )
           yield* Effect.promise(() =>
@@ -718,6 +743,15 @@ describe("Relay backups", () => {
           const restored = yield* Effect.promise(() => readdir(root))
           assert.notInclude(restored, "extra.txt")
           assert.notInclude(restored, ".kiln-backup")
+          assert.deepStrictEqual(
+            yield* Effect.promise(() =>
+              new BrickCatalog(
+                config.brickCatalogUrl,
+                config.dataDirectory
+              ).recipe(instance.brickSource ?? "", instance.brickSnapshotSha256)
+            ),
+            testBrickRecipe()
+          )
         }),
       removeTemporaryDirectory
     )
@@ -1348,6 +1382,33 @@ function testConfig(directory: string) {
     KILN_RELAY_DATA_DIR: directory,
     KILN_RELAY_HOST: "relay.test",
     NODE_ENV: "test",
+  })
+}
+
+function testBrickRecipe() {
+  return brickRecipeSchema.parse({
+    format: "kiln.brick/v1",
+    metadata: {
+      author: "Kiln",
+      description: "Paper test recipe",
+      game: "Minecraft",
+      id: "paper",
+      name: "Paper",
+    },
+    variables: {},
+    runtime: {
+      environment: {},
+      image: "example.test/paper:latest",
+      name: "Paper",
+      resources: { memory: "4G", pids: 128 },
+      storage: { mount: "/server" },
+    },
+    network: {
+      mode: "minecraft-backend",
+      ports: [{ container: 25_565, name: "game", protocol: "tcp" }],
+      primaryPort: "game",
+      supportsSrv: true,
+    },
   })
 }
 
