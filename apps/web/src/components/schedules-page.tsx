@@ -61,6 +61,8 @@ import {
   useWorkspaceTableSearchInput,
 } from "@/components/workspace-data-table"
 import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
+import type { ServerPickerOption } from "@/components/server-picker-list"
+import { useScheduleScope } from "@/components/schedule-scope"
 import {
   queryKeys,
   scheduleOptionsQueryOptions,
@@ -87,10 +89,20 @@ const relativeFormatter = new Intl.RelativeTimeFormat("en-US", {
 export const SchedulesPage = React.memo(function SchedulesPage() {
   const { data: schedules } = useSuspenseQuery(schedulesQueryOptions())
   const { data: options } = useSuspenseQuery(scheduleOptionsQueryOptions())
+  const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
   const [deleting, setDeleting] = React.useState<Schedule | null>(null)
   const canCreate = options.some((option) => option.canCreate)
+  const scopedSchedules = React.useMemo(
+    () =>
+      selectedScope
+        ? schedules.filter((schedule) =>
+            scheduleMatchesScope(schedule, selectedScope)
+          )
+        : schedules,
+    [schedules, selectedScope]
+  )
   const openEdit = React.useCallback(
     (schedule: Schedule) => setEditor({ kind: "edit", schedule }),
     []
@@ -111,7 +123,8 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
         <ScheduleTable
           canCreate={canCreate}
           options={options}
-          schedules={schedules}
+          schedules={scopedSchedules}
+          scopeActive={selectedScope !== null}
           searchStore={searchStore}
           onCreate={() => setEditor({ kind: "create" })}
           onDelete={openDelete}
@@ -175,6 +188,7 @@ const ScheduleTable = React.memo(function ScheduleTable({
   canCreate,
   options,
   schedules,
+  scopeActive,
   searchStore,
   onCreate,
   onDelete,
@@ -183,6 +197,7 @@ const ScheduleTable = React.memo(function ScheduleTable({
   canCreate: boolean
   options: ReadonlyArray<ScheduleOption>
   schedules: Array<Schedule>
+  scopeActive: boolean
   searchStore: WorkspaceTableSearchStore
   onCreate: () => void
   onDelete: (schedule: Schedule) => void
@@ -203,11 +218,12 @@ const ScheduleTable = React.memo(function ScheduleTable({
     (searchActive: boolean) => (
       <EmptyScheduleTable
         canCreate={canCreate}
+        scopeActive={scopeActive}
         searchActive={searchActive}
         onCreate={onCreate}
       />
     ),
-    [canCreate, onCreate]
+    [canCreate, onCreate, scopeActive]
   )
 
   return (
@@ -419,10 +435,12 @@ function ScheduleActionButton({
 
 function EmptyScheduleTable({
   canCreate,
+  scopeActive,
   searchActive,
   onCreate,
 }: {
   canCreate: boolean
+  scopeActive: boolean
   searchActive: boolean
   onCreate: () => void
 }) {
@@ -430,12 +448,18 @@ function EmptyScheduleTable({
     <div className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center">
       <Play className="size-6 text-muted-foreground/45" />
       <p className="mt-3 text-sm font-semibold">
-        {searchActive ? "No schedules match your search" : "No schedules yet"}
+        {searchActive
+          ? "No schedules match your search"
+          : scopeActive
+            ? "No schedules for this instance"
+            : "No schedules yet"}
       </p>
       <p className="mt-1 max-w-sm text-[0.625rem] leading-4 text-muted-foreground">
         {searchActive
           ? "Try a schedule name, cron expression, timezone, action, or target."
-          : "Create Relay-owned automation that keeps running when Hearth is offline."}
+          : scopeActive
+            ? "Choose another instance or create a schedule for this target."
+            : "Create Relay-owned automation that keeps running when Hearth is offline."}
       </p>
       {!searchActive && canCreate ? (
         <Button type="button" size="sm" className="mt-4" onClick={onCreate}>
@@ -448,26 +472,22 @@ function EmptyScheduleTable({
 
 export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
   const { data: schedules } = useSuspenseQuery(schedulesQueryOptions())
+  const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const runs = React.useMemo(
-    () =>
-      schedules
-        .flatMap((schedule) =>
-          schedule.runs.map((run) => ({
-            ...run,
-            scheduleName: schedule.name,
-            timezone: schedule.timezone,
-          }))
-        )
-        .sort((left, right) => right.scheduledAt - left.scheduledAt),
-    [schedules]
+    () => scheduleHistoryRuns(schedules, selectedScope),
+    [schedules, selectedScope]
   )
 
   return (
     <div className="mx-auto w-full max-w-[90rem] px-3 pb-10 sm:px-5">
       <section className="overflow-hidden rounded-xl border bg-card/45 [contain:paint]">
         <HistoryToolbar searchStore={searchStore} runCount={runs.length} />
-        <ScheduleHistoryTable runs={runs} searchStore={searchStore} />
+        <ScheduleHistoryTable
+          runs={runs}
+          scopeActive={selectedScope !== null}
+          searchStore={searchStore}
+        />
       </section>
     </div>
   )
@@ -476,6 +496,31 @@ export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
 type ScheduleHistoryRun = Schedule["runs"][number] & {
   scheduleName: string
   timezone: string
+}
+
+function scheduleHistoryRuns(
+  schedules: ReadonlyArray<Schedule>,
+  scope: ServerPickerOption | null
+): Array<ScheduleHistoryRun> {
+  const runs: Array<ScheduleHistoryRun> = []
+  for (const schedule of schedules) {
+    for (const run of schedule.runs) {
+      if (
+        scope &&
+        !run.targetRuns.some((targetRun) =>
+          scheduleTargetMatchesScope(targetRun.target, scope)
+        )
+      ) {
+        continue
+      }
+      runs.push({
+        ...run,
+        scheduleName: schedule.name,
+        timezone: schedule.timezone,
+      })
+    }
+  }
+  return runs.sort((left, right) => right.scheduledAt - left.scheduledAt)
 }
 
 function HistoryToolbar({
@@ -510,9 +555,11 @@ function HistoryToolbar({
 
 const ScheduleHistoryTable = React.memo(function ScheduleHistoryTable({
   runs,
+  scopeActive,
   searchStore,
 }: {
   runs: Array<ScheduleHistoryRun>
+  scopeActive: boolean
   searchStore: WorkspaceTableSearchStore
 }) {
   const renderRow = React.useCallback(
@@ -524,14 +571,20 @@ const ScheduleHistoryTable = React.memo(function ScheduleHistoryTable({
       <div className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center">
         <Play className="size-6 text-muted-foreground/45" />
         <p className="mt-3 text-sm font-semibold">
-          {searchActive ? "No runs match your search" : "No schedule runs yet"}
+          {searchActive
+            ? "No runs match your search"
+            : scopeActive
+              ? "No runs for this instance"
+              : "No schedule runs yet"}
         </p>
         <p className="mt-1 max-w-sm text-[0.625rem] leading-4 text-muted-foreground">
-          Completed and attempted schedule runs will appear here.
+          {scopeActive && !searchActive
+            ? "Completed and attempted runs for this instance will appear here."
+            : "Completed and attempted schedule runs will appear here."}
         </p>
       </div>
     ),
-    []
+    [scopeActive]
   )
   return (
     <WorkspaceDataTable
@@ -671,6 +724,7 @@ function ScheduleEditorDialog({
             canExecute: ___,
             canUpdate: ____,
             permittedActions: _____,
+            relayName: ______,
             ...target
           }) => target
         ),
@@ -1294,6 +1348,28 @@ function cronLabel(cron: string) {
 
 function scheduleRowKey(schedule: Schedule) {
   return schedule.id
+}
+
+function scheduleMatchesScope(
+  schedule: Pick<Schedule, "targets">,
+  scope: ServerPickerOption
+) {
+  return schedule.targets.some((target) =>
+    scheduleTargetMatchesScope(target, scope)
+  )
+}
+
+function scheduleTargetMatchesScope(
+  target: ScheduleTarget,
+  scope: ServerPickerOption
+) {
+  const scopeKind = scope.kind ?? "server"
+  const kind = scopeKind === "server" ? "instance" : scopeKind
+  return (
+    target.kind === kind &&
+    target.id === scope.id &&
+    target.relayId === scope.relayId
+  )
 }
 
 function scheduleSearchText(schedule: Schedule) {

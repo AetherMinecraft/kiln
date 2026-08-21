@@ -102,8 +102,12 @@ interface TargetDirectoryRow extends RowDataPacket {
 export const getScheduleOptions = createServerFn({ method: "GET" }).handler(
   async () => {
     const user = await requireAuthenticatedUser()
-    const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
-    const targets = await loadTargetDirectory()
+    const [grants, targets, relays] = await Promise.all([
+      isPlatformAdmin(user) ? Promise.resolve([]) : listUserGrants(user.id),
+      loadTargetDirectory(),
+      listPersistedRelays(),
+    ])
+    const relayNames = new Map(relays.map((relay) => [relay.id, relay.name]))
     return targets.flatMap((target) => {
       if (
         !hasScheduleTargetPermission({
@@ -127,6 +131,7 @@ export const getScheduleOptions = createServerFn({ method: "GET" }).handler(
       return [
         {
           ...target,
+          relayName: relayNames.get(target.relayId) ?? target.relayId,
           canCreate: hasScheduleTargetPermission({
             grants,
             permission: "schedule.create",
