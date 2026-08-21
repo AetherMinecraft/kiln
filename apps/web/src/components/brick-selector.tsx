@@ -266,7 +266,7 @@ const BrickTabSidebar = React.memo(function BrickTabSidebar({
   onTabChange: (tab: BrickTabId) => void
 }) {
   return (
-    <aside className="flex min-h-0 flex-col border-b border-border/60 md:border-r md:border-b-0">
+    <aside className="flex min-h-0 flex-col border-b border-border/60 max-md:min-h-max md:border-r md:border-b-0">
       <p className="px-3 pt-3 pb-2 font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
         Categories
       </p>
@@ -472,7 +472,7 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
   return (
     <div
       className={cn(
-        "grid min-h-0 flex-1 overflow-hidden rounded-xl border border-border/70 bg-background/35 max-md:overflow-y-auto md:grid-cols-[9.5rem_minmax(0,1fr)_18.5rem] lg:grid-cols-[10.5rem_minmax(0,1fr)_20rem]",
+        "grid min-h-0 flex-1 overflow-hidden rounded-xl border border-border/70 bg-background/35 max-md:grid-rows-[max-content_minmax(32rem,auto)] max-md:overflow-y-auto md:grid-cols-[9.5rem_minmax(0,1fr)_18.5rem] lg:grid-cols-[10.5rem_minmax(0,1fr)_20rem]",
         className
       )}
     >
@@ -829,11 +829,16 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                       )}
                     </span>
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-semibold tracking-tight">
-                        {catalogSourceLabel(catalog.source)}
+                      <span className="flex min-w-0 items-center gap-1.5 text-sm font-semibold tracking-tight">
+                        <span className="truncate">
+                          {catalogDisplayName(catalog)}
+                        </span>
+                        <CatalogTrustBadge catalog={catalog} />
                       </span>
                       <span className="mt-0.5 block truncate text-[0.6875rem] text-muted-foreground">
-                        {catalogVisibilityLabel(catalog.visibility)} ·{" "}
+                        {catalog.isDefault
+                          ? ""
+                          : `${catalogVisibilityLabel(catalog.visibility)} · `}
                         {catalog.brickCount} Brick
                         {catalog.brickCount === 1 ? "" : "s"}
                         {catalogsQuery.data?.isPlatformAdmin &&
@@ -863,33 +868,30 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
             <div className="border-b border-border/60 p-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
-                    {catalogVisibilityLabel(selected.visibility)}
-                  </p>
-                  <h3 className="mt-1.5 truncate font-heading text-base font-semibold tracking-tight">
-                    {catalogSourceLabel(selected.source)}
-                  </h3>
+                  {selected.isDefault ? null : (
+                    <p className="font-mono text-[0.625rem] tracking-[0.14em] text-muted-foreground uppercase">
+                      {catalogVisibilityLabel(selected.visibility)}
+                    </p>
+                  )}
+                  <div
+                    className={cn(
+                      "flex min-w-0 items-center gap-1.5",
+                      !selected.isDefault && "mt-1.5"
+                    )}
+                  >
+                    <h3 className="min-w-0 truncate font-heading text-lg font-semibold tracking-[-0.025em] sm:text-xl">
+                      {catalogDisplayName(selected)}
+                    </h3>
+                    <CatalogTrustBadge catalog={selected} />
+                  </div>
                 </div>
-                <Badge variant="outline" className="shrink-0">
-                  {selected.brickCount} Brick
-                  {selected.brickCount === 1 ? "" : "s"}
-                </Badge>
               </div>
-              <a
-                href={selected.source}
-                target="_blank"
-                rel="noreferrer"
-                className="mt-2 flex items-center gap-1 truncate text-[0.6875rem] text-muted-foreground hover:text-foreground"
-              >
-                <span className="truncate">{selected.source}</span>
-                <ExternalLink className="size-3 shrink-0" />
-              </a>
               {selected.revisionUrl && selected.revisionSha ? (
                 <a
                   href={selected.revisionUrl}
                   target="_blank"
                   rel="noreferrer"
-                  className="mt-3 flex items-center justify-between gap-3 rounded-md border border-primary/25 bg-primary/7 px-2.5 py-2 text-xs hover:bg-primary/10"
+                  className="mt-4 flex items-center justify-between gap-3 rounded-md border border-primary/25 bg-primary/7 px-2.5 py-2 text-xs hover:bg-primary/10"
                 >
                   <span>
                     <span className="block font-medium">
@@ -987,7 +989,7 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                     onClick={() => {
                       if (
                         window.confirm(
-                          `Delete ${catalogSourceLabel(selected.source)}?`
+                          `Delete ${catalogDisplayName(selected)}?`
                         )
                       ) {
                         deleteMutation.mutate(selected.id)
@@ -1016,18 +1018,61 @@ function catalogMutationError(cause: unknown): void {
   })
 }
 
+export function catalogDisplayName(catalog: {
+  isDefault: boolean
+  source: string
+}): string {
+  if (catalog.isDefault) return "Kiln"
+  return catalogSourceLabel(catalog.source)
+}
+
 function catalogSourceLabel(source: string): string {
   return Result.getOrElse(
     Result.try(() => {
       const url = new URL(source)
-      if (url.hostname.toLowerCase() === "github.com") {
-        return url.pathname.replace(/^\/+|\/+$/gu, "")
+      const hostname = url.hostname.toLowerCase()
+      const segments = url.pathname.split("/").filter(Boolean)
+      if (
+        (hostname === "github.com" ||
+          hostname === "raw.githubusercontent.com") &&
+        segments[0] &&
+        segments[1]
+      ) {
+        return `${segments[0]}/${segments[1].replace(/\.git$/u, "")}`
       }
-      const filename = url.pathname.split("/").filter(Boolean).at(-1)
-      return filename ? `${url.hostname}/${filename}` : url.hostname
+      return hostname
     }),
     () => source
   )
+}
+
+function CatalogTrustBadge({
+  catalog,
+}: {
+  catalog: {
+    isDefault: boolean
+    visibility: "community" | "default" | "personal"
+  }
+}) {
+  if (catalog.isDefault) {
+    return (
+      <Badge
+        variant="outline"
+        className="h-5 shrink-0 gap-1 border-primary/35 bg-primary/10 px-1.5 text-[0.625rem] text-primary"
+      >
+        <BadgeCheck className="size-3" />
+        Verified
+      </Badge>
+    )
+  }
+  if (catalog.visibility === "community") {
+    return (
+      <Badge variant="outline" className="h-5 shrink-0 px-1.5 text-[0.625rem]">
+        Community
+      </Badge>
+    )
+  }
+  return null
 }
 
 function catalogVisibilityLabel(
