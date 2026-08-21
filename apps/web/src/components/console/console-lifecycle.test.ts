@@ -6,8 +6,10 @@ import {
   initialConsoleStateLines,
   isConsoleRecoveryLine,
   isConsoleStateLine,
+  isConsoleStateLineFor,
   mergeConsoleHistory,
   mergeConsoleStateLines,
+  retimestampConsoleStateLine,
   shouldRecordConsoleStateTransition,
 } from "./console-lifecycle"
 
@@ -133,6 +135,39 @@ describe("console lifecycle lines", () => {
         (line) => line.text
       )
     ).toEqual(["Preparing spawn", "Server is running", "Player joined"])
+  })
+
+  it("repositions a provisional running transition when readiness arrives", () => {
+    const lines = [
+      {
+        id: "before-ready",
+        level: "info" as const,
+        text: "Preparing spawn",
+        timestamp: "2026-07-28T19:57:14.000Z",
+      },
+      consoleStateLine("running", null),
+      {
+        id: "after-ready",
+        level: "info" as const,
+        text: "Player joined",
+        timestamp: "2026-07-28T19:57:20.000Z",
+      },
+    ]
+
+    const replaced = retimestampConsoleStateLine(lines, "running", readyAt)
+
+    expect(replaced?.map((line) => line.text)).toEqual([
+      "Preparing spawn",
+      "Server is running",
+      "Player joined",
+    ])
+    expect(
+      replaced?.filter((line) => isConsoleStateLineFor(line, "running"))
+    ).toHaveLength(1)
+    expect(replaced?.[1]?.timestamp).toBe(readyAt)
+    expect(
+      retimestampConsoleStateLine(replaced ?? [], "running", readyAt)
+    ).toBeNull()
   })
 
   it("does not invent a running transition while the server is stopping", () => {

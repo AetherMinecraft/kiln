@@ -62,10 +62,12 @@ import {
   consoleRecoveryLine,
   consoleStateLine,
   initialConsoleStateLines,
-  isConsoleStateLine,
   isConsoleRecoveryLine,
+  isConsoleStateLine,
+  isConsoleStateLineFor,
   mergeConsoleHistory,
   mergeConsoleStateLines,
+  retimestampConsoleStateLine,
   shouldRecordConsoleStateTransition,
 } from "@/components/console/console-lifecycle"
 import {
@@ -2192,7 +2194,28 @@ function useRelayConsoleStream(
   React.useEffect(() => {
     const state = runtime?.observedState
     const previous = previousStateRef.current
-    if (!state || !shouldRecordConsoleStateTransition(previous, state)) return
+    if (!state) return
+
+    const current = consoleDataRef.current
+    if (state === "running" && runtime.readyAt && current) {
+      const retimestampedLines = retimestampConsoleStateLine(
+        current.lines,
+        "running",
+        runtime.readyAt
+      )
+      if (retimestampedLines) {
+        if (shouldRecordConsoleStateTransition(previous, state)) {
+          previousStateRef.current = state
+        }
+        commitConsole({
+          ...current,
+          lines: retimestampedLines,
+        })
+        return
+      }
+    }
+
+    if (!shouldRecordConsoleStateTransition(previous, state)) return
     previousStateRef.current = state
 
     if (state === "starting") {
@@ -2213,7 +2236,6 @@ function useRelayConsoleStream(
     }
 
     if (!sessionInitializedRef.current && previous === undefined) return
-    const current = consoleDataRef.current
     if (!current) return
     const line = consoleStateLine(
       state,
@@ -2222,10 +2244,7 @@ function useRelayConsoleStream(
         : new Date().toISOString()
     )
     if (
-      current.lines.some(
-        (existing) =>
-          isConsoleStateLine(existing) && existing.id.endsWith(`:${state}`)
-      )
+      current.lines.some((existing) => isConsoleStateLineFor(existing, state))
     ) {
       return
     }
