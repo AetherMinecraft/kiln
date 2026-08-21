@@ -65,7 +65,11 @@ export function isKilnGitRepositorySource(
   source: string | undefined,
   configuredRepository: string
 ): boolean {
-  return source === configuredRepository || source === LEGACY_KILN_GIT_REPO
+  const normalizedSource = source?.toLowerCase()
+  return (
+    normalizedSource === configuredRepository.toLowerCase() ||
+    normalizedSource === LEGACY_KILN_GIT_REPO.toLowerCase()
+  )
 }
 
 function invalidRepositoryError(): Error {

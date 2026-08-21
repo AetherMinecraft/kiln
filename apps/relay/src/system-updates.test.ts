@@ -23,7 +23,7 @@ import type { CommandOptions, CommandResult } from "./command.js"
 
 const targetImage = `ghcr.io/kiln-site/relay@sha256:${"a".repeat(64)}`
 const hearthImage = `ghcr.io/kiln-site/hearth@sha256:${"b".repeat(64)}`
-const forkTargetImage = `ghcr.io/example/relay@sha256:${"d".repeat(64)}`
+const forkTargetImage = `ghcr.io/aetherminecraft/relay@sha256:${"d".repeat(64)}`
 
 const relayContainer = {
   Config: {
@@ -181,10 +181,11 @@ describe("release image versions", () => {
     withTemporaryDataDirectory((dataDirectory) =>
       Effect.gen(function* () {
         const docker = new FakeCommand()
-        const gitRepository = "https://github.com/example/kiln-fork"
-        docker.containerImageSource = gitRepository
-        docker.imageSource = gitRepository
-        docker.relayImage = "ghcr.io/example/relay:latest"
+        const gitRepository = "https://github.com/aetherminecraft/kiln"
+        const imageSource = "https://github.com/AetherMinecraft/kiln"
+        docker.containerImageSource = imageSource
+        docker.imageSource = imageSource
+        docker.relayImage = "ghcr.io/aetherminecraft/relay:latest"
         const manager = new SystemUpdateManager(
           { dataDirectory, gitRepository },
           docker.run
@@ -198,7 +199,9 @@ describe("release image versions", () => {
         })
 
         expect(operation.status).toBe("running")
-        expect(operation.targetReference).toBe("ghcr.io/example/relay:latest")
+        expect(operation.targetReference).toBe(
+          "ghcr.io/aetherminecraft/relay:latest"
+        )
       })
     )
   )
