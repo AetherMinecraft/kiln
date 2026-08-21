@@ -273,12 +273,19 @@ const scheduleManager = await ScheduleManager.make({
       backupManager.enqueue(input)
     ),
   findInstance: (instanceId) => docker.findInstance(instanceId),
+  forkEffect: (name, effect) => forkRelayEffect(name, effect),
   getBackup: (taskId) =>
     runRelayEffect("relay.schedules.backup.get", backupManager.get(taskId)),
   listDatabaseIds: async () =>
     new Set((await databases.list()).map((database) => database.id)),
   platformTargetId: config.installationId ?? relayIdentity.fingerprint,
   relayId: relayIdentity.fingerprint,
+  reportError: (message, cause) => {
+    Sentry.captureException(
+      cause instanceof Error ? cause : new Error(message, { cause }),
+      { tags: { "kiln.operation": "schedule.occurrence" } }
+    )
+  },
   runDatabasePower: async (databaseId, action) => {
     await databases.action({ action, databaseId })
   },
@@ -605,6 +612,7 @@ const sftpServer = await Effect.runPromise(
         tailscaleFirewallFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
         scheduleFiber.interruptUnsafe()
+        scheduleManager.close()
         lifecycle.close()
         snapshotHub.close()
       }).pipe(
@@ -828,6 +836,7 @@ function shutdownRelay(signal: NodeJS.Signals): Promise<void> {
         tlsRefreshFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
         scheduleFiber.interruptUnsafe()
+        scheduleManager.close()
         lifecycle.close()
         snapshotHub.close()
       })

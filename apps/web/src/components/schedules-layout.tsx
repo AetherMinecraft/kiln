@@ -128,7 +128,11 @@ const SchedulesNavigation = React.memo(function SchedulesNavigation() {
           key={tab.to}
           to={tab.to}
           activeOptions={{ exact: tab.exact }}
-          search={(previous) => previous}
+          search={(previous) => ({
+            kind: previous.kind,
+            relay: previous.relay,
+            target: previous.target,
+          })}
           className="relative flex h-10 shrink-0 items-center gap-2 px-3 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
           activeProps={{
             className:

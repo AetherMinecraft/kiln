@@ -1,7 +1,8 @@
 import { mkdir, readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
-import { Effect, Result } from "effect"
+import { Data, Effect, Result, Schedule, Semaphore } from "effect"
+import type { Fiber } from "effect"
 import { z } from "zod"
 
 import {
@@ -22,6 +23,7 @@ import {
 } from "@workspace/contracts"
 
 import { writeFileAtomic } from "./effect/atomic-file.js"
+import { promiseEffect } from "./effect/promise.js"
 
 const persistedScheduleSchema = relayScheduleProjectionSchema.safeExtend({
   nextRunAt: z.number().int().nonnegative().nullable(),
@@ -42,13 +44,38 @@ type PersistedState = z.infer<typeof persistedStateSchema>
 
 const heartbeatPersistenceIntervalMs = 5_000
 const maxRetainedRuns = 1_000
+const scheduledBackupPollIntervalMs = 500
+const scheduledBackupWaitTimeoutMs = 6 * 60 * 60 * 1_000
+const targetExecutionConcurrency = 8
+const scheduleTickIntervalMs = 1_000
+const scheduleTickRetryBaseMs = 100
+
+class ScheduleTickError extends Data.TaggedError("ScheduleTickError")<{
+  readonly cause: unknown
+  readonly message: string
+}> {}
+
+class ScheduledBackupWaitError extends Data.TaggedError(
+  "ScheduledBackupWaitError"
+)<{
+  readonly cause?: unknown
+  readonly message: string
+  readonly taskId: string
+}> {}
 
 export interface ScheduleManagerOptions {
+  readonly backupPollIntervalMs?: number
+  readonly backupWaitTimeoutMs?: number
   readonly enqueueBackup: (input: BackupTaskInput) => Promise<RelayBackupTask>
   readonly findInstance: (instanceId: string) => Promise<object | null>
+  readonly forkEffect?: (
+    name: string,
+    effect: Effect.Effect<void, never>
+  ) => Fiber.Fiber<void, unknown>
   readonly getBackup: (taskId: string) => Promise<RelayBackupTask | null>
   readonly listDatabaseIds: () => Promise<ReadonlySet<string>>
   readonly platformTargetId: string
+  readonly reportError?: (message: string, cause: unknown) => void
   readonly relayId: string
   readonly runDatabasePower: (
     databaseId: string,
@@ -63,20 +90,33 @@ export interface ScheduleManagerOptions {
     command: string
   ) => Promise<void>
   readonly stateDirectory: string
+  readonly tickIntervalMs?: number
+  readonly tickRetryBaseMs?: number
 }
 
 export class ScheduleManager {
   readonly #activeTargets = new Set<string>()
+  readonly #backupPollIntervalMs: number
+  readonly #backupWaitTimeoutMs: number
+  readonly #occurrenceFibers = new Set<Fiber.Fiber<void, unknown>>()
   readonly #options: ScheduleManagerOptions
+  readonly #semaphore = Semaphore.makeUnsafe(1)
   readonly #statePath: string
+  readonly #tickIntervalMs: number
+  readonly #tickRetryBaseMs: number
   #lastHeartbeatPersistedAt = 0
   #state: PersistedState
-  #tail = Promise.resolve()
 
   private constructor(options: ScheduleManagerOptions, state: PersistedState) {
+    this.#backupPollIntervalMs =
+      options.backupPollIntervalMs ?? scheduledBackupPollIntervalMs
+    this.#backupWaitTimeoutMs =
+      options.backupWaitTimeoutMs ?? scheduledBackupWaitTimeoutMs
     this.#options = options
     this.#state = state
     this.#statePath = resolve(options.stateDirectory, "schedules.json")
+    this.#tickIntervalMs = options.tickIntervalMs ?? scheduleTickIntervalMs
+    this.#tickRetryBaseMs = options.tickRetryBaseMs ?? scheduleTickRetryBaseMs
   }
 
   static async make(options: ScheduleManagerOptions) {
@@ -89,10 +129,37 @@ export class ScheduleManager {
   }
 
   run() {
-    return Effect.tryPromise(() => this.#tick()).pipe(
-      Effect.andThen(Effect.sleep("1 second")),
+    return promiseEffect(() => this.#tick()).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ScheduleTickError({
+            cause,
+            message: "Relay schedule tick failed",
+          })
+      ),
+      Effect.retry({
+        schedule: Schedule.exponential(`${this.#tickRetryBaseMs} millis`).pipe(
+          Schedule.jittered
+        ),
+        times: 3,
+      }),
+      Effect.catchTag("ScheduleTickError", (failure) =>
+        Effect.sync(() =>
+          this.#options.reportError?.(failure.message, failure.cause)
+        ).pipe(
+          Effect.andThen(
+            Effect.logError(failure.message, { cause: failure.cause })
+          )
+        )
+      ),
+      Effect.andThen(Effect.sleep(`${this.#tickIntervalMs} millis`)),
       Effect.forever
     )
+  }
+
+  close() {
+    for (const fiber of this.#occurrenceFibers) fiber.interruptUnsafe()
+    this.#occurrenceFibers.clear()
   }
 
   apply(projection: RelayScheduleProjection) {
@@ -242,47 +309,66 @@ export class ScheduleManager {
 
   async #tick() {
     const due = await this.#serialized(async () => {
+      const previousState = structuredClone(this.#state)
+      const previousHeartbeatPersistedAt = this.#lastHeartbeatPersistedAt
       const now = Date.now()
       const claimed: Array<{
         definition: RelayScheduleProjection
         scheduledAt: number
       }> = []
-      for (const schedule of this.#state.schedules) {
-        if (
-          !schedule.enabled ||
-          schedule.nextRunAt === null ||
-          schedule.nextRunAt > now
-        ) {
-          continue
-        }
-        const scheduledAt = schedule.nextRunAt
-        const { nextRunAt: _, ...definition } = schedule
-        claimed.push({ definition, scheduledAt })
-        schedule.nextRunAt = nextScheduleOccurrence(
-          schedule.cron,
-          schedule.timezone,
-          now
-        ).getTime()
-        const running = scheduleRunSchema.parse({
-          finishedAt: now,
-          id: scheduleStableId(schedule.id, scheduledAt, this.#options.relayId),
-          revision: schedule.revision,
-          scheduleId: schedule.id,
-          scheduledAt,
-          startedAt: now,
-          status: "running",
-          targetRuns: [],
-        })
-        this.#upsertRun(running)
+      const result = await Effect.runPromise(
+        Effect.result(
+          promiseEffect(async () => {
+            for (const schedule of this.#state.schedules) {
+              if (
+                !schedule.enabled ||
+                schedule.nextRunAt === null ||
+                schedule.nextRunAt > now
+              ) {
+                continue
+              }
+              const scheduledAt = schedule.nextRunAt
+              const { nextRunAt: _, ...definition } = schedule
+              claimed.push({ definition, scheduledAt })
+              schedule.nextRunAt = nextScheduleOccurrence(
+                schedule.cron,
+                schedule.timezone,
+                now
+              ).getTime()
+              const running = scheduleRunSchema.parse({
+                finishedAt: now,
+                id: scheduleStableId(
+                  schedule.id,
+                  scheduledAt,
+                  this.#options.relayId
+                ),
+                revision: schedule.revision,
+                scheduleId: schedule.id,
+                scheduledAt,
+                startedAt: now,
+                status: "running",
+                targetRuns: [],
+              })
+              this.#upsertRun(running)
+            }
+            const persistHeartbeat =
+              now - this.#lastHeartbeatPersistedAt >=
+              heartbeatPersistenceIntervalMs
+            this.#state.lastHeartbeatAt = now
+            if (claimed.length > 0 || persistHeartbeat) {
+              await this.#persist()
+              this.#lastHeartbeatPersistedAt = now
+            }
+            return claimed
+          })
+        )
+      )
+      if (Result.isFailure(result)) {
+        this.#state = previousState
+        this.#lastHeartbeatPersistedAt = previousHeartbeatPersistedAt
+        throw result.failure
       }
-      const persistHeartbeat =
-        now - this.#lastHeartbeatPersistedAt >= heartbeatPersistenceIntervalMs
-      this.#state.lastHeartbeatAt = now
-      if (claimed.length > 0 || persistHeartbeat) {
-        this.#lastHeartbeatPersistedAt = now
-        await this.#persist()
-      }
-      return claimed
+      return result.success
     })
     for (const occurrence of due) {
       this.#launchOccurrence(occurrence.definition, occurrence.scheduledAt)
@@ -290,29 +376,50 @@ export class ScheduleManager {
   }
 
   #launchOccurrence(definition: RelayScheduleProjection, scheduledAt: number) {
-    Effect.runFork(
-      Effect.tryPromise({
-        try: () => this.#executeOccurrence(definition, scheduledAt),
-        catch: (cause) => cause,
-      }).pipe(
-        Effect.catch((cause) =>
-          Effect.sync(() =>
-            console.error(`Scheduled occurrence ${definition.id} failed`, cause)
+    const effect = Effect.tryPromise({
+      try: (signal) => this.#executeOccurrence(definition, scheduledAt, signal),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.sync(() => {
+          const message = `Scheduled occurrence ${definition.id} failed`
+          this.#options.reportError?.(message, cause)
+        }).pipe(
+          Effect.andThen(
+            Effect.logError(`Scheduled occurrence ${definition.id} failed`, {
+              cause,
+              scheduleId: definition.id,
+              scheduledAt,
+            })
           )
         )
       )
     )
+    const fiber = this.#options.forkEffect
+      ? this.#options.forkEffect("relay.schedules.occurrence", effect)
+      : Effect.runFork(effect)
+    this.#occurrenceFibers.add(fiber)
+    fiber.addObserver(() => this.#occurrenceFibers.delete(fiber))
   }
 
   async #executeOccurrence(
     schedule: RelayScheduleProjection,
-    scheduledAt: number
+    scheduledAt: number,
+    signal?: AbortSignal
   ) {
     const startedAt = Date.now()
-    const targetRuns = await Promise.all(
-      schedule.targets.map((target) =>
-        this.#executeTarget(schedule, target, scheduledAt)
-      )
+    const targetRuns = await Effect.runPromise(
+      Effect.forEach(
+        schedule.targets,
+        (target) =>
+          Effect.tryPromise({
+            try: (targetSignal) =>
+              this.#executeTarget(schedule, target, scheduledAt, targetSignal),
+            catch: (cause) => cause,
+          }),
+        { concurrency: targetExecutionConcurrency }
+      ),
+      signal ? { signal } : undefined
     )
     const run = scheduleRunSchema.parse({
       finishedAt: Date.now(),
@@ -333,7 +440,8 @@ export class ScheduleManager {
   async #executeTarget(
     schedule: RelayScheduleProjection,
     target: ScheduleTarget,
-    scheduledAt: number
+    scheduledAt: number,
+    signal?: AbortSignal
   ) {
     const id = scheduleStableId(
       schedule.id,
@@ -355,110 +463,121 @@ export class ScheduleManager {
       }
     }
     this.#activeTargets.add(activeKey)
-    const executed = await promiseResult(async () => {
-      if (!(await this.#targetExists(target))) {
-        return {
-          attempts: schedule.actions.map((action) =>
-            attempt({
-              action,
+    const executed = await Effect.runPromise(
+      Effect.result(
+        promiseEffect(async () => {
+          if (!(await this.#targetExists(target))) {
+            return {
+              attempts: schedule.actions.map((action) =>
+                attempt({
+                  action,
+                  error: "Target no longer exists",
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt,
+                  status: "skipped_missing",
+                  target,
+                })
+              ),
               error: "Target no longer exists",
-              scheduledAt,
-              scheduleId: schedule.id,
+              finishedAt: Date.now(),
+              id,
               startedAt,
-              status: "skipped_missing",
+              status: "noop" as const,
               target,
-            })
-          ),
-          error: "Target no longer exists",
-          finishedAt: Date.now(),
-          id,
-          startedAt,
-          status: "noop" as const,
-          target,
-        }
-      }
-      const attempts = []
-      let failure: string | null = null
-      for (const action of schedule.actions) {
-        const actionStartedAt = Date.now()
-        if (failure) {
-          attempts.push(
-            attempt({
-              action,
-              error: "A previous action failed",
-              scheduledAt,
-              scheduleId: schedule.id,
-              startedAt: actionStartedAt,
-              status: "not_run",
-              target,
-            })
+            }
+          }
+          const attempts = []
+          let failure: string | null = null
+          for (const action of schedule.actions) {
+            const actionStartedAt = Date.now()
+            if (failure) {
+              attempts.push(
+                attempt({
+                  action,
+                  error: "A previous action failed",
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt: actionStartedAt,
+                  status: "not_run",
+                  target,
+                })
+              )
+              continue
+            }
+            if (!scheduleActionSupportsTarget(action, target)) {
+              attempts.push(
+                attempt({
+                  action,
+                  error: null,
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt: actionStartedAt,
+                  status: "skipped_unsupported",
+                  target,
+                })
+              )
+              continue
+            }
+            const actionResult = await Effect.runPromise(
+              Effect.result(
+                promiseEffect(() =>
+                  this.#executeAction(
+                    schedule,
+                    action,
+                    target,
+                    scheduledAt,
+                    signal
+                  )
+                )
+              )
+            )
+            if (Result.isSuccess(actionResult)) {
+              attempts.push(
+                attempt({
+                  action,
+                  error: null,
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt: actionStartedAt,
+                  status: "succeeded",
+                  target,
+                })
+              )
+            } else {
+              failure = errorMessage(actionResult.failure)
+              attempts.push(
+                attempt({
+                  action,
+                  error: failure,
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt: actionStartedAt,
+                  status: "failed",
+                  target,
+                })
+              )
+            }
+          }
+          const succeeded = attempts.some(
+            (entry) => entry.status === "succeeded"
           )
-          continue
-        }
-        if (
-          !scheduleActionSupportsTarget(action, target) ||
-          (action.type === "power" &&
-            action.action === "kill" &&
-            target.kind === "database")
-        ) {
-          attempts.push(
-            attempt({
-              action,
-              error: null,
-              scheduledAt,
-              scheduleId: schedule.id,
-              startedAt: actionStartedAt,
-              status: "skipped_unsupported",
-              target,
-            })
-          )
-          continue
-        }
-        const actionResult = await promiseResult(() =>
-          this.#executeAction(schedule, action, target, scheduledAt)
-        )
-        if (Result.isSuccess(actionResult)) {
-          attempts.push(
-            attempt({
-              action,
-              error: null,
-              scheduledAt,
-              scheduleId: schedule.id,
-              startedAt: actionStartedAt,
-              status: "succeeded",
-              target,
-            })
-          )
-        } else {
-          failure = errorMessage(actionResult.failure)
-          attempts.push(
-            attempt({
-              action,
-              error: failure,
-              scheduledAt,
-              scheduleId: schedule.id,
-              startedAt: actionStartedAt,
-              status: "failed",
-              target,
-            })
-          )
-        }
-      }
-      const succeeded = attempts.some((entry) => entry.status === "succeeded")
-      return {
-        attempts,
-        error: failure,
-        finishedAt: Date.now(),
-        id,
-        startedAt,
-        status: failure
-          ? ("failed" as const)
-          : succeeded
-            ? ("succeeded" as const)
-            : ("noop" as const),
-        target,
-      }
-    })
+          return {
+            attempts,
+            error: failure,
+            finishedAt: Date.now(),
+            id,
+            startedAt,
+            status: failure
+              ? ("failed" as const)
+              : succeeded
+                ? ("succeeded" as const)
+                : ("noop" as const),
+            target,
+          }
+        })
+      )
+    )
     this.#activeTargets.delete(activeKey)
     if (Result.isSuccess(executed)) return executed.success
     return {
@@ -484,7 +603,8 @@ export class ScheduleManager {
     schedule: RelayScheduleProjection,
     action: RelayScheduleAction,
     target: ScheduleTarget,
-    scheduledAt: number
+    scheduledAt: number,
+    signal?: AbortSignal
   ) {
     if (action.type === "console_command" && target.kind === "instance") {
       await this.#options.sendConsoleCommand(target.id, action.command)
@@ -561,20 +681,56 @@ export class ScheduleManager {
         taskId,
       }
       const queued = await this.#options.enqueueBackup(input)
-      await this.#waitForBackup(queued)
+      await Effect.runPromise(
+        this.#waitForBackup(queued),
+        signal ? { signal } : undefined
+      )
     }
   }
 
-  async #waitForBackup(initial: RelayBackupTask) {
-    let task: RelayBackupTask | null = initial
-    while (task && (task.status === "queued" || task.status === "running")) {
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 500))
-      task = await this.#options.getBackup(initial.taskId)
-    }
-    if (!task) throw new Error("Scheduled backup disappeared from the queue")
-    if (task.status !== "succeeded") {
-      throw new Error(task.error ?? `Scheduled backup ${task.status}`)
-    }
+  #waitForBackup(initial: RelayBackupTask) {
+    const pollIntervalMs = this.#backupPollIntervalMs
+    const waitTimeoutMs = this.#backupWaitTimeoutMs
+    const getBackup = this.#options.getBackup
+    const poll = Effect.gen(function* () {
+      let task: RelayBackupTask | null = initial
+      while (task.status === "queued" || task.status === "running") {
+        yield* Effect.sleep(`${pollIntervalMs} millis`)
+        task = yield* Effect.tryPromise({
+          try: () => getBackup(initial.taskId),
+          catch: (cause) =>
+            new ScheduledBackupWaitError({
+              cause,
+              message: "Could not inspect the scheduled backup",
+              taskId: initial.taskId,
+            }),
+        })
+        if (!task) {
+          return yield* new ScheduledBackupWaitError({
+            message: "Scheduled backup disappeared from the queue",
+            taskId: initial.taskId,
+          })
+        }
+      }
+      if (task.status !== "succeeded") {
+        return yield* new ScheduledBackupWaitError({
+          message: task.error ?? `Scheduled backup ${task.status}`,
+          taskId: initial.taskId,
+        })
+      }
+    })
+    return poll.pipe(
+      Effect.timeoutOrElse({
+        duration: `${waitTimeoutMs} millis`,
+        orElse: () =>
+          Effect.fail(
+            new ScheduledBackupWaitError({
+              message: "Scheduled backup timed out",
+              taskId: initial.taskId,
+            })
+          ),
+      })
+    )
   }
 
   #upsertRun(run: ScheduleRun) {
@@ -585,13 +741,9 @@ export class ScheduleManager {
   }
 
   #serialized<TResult>(operation: () => Promise<TResult>): Promise<TResult> {
-    const result = this.#tail.then(operation)
-    this.#tail = Effect.runPromise(
-      Effect.tryPromise({ try: () => result, catch: (cause) => cause }).pipe(
-        Effect.ignore
-      )
+    return Effect.runPromise(
+      this.#semaphore.withPermit(promiseEffect(operation))
     )
-    return result
   }
 
   #persist() {
@@ -663,8 +815,12 @@ function aggregateRunStatus(
 }
 
 async function readScheduleState(path: string): Promise<PersistedState> {
-  const loaded = await promiseResult(async () =>
-    persistedStateSchema.parse(JSON.parse(await readFile(path, "utf8")))
+  const loaded = await Effect.runPromise(
+    Effect.result(
+      promiseEffect(async () =>
+        persistedStateSchema.parse(JSON.parse(await readFile(path, "utf8")))
+      )
+    )
   )
   if (Result.isFailure(loaded)) {
     const cause = loaded.failure
@@ -685,12 +841,6 @@ async function readScheduleState(path: string): Promise<PersistedState> {
     throw cause
   }
   return loaded.success
-}
-
-function promiseResult<TResult>(run: () => Promise<TResult>) {
-  return Effect.runPromise(
-    Effect.result(Effect.tryPromise({ try: run, catch: (cause) => cause }))
-  )
 }
 
 function errorMessage(cause: unknown) {

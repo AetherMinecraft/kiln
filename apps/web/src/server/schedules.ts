@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
-import { Effect, Result } from "effect"
+import { Data, Effect, Result } from "effect"
 import type { RowDataPacket } from "mysql2/promise"
 import { z } from "zod"
 
@@ -14,6 +14,7 @@ import {
   scheduleInputSchema,
   scheduleRunSchema,
   scheduleTargetSchema,
+  type RelayScheduleAction,
   type RelayScheduleProjection,
   type ScheduleAction,
   type ScheduleDefinition,
@@ -24,7 +25,8 @@ import {
 import { prepareResticRepositoryLocation } from "@/backups/destinations"
 import { loadBackupStorageEffect } from "@/backups/destinations/s3"
 import { ensureBackupRepositoryEffect } from "@/effect/backups"
-import { runAppEffect } from "@/effect/runtime"
+import { Database, type DatabaseTransaction } from "@/effect/database"
+import { forkAppEffect, runAppEffect } from "@/effect/runtime"
 import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import {
@@ -41,12 +43,24 @@ import {
 } from "@/lib/schedule-permissions"
 import { relayRpc } from "@/lib/relay-connection"
 import { listPersistedRelays } from "@/lib/relay-registry"
+import { promiseEffect } from "@/effect/promise"
 import { requireAuthenticatedUser } from "@/server/auth"
 
 const scheduleWriteSchema = scheduleInputSchema
 
-const scheduleUpdateSchema = scheduleWriteSchema.safeExtend({ id: z.uuid() })
+const scheduleUpdateSchema = scheduleWriteSchema.safeExtend({
+  id: z.uuid(),
+  revision: z.number().int().positive(),
+})
 const scheduleIdSchema = z.strictObject({ id: z.uuid() })
+const scheduleReconciliationIntervalMs = 60_000
+const scheduleReconciliationConcurrency = 4
+let scheduleReconciliationActive = false
+let nextScheduleReconciliationAt = 0
+
+class ScheduleRevisionConflictError extends Data.TaggedError(
+  "ScheduleRevisionConflictError"
+)<{ readonly message: string }> {}
 
 interface ScheduleRow extends RowDataPacket {
   created_at: Date
@@ -184,11 +198,8 @@ export const getSchedules = createServerFn({ method: "GET" }).handler(
           user,
         }) === null
     )
-    await reconcileScheduleState(visible, user.id)
-    await reconcileScheduleTombstones(user.id)
-    const refreshed = await loadSchedules()
-    const visibleIds = new Set(visible.map((schedule) => schedule.id))
-    return refreshed.filter((schedule) => visibleIds.has(schedule.id))
+    requestScheduleReconciliation(schedules)
+    return visible
   }
 )
 
@@ -228,6 +239,12 @@ export const updateSchedule = createServerFn({ method: "POST" })
       (schedule) => schedule.id === data.id
     )
     if (!existing) throw new Error("Schedule not found")
+    if (existing.revision !== data.revision) {
+      throw new ScheduleRevisionConflictError({
+        message:
+          "This schedule changed after you opened it. Refresh and try again.",
+      })
+    }
 
     // Editing is all-or-nothing. The user must still be authorized for every
     // stored action, even when the proposed change removes that action.
@@ -242,7 +259,7 @@ export const updateSchedule = createServerFn({ method: "POST" })
     const definition = scheduleDefinitionSchema.parse({
       ...data,
       cron: normalizeScheduleCron(data.cron),
-      revision: existing.revision + 1,
+      revision: data.revision + 1,
       targets: await canonicalTargets(data.targets),
     })
     requireScheduleAuthorization({
@@ -256,7 +273,7 @@ export const updateSchedule = createServerFn({ method: "POST" })
     const previousRelayIds = new Set(
       existing.targets.map((target) => target.relayId)
     )
-    await replaceSchedule(definition)
+    await replaceSchedule(definition, data.revision)
     await deploySchedule(definition, user.id)
     const nextRelayIds = new Set(
       definition.targets.map((target) => target.relayId)
@@ -333,16 +350,20 @@ export const runScheduleNow = createServerFn({ method: "POST" })
         if (!relay?.enabled) {
           return { error: "Relay is unavailable", relayId, started: false }
         }
-        const started = await promiseResult(() =>
-          Promise.resolve(
-            relayRpc(
-              relay,
-              "schedule.run",
-              { revision: schedule.revision, scheduleId: schedule.id },
-              15_000,
-              user.id
+        const started = await Effect.runPromise(
+          Effect.result(
+            promiseEffect(() =>
+              Promise.resolve(
+                relayRpc(
+                  relay,
+                  "schedule.run",
+                  { revision: schedule.revision, scheduleId: schedule.id },
+                  15_000,
+                  user.id
+                )
+              ).then((value) => scheduleRunSchema.parse(value))
             )
-          ).then((value) => scheduleRunSchema.parse(value))
+          )
         )
         return Result.isSuccess(started)
           ? { error: null, relayId, started: true }
@@ -428,96 +449,101 @@ async function saveNewSchedule(
   schedule: ScheduleDefinition,
   createdBy: string
 ) {
-  await withScheduleTransaction(async (connection) => {
-    await connection.execute(
-      `INSERT INTO ${databaseTable("schedule")}
-         (id, name, cron_expression, timezone, enabled, revision, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        schedule.id,
-        schedule.name,
-        schedule.cron,
-        schedule.timezone,
-        schedule.enabled,
-        schedule.revision,
-        createdBy,
-      ]
-    )
-    await insertScheduleParts(connection, schedule)
-  })
+  await runAppEffect(
+    "schedules.create",
+    Effect.gen(function* () {
+      const database = yield* Database
+      yield* database.transaction("schedules.create", (transaction) =>
+        Effect.gen(function* () {
+          yield* transaction.execute(
+            `INSERT INTO ${databaseTable("schedule")}
+               (id, name, cron_expression, timezone, enabled, revision, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              schedule.id,
+              schedule.name,
+              schedule.cron,
+              schedule.timezone,
+              schedule.enabled,
+              schedule.revision,
+              createdBy,
+            ]
+          )
+          yield* insertScheduleParts(transaction, schedule)
+        })
+      )
+    })
+  )
 }
 
-async function replaceSchedule(schedule: ScheduleDefinition) {
-  await withScheduleTransaction(async (connection) => {
-    const [result] = await connection.execute(
-      `UPDATE ${databaseTable("schedule")}
-          SET name = ?, cron_expression = ?, timezone = ?, enabled = ?,
-              revision = ?
-        WHERE id = ? AND deleted_at IS NULL`,
-      [
-        schedule.name,
-        schedule.cron,
-        schedule.timezone,
-        schedule.enabled,
-        schedule.revision,
-        schedule.id,
-      ]
-    )
-    if (!("affectedRows" in result) || result.affectedRows !== 1) {
-      throw new Error("Schedule was changed by another request")
-    }
-    await connection.execute(
-      `DELETE FROM ${databaseTable("schedule_action")} WHERE schedule_id = ?`,
-      [schedule.id]
-    )
-    await connection.execute(
-      `DELETE FROM ${databaseTable("schedule_target")} WHERE schedule_id = ?`,
-      [schedule.id]
-    )
-    await insertScheduleParts(connection, schedule)
-  })
-}
-
-async function withScheduleTransaction<TResult>(
-  operation: (
-    connection: Awaited<ReturnType<typeof databasePool.getConnection>>
-  ) => Promise<TResult>
+async function replaceSchedule(
+  schedule: ScheduleDefinition,
+  expectedRevision: number
 ) {
-  const connection = await databasePool.getConnection()
-  const result = await promiseResult(async () => {
-    await connection.beginTransaction()
-    const value = await operation(connection)
-    await connection.commit()
-    return value
-  })
-  if (Result.isFailure(result)) {
-    await ignorePromise(() => connection.rollback())
-  }
-  connection.release()
-  if (Result.isFailure(result)) throw result.failure
-  return result.success
+  await runAppEffect(
+    "schedules.update",
+    Effect.gen(function* () {
+      const database = yield* Database
+      yield* database.transaction("schedules.update", (transaction) =>
+        Effect.gen(function* () {
+          const result = yield* transaction.execute(
+            `UPDATE ${databaseTable("schedule")}
+                SET name = ?, cron_expression = ?, timezone = ?, enabled = ?,
+                    revision = ?
+              WHERE id = ? AND revision = ? AND deleted_at IS NULL`,
+            [
+              schedule.name,
+              schedule.cron,
+              schedule.timezone,
+              schedule.enabled,
+              schedule.revision,
+              schedule.id,
+              expectedRevision,
+            ]
+          )
+          if (result.affectedRows !== 1) {
+            return yield* new ScheduleRevisionConflictError({
+              message:
+                "This schedule changed after you opened it. Refresh and try again.",
+            })
+          }
+          yield* transaction.execute(
+            `DELETE FROM ${databaseTable("schedule_action")} WHERE schedule_id = ?`,
+            [schedule.id]
+          )
+          yield* transaction.execute(
+            `DELETE FROM ${databaseTable("schedule_target")} WHERE schedule_id = ?`,
+            [schedule.id]
+          )
+          yield* insertScheduleParts(transaction, schedule)
+        })
+      )
+    })
+  )
 }
 
-async function insertScheduleParts(
-  connection: Awaited<ReturnType<typeof databasePool.getConnection>>,
+function insertScheduleParts(
+  transaction: DatabaseTransaction,
   schedule: ScheduleDefinition
 ) {
-  for (const [position, action] of schedule.actions.entries()) {
-    await connection.execute(
-      `INSERT INTO ${databaseTable("schedule_action")}
-         (id, schedule_id, position, action_type, action_config)
-       VALUES (?, ?, ?, ?, ?)`,
-      [action.id, schedule.id, position, action.type, JSON.stringify(action)]
-    )
-  }
-  for (const target of schedule.targets) {
-    await connection.execute(
-      `INSERT INTO ${databaseTable("schedule_target")}
-         (schedule_id, relay_id, target_kind, target_id, target_name)
-       VALUES (?, ?, ?, ?, ?)`,
-      [schedule.id, target.relayId, target.kind, target.id, target.name]
-    )
-  }
+  return Effect.gen(function* () {
+    for (const [position, action] of schedule.actions.entries()) {
+      yield* transaction.execute(
+        `INSERT INTO ${databaseTable("schedule_action")}
+           (id, schedule_id, position, action_type, action_config)
+         VALUES (?, ?, ?, ?, ?)`,
+        [action.id, schedule.id, position, action.type, JSON.stringify(action)]
+      )
+    }
+    for (const target of schedule.targets) {
+      yield* transaction.execute(
+        `INSERT INTO ${databaseTable("schedule_target")}
+           (schedule_id, relay_id, target_kind, target_id, target_name)
+         VALUES (?, ?, ?, ?, ?)`,
+        [schedule.id, target.relayId, target.kind, target.id, target.name]
+      )
+    }
+  })
 }
 
 async function loadSchedules() {
@@ -635,7 +661,7 @@ async function deployScheduleToRelay(
   schedule: ScheduleDefinition,
   targets: ReadonlyArray<ScheduleTarget>,
   relay: Awaited<ReturnType<typeof listPersistedRelays>>[number] | undefined,
-  subject: string
+  subject?: string
 ) {
   const relayId = targets[0]?.relayId
   if (!relayId) return
@@ -649,52 +675,45 @@ async function deployScheduleToRelay(
     )
     return
   }
-  const deployed = await promiseResult(async () => {
-    const projection: RelayScheduleProjection = {
-      ...schedule,
-      actions: await Promise.all(
-        schedule.actions.map(async (action) => {
-          if (action.type !== "backup") return action
-          const executions = []
-          for (const target of targets) {
-            if (!scheduleActionSupportsTarget(action, target)) continue
-            executions.push(
-              (async () => ({
-                destination:
-                  action.mode === "full"
-                    ? ({ kind: "local" } as const)
-                    : await scheduledResticDestination(action, target),
-                mode: action.mode,
-                targetId: target.id,
-                targetKind: target.kind,
-              }))()
-            )
-          }
-          return {
-            ...action,
-            executions: await Promise.all(executions),
-          }
-        })
-      ),
-      targets: [...targets],
-    }
-    const result = z
-      .object({
-        acknowledgedRevision: z.number().int().positive(),
-        nextRunAt: z.number().int().nonnegative().nullable(),
-        scheduleId: z.uuid(),
-      })
-      .parse(
-        await relayRpc(relay, "schedule.apply", projection, 15_000, subject)
-      )
-    await databasePool.execute(
-      `UPDATE ${databaseTable("schedule_deployment")}
-          SET acknowledged_revision = ?, status = 'applied',
-              next_run_at = FROM_UNIXTIME(? / 1000), last_error = NULL
+  const deployed = await Effect.runPromise(
+    Effect.result(
+      promiseEffect(async () => {
+        const projection: RelayScheduleProjection = {
+          ...schedule,
+          actions: await prepareRelayScheduleActions(schedule.actions, targets),
+          targets: [...targets],
+        }
+        const result = z
+          .object({
+            acknowledgedRevision: z.number().int().positive(),
+            nextRunAt: z.number().int().nonnegative().nullable(),
+            scheduleId: z.uuid(),
+          })
+          .parse(
+            await relayRpc(relay, "schedule.apply", projection, 15_000, subject)
+          )
+        await databasePool.execute(
+          `UPDATE ${databaseTable("schedule_deployment")}
+          SET status = IF(? >= desired_revision, 'applied', status),
+              next_run_at = IF(? >= desired_revision,
+                FROM_UNIXTIME(? / 1000), next_run_at),
+              last_error = IF(? >= desired_revision, NULL, last_error),
+              acknowledged_revision = GREATEST(
+                COALESCE(acknowledged_revision, 0), ?)
         WHERE schedule_id = ? AND relay_id = ?`,
-      [result.acknowledgedRevision, result.nextRunAt, schedule.id, relayId]
+          [
+            result.acknowledgedRevision,
+            result.acknowledgedRevision,
+            result.nextRunAt,
+            result.acknowledgedRevision,
+            result.acknowledgedRevision,
+            schedule.id,
+            relayId,
+          ]
+        )
+      })
     )
-  })
+  )
   if (Result.isFailure(deployed)) {
     await deploymentError(
       schedule.id,
@@ -703,6 +722,44 @@ async function deployScheduleToRelay(
       errorMessage(deployed.failure)
     )
   }
+}
+
+async function prepareRelayScheduleActions(
+  actions: ReadonlyArray<ScheduleAction>,
+  targets: ReadonlyArray<ScheduleTarget>
+): Promise<Array<RelayScheduleAction>> {
+  return Effect.runPromise(
+    Effect.forEach(
+      actions,
+      (action): Effect.Effect<RelayScheduleAction, unknown> => {
+        if (action.type !== "backup") return Effect.succeed(action)
+        return Effect.forEach(
+          targets,
+          (target) =>
+            !scheduleActionSupportsTarget(action, target)
+              ? Effect.succeed(null)
+              : promiseEffect(async () => ({
+                  destination:
+                    action.mode === "full"
+                      ? ({ kind: "local" } as const)
+                      : await scheduledResticDestination(action, target),
+                  mode: action.mode,
+                  targetId: target.id,
+                  targetKind: target.kind,
+                })),
+          { concurrency: scheduleReconciliationConcurrency }
+        ).pipe(
+          Effect.map((executions) => ({
+            ...action,
+            executions: executions.flatMap((execution) =>
+              execution ? [execution] : []
+            ),
+          }))
+        )
+      },
+      { concurrency: 1 }
+    )
+  )
 }
 
 async function scheduledResticDestination(
@@ -787,7 +844,7 @@ async function removeRelayProjections(
   scheduleId: string,
   revision: number,
   relayIds: ReadonlyArray<string>,
-  subject: string
+  subject?: string
 ) {
   const relays = new Map(
     (await listPersistedRelays()).map((relay) => [relay.id, relay])
@@ -805,20 +862,24 @@ async function removeRelayProjections(
         )
         return
       }
-      const removed = await promiseResult(async () => {
-        await relayRpc(
-          relay,
-          "schedule.remove",
-          { revision, scheduleId },
-          15_000,
-          subject
-        )
-        await databasePool.execute(
-          `DELETE FROM ${databaseTable("schedule_deployment")}
+      const removed = await Effect.runPromise(
+        Effect.result(
+          promiseEffect(async () => {
+            await relayRpc(
+              relay,
+              "schedule.remove",
+              { revision, scheduleId },
+              15_000,
+              subject
+            )
+            await databasePool.execute(
+              `DELETE FROM ${databaseTable("schedule_deployment")}
             WHERE schedule_id = ? AND relay_id = ?`,
-          [scheduleId, relayId]
+              [scheduleId, relayId]
+            )
+          })
         )
-      })
+      )
       if (Result.isFailure(removed)) {
         await deploymentError(
           scheduleId,
@@ -831,9 +892,42 @@ async function removeRelayProjections(
   )
 }
 
+function requestScheduleReconciliation(
+  schedules: ReadonlyArray<ScheduleDefinition>
+) {
+  const now = Date.now()
+  if (scheduleReconciliationActive || now < nextScheduleReconciliationAt) {
+    return
+  }
+  scheduleReconciliationActive = true
+  nextScheduleReconciliationAt = now + scheduleReconciliationIntervalMs
+  forkAppEffect(
+    "schedules.reconcileInBackground",
+    promiseEffect(() => reconcileSchedules(schedules)).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("Schedule reconciliation failed", { cause })
+      ),
+      Effect.ensuring(
+        Effect.sync(() => {
+          scheduleReconciliationActive = false
+        })
+      )
+    )
+  )
+}
+
+async function reconcileSchedules(
+  schedules: ReadonlyArray<ScheduleDefinition>,
+  relayIds?: ReadonlySet<string>
+) {
+  await reconcileScheduleState(schedules, undefined, relayIds)
+  await reconcileScheduleTombstones(undefined, relayIds)
+}
+
 async function reconcileScheduleState(
   schedules: ReadonlyArray<ScheduleDefinition>,
-  subject: string
+  subject?: string,
+  relayIds?: ReadonlySet<string>
 ) {
   const projectionsByRelay = new Map<
     string,
@@ -844,6 +938,7 @@ async function reconcileScheduleState(
       schedule.targets,
       (target) => target.relayId
     )) {
+      if (relayIds && !relayIds.has(relayId)) continue
       const projections = projectionsByRelay.get(relayId) ?? []
       projections.push({ schedule, targets })
       projectionsByRelay.set(relayId, projections)
@@ -852,44 +947,73 @@ async function reconcileScheduleState(
   const relays = new Map(
     (await listPersistedRelays()).map((relay) => [relay.id, relay])
   )
-  await Promise.all(
-    [...projectionsByRelay].map(async ([relayId, projections]) => {
-      const relay = relays.get(relayId)
-      if (!relay?.enabled) return
-      const reconciled = await promiseResult(async () => {
-        const overview = relayScheduleOverviewSchema.parse(
-          await relayRpc(
-            relay,
-            "schedule.overview",
-            { scheduleIds: projections.map(({ schedule }) => schedule.id) },
-            15_000
+  await Effect.runPromise(
+    Effect.forEach(
+      [...projectionsByRelay],
+      ([relayId, projections]) =>
+        promiseEffect(async () => {
+          const relay = relays.get(relayId)
+          if (!relay?.enabled) return
+          const reconciled = await Effect.runPromise(
+            Effect.result(
+              promiseEffect(async () => {
+                const overview = relayScheduleOverviewSchema.parse(
+                  await relayRpc(
+                    relay,
+                    "schedule.overview",
+                    {
+                      scheduleIds: projections.map(
+                        ({ schedule }) => schedule.id
+                      ),
+                    },
+                    15_000
+                  )
+                )
+                await importRelayScheduleOverview(relayId, overview)
+                const revisions = new Map(
+                  overview.deployments.map((deployment) => [
+                    deployment.scheduleId,
+                    deployment.acknowledgedRevision,
+                  ])
+                )
+                await Effect.runPromise(
+                  Effect.forEach(
+                    projections,
+                    ({ schedule, targets }) =>
+                      revisions.get(schedule.id) === schedule.revision
+                        ? Effect.void
+                        : promiseEffect(() =>
+                            deployScheduleToRelay(
+                              schedule,
+                              targets,
+                              relay,
+                              subject
+                            )
+                          ),
+                    {
+                      concurrency: scheduleReconciliationConcurrency,
+                      discard: true,
+                    }
+                  )
+                )
+              })
+            )
           )
-        )
-        await importRelayScheduleOverview(relayId, overview)
-        const revisions = new Map(
-          overview.deployments.map((deployment) => [
-            deployment.scheduleId,
-            deployment.acknowledgedRevision,
-          ])
-        )
-        await Promise.all(
-          projections.map(({ schedule, targets }) =>
-            revisions.get(schedule.id) === schedule.revision
-              ? Promise.resolve()
-              : deployScheduleToRelay(schedule, targets, relay, subject)
-          )
-        )
-      })
-      if (Result.isFailure(reconciled)) {
-        // The last acknowledged next-run and history remain available while a
-        // Relay is disconnected. Disconnection is not recorded as a run fail.
-        return
-      }
-    })
+          if (Result.isFailure(reconciled)) {
+            // The last acknowledged next-run and history remain available while a
+            // Relay is disconnected. Disconnection is not recorded as a run fail.
+            return
+          }
+        }),
+      { concurrency: scheduleReconciliationConcurrency, discard: true }
+    )
   )
 }
 
-async function reconcileScheduleTombstones(subject: string) {
+async function reconcileScheduleTombstones(
+  subject?: string,
+  relayIds?: ReadonlySet<string>
+) {
   const [rows] = await databasePool.query<ScheduleTombstoneRow[]>(
     `SELECT deployment.schedule_id, deployment.relay_id,
             deployment.desired_revision
@@ -904,14 +1028,21 @@ async function reconcileScheduleTombstones(subject: string) {
               AND target.relay_id = deployment.relay_id
          )`
   )
-  await Promise.all(
-    rows.map((row) =>
-      removeRelayProjections(
-        row.schedule_id,
-        row.desired_revision,
-        [row.relay_id],
-        subject
-      )
+  await Effect.runPromise(
+    Effect.forEach(
+      rows,
+      (row) =>
+        relayIds && !relayIds.has(row.relay_id)
+          ? Effect.void
+          : promiseEffect(() =>
+              removeRelayProjections(
+                row.schedule_id,
+                row.desired_revision,
+                [row.relay_id],
+                subject
+              )
+            ),
+      { concurrency: scheduleReconciliationConcurrency, discard: true }
     )
   )
 }
@@ -922,15 +1053,26 @@ async function importRelayScheduleOverview(
 ) {
   for (const deployment of overview.deployments) {
     await databasePool.execute(
-      `UPDATE ${databaseTable("schedule_deployment")}
-          SET acknowledged_revision = ?, status = 'applied',
-              next_run_at = FROM_UNIXTIME(? / 1000), last_error = NULL
-        WHERE schedule_id = ? AND relay_id = ?`,
+      `INSERT INTO ${databaseTable("schedule_deployment")}
+         (schedule_id, relay_id, desired_revision, acknowledged_revision,
+          status, next_run_at, last_error)
+       VALUES (?, ?, ?, ?, 'applied', FROM_UNIXTIME(? / 1000), NULL)
+       ON DUPLICATE KEY UPDATE
+         status = IF(VALUES(acknowledged_revision) >= desired_revision,
+           'applied', status),
+         next_run_at = IF(VALUES(acknowledged_revision) >= desired_revision,
+           VALUES(next_run_at), next_run_at),
+         last_error = IF(VALUES(acknowledged_revision) >= desired_revision,
+           NULL, last_error),
+         acknowledged_revision = GREATEST(
+           COALESCE(acknowledged_revision, 0),
+           VALUES(acknowledged_revision))`,
       [
-        deployment.acknowledgedRevision,
-        deployment.nextRunAt,
         deployment.scheduleId,
         relayId,
+        deployment.acknowledgedRevision,
+        deployment.acknowledgedRevision,
+        deployment.nextRunAt,
       ]
     )
   }
@@ -965,8 +1107,13 @@ async function upsertDeployment(
     `INSERT INTO ${databaseTable("schedule_deployment")}
        (schedule_id, relay_id, desired_revision, status)
      VALUES (?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE desired_revision = VALUES(desired_revision),
-       status = VALUES(status), last_error = NULL`,
+     ON DUPLICATE KEY UPDATE
+       status = IF(VALUES(desired_revision) >= desired_revision,
+         VALUES(status), status),
+       last_error = IF(VALUES(desired_revision) >= desired_revision,
+         NULL, last_error),
+       desired_revision = GREATEST(desired_revision,
+         VALUES(desired_revision))`,
     [scheduleId, relayId, revision, status]
   )
 }
@@ -981,24 +1128,17 @@ async function deploymentError(
     `INSERT INTO ${databaseTable("schedule_deployment")}
        (schedule_id, relay_id, desired_revision, status, last_error)
      VALUES (?, ?, ?, 'error', ?)
-     ON DUPLICATE KEY UPDATE desired_revision = VALUES(desired_revision),
-       status = 'error', last_error = VALUES(last_error)`,
+     ON DUPLICATE KEY UPDATE
+       status = IF(VALUES(desired_revision) >= desired_revision,
+         'error', status),
+       last_error = IF(VALUES(desired_revision) >= desired_revision,
+         VALUES(last_error), last_error),
+       desired_revision = GREATEST(desired_revision,
+         VALUES(desired_revision))`,
     [scheduleId, relayId, revision, error.slice(0, 2_000)]
   )
 }
 
 function errorMessage(cause: unknown) {
   return cause instanceof Error ? cause.message : "Unknown Relay error"
-}
-
-function promiseResult<TResult>(run: () => Promise<TResult>) {
-  return Effect.runPromise(
-    Effect.result(Effect.tryPromise({ try: run, catch: (cause) => cause }))
-  )
-}
-
-async function ignorePromise(run: () => Promise<unknown>): Promise<void> {
-  await Effect.runPromise(
-    Effect.tryPromise({ try: run, catch: (cause) => cause }).pipe(Effect.ignore)
-  )
 }

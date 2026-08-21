@@ -1,4 +1,8 @@
-import type { ScheduleAction, ScheduleTarget } from "@workspace/contracts"
+import {
+  scheduleActionSupportsTarget,
+  type ScheduleAction,
+  type ScheduleTarget,
+} from "@workspace/contracts"
 
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import type { AccessGrant } from "@/lib/access-control"
@@ -62,6 +66,7 @@ export function scheduleAuthorizationFailure(input: {
       return `You do not have ${input.schedulePermission} permission for ${target.name}`
     }
     for (const action of input.actions) {
+      if (!scheduleActionSupportsTarget(action, target)) continue
       const permission = scheduleActionPermission(action, target)
       if (
         permission &&

@@ -326,11 +326,20 @@ export function scheduleDeterministicUuid(
 }
 
 export function scheduleActionSupportsTarget(
-  action: { mode?: "full" | "incremental"; type: ScheduleActionType },
+  action: {
+    action?: "kill" | "restart" | "start" | "stop"
+    mode?: "full" | "incremental"
+    type: ScheduleActionType
+  },
   target: Pick<ScheduleTarget, "kind">
 ): boolean {
   if (action.type === "console_command") return target.kind === "instance"
-  if (action.type === "power") return target.kind !== "relay"
+  if (action.type === "power") {
+    return (
+      target.kind !== "relay" &&
+      !(target.kind === "database" && action.action === "kill")
+    )
+  }
   if (action.mode === "incremental") return target.kind === "instance"
   return true
 }

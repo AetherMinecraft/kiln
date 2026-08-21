@@ -120,6 +120,11 @@ const relativeFormatter = new Intl.RelativeTimeFormat("en-US", {
   numeric: "auto",
   style: "short",
 })
+const timestampFormatters = new Map<string, Intl.DateTimeFormat>()
+const fullTimestampFormatters = new Map<string, Intl.DateTimeFormat>()
+const relativeClockListeners = new Set<() => void>()
+let relativeClockSnapshot = Date.now()
+let relativeClockTimer: ReturnType<typeof setInterval> | null = null
 
 const timezones = Intl.supportedValuesOf("timeZone")
 
@@ -422,12 +427,20 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
       })
     },
     onError: (cause) =>
-      showToast({ message: errorMessage(cause), type: "error" }),
+      showToast({
+        message: errorMessage(cause, "The schedule could not be started"),
+        type: "error",
+      }),
   })
   const enabledMutation = useMutation({
     mutationFn: (enabled: boolean) =>
       updateSchedule({
-        data: { ...scheduleInput(schedule), enabled, id: schedule.id },
+        data: {
+          ...scheduleInput(schedule),
+          enabled,
+          id: schedule.id,
+          revision: schedule.revision,
+        },
       }),
     onSuccess: async (_updated, enabled) => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
@@ -437,7 +450,10 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
       })
     },
     onError: (cause) =>
-      showToast({ message: errorMessage(cause), type: "error" }),
+      showToast({
+        message: errorMessage(cause, "The schedule could not be updated"),
+        type: "error",
+      }),
   })
   const duplicateMutation = useMutation({
     mutationFn: () =>
@@ -456,7 +472,10 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
       showToast({ message: "Schedule duplicated", type: "success" })
     },
     onError: (cause) =>
-      showToast({ message: errorMessage(cause), type: "error" }),
+      showToast({
+        message: errorMessage(cause, "The schedule could not be duplicated"),
+        type: "error",
+      }),
   })
   const nextRun = scheduleNextRun(schedule)
   const lastRun = scheduleLastRun(schedule, scope)
@@ -467,7 +486,11 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
         await navigator.clipboard.writeText(schedule.id)
         showToast({ message: "Schedule ID copied", type: "success" })
       },
-      (cause) => showToast({ message: errorMessage(cause), type: "error" })
+      (cause) =>
+        showToast({
+          message: errorMessage(cause, "The schedule ID could not be copied"),
+          type: "error",
+        })
     )
   }, [schedule.id])
 
@@ -656,7 +679,7 @@ function ScheduleNextRun({
           className="-my-1 inline-flex h-7 cursor-default items-center rounded-sm px-1 text-[0.625rem] leading-none text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           suppressHydrationWarning
         >
-          {relativeTime(nextRun)}
+          <RelativeTimeText date={nextRun} />
         </time>
       </TooltipTrigger>
       <TooltipContent side="bottom">
@@ -665,6 +688,24 @@ function ScheduleNextRun({
     </Tooltip>
   )
 }
+
+const RelativeTimeText = React.memo(function RelativeTimeText({
+  date,
+}: {
+  date: Date
+}) {
+  const serverSnapshot = React.useMemo(() => Date.now(), [])
+  const getServerSnapshot = React.useCallback(
+    () => serverSnapshot,
+    [serverSnapshot]
+  )
+  const now = React.useSyncExternalStore(
+    subscribeRelativeClock,
+    getRelativeClockSnapshot,
+    getServerSnapshot
+  )
+  return relativeTime(date, now)
+})
 
 function ScheduleLastRun({
   run,
@@ -1047,7 +1088,7 @@ const ScheduleHistoryRow = React.memo(function ScheduleHistoryRow({
             {timestampLabel(new Date(run.startedAt), run.timezone)}
           </p>
           <p className="truncate text-[0.5rem] text-muted-foreground">
-            {relativeTime(new Date(run.startedAt))}
+            <RelativeTimeText date={new Date(run.startedAt)} />
           </p>
         </div>
       </WorkspaceTableCell>
@@ -1113,7 +1154,7 @@ const ScheduleRunDialog = React.memo(function ScheduleRunDialog({
                 <RunMetadataItem
                   label="Started"
                   value={timestampLabel(new Date(run.startedAt), run.timezone)}
-                  detail={relativeTime(new Date(run.startedAt))}
+                  detail={<RelativeTimeText date={new Date(run.startedAt)} />}
                 />
                 <RunMetadataItem
                   label="Duration"
@@ -1219,7 +1260,7 @@ function RunMetadataItem({
 }: {
   label: string
   value: string
-  detail?: string
+  detail?: React.ReactNode
   mono?: boolean
 }) {
   return (
@@ -1413,13 +1454,17 @@ function ScheduleEditorDialog({
     }),
     [permissionKey, selectedOptions]
   )
+  const actionSelectionValid = actions.every((action) =>
+    scheduleActionAllowed(action, selectedOptions, permissionKey)
+  )
   const canSave =
     name.trim().length > 0 &&
     cron.trim().length > 0 &&
     timezone.trim().length > 0 &&
     selectedOptions.length > 0 &&
     selectedOptions.every((option) => option[permissionKey]) &&
-    actions.length > 0
+    actions.length > 0 &&
+    actionSelectionValid
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -1442,7 +1487,9 @@ function ScheduleEditorDialog({
         timezone,
       }
       return existing
-        ? updateSchedule({ data: { ...data, id: existing.id } })
+        ? updateSchedule({
+            data: { ...data, id: existing.id, revision: existing.revision },
+          })
         : createSchedule({ data })
     },
     onSuccess: async (schedule) => {
@@ -1454,7 +1501,10 @@ function ScheduleEditorDialog({
       if (schedule) onSaved(schedule.id)
     },
     onError: (cause) =>
-      showToast({ message: errorMessage(cause), type: "error" }),
+      showToast({
+        message: errorMessage(cause, "The schedule could not be saved"),
+        type: "error",
+      }),
   })
 
   const addAction = React.useCallback(
@@ -1532,6 +1582,7 @@ function ScheduleEditorDialog({
         >
           <ScheduleEditorFields
             actionPermissions={actionPermissions}
+            actionSelectionValid={actionSelectionValid}
             actions={actions}
             cron={cron}
             isCreate={isCreate}
@@ -1593,6 +1644,7 @@ function ScheduleEditorDialog({
 
 const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   actionPermissions,
+  actionSelectionValid,
   actions,
   cron,
   isCreate,
@@ -1615,6 +1667,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   onTimezoneChange,
 }: {
   actionPermissions: Readonly<Record<ScheduleAction["type"], boolean>>
+  actionSelectionValid: boolean
   actions: ReadonlyArray<ScheduleAction>
   cron: string
   isCreate: boolean
@@ -1669,6 +1722,10 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
           onMove={onActionMove}
           onReorder={onActionReorder}
           onRemove={onActionRemove}
+        />
+        <ScheduleActionValidationMessage
+          actions={actions}
+          valid={actionSelectionValid}
         />
       </>
     )
@@ -1742,10 +1799,29 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
           onReorder={onActionReorder}
           onRemove={onActionRemove}
         />
+        <ScheduleActionValidationMessage
+          actions={actions}
+          valid={actionSelectionValid}
+        />
       </CreateSection>
     </>
   )
 })
+
+function ScheduleActionValidationMessage({
+  actions,
+  valid,
+}: {
+  actions: ReadonlyArray<ScheduleAction>
+  valid: boolean
+}) {
+  return actions.length > 0 && !valid ? (
+    <p className="mt-2 text-[0.625rem] leading-4 text-destructive" role="alert">
+      One or more actions are not supported or permitted by the selected
+      targets.
+    </p>
+  ) : null
+}
 
 const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
   cron,
@@ -2371,7 +2447,10 @@ function DeleteScheduleDialog({
       onClose()
     },
     onError: (cause) =>
-      showToast({ message: errorMessage(cause), type: "error" }),
+      showToast({
+        message: errorMessage(cause, "The schedule could not be deleted"),
+        type: "error",
+      }),
   })
   return (
     <Dialog
@@ -2558,17 +2637,23 @@ function canOperateSchedule(
 }
 
 function scheduleActionAllowed(
-  type: ScheduleAction["type"],
+  actionOrType:
+    | ScheduleAction["type"]
+    | Pick<ScheduleAction, "type">
+    | Pick<Extract<ScheduleAction, { type: "backup" }>, "mode" | "type">,
   targets: ReadonlyArray<ScheduleOption>,
   permission: "canCreate" | "canUpdate"
 ) {
+  const action =
+    typeof actionOrType === "string" ? { type: actionOrType } : actionOrType
   const compatible = targets.filter((target) =>
-    scheduleActionSupportsTarget({ type }, target)
+    scheduleActionSupportsTarget(action, target)
   )
   return (
     compatible.length > 0 &&
     compatible.every(
-      (target) => target[permission] && target.permittedActions.includes(type)
+      (target) =>
+        target[permission] && target.permittedActions.includes(action.type)
     )
   )
 }
@@ -2714,19 +2799,29 @@ function durationLabel(durationMs: number) {
 }
 
 function timestampLabel(date: Date, timeZone: string) {
-  return new Intl.DateTimeFormat("en-US", {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone,
-  }).format(date)
+  let formatter = timestampFormatters.get(timeZone)
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone,
+    })
+    timestampFormatters.set(timeZone, formatter)
+  }
+  return formatter.format(date)
 }
 
 function fullTimestampLabel(date: Date, timeZone: string) {
-  return new Intl.DateTimeFormat("en-US", {
-    dateStyle: "full",
-    timeStyle: "long",
-    timeZone,
-  }).format(date)
+  let formatter = fullTimestampFormatters.get(timeZone)
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      dateStyle: "full",
+      timeStyle: "long",
+      timeZone,
+    })
+    fullTimestampFormatters.set(timeZone, formatter)
+  }
+  return formatter.format(date)
 }
 
 function localTimezone() {
@@ -2769,8 +2864,30 @@ function scheduleStatus(
   return schedule.enabled ? "enabled" : "disabled"
 }
 
-function relativeTime(date: Date) {
-  const difference = date.getTime() - Date.now()
+function subscribeRelativeClock(listener: () => void) {
+  if (relativeClockListeners.size === 0) relativeClockSnapshot = Date.now()
+  relativeClockListeners.add(listener)
+  if (!relativeClockTimer) {
+    relativeClockTimer = setInterval(() => {
+      relativeClockSnapshot = Date.now()
+      for (const notify of relativeClockListeners) notify()
+    }, 30_000)
+  }
+  return () => {
+    relativeClockListeners.delete(listener)
+    if (relativeClockListeners.size === 0 && relativeClockTimer) {
+      clearInterval(relativeClockTimer)
+      relativeClockTimer = null
+    }
+  }
+}
+
+function getRelativeClockSnapshot() {
+  return relativeClockSnapshot
+}
+
+function relativeTime(date: Date, now: number = Date.now()) {
+  const difference = date.getTime() - now
   const minutes = Math.round(difference / 60_000)
   if (Math.abs(minutes) < 60) {
     return stripTrailingPeriod(relativeFormatter.format(minutes, "minute"))
@@ -2788,8 +2905,6 @@ function stripTrailingPeriod(value: string) {
   return value.endsWith(".") ? value.slice(0, -1) : value
 }
 
-function errorMessage(cause: unknown) {
-  return cause instanceof Error
-    ? cause.message
-    : "The schedule could not be saved"
+function errorMessage(cause: unknown, fallback: string) {
+  return cause instanceof Error ? cause.message : fallback
 }
