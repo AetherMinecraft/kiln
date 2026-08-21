@@ -526,6 +526,7 @@ export class ScheduleManager {
         action.id
       )
       const taskId = scheduleDeterministicUuid("task", backupId)
+      const artifactId = scheduleDeterministicUuid("artifact", backupId)
       const targetKind = target.kind === "relay" ? "platform" : target.kind
       const input: BackupTaskInput = {
         artifactKind:
@@ -537,7 +538,14 @@ export class ScheduleManager {
                 ? "database_dump"
                 : "platform_bundle",
         backupId,
-        destination,
+        catalog: {
+          name: scheduledBackupName(scheduledAt),
+          storageId:
+            action.destination.kind === "storage"
+              ? action.destination.storageId
+              : null,
+        },
+        destination: { ...destination, artifactId },
         exclude: [],
         kind: "create",
         maxBytes: null,
@@ -591,6 +599,11 @@ export class ScheduleManager {
       writeFileAtomic(this.#statePath, JSON.stringify(this.#state), 0o600)
     )
   }
+}
+
+function scheduledBackupName(scheduledAt: number) {
+  const timestamp = new Date(scheduledAt).toISOString()
+  return `scheduled-${timestamp.slice(0, 10).replaceAll("-", ".")}-${timestamp.slice(11, 19).replaceAll(":", ".")}Z`
 }
 
 function deployment(

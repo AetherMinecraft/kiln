@@ -174,7 +174,14 @@ describe("Relay schedule persistence", () => {
       expect(inputs).toHaveLength(1)
       expect(inputs[0]).toMatchObject({
         artifactKind: "restic_snapshot",
+        catalog: {
+          name: expect.stringMatching(
+            /^scheduled-\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}Z$/u
+          ),
+          storageId: "87949dc0-3b2a-4b57-999c-f9bfaf487880",
+        },
         destination: {
+          artifactId: expect.any(String),
           kind: "restic",
           repositoryPassword: "repository-secret",
         },
