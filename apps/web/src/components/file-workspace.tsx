@@ -1,6 +1,7 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useRouter } from "@tanstack/react-router"
+import type { ContextMenuAnchorRect } from "@pierre/trees"
 import { FileTree, useFileTree, useFileTreeSearch } from "@pierre/trees/react"
 import { Effect, Result } from "effect"
 import type {
@@ -49,6 +50,7 @@ import {
   WrapText,
   X,
 } from "lucide-react"
+import { createPortal } from "react-dom"
 
 import { Button } from "@workspace/ui/components/button"
 import { Input } from "@workspace/ui/components/input"
@@ -141,6 +143,97 @@ const SyntaxCodeEditor = React.lazy(async () => {
 
 const activeFileRevisionPollDelayMs = 30_000
 const folderInputAttributes = { webkitdirectory: "" }
+const contextMenuCursorGap = 4
+const contextMenuViewportPadding = 8
+
+function FileTreeContextMenu({
+  anchorRect,
+  children,
+  label,
+}: {
+  anchorRect: ContextMenuAnchorRect
+  children: React.ReactNode
+  label: string
+}) {
+  const menuRef = React.useRef<HTMLDivElement>(null)
+  const portalTarget = typeof document === "undefined" ? null : document.body
+  const [position, setPosition] = React.useState<{
+    left: number
+    top: number
+  } | null>(null)
+
+  React.useLayoutEffect(() => {
+    if (!portalTarget) return
+
+    const updatePosition = () => {
+      const menu = menuRef.current
+      if (!menu) return
+
+      const { height, width } = menu.getBoundingClientRect()
+      const maxLeft = Math.max(
+        contextMenuViewportPadding,
+        window.innerWidth - width - contextMenuViewportPadding
+      )
+      const maxTop = Math.max(
+        contextMenuViewportPadding,
+        window.innerHeight - height - contextMenuViewportPadding
+      )
+      const fitsRight =
+        anchorRect.right + contextMenuCursorGap + width <=
+        window.innerWidth - contextMenuViewportPadding
+      const fitsBelow =
+        anchorRect.bottom + contextMenuCursorGap + height <=
+        window.innerHeight - contextMenuViewportPadding
+      const preferredLeft = fitsRight
+        ? anchorRect.right + contextMenuCursorGap
+        : anchorRect.left - width - contextMenuCursorGap
+      const preferredTop = fitsBelow
+        ? anchorRect.bottom + contextMenuCursorGap
+        : anchorRect.top - height - contextMenuCursorGap
+
+      setPosition({
+        left: Math.min(
+          maxLeft,
+          Math.max(contextMenuViewportPadding, preferredLeft)
+        ),
+        top: Math.min(
+          maxTop,
+          Math.max(contextMenuViewportPadding, preferredTop)
+        ),
+      })
+    }
+
+    updatePosition()
+    window.addEventListener("resize", updatePosition)
+    return () => window.removeEventListener("resize", updatePosition)
+  }, [
+    anchorRect.bottom,
+    anchorRect.left,
+    anchorRect.right,
+    anchorRect.top,
+    portalTarget,
+  ])
+
+  if (!portalTarget) return null
+
+  return createPortal(
+    <div
+      ref={menuRef}
+      role="menu"
+      aria-label={label}
+      data-file-tree-context-menu-root="true"
+      className={`${floatingSurfaceClassName} fixed z-[100] min-w-44 rounded-lg p-1 text-xs ring-1 ring-accent-border/22`}
+      style={
+        position
+          ? { left: position.left, top: position.top }
+          : { top: 0, left: 0, visibility: "hidden" }
+      }
+    >
+      {children}
+    </div>,
+    portalTarget
+  )
+}
 
 function formatName(path: string) {
   return path.split("/").filter(Boolean).at(-1) ?? path
@@ -3406,10 +3499,9 @@ function FileTreePanel({
             } as React.CSSProperties
           }
           renderContextMenu={(item, context) => (
-            <div
-              role="menu"
-              aria-label={`Actions for ${item.name}`}
-              className={`${floatingSurfaceClassName} absolute top-full right-0 z-[100] min-w-44 rounded-lg p-1 text-xs ring-1 ring-accent-border/22`}
+            <FileTreeContextMenu
+              anchorRect={context.anchorRect}
+              label={`Actions for ${item.name}`}
             >
               <button
                 type="button"
@@ -3485,7 +3577,7 @@ function FileTreePanel({
               >
                 <Trash2 /> Delete
               </button>
-            </div>
+            </FileTreeContextMenu>
           )}
         />
       </div>
