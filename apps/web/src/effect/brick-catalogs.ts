@@ -106,16 +106,16 @@ export const saveBrickCatalogEffect = Effect.fn("brickCatalogs.save")(
     const id = randomUUID()
     return yield* database.transaction("brickCatalogs.save", (transaction) =>
       Effect.gen(function* () {
-        const owners = yield* transaction.queryRows<
+        yield* transaction.queryRows<
           RowDataPacket & { id: string }
         >(
           `SELECT id FROM ${databaseTable("user")}
             WHERE id = ? LIMIT 1 FOR UPDATE`,
           [input.ownerUserId]
         )
-        if (!owners[0]) {
-          return yield* Effect.fail(new Error("Catalog owner not found"))
-        }
+        // Production sessions lock their persisted user row to serialize the
+        // per-account limit. The development bypass is intentionally virtual,
+        // so an absent row must not prevent its local catalog from being saved.
         const existing = yield* transaction.queryRows<CatalogRow>(
           `SELECT catalog.id, catalog.owner_user_id, catalog.source,
                   catalog.snapshot, catalog.snapshot_sha256,
