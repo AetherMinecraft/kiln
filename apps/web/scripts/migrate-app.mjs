@@ -26,9 +26,22 @@ try {
   await ensureDatabaseAccessSchema(connection)
   await ensureAccessAssignmentSchema(connection)
   await ensureBackupSchema(connection)
+  await ensureScheduleSchema(connection)
   console.log("Kiln application tables are up to date")
 } finally {
   await connection.end()
+}
+
+async function ensureScheduleSchema(database) {
+  const [columns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("schedule_run")} LIKE 'status'`
+  )
+  const statusType = columns[0]?.Type ?? ""
+  if (statusType.includes("'running'")) return
+  await database.query(
+    `ALTER TABLE ${databaseTable("schedule_run")}
+     MODIFY status ENUM('running', 'succeeded', 'partial', 'failed', 'noop', 'interrupted', 'missed') NOT NULL`
+  )
 }
 
 async function ensureBackupSchema(database) {
@@ -149,7 +162,9 @@ async function ensureBackupSchema(database) {
        MODIFY artifact_kind ENUM('archive', 'database_dump', 'platform_bundle', 'restic_snapshot') NOT NULL`
     )
   }
-  const taskKindColumn = taskColumns.find((column) => column.Field === "task_kind")
+  const taskKindColumn = taskColumns.find(
+    (column) => column.Field === "task_kind"
+  )
   if (!taskKindColumn?.Type?.includes("export")) {
     await database.query(
       `ALTER TABLE ${databaseTable("backup_task")}
@@ -162,7 +177,9 @@ async function ensureBackupResticS3Schema(database) {
   const [storageColumns] = await database.query(
     `SHOW COLUMNS FROM ${databaseTable("backup_storage")}`
   )
-  const storageColumnNames = new Set(storageColumns.map((column) => column.Field))
+  const storageColumnNames = new Set(
+    storageColumns.map((column) => column.Field)
+  )
   if (!storageColumnNames.has("deleting")) {
     await database.query(
       `ALTER TABLE ${databaseTable("backup_storage")}

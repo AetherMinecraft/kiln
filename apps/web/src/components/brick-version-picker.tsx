@@ -165,8 +165,8 @@ export const BrickVersionPicker = React.memo(function BrickVersionPicker({
             onChange={(event) => {
               const next = event.currentTarget.value
               setQuery(next)
-              if (next !== query) setHasTyped(true)
               if (!open) openMenu()
+              if (next !== query) setHasTyped(true)
             }}
             onFocus={(event) => {
               openMenu()

@@ -41,6 +41,7 @@ import {
   requireRelayPermission,
 } from "@/lib/access-control"
 import { hasBackupPermission } from "@/lib/backup-access"
+import { roleHasPermission } from "@/lib/permissions"
 import { scheduleBackupCopyProcessing } from "@/lib/backup-copy"
 import { selectBackupCopySource } from "@/lib/backup-copy-source"
 import { signLocalBackupDownload } from "@/backups/destinations/local"
@@ -317,13 +318,12 @@ export const getBackups = createServerFn({ method: "GET" }).handler(
       "backups.listForReconcile",
       listBackupCatalogEffect()
     )
-    const visibleRelayIds = new Set(
-      catalog
-        .filter((backup) =>
-          hasBackupPermission(user, grants, backup, "backup.read")
-        )
-        .map((backup) => backup.relayId)
-    )
+    const visibleRelayIds = new Set<string>()
+    for (const backup of catalog) {
+      if (hasBackupPermission(user, grants, backup, "backup.read")) {
+        visibleRelayIds.add(backup.relayId)
+      }
+    }
     const hasActiveRelayTasks = catalog.some(
       (backup) =>
         visibleRelayIds.has(backup.relayId) &&
@@ -331,27 +331,39 @@ export const getBackups = createServerFn({ method: "GET" }).handler(
           backup.taskStatus === "queued" ||
           backup.taskStatus === "running")
     )
-    if (hasActiveRelayTasks) {
-      await Promise.allSettled(
-        relays
-          .filter((relay) => visibleRelayIds.has(relay.id))
-          .map((relay) => reconcileRelayBackups(relay, user.id))
-      )
+    const discoverableRelayIds = isPlatformAdmin(user)
+      ? new Set(relays.map((relay) => relay.id))
+      : new Set(
+          grants.flatMap((grant) =>
+            roleHasPermission(grant.role, "backup.read") ? [grant.relayId] : []
+          )
+        )
+    const relayIdsToReconcile = hasActiveRelayTasks
+      ? visibleRelayIds
+      : discoverableRelayIds
+    const reconciliationPromises = []
+    for (const relay of relays) {
+      if (relayIdsToReconcile.has(relay.id)) {
+        reconciliationPromises.push(reconcileRelayBackups(relay, user.id))
+      }
     }
+    await Promise.allSettled(reconciliationPromises)
     const reconciled = await runAppEffect(
       "backups.listReconciled",
       listBackupCatalogEffect()
     )
-    return reconciled
-      .filter((backup) =>
-        hasBackupPermission(user, grants, backup, "backup.read")
-      )
-      .map(({ createdBy: _, objectKey: __, ...backup }) => ({
+    const visibleBackups = []
+    for (const candidate of reconciled) {
+      if (!hasBackupPermission(user, grants, candidate, "backup.read")) continue
+      const { createdBy: _, objectKey: __, ...backup } = candidate
+      visibleBackups.push({
         ...backup,
         artifacts: backup.artifacts.map(
           ({ objectKey: ___, ...artifact }) => artifact
         ),
-      }))
+      })
+    }
+    return visibleBackups
   }
 )
 
@@ -406,7 +418,7 @@ export const cancelBackup = createServerFn({ method: "POST" })
     )
     await runAppEffect(
       "backups.reconcileCancel",
-      reconcileBackupTaskEffect(task)
+      reconcileBackupTaskEffect(task, relay.id)
     )
     if (task.status !== "cancelled") {
       throw new Error("This backup is no longer being created")

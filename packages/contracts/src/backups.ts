@@ -237,6 +237,13 @@ const backupCreateTaskInputObjectSchema = z
   .object({
     artifactKind: backupArtifactKindSchema,
     backupId: backupIdSchema,
+    catalog: z
+      .object({
+        name: z.string().trim().min(1).max(120),
+        storageId: z.uuid().nullable(),
+      })
+      .strict()
+      .optional(),
     destination: z.discriminatedUnion("kind", [
       backupLocalDestinationSchema,
       backupS3UploadDestinationSchema,

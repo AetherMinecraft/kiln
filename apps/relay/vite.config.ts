@@ -21,7 +21,7 @@ export default defineConfig({
       // Bundle the workspace contract while production dependencies stay in
       // the separately cached runtime layer.
       alwaysBundle: ["@workspace/contracts"],
-      onlyBundle: ["zod"],
+      onlyBundle: ["cron-parser", "luxon"],
     },
     entry: ["src/index.ts", "src/updater.ts", "instrument.mjs"],
     format: "esm",

@@ -12,6 +12,7 @@ import { InstanceRouteFrame } from "@/components/instance-route-frame"
 import { InstanceWorkspaceShell } from "@/components/instance-workspace"
 import { RelayUnavailableState } from "@/components/relay-unavailable-state"
 import { SettingsShell } from "@/components/settings-layout"
+import { SchedulesShell } from "@/components/schedules-layout"
 import { GlobalPageToolbar } from "@/components/global-page-toolbar"
 import { WorkspaceFrame } from "@/components/workspace-frame"
 import {
@@ -98,6 +99,8 @@ const GlobalRouteFrame = React.memo(function GlobalRouteFrame({
           <InfraShell>{children}</InfraShell>
         ) : section === "settings" ? (
           <SettingsShell>{children}</SettingsShell>
+        ) : section === "schedules" ? (
+          <SchedulesShell>{children}</SchedulesShell>
         ) : (
           children
         )}
@@ -181,6 +184,7 @@ function RouteEmptyState() {
 function routeLabel(section: Exclude<GlobalSection, null>) {
   if (section === "infra") return "Infrastructure"
   if (section === "backups") return "Backups"
+  if (section === "schedules") return "Schedules"
   if (section === "activity") return "Activity"
   if (section === "access") return "Administration / Access"
   return "Settings"

@@ -55,6 +55,9 @@ importers:
       zip-stream:
         specifier: 7.0.5
         version: 7.0.5
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
 
 packages:
 
@@ -493,6 +496,9 @@ packages:
   zip-stream@7.0.5:
     resolution: {integrity: sha512-dSvYKdvLsAHCDqPOhIwk/q5CvuWtTB3Dgpoe0uVEFjTzIOAmsQpprX25InCvrvJsirEbu1OHyy67n/kAj1Sw/w==}
     engines: {node: '>=18'}
+
+  zod@4.4.3:
+    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
 
 snapshots:
 
@@ -974,3 +980,5 @@ snapshots:
       compress-commons: 7.0.1
       normalize-path: 3.0.0
       readable-stream: 4.7.0
+
+  zod@4.4.3: {}

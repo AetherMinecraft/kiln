@@ -165,6 +165,10 @@ interface KnownBackupTaskRow extends RowDataPacket {
   status: BackupTaskStatus
 }
 
+interface ScheduledBackupRepositoryRow extends RowDataPacket {
+  id: string
+}
+
 interface BackupTaskReconcileState {
   bytesCompleted: number
   relayUpdatedAt: number | null
@@ -712,8 +716,85 @@ export const reservePlatformBackupEffect = Effect.fn("backups.reservePlatform")(
     })
 )
 
+const adoptScheduledBackupTask = Effect.fnUntraced(function* (
+  transaction: DatabaseTransaction,
+  relayId: string,
+  task: RelayBackupTask
+) {
+  if (
+    task.kind !== "create" ||
+    task.input.kind !== "create" ||
+    task.input.reason !== "scheduled"
+  ) {
+    return
+  }
+  const input = task.input
+  const catalog = input.catalog
+  const artifactId = input.destination.artifactId
+  if (!catalog || !artifactId) return
+  const repositoryRows =
+    input.mode === "incremental"
+      ? yield* transaction.queryRows<ScheduledBackupRepositoryRow>(
+          `SELECT id
+             FROM ${databaseTable("backup_repository")}
+            WHERE relay_id = ? AND target_kind = ? AND target_id = ?
+              AND storage_id <=> ?
+            LIMIT 1
+            FOR UPDATE`,
+          [relayId, input.target.kind, input.target.id, catalog.storageId]
+        )
+      : []
+  const repositoryId = repositoryRows[0]?.id ?? null
+  if (input.mode === "incremental" && !repositoryId) return
+  const objectKey =
+    input.destination.kind === "s3" ? input.destination.objectKey : null
+
+  yield* transaction.execute(
+    `INSERT IGNORE INTO ${databaseTable("backup")}
+      (id, relay_id, target_kind, target_id, storage_id, artifact_kind,
+       backup_mode, reason, status, name, object_key, repository_id,
+       warnings, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', 'queued', ?, ?, ?,
+             JSON_ARRAY(), NULL, FROM_UNIXTIME(? / 1000))`,
+    [
+      input.backupId,
+      relayId,
+      input.target.kind,
+      input.target.id,
+      catalog.storageId,
+      input.artifactKind,
+      input.mode,
+      catalog.name,
+      objectKey,
+      repositoryId,
+      task.createdAt,
+    ]
+  )
+  yield* transaction.execute(
+    `INSERT IGNORE INTO ${databaseTable("backup_artifact")}
+      (id, backup_id, destination_key, storage_id, status, object_key,
+       created_at)
+     VALUES (?, ?, ?, ?, 'queued', ?, FROM_UNIXTIME(? / 1000))`,
+    [
+      artifactId,
+      input.backupId,
+      input.mode === "incremental" ? "restic" : (catalog.storageId ?? "local"),
+      catalog.storageId,
+      objectKey,
+      task.createdAt,
+    ]
+  )
+  yield* transaction.execute(
+    `INSERT IGNORE INTO ${databaseTable("backup_task")}
+      (id, backup_id, task_kind, status, reserved_bytes, requested_by,
+       created_at)
+     VALUES (?, ?, 'create', 'queued', ?, NULL, FROM_UNIXTIME(? / 1000))`,
+    [input.taskId, input.backupId, input.maxBytes, task.createdAt]
+  )
+})
+
 export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
-  function* (task: RelayBackupTask) {
+  function* (task: RelayBackupTask, relayId?: string) {
     const database = yield* Database
     yield* database.transaction("backup_reconcile", (transaction) =>
       Effect.gen(function* () {
@@ -727,7 +808,21 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
             FOR UPDATE`,
           [task.taskId, task.backupId]
         )
-        const knownTask = knownTasks[0]
+        let knownTask = knownTasks[0]
+        if (!knownTask && relayId) {
+          yield* adoptScheduledBackupTask(transaction, relayId, task)
+          const adoptedTasks = yield* transaction.queryRows<KnownBackupTaskRow>(
+            `SELECT task.id, task.status, task.bytes_completed,
+                      backup.status AS backup_status,
+                      task.relay_updated_at_ms
+                 FROM ${databaseTable("backup_task")} task
+                 JOIN ${databaseTable("backup")} backup ON backup.id = task.backup_id
+                WHERE task.id = ? AND task.backup_id = ?
+                FOR UPDATE`,
+            [task.taskId, task.backupId]
+          )
+          knownTask = adoptedTasks[0]
+        }
         if (!knownTask) return
         if (
           !shouldApplyRelayBackupTaskSnapshot(
@@ -1691,6 +1786,49 @@ export interface BackupRepositorySecret {
   password: string
   storageId: string | null
 }
+
+export const ensureBackupRepositoryEffect = Effect.fn(
+  "backups.ensureRepository"
+)(function* (input: {
+  relayId: string
+  storageId: string | null
+  targetId: string
+}) {
+  const database = yield* Database
+  return yield* database.transaction(
+    "backup_repository_ensure",
+    (transaction) =>
+      Effect.gen(function* () {
+        const storage = input.storageId
+          ? (yield* lockBackupStorageRows(transaction, [input.storageId])).get(
+              input.storageId
+            )
+          : undefined
+        if (
+          input.storageId &&
+          (!storage || !storage.enabled || Boolean(storage.deleting))
+        ) {
+          return yield* BackupStorageError.make({
+            code: "storage_unavailable",
+            operation: "backup.repository.ensure",
+            reason: "The selected backup destination is unavailable",
+          })
+        }
+        const repository = yield* loadOrCreateBackupRepository(transaction, {
+          destinationObjectPrefix: storage?.object_prefix ?? "",
+          relayId: input.relayId,
+          storageId: input.storageId,
+          targetId: input.targetId,
+          targetKind: "instance",
+        })
+        return {
+          objectPrefix: repository.objectPrefix,
+          password: repository.password,
+          storageId: repository.storageId,
+        } satisfies BackupRepositorySecret
+      })
+  )
+})
 
 export const loadBackupRepositoryPasswordEffect = Effect.fn(
   "backups.repositoryPassword"

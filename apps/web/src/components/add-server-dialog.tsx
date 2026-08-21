@@ -216,6 +216,9 @@ const AddServerForm = React.memo(function AddServerForm({
           queryKey: queryKeys.relay.connection,
         }),
         queryClient.invalidateQueries({ queryKey: queryKeys.relay.snapshot }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.schedules.options,
+        }),
       ])
     },
   })

@@ -610,6 +610,127 @@ describe("final deletion repository purge", () => {
 })
 
 describe("backup reconciliation", () => {
+  it("adopts Relay-owned scheduled backups into the backup catalog", async () => {
+    const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
+    let knownTaskQueries = 0
+    const databaseLayer = Layer.succeed(Database)({
+      execute: () => Effect.die("Unexpected standalone database write"),
+      queryRows: () => Effect.die("Unexpected standalone database query"),
+      transaction: (_operation, run) =>
+        run({
+          execute: (sql, values) =>
+            Effect.sync(() => {
+              writes.push({ sql, values })
+              return emptyResult
+            }),
+          queryRows: <TRow extends RowDataPacket>(sql: string) => {
+            if (sql.includes("backup.status AS backup_status")) {
+              knownTaskQueries += 1
+              return Effect.succeed(
+                (knownTaskQueries === 1
+                  ? []
+                  : [
+                      {
+                        backup_status: "queued",
+                        bytes_completed: 0,
+                        id: "task-one",
+                        relay_updated_at_ms: null,
+                        status: "queued",
+                      },
+                    ]) as unknown as ReadonlyArray<TRow>
+              )
+            }
+            if (sql.includes("status = 'available' LIMIT 1")) {
+              return Effect.succeed([
+                { id: "00000000-0000-4000-8000-000000000001" },
+              ] as unknown as ReadonlyArray<TRow>)
+            }
+            return Effect.die(`Unexpected transaction query: ${sql}`)
+          },
+        }),
+    })
+    const task = {
+      backupId: "10000000-0000-4000-8000-000000000001",
+      bytesCompleted: 256,
+      bytesTotal: 256,
+      createdAt: Date.UTC(2026, 7, 21, 10, 29, 15),
+      currentArtifactId: null,
+      currentPath: null,
+      error: null,
+      finishedAt: Date.UTC(2026, 7, 21, 10, 29, 20),
+      input: {
+        artifactKind: "archive",
+        backupId: "10000000-0000-4000-8000-000000000001",
+        catalog: {
+          name: "scheduled-2026.08.21-10.29.15Z",
+          storageId: null,
+        },
+        destination: {
+          artifactId: "00000000-0000-4000-8000-000000000001",
+          kind: "local",
+        },
+        exclude: [],
+        kind: "create",
+        maxBytes: null,
+        mode: "full",
+        reason: "scheduled",
+        target: { id: "instance-one", kind: "instance" },
+        taskId: "task-one",
+      },
+      inputRefreshRequired: false,
+      kind: "create",
+      phase: null,
+      result: {
+        bytes: 256,
+        checksumSha256: "a".repeat(64),
+        filename: "backup-one.zip",
+        warnings: [],
+      },
+      startedAt: Date.UTC(2026, 7, 21, 10, 29, 15),
+      status: "succeeded",
+      taskId: "task-one",
+      updatedAt: Date.UTC(2026, 7, 21, 10, 29, 20),
+    } satisfies RelayBackupTask
+
+    await Effect.runPromise(
+      reconcileBackupTaskEffect(task, "relay-a").pipe(
+        Effect.provide(databaseLayer)
+      )
+    )
+
+    const catalogWrite = writes.find(
+      ({ sql }) =>
+        sql.includes("INSERT IGNORE INTO") &&
+        sql.includes("backup_mode, reason, status, name")
+    )
+    expect(catalogWrite?.values).toEqual([
+      task.backupId,
+      "relay-a",
+      "instance",
+      "instance-one",
+      null,
+      "archive",
+      "full",
+      "scheduled-2026.08.21-10.29.15Z",
+      null,
+      null,
+      task.createdAt,
+    ])
+    expect(
+      writes.some(
+        ({ sql }) =>
+          sql.includes("INSERT IGNORE INTO") && sql.includes("destination_key")
+      )
+    ).toBe(true)
+    expect(
+      writes.some(
+        ({ sql }) =>
+          sql.includes("INSERT IGNORE INTO") &&
+          sql.includes("reserved_bytes, requested_by")
+      )
+    ).toBe(true)
+  })
+
   it("does not resurrect a deleted backup from its historical create task", async () => {
     const writes: Array<{ sql: string; values?: ReadonlyArray<unknown> }> = []
     const databaseLayer = Layer.succeed(Database)({

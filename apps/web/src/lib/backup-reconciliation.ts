@@ -34,9 +34,14 @@ export async function reconcileRelayBackups(
     .array(relayBackupTaskSchema)
     .parse(await relayRpc(relay, "backup.task.list", {}, 15_000, subject))
   const relayTasksById = new Map(tasks.map((task) => [task.taskId, task]))
-  for (const task of tasks) {
-    await runAppEffect("backups.reconcileTask", reconcileBackupTaskEffect(task))
-  }
+  await Promise.all(
+    tasks.map((task) =>
+      runAppEffect(
+        "backups.reconcileTask",
+        reconcileBackupTaskEffect(task, relay.id)
+      )
+    )
+  )
   const dispatchable = await runAppEffect(
     "backups.dispatchable",
     listDispatchableBackupTasksEffect(relay.id)
@@ -78,7 +83,7 @@ export async function dispatchBackupTask(
   )
   await runAppEffect(
     "backups.reconcileEnqueue",
-    reconcileBackupTaskEffect(task)
+    reconcileBackupTaskEffect(task, relay.id)
   )
 }
 
