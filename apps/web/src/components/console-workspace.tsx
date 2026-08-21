@@ -62,8 +62,9 @@ import {
   consoleRecoveryLine,
   consoleStateLine,
   initialConsoleStateLines,
-  isConsoleStateLine,
   isConsoleRecoveryLine,
+  isConsoleStateLine,
+  isConsoleStateLineFor,
   mergeConsoleHistory,
   mergeConsoleStateLines,
   retimestampConsoleStateLine,
@@ -2243,10 +2244,7 @@ function useRelayConsoleStream(
         : new Date().toISOString()
     )
     if (
-      current.lines.some(
-        (existing) =>
-          isConsoleStateLine(existing) && existing.id.endsWith(`:${state}`)
-      )
+      current.lines.some((existing) => isConsoleStateLineFor(existing, state))
     ) {
       return
     }

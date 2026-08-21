@@ -6,6 +6,7 @@ import {
   initialConsoleStateLines,
   isConsoleRecoveryLine,
   isConsoleStateLine,
+  isConsoleStateLineFor,
   mergeConsoleHistory,
   mergeConsoleStateLines,
   retimestampConsoleStateLine,
@@ -161,9 +162,7 @@ describe("console lifecycle lines", () => {
       "Player joined",
     ])
     expect(
-      replaced?.filter(
-        (line) => isConsoleStateLine(line) && line.id.endsWith(":running")
-      )
+      replaced?.filter((line) => isConsoleStateLineFor(line, "running"))
     ).toHaveLength(1)
     expect(replaced?.[1]?.timestamp).toBe(readyAt)
     expect(
