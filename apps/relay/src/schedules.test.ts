@@ -106,7 +106,7 @@ describe("Relay schedule persistence", () => {
       scheduleId: projection.id,
     })
 
-    expect(started.status).toBe("interrupted")
+    expect(started.status).toBe("running")
     expect(schedules.overview([projection.id]).deployments[0]?.nextRunAt).toBe(
       applied.nextRunAt
     )

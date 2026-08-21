@@ -24,3 +24,10 @@ test("adds the restic storage unique key before dropping the legacy unique", () 
   assert.notEqual(drop, -1)
   assert.ok(add < drop)
 })
+
+test("adds the running state to schedule run status", () => {
+  assert.match(
+    source,
+    /MODIFY status ENUM\('running', 'succeeded', 'partial', 'failed', 'noop', 'interrupted', 'missed'\)/
+  )
+})

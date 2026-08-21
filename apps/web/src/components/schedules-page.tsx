@@ -8,9 +8,15 @@ import {
   ArrowDown,
   ArrowUp,
   Check,
+  CirclePause,
+  CirclePlay,
+  ClipboardCopy,
   Code2,
+  Copy,
   Database,
+  EllipsisVertical,
   HardDriveDownload,
+  History,
   LoaderCircle,
   Pencil,
   Play,
@@ -21,6 +27,7 @@ import {
   Trash2,
   X,
 } from "lucide-react"
+import { useNavigate, useSearch } from "@tanstack/react-router"
 
 import type { ScheduleAction, ScheduleTarget } from "@workspace/contracts"
 import {
@@ -37,6 +44,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@workspace/ui/components/dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
 import {
   Select,
@@ -63,6 +77,7 @@ import {
 import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
 import type { ServerPickerOption } from "@/components/server-picker-list"
 import { useScheduleScope } from "@/components/schedule-scope"
+import { forkPromise } from "@/effect/promise"
 import {
   queryKeys,
   scheduleOptionsQueryOptions,
@@ -89,6 +104,7 @@ const relativeFormatter = new Intl.RelativeTimeFormat("en-US", {
 export const SchedulesPage = React.memo(function SchedulesPage() {
   const { data: schedules } = useSuspenseQuery(schedulesQueryOptions())
   const { data: options } = useSuspenseQuery(scheduleOptionsQueryOptions())
+  const navigate = useNavigate({ from: "/schedules" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
@@ -111,6 +127,15 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
     (schedule: Schedule) => setDeleting(schedule),
     []
   )
+  const viewHistory = React.useCallback(
+    (schedule: Schedule) => {
+      void navigate({
+        to: "/schedules/history",
+        search: (previous) => ({ ...previous, schedule: schedule.id }),
+      })
+    },
+    [navigate]
+  )
 
   return (
     <div className="mx-auto w-full max-w-[90rem] px-3 pb-10 sm:px-5">
@@ -129,6 +154,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
           onCreate={() => setEditor({ kind: "create" })}
           onDelete={openDelete}
           onEdit={openEdit}
+          onViewHistory={viewHistory}
         />
       </section>
 
@@ -193,6 +219,7 @@ const ScheduleTable = React.memo(function ScheduleTable({
   onCreate,
   onDelete,
   onEdit,
+  onViewHistory,
 }: {
   canCreate: boolean
   options: ReadonlyArray<ScheduleOption>
@@ -202,6 +229,7 @@ const ScheduleTable = React.memo(function ScheduleTable({
   onCreate: () => void
   onDelete: (schedule: Schedule) => void
   onEdit: (schedule: Schedule) => void
+  onViewHistory: (schedule: Schedule) => void
 }) {
   const renderRow = React.useCallback(
     (schedule: Schedule) => (
@@ -210,9 +238,10 @@ const ScheduleTable = React.memo(function ScheduleTable({
         schedule={schedule}
         onDelete={() => onDelete(schedule)}
         onEdit={() => onEdit(schedule)}
+        onViewHistory={() => onViewHistory(schedule)}
       />
     ),
-    [onDelete, onEdit, options]
+    [onDelete, onEdit, onViewHistory, options]
   )
   const renderEmpty = React.useCallback(
     (searchActive: boolean) => (
@@ -245,19 +274,16 @@ const ScheduleTableHead = React.memo(function ScheduleTableHead() {
       <WorkspaceTableHeading className="w-20 px-2 sm:w-28 sm:px-3">
         Status
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-auto sm:w-[27%]">
+      <WorkspaceTableHeading className="w-auto sm:w-[34%]">
         Schedule
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[24%] md:table-cell">
+      <WorkspaceTableHeading className="hidden w-[20%] md:table-cell">
         Timing
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[22%] lg:table-cell">
+      <WorkspaceTableHeading className="hidden w-[20%] lg:table-cell">
         Next run
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[12%] xl:table-cell">
-        Targets
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-36 px-1 text-right sm:w-40 sm:px-3">
+      <WorkspaceTableHeading className="w-48 px-1 text-right sm:w-64 sm:px-3">
         Actions
       </WorkspaceTableHeading>
     </WorkspaceTableHead>
@@ -269,21 +295,25 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
   schedule,
   onDelete,
   onEdit,
+  onViewHistory,
 }: {
   options: ReadonlyArray<ScheduleOption>
   schedule: Schedule
   onDelete: () => void
   onEdit: () => void
+  onViewHistory: () => void
 }) {
   const queryClient = useQueryClient()
-  const optionMap = new Map(
-    options.map((option) => [targetKey(option), option])
+  const optionMap = React.useMemo(
+    () => new Map(options.map((option) => [targetKey(option), option])),
+    [options]
   )
   const canEdit = canOperateSchedule(schedule, optionMap, "canUpdate")
   const canDelete = schedule.targets.every(
     (target) => optionMap.get(targetKey(target))?.canDelete
   )
   const canRun = canOperateSchedule(schedule, optionMap, "canExecute")
+  const canDuplicate = canOperateSchedule(schedule, optionMap, "canCreate")
   const runMutation = useMutation({
     mutationFn: () => runScheduleNow({ data: { id: schedule.id } }),
     onSuccess: async (result) => {
@@ -299,135 +329,233 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
     onError: (cause) =>
       showToast({ message: errorMessage(cause), type: "error" }),
   })
+  const enabledMutation = useMutation({
+    mutationFn: (enabled: boolean) =>
+      updateSchedule({
+        data: { ...scheduleInput(schedule), enabled, id: schedule.id },
+      }),
+    onSuccess: async (_updated, enabled) => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
+      showToast({
+        message: enabled ? "Schedule enabled" : "Schedule disabled",
+        type: "success",
+      })
+    },
+    onError: (cause) =>
+      showToast({ message: errorMessage(cause), type: "error" }),
+  })
+  const duplicateMutation = useMutation({
+    mutationFn: () =>
+      createSchedule({
+        data: {
+          ...scheduleInput(schedule),
+          actions: schedule.actions.map((action) => ({
+            ...action,
+            id: crypto.randomUUID(),
+          })),
+          enabled: false,
+        },
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
+      showToast({ message: "Schedule duplicated", type: "success" })
+    },
+    onError: (cause) =>
+      showToast({ message: errorMessage(cause), type: "error" }),
+  })
   const nextRun = scheduleNextRun(schedule)
+  const status = scheduleStatus(schedule)
+  const copyScheduleId = React.useCallback(() => {
+    forkPromise(
+      async () => {
+        await navigator.clipboard.writeText(schedule.id)
+        showToast({ message: "Schedule ID copied", type: "success" })
+      },
+      (cause) => showToast({ message: errorMessage(cause), type: "error" })
+    )
+  }, [schedule.id])
 
   return (
     <tr className="group transition-colors hover:bg-accent/25">
       <WorkspaceTableCell className="px-2 sm:px-3">
-        <ScheduleState state={deploymentState(schedule)} />
+        <ScheduleState state={status} />
       </WorkspaceTableCell>
       <WorkspaceTableCell>
-        <div className="min-w-0">
-          <p className="truncate text-xs font-semibold text-foreground">
-            {schedule.name}
-          </p>
-          <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
-            {schedule.actions.length} action
-            {schedule.actions.length === 1 ? "" : "s"}
-            {!schedule.enabled ? " · paused" : ""}
-          </p>
-        </div>
+        <p className="truncate text-xs font-semibold text-foreground">
+          {schedule.name}
+        </p>
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden md:table-cell">
-        <div className="min-w-0">
-          <p className="truncate text-[0.625rem] font-medium text-foreground">
-            {cronLabel(schedule.cron)}
-          </p>
-          <p className="truncate font-mono text-[0.5rem] text-muted-foreground">
-            {schedule.cron} · {schedule.timezone}
-          </p>
-        </div>
+        <ScheduleTiming cron={schedule.cron} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden lg:table-cell">
-        {nextRun ? (
-          <div className="min-w-0">
-            <p className="truncate text-[0.625rem] text-foreground">
-              {timestampLabel(nextRun, schedule.timezone)}
-            </p>
-            <p className="truncate text-[0.5rem] text-muted-foreground">
-              {relativeTime(nextRun)}
-            </p>
-          </div>
-        ) : (
-          <span className="text-[0.625rem] text-muted-foreground">
-            Not scheduled
-          </span>
-        )}
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden xl:table-cell">
-        <div className="min-w-0">
-          <p className="text-[0.625rem] text-foreground">
-            {schedule.targets.length} target
-            {schedule.targets.length === 1 ? "" : "s"}
-          </p>
-          <p className="truncate text-[0.5rem] text-muted-foreground">
-            {relayCountLabel(schedule)}
-          </p>
-        </div>
+        <ScheduleNextRun nextRun={nextRun} timezone={schedule.timezone} />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="px-1 sm:px-3">
         <div className="flex items-center justify-end gap-1">
           {canRun ? (
-            <ScheduleActionButton
+            <Button
+              type="button"
+              size="sm"
+              className="bg-emerald-600 px-2 text-xs text-white hover:bg-emerald-500 focus-visible:ring-emerald-500/40 dark:bg-emerald-600 dark:hover:bg-emerald-500"
               disabled={runMutation.isPending}
-              icon={runMutation.isPending ? LoaderCircle : Play}
-              label={`Run ${schedule.name} now`}
-              spinning={runMutation.isPending}
-              tooltip="Run now"
               onClick={() => runMutation.mutate()}
-            />
+            >
+              {runMutation.isPending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Play />
+              )}
+              Run now
+            </Button>
           ) : null}
           {canEdit ? (
-            <ScheduleActionButton
-              icon={Pencil}
-              label={`Edit ${schedule.name}`}
-              tooltip="Edit"
-              onClick={onEdit}
-            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label={`Edit ${schedule.name}`}
+                  onClick={onEdit}
+                >
+                  <Pencil />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Edit schedule</TooltipContent>
+            </Tooltip>
           ) : null}
           {canDelete ? (
-            <ScheduleActionButton
-              destructive
-              icon={Trash2}
-              label={`Delete ${schedule.name}`}
-              tooltip="Delete"
-              onClick={onDelete}
-            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                  aria-label={`Delete ${schedule.name}`}
+                  onClick={onDelete}
+                >
+                  <Trash2 />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Delete schedule</TooltipContent>
+            </Tooltip>
           ) : null}
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    aria-label={`More actions for ${schedule.name}`}
+                  >
+                    <EllipsisVertical />
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">More actions</TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent align="end" className="min-w-48">
+              <DropdownMenuItem onSelect={copyScheduleId}>
+                <ClipboardCopy /> Copy schedule ID
+              </DropdownMenuItem>
+              {canDuplicate ? (
+                <DropdownMenuItem
+                  disabled={duplicateMutation.isPending}
+                  onSelect={() => duplicateMutation.mutate()}
+                >
+                  {duplicateMutation.isPending ? (
+                    <LoaderCircle className="animate-spin" />
+                  ) : (
+                    <Copy />
+                  )}
+                  Duplicate schedule
+                </DropdownMenuItem>
+              ) : null}
+              <DropdownMenuItem onSelect={onViewHistory}>
+                <History /> View history
+              </DropdownMenuItem>
+              {canEdit ? (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    disabled={enabledMutation.isPending}
+                    onSelect={() => enabledMutation.mutate(!schedule.enabled)}
+                  >
+                    {enabledMutation.isPending ? (
+                      <LoaderCircle className="animate-spin" />
+                    ) : schedule.enabled ? (
+                      <CirclePause />
+                    ) : (
+                      <CirclePlay />
+                    )}
+                    {schedule.enabled ? "Disable schedule" : "Enable schedule"}
+                  </DropdownMenuItem>
+                </>
+              ) : null}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </WorkspaceTableCell>
     </tr>
   )
 })
 
-function ScheduleActionButton({
-  destructive = false,
-  disabled = false,
-  icon: Icon,
-  label,
-  spinning = false,
-  tooltip,
-  onClick,
-}: {
-  destructive?: boolean
-  disabled?: boolean
-  icon: typeof Play
-  label: string
-  spinning?: boolean
-  tooltip: string
-  onClick: () => void
-}) {
+function ScheduleTiming({ cron }: { cron: string }) {
+  const alias = cronAliasLabel(cron)
+  if (!alias) {
+    return (
+      <span className="font-mono text-[0.625rem] text-foreground">{cron}</span>
+    )
+  }
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          aria-label={label}
-          className={
-            destructive
-              ? "text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-              : "text-muted-foreground"
-          }
-          disabled={disabled}
-          onClick={onClick}
+        <span
+          tabIndex={0}
+          className="inline-flex cursor-default text-[0.625rem] font-medium text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
         >
-          <Icon className={spinning ? "animate-spin" : undefined} />
-        </Button>
+          {alias}
+        </span>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={6}>
-        {tooltip}
+      <TooltipContent side="bottom" className="font-mono">
+        {cron}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function ScheduleNextRun({
+  nextRun,
+  timezone,
+}: {
+  nextRun: Date | null
+  timezone: string
+}) {
+  if (!nextRun) {
+    return (
+      <span className="text-[0.625rem] text-muted-foreground">
+        Not scheduled
+      </span>
+    )
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <time
+          dateTime={nextRun.toISOString()}
+          tabIndex={0}
+          className="inline-flex cursor-default text-[0.625rem] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          suppressHydrationWarning
+        >
+          {relativeTime(nextRun)}
+        </time>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">
+        {fullTimestampLabel(nextRun, timezone)}
       </TooltipContent>
     </Tooltip>
   )
@@ -472,17 +600,44 @@ function EmptyScheduleTable({
 
 export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
   const { data: schedules } = useSuspenseQuery(schedulesQueryOptions())
+  const search = useSearch({ from: "/_app/schedules" })
+  const navigate = useNavigate({ from: "/schedules/history" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
+  const filteredSchedule = React.useMemo(
+    () =>
+      search.schedule
+        ? (schedules.find((schedule) => schedule.id === search.schedule) ??
+          null)
+        : null,
+    [schedules, search.schedule]
+  )
   const runs = React.useMemo(
-    () => scheduleHistoryRuns(schedules, selectedScope),
-    [schedules, selectedScope]
+    () => scheduleHistoryRuns(schedules, selectedScope, search.schedule),
+    [schedules, search.schedule, selectedScope]
+  )
+  const clearScheduleFilter = React.useCallback(
+    () =>
+      void navigate({
+        replace: true,
+        search: (previous) => ({ ...previous, schedule: undefined }),
+      }),
+    [navigate]
   )
 
   return (
     <div className="mx-auto w-full max-w-[90rem] px-3 pb-10 sm:px-5">
       <section className="overflow-hidden rounded-xl border bg-card/45 [contain:paint]">
-        <HistoryToolbar searchStore={searchStore} runCount={runs.length} />
+        <HistoryToolbar
+          filteredScheduleName={
+            search.schedule
+              ? (filteredSchedule?.name ?? "Unknown schedule")
+              : null
+          }
+          searchStore={searchStore}
+          runCount={runs.length}
+          onClearScheduleFilter={clearScheduleFilter}
+        />
         <ScheduleHistoryTable
           runs={runs}
           scopeActive={selectedScope !== null}
@@ -500,10 +655,12 @@ type ScheduleHistoryRun = Schedule["runs"][number] & {
 
 function scheduleHistoryRuns(
   schedules: ReadonlyArray<Schedule>,
-  scope: ServerPickerOption | null
+  scope: ServerPickerOption | null,
+  scheduleId: string | undefined
 ): Array<ScheduleHistoryRun> {
   const runs: Array<ScheduleHistoryRun> = []
   for (const schedule of schedules) {
+    if (scheduleId && schedule.id !== scheduleId) continue
     for (const run of schedule.runs) {
       if (
         scope &&
@@ -524,16 +681,20 @@ function scheduleHistoryRuns(
 }
 
 function HistoryToolbar({
+  filteredScheduleName,
   runCount,
   searchStore,
+  onClearScheduleFilter,
 }: {
+  filteredScheduleName: string | null
   runCount: number
   searchStore: WorkspaceTableSearchStore
+  onClearScheduleFilter: () => void
 }) {
   const inputRef = React.useRef<HTMLInputElement>(null)
   useWorkspaceTableSearchInput(inputRef, searchStore)
   return (
-    <div className="flex min-w-0 items-center gap-3 border-b bg-background/25 p-3">
+    <div className="flex min-w-0 items-center gap-2 border-b bg-background/25 p-3">
       <div className="relative min-w-0 flex-1 sm:max-w-md">
         <Search className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted-foreground" />
         <Input
@@ -546,6 +707,19 @@ function HistoryToolbar({
           onChange={(event) => searchStore.set(event.currentTarget.value)}
         />
       </div>
+      {filteredScheduleName ? (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="flex max-w-32 min-w-0 gap-1.5 px-2 text-[0.625rem] sm:max-w-52"
+          aria-label={`Clear history filter for ${filteredScheduleName}`}
+          onClick={onClearScheduleFilter}
+        >
+          <span className="truncate">{filteredScheduleName}</span>
+          <X className="shrink-0" />
+        </Button>
+      ) : null}
       <Badge variant="outline" className="font-mono text-[0.625rem]">
         {runCount} run{runCount === 1 ? "" : "s"}
       </Badge>
@@ -1215,17 +1389,25 @@ function DeleteScheduleDialog({
   )
 }
 
-function ScheduleState({ state }: { state: "applied" | "error" | "pending" }) {
+function ScheduleState({
+  state,
+}: {
+  state: "deployed" | "disabled" | "running"
+}) {
   const label =
-    state === "applied" ? "Deployed" : state === "error" ? "Error" : "Pending"
+    state === "deployed"
+      ? "Deployed"
+      : state === "running"
+        ? "Running"
+        : "Disabled"
   return (
     <span
-      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium ${state === "applied" ? "text-emerald-400" : state === "error" ? "text-destructive" : "text-amber-300"}`}
+      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium ${state === "deployed" ? "text-emerald-400" : state === "running" ? "text-amber-300" : "text-muted-foreground"}`}
     >
       <span
-        className={`size-1.5 shrink-0 rounded-full ${state === "applied" ? "bg-emerald-400" : state === "error" ? "bg-destructive" : "bg-amber-400"}`}
+        className={`size-1.5 shrink-0 rounded-full ${state === "deployed" ? "bg-emerald-400" : state === "running" ? "animate-pulse bg-amber-400" : "bg-muted-foreground"}`}
       />
-      <span className="hidden sm:inline">{label}</span>
+      <span>{label}</span>
     </span>
   )
 }
@@ -1238,10 +1420,10 @@ function RunStatusDot({
   const label = status.replaceAll("_", " ")
   return (
     <span
-      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium capitalize ${status === "succeeded" ? "text-emerald-400" : status === "failed" || status === "interrupted" ? "text-destructive" : status === "partial" ? "text-amber-300" : "text-muted-foreground"}`}
+      className={`inline-flex items-center gap-1.5 text-[0.625rem] font-medium capitalize ${status === "succeeded" ? "text-emerald-400" : status === "failed" || status === "interrupted" ? "text-destructive" : status === "partial" || status === "running" ? "text-amber-300" : "text-muted-foreground"}`}
     >
       <span
-        className={`size-1.5 shrink-0 rounded-full ${status === "succeeded" ? "bg-emerald-400" : status === "failed" || status === "interrupted" ? "bg-destructive" : status === "partial" ? "bg-amber-400" : "bg-muted-foreground"}`}
+        className={`size-1.5 shrink-0 rounded-full ${status === "succeeded" ? "bg-emerald-400" : status === "failed" || status === "interrupted" ? "bg-destructive" : status === "partial" || status === "running" ? `${status === "running" ? "animate-pulse " : ""}bg-amber-400` : "bg-muted-foreground"}`}
       />
       <span className="hidden sm:inline">{label}</span>
     </span>
@@ -1293,7 +1475,7 @@ function targetKey(target: Pick<ScheduleTarget, "id" | "kind" | "relayId">) {
 function canOperateSchedule(
   schedule: Pick<Schedule, "actions" | "targets">,
   options: ReadonlyMap<string, ScheduleOption>,
-  permission: "canExecute" | "canUpdate"
+  permission: "canCreate" | "canExecute" | "canUpdate"
 ) {
   return schedule.targets.every((target) => {
     const option = options.get(targetKey(target))
@@ -1339,11 +1521,22 @@ function cronPreset(cron: string) {
   return presets[cron] ?? "custom"
 }
 
-function cronLabel(cron: string) {
+function cronAliasLabel(cron: string) {
   const preset = cronPreset(cron)
   return preset === "custom"
-    ? "Custom schedule"
+    ? null
     : `${preset[0]?.toUpperCase()}${preset.slice(1)}`
+}
+
+function scheduleInput(schedule: Schedule) {
+  return {
+    actions: schedule.actions,
+    cron: schedule.cron,
+    enabled: schedule.enabled,
+    name: schedule.name,
+    targets: schedule.targets,
+    timezone: schedule.timezone,
+  }
 }
 
 function scheduleRowKey(schedule: Schedule) {
@@ -1393,11 +1586,6 @@ function scheduleSearchText(schedule: Schedule) {
   ].join(" ")
 }
 
-function relayCountLabel(schedule: Schedule) {
-  const count = new Set(schedule.targets.map((target) => target.relayId)).size
-  return `${count} Relay${count === 1 ? "" : "s"}`
-}
-
 function historyRowKey(run: ScheduleHistoryRun) {
   return `${run.relayId}:${run.id}`
 }
@@ -1432,6 +1620,14 @@ function timestampLabel(date: Date, timeZone: string) {
   }).format(date)
 }
 
+function fullTimestampLabel(date: Date, timeZone: string) {
+  return new Intl.DateTimeFormat("en-US", {
+    dateStyle: "full",
+    timeStyle: "long",
+    timeZone,
+  }).format(date)
+}
+
 function localTimezone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
 }
@@ -1445,20 +1641,11 @@ function scheduleNextRun(schedule: Schedule) {
   )
 }
 
-function deploymentState(schedule: Schedule): "applied" | "error" | "pending" {
-  if (schedule.deployments.some((deployment) => deployment.status === "error"))
-    return "error"
-  if (
-    schedule.deployments.length === 0 ||
-    schedule.deployments.some(
-      (deployment) =>
-        deployment.status !== "applied" ||
-        deployment.acknowledgedRevision !== schedule.revision
-    )
-  ) {
-    return "pending"
-  }
-  return "applied"
+function scheduleStatus(
+  schedule: Schedule
+): "deployed" | "disabled" | "running" {
+  if (schedule.runs.some((run) => run.status === "running")) return "running"
+  return schedule.enabled ? "deployed" : "disabled"
 }
 
 function relativeTime(date: Date) {

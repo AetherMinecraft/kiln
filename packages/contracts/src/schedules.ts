@@ -187,6 +187,7 @@ export const scheduleTargetRunStatusSchema = z.enum([
 ])
 
 export const scheduleRunStatusSchema = z.enum([
+  "running",
   "succeeded",
   "partial",
   "failed",

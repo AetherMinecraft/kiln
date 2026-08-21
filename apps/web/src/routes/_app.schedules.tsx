@@ -10,6 +10,7 @@ import {
 const scheduleSearchSchema = z.object({
   kind: z.enum(["database", "relay", "server"]).optional(),
   relay: z.string().max(120).optional(),
+  schedule: z.uuid().optional(),
   target: z.string().max(120).optional(),
 })
 

@@ -528,7 +528,7 @@ CREATE TABLE IF NOT EXISTS kiln_schedule_run (
   schedule_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   scheduled_at TIMESTAMP(3) NOT NULL,
-  status ENUM('succeeded', 'partial', 'failed', 'noop', 'interrupted', 'missed') NOT NULL,
+  status ENUM('running', 'succeeded', 'partial', 'failed', 'noop', 'interrupted', 'missed') NOT NULL,
   run_json JSON NOT NULL,
   created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),

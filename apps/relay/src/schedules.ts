@@ -174,7 +174,7 @@ export class ScheduleManager {
         scheduleId: schedule.id,
         scheduledAt,
         startedAt: scheduledAt,
-        status: "interrupted",
+        status: "running",
         targetRuns: [],
       })
       this.#upsertRun(run)
@@ -202,6 +202,11 @@ export class ScheduleManager {
 
   async #recoverAfterRestart() {
     const now = Date.now()
+    this.#state.runs = this.#state.runs.map((run) =>
+      run.status === "running"
+        ? { ...run, finishedAt: now, status: "interrupted" }
+        : run
+    )
     for (const schedule of this.#state.schedules) {
       if (
         !schedule.enabled ||
@@ -258,17 +263,17 @@ export class ScheduleManager {
           schedule.timezone,
           now
         ).getTime()
-        const interrupted = scheduleRunSchema.parse({
+        const running = scheduleRunSchema.parse({
           finishedAt: now,
           id: scheduleStableId(schedule.id, scheduledAt, this.#options.relayId),
           revision: schedule.revision,
           scheduleId: schedule.id,
           scheduledAt,
           startedAt: now,
-          status: "interrupted",
+          status: "running",
           targetRuns: [],
         })
-        this.#upsertRun(interrupted)
+        this.#upsertRun(running)
       }
       const persistHeartbeat =
         now - this.#lastHeartbeatPersistedAt >= heartbeatPersistenceIntervalMs
