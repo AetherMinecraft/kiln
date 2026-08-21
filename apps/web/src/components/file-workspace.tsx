@@ -3506,7 +3506,7 @@ function FileTreePanel({
               <button
                 type="button"
                 role="menuitem"
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-popover-accent focus-visible:bg-popover-accent focus-visible:outline-none"
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-popover-accent focus-visible:bg-popover-accent focus-visible:outline-none [&>svg]:size-3.5"
                 onClick={() => {
                   context.close()
                   onPathChange(item.path)
