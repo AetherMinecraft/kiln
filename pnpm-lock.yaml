@@ -123,6 +123,9 @@ importers:
       zip-stream:
         specifier: 7.0.5
         version: 7.0.5
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
     devDependencies:
       '@effect/vitest':
         specifier: 4.0.0-beta.99
@@ -344,6 +347,9 @@ importers:
 
   packages/contracts:
     dependencies:
+      cron-parser:
+        specifier: 5.10.0
+        version: 5.10.0
       effect:
         specifier: 4.0.0-beta.99
         version: 4.0.0-beta.99
@@ -4262,6 +4268,10 @@ packages:
 
   crelt@1.0.7:
     resolution: {integrity: sha512-aK6BbWfhf4U/wCcLHKPJl/xa6VkVstRaPywWtMKGwuOLc/wZTyQYuoxgvZnNsBvv7Kg3YTBQYYBCggcviQczuA==}
+
+  cron-parser@5.10.0:
+    resolution: {integrity: sha512-izNAxJyRWUP8ljBoDSub5WyrVOUlT4SLGShswE7eoRBpp6QUsSycYxLBMJlbshgPBMcPT/nrfgjNY2918ayv2A==}
+    engines: {node: '>=18'}
 
   cross-spawn@7.0.6:
     resolution: {integrity: sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==}
@@ -10191,6 +10201,10 @@ snapshots:
       readable-stream: 4.7.0
 
   crelt@1.0.7: {}
+
+  cron-parser@5.10.0:
+    dependencies:
+      luxon: 3.7.2
 
   cross-spawn@7.0.6:
     dependencies:

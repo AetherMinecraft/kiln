@@ -29,6 +29,7 @@ import { Route as AppActivityRouteImport } from './routes/_app.activity'
 import { Route as AppBackupsRouteImport } from './routes/_app.backups'
 import { Route as AppInfraRouteImport } from './routes/_app.infra'
 import { Route as AppOperationsRouteImport } from './routes/_app.operations'
+import { Route as AppSchedulesRouteImport } from './routes/_app.schedules'
 import { Route as AppServersRouteImport } from './routes/_app.servers'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as ApiHealthRouteImport } from './routes/api.health'
@@ -160,6 +161,11 @@ const AppInfraRoute = AppInfraRouteImport.update({
 const AppOperationsRoute = AppOperationsRouteImport.update({
   id: '/operations',
   path: '/operations',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSchedulesRoute = AppSchedulesRouteImport.update({
+  id: '/schedules',
+  path: '/schedules',
   getParentRoute: () => AppRoute,
 } as any)
 const AppServersRoute = AppServersRouteImport.update({
@@ -352,6 +358,7 @@ export interface FileRoutesByFullPath {
   '/backups': typeof AppBackupsRoute
   '/infra': typeof AppInfraRouteWithChildren
   '/operations': typeof AppOperationsRoute
+  '/schedules': typeof AppSchedulesRoute
   '/servers': typeof AppServersRoute
   '/settings': typeof AppSettingsRouteWithChildren
   '/api/health': typeof ApiHealthRoute
@@ -405,6 +412,7 @@ export interface FileRoutesByTo {
   '/activity': typeof AppActivityRoute
   '/backups': typeof AppBackupsRoute
   '/operations': typeof AppOperationsRoute
+  '/schedules': typeof AppSchedulesRoute
   '/servers': typeof AppServersRoute
   '/api/health': typeof ApiHealthRoute
   '/api/sentry-check': typeof ApiSentryCheckRoute
@@ -459,6 +467,7 @@ export interface FileRoutesById {
   '/_app/backups': typeof AppBackupsRoute
   '/_app/infra': typeof AppInfraRouteWithChildren
   '/_app/operations': typeof AppOperationsRoute
+  '/_app/schedules': typeof AppSchedulesRoute
   '/_app/servers': typeof AppServersRoute
   '/_app/settings': typeof AppSettingsRouteWithChildren
   '/api/health': typeof ApiHealthRoute
@@ -515,6 +524,7 @@ export interface FileRouteTypes {
     | '/backups'
     | '/infra'
     | '/operations'
+    | '/schedules'
     | '/servers'
     | '/settings'
     | '/api/health'
@@ -568,6 +578,7 @@ export interface FileRouteTypes {
     | '/activity'
     | '/backups'
     | '/operations'
+    | '/schedules'
     | '/servers'
     | '/api/health'
     | '/api/sentry-check'
@@ -621,6 +632,7 @@ export interface FileRouteTypes {
     | '/_app/backups'
     | '/_app/infra'
     | '/_app/operations'
+    | '/_app/schedules'
     | '/_app/servers'
     | '/_app/settings'
     | '/api/health'
@@ -822,6 +834,13 @@ declare module '@tanstack/react-router' {
       path: '/operations'
       fullPath: '/operations'
       preLoaderRoute: typeof AppOperationsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/schedules': {
+      id: '/_app/schedules'
+      path: '/schedules'
+      fullPath: '/schedules'
+      preLoaderRoute: typeof AppSchedulesRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/servers': {
@@ -1148,6 +1167,7 @@ interface AppRouteChildren {
   AppBackupsRoute: typeof AppBackupsRoute
   AppInfraRoute: typeof AppInfraRouteWithChildren
   AppOperationsRoute: typeof AppOperationsRoute
+  AppSchedulesRoute: typeof AppSchedulesRoute
   AppServersRoute: typeof AppServersRoute
   AppSettingsRoute: typeof AppSettingsRouteWithChildren
   AppServerServerIdRoute: typeof AppServerServerIdRouteWithChildren
@@ -1160,6 +1180,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppBackupsRoute: AppBackupsRoute,
   AppInfraRoute: AppInfraRouteWithChildren,
   AppOperationsRoute: AppOperationsRoute,
+  AppSchedulesRoute: AppSchedulesRoute,
   AppServersRoute: AppServersRoute,
   AppSettingsRoute: AppSettingsRouteWithChildren,
   AppServerServerIdRoute: AppServerServerIdRouteWithChildren,

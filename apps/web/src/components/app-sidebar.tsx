@@ -6,6 +6,7 @@ import {
 } from "@tanstack/react-query"
 import {
   Archive,
+  CalendarClock,
   ChevronsUpDown,
   Database,
   Folder,
@@ -709,6 +710,19 @@ function AccountNavigation({
   return (
     <SidebarFooter>
       <SidebarMenu>
+        <SidebarMenuItem>
+          <SidebarMenuButton asChild tooltip="Schedules">
+            <Link
+              to="/schedules"
+              activeOptions={{ exact: true, includeSearch: false }}
+              activeProps={{ "data-active": true }}
+              preload="intent"
+            >
+              <CalendarClock />
+              <span>Schedules</span>
+            </Link>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
         <SidebarMenuItem>
           <SidebarMenuButton asChild tooltip="Backups">
             <Link

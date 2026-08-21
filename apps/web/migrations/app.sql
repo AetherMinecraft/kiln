@@ -462,3 +462,78 @@ CREATE TABLE IF NOT EXISTS kiln_backup_download_share (
   created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   KEY kiln_backup_download_share_expiry_idx (expires_at)
 );
+
+CREATE TABLE IF NOT EXISTS kiln_schedule (
+  id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  cron_expression VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  timezone VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  revision INT UNSIGNED NOT NULL DEFAULT 1,
+  created_by VARCHAR(36) NOT NULL,
+  deleted_at TIMESTAMP(3) NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  KEY kiln_schedule_created_by_idx (created_by, updated_at),
+  KEY kiln_schedule_enabled_idx (enabled, updated_at)
+);
+
+CREATE TABLE IF NOT EXISTS kiln_schedule_action (
+  id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+  schedule_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  position SMALLINT UNSIGNED NOT NULL,
+  action_type ENUM('console_command', 'backup', 'power') NOT NULL,
+  action_config JSON NOT NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY kiln_schedule_action_position_unique (schedule_id, position),
+  CONSTRAINT kiln_schedule_action_schedule_fk
+    FOREIGN KEY (schedule_id) REFERENCES kiln_schedule (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS kiln_schedule_target (
+  schedule_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  target_kind ENUM('instance', 'database', 'relay') NOT NULL,
+  target_id VARCHAR(120) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  target_name VARCHAR(120) NOT NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (schedule_id, relay_id, target_kind, target_id),
+  KEY kiln_schedule_target_relay_idx (relay_id, target_kind, target_id),
+  CONSTRAINT kiln_schedule_target_schedule_fk
+    FOREIGN KEY (schedule_id) REFERENCES kiln_schedule (id) ON DELETE CASCADE,
+  CONSTRAINT kiln_schedule_target_relay_fk
+    FOREIGN KEY (relay_id) REFERENCES kiln_relay (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS kiln_schedule_deployment (
+  schedule_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  desired_revision INT UNSIGNED NOT NULL,
+  acknowledged_revision INT UNSIGNED NULL,
+  status ENUM('pending', 'applied', 'error') NOT NULL DEFAULT 'pending',
+  next_run_at TIMESTAMP(3) NULL,
+  last_error VARCHAR(2000) NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (schedule_id, relay_id),
+  KEY kiln_schedule_deployment_status_idx (status, updated_at),
+  CONSTRAINT kiln_schedule_deployment_schedule_fk
+    FOREIGN KEY (schedule_id) REFERENCES kiln_schedule (id) ON DELETE CASCADE,
+  CONSTRAINT kiln_schedule_deployment_relay_fk
+    FOREIGN KEY (relay_id) REFERENCES kiln_relay (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS kiln_schedule_run (
+  id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+  schedule_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  relay_id CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scheduled_at TIMESTAMP(3) NOT NULL,
+  status ENUM('succeeded', 'partial', 'failed', 'noop', 'interrupted', 'missed') NOT NULL,
+  run_json JSON NOT NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  KEY kiln_schedule_run_schedule_idx (schedule_id, scheduled_at DESC),
+  KEY kiln_schedule_run_relay_idx (relay_id, scheduled_at DESC),
+  CONSTRAINT kiln_schedule_run_relay_fk
+    FOREIGN KEY (relay_id) REFERENCES kiln_relay (id) ON DELETE CASCADE
+);

@@ -52,6 +52,9 @@ export const relayControlOperations = [
   "backup.task.cancel",
   "backup.task.get",
   "backup.task.list",
+  "schedule.apply",
+  "schedule.remove",
+  "schedule.overview",
   "instance.create",
   "instance.startup.write",
   "instance.rename",
@@ -94,6 +97,9 @@ export function relayControlDeadlineMs(
   if (operation === "database.dump.export") return 120_000
   if (operation === "database.dump.import") return 120_000
   if (operation === "instance.action") return 180_000
+  if (operation === "schedule.apply" || operation === "schedule.remove") {
+    return 30_000
+  }
   if (operation === "instance.logs.share") return 60_000
   if (
     operation === "instance.create" ||
