@@ -2088,19 +2088,19 @@ const ActionEditor = React.memo(function ActionEditor({
 
   return (
     <div
-      className={`rounded-lg border bg-background/45 p-2.5 transition-[border-color,opacity] ${dragging ? "border-primary/40 opacity-55" : ""}`}
+      className={`h-44 rounded-lg border bg-background/45 p-2.5 transition-[border-color,opacity] sm:h-32 ${dragging ? "border-primary/40 opacity-55" : ""}`}
       onDragOver={(event) => {
         event.preventDefault()
         onDragOver(action.id)
       }}
       onDrop={(event) => event.preventDefault()}
     >
-      <div className="flex items-start gap-3">
+      <div className="flex h-full items-start gap-3">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
-              className="grid size-7 shrink-0 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing"
+              className="grid h-full w-8 shrink-0 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing"
               draggable
               type="button"
               onDragEnd={onDragEnd}
