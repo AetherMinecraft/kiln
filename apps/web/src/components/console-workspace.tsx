@@ -1355,7 +1355,7 @@ const ConsoleLogRow = React.memo(function ConsoleLogRow({
       tabIndex={0}
       ref={measureElement}
       data-index={index}
-      className={`absolute left-0 flex min-h-[30px] transition-colors ${stateLine ? "border-l-0 pr-0 text-center" : "border-l-2 pr-5 text-left"} ${wrapLines ? "w-full items-start py-1.5 whitespace-pre-wrap" : "h-[30px] min-w-full items-center whitespace-nowrap"} ${lineTone(line.level, selected, stateLine)}`}
+      className={`absolute top-0 left-0 flex min-h-[30px] transition-colors ${stateLine ? "border-l-0 pr-0 text-center" : "border-l-2 pr-5 text-left"} ${wrapLines ? "w-full items-start py-1.5 whitespace-pre-wrap" : "h-[30px] min-w-full items-center whitespace-nowrap"} ${lineTone(line.level, selected, stateLine)}`}
       style={{
         transform: `translateY(${start}px)`,
         width: wrapLines ? "100%" : "max(100%, max-content)",
