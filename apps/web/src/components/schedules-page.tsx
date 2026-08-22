@@ -107,6 +107,10 @@ import { BackupIcon } from "@/components/backup-icon"
 import { useScheduleScope } from "@/components/schedule-scope"
 import { forkPromise } from "@/effect/promise"
 import {
+  scheduleBackupAllowsIncremental,
+  scheduleBackupDestination,
+} from "@/lib/schedule-backup-configuration"
+import {
   backupStorageQueryOptions,
   queryKeys,
   scheduleOptionsQueryOptions,
@@ -2354,10 +2358,11 @@ const ActionEditor = React.memo(function ActionEditor({
       </div>
       {action.type === "backup" ? (
         <BackupConfigurationDialog
-          allowIncremental={
-            selectedOptions.length > 0 &&
-            selectedOptions.every((target) => target.kind === "instance")
-          }
+          allowDefaultDestination={false}
+          allowIncremental={scheduleBackupAllowsIncremental(
+            selectedActionTargets,
+            permissionKey
+          )}
           fullDestination="local"
           initialDestinationKeys={
             action.destination.kind === "storage"
@@ -2368,13 +2373,12 @@ const ActionEditor = React.memo(function ActionEditor({
           initialName={action.name}
           onOpenChange={setBackupConfigOpen}
           onSubmit={(configuration) => {
-            const destination = configuration.destinationKeys[0] ?? "local"
             onChange({
               ...action,
-              destination:
-                configuration.mode === "full" || destination === "local"
-                  ? { kind: "local" }
-                  : { kind: "storage", storageId: destination },
+              destination: scheduleBackupDestination(
+                configuration.mode,
+                configuration.destinationKeys[0]
+              ),
               mode: configuration.mode,
               name: configuration.name,
             })

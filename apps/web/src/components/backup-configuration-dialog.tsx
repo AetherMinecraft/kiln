@@ -44,7 +44,16 @@ export interface BackupConfiguration {
   targetKey?: string
 }
 
+interface BackupStorageOption {
+  deleting: boolean
+  enabled: boolean
+  id: string
+  name: string
+  ownerUserId: string | null
+}
+
 export function BackupConfigurationDialog({
+  allowDefaultDestination = true,
   allowIncremental,
   description = "Relay runs this job in its single durable queue. Servers remain online while their data is archived.",
   error,
@@ -63,6 +72,7 @@ export function BackupConfigurationDialog({
   targets,
   title,
 }: {
+  allowDefaultDestination?: boolean
   allowIncremental?: boolean
   description?: React.ReactNode
   error?: string
@@ -76,13 +86,7 @@ export function BackupConfigurationDialog({
   open: boolean
   pending?: boolean
   showTarget?: boolean
-  storage: ReadonlyArray<{
-    deleting: boolean
-    enabled: boolean
-    id: string
-    name: string
-    ownerUserId: string | null
-  }>
+  storage: ReadonlyArray<BackupStorageOption>
   submitLabel?: string
   targets: ReadonlyArray<BackupConfigurationTarget>
   title: string
@@ -97,7 +101,11 @@ export function BackupConfigurationDialog({
       ""
   )
   const [destinationKeys, setDestinationKeys] = React.useState<Array<string>>(
-    () => [...(initialDestinationKeys ?? ["default"])]
+    () => [
+      ...(initialDestinationKeys ?? [
+        allowDefaultDestination ? "default" : "local",
+      ]),
+    ]
   )
   const [mode, setMode] = React.useState<"full" | "incremental">(initialMode)
   const target = showTarget
@@ -122,27 +130,58 @@ export function BackupConfigurationDialog({
     if (fullDestination === "local" && effectiveMode === "full") {
       return ["local"]
     }
+    const fallbackDestination = allowDefaultDestination ? "default" : "local"
     const allowed = new Set([
-      "default",
+      ...(allowDefaultDestination ? ["default"] : []),
       "local",
       ...availableStorage.map((destination) => destination.id),
     ])
     const next = destinationKeys.filter((destination) =>
       allowed.has(destination)
     )
-    const usable = next.length > 0 ? next : ["default"]
-    return effectiveMode === "incremental" ? [usable[0] ?? "default"] : usable
-  }, [availableStorage, destinationKeys, effectiveMode, fullDestination])
+    const usable = next.length > 0 ? next : [fallbackDestination]
+    return effectiveMode === "incremental"
+      ? [usable[0] ?? fallbackDestination]
+      : usable
+  }, [
+    allowDefaultDestination,
+    availableStorage,
+    destinationKeys,
+    effectiveMode,
+    fullDestination,
+  ])
   const selectedDestinations = React.useMemo(
     () => new Set(destinationKeysInUse),
     [destinationKeysInUse]
   )
   const showMode = showTarget ? target?.kind === "instance" : true
 
+  const resetConfiguration = () => {
+    setName(initialName ?? timestampedBackupName("manual"))
+    setTargetKeyValue(
+      targets.find((candidate) => candidate.key === initialTargetKey)?.key ??
+        targets.at(0)?.key ??
+        ""
+    )
+    setDestinationKeys([
+      ...(initialDestinationKeys ?? [
+        allowDefaultDestination ? "default" : "local",
+      ]),
+    ])
+    setMode(initialMode)
+  }
+
+  const changeOpen = (nextOpen: boolean) => {
+    if (!nextOpen) resetConfiguration()
+    onOpenChange(nextOpen)
+  }
+
   const toggleDestination = (destination: string, checked: boolean) => {
     setDestinationKeys((current) => {
       if (effectiveMode === "incremental") {
-        if (!checked) return ["default"]
+        if (!checked) {
+          return [allowDefaultDestination ? "default" : "local"]
+        }
         return [destination]
       }
       if (destination === "default") {
@@ -152,12 +191,14 @@ export function BackupConfigurationDialog({
       const next = checked
         ? [...new Set([...withoutDefault, destination])]
         : withoutDefault.filter((key) => key !== destination)
-      return next.length > 0 ? next : ["default"]
+      return next.length > 0
+        ? next
+        : [allowDefaultDestination ? "default" : "local"]
     })
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={changeOpen}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
@@ -204,92 +245,28 @@ export function BackupConfigurationDialog({
             </label>
           ) : null}
           {showMode ? (
-            <fieldset>
-              <legend className="mb-2 text-xs font-medium">Mode</legend>
-              <div className="grid gap-2 sm:grid-cols-2">
-                <BackupDestinationChoice
-                  checked={effectiveMode === "incremental"}
-                  description="Deduplicated snapshots on this Relay or S3"
-                  disabled={!incrementalAllowed}
-                  icon={Archive}
-                  label="Incremental"
-                  onCheckedChange={(checked) => {
-                    if (checked && incrementalAllowed) setMode("incremental")
-                  }}
-                />
-                <BackupDestinationChoice
-                  checked={effectiveMode === "full"}
-                  description="Portable zip archive"
-                  icon={HardDrive}
-                  label="Full archive"
-                  onCheckedChange={(checked) => {
-                    if (checked) setMode("full")
-                  }}
-                />
-              </div>
-            </fieldset>
+            <BackupModeChoices
+              effectiveMode={effectiveMode}
+              incrementalAllowed={incrementalAllowed}
+              onModeChange={setMode}
+            />
           ) : null}
-          <fieldset>
-            <legend className="mb-2 text-xs font-medium">Destinations</legend>
-            <div className="grid gap-2 sm:grid-cols-2">
-              <BackupDestinationChoice
-                checked={selectedDestinations.has("default")}
-                description="Use the target’s preferred destination"
-                disabled={
-                  fullDestination === "local" && effectiveMode === "full"
-                }
-                icon={CloudCog}
-                label="Default"
-                onCheckedChange={(checked) =>
-                  toggleDestination("default", checked)
-                }
-              />
-              <BackupDestinationChoice
-                checked={selectedDestinations.has("local")}
-                description="Keep a copy on this Relay"
-                disabled={
-                  fullDestination === "local" && effectiveMode === "full"
-                }
-                icon={HardDrive}
-                label="Local"
-                onCheckedChange={(checked) =>
-                  toggleDestination("local", checked)
-                }
-              />
-              {fullDestination === undefined || effectiveMode === "incremental"
-                ? availableStorage.map((destination) => (
-                    <BackupDestinationChoice
-                      key={destination.id}
-                      checked={selectedDestinations.has(destination.id)}
-                      description={destination.name}
-                      icon={Cloud}
-                      label="S3"
-                      onCheckedChange={(checked) =>
-                        toggleDestination(destination.id, checked)
-                      }
-                    />
-                  ))
-                : null}
-            </div>
-            <span className="mt-1.5 block text-[0.625rem] text-muted-foreground">
-              {effectiveMode === "incremental"
-                ? "Choose one destination. Incremental snapshots can stay on this Relay or use S3."
-                : fullDestination === "local"
-                  ? "Scheduled full archives are stored on the target Relay."
-                  : target?.kind === "platform"
-                    ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
-                    : target?.kind === "instance"
-                      ? "Choose one or more copies. Default uses this server’s preferred destination."
-                      : "Choose one or more copies. Default uses Relay-local storage."}
-            </span>
-          </fieldset>
+          <BackupDestinationChoices
+            allowDefaultDestination={allowDefaultDestination}
+            availableStorage={availableStorage}
+            effectiveMode={effectiveMode}
+            fullDestination={fullDestination}
+            selectedDestinations={selectedDestinations}
+            targetKind={target?.kind}
+            onToggleDestination={toggleDestination}
+          />
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
         </div>
         <DialogFooter>
           <Button
             variant="ghost"
             type="button"
-            onClick={() => onOpenChange(false)}
+            onClick={() => changeOpen(false)}
           >
             Cancel
           </Button>
@@ -313,6 +290,116 @@ export function BackupConfigurationDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function BackupModeChoices({
+  effectiveMode,
+  incrementalAllowed,
+  onModeChange,
+}: {
+  effectiveMode: "full" | "incremental"
+  incrementalAllowed: boolean
+  onModeChange: (mode: "full" | "incremental") => void
+}) {
+  return (
+    <fieldset>
+      <legend className="mb-2 text-xs font-medium">Mode</legend>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <BackupDestinationChoice
+          checked={effectiveMode === "incremental"}
+          description="Deduplicated snapshots on this Relay or S3"
+          disabled={!incrementalAllowed}
+          icon={Archive}
+          label="Incremental"
+          onCheckedChange={(checked) => {
+            if (checked && incrementalAllowed) onModeChange("incremental")
+          }}
+        />
+        <BackupDestinationChoice
+          checked={effectiveMode === "full"}
+          description="Portable zip archive"
+          icon={HardDrive}
+          label="Full archive"
+          onCheckedChange={(checked) => {
+            if (checked) onModeChange("full")
+          }}
+        />
+      </div>
+    </fieldset>
+  )
+}
+
+function BackupDestinationChoices({
+  allowDefaultDestination,
+  availableStorage,
+  effectiveMode,
+  fullDestination,
+  onToggleDestination,
+  selectedDestinations,
+  targetKind,
+}: {
+  allowDefaultDestination: boolean
+  availableStorage: ReadonlyArray<BackupStorageOption>
+  effectiveMode: "full" | "incremental"
+  fullDestination?: "local"
+  onToggleDestination: (destination: string, checked: boolean) => void
+  selectedDestinations: ReadonlySet<string>
+  targetKind?: BackupConfigurationTarget["kind"]
+}) {
+  const fullIsLocal = fullDestination === "local" && effectiveMode === "full"
+
+  return (
+    <fieldset>
+      <legend className="mb-2 text-xs font-medium">Destinations</legend>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {allowDefaultDestination ? (
+          <BackupDestinationChoice
+            checked={selectedDestinations.has("default")}
+            description="Use the target’s preferred destination"
+            disabled={fullIsLocal}
+            icon={CloudCog}
+            label="Default"
+            onCheckedChange={(checked) =>
+              onToggleDestination("default", checked)
+            }
+          />
+        ) : null}
+        <BackupDestinationChoice
+          checked={selectedDestinations.has("local")}
+          description="Keep a copy on this Relay"
+          disabled={fullIsLocal}
+          icon={HardDrive}
+          label="Local"
+          onCheckedChange={(checked) => onToggleDestination("local", checked)}
+        />
+        {fullDestination === undefined || effectiveMode === "incremental"
+          ? availableStorage.map((destination) => (
+              <BackupDestinationChoice
+                key={destination.id}
+                checked={selectedDestinations.has(destination.id)}
+                description={destination.name}
+                icon={Cloud}
+                label="S3"
+                onCheckedChange={(checked) =>
+                  onToggleDestination(destination.id, checked)
+                }
+              />
+            ))
+          : null}
+      </div>
+      <span className="mt-1.5 block text-[0.625rem] text-muted-foreground">
+        {effectiveMode === "incremental"
+          ? "Choose one destination. Incremental snapshots can stay on this Relay or use S3."
+          : fullDestination === "local"
+            ? "Scheduled full archives are stored on the target Relay."
+            : targetKind === "platform"
+              ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
+              : targetKind === "instance"
+                ? "Choose one or more copies. Default uses this server’s preferred destination."
+                : "Choose one or more copies. Default uses Relay-local storage."}
+      </span>
+    </fieldset>
   )
 }
 
