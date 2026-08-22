@@ -7,7 +7,6 @@ import {
 } from "@tanstack/react-query"
 import {
   ArrowDown,
-  ArrowLeftRight,
   ArrowUp,
   Check,
   ChevronDown,
@@ -31,6 +30,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  SlidersHorizontal,
   Trash2,
   TriangleAlert,
   X,
@@ -2291,7 +2291,7 @@ const ActionEditor = React.memo(function ActionEditor({
               variant="outline"
               onClick={() => setBackupConfigOpen(true)}
             >
-              <ArrowLeftRight className="size-3.5 shrink-0" />
+              <SlidersHorizontal className="size-3.5 shrink-0" />
               <span className="hidden truncate sm:inline">
                 Configure Backup
               </span>
@@ -2595,7 +2595,7 @@ const CommandEditorField = React.memo(function CommandEditorField({
         variant="outline"
         onClick={openEditor}
       >
-        <ArrowLeftRight className="size-3.5 shrink-0" />
+        <SlidersHorizontal className="size-3.5 shrink-0" />
         <span className="hidden truncate sm:inline">Configure Command</span>
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
