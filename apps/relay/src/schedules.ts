@@ -485,11 +485,17 @@ export class ScheduleManager {
         for (const action of schedule.actions) {
           if (action.type === "wait") {
             const actionStartedAt = Date.now()
-            if (sequenceFailure) {
+            const canContinue = targetStates.some(
+              (state) =>
+                state.activeKey !== null && !state.failure && !state.missing
+            )
+            if (sequenceFailure || !canContinue) {
               sequenceAttempts.push(
                 sequenceAttempt({
                   action,
-                  error: "A previous sequence action failed",
+                  error: sequenceFailure
+                    ? "A previous sequence action failed"
+                    : "No targets can continue",
                   scheduledAt,
                   scheduleId: schedule.id,
                   startedAt: actionStartedAt,
@@ -568,13 +574,12 @@ export class ScheduleManager {
         }
       }
     )
-    const sequenceStatus = sequenceAttempts.some(
+    const sequenceFailed = sequenceAttempts.some(
       (entry) => entry.status === "failed" || entry.status === "interrupted"
     )
-      ? ("failed" as const)
-      : sequenceAttempts.some((entry) => entry.status === "succeeded")
-        ? ("succeeded" as const)
-        : ("noop" as const)
+    const targetStatus = aggregateRunStatus(
+      targetRuns.map((target) => target.status)
+    )
     const run = scheduleRunSchema.parse({
       finishedAt: Date.now(),
       id: scheduleStableId(schedule.id, scheduledAt, this.#options.relayId),
@@ -583,10 +588,11 @@ export class ScheduleManager {
       scheduledAt,
       startedAt,
       sequenceAttempts,
-      status: aggregateRunStatus([
-        ...targetRuns.map((target) => target.status),
-        ...(sequenceAttempts.length > 0 ? [sequenceStatus] : []),
-      ]),
+      status: sequenceFailed
+        ? targetStatus === "succeeded" || targetStatus === "partial"
+          ? "partial"
+          : "failed"
+        : targetStatus,
       targetRuns,
     })
     await this.#serialized(async () => {

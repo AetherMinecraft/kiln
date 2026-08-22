@@ -321,6 +321,142 @@ describe("Relay schedule persistence", () => {
     ).toBe(true)
   })
 
+  it("skips a wait when every target overlaps another occurrence", async () => {
+    let releaseCommand: () => void = () => undefined
+    const commandBlocked = new Promise<void>((resolve) => {
+      releaseCommand = resolve
+    })
+    let markCommandStarted: () => void = () => undefined
+    const commandStarted = new Promise<void>((resolve) => {
+      markCommandStarted = resolve
+    })
+    const schedules = await manager({
+      findInstance: async () => ({}),
+      sendConsoleCommand: async () => {
+        markCommandStarted()
+        await commandBlocked
+      },
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        projection.actions[0],
+        {
+          duration: 20,
+          id: "1e68e6ac-7381-494d-82bb-d50c4a63f575",
+          type: "wait",
+          unit: "milliseconds",
+        },
+      ],
+    })
+
+    const first = await schedules.runNow({
+      revision: projection.revision,
+      scheduleId: projection.id,
+    })
+    await commandStarted
+    const overlapping = await schedules.runNow({
+      revision: projection.revision,
+      scheduleId: projection.id,
+    })
+
+    await vi.waitFor(() => {
+      expect(
+        schedules
+          .overview([projection.id])
+          .runs.find((run) => run.id === overlapping.id)?.status
+      ).toBe("noop")
+    })
+    const overlappingRun = schedules
+      .overview([projection.id])
+      .runs.find((run) => run.id === overlapping.id)
+    expect(overlappingRun?.targetRuns[0]?.status).toBe("skipped_overlap")
+    expect(overlappingRun?.sequenceAttempts).toMatchObject([
+      {
+        actionType: "wait",
+        error: "No targets can continue",
+        status: "not_run",
+      },
+    ])
+
+    releaseCommand()
+    await vi.waitFor(() => {
+      expect(
+        schedules
+          .overview([projection.id])
+          .runs.find((run) => run.id === first.id)?.status
+      ).toBe("succeeded")
+    })
+  })
+
+  it("skips waits after every target has failed", async () => {
+    const schedules = await manager({
+      findInstance: async () => ({}),
+      sendConsoleCommand: async () => {
+        throw new Error("Command failed")
+      },
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        projection.actions[0],
+        {
+          duration: 20,
+          id: "1e68e6ac-7381-494d-82bb-d50c4a63f575",
+          type: "wait",
+          unit: "milliseconds",
+        },
+      ],
+    })
+
+    await schedules.runNow({
+      revision: projection.revision,
+      scheduleId: projection.id,
+    })
+
+    await vi.waitFor(() => {
+      expect(schedules.overview([projection.id]).runs[0]?.status).toBe("failed")
+    })
+    const run = schedules.overview([projection.id]).runs[0]
+    expect(run?.targetRuns[0]?.status).toBe("failed")
+    expect(run?.sequenceAttempts).toMatchObject([
+      {
+        actionType: "wait",
+        error: "No targets can continue",
+        status: "not_run",
+      },
+    ])
+  })
+
+  it("keeps a successful wait-only run as a noop", async () => {
+    const schedules = await manager({ findInstance: async () => ({}) })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        {
+          duration: 1,
+          id: "1e68e6ac-7381-494d-82bb-d50c4a63f575",
+          type: "wait",
+          unit: "milliseconds",
+        },
+      ],
+    })
+
+    await schedules.runNow({
+      revision: projection.revision,
+      scheduleId: projection.id,
+    })
+
+    await vi.waitFor(() => {
+      expect(schedules.overview([projection.id]).runs[0]?.status).toBe("noop")
+    })
+    const run = schedules.overview([projection.id]).runs[0]
+    expect(run?.targetRuns[0]?.status).toBe("noop")
+    expect(run?.sequenceAttempts).toMatchObject([
+      { actionType: "wait", status: "succeeded" },
+    ])
+  })
+
   it("does not run an action on targets disabled by its override", async () => {
     const commands: Array<string> = []
     const schedules = await manager({
