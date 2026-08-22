@@ -1166,7 +1166,7 @@ function ConsoleLogViewport({
     <div className="relative min-h-0 flex-1 bg-background">
       <div
         ref={parentRef}
-        className={`[container-type:inline-size] absolute inset-0 overscroll-contain font-mono text-[0.6875rem] selection:bg-primary/25 sm:text-xs ${wrapLines ? "overflow-x-hidden overflow-y-auto" : "overflow-auto"}`}
+        className={`absolute inset-0 overscroll-contain font-mono text-[0.6875rem] selection:bg-primary/25 sm:text-xs ${wrapLines ? "overflow-x-hidden overflow-y-auto" : "overflow-auto"}`}
         onScroll={(event) => {
           if (programmaticScroll.current) return
           const viewport = event.currentTarget
@@ -1180,7 +1180,7 @@ function ConsoleLogViewport({
         }}
       >
         <div
-          className={wrapLines ? "relative w-full" : "relative min-w-max"}
+          className={`[container-type:inline-size] ${wrapLines ? "relative w-full" : "relative min-w-max"}`}
           style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
         >
           {rowVirtualizer.getVirtualItems().map((virtualRow) => {
