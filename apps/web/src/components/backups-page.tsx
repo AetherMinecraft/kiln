@@ -22,7 +22,6 @@ import {
   HardDrive,
   History as RotateCcwClock,
   LoaderCircle,
-  ExternalLink,
   Link2,
   Pencil,
   Plus,
@@ -1334,17 +1333,14 @@ const BackupTableHead = React.memo(function BackupTableHead({
           />
         </span>
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-[26%] min-w-0">
-        Backup
+      <WorkspaceTableHeading className="w-[34%] min-w-0">
+        Name
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[28%] min-w-0 md:table-cell">
         Target
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[12rem] sm:table-cell">
         File
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[5.5rem] lg:table-cell">
-        Size
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[5.25rem] xl:table-cell">
         Created
@@ -1390,16 +1386,11 @@ const BackupTableRow = React.memo(function BackupTableRow({
       </WorkspaceTableCell>
       <WorkspaceTableCell className="h-auto py-2.5">
         <div className="min-w-0">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <div className="min-w-0 flex-1">
-              <BackupNameEditor
-                backupId={backup.id}
-                editable={canCreate}
-                name={backup.name}
-              />
-            </div>
-            <BackupModeBadge mode={backup.backupMode} />
-          </div>
+          <BackupNameEditor
+            backupId={backup.id}
+            editable={canCreate}
+            name={backup.name}
+          />
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
@@ -1421,16 +1412,11 @@ const BackupTableRow = React.memo(function BackupTableRow({
         {showsPrimaryTaskFeedback ? (
           <DesktopBackupTaskFeedback backup={backup} />
         ) : (
-          <span className="block truncate" title={displayFilename}>
-            {displayFilename}
-          </span>
-        )}
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground lg:table-cell">
-        {showsPrimaryTaskFeedback ? null : (
-          <span className="whitespace-nowrap">
-            {displayBytes === null ? "—" : formatBytes(displayBytes)}
-          </span>
+          <BackupFileDetails
+            bytes={displayBytes}
+            filename={displayFilename}
+            mode={backup.backupMode}
+          />
         )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground xl:table-cell">
@@ -1485,16 +1471,11 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
       <div className="flex min-w-0 items-start gap-2.5">
         <BackupSelectionCheckbox backup={backup} store={selectionStore} />
         <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <div className="min-w-0 flex-1">
-              <BackupNameEditor
-                backupId={backup.id}
-                editable={canCreate}
-                name={backup.name}
-              />
-            </div>
-            <BackupModeBadge mode={backup.backupMode} />
-          </div>
+          <BackupNameEditor
+            backupId={backup.id}
+            editable={canCreate}
+            name={backup.name}
+          />
         </div>
       </div>
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
@@ -1511,14 +1492,13 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
           <BackupTaskFeedback backup={backup} />
         </div>
       ) : (
-        <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 text-xs text-muted-foreground">
-          <span className="truncate" title={displayFilename}>
-            {displayFilename}
-          </span>
-          <span className="whitespace-nowrap">
-            {displayBytes === null ? "—" : formatBytes(displayBytes)} ·{" "}
-            <BackupCreatedTime createdAt={backup.createdAt} />
-          </span>
+        <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-end gap-x-3 text-xs text-muted-foreground">
+          <BackupFileDetails
+            bytes={displayBytes}
+            filename={displayFilename}
+            mode={backup.backupMode}
+          />
+          <BackupCreatedTime createdAt={backup.createdAt} />
         </div>
       )}
       <BackupAvailabilityTags
@@ -2076,7 +2056,7 @@ const BackupRowActions = React.memo(function BackupRowActions({
     </Button>
   )
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="flex items-center gap-1">
       {cancellable ? (
         <CancelBackupButton backup={backup} />
       ) : targetAvailable ? (
@@ -2091,20 +2071,22 @@ const BackupRowActions = React.memo(function BackupRowActions({
           </TooltipContent>
         </Tooltip>
       )}
-      <BackupActionButton
-        disabled={backup.status !== "available"}
-        icon={Download}
-        label={`Download ${backup.name}`}
-        tooltip="Download or create a link"
-        onClick={() => dialogStore.open({ backup, kind: "download" })}
-      />
-      <BackupActionButton
-        disabled={backupIsActive(backup)}
-        icon={Trash2}
-        label={`Delete ${backup.name}`}
-        tooltip="Delete backup"
-        onClick={() => dialogStore.open({ backup, kind: "delete" })}
-      />
+      <div className="flex items-center gap-0.5">
+        <BackupActionButton
+          disabled={backup.status !== "available"}
+          icon={Download}
+          label={`Download ${backup.name}`}
+          tooltip="Download or create a link"
+          onClick={() => dialogStore.open({ backup, kind: "download" })}
+        />
+        <BackupActionButton
+          disabled={backupIsActive(backup)}
+          icon={Trash2}
+          label={`Delete ${backup.name}`}
+          tooltip="Delete backup"
+          onClick={() => dialogStore.open({ backup, kind: "delete" })}
+        />
+      </div>
     </div>
   )
 })
@@ -2523,8 +2505,8 @@ const BackupTargetIcon = React.memo(function BackupTargetIcon({
   const Icon =
     kind === "database" ? Database : kind === "platform" ? RadioTower : Server
   return (
-    <span className="grid size-10 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
-      <Icon className="size-5" />
+    <span className="grid size-9 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
+      <Icon className="size-[1.125rem]" />
     </span>
   )
 })
@@ -2539,7 +2521,7 @@ function BackupTargetLayout({
   name: React.ReactNode
 }) {
   return (
-    <div className="-mx-3 -my-2.5 grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2.5 px-3 py-2.5">
+    <div className="-mx-3 -my-2.5 grid grid-cols-[auto_minmax(0,1fr)] grid-rows-[1.25rem_1.25rem] items-center gap-x-2.5 gap-y-0.5 px-3 py-2.5">
       <span className="row-span-2">{icon}</span>
       {name}
       {copyButton}
@@ -2607,10 +2589,7 @@ const BackupTargetLink = React.memo(function BackupTargetLink({
   targetKind: Backup["targetKind"]
 }) {
   const name = (
-    <span className="flex min-w-0 items-center gap-1.5 text-sm font-medium">
-      <span className="shrink-0 text-muted-foreground">
-        {target.kindLabel}:
-      </span>
+    <span className="flex min-w-0 items-center gap-1.5 text-sm">
       {available ? (
         <BackupTargetNameAnchor
           relayId={relayId}
@@ -2664,13 +2643,8 @@ const BackupTargetNameAnchor = React.memo(function BackupTargetNameAnchor({
   targetName: string
 }) {
   const className =
-    "inline-flex min-w-0 items-center gap-1.5 text-primary outline-none transition-colors hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring/40"
-  const label = (
-    <>
-      <span className="truncate">{targetName}</span>
-      <ExternalLink className="size-3.5 shrink-0 text-primary/75" />
-    </>
-  )
+    "inline-flex min-w-0 items-center text-primary outline-none transition-colors hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring/40"
+  const label = <span className="truncate">{targetName}</span>
 
   if (targetKind === "instance") {
     return (
@@ -4212,6 +4186,30 @@ const BackupModeBadge = React.memo(function BackupModeBadge({
     <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[0.625rem]">
       {mode === "incremental" ? "Incremental" : "Full"}
     </Badge>
+  )
+})
+
+const BackupFileDetails = React.memo(function BackupFileDetails({
+  bytes,
+  filename,
+  mode,
+}: {
+  bytes: number | null
+  filename: string
+  mode: Backup["backupMode"]
+}) {
+  return (
+    <div className="min-w-0">
+      <span className="block truncate" title={filename}>
+        {filename}
+      </span>
+      <div className="mt-0.5 flex items-center gap-1.5 text-xs">
+        <span className="whitespace-nowrap">
+          {bytes === null ? "—" : formatBytes(bytes)}
+        </span>
+        <BackupModeBadge mode={mode} />
+      </div>
+    </div>
   )
 })
 
