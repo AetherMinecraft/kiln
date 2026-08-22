@@ -72,7 +72,6 @@ import {
 
 import { ServerScopePicker } from "@/components/server-scope-picker"
 import type { ServerPickerOption } from "@/components/server-picker-list"
-import { timestampedBackupName } from "@/lib/backup-name"
 import {
   backupDisplayFilename,
   backupDisplayBytes,
@@ -128,6 +127,11 @@ import {
   setPreferredBackupStorage,
   type getBackupStorage,
 } from "@/server/backup-storage"
+import {
+  BackupConfigurationDialog,
+  type BackupConfiguration,
+  type BackupConfigurationTarget,
+} from "@/components/backup-configuration-dialog"
 import type { getManagedDatabaseDirectory } from "@/server/databases"
 import type { getRelaySnapshot } from "@/server/relay"
 
@@ -294,14 +298,7 @@ function createBackupDeleteFeedbackStore() {
   }
 }
 
-interface CreateTarget {
-  id: string
-  key: string
-  kind: "database" | "instance" | "platform"
-  name: string
-  relayId: string
-  relayName: string
-}
+type CreateTarget = BackupConfigurationTarget
 
 const activeStatuses = new Set(["queued", "running", "deleting"])
 const completedDeleteFeedbackMs = 1_000
@@ -3033,61 +3030,6 @@ function DownloadBackupDialog({
   )
 }
 
-function BackupDestinationChoice({
-  checked,
-  description,
-  icon: Icon,
-  label,
-  onCheckedChange,
-}: {
-  checked: boolean
-  description: string
-  icon: typeof Cloud
-  label: string
-  onCheckedChange: (checked: boolean) => void
-}) {
-  return (
-    <label
-      className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 transition-colors ${
-        checked
-          ? "border-primary/45 bg-primary/5"
-          : "border-border/80 hover:bg-muted/25"
-      }`}
-    >
-      <input
-        checked={checked}
-        className="sr-only"
-        type="checkbox"
-        onChange={(event) => onCheckedChange(event.currentTarget.checked)}
-      />
-      <span
-        className={`grid size-8 shrink-0 place-items-center rounded-md border ${
-          checked
-            ? "border-primary/30 bg-primary/10 text-primary"
-            : "text-muted-foreground"
-        }`}
-      >
-        <Icon className="size-4" />
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block text-xs font-semibold">{label}</span>
-        <span className="block truncate text-[0.625rem] text-muted-foreground">
-          {description}
-        </span>
-      </span>
-      <span
-        className={`grid size-4 place-items-center rounded-sm border ${
-          checked
-            ? "border-primary bg-primary text-primary-foreground"
-            : "border-input"
-        }`}
-      >
-        {checked ? <Check className="size-3" /> : null}
-      </span>
-    </label>
-  )
-}
-
 function CreateBackupDialog({
   initialTargetKey,
   onOpenChange,
@@ -3102,56 +3044,20 @@ function CreateBackupDialog({
   targets: Array<CreateTarget>
 }) {
   const queryClient = useQueryClient()
-  const [name, setName] = React.useState(() => timestampedBackupName("manual"))
-  const [targetKeyValue, setTargetKeyValue] = React.useState(
-    () =>
-      targets.find((target) => target.key === initialTargetKey)?.key ??
-      targets.at(0)?.key ??
-      ""
-  )
-  const [destinationKeys, setDestinationKeys] = React.useState<Array<string>>([
-    "default",
-  ])
-  const [mode, setMode] = React.useState<"full" | "incremental">("incremental")
-  const target = targets.find((candidate) => candidate.key === targetKeyValue)
-  const incremental = target?.kind === "instance" && mode === "incremental"
-  const availableStorage = React.useMemo(
-    () =>
-      storage.filter(
-        (destination) =>
-          destination.enabled &&
-          !destination.deleting &&
-          (target?.kind !== "platform" || destination.ownerUserId === null)
-      ),
-    [storage, target?.kind]
-  )
-  const destinationKeysInUse = React.useMemo(() => {
-    const allowed = new Set([
-      "default",
-      "local",
-      ...availableStorage.map((destination) => destination.id),
-    ])
-    const next = destinationKeys.filter((destination) =>
-      allowed.has(destination)
-    )
-    const usable = next.length > 0 ? next : ["default"]
-    return incremental ? [usable[0] ?? "default"] : usable
-  }, [availableStorage, destinationKeys, incremental])
-  const selectedDestinations = React.useMemo(
-    () => new Set(destinationKeysInUse),
-    [destinationKeysInUse]
-  )
   const create = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (configuration: BackupConfiguration) => {
+      const target = targets.find(
+        (candidate) => candidate.key === configuration.targetKey
+      )
       if (!target) throw new Error("Choose a backup target")
       const data = {
         maxBytes: null,
-        name: name.trim(),
+        name: configuration.name,
         relayId: target.relayId,
-        ...(selectedDestinations.has("default")
+        ...(configuration.destinationKeys.includes("default")
           ? {}
           : {
-              storageIds: destinationKeysInUse.map((destination) =>
+              storageIds: configuration.destinationKeys.map((destination) =>
                 destination === "local" ? null : destination
               ),
             }),
@@ -3161,7 +3067,7 @@ function CreateBackupDialog({
           data: {
             ...data,
             instanceId: target.id,
-            mode: incremental ? "incremental" : "full",
+            mode: configuration.mode,
           },
         })
       }
@@ -3172,178 +3078,31 @@ function CreateBackupDialog({
       }
       return createPlatformBackup({ data })
     },
-    onSuccess: async (result) => {
+    onSuccess: async (result, configuration) => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
       showToast({
         message: result.relayAccepted
-          ? `${name.trim()} queued`
-          : `${name.trim()} saved and will resume when Relay reconnects`,
+          ? `${configuration.name} queued`
+          : `${configuration.name} saved and will resume when Relay reconnects`,
         type: result.relayAccepted ? "success" : "warning",
       })
       onOpenChange(false)
     },
   })
 
-  const toggleDestination = (destination: string, checked: boolean) => {
-    setDestinationKeys((current) => {
-      if (incremental) {
-        if (!checked) return ["default"]
-        return [destination]
-      }
-      if (destination === "default") {
-        return checked ? ["default"] : ["local"]
-      }
-      const withoutDefault = current.filter((key) => key !== "default")
-      const next = checked
-        ? [...new Set([...withoutDefault, destination])]
-        : withoutDefault.filter((key) => key !== destination)
-      return next.length > 0 ? next : ["default"]
-    })
-  }
-
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-xl">
-        <DialogHeader>
-          <DialogTitle>Create backup</DialogTitle>
-          <DialogDescription>
-            Relay runs this job in its single durable queue. Servers remain
-            online while their data is archived.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-4">
-          <label className="block">
-            <span className="mb-2 block text-xs font-medium">Name</span>
-            <Input
-              autoFocus
-              aria-label="Backup name"
-              maxLength={120}
-              value={name}
-              onChange={(event) => setName(event.currentTarget.value)}
-            />
-          </label>
-          <label className="block">
-            <span className="mb-2 block text-xs font-medium">Target</span>
-            <Select
-              disabled={targets.length === 0}
-              value={targetKeyValue}
-              onValueChange={setTargetKeyValue}
-            >
-              <SelectTrigger
-                aria-label="Backup target"
-                className="h-8 w-full [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:text-left"
-              >
-                <SelectValue placeholder="No targets available" />
-              </SelectTrigger>
-              <SelectContent className="w-max max-w-[calc(100vw-2rem)] min-w-(--radix-select-trigger-width)">
-                {targets.map((option) => (
-                  <SelectItem key={option.key} value={option.key}>
-                    {targetKindLabel(option.kind)} · {option.name} ·{" "}
-                    {option.relayName}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </label>
-          {target?.kind === "instance" ? (
-            <fieldset>
-              <legend className="mb-2 text-xs font-medium">Mode</legend>
-              <div className="grid gap-2 sm:grid-cols-2">
-                <BackupDestinationChoice
-                  checked={mode === "incremental"}
-                  description="Deduplicated snapshots on this Relay or S3"
-                  icon={Archive}
-                  label="Incremental"
-                  onCheckedChange={(checked) => {
-                    if (checked) {
-                      setMode("incremental")
-                      setDestinationKeys((current) => [current[0] ?? "default"])
-                    }
-                  }}
-                />
-                <BackupDestinationChoice
-                  checked={mode === "full"}
-                  description="Portable zip archive"
-                  icon={HardDrive}
-                  label="Full archive"
-                  onCheckedChange={(checked) => {
-                    if (checked) setMode("full")
-                  }}
-                />
-              </div>
-            </fieldset>
-          ) : null}
-          <fieldset>
-            <legend className="mb-2 text-xs font-medium">Destinations</legend>
-            <div className="grid gap-2 sm:grid-cols-2">
-              <BackupDestinationChoice
-                checked={selectedDestinations.has("default")}
-                description="Use the target’s preferred destination"
-                icon={CloudCog}
-                label="Default"
-                onCheckedChange={(checked) =>
-                  toggleDestination("default", checked)
-                }
-              />
-              <BackupDestinationChoice
-                checked={selectedDestinations.has("local")}
-                description="Keep a copy on this Relay"
-                icon={HardDrive}
-                label="Local"
-                onCheckedChange={(checked) =>
-                  toggleDestination("local", checked)
-                }
-              />
-              {availableStorage.map((destination) => (
-                <BackupDestinationChoice
-                  key={destination.id}
-                  checked={selectedDestinations.has(destination.id)}
-                  description={destination.name}
-                  icon={Cloud}
-                  label="S3"
-                  onCheckedChange={(checked) =>
-                    toggleDestination(destination.id, checked)
-                  }
-                />
-              ))}
-            </div>
-            <span className="mt-1.5 block text-[0.625rem] text-muted-foreground">
-              {incremental
-                ? "Choose one destination. Incremental snapshots can stay on this Relay or use S3."
-                : target?.kind === "platform"
-                  ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
-                  : target?.kind === "instance"
-                    ? "Choose one or more copies. Default uses this server’s preferred destination."
-                    : "Choose one or more copies. Default uses Relay-local storage."}
-            </span>
-          </fieldset>
-          {create.error ? (
-            <p className="text-xs text-destructive">{create.error.message}</p>
-          ) : null}
-        </div>
-        <DialogFooter>
-          <Button
-            variant="ghost"
-            type="button"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            disabled={create.isPending || !name.trim() || !target}
-            type="button"
-            onClick={() => create.mutate()}
-          >
-            {create.isPending ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <Archive />
-            )}
-            Create backup
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <BackupConfigurationDialog
+      error={create.error?.message}
+      initialTargetKey={initialTargetKey}
+      onOpenChange={onOpenChange}
+      onSubmit={(configuration) => create.mutate(configuration)}
+      open={open}
+      pending={create.isPending}
+      storage={storage}
+      submitLabel={create.isPending ? "Creating backup…" : "Create backup"}
+      targets={targets}
+      title="Create backup"
+    />
   )
 }
 
@@ -4698,12 +4457,6 @@ function targetKey(
   targetId: string
 ): string {
   return `${kind}:${relayId}:${targetId}`
-}
-
-function targetKindLabel(kind: CreateTarget["kind"]): string {
-  if (kind === "database") return "Database"
-  if (kind === "platform") return "Platform"
-  return "Server"
 }
 
 function backupStatusFilterLabel(status: BackupFilters["status"]): string {

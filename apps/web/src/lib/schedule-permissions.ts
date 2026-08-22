@@ -1,5 +1,5 @@
 import {
-  scheduleActionSupportsTarget,
+  scheduleActionAppliesToTarget,
   type ScheduleAction,
   type ScheduleTarget,
 } from "@workspace/contracts"
@@ -66,7 +66,7 @@ export function scheduleAuthorizationFailure(input: {
       return `You do not have ${input.schedulePermission} permission for ${target.name}`
     }
     for (const action of input.actions) {
-      if (!scheduleActionSupportsTarget(action, target)) continue
+      if (!scheduleActionAppliesToTarget(action, target)) continue
       const permission = scheduleActionPermission(action, target)
       if (
         permission &&

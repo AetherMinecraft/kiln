@@ -8,7 +8,7 @@ import { z } from "zod"
 import {
   normalizeScheduleCron,
   relayScheduleOverviewSchema,
-  scheduleActionSupportsTarget,
+  scheduleActionAppliesToTarget,
   scheduleActionSchema,
   scheduleDefinitionSchema,
   scheduleInputSchema,
@@ -736,7 +736,7 @@ async function prepareRelayScheduleActions(
         return Effect.forEach(
           targets,
           (target) =>
-            !scheduleActionSupportsTarget(action, target)
+            !scheduleActionAppliesToTarget(action, target)
               ? Effect.succeed(null)
               : promiseEffect(async () => ({
                   destination:

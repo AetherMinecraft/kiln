@@ -12,6 +12,8 @@ import type {
 } from "@workspace/contracts"
 import {
   nextScheduleOccurrence,
+  resolveScheduleBackupName,
+  scheduleActionAppliesToTarget,
   scheduleActionSchema,
   scheduleActionSupportsTarget,
 } from "@workspace/contracts"
@@ -202,6 +204,34 @@ describe("Relay schedule persistence", () => {
     })
   })
 
+  it("does not run an action on targets disabled by its override", async () => {
+    const commands: Array<string> = []
+    const schedules = await manager({
+      findInstance: async () => ({}),
+      sendConsoleCommand: async (_instanceId, command) => {
+        commands.push(command)
+      },
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [{ ...projection.actions[0], targetKeys: [] }],
+    })
+
+    await schedules.runNow({
+      revision: projection.revision,
+      scheduleId: projection.id,
+    })
+
+    await vi.waitFor(() => {
+      expect(commands).toEqual([])
+      expect(schedules.overview([projection.id]).runs[0]?.status).toBe("noop")
+      expect(
+        schedules.overview([projection.id]).runs[0]?.targetRuns[0]?.attempts[0]
+          ?.status
+      ).toBe("skipped_policy")
+    })
+  })
+
   it("runs a deployed incremental backup with its prepared destination", async () => {
     const inputs: Array<BackupTaskInput> = []
     const schedules = await manager({
@@ -236,7 +266,7 @@ describe("Relay schedule persistence", () => {
           ],
           id: "6cc00681-a2cd-40c7-a036-7c9bd09b269b",
           mode: "incremental",
-          name: "Scheduled snapshot",
+          name: "scheduled-<schedule>-<timestamp>",
           type: "backup",
         },
       ],
@@ -253,7 +283,7 @@ describe("Relay schedule persistence", () => {
         artifactKind: "restic_snapshot",
         catalog: {
           name: expect.stringMatching(
-            /^scheduled-\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}Z$/u
+            /^scheduled-Daily greeting-\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}Z$/u
           ),
           storageId: "87949dc0-3b2a-4b57-999c-f9bfaf487880",
         },
@@ -347,5 +377,42 @@ describe("scheduled action target support", () => {
         { kind: "database" }
       )
     ).toBe(false)
+  })
+
+  it("honors explicit target overrides after compatibility checks", () => {
+    const target = projection.targets[0]
+    expect(
+      scheduleActionAppliesToTarget(
+        { targetKeys: [], type: "console_command" },
+        target
+      )
+    ).toBe(false)
+    expect(
+      scheduleActionAppliesToTarget(
+        {
+          targetKeys: [`${target.relayId}:${target.kind}:${target.id}`],
+          type: "console_command",
+        },
+        target
+      )
+    ).toBe(true)
+  })
+
+  it("expands scheduled backup name tags", () => {
+    expect(
+      resolveScheduleBackupName(
+        "scheduled-<schedule>-<timestamp>-<backup_id>-<instance_id>-<run_id>-<schedule_id>",
+        {
+          backupId: "backup-1",
+          instanceId: "instance-1",
+          runId: "run-1",
+          scheduleId: "schedule-1",
+          scheduleName: "Nightly",
+          timestamp: Date.parse("2026-01-02T03:04:05.000Z"),
+        }
+      )
+    ).toBe(
+      "scheduled-Nightly-2026.01.02-03.04.05Z-backup-1-instance-1-run-1-schedule-1"
+    )
   })
 })

@@ -7,7 +7,9 @@ import { z } from "zod"
 
 import {
   nextScheduleOccurrence,
+  resolveScheduleBackupName,
   relayScheduleProjectionSchema,
+  scheduleActionAppliesToTarget,
   scheduleActionSupportsTarget,
   scheduleDeterministicUuid,
   scheduleRunSchema,
@@ -532,6 +534,20 @@ export class ScheduleManager {
               )
               continue
             }
+            if (!scheduleActionAppliesToTarget(action, target)) {
+              attempts.push(
+                attempt({
+                  action,
+                  error: null,
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt: actionStartedAt,
+                  status: "skipped_policy",
+                  target,
+                })
+              )
+              continue
+            }
             const actionResult = await Effect.runPromise(
               Effect.result(
                 promiseEffect(() =>
@@ -658,6 +674,11 @@ export class ScheduleManager {
         target.id,
         action.id
       )
+      const runId = scheduleStableId(
+        schedule.id,
+        scheduledAt,
+        this.#options.relayId
+      )
       const taskId = scheduleDeterministicUuid("task", backupId)
       const artifactId = scheduleDeterministicUuid("artifact", backupId)
       const targetKind = target.kind === "relay" ? "platform" : target.kind
@@ -672,7 +693,14 @@ export class ScheduleManager {
                 : "platform_bundle",
         backupId,
         catalog: {
-          name: scheduledBackupName(scheduledAt),
+          name: resolveScheduleBackupName(action.name, {
+            backupId,
+            instanceId: target.kind === "instance" ? target.id : "",
+            runId,
+            scheduleId: schedule.id,
+            scheduleName: schedule.name,
+            timestamp: scheduledAt,
+          }),
           storageId:
             action.destination.kind === "storage"
               ? action.destination.storageId
@@ -766,11 +794,6 @@ export class ScheduleManager {
   }
 }
 
-function scheduledBackupName(scheduledAt: number) {
-  const timestamp = new Date(scheduledAt).toISOString()
-  return `scheduled-${timestamp.slice(0, 10).replaceAll("-", ".")}-${timestamp.slice(11, 19).replaceAll(":", ".")}Z`
-}
-
 function deployment(
   scheduleId: string,
   acknowledgedRevision: number,
@@ -789,6 +812,7 @@ function attempt(input: {
     | "failed"
     | "not_run"
     | "skipped_missing"
+    | "skipped_policy"
     | "skipped_unsupported"
     | "succeeded"
   target: ScheduleTarget
