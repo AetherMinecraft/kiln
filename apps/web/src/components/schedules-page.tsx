@@ -97,6 +97,7 @@ import {
   serverPickerOptionKey,
   type ServerPickerOption,
 } from "@/components/server-picker-list"
+import { BackupIcon } from "@/components/backup-icon"
 import { useScheduleScope } from "@/components/schedule-scope"
 import { forkPromise } from "@/effect/promise"
 import {
@@ -1765,6 +1766,11 @@ const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
         <Field label="Name">
           <Input
             aria-label="Schedule name"
+            autoComplete="off"
+            data-1p-ignore
+            data-bwignore
+            data-lpignore="true"
+            name="schedule-name"
             value={name}
             maxLength={120}
             placeholder="Daily server backup"
@@ -2133,7 +2139,7 @@ const ActionEditor = React.memo(function ActionEditor({
       }}
       onDrop={(event) => event.preventDefault()}
     >
-      <div className="grid h-full grid-cols-[2rem_minmax(0,0.85fr)_minmax(0,1.15fr)_auto] items-center gap-2">
+      <div className="grid h-full grid-cols-[2rem_9rem_minmax(0,1fr)_auto] items-center gap-2">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -2176,18 +2182,46 @@ const ActionEditor = React.memo(function ActionEditor({
               aria-label={`Action ${index + 1} type`}
               className="h-8 min-w-0 flex-1 justify-start text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:text-left"
             >
-              {action.type === null ? null : (
-                <ActionIcon
-                  type={action.type}
-                  className="size-4 shrink-0 text-primary"
-                />
+              {action.type === null ? (
+                <SelectValue placeholder="Select action type" />
+              ) : (
+                <>
+                  <ActionIcon
+                    type={action.type}
+                    className="size-4 shrink-0 text-primary"
+                  />
+                  <SelectValue>{actionLabel(action.type)}</SelectValue>
+                </>
               )}
-              <SelectValue placeholder="Select action type" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="console_command">Run command</SelectItem>
-              <SelectItem value="backup">Create backup</SelectItem>
-              <SelectItem value="power">Power action</SelectItem>
+              <SelectItem value="console_command">
+                <span className="flex items-center gap-2">
+                  <ActionIcon
+                    type="console_command"
+                    className="size-4 text-muted-foreground"
+                  />
+                  Command
+                </span>
+              </SelectItem>
+              <SelectItem value="backup">
+                <span className="flex items-center gap-2">
+                  <ActionIcon
+                    type="backup"
+                    className="size-4 text-muted-foreground"
+                  />
+                  Backup
+                </span>
+              </SelectItem>
+              <SelectItem value="power">
+                <span className="flex items-center gap-2">
+                  <ActionIcon
+                    type="power"
+                    className="size-4 text-muted-foreground"
+                  />
+                  Power
+                </span>
+              </SelectItem>
             </SelectContent>
           </Select>
           <ActionCompatibilityWarning
@@ -2624,18 +2658,14 @@ function ActionIcon({
   className?: string
 }) {
   const Icon =
-    type === "console_command"
-      ? Code2
-      : type === "backup"
-        ? HardDriveDownload
-        : Power
+    type === "console_command" ? Code2 : type === "backup" ? BackupIcon : Power
   return <Icon className={className} aria-hidden="true" />
 }
 
 function actionLabel(type: ScheduleAction["type"]) {
-  if (type === "console_command") return "Console command"
-  if (type === "backup") return "Trigger backup"
-  return "Power action"
+  if (type === "console_command") return "Command"
+  if (type === "backup") return "Backup"
+  return "Power"
 }
 
 function actionAuditSummary(
