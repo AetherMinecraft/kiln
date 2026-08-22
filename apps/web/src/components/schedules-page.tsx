@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query"
 import {
   ArrowDown,
+  ArrowLeftRight,
   ArrowUp,
   Check,
   ChevronDown,
@@ -1604,7 +1605,7 @@ function ScheduleEditorDialog({
             onTargetToggle={toggleTarget}
           />
 
-          <DialogFooter className="flex-row flex-nowrap items-center">
+          <DialogFooter className="sticky bottom-0 z-10 -mx-5 -mb-5 flex-row flex-nowrap items-center border-t border-border/60 bg-[color-mix(in_oklab,var(--surface-overlay)_92%,transparent)] px-5 py-3 backdrop-blur-xl">
             <Button
               aria-label={`Schedule is ${enabled ? "enabled" : "disabled"}. Click to ${enabled ? "disable" : "enable"}.`}
               aria-pressed={enabled}
@@ -2173,7 +2174,7 @@ const ActionEditor = React.memo(function ActionEditor({
   return (
     <div
       data-schedule-action-row
-      className={`h-16 rounded-lg border bg-background/45 p-2 transition-[border-color,opacity] ${dragging ? "border-primary/40 opacity-55" : ""}`}
+      className={`h-12 rounded-lg border bg-background/45 p-1 transition-[border-color,opacity] sm:h-16 sm:p-2 ${dragging ? "border-primary/40 opacity-55" : ""}`}
       onDragOver={(event) => {
         event.preventDefault()
         onDragOver(action.id)
@@ -2185,7 +2186,7 @@ const ActionEditor = React.memo(function ActionEditor({
           <TooltipTrigger asChild>
             <button
               aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
-              className="-my-2 grid h-[calc(100%+1rem)] w-8 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing"
+              className="-my-1 grid h-[calc(100%+0.5rem)] w-8 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing sm:-my-2 sm:h-[calc(100%+1rem)]"
               draggable
               type="button"
               onDragEnd={onDragEnd}
@@ -2270,7 +2271,7 @@ const ActionEditor = React.memo(function ActionEditor({
             unsupportedTargets={unsupportedTargets}
           />
         </div>
-        <div className="flex min-w-0 items-center gap-1.5">
+        <div className="flex w-fit max-w-full min-w-0 items-center gap-1.5 justify-self-start">
           {action.type === "console_command" ? (
             <CommandEditorField
               value={action.command}
@@ -2279,13 +2280,13 @@ const ActionEditor = React.memo(function ActionEditor({
           ) : action.type === "backup" ? (
             <Button
               aria-label="Configure Backup"
-              className="min-w-0 flex-1 justify-start truncate"
+              className="w-fit max-w-full min-w-0 justify-start truncate"
               type="button"
               title={action.name}
               variant="outline"
               onClick={() => setBackupConfigOpen(true)}
             >
-              <BackupIcon className="size-3.5 shrink-0" />
+              <ArrowLeftRight className="size-3.5 shrink-0" />
               <span className="truncate">Configure Backup</span>
             </Button>
           ) : action.type === "power" ? (
@@ -2565,13 +2566,13 @@ const CommandEditorField = React.memo(function CommandEditorField({
     <>
       <Button
         aria-label="Configure Command"
-        className="min-w-0 flex-1 justify-start truncate font-mono text-xs"
+        className="w-fit max-w-full min-w-0 justify-start truncate font-mono text-xs"
         type="button"
         title={value || "Configure Command"}
         variant="outline"
         onClick={openEditor}
       >
-        <Pencil className="size-3.5 shrink-0" />
+        <ArrowLeftRight className="size-3.5 shrink-0" />
         <span className="truncate">Configure Command</span>
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
