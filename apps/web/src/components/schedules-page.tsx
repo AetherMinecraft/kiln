@@ -77,6 +77,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@workspace/ui/components/select"
+import { Separator } from "@workspace/ui/components/separator"
 import { showToast } from "@workspace/ui/components/sonner"
 import { Textarea } from "@workspace/ui/components/textarea"
 import {
@@ -2219,7 +2220,7 @@ const ActionEditor = React.memo(function ActionEditor({
           </TooltipTrigger>
           <TooltipContent side="left">Drag to reorder</TooltipContent>
         </Tooltip>
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 items-center">
           <Select
             value={action.type ?? ""}
             onValueChange={(value) =>
@@ -2274,10 +2275,6 @@ const ActionEditor = React.memo(function ActionEditor({
               </SelectItem>
             </SelectContent>
           </Select>
-          <ActionCompatibilityWarning
-            restrictedTargets={restrictedTargets}
-            unsupportedTargets={unsupportedTargets}
-          />
         </div>
         <div className="flex w-fit max-w-full min-w-0 items-center gap-1.5 justify-self-start">
           {action.type === "console_command" ? (
@@ -2320,18 +2317,28 @@ const ActionEditor = React.memo(function ActionEditor({
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
           {action.type !== null ? (
-            <ScheduleActionTargetsButton
-              action={action}
-              eligibleTargets={eligibleTargets}
-              targets={selectedOptions}
-              selectedTargets={selectedActionTargets}
-              onToggle={(targetKeyValue, checked) => {
-                const next = new Set(actionTargetKeys)
-                if (checked) next.add(targetKeyValue)
-                else next.delete(targetKeyValue)
-                onChange({ ...action, targetKeys: [...next] })
-              }}
-            />
+            <>
+              <ActionCompatibilityWarning
+                restrictedTargets={restrictedTargets}
+                unsupportedTargets={unsupportedTargets}
+              />
+              <ScheduleActionTargetsButton
+                action={action}
+                eligibleTargets={eligibleTargets}
+                targets={selectedOptions}
+                selectedTargets={selectedActionTargets}
+                onToggle={(targetKeyValue, checked) => {
+                  const next = new Set(actionTargetKeys)
+                  if (checked) next.add(targetKeyValue)
+                  else next.delete(targetKeyValue)
+                  onChange({ ...action, targetKeys: [...next] })
+                }}
+              />
+              <Separator
+                className="mx-1 data-vertical:h-4 data-vertical:self-center"
+                orientation="vertical"
+              />
+            </>
           ) : null}
           <ActionRowButton
             disabled={total === 1 || index === total - 1}
