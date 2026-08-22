@@ -210,6 +210,7 @@ export const scheduleDefinitionSchema = scheduleInputSchema
       })
     }
     for (const [actionIndex, action] of schedule.actions.entries()) {
+      if (action.type === "wait") continue
       if (action.targetKeys === undefined) continue
       const seenTargetKeys = new Set<string>()
       for (const targetKey of action.targetKeys) {
@@ -314,6 +315,8 @@ export const scheduleActionAttemptSchema = z
   })
   .strict()
 
+export type ScheduleActionAttempt = z.infer<typeof scheduleActionAttemptSchema>
+
 export const scheduleTargetRunSchema = z
   .object({
     attempts: z.array(scheduleActionAttemptSchema).max(32),
@@ -333,6 +336,7 @@ export const scheduleRunSchema = z
     revision: z.number().int().positive(),
     scheduleId: z.uuid(),
     scheduledAt: z.number().int().nonnegative(),
+    sequenceAttempts: z.array(scheduleActionAttemptSchema).max(32).default([]),
     startedAt: z.number().int().nonnegative(),
     status: scheduleRunStatusSchema,
     targetRuns: z.array(scheduleTargetRunSchema).max(2_000),

@@ -235,7 +235,12 @@ describe("Relay schedule persistence", () => {
       scheduleId: projection.id,
     })
 
-    await vi.waitFor(() => expect(commands).toHaveLength(2))
+    await vi.waitFor(() => {
+      expect(commands).toHaveLength(2)
+      expect(schedules.overview([projection.id]).runs[0]?.status).toBe(
+        "succeeded"
+      )
+    })
     expect(commands.map(({ command }) => command)).toEqual([
       "say hello",
       "say after wait",
@@ -243,6 +248,77 @@ describe("Relay schedule persistence", () => {
     expect(
       (commands[1]?.timestamp ?? 0) - (commands[0]?.timestamp ?? 0)
     ).toBeGreaterThanOrEqual(15)
+    const run = schedules.overview([projection.id]).runs[0]
+    expect(run?.sequenceAttempts).toMatchObject([
+      { actionType: "wait", status: "succeeded" },
+    ])
+    expect(
+      run?.targetRuns[0]?.attempts.map((attempt) => attempt.actionType)
+    ).toEqual(["console_command", "console_command"])
+  })
+
+  it("finishes each action phase across targets before waiting", async () => {
+    const commands: Array<{ command: string; instanceId: string }> = []
+    const schedules = await manager({
+      findInstance: async () => ({}),
+      sendConsoleCommand: async (instanceId, command) => {
+        commands.push({ command, instanceId })
+      },
+    })
+    const targets = Array.from({ length: 9 }, (_, index) => ({
+      id: `server-${index + 1}`,
+      kind: "instance" as const,
+      name: `Server ${index + 1}`,
+      relayId: "relay-a",
+    }))
+    await schedules.apply({
+      ...projection,
+      actions: [
+        projection.actions[0],
+        {
+          duration: 20,
+          id: "1e68e6ac-7381-494d-82bb-d50c4a63f575",
+          type: "wait",
+          unit: "milliseconds",
+        },
+        {
+          command: "say after wait",
+          id: "3c99d222-3d12-4fb6-a5f7-9d18078d7e90",
+          type: "console_command",
+        },
+      ],
+      targets,
+    })
+
+    await schedules.runNow({
+      revision: projection.revision,
+      scheduleId: projection.id,
+    })
+
+    await vi.waitFor(() => {
+      expect(commands).toHaveLength(18)
+      expect(schedules.overview([projection.id]).runs[0]?.status).toBe(
+        "succeeded"
+      )
+    })
+    expect(commands.slice(0, 9).map(({ command }) => command)).toEqual(
+      Array(9).fill("say hello")
+    )
+    expect(commands.slice(9).map(({ command }) => command)).toEqual(
+      Array(9).fill("say after wait")
+    )
+    const run = schedules.overview([projection.id]).runs[0]
+    expect(run?.sequenceAttempts).toHaveLength(1)
+    expect(run?.targetRuns).toHaveLength(9)
+    expect(
+      run?.targetRuns.every(
+        (targetRun) =>
+          targetRun.attempts.length === 2 &&
+          targetRun.attempts.every(
+            (attempt) => attempt.actionType === "console_command"
+          )
+      )
+    ).toBe(true)
   })
 
   it("does not run an action on targets disabled by its override", async () => {
@@ -255,7 +331,14 @@ describe("Relay schedule persistence", () => {
     })
     await schedules.apply({
       ...projection,
-      actions: [{ ...projection.actions[0], targetKeys: [] }],
+      actions: [
+        {
+          command: "say hello",
+          id: "8ff172c1-dc22-45fa-8457-b899ca25a8f8",
+          targetKeys: [],
+          type: "console_command",
+        },
+      ],
     })
 
     await schedules.runNow({

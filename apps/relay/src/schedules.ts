@@ -19,13 +19,14 @@ import {
   type RelayScheduleDeployment,
   type RelayScheduleAction,
   type RelayScheduleProjection,
+  type ScheduleActionAttempt,
   type ScheduleActionType,
   type ScheduleRun,
   type ScheduleTarget,
 } from "@workspace/contracts"
 
 import { writeFileAtomic } from "./effect/atomic-file.js"
-import { promiseEffect } from "./effect/promise.js"
+import { ensuringPromise, promiseEffect } from "./effect/promise.js"
 
 const persistedScheduleSchema = relayScheduleProjectionSchema.safeExtend({
   nextRunAt: z.number().int().nonnegative().nullable(),
@@ -43,6 +44,17 @@ const persistedStateSchema = z
 
 type PersistedSchedule = z.infer<typeof persistedScheduleSchema>
 type PersistedState = z.infer<typeof persistedStateSchema>
+type TargetScheduleAction = Exclude<RelayScheduleAction, { type: "wait" }>
+
+interface TargetExecutionState {
+  readonly activeKey: string | null
+  readonly attempts: Array<ScheduleActionAttempt>
+  error: string | null
+  failure: string | null
+  missing: boolean
+  readonly startedAt: number
+  readonly target: ScheduleTarget
+}
 
 const heartbeatPersistenceIntervalMs = 5_000
 const maxRetainedRuns = 1_000
@@ -424,19 +436,145 @@ export class ScheduleManager {
     signal?: AbortSignal
   ) {
     const startedAt = Date.now()
-    const targetRuns = await Effect.runPromise(
-      Effect.forEach(
-        schedule.targets,
-        (target) =>
-          Effect.tryPromise({
-            try: (targetSignal) =>
-              this.#executeTarget(schedule, target, scheduledAt, targetSignal),
-            catch: (cause) => cause,
-          }),
-        { concurrency: targetExecutionConcurrency }
-      ),
-      signal ? { signal } : undefined
+    const targetStates = schedule.targets.map(
+      (target): TargetExecutionState => {
+        const activeKey = `${target.kind}:${target.id}`
+        const overlapping = this.#activeTargets.has(activeKey)
+        if (!overlapping) this.#activeTargets.add(activeKey)
+        return {
+          activeKey: overlapping ? null : activeKey,
+          attempts: [],
+          error: null,
+          failure: null,
+          missing: false,
+          startedAt: Date.now(),
+          target,
+        }
+      }
     )
+    const sequenceAttempts: Array<ScheduleActionAttempt> = []
+    let sequenceFailure: string | null = null
+    const targetRuns = await ensuringPromise(
+      async () => {
+        await Effect.runPromise(
+          Effect.forEach(
+            targetStates,
+            (state) =>
+              state.activeKey === null
+                ? Effect.void
+                : Effect.result(
+                    promiseEffect(() => this.#targetExists(state.target))
+                  ).pipe(
+                    Effect.map((exists) => {
+                      if (Result.isFailure(exists)) {
+                        state.failure = errorMessage(exists.failure)
+                        state.error = state.failure
+                      } else if (!exists.success) {
+                        state.missing = true
+                        state.error = "Target no longer exists"
+                      }
+                    })
+                  ),
+            { concurrency: targetExecutionConcurrency }
+          ),
+          signal ? { signal } : undefined
+        )
+
+        // Actions execute as ordered phases. A wait pauses the sequence once;
+        // target work is still bounded by the normal concurrency limit.
+        for (const action of schedule.actions) {
+          if (action.type === "wait") {
+            const actionStartedAt = Date.now()
+            if (sequenceFailure) {
+              sequenceAttempts.push(
+                sequenceAttempt({
+                  action,
+                  error: "A previous sequence action failed",
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt: actionStartedAt,
+                  status: "not_run",
+                })
+              )
+              continue
+            }
+            const waitResult = await Effect.runPromise(
+              Effect.result(
+                promiseEffect(() =>
+                  waitForDuration(
+                    waitDurationMs(action.duration, action.unit),
+                    signal
+                  )
+                )
+              )
+            )
+            if (Result.isSuccess(waitResult)) {
+              sequenceAttempts.push(
+                sequenceAttempt({
+                  action,
+                  error: null,
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt: actionStartedAt,
+                  status: "succeeded",
+                })
+              )
+            } else {
+              sequenceFailure = errorMessage(waitResult.failure)
+              sequenceAttempts.push(
+                sequenceAttempt({
+                  action,
+                  error: sequenceFailure,
+                  scheduledAt,
+                  scheduleId: schedule.id,
+                  startedAt: actionStartedAt,
+                  status: "failed",
+                })
+              )
+            }
+            continue
+          }
+
+          await Effect.runPromise(
+            Effect.forEach(
+              targetStates,
+              (state) =>
+                promiseEffect(() =>
+                  this.#executeTargetAction(
+                    schedule,
+                    action,
+                    state,
+                    scheduledAt,
+                    sequenceFailure,
+                    signal
+                  )
+                ),
+              { concurrency: targetExecutionConcurrency }
+            ),
+            signal ? { signal } : undefined
+          )
+        }
+        return targetStates.map((state) =>
+          targetRun(schedule.id, scheduledAt, state)
+        )
+      },
+      () => {
+        // Reservation spans waits so another occurrence cannot interleave with
+        // an ordered Stop -> Wait -> Start sequence.
+        for (const state of targetStates) {
+          if (state.activeKey !== null) {
+            this.#activeTargets.delete(state.activeKey)
+          }
+        }
+      }
+    )
+    const sequenceStatus = sequenceAttempts.some(
+      (entry) => entry.status === "failed" || entry.status === "interrupted"
+    )
+      ? ("failed" as const)
+      : sequenceAttempts.some((entry) => entry.status === "succeeded")
+        ? ("succeeded" as const)
+        : ("noop" as const)
     const run = scheduleRunSchema.parse({
       finishedAt: Date.now(),
       id: scheduleStableId(schedule.id, scheduledAt, this.#options.relayId),
@@ -444,7 +582,11 @@ export class ScheduleManager {
       scheduleId: schedule.id,
       scheduledAt,
       startedAt,
-      status: aggregateRunStatus(targetRuns.map((target) => target.status)),
+      sequenceAttempts,
+      status: aggregateRunStatus([
+        ...targetRuns.map((target) => target.status),
+        ...(sequenceAttempts.length > 0 ? [sequenceStatus] : []),
+      ]),
       targetRuns,
     })
     await this.#serialized(async () => {
@@ -453,172 +595,114 @@ export class ScheduleManager {
     })
   }
 
-  async #executeTarget(
+  async #executeTargetAction(
     schedule: RelayScheduleProjection,
-    target: ScheduleTarget,
+    action: TargetScheduleAction,
+    state: TargetExecutionState,
     scheduledAt: number,
+    sequenceFailure: string | null,
     signal?: AbortSignal
   ) {
-    const id = scheduleStableId(
-      schedule.id,
-      scheduledAt,
-      target.kind,
-      target.id
-    )
-    const startedAt = Date.now()
-    const activeKey = `${target.kind}:${target.id}`
-    if (this.#activeTargets.has(activeKey)) {
-      return {
-        attempts: [],
-        error: null,
-        finishedAt: Date.now(),
-        id,
-        startedAt,
-        status: "skipped_overlap" as const,
-        target,
-      }
-    }
-    this.#activeTargets.add(activeKey)
-    const executed = await Effect.runPromise(
-      Effect.result(
-        promiseEffect(async () => {
-          if (!(await this.#targetExists(target))) {
-            return {
-              attempts: schedule.actions.map((action) =>
-                attempt({
-                  action,
-                  error: "Target no longer exists",
-                  scheduledAt,
-                  scheduleId: schedule.id,
-                  startedAt,
-                  status: "skipped_missing",
-                  target,
-                })
-              ),
-              error: "Target no longer exists",
-              finishedAt: Date.now(),
-              id,
-              startedAt,
-              status: "noop" as const,
-              target,
-            }
-          }
-          const attempts = []
-          let failure: string | null = null
-          for (const action of schedule.actions) {
-            const actionStartedAt = Date.now()
-            if (failure) {
-              attempts.push(
-                attempt({
-                  action,
-                  error: "A previous action failed",
-                  scheduledAt,
-                  scheduleId: schedule.id,
-                  startedAt: actionStartedAt,
-                  status: "not_run",
-                  target,
-                })
-              )
-              continue
-            }
-            if (!scheduleActionSupportsTarget(action, target)) {
-              attempts.push(
-                attempt({
-                  action,
-                  error: null,
-                  scheduledAt,
-                  scheduleId: schedule.id,
-                  startedAt: actionStartedAt,
-                  status: "skipped_unsupported",
-                  target,
-                })
-              )
-              continue
-            }
-            if (!scheduleActionAppliesToTarget(action, target)) {
-              attempts.push(
-                attempt({
-                  action,
-                  error: null,
-                  scheduledAt,
-                  scheduleId: schedule.id,
-                  startedAt: actionStartedAt,
-                  status: "skipped_policy",
-                  target,
-                })
-              )
-              continue
-            }
-            const actionResult = await Effect.runPromise(
-              Effect.result(
-                promiseEffect(() =>
-                  this.#executeAction(
-                    schedule,
-                    action,
-                    target,
-                    scheduledAt,
-                    signal
-                  )
-                )
-              )
-            )
-            if (Result.isSuccess(actionResult)) {
-              attempts.push(
-                attempt({
-                  action,
-                  error: null,
-                  scheduledAt,
-                  scheduleId: schedule.id,
-                  startedAt: actionStartedAt,
-                  status: "succeeded",
-                  target,
-                })
-              )
-            } else {
-              failure = errorMessage(actionResult.failure)
-              attempts.push(
-                attempt({
-                  action,
-                  error: failure,
-                  scheduledAt,
-                  scheduleId: schedule.id,
-                  startedAt: actionStartedAt,
-                  status: "failed",
-                  target,
-                })
-              )
-            }
-          }
-          const succeeded = attempts.some(
-            (entry) => entry.status === "succeeded"
-          )
-          return {
-            attempts,
-            error: failure,
-            finishedAt: Date.now(),
-            id,
-            startedAt,
-            status: failure
-              ? ("failed" as const)
-              : succeeded
-                ? ("succeeded" as const)
-                : ("noop" as const),
-            target,
-          }
+    if (state.activeKey === null) return
+    const actionStartedAt = Date.now()
+    if (sequenceFailure) {
+      state.attempts.push(
+        attempt({
+          action,
+          error: "A previous sequence action failed",
+          scheduledAt,
+          scheduleId: schedule.id,
+          startedAt: actionStartedAt,
+          status: "not_run",
+          target: state.target,
         })
       )
-    )
-    this.#activeTargets.delete(activeKey)
-    if (Result.isSuccess(executed)) return executed.success
-    return {
-      attempts: [],
-      error: errorMessage(executed.failure),
-      finishedAt: Date.now(),
-      id,
-      startedAt,
-      status: "failed" as const,
-      target,
+      return
     }
+    if (state.failure) {
+      state.attempts.push(
+        attempt({
+          action,
+          error: "A previous action failed",
+          scheduledAt,
+          scheduleId: schedule.id,
+          startedAt: actionStartedAt,
+          status: "not_run",
+          target: state.target,
+        })
+      )
+      return
+    }
+    if (state.missing) {
+      state.attempts.push(
+        attempt({
+          action,
+          error: "Target no longer exists",
+          scheduledAt,
+          scheduleId: schedule.id,
+          startedAt: actionStartedAt,
+          status: "skipped_missing",
+          target: state.target,
+        })
+      )
+      return
+    }
+    if (!scheduleActionSupportsTarget(action, state.target)) {
+      state.attempts.push(
+        attempt({
+          action,
+          error: null,
+          scheduledAt,
+          scheduleId: schedule.id,
+          startedAt: actionStartedAt,
+          status: "skipped_unsupported",
+          target: state.target,
+        })
+      )
+      return
+    }
+    if (!scheduleActionAppliesToTarget(action, state.target)) {
+      state.attempts.push(
+        attempt({
+          action,
+          error: null,
+          scheduledAt,
+          scheduleId: schedule.id,
+          startedAt: actionStartedAt,
+          status: "skipped_policy",
+          target: state.target,
+        })
+      )
+      return
+    }
+    const executed = await Effect.runPromise(
+      Effect.result(
+        promiseEffect(() =>
+          this.#executeAction(
+            schedule,
+            action,
+            state.target,
+            scheduledAt,
+            signal
+          )
+        )
+      )
+    )
+    if (Result.isFailure(executed)) {
+      state.failure = errorMessage(executed.failure)
+      state.error = state.failure
+    }
+    state.attempts.push(
+      attempt({
+        action,
+        error: state.failure,
+        scheduledAt,
+        scheduleId: schedule.id,
+        startedAt: actionStartedAt,
+        status: state.failure ? "failed" : "succeeded",
+        target: state.target,
+      })
+    )
   }
 
   async #targetExists(target: ScheduleTarget) {
@@ -631,18 +715,11 @@ export class ScheduleManager {
 
   async #executeAction(
     schedule: RelayScheduleProjection,
-    action: RelayScheduleAction,
+    action: TargetScheduleAction,
     target: ScheduleTarget,
     scheduledAt: number,
     signal?: AbortSignal
   ) {
-    if (action.type === "wait") {
-      await waitForDuration(
-        waitDurationMs(action.duration, action.unit),
-        signal
-      )
-      return
-    }
     if (action.type === "console_command" && target.kind === "instance") {
       await this.#options.sendConsoleCommand(target.id, action.command)
       return
@@ -868,6 +945,65 @@ function attempt(input: {
     ),
     startedAt: input.startedAt,
     status: input.status,
+  }
+}
+
+function sequenceAttempt(input: {
+  action: Pick<RelayScheduleAction, "id" | "type">
+  error: string | null
+  scheduledAt: number
+  scheduleId: string
+  startedAt: number
+  status:
+    | "failed"
+    | "not_run"
+    | "skipped_missing"
+    | "skipped_policy"
+    | "skipped_unsupported"
+    | "succeeded"
+}): ScheduleActionAttempt {
+  return {
+    actionId: input.action.id,
+    actionType: input.action.type,
+    error: input.error,
+    finishedAt: Date.now(),
+    id: scheduleStableId(
+      input.scheduleId,
+      input.scheduledAt,
+      "sequence",
+      input.action.id
+    ),
+    startedAt: input.startedAt,
+    status: input.status,
+  }
+}
+
+function targetRun(
+  scheduleId: string,
+  scheduledAt: number,
+  state: TargetExecutionState
+): ScheduleRun["targetRuns"][number] {
+  const succeeded = state.attempts.some((entry) => entry.status === "succeeded")
+  return {
+    attempts: state.attempts,
+    error: state.error,
+    finishedAt: Date.now(),
+    id: scheduleStableId(
+      scheduleId,
+      scheduledAt,
+      state.target.kind,
+      state.target.id
+    ),
+    startedAt: state.startedAt,
+    status:
+      state.activeKey === null
+        ? "skipped_overlap"
+        : state.failure
+          ? "failed"
+          : succeeded
+            ? "succeeded"
+            : "noop",
+    target: state.target,
   }
 }
 

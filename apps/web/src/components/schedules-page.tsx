@@ -767,7 +767,10 @@ function ScheduleLastRun({
 }
 
 function latestRunResult(run: ScheduleRunWithRelay) {
-  const attempts = run.targetRuns.flatMap((targetRun) => targetRun.attempts)
+  const attempts = [
+    ...run.sequenceAttempts,
+    ...run.targetRuns.flatMap((targetRun) => targetRun.attempts),
+  ]
   const passed = attempts.filter((attempt) => attempt.status === "succeeded")
   const failed = attempts.filter((attempt) =>
     ["failed", "interrupted", "not_run"].includes(attempt.status)
@@ -1225,6 +1228,34 @@ const ScheduleRunDialog = React.memo(function ScheduleRunDialog({
                 </dl>
               </section>
 
+              {run.sequenceAttempts.length > 0 ? (
+                <section className="border-b px-5 py-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <h3 className="text-xs font-semibold">
+                        Sequence activity
+                      </h3>
+                      <p className="mt-0.5 text-[0.625rem] text-muted-foreground">
+                        Waits pause the sequence once between target actions.
+                      </p>
+                    </div>
+                    <Badge
+                      variant="outline"
+                      className="font-mono text-[0.5625rem]"
+                    >
+                      {run.sequenceAttempts.length} attempts
+                    </Badge>
+                  </div>
+                  <div className="mt-4 overflow-hidden rounded-lg border bg-background/35">
+                    <ActionAttemptAudit
+                      actionsById={actionsById}
+                      attempts={run.sequenceAttempts}
+                      timezone={run.timezone}
+                    />
+                  </div>
+                </section>
+              ) : null}
+
               <section className="px-5 py-4">
                 <div className="flex items-center justify-between gap-4">
                   <div>
@@ -1360,44 +1391,62 @@ function TargetRunAudit({
           No actions were attempted.
         </p>
       ) : (
-        <ol className="divide-y divide-border/70">
-          {run.attempts.map((attempt, index) => {
-            const action = actionsById.get(attempt.actionId)
-            return (
-              <li key={attempt.id} className="flex gap-3 px-3 py-3">
-                <span className="relative mt-0.5 grid size-5 shrink-0 place-items-center rounded-full border bg-background font-mono text-[0.5rem] text-muted-foreground">
-                  {index + 1}
-                </span>
-                <ActionIcon
-                  type={attempt.actionType}
-                  className="mt-1 size-3.5 shrink-0 text-primary"
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <p className="text-[0.6875rem] font-semibold">
-                      {actionLabel(attempt.actionType)}
-                    </p>
-                    <AttemptStatus status={attempt.status} />
-                  </div>
-                  <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
-                    {actionAuditSummary(action, attempt.actionId)}
-                  </p>
-                  <p className="mt-1 text-[0.5625rem] text-muted-foreground">
-                    {timestampLabel(new Date(attempt.startedAt), timezone)} ·{" "}
-                    {durationLabel(attempt.finishedAt - attempt.startedAt)}
-                  </p>
-                  {attempt.error ? (
-                    <p className="mt-2 rounded-md border border-destructive/20 bg-destructive/5 px-2.5 py-2 text-[0.625rem] leading-4 text-destructive">
-                      {attempt.error}
-                    </p>
-                  ) : null}
-                </div>
-              </li>
-            )
-          })}
-        </ol>
+        <ActionAttemptAudit
+          actionsById={actionsById}
+          attempts={run.attempts}
+          timezone={timezone}
+        />
       )}
     </article>
+  )
+}
+
+function ActionAttemptAudit({
+  actionsById,
+  attempts,
+  timezone,
+}: {
+  actionsById: ReadonlyMap<string, ScheduleAction>
+  attempts: ReadonlyArray<ScheduleHistoryRun["sequenceAttempts"][number]>
+  timezone: string
+}) {
+  return (
+    <ol className="divide-y divide-border/70">
+      {attempts.map((attempt, index) => {
+        const action = actionsById.get(attempt.actionId)
+        return (
+          <li key={attempt.id} className="flex gap-3 px-3 py-3">
+            <span className="relative mt-0.5 grid size-5 shrink-0 place-items-center rounded-full border bg-background font-mono text-[0.5rem] text-muted-foreground">
+              {index + 1}
+            </span>
+            <ActionIcon
+              type={attempt.actionType}
+              className="mt-1 size-3.5 shrink-0 text-primary"
+            />
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <p className="text-[0.6875rem] font-semibold">
+                  {actionLabel(attempt.actionType)}
+                </p>
+                <AttemptStatus status={attempt.status} />
+              </div>
+              <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
+                {actionAuditSummary(action, attempt.actionId)}
+              </p>
+              <p className="mt-1 text-[0.5625rem] text-muted-foreground">
+                {timestampLabel(new Date(attempt.startedAt), timezone)} ·{" "}
+                {durationLabel(attempt.finishedAt - attempt.startedAt)}
+              </p>
+              {attempt.error ? (
+                <p className="mt-2 rounded-md border border-destructive/20 bg-destructive/5 px-2.5 py-2 text-[0.625rem] leading-4 text-destructive">
+                  {attempt.error}
+                </p>
+              ) : null}
+            </div>
+          </li>
+        )
+      })}
+    </ol>
   )
 }
 
@@ -1464,7 +1513,7 @@ function ScheduleEditorDialog({
     for (const action of actions) {
       if (!isCompleteScheduleAction(action)) continue
       complete.push(
-        action.targetKeys === undefined
+        action.type === "wait" || action.targetKeys === undefined
           ? action
           : {
               ...action,
@@ -2171,9 +2220,9 @@ const ActionEditor = React.memo(function ActionEditor({
             target.permittedActions.includes(action.type)
         )
   const actionTargetKeys =
-    action.type === null
+    action.type === null || action.type === "wait"
       ? new Set<string>()
-      : new Set(
+      : new Set<string>(
           action.targetKeys ??
             eligibleTargets.map((target) => targetKey(target))
         )
@@ -2290,6 +2339,7 @@ const ActionEditor = React.memo(function ActionEditor({
                 targets={selectedOptions}
                 selectedTargets={selectedActionTargets}
                 onToggle={(targetKeyValue, checked) => {
+                  if (action.type === null) return
                   const next = new Set(actionTargetKeys)
                   if (checked) next.add(targetKeyValue)
                   else next.delete(targetKeyValue)
