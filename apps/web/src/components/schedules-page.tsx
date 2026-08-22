@@ -1566,7 +1566,7 @@ function ScheduleEditorDialog({
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[min(90dvh,56rem)] gap-4 overflow-x-hidden overflow-y-auto sm:max-w-3xl">
+      <DialogContent className="grid h-[min(90dvh,56rem)] max-h-none grid-rows-[auto_minmax(0,1fr)] gap-4 overflow-hidden sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>
             {existing ? "Edit schedule" : "Create schedule"}
@@ -1581,7 +1581,7 @@ function ScheduleEditorDialog({
           action={() => {
             if (canSave && !mutation.isPending) mutation.mutate()
           }}
-          className="space-y-5"
+          className="grid min-h-0 grid-rows-[minmax(0,1fr)_auto] gap-5"
         >
           <ScheduleEditorFields
             actionSelectionValid={actionSelectionValid}
@@ -1605,7 +1605,7 @@ function ScheduleEditorDialog({
             onTargetToggle={toggleTarget}
           />
 
-          <DialogFooter className="sticky bottom-0 z-10 -mx-5 -mb-5 flex-row flex-nowrap items-center border-t border-border/60 bg-[color-mix(in_oklab,var(--surface-overlay)_92%,transparent)] px-5 py-3 backdrop-blur-xl">
+          <DialogFooter className="flex-row flex-nowrap items-center">
             <Button
               aria-label={`Schedule is ${enabled ? "enabled" : "disabled"}. Click to ${enabled ? "disable" : "enable"}.`}
               aria-pressed={enabled}
@@ -1693,16 +1693,14 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   onTargetToggle: (key: string, checked: boolean) => void
 }) {
   return (
-    <>
-      <EditorSection title="Details">
-        <ScheduleDetailsFields
-          cron={cron}
-          cronSummary={cronSummary}
-          name={name}
-          onCronChange={onCronChange}
-          onNameChange={onNameChange}
-        />
-      </EditorSection>
+    <div className="grid min-h-0 grid-rows-[auto_auto_minmax(0,1fr)] gap-5">
+      <ScheduleDetailsFields
+        cron={cron}
+        cronSummary={cronSummary}
+        name={name}
+        onCronChange={onCronChange}
+        onNameChange={onNameChange}
+      />
       <EditorSection
         aside={
           <span className="font-mono text-[0.625rem] text-muted-foreground">
@@ -1721,6 +1719,8 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
         />
       </EditorSection>
       <EditorSection
+        className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]"
+        contentClassName="grid min-h-0 grid-rows-[minmax(0,1fr)_auto]"
         aside={
           <Button
             type="button"
@@ -1750,7 +1750,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
           valid={actionSelectionValid}
         />
       </EditorSection>
-    </>
+    </div>
   )
 })
 
@@ -2018,12 +2018,12 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
     [onReorder]
   )
   return (
-    <div>
+    <div className="h-full min-h-0">
       {hideHeader ? null : <h3 className="text-sm font-semibold">Actions</h3>}
       <div
         ref={actionViewportRef}
         aria-label="Schedule actions"
-        className={`${hideHeader ? "" : "mt-3"} h-80 [scrollbar-gutter:stable] overflow-y-auto overscroll-contain pr-1`}
+        className={`${hideHeader ? "" : "mt-3"} h-full min-h-0 [scrollbar-gutter:stable] overflow-y-auto overscroll-contain pr-1`}
         role="region"
       >
         {actions.length === 0 ? (
@@ -2060,19 +2060,23 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
 function EditorSection({
   aside,
   children,
+  className = "",
+  contentClassName = "space-y-3",
   title,
 }: {
   aside?: React.ReactNode
   children: React.ReactNode
+  className?: string
+  contentClassName?: string
   title: string
 }) {
   return (
-    <section>
+    <section className={className}>
       <div className="flex items-center justify-between gap-4">
         <h3 className="text-xs font-semibold">{title}</h3>
         {aside ? <div className="shrink-0">{aside}</div> : null}
       </div>
-      <div className="mt-2.5 space-y-3">{children}</div>
+      <div className={`mt-2.5 ${contentClassName}`}>{children}</div>
     </section>
   )
 }
@@ -2181,12 +2185,12 @@ const ActionEditor = React.memo(function ActionEditor({
       }}
       onDrop={(event) => event.preventDefault()}
     >
-      <div className="grid h-full grid-cols-[2rem_9rem_minmax(0,1fr)_auto] items-center gap-2">
+      <div className="grid h-full grid-cols-[1.5rem_9rem_minmax(0,1fr)_auto] items-center gap-1 sm:grid-cols-[2rem_9rem_minmax(0,1fr)_auto] sm:gap-2">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
-              className="-my-1 grid h-[calc(100%+0.5rem)] w-8 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing sm:-my-2 sm:h-[calc(100%+1rem)]"
+              className="-my-1 grid h-[calc(100%+0.5rem)] w-6 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing sm:-my-2 sm:h-[calc(100%+1rem)] sm:w-8"
               draggable
               type="button"
               onDragEnd={onDragEnd}
@@ -2280,14 +2284,16 @@ const ActionEditor = React.memo(function ActionEditor({
           ) : action.type === "backup" ? (
             <Button
               aria-label="Configure Backup"
-              className="w-fit max-w-full min-w-0 justify-start truncate"
+              className="size-8 max-w-full min-w-0 justify-center truncate px-0 sm:w-fit sm:justify-start sm:px-2.5"
               type="button"
               title={action.name}
               variant="outline"
               onClick={() => setBackupConfigOpen(true)}
             >
               <ArrowLeftRight className="size-3.5 shrink-0" />
-              <span className="truncate">Configure Backup</span>
+              <span className="hidden truncate sm:inline">
+                Configure Backup
+              </span>
             </Button>
           ) : action.type === "power" ? (
             <Select
@@ -2296,7 +2302,7 @@ const ActionEditor = React.memo(function ActionEditor({
                 onChange({ ...action, action: value as typeof action.action })
               }
             >
-              <SelectTrigger className="h-8 w-28 min-w-0 [&_[data-slot=select-value]]:truncate">
+              <SelectTrigger className="h-8 w-20 min-w-0 sm:w-28 [&_[data-slot=select-value]]:truncate">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -2324,6 +2330,7 @@ const ActionEditor = React.memo(function ActionEditor({
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
           <ActionRowButton
+            className="hidden sm:inline-flex"
             disabled={total === 1 || index === total - 1}
             icon={ArrowDown}
             label={`Move action ${index + 1} down`}
@@ -2331,6 +2338,7 @@ const ActionEditor = React.memo(function ActionEditor({
             onClick={() => onMove(action.id, 1)}
           />
           <ActionRowButton
+            className="hidden sm:inline-flex"
             disabled={total === 1 || index === 0}
             icon={ArrowUp}
             label={`Move action ${index + 1} up`}
@@ -2409,11 +2417,12 @@ function ScheduleActionTargetsButton({
         <Button
           aria-expanded={open}
           aria-label={`${selectedTargets.length} targets for ${actionLabel(action.type)}`}
-          className="h-8 shrink-0 px-2 text-[0.6875rem]"
+          className="h-8 shrink-0 gap-1 px-2 text-[0.6875rem]"
           type="button"
           variant="outline"
         >
-          {selectedTargets.length} targets
+          {selectedTargets.length}
+          <span className="hidden sm:inline">targets</span>
           <ChevronDown className="size-3.5 text-muted-foreground" />
         </Button>
       </PopoverTrigger>
@@ -2474,6 +2483,7 @@ function scheduleBackupTarget(
 }
 
 const ActionRowButton = React.memo(function ActionRowButton({
+  className = "",
   destructive = false,
   disabled = false,
   icon: Icon,
@@ -2481,6 +2491,7 @@ const ActionRowButton = React.memo(function ActionRowButton({
   tooltip,
   onClick,
 }: {
+  className?: string
   destructive?: boolean
   disabled?: boolean
   icon: typeof ArrowDown
@@ -2493,9 +2504,7 @@ const ActionRowButton = React.memo(function ActionRowButton({
       <TooltipTrigger asChild>
         <Button
           aria-label={label}
-          className={
-            destructive ? "text-destructive hover:text-destructive" : undefined
-          }
+          className={`${className} ${destructive ? "text-destructive hover:text-destructive" : ""}`}
           disabled={disabled}
           size="icon-sm"
           type="button"
@@ -2566,14 +2575,14 @@ const CommandEditorField = React.memo(function CommandEditorField({
     <>
       <Button
         aria-label="Configure Command"
-        className="w-fit max-w-full min-w-0 justify-start truncate font-mono text-xs"
+        className="size-8 max-w-full min-w-0 justify-center truncate px-0 font-mono text-xs sm:w-fit sm:justify-start sm:px-2.5"
         type="button"
         title={value || "Configure Command"}
         variant="outline"
         onClick={openEditor}
       >
         <ArrowLeftRight className="size-3.5 shrink-0" />
-        <span className="truncate">Configure Command</span>
+        <span className="hidden truncate sm:inline">Configure Command</span>
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="sm:max-w-xl">
