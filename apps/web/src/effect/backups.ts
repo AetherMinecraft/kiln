@@ -1622,6 +1622,131 @@ export const reserveBackupDeleteEffect = Effect.fn("backups.reserveDelete")(
   }
 )
 
+export const forgetBackupEffect = Effect.fn("backups.forget")(function* (
+  backupId: string
+) {
+  const database = yield* Database
+  return yield* database.transaction("backup_forget", (transaction) =>
+    Effect.gen(function* () {
+      const backup = (yield* transaction.queryRows<
+        Pick<
+          BackupRow,
+          "relay_id" | "repository_id" | "target_id" | "target_kind"
+        > &
+          RowDataPacket
+      >(
+        `SELECT relay_id, repository_id, target_kind, target_id
+             FROM ${databaseTable("backup")}
+            WHERE id = ?
+            LIMIT 1
+            FOR UPDATE`,
+        [backupId]
+      ))[0]
+      if (!backup) return "not_found" as const
+      // Pairing locks this same primary-key lookup before inserting, so an
+      // absent Relay stays absent until this forget transaction commits.
+      const relay = (yield* transaction.queryRows<
+        { id: string } & RowDataPacket
+      >(
+        `SELECT id
+             FROM ${databaseTable("relay")}
+            WHERE id = ?
+            LIMIT 1
+            FOR UPDATE`,
+        [backup.relay_id]
+      ))[0]
+      if (relay) return "relay_present" as const
+      yield* transaction.execute(
+        `DELETE FROM ${databaseTable("backup_download_share")}
+          WHERE backup_id = ?`,
+        [backupId]
+      )
+      yield* transaction.execute(
+        `DELETE FROM ${databaseTable("backup_final_database_delete")}
+          WHERE backup_id = ?`,
+        [backupId]
+      )
+      yield* transaction.execute(
+        `DELETE FROM ${databaseTable("backup_final_delete")}
+          WHERE backup_id = ?`,
+        [backupId]
+      )
+      const result = yield* transaction.execute(
+        `DELETE FROM ${databaseTable("backup")} WHERE id = ?`,
+        [backupId]
+      )
+      if (backup.repository_id) {
+        yield* transaction.execute(
+          `DELETE FROM ${databaseTable("backup_repository")}
+            WHERE id = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM ${databaseTable("backup")}
+                 WHERE repository_id = ?
+              )`,
+          [backup.repository_id, backup.repository_id]
+        )
+      }
+      yield* transaction.execute(
+        `DELETE FROM ${databaseTable("backup_policy")}
+          WHERE relay_id = ? AND target_kind = ? AND target_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM ${databaseTable("backup")}
+               WHERE relay_id = ? AND target_kind = ? AND target_id = ?
+            )`,
+        [
+          backup.relay_id,
+          backup.target_kind,
+          backup.target_id,
+          backup.relay_id,
+          backup.target_kind,
+          backup.target_id,
+        ]
+      )
+      return result.affectedRows === 1 ? ("forgotten" as const) : "not_found"
+    })
+  )
+})
+
+export const forgetRelayBackupsEffect = Effect.fn("backups.forgetRelay")(
+  function* (relayId: string) {
+    const database = yield* Database
+    return yield* database.transaction("backup_forget_relay", (transaction) =>
+      Effect.gen(function* () {
+        yield* transaction.execute(
+          `DELETE FROM ${databaseTable("backup_download_share")}
+            WHERE backup_id IN (
+              SELECT id FROM ${databaseTable("backup")} WHERE relay_id = ?
+            )`,
+          [relayId]
+        )
+        yield* transaction.execute(
+          `DELETE FROM ${databaseTable("backup_final_database_delete")}
+            WHERE relay_id = ?`,
+          [relayId]
+        )
+        yield* transaction.execute(
+          `DELETE FROM ${databaseTable("backup_final_delete")}
+            WHERE relay_id = ?`,
+          [relayId]
+        )
+        const result = yield* transaction.execute(
+          `DELETE FROM ${databaseTable("backup")} WHERE relay_id = ?`,
+          [relayId]
+        )
+        yield* transaction.execute(
+          `DELETE FROM ${databaseTable("backup_policy")} WHERE relay_id = ?`,
+          [relayId]
+        )
+        yield* transaction.execute(
+          `DELETE FROM ${databaseTable("backup_repository")} WHERE relay_id = ?`,
+          [relayId]
+        )
+        return result.affectedRows
+      })
+    )
+  }
+)
+
 export type BackupExportReservation =
   | {
       expiresAt: number
