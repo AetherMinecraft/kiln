@@ -145,7 +145,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
     ...backupStorageQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
-  const navigate = useNavigate({ from: "/schedules" })
+  const navigate = useNavigate({ from: "/automations/schedules" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
@@ -176,7 +176,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   const viewHistory = React.useCallback(
     (schedule: Schedule) => {
       void navigate({
-        to: "/schedules/history",
+        to: "/automations/history",
         search: (previous) => ({
           ...previous,
           run: undefined,
@@ -190,7 +190,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   const viewRun = React.useCallback(
     (schedule: Schedule, run: ScheduleRunWithRelay) => {
       void navigate({
-        to: "/schedules/history",
+        to: "/automations/history",
         search: (previous) => ({
           ...previous,
           run: run.id,
@@ -805,8 +805,8 @@ export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
     ...schedulesQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
-  const search = useSearch({ from: "/_app/schedules" })
-  const navigate = useNavigate({ from: "/schedules/history" })
+  const search = useSearch({ from: "/_app/automations" })
+  const navigate = useNavigate({ from: "/automations/history" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const filteredSchedule = React.useMemo(

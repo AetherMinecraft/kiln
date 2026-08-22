@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router"
 import { z } from "zod"
 
-import { SchedulesRouteOutlet } from "@/components/schedules-layout"
+import { AutomationsRouteOutlet } from "@/components/automations-layout"
 import {
   relaySnapshotQueryOptions,
   scheduleOptionsQueryOptions,
@@ -16,7 +16,7 @@ const scheduleSearchSchema = z.object({
   target: z.string().max(120).optional(),
 })
 
-export const Route = createFileRoute("/_app/schedules")({
+export const Route = createFileRoute("/_app/automations")({
   validateSearch: scheduleSearchSchema,
   loader: async ({ context }) => {
     await Promise.all([
@@ -24,5 +24,5 @@ export const Route = createFileRoute("/_app/schedules")({
       context.queryClient.ensureQueryData(relaySnapshotQueryOptions()),
     ])
   },
-  component: SchedulesRouteOutlet,
+  component: AutomationsRouteOutlet,
 })

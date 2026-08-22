@@ -4,7 +4,7 @@ import { CalendarDays } from "lucide-react"
 import { SettingsPlaceholderPage } from "@/components/settings-placeholder-page"
 import { pageTitle } from "@/lib/page-title"
 
-export const Route = createFileRoute("/_app/schedules/calendar")({
+export const Route = createFileRoute("/_app/automations/calendar")({
   head: () => ({ meta: [{ title: pageTitle("Schedule Calendar") }] }),
   component: ScheduleCalendarRoute,
 })

@@ -1,13 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router"
 
-import { SchedulesPage } from "@/components/schedules-page"
+import { ScheduleHistoryPage } from "@/components/schedules-page"
 import { schedulesQueryOptions } from "@/lib/query-options"
 import { pageTitle } from "@/lib/page-title"
 
-export const Route = createFileRoute("/_app/schedules/")({
+export const Route = createFileRoute("/_app/automations/history")({
   loader: async ({ context }) => {
     await context.queryClient.ensureQueryData(schedulesQueryOptions())
   },
-  head: () => ({ meta: [{ title: pageTitle("Schedules") }] }),
-  component: SchedulesPage,
+  head: () => ({ meta: [{ title: pageTitle("Schedule History") }] }),
+  component: ScheduleHistoryPage,
 })
