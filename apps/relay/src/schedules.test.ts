@@ -204,6 +204,47 @@ describe("Relay schedule persistence", () => {
     })
   })
 
+  it("waits between actions without delaying the server", async () => {
+    const commands: Array<{ command: string; timestamp: number }> = []
+    const schedules = await manager({
+      findInstance: async () => ({}),
+      sendConsoleCommand: async (_instanceId, command) => {
+        commands.push({ command, timestamp: Date.now() })
+      },
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        projection.actions[0],
+        {
+          duration: 20,
+          id: "1e68e6ac-7381-494d-82bb-d50c4a63f575",
+          type: "wait",
+          unit: "milliseconds",
+        },
+        {
+          command: "say after wait",
+          id: "3c99d222-3d12-4fb6-a5f7-9d18078d7e90",
+          type: "console_command",
+        },
+      ],
+    })
+
+    await schedules.runNow({
+      revision: projection.revision,
+      scheduleId: projection.id,
+    })
+
+    await vi.waitFor(() => expect(commands).toHaveLength(2))
+    expect(commands.map(({ command }) => command)).toEqual([
+      "say hello",
+      "say after wait",
+    ])
+    expect(
+      (commands[1]?.timestamp ?? 0) - (commands[0]?.timestamp ?? 0)
+    ).toBeGreaterThanOrEqual(15)
+  })
+
   it("does not run an action on targets disabled by its override", async () => {
     const commands: Array<string> = []
     const schedules = await manager({
@@ -354,6 +395,21 @@ describe("schedule action schema", () => {
         type: "backup",
       })
     ).toMatchObject({ name: "Scheduled backup" })
+  })
+
+  it("defaults wait actions to seconds", () => {
+    expect(
+      scheduleActionSchema.parse({
+        duration: 4,
+        id: "1e68e6ac-7381-494d-82bb-d50c4a63f575",
+        type: "wait",
+      })
+    ).toEqual({
+      duration: 4,
+      id: "1e68e6ac-7381-494d-82bb-d50c4a63f575",
+      type: "wait",
+      unit: "seconds",
+    })
   })
 })
 

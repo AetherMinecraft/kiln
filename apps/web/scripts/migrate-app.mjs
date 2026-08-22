@@ -33,6 +33,16 @@ try {
 }
 
 async function ensureScheduleSchema(database) {
+  const [actionTypeColumns] = await database.query(
+    `SHOW COLUMNS FROM ${databaseTable("schedule_action")} LIKE 'action_type'`
+  )
+  const actionType = actionTypeColumns[0]?.Type ?? ""
+  if (!actionType.includes("'wait'")) {
+    await database.query(
+      `ALTER TABLE ${databaseTable("schedule_action")}
+       MODIFY action_type ENUM('console_command', 'backup', 'power', 'wait') NOT NULL`
+    )
+  }
   const [columns] = await database.query(
     `SHOW COLUMNS FROM ${databaseTable("schedule_run")} LIKE 'status'`
   )

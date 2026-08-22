@@ -140,7 +140,7 @@ export const getScheduleOptions = createServerFn({ method: "GET" }).handler(
         return []
       }
       const permittedActions = (
-        ["console_command", "backup", "power"] as const
+        ["console_command", "backup", "power", "wait"] as const
       ).filter((type) => {
         const permission = scheduleActionPermission({ type }, target)
         return (

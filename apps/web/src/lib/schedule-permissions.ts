@@ -14,6 +14,7 @@ export function scheduleActionPermission(
   action: Pick<ScheduleAction, "type">,
   target: Pick<ScheduleTarget, "kind">
 ): AccessPermission | null {
+  if (action.type === "wait") return null
   if (action.type === "console_command") {
     return target.kind === "instance" ? "instance.console.write" : null
   }

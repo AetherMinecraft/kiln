@@ -48,6 +48,7 @@ const heartbeatPersistenceIntervalMs = 5_000
 const maxRetainedRuns = 1_000
 const scheduledBackupPollIntervalMs = 500
 const scheduledBackupWaitTimeoutMs = 6 * 60 * 60 * 1_000
+const maximumTimerDurationMs = 2_147_483_647
 const targetExecutionConcurrency = 8
 const scheduleTickIntervalMs = 1_000
 const scheduleTickRetryBaseMs = 100
@@ -635,6 +636,13 @@ export class ScheduleManager {
     scheduledAt: number,
     signal?: AbortSignal
   ) {
+    if (action.type === "wait") {
+      await waitForDuration(
+        waitDurationMs(action.duration, action.unit),
+        signal
+      )
+      return
+    }
     if (action.type === "console_command" && target.kind === "instance") {
       await this.#options.sendConsoleCommand(target.id, action.command)
       return
@@ -791,6 +799,35 @@ export class ScheduleManager {
     return Effect.runPromise(
       writeFileAtomic(this.#statePath, JSON.stringify(this.#state), 0o600)
     )
+  }
+}
+
+function waitDurationMs(
+  duration: number,
+  unit: Extract<RelayScheduleAction, { type: "wait" }>["unit"]
+) {
+  const multiplier =
+    unit === "milliseconds"
+      ? 1
+      : unit === "seconds"
+        ? 1_000
+        : unit === "minutes"
+          ? 60_000
+          : unit === "hours"
+            ? 3_600_000
+            : 86_400_000
+  return duration * multiplier
+}
+
+async function waitForDuration(durationMs: number, signal?: AbortSignal) {
+  let remainingMs = durationMs
+  while (remainingMs > 0) {
+    const chunkMs = Math.min(remainingMs, maximumTimerDurationMs)
+    await Effect.runPromise(
+      Effect.sleep(`${chunkMs} millis`),
+      signal ? { signal } : undefined
+    )
+    remainingMs -= chunkMs
   }
 }
 

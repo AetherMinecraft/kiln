@@ -12,6 +12,7 @@ export const scheduleActionTypeSchema = z.enum([
   "console_command",
   "backup",
   "power",
+  "wait",
 ])
 
 export type ScheduleActionType = z.infer<typeof scheduleActionTypeSchema>
@@ -66,10 +67,34 @@ export const schedulePowerActionSchema = z
   })
   .strict()
 
+export const scheduleWaitUnitSchema = z.enum([
+  "milliseconds",
+  "seconds",
+  "minutes",
+  "hours",
+  "days",
+])
+
+export type ScheduleWaitUnit = z.infer<typeof scheduleWaitUnitSchema>
+
+export const scheduleWaitActionSchema = z
+  .object({
+    duration: z
+      .number()
+      .int()
+      .positive()
+      .max(Math.floor(Number.MAX_SAFE_INTEGER / 86_400_000)),
+    id: scheduleActionIdSchema,
+    type: z.literal("wait"),
+    unit: scheduleWaitUnitSchema.default("seconds"),
+  })
+  .strict()
+
 export const scheduleActionSchema = z.discriminatedUnion("type", [
   scheduleConsoleCommandActionSchema,
   scheduleBackupActionSchema,
   schedulePowerActionSchema,
+  scheduleWaitActionSchema,
 ])
 
 export type ScheduleAction = z.infer<typeof scheduleActionSchema>
@@ -234,6 +259,7 @@ export const relayScheduleActionSchema = z.discriminatedUnion("type", [
   scheduleConsoleCommandActionSchema,
   relayScheduleBackupActionSchema,
   schedulePowerActionSchema,
+  scheduleWaitActionSchema,
 ])
 
 export type RelayScheduleAction = z.infer<typeof relayScheduleActionSchema>
@@ -394,6 +420,7 @@ export function scheduleActionSupportsTarget(
   },
   target: Pick<ScheduleTarget, "kind">
 ): boolean {
+  if (action.type === "wait") return true
   if (action.type === "console_command") return target.kind === "instance"
   if (action.type === "power") {
     return (
@@ -420,6 +447,7 @@ export function scheduleActionAppliesToTarget(
   },
   target: ScheduleTarget
 ) {
+  if (action.type === "wait") return true
   return (
     scheduleActionSupportsTarget(action, target) &&
     (action.targetKeys === undefined ||
