@@ -17,11 +17,16 @@ export const scheduleActionTypeSchema = z.enum([
 export type ScheduleActionType = z.infer<typeof scheduleActionTypeSchema>
 
 const scheduleActionIdSchema = z.uuid()
+const scheduleActionTargetKeysSchema = z
+  .array(z.string().trim().min(1).max(512))
+  .max(2_000)
+  .optional()
 
 export const scheduleConsoleCommandActionSchema = z
   .object({
     command: z.string().trim().min(1).max(4_096),
     id: scheduleActionIdSchema,
+    targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("console_command"),
   })
   .strict()
@@ -47,6 +52,7 @@ export const scheduleBackupActionSchema = z
       .max(120)
       .transform((name) => name || "Scheduled backup")
       .default("Scheduled backup"),
+    targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("backup"),
   })
   .strict()
@@ -55,6 +61,7 @@ export const schedulePowerActionSchema = z
   .object({
     action: z.enum(["start", "stop", "restart", "kill"]),
     id: scheduleActionIdSchema,
+    targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("power"),
   })
   .strict()
@@ -176,6 +183,27 @@ export const scheduleDefinitionSchema = scheduleInputSchema
         message: "Targets must be unique",
         path: ["targets"],
       })
+    }
+    for (const [actionIndex, action] of schedule.actions.entries()) {
+      if (action.targetKeys === undefined) continue
+      const seenTargetKeys = new Set<string>()
+      for (const targetKey of action.targetKeys) {
+        if (seenTargetKeys.has(targetKey)) {
+          context.addIssue({
+            code: "custom",
+            message: "Action target overrides must be unique",
+            path: ["actions", actionIndex, "targetKeys"],
+          })
+        }
+        seenTargetKeys.add(targetKey)
+        if (!targetIds.has(targetKey)) {
+          context.addIssue({
+            code: "custom",
+            message: "Action target overrides must reference selected targets",
+            path: ["actions", actionIndex, "targetKeys"],
+          })
+        }
+      }
     }
   })
 
@@ -330,6 +358,34 @@ export function scheduleDeterministicUuid(
   return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`
 }
 
+export function resolveScheduleBackupName(
+  template: string,
+  context: {
+    backupId: string
+    instanceId: string
+    runId: string
+    scheduleId: string
+    scheduleName: string
+    timestamp: number
+  }
+) {
+  const isoTimestamp = new Date(context.timestamp).toISOString()
+  const timestamp = `${isoTimestamp.slice(0, 10).replaceAll("-", ".")}-${isoTimestamp.slice(11, 19).replaceAll(":", ".")}Z`
+  const tags: Record<string, string> = {
+    "<backup_id>": context.backupId,
+    "<instance_id>": context.instanceId,
+    "<run_id>": context.runId,
+    "<schedule>": context.scheduleName,
+    "<schedule_id>": context.scheduleId,
+    "<timestamp>": timestamp,
+  }
+  const resolved = template.replaceAll(
+    /<(?:backup_id|instance_id|run_id|schedule|schedule_id|timestamp)>/gu,
+    (tag) => tags[tag] ?? tag
+  )
+  return resolved.slice(0, 120)
+}
+
 export function scheduleActionSupportsTarget(
   action: {
     action?: "kill" | "restart" | "start" | "stop"
@@ -347,4 +403,26 @@ export function scheduleActionSupportsTarget(
   }
   if (action.mode === "incremental") return target.kind === "instance"
   return true
+}
+
+export function scheduleTargetKey(
+  target: Pick<ScheduleTarget, "id" | "kind" | "relayId">
+) {
+  return `${target.relayId}:${target.kind}:${target.id}`
+}
+
+export function scheduleActionAppliesToTarget(
+  action: {
+    targetKeys?: ReadonlyArray<string>
+    action?: "kill" | "restart" | "start" | "stop"
+    mode?: "full" | "incremental"
+    type: ScheduleActionType
+  },
+  target: ScheduleTarget
+) {
+  return (
+    scheduleActionSupportsTarget(action, target) &&
+    (action.targetKeys === undefined ||
+      action.targetKeys.includes(scheduleTargetKey(target)))
+  )
 }

@@ -41,6 +41,7 @@ import { Result } from "effect"
 import type { ScheduleAction, ScheduleTarget } from "@workspace/contracts"
 import {
   normalizeScheduleCron,
+  scheduleActionAppliesToTarget,
   scheduleActionSupportsTarget,
   scheduleCronAliases,
   validateScheduleCron,
@@ -97,6 +98,10 @@ import {
   serverPickerOptionKey,
   type ServerPickerOption,
 } from "@/components/server-picker-list"
+import {
+  BackupConfigurationDialog,
+  type BackupConfigurationTarget,
+} from "@/components/backup-configuration-dialog"
 import { BackupIcon } from "@/components/backup-icon"
 import { useScheduleScope } from "@/components/schedule-scope"
 import { forkPromise } from "@/effect/promise"
@@ -1444,10 +1449,26 @@ function ScheduleEditorDialog({
     () => options.filter((option) => selectedTargets.has(targetKey(option))),
     [options, selectedTargets]
   )
-  const completeActions = React.useMemo(
-    () => actions.filter(isCompleteScheduleAction),
-    [actions]
-  )
+  const completeActions = React.useMemo(() => {
+    const selectedTargetKeys = new Set(
+      selectedOptions.map((option) => targetKey(option))
+    )
+    const complete: Array<ScheduleAction> = []
+    for (const action of actions) {
+      if (!isCompleteScheduleAction(action)) continue
+      complete.push(
+        action.targetKeys === undefined
+          ? action
+          : {
+              ...action,
+              targetKeys: action.targetKeys.filter((key) =>
+                selectedTargetKeys.has(key)
+              ),
+            }
+      )
+    }
+    return complete
+  }, [actions, selectedOptions])
   const actionSelectionValid = completeActions.every((action) =>
     scheduleActionPermitted(action, selectedOptions, permissionKey)
   )
@@ -2113,6 +2134,7 @@ const ActionEditor = React.memo(function ActionEditor({
   onMove: (actionId: string, direction: -1 | 1) => void
   onRemove: (actionId: string) => void
 }) {
+  const [backupConfigOpen, setBackupConfigOpen] = React.useState(false)
   const unsupportedTargets =
     action.type === null
       ? []
@@ -2128,6 +2150,25 @@ const ActionEditor = React.memo(function ActionEditor({
             (!target[permissionKey] ||
               !target.permittedActions.includes(action.type))
         )
+  const eligibleTargets =
+    action.type === null
+      ? []
+      : selectedOptions.filter(
+          (target) =>
+            scheduleActionSupportsTarget(action, target) &&
+            target[permissionKey] &&
+            target.permittedActions.includes(action.type)
+        )
+  const actionTargetKeys =
+    action.type === null
+      ? new Set<string>()
+      : new Set(
+          action.targetKeys ??
+            eligibleTargets.map((target) => targetKey(target))
+        )
+  const selectedActionTargets = eligibleTargets.filter((target) =>
+    actionTargetKeys.has(targetKey(target))
+  )
 
   return (
     <div
@@ -2183,7 +2224,7 @@ const ActionEditor = React.memo(function ActionEditor({
               className="h-8 min-w-0 flex-1 justify-start text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:text-left"
             >
               {action.type === null ? (
-                <SelectValue placeholder="Select action type" />
+                <SelectValue placeholder="Select Action" />
               ) : (
                 <>
                   <ActionIcon
@@ -2229,78 +2270,24 @@ const ActionEditor = React.memo(function ActionEditor({
             unsupportedTargets={unsupportedTargets}
           />
         </div>
-        <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-1.5">
           {action.type === "console_command" ? (
             <CommandEditorField
               value={action.command}
               onChange={(command) => onChange({ ...action, command })}
             />
           ) : action.type === "backup" ? (
-            <div className="grid min-w-0 grid-cols-2 gap-2">
-              <Select
-                value={action.mode}
-                onValueChange={(value) => {
-                  const mode = value as typeof action.mode
-                  onChange({
-                    ...action,
-                    destination:
-                      mode === "full" ? { kind: "local" } : action.destination,
-                    mode,
-                  })
-                }}
-              >
-                <SelectTrigger
-                  aria-label="Backup mode"
-                  className="w-full min-w-0 [&_[data-slot=select-value]]:truncate"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="incremental">Incremental</SelectItem>
-                  <SelectItem value="full">Full archive</SelectItem>
-                </SelectContent>
-              </Select>
-              <Select
-                value={
-                  action.destination.kind === "storage"
-                    ? action.destination.storageId
-                    : "local"
-                }
-                onValueChange={(value) =>
-                  onChange({
-                    ...action,
-                    destination:
-                      value === "local"
-                        ? { kind: "local" }
-                        : { kind: "storage", storageId: value },
-                  })
-                }
-              >
-                <SelectTrigger
-                  aria-label="Backup destination"
-                  className="w-full min-w-0 [&_[data-slot=select-value]]:truncate"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="local">Local Relay</SelectItem>
-                  {action.mode === "incremental"
-                    ? storage.flatMap((destination) =>
-                        destination.enabled && !destination.deleting
-                          ? [
-                              <SelectItem
-                                key={destination.id}
-                                value={destination.id}
-                              >
-                                {destination.name}
-                              </SelectItem>,
-                            ]
-                          : []
-                      )
-                    : null}
-                </SelectContent>
-              </Select>
-            </div>
+            <Button
+              aria-label="Configure Backup"
+              className="min-w-0 flex-1 justify-start truncate"
+              type="button"
+              title={action.name}
+              variant="outline"
+              onClick={() => setBackupConfigOpen(true)}
+            >
+              <BackupIcon className="size-3.5 shrink-0" />
+              <span className="truncate">Configure Backup</span>
+            </Button>
           ) : action.type === "power" ? (
             <Select
               value={action.action}
@@ -2308,7 +2295,7 @@ const ActionEditor = React.memo(function ActionEditor({
                 onChange({ ...action, action: value as typeof action.action })
               }
             >
-              <SelectTrigger className="w-full min-w-0 [&_[data-slot=select-value]]:truncate">
+              <SelectTrigger className="h-8 w-28 min-w-0 [&_[data-slot=select-value]]:truncate">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -2318,6 +2305,20 @@ const ActionEditor = React.memo(function ActionEditor({
                 <SelectItem value="kill">Kill</SelectItem>
               </SelectContent>
             </Select>
+          ) : null}
+          {action.type !== null ? (
+            <ScheduleActionTargetsButton
+              action={action}
+              eligibleTargets={eligibleTargets}
+              targets={selectedOptions}
+              selectedTargets={selectedActionTargets}
+              onToggle={(targetKeyValue, checked) => {
+                const next = new Set(actionTargetKeys)
+                if (checked) next.add(targetKeyValue)
+                else next.delete(targetKeyValue)
+                onChange({ ...action, targetKeys: [...next] })
+              }}
+            />
           ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
@@ -2344,9 +2345,132 @@ const ActionEditor = React.memo(function ActionEditor({
           />
         </div>
       </div>
+      {action.type === "backup" ? (
+        <BackupConfigurationDialog
+          allowIncremental={
+            selectedOptions.length > 0 &&
+            selectedOptions.every((target) => target.kind === "instance")
+          }
+          fullDestination="local"
+          initialDestinationKeys={
+            action.destination.kind === "storage"
+              ? [action.destination.storageId]
+              : ["local"]
+          }
+          initialMode={action.mode}
+          initialName={action.name}
+          onOpenChange={setBackupConfigOpen}
+          onSubmit={(configuration) => {
+            const destination = configuration.destinationKeys[0] ?? "local"
+            onChange({
+              ...action,
+              destination:
+                configuration.mode === "full" || destination === "local"
+                  ? { kind: "local" }
+                  : { kind: "storage", storageId: destination },
+              mode: configuration.mode,
+              name: configuration.name,
+            })
+            setBackupConfigOpen(false)
+          }}
+          open={backupConfigOpen}
+          showTarget={false}
+          storage={storage}
+          submitLabel="Save backup"
+          targets={selectedOptions.map(scheduleBackupTarget)}
+          title="Configure Backup"
+        />
+      ) : null}
     </div>
   )
 })
+
+function ScheduleActionTargetsButton({
+  action,
+  eligibleTargets,
+  onToggle,
+  selectedTargets,
+  targets,
+}: {
+  action: ScheduleAction
+  eligibleTargets: ReadonlyArray<ScheduleOption>
+  onToggle: (targetKey: string, checked: boolean) => void
+  selectedTargets: ReadonlyArray<ScheduleOption>
+  targets: ReadonlyArray<ScheduleOption>
+}) {
+  const [open, setOpen] = React.useState(false)
+  const eligibleKeys = new Set(
+    eligibleTargets.map((target) => targetKey(target))
+  )
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          aria-expanded={open}
+          aria-label={`${selectedTargets.length} targets for ${actionLabel(action.type)}`}
+          className="h-8 shrink-0 px-2 text-[0.6875rem]"
+          type="button"
+          variant="outline"
+        >
+          {selectedTargets.length} targets
+          <ChevronDown className="size-3.5 text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-72 p-1.5">
+        <p className="px-2 py-1.5 text-[0.625rem] text-muted-foreground">
+          Choose which selected targets run this action.
+        </p>
+        <div className="space-y-0.5">
+          {targets.map((target) => {
+            const key = targetKey(target)
+            const eligible = eligibleKeys.has(key)
+            const checked = selectedTargets.some(
+              (selected) => targetKey(selected) === key
+            )
+            return (
+              <button
+                key={key}
+                aria-pressed={checked}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!eligible}
+                type="button"
+                onClick={() => onToggle(key, !checked)}
+              >
+                <span
+                  className={`grid size-4 shrink-0 place-items-center rounded-sm border ${checked ? "border-primary bg-primary text-primary-foreground" : "border-input"}`}
+                >
+                  {checked ? <Check className="size-3" /> : null}
+                </span>
+                <span className="min-w-0 flex-1 truncate">{target.name}</span>
+                <span className="shrink-0 text-[0.5625rem] text-muted-foreground">
+                  {target.kind}
+                </span>
+              </button>
+            )
+          })}
+          {targets.length === 0 ? (
+            <p className="px-2 py-2 text-xs text-muted-foreground">
+              No compatible targets selected.
+            </p>
+          ) : null}
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+function scheduleBackupTarget(
+  target: ScheduleOption
+): BackupConfigurationTarget {
+  return {
+    id: target.id,
+    key: targetKey(target),
+    kind: target.kind === "relay" ? "platform" : target.kind,
+    name: target.name,
+    relayId: target.relayId,
+    relayName: target.relayName,
+  }
+}
 
 const ActionRowButton = React.memo(function ActionRowButton({
   destructive = false,
@@ -2439,36 +2563,21 @@ const CommandEditorField = React.memo(function CommandEditorField({
   }, [value])
   return (
     <>
-      <div className="flex items-center gap-1">
-        <Input
-          readOnly
-          aria-label="Console command"
-          className="cursor-pointer font-mono text-xs"
-          placeholder="Add a console command"
-          title={value}
-          value={value}
-          onClick={openEditor}
-        />
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              aria-label="Edit console command"
-              className="shrink-0"
-              size="icon-sm"
-              type="button"
-              variant="ghost"
-              onClick={openEditor}
-            >
-              <Pencil className="size-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="top">Edit command</TooltipContent>
-        </Tooltip>
-      </div>
+      <Button
+        aria-label="Configure Command"
+        className="min-w-0 flex-1 justify-start truncate font-mono text-xs"
+        type="button"
+        title={value || "Configure Command"}
+        variant="outline"
+        onClick={openEditor}
+      >
+        <Pencil className="size-3.5 shrink-0" />
+        <span className="truncate">Configure Command</span>
+      </Button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="sm:max-w-xl">
           <DialogHeader>
-            <DialogTitle>Edit command</DialogTitle>
+            <DialogTitle>Configure Command</DialogTitle>
             <DialogDescription className="sr-only">
               Enter the console command this action should run.
             </DialogDescription>
@@ -2704,7 +2813,7 @@ function canOperateSchedule(
     const permittedActions = new Set(option.permittedActions)
     return schedule.actions.every(
       (action) =>
-        !scheduleActionSupportsTarget(action, target) ||
+        !scheduleActionAppliesToTarget(action, target) ||
         permittedActions.has(action.type)
     )
   })
@@ -2716,7 +2825,7 @@ function scheduleActionPermitted(
   permission: "canCreate" | "canUpdate"
 ) {
   const compatible = targets.filter((target) =>
-    scheduleActionSupportsTarget(action, target)
+    scheduleActionAppliesToTarget(action, target)
   )
   return compatible.every(
     (target) =>
@@ -2767,7 +2876,7 @@ function createScheduleAction(
       destination: { kind: "local" },
       id,
       mode: "full",
-      name: "Scheduled backup",
+      name: "scheduled-<schedule>-<timestamp>",
       type,
     }
   }
