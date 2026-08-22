@@ -25,7 +25,15 @@ describe("S3 backup storage", () => {
     expect(() => normalizeS3Endpoint("http://s3.example.com")).toThrow()
     expect(() => normalizeS3Endpoint("https://s3.example.com/path")).toThrow()
     expect(() => normalizeObjectPrefix("team/../other")).toThrow()
-    expect(() => normalizeObjectPrefix("é".repeat(300))).toThrow()
+    expect(() => normalizeObjectPrefix("team/foo bar")).toThrow(
+      "The object prefix can contain only letters, numbers, periods, underscores, slashes, and hyphens"
+    )
+    expect(() => normalizeObjectPrefix("é")).toThrow(
+      "The object prefix can contain only letters, numbers, periods, underscores, slashes, and hyphens"
+    )
+    expect(() => normalizeObjectPrefix("a".repeat(513))).toThrow(
+      "The object prefix must be 512 bytes or fewer"
+    )
   })
 
   it("bounds generated keys even when target names require heavy escaping", () => {
@@ -97,6 +105,7 @@ describe("restic S3 prefixes", () => {
   it("keeps safe segments and hashes unsafe ones", () => {
     expect(isSafeResticObjectPrefix("team/production")).toBe(true)
     expect(isSafeResticObjectPrefix("team/foo bar")).toBe(false)
+    expect(isSafeResticObjectPrefix("team/./other")).toBe(false)
     expect(isSafeResticObjectPrefix("team/../other")).toBe(false)
     expect(resticPrefixSegment("relay-one")).toBe("relay-one")
     expect(resticPrefixSegment(".")).toMatch(/^sha256-[a-f0-9]{64}$/u)

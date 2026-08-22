@@ -12,6 +12,7 @@ import {
 
 import { createBackupDownloadShareEffect } from "@/effect/backup-download-shares"
 import {
+  forgetBackupEffect,
   listBackupCatalogEffect,
   getInstanceBackupPolicyEffect,
   reconcileBackupTaskEffect,
@@ -102,6 +103,11 @@ const platformBackupInputSchema = z.strictObject({
 })
 
 const backupIdInputSchema = z.strictObject({ backupId: z.uuid() })
+
+const backupRemovalInputSchema = z.strictObject({
+  backupId: z.uuid(),
+  mode: z.enum(["delete", "forget"]),
+})
 
 const renameBackupInputSchema = z.strictObject({
   backupId: z.uuid(),
@@ -310,9 +316,9 @@ export const getBackups = createServerFn({ method: "GET" }).handler(
   async () => {
     const user = await requireAuthenticatedUser()
     scheduleBackupCopyProcessing()
-    const relays = (await listPersistedRelays()).filter(
-      (relay) => relay.enabled
-    )
+    const persistedRelays = await listPersistedRelays()
+    const persistedRelayIds = new Set(persistedRelays.map((relay) => relay.id))
+    const relays = persistedRelays.filter((relay) => relay.enabled)
     const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
     const catalog = await runAppEffect(
       "backups.listForReconcile",
@@ -358,6 +364,7 @@ export const getBackups = createServerFn({ method: "GET" }).handler(
       const { createdBy: _, objectKey: __, ...backup } = candidate
       visibleBackups.push({
         ...backup,
+        relayPresent: persistedRelayIds.has(backup.relayId),
         artifacts: backup.artifacts.map(
           ({ objectKey: ___, ...artifact }) => artifact
         ),
@@ -427,7 +434,7 @@ export const cancelBackup = createServerFn({ method: "POST" })
   })
 
 export const deleteBackup = createServerFn({ method: "POST" })
-  .validator(backupIdInputSchema)
+  .validator(backupRemovalInputSchema)
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
     const catalog = await runAppEffect(
@@ -437,8 +444,37 @@ export const deleteBackup = createServerFn({ method: "POST" })
     const backup = catalog.find((candidate) => candidate.id === data.backupId)
     if (!backup) throw new Error("Backup not found")
     const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+    const relayPresent = (await listPersistedRelays()).some(
+      (relay) => relay.id === backup.relayId
+    )
+    if (data.mode === "forget") {
+      if (!hasBackupPermission(user, grants, backup, "backup.read")) {
+        throw new Error("You do not have permission to forget this backup")
+      }
+      if (relayPresent) {
+        throw new Error(
+          "This Relay belongs to Hearth again. Refresh before removing the backup."
+        )
+      }
+      const forgetResult = await runAppEffect(
+        "backups.forget",
+        forgetBackupEffect(backup.id)
+      )
+      if (forgetResult === "relay_present") {
+        throw new Error(
+          "This Relay belongs to Hearth again. Refresh before removing the backup."
+        )
+      }
+      if (forgetResult === "not_found") throw new Error("Backup not found")
+      return { forgotten: true as const }
+    }
     if (!hasBackupPermission(user, grants, backup, "backup.delete")) {
       throw new Error("You do not have permission to delete this backup")
+    }
+    if (!relayPresent) {
+      throw new Error(
+        "This Relay no longer belongs to Hearth. Refresh before forgetting the backup."
+      )
     }
     const relay = await requireBackupRelay(backup.relayId)
     const input = await runAppEffect(
@@ -452,7 +488,10 @@ export const deleteBackup = createServerFn({ method: "POST" })
     const dispatched = await Promise.allSettled([
       dispatchBackupTask(relay, input, user.id),
     ])
-    return { relayAccepted: dispatched[0]?.status === "fulfilled" }
+    return {
+      forgotten: false as const,
+      relayAccepted: dispatched[0]?.status === "fulfilled",
+    }
   })
 
 export const renameBackup = createServerFn({ method: "POST" })

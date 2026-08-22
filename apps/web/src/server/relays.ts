@@ -12,13 +12,19 @@ import {
 import { z } from "zod"
 
 import { isPlatformAdmin, isRelayCreator } from "@/lib/access-control"
+import { runAppEffect } from "@/effect/runtime"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { requireAuthenticatedUser } from "@/server/auth"
+import { removeRelayThenCleanup } from "@/server/relay-removal"
 
 const relayIdSchema = z.object({
   id: relayFingerprintSchema,
 })
 const relayEnabledSchema = relayIdSchema.extend({ enabled: z.boolean() })
+const removeRelaySchema = relayIdSchema.extend({
+  forgetBackups: z.boolean().default(true),
+  removeVanityDomains: z.boolean().default(true),
+})
 const relayProxyInputSchema = relayProxySettingsSchema.extend({
   relayId: relayFingerprintSchema,
 })
@@ -146,12 +152,35 @@ export const setRelayEnabled = createServerFn({ method: "POST" })
   })
 
 export const removeRelay = createServerFn({ method: "POST" })
-  .validator(relayIdSchema)
+  .validator(removeRelaySchema)
   .handler(async ({ data }) => {
     await requireRelayAdministrator(data.id)
     const { deletePersistedRelay } = await import("@/lib/relay-registry")
-    await deletePersistedRelay(data.id)
-    return { removed: true }
+    return removeRelayThenCleanup(
+      {
+        forgetBackups: data.forgetBackups,
+        relayId: data.id,
+        removeVanityDomains: data.removeVanityDomains,
+      },
+      {
+        deleteRelay: () => deletePersistedRelay(data.id),
+        forgetBackups: async () => {
+          const { forgetRelayBackupsEffect } = await import("@/effect/backups")
+          return runAppEffect(
+            "backups.forgetRelay",
+            forgetRelayBackupsEffect(data.id)
+          )
+        },
+        removeManagedDomains: async () => {
+          const { removeRelayManagedDomainsEffect } =
+            await import("@/server/domains.server")
+          return runAppEffect(
+            "domains.relay.removeAssignments",
+            removeRelayManagedDomainsEffect(data.id, data.removeVanityDomains)
+          )
+        },
+      }
+    )
   })
 
 export const previewRelayPairing = createServerFn({ method: "POST" })

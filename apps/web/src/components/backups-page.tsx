@@ -9,6 +9,7 @@ import { ensuringPromise, forkPromise, settlePromises } from "@/effect/promise"
 import { Link } from "@tanstack/react-router"
 import {
   Archive,
+  ArchiveX,
   ArrowLeft,
   Check,
   CircleAlert,
@@ -22,7 +23,6 @@ import {
   HardDrive,
   History as RotateCcwClock,
   LoaderCircle,
-  ExternalLink,
   Link2,
   Pencil,
   Plus,
@@ -603,7 +603,7 @@ export const BackupsPage = React.memo(function BackupsPage({
       selectionStore.retain(
         new Set(
           filteredBackups.flatMap((backup) =>
-            !backupIsActive(backup) &&
+            backupCanBeRemoved(backup) &&
             backupMatchesSearch(backup, normalizedSearch)
               ? [backup.id]
               : []
@@ -1202,7 +1202,9 @@ const BackupMobileSelectAll = React.memo(function BackupMobileSelectAll({
 }) {
   const backupIds = React.useMemo(
     () =>
-      backups.flatMap((backup) => (backupIsActive(backup) ? [] : [backup.id])),
+      backups.flatMap((backup) =>
+        backupCanBeRemoved(backup) ? [backup.id] : []
+      ),
     [backups]
   )
 
@@ -1295,7 +1297,7 @@ const BackupFilteredSelectAllCheckbox = React.memo(
     const visibleBackupIds = React.useMemo(
       () =>
         backups.flatMap((backup) =>
-          !backupIsActive(backup) &&
+          backupCanBeRemoved(backup) &&
           backupMatchesSearch(backup, normalizedSearch)
             ? [backup.id]
             : []
@@ -1334,17 +1336,14 @@ const BackupTableHead = React.memo(function BackupTableHead({
           />
         </span>
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-[26%] min-w-0">
-        Backup
+      <WorkspaceTableHeading className="w-[34%] min-w-0">
+        Name
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[28%] min-w-0 md:table-cell">
         Target
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[12rem] sm:table-cell">
         File
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[5.5rem] lg:table-cell">
-        Size
       </WorkspaceTableHeading>
       <WorkspaceTableHeading className="hidden w-[5.25rem] xl:table-cell">
         Created
@@ -1390,16 +1389,11 @@ const BackupTableRow = React.memo(function BackupTableRow({
       </WorkspaceTableCell>
       <WorkspaceTableCell className="h-auto py-2.5">
         <div className="min-w-0">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <div className="min-w-0 flex-1">
-              <BackupNameEditor
-                backupId={backup.id}
-                editable={canCreate}
-                name={backup.name}
-              />
-            </div>
-            <BackupModeBadge mode={backup.backupMode} />
-          </div>
+          <BackupNameEditor
+            backupId={backup.id}
+            editable={canCreate}
+            name={backup.name}
+          />
           <BackupAvailabilityTags
             backup={backup}
             canCopy={canCreate}
@@ -1421,16 +1415,11 @@ const BackupTableRow = React.memo(function BackupTableRow({
         {showsPrimaryTaskFeedback ? (
           <DesktopBackupTaskFeedback backup={backup} />
         ) : (
-          <span className="block truncate" title={displayFilename}>
-            {displayFilename}
-          </span>
-        )}
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground lg:table-cell">
-        {showsPrimaryTaskFeedback ? null : (
-          <span className="whitespace-nowrap">
-            {displayBytes === null ? "—" : formatBytes(displayBytes)}
-          </span>
+          <BackupFileDetails
+            bytes={displayBytes}
+            filename={displayFilename}
+            mode={backup.backupMode}
+          />
         )}
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden h-auto py-2.5 text-sm text-muted-foreground xl:table-cell">
@@ -1485,16 +1474,11 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
       <div className="flex min-w-0 items-start gap-2.5">
         <BackupSelectionCheckbox backup={backup} store={selectionStore} />
         <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <div className="min-w-0 flex-1">
-              <BackupNameEditor
-                backupId={backup.id}
-                editable={canCreate}
-                name={backup.name}
-              />
-            </div>
-            <BackupModeBadge mode={backup.backupMode} />
-          </div>
+          <BackupNameEditor
+            backupId={backup.id}
+            editable={canCreate}
+            name={backup.name}
+          />
         </div>
       </div>
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
@@ -1511,14 +1495,13 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
           <BackupTaskFeedback backup={backup} />
         </div>
       ) : (
-        <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 text-xs text-muted-foreground">
-          <span className="truncate" title={displayFilename}>
-            {displayFilename}
-          </span>
-          <span className="whitespace-nowrap">
-            {displayBytes === null ? "—" : formatBytes(displayBytes)} ·{" "}
-            <BackupCreatedTime createdAt={backup.createdAt} />
-          </span>
+        <div className="mt-2.5 grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-end gap-x-3 text-xs text-muted-foreground">
+          <BackupFileDetails
+            bytes={displayBytes}
+            filename={displayFilename}
+            mode={backup.backupMode}
+          />
+          <BackupCreatedTime createdAt={backup.createdAt} />
         </div>
       )}
       <BackupAvailabilityTags
@@ -1555,7 +1538,7 @@ const BackupSelectionCheckbox = React.memo(function BackupSelectionCheckbox({
     getSelectedSnapshot,
     () => false
   )
-  const disabled = backupIsActive(backup)
+  const disabled = !backupCanBeRemoved(backup)
 
   return (
     <label
@@ -1693,7 +1676,13 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
     mutationFn: async (targets: Array<Backup>) => {
       const settlements = await settlePromises(
         targets,
-        (backup) => deleteBackup({ data: { backupId: backup.id } }),
+        (backup) =>
+          deleteBackup({
+            data: {
+              backupId: backup.id,
+              mode: backup.relayPresent ? "delete" : "forget",
+            },
+          }),
         4
       )
       return settlements.map(
@@ -1717,8 +1706,9 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
     onSuccess: async (outcomes) => {
       const deleted = outcomes.filter((outcome) => outcome.status === "deleted")
       const failed = outcomes.filter((outcome) => outcome.status === "failed")
+      const forgotten = deleted.filter((outcome) => outcome.result.forgotten)
       const deferred = deleted.filter(
-        (outcome) => !outcome.result.relayAccepted
+        (outcome) => !outcome.result.forgotten && !outcome.result.relayAccepted
       )
       deleteFeedbackStore.remove(failed.map((outcome) => outcome.backup.id))
 
@@ -1745,9 +1735,13 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
       }
       showToast({
         message:
-          deferred.length > 0
-            ? `${deleted.length} backups scheduled; ${deferred.length} will resume when Relay reconnects`
-            : `${deleted.length} ${deleted.length === 1 ? "backup" : "backups"} queued for deletion`,
+          forgotten.length === deleted.length
+            ? `${forgotten.length} ${forgotten.length === 1 ? "backup" : "backups"} forgotten`
+            : forgotten.length > 0
+              ? `${forgotten.length} forgotten; ${deleted.length - forgotten.length} queued for deletion`
+              : deferred.length > 0
+                ? `${deleted.length} backups scheduled; ${deferred.length} will resume when Relay reconnects`
+                : `${deleted.length} ${deleted.length === 1 ? "backup" : "backups"} queued for deletion`,
         type: deferred.length > 0 ? "warning" : "success",
       })
     },
@@ -1755,6 +1749,12 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
   const failedOutcomes = (remove.data ?? []).filter(
     (outcome) => outcome.status === "failed"
   )
+  const orphanedConfirmationCount = confirmationBackups.filter(
+    (backup) => !backup.relayPresent
+  ).length
+  const allConfirmationBackupsOrphaned =
+    confirmationBackups.length > 0 &&
+    orphanedConfirmationCount === confirmationBackups.length
   const openConfirmation = React.useCallback(() => {
     const selected = selectionStore.getSnapshot()
     const selectedBackups = backups.filter((backup) => selected.has(backup.id))
@@ -1786,12 +1786,20 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              Delete {confirmationBackups.length}{" "}
+              {allConfirmationBackupsOrphaned
+                ? "Forget"
+                : orphanedConfirmationCount > 0
+                  ? "Remove"
+                  : "Delete"}{" "}
+              {confirmationBackups.length}{" "}
               {confirmationBackups.length === 1 ? "backup" : "backups"}?
             </DialogTitle>
             <DialogDescription>
-              Every selected backup and all of its stored artifacts will be
-              permanently removed. This cannot be undone.
+              {allConfirmationBackupsOrphaned
+                ? "Their Relays no longer belong to Hearth. Backup history will be forgotten, while stored files remain untouched."
+                : orphanedConfirmationCount > 0
+                  ? `${orphanedConfirmationCount} orphaned ${orphanedConfirmationCount === 1 ? "backup" : "backups"} will be forgotten. The remaining backups and their stored artifacts will be deleted.`
+                  : "Every selected backup and all of its stored artifacts will be permanently removed. This cannot be undone."}
             </DialogDescription>
           </DialogHeader>
           <div className="max-h-44 overflow-y-auto rounded-lg border bg-muted/15 px-3 py-2">
@@ -1837,10 +1845,17 @@ const BackupBulkActions = React.memo(function BackupBulkActions({
             >
               {remove.isPending ? (
                 <LoaderCircle className="animate-spin" />
+              ) : allConfirmationBackupsOrphaned ? (
+                <ArchiveX />
               ) : (
                 <Trash2 />
               )}
-              Delete {confirmationBackups.length}{" "}
+              {allConfirmationBackupsOrphaned
+                ? "Forget"
+                : orphanedConfirmationCount > 0
+                  ? "Remove"
+                  : "Delete"}{" "}
+              {confirmationBackups.length}{" "}
               {confirmationBackups.length === 1 ? "backup" : "backups"}
             </Button>
           </DialogFooter>
@@ -2076,7 +2091,7 @@ const BackupRowActions = React.memo(function BackupRowActions({
     </Button>
   )
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="flex items-center gap-1">
       {cancellable ? (
         <CancelBackupButton backup={backup} />
       ) : targetAvailable ? (
@@ -2091,20 +2106,22 @@ const BackupRowActions = React.memo(function BackupRowActions({
           </TooltipContent>
         </Tooltip>
       )}
-      <BackupActionButton
-        disabled={backup.status !== "available"}
-        icon={Download}
-        label={`Download ${backup.name}`}
-        tooltip="Download or create a link"
-        onClick={() => dialogStore.open({ backup, kind: "download" })}
-      />
-      <BackupActionButton
-        disabled={backupIsActive(backup)}
-        icon={Trash2}
-        label={`Delete ${backup.name}`}
-        tooltip="Delete backup"
-        onClick={() => dialogStore.open({ backup, kind: "delete" })}
-      />
+      <div className="flex items-center gap-0.5">
+        <BackupActionButton
+          disabled={backup.status !== "available"}
+          icon={Download}
+          label={`Download ${backup.name}`}
+          tooltip="Download or create a link"
+          onClick={() => dialogStore.open({ backup, kind: "download" })}
+        />
+        <BackupActionButton
+          disabled={!backupCanBeRemoved(backup)}
+          icon={Trash2}
+          label={`${backup.relayPresent ? "Delete" : "Forget"} ${backup.name}`}
+          tooltip={backup.relayPresent ? "Delete backup" : "Forget backup"}
+          onClick={() => dialogStore.open({ backup, kind: "delete" })}
+        />
+      </div>
     </div>
   )
 })
@@ -2523,8 +2540,8 @@ const BackupTargetIcon = React.memo(function BackupTargetIcon({
   const Icon =
     kind === "database" ? Database : kind === "platform" ? RadioTower : Server
   return (
-    <span className="grid size-10 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
-      <Icon className="size-5" />
+    <span className="grid size-9 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
+      <Icon className="size-[1.125rem]" />
     </span>
   )
 })
@@ -2539,7 +2556,7 @@ function BackupTargetLayout({
   name: React.ReactNode
 }) {
   return (
-    <div className="-mx-3 -my-2.5 grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2.5 px-3 py-2.5">
+    <div className="-mx-3 -my-2.5 grid grid-cols-[auto_minmax(0,1fr)] grid-rows-[1.25rem_1.25rem] items-center gap-x-2.5 gap-y-0.5 px-3 py-2.5">
       <span className="row-span-2">{icon}</span>
       {name}
       {copyButton}
@@ -2607,10 +2624,7 @@ const BackupTargetLink = React.memo(function BackupTargetLink({
   targetKind: Backup["targetKind"]
 }) {
   const name = (
-    <span className="flex min-w-0 items-center gap-1.5 text-sm font-medium">
-      <span className="shrink-0 text-muted-foreground">
-        {target.kindLabel}:
-      </span>
+    <span className="flex min-w-0 items-center gap-1.5 text-sm">
       {available ? (
         <BackupTargetNameAnchor
           relayId={relayId}
@@ -2664,13 +2678,8 @@ const BackupTargetNameAnchor = React.memo(function BackupTargetNameAnchor({
   targetName: string
 }) {
   const className =
-    "inline-flex min-w-0 items-center gap-1.5 text-primary outline-none transition-colors hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring/40"
-  const label = (
-    <>
-      <span className="truncate">{targetName}</span>
-      <ExternalLink className="size-3.5 shrink-0 text-primary/75" />
-    </>
-  )
+    "inline-flex min-w-0 items-center text-primary outline-none transition-colors hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring/40"
+  const label = <span className="truncate">{targetName}</span>
 
   if (targetKind === "instance") {
     return (
@@ -3959,7 +3968,13 @@ function DeleteBackupDialog({
     onMutate: () => {
       deleteFeedbackStore.mark([backup])
     },
-    mutationFn: () => deleteBackup({ data: { backupId: backup.id } }),
+    mutationFn: () =>
+      deleteBackup({
+        data: {
+          backupId: backup.id,
+          mode: backup.relayPresent ? "delete" : "forget",
+        },
+      }),
     onError: async () => {
       deleteFeedbackStore.remove([backup.id])
       await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
@@ -3967,10 +3982,12 @@ function DeleteBackupDialog({
     onSuccess: async (result) => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
       showToast({
-        message: result.relayAccepted
-          ? `${backup.name} queued for deletion`
-          : `Deletion saved and will resume when Relay reconnects`,
-        type: result.relayAccepted ? "success" : "warning",
+        message: result.forgotten
+          ? `${backup.name} forgotten`
+          : result.relayAccepted
+            ? `${backup.name} queued for deletion`
+            : `Deletion saved and will resume when Relay reconnects`,
+        type: result.forgotten || result.relayAccepted ? "success" : "warning",
       })
       onOpenChange(false)
     },
@@ -3980,11 +3997,24 @@ function DeleteBackupDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete backup?</DialogTitle>
+          <DialogTitle>
+            {backup.relayPresent ? "Delete backup?" : "Forget backup?"}
+          </DialogTitle>
           <DialogDescription>
-            “{backup.name}” and its stored artifact will be permanently removed.
+            {backup.relayPresent
+              ? `“${backup.name}” and its stored artifact will be permanently removed.`
+              : `The Relay for “${backup.name}” no longer belongs to Hearth.`}
           </DialogDescription>
         </DialogHeader>
+        {!backup.relayPresent ? (
+          <div className="flex gap-2.5 rounded-lg border border-primary/25 bg-primary/[0.06] px-3 py-2.5 text-xs leading-5">
+            <CircleAlert className="mt-0.5 size-4 shrink-0 text-primary" />
+            <p>
+              Forgetting removes this backup’s history from Hearth. Any stored
+              files are left untouched.
+            </p>
+          </div>
+        ) : null}
         {remove.error ? (
           <p className="text-xs text-destructive">{remove.error.message}</p>
         ) : null}
@@ -4004,10 +4034,12 @@ function DeleteBackupDialog({
           >
             {remove.isPending ? (
               <LoaderCircle className="animate-spin" />
-            ) : (
+            ) : backup.relayPresent ? (
               <Trash2 />
+            ) : (
+              <ArchiveX />
             )}
-            Delete backup
+            {backup.relayPresent ? "Delete backup" : "Forget backup"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -4181,6 +4213,10 @@ function backupIsActive(backup: Backup): boolean {
   )
 }
 
+function backupCanBeRemoved(backup: Backup): boolean {
+  return !backup.relayPresent || !backupIsActive(backup)
+}
+
 function backupSourceIsActive(backup: Backup): boolean {
   return (
     activeStatuses.has(backup.status) ||
@@ -4212,6 +4248,30 @@ const BackupModeBadge = React.memo(function BackupModeBadge({
     <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[0.625rem]">
       {mode === "incremental" ? "Incremental" : "Full"}
     </Badge>
+  )
+})
+
+const BackupFileDetails = React.memo(function BackupFileDetails({
+  bytes,
+  filename,
+  mode,
+}: {
+  bytes: number | null
+  filename: string
+  mode: Backup["backupMode"]
+}) {
+  return (
+    <div className="min-w-0">
+      <span className="block truncate" title={filename}>
+        {filename}
+      </span>
+      <div className="mt-0.5 flex items-center gap-1.5 text-xs">
+        <span className="whitespace-nowrap">
+          {bytes === null ? "—" : formatBytes(bytes)}
+        </span>
+        <BackupModeBadge mode={mode} />
+      </div>
+    </div>
   )
 })
 
