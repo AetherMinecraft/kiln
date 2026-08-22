@@ -36,6 +36,7 @@ import {
 } from "lucide-react"
 import { useNavigate, useSearch } from "@tanstack/react-router"
 import cronstrue from "cronstrue"
+import { Result } from "effect"
 
 import type { ScheduleAction, ScheduleTarget } from "@workspace/contracts"
 import {
@@ -145,7 +146,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
     ...backupStorageQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
-  const navigate = useNavigate({ from: "/schedules" })
+  const navigate = useNavigate({ from: "/automations/schedules" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
@@ -176,7 +177,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   const viewHistory = React.useCallback(
     (schedule: Schedule) => {
       void navigate({
-        to: "/schedules/history",
+        to: "/automations/history",
         search: (previous) => ({
           ...previous,
           run: undefined,
@@ -190,7 +191,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   const viewRun = React.useCallback(
     (schedule: Schedule, run: ScheduleRunWithRelay) => {
       void navigate({
-        to: "/schedules/history",
+        to: "/automations/history",
         search: (previous) => ({
           ...previous,
           run: run.id,
@@ -805,8 +806,8 @@ export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
     ...schedulesQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
-  const search = useSearch({ from: "/_app/schedules" })
-  const navigate = useNavigate({ from: "/schedules/history" })
+  const search = useSearch({ from: "/_app/automations" })
+  const navigate = useNavigate({ from: "/automations/history" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const filteredSchedule = React.useMemo(
@@ -2778,28 +2779,29 @@ function cronPreset(cron: string) {
 }
 
 function cronDescription(cron: string) {
-  try {
-    if (!validateScheduleCron(cron, "UTC")) return null
-    const normalizedCron = normalizeScheduleCron(cron)
-    const [minute = "", hour = "", dayOfMonth, month, dayOfWeek] =
-      normalizedCron.split(/\s+/u)
-    if (
-      /^\d+$/u.test(minute) &&
-      /^\d+$/u.test(hour) &&
-      dayOfMonth === "*" &&
-      month === "*" &&
-      dayOfWeek === "*"
-    ) {
-      const hourNumber = Number(hour)
-      const displayHour = hourNumber % 12 || 12
-      return `Every day at ${displayHour}:${minute.padStart(2, "0")} ${hourNumber >= 12 ? "PM" : "AM"}`
-    }
-    return cronstrue.toString(normalizedCron, {
-      throwExceptionOnParseError: true,
-    })
-  } catch {
-    return null
-  }
+  return Result.getOrElse(
+    Result.try(() => {
+      if (!validateScheduleCron(cron, "UTC")) return null
+      const normalizedCron = normalizeScheduleCron(cron)
+      const [minute = "", hour = "", dayOfMonth, month, dayOfWeek] =
+        normalizedCron.split(/\s+/u)
+      if (
+        /^\d+$/u.test(minute) &&
+        /^\d+$/u.test(hour) &&
+        dayOfMonth === "*" &&
+        month === "*" &&
+        dayOfWeek === "*"
+      ) {
+        const hourNumber = Number(hour)
+        const displayHour = hourNumber % 12 || 12
+        return `Every day at ${displayHour}:${minute.padStart(2, "0")} ${hourNumber >= 12 ? "PM" : "AM"}`
+      }
+      return cronstrue.toString(normalizedCron, {
+        throwExceptionOnParseError: true,
+      })
+    }),
+    () => null
+  )
 }
 
 function cronAliasLabel(cron: string) {

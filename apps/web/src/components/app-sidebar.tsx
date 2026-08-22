@@ -711,15 +711,15 @@ function AccountNavigation({
     <SidebarFooter>
       <SidebarMenu>
         <SidebarMenuItem>
-          <SidebarMenuButton asChild tooltip="Schedules">
+          <SidebarMenuButton asChild tooltip="Automations">
             <Link
-              to="/schedules"
+              to="/automations/schedules"
               activeOptions={{ includeSearch: false }}
               activeProps={{ "data-active": true }}
               preload="intent"
             >
               <CalendarClock />
-              <span>Schedules</span>
+              <span>Automations</span>
             </Link>
           </SidebarMenuButton>
         </SidebarMenuItem>
@@ -889,8 +889,8 @@ function statusBorderTone(state: SidebarInstance["observedState"]): string {
 
 function globalSectionFromPathname(pathname: string): GlobalSection {
   if (pathname === "/infra" || pathname.startsWith("/infra/")) return "infra"
-  if (pathname === "/schedules" || pathname.startsWith("/schedules/")) {
-    return "schedules"
+  if (pathname === "/automations" || pathname.startsWith("/automations/")) {
+    return "automations"
   }
   if (pathname === "/backups") return "backups"
   if (pathname === "/access") return "access"
