@@ -36,6 +36,7 @@ import {
 } from "lucide-react"
 import { useNavigate, useSearch } from "@tanstack/react-router"
 import cronstrue from "cronstrue"
+import { Result } from "effect"
 
 import type { ScheduleAction, ScheduleTarget } from "@workspace/contracts"
 import {
@@ -2778,28 +2779,29 @@ function cronPreset(cron: string) {
 }
 
 function cronDescription(cron: string) {
-  try {
-    if (!validateScheduleCron(cron, "UTC")) return null
-    const normalizedCron = normalizeScheduleCron(cron)
-    const [minute = "", hour = "", dayOfMonth, month, dayOfWeek] =
-      normalizedCron.split(/\s+/u)
-    if (
-      /^\d+$/u.test(minute) &&
-      /^\d+$/u.test(hour) &&
-      dayOfMonth === "*" &&
-      month === "*" &&
-      dayOfWeek === "*"
-    ) {
-      const hourNumber = Number(hour)
-      const displayHour = hourNumber % 12 || 12
-      return `Every day at ${displayHour}:${minute.padStart(2, "0")} ${hourNumber >= 12 ? "PM" : "AM"}`
-    }
-    return cronstrue.toString(normalizedCron, {
-      throwExceptionOnParseError: true,
-    })
-  } catch {
-    return null
-  }
+  return Result.getOrElse(
+    Result.try(() => {
+      if (!validateScheduleCron(cron, "UTC")) return null
+      const normalizedCron = normalizeScheduleCron(cron)
+      const [minute = "", hour = "", dayOfMonth, month, dayOfWeek] =
+        normalizedCron.split(/\s+/u)
+      if (
+        /^\d+$/u.test(minute) &&
+        /^\d+$/u.test(hour) &&
+        dayOfMonth === "*" &&
+        month === "*" &&
+        dayOfWeek === "*"
+      ) {
+        const hourNumber = Number(hour)
+        const displayHour = hourNumber % 12 || 12
+        return `Every day at ${displayHour}:${minute.padStart(2, "0")} ${hourNumber >= 12 ? "PM" : "AM"}`
+      }
+      return cronstrue.toString(normalizedCron, {
+        throwExceptionOnParseError: true,
+      })
+    }),
+    () => null
+  )
 }
 
 function cronAliasLabel(cron: string) {
