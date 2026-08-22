@@ -115,10 +115,12 @@ import {
 import {
   backupStorageQueryOptions,
   queryKeys,
+  relaySnapshotQueryOptions,
   scheduleOptionsQueryOptions,
   schedulesQueryOptions,
 } from "@/lib/query-options"
 import { getBackupStorage } from "@/server/backup-storage"
+import { getRelaySnapshot } from "@/server/relay"
 import {
   createSchedule,
   deleteSchedule,
@@ -130,6 +132,7 @@ import {
 
 type Schedule = Awaited<ReturnType<typeof getSchedules>>[number]
 type ScheduleOption = Awaited<ReturnType<typeof getScheduleOptions>>[number]
+type RelaySnapshot = Awaited<ReturnType<typeof getRelaySnapshot>>
 type BackupStorage = Awaited<ReturnType<typeof getBackupStorage>>[number]
 type EditorMode = { kind: "create" } | { kind: "edit"; schedule: Schedule }
 type ScheduleRun = Schedule["runs"][number]
@@ -151,9 +154,14 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
     ...schedulesQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
-  const { data: options } = useSuspenseQuery({
+  const { data: scheduleOptions } = useSuspenseQuery({
     ...scheduleOptionsQueryOptions(),
     notifyOnChangeProps: ["data"],
+  })
+  const { data: instances } = useSuspenseQuery({
+    ...relaySnapshotQueryOptions(),
+    notifyOnChangeProps: ["data"],
+    select: selectScheduleTargetInstances,
   })
   const { data: storage } = useSuspenseQuery({
     ...backupStorageQueryOptions(),
@@ -164,6 +172,10 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
   const [deleting, setDeleting] = React.useState<Schedule | null>(null)
+  const options = React.useMemo(
+    () => scheduleOptionsWithInstanceNames(scheduleOptions, instances),
+    [instances, scheduleOptions]
+  )
   const canCreate = options.some((option) => option.canCreate)
   const optionMap = React.useMemo(
     () => new Map(options.map((option) => [targetKey(option), option])),
@@ -1488,19 +1500,22 @@ function ScheduleEditorDialog({
 }) {
   const queryClient = useQueryClient()
   const existing = mode.kind === "edit" ? mode.schedule : null
+  const permissionKey = mode.kind === "create" ? "canCreate" : "canUpdate"
   const [name, setName] = React.useState(existing?.name ?? "")
   const [cron, setCron] = React.useState(() =>
     normalizeScheduleCron(existing?.cron ?? "daily")
   )
   const [enabled, setEnabled] = React.useState(existing?.enabled ?? true)
-  const [selectedTargets, setSelectedTargets] = React.useState(
-    () => new Set(existing?.targets.map(targetKey) ?? [])
-  )
+  const [selectedTargets, setSelectedTargets] = React.useState(() => {
+    if (existing) return new Set(existing.targets.map(targetKey))
+    const selectable = options.filter((option) => option[permissionKey])
+    const onlyTarget = selectable.length === 1 ? selectable[0] : undefined
+    return new Set(onlyTarget ? [targetKey(onlyTarget)] : [])
+  })
   const [actions, setActions] = React.useState<Array<ScheduleActionDraft>>(
     existing?.actions ?? []
   )
   const cronSummary = React.useMemo(() => cronDescription(cron), [cron])
-  const permissionKey = mode.kind === "create" ? "canCreate" : "canUpdate"
   const selectedOptions = React.useMemo(
     () => options.filter((option) => selectedTargets.has(targetKey(option))),
     [options, selectedTargets]
@@ -1610,14 +1625,19 @@ function ScheduleEditorDialog({
   const removeAction = React.useCallback((actionId: string) => {
     setActions((current) => current.filter((action) => action.id !== actionId))
   }, [])
-  const toggleTarget = React.useCallback((key: string, checked: boolean) => {
-    setSelectedTargets((current) => {
-      const next = new Set(current)
-      if (checked) next.add(key)
-      else next.delete(key)
-      return next
-    })
-  }, [])
+  const toggleTargets = React.useCallback(
+    (keys: ReadonlyArray<string>, checked: boolean) => {
+      setSelectedTargets((current) => {
+        const next = new Set(current)
+        for (const key of keys) {
+          if (checked) next.add(key)
+          else next.delete(key)
+        }
+        return next
+      })
+    },
+    []
+  )
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -1657,7 +1677,7 @@ function ScheduleEditorDialog({
             onActionReorder={reorderEditorAction}
             onCronChange={setCron}
             onNameChange={setName}
-            onTargetToggle={toggleTarget}
+            onTargetToggle={toggleTargets}
           />
 
           <DialogFooter className="flex-row flex-nowrap items-center">
@@ -1745,7 +1765,7 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   onActionReorder: (actionId: string, targetId: string) => void
   onCronChange: React.Dispatch<React.SetStateAction<string>>
   onNameChange: React.Dispatch<React.SetStateAction<string>>
-  onTargetToggle: (key: string, checked: boolean) => void
+  onTargetToggle: (keys: ReadonlyArray<string>, checked: boolean) => void
 }) {
   return (
     <div className="grid min-h-0 grid-rows-[auto_auto_minmax(0,1fr)] gap-5">
@@ -1916,14 +1936,17 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
   permissionKey: "canCreate" | "canUpdate"
   selectedOptionsCount: number
   selectedTargets: ReadonlySet<string>
-  onToggle: (key: string, checked: boolean) => void
+  onToggle: (keys: ReadonlyArray<string>, checked: boolean) => void
 }) {
   const [open, setOpen] = React.useState(false)
   const pickerOptions = React.useMemo(
     () =>
       options.map(
         (option): ServerPickerOption => ({
-          description: `${option.relayName} · ${option.kind}`,
+          description:
+            option.kind === "relay"
+              ? `Relay · ${option.id}`
+              : `${option.kind === "instance" ? "Server" : "Database"} · ${option.relayName} · ${option.id}`,
           disabled: !option[permissionKey],
           id: option.id,
           kind:
@@ -1958,10 +1981,65 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
   const selectTarget = React.useCallback(
     (option: ServerPickerOption) => {
       const key = scheduleTargetKey(option)
-      onToggle(key, !selectedTargets.has(key))
+      onToggle([key], !selectedTargets.has(key))
     },
     [onToggle, selectedTargets]
   )
+  const allOptions = React.useMemo(() => {
+    const selectable = pickerOptions.filter((option) => !option.disabled)
+    const aggregateOption = (
+      label: string,
+      description: string,
+      targets: ReadonlyArray<ServerPickerOption>,
+      kind?: "database" | "relay" | "server"
+    ) => {
+      const keys = targets.map(scheduleTargetKey)
+      const selected = keys.every((key) => selectedTargets.has(key))
+      return {
+        description,
+        kind,
+        label,
+        selected,
+        onSelect: () => onToggle(keys, !selected),
+      }
+    }
+    const servers = selectable.filter((option) => option.kind === "server")
+    const databases = selectable.filter((option) => option.kind === "database")
+    const relays = selectable.filter((option) => option.kind === "relay")
+    return [
+      selectable.length > 0
+        ? aggregateOption(
+            "All Instances",
+            "Every accessible server, database, and Relay",
+            selectable
+          )
+        : null,
+      servers.length > 0
+        ? aggregateOption(
+            "All Servers",
+            "Every accessible server",
+            servers,
+            "server"
+          )
+        : null,
+      databases.length > 0
+        ? aggregateOption(
+            "All Databases",
+            "Every accessible database",
+            databases,
+            "database"
+          )
+        : null,
+      relays.length > 0
+        ? aggregateOption(
+            "All Relays",
+            "Every accessible Relay",
+            relays,
+            "relay"
+          )
+        : null,
+    ].filter((option) => option !== null)
+  }, [onToggle, pickerOptions, selectedTargets])
   return (
     <div>
       {hideHeader ? null : (
@@ -2000,6 +2078,7 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
           className="z-[70] w-[min(34rem,calc(100vw-2rem))] p-1.5"
         >
           <ServerPickerList
+            allOptions={allOptions}
             multiple
             ariaLabel="Schedule targets"
             emptyMessage="No accessible schedule targets found."
@@ -2950,6 +3029,39 @@ function targetKey(target: Pick<ScheduleTarget, "id" | "kind" | "relayId">) {
 function scheduleTargetKey(target: ServerPickerOption) {
   const kind = target.kind === "server" ? "instance" : target.kind
   return `${target.relayId}:${kind ?? "instance"}:${target.id}`
+}
+
+function scheduleOptionsWithInstanceNames(
+  options: ReadonlyArray<ScheduleOption>,
+  instances: ReadonlyArray<{
+    id: string
+    name: string
+    relayId: string
+    relayName: string
+  }>
+): Array<ScheduleOption> {
+  const instancesById = new Map(
+    instances.map((instance) => [
+      `${instance.relayId}:${instance.id}`,
+      instance,
+    ])
+  )
+  return options.map((option) => {
+    if (option.kind !== "instance") return option
+    const instance = instancesById.get(`${option.relayId}:${option.id}`)
+    return instance
+      ? { ...option, name: instance.name, relayName: instance.relayName }
+      : option
+  })
+}
+
+function selectScheduleTargetInstances(snapshot: RelaySnapshot) {
+  return snapshot.instances.map(({ id, name, relayId, relayName }) => ({
+    id,
+    name,
+    relayId,
+    relayName,
+  }))
 }
 
 function canOperateSchedule(
