@@ -1621,9 +1621,9 @@ function ScheduleEditorDialog({
               onClick={() => setEnabled((current) => !current)}
             >
               {enabled ? (
-                <CircleCheck className="size-4" />
+                <CircleCheck className="size-3.5" />
               ) : (
-                <CirclePause className="size-4" />
+                <CirclePause className="size-3.5" />
               )}
               {enabled ? "Enabled" : "Disabled"}
             </Button>
@@ -1642,9 +1642,9 @@ function ScheduleEditorDialog({
                 disabled={!canSave || mutation.isPending}
               >
                 {mutation.isPending ? (
-                  <LoaderCircle className="size-4 animate-spin" />
+                  <LoaderCircle className="size-3.5 animate-spin" />
                 ) : (
-                  <Check className="size-4" />
+                  <Check className="size-3.5" />
                 )}
                 {existing ? "Save changes" : "Create schedule"}
               </Button>
@@ -1832,7 +1832,7 @@ const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
         <Field label="Cron">
           <Input
             aria-label="Cron expression"
-            className="font-mono text-xs"
+            className="font-mono"
             value={cron}
             maxLength={120}
             placeholder="0 0 * * *"
@@ -1936,7 +1936,7 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
             aria-expanded={open}
             className={`${hideHeader ? "" : "mt-3"} h-auto min-h-10 w-full justify-between gap-3 px-3 py-2 font-normal`}
           >
-            <span className="min-w-0 truncate text-left text-xs">
+            <span className="min-w-0 truncate text-left">
               {selectedNames.length === 0
                 ? "Select servers, databases, or Relays"
                 : selectedNames.slice(0, 3).join(", ")}
@@ -2231,7 +2231,7 @@ const ActionEditor = React.memo(function ActionEditor({
           >
             <SelectTrigger
               aria-label={`Action ${index + 1} type`}
-              className="h-8 min-w-0 flex-1 justify-start text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:text-left"
+              className="h-8 min-w-0 flex-1 justify-start text-sm font-medium [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:text-left"
             >
               {action.type === null ? (
                 <SelectValue placeholder="Select Action" />
@@ -2291,7 +2291,7 @@ const ActionEditor = React.memo(function ActionEditor({
               variant="outline"
               onClick={() => setBackupConfigOpen(true)}
             >
-              <SlidersHorizontal className="size-3.5 shrink-0" />
+              <SlidersHorizontal className="size-4 shrink-0" />
               <span className="hidden truncate sm:inline">
                 Configure Backup
               </span>
@@ -2303,7 +2303,7 @@ const ActionEditor = React.memo(function ActionEditor({
                 onChange({ ...action, action: value as typeof action.action })
               }
             >
-              <SelectTrigger className="h-8 w-20 min-w-0 sm:w-28 [&_[data-slot=select-value]]:truncate">
+              <SelectTrigger className="h-8 w-20 min-w-0 font-medium sm:w-28 [&_[data-slot=select-value]]:truncate">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -2595,7 +2595,7 @@ const CommandEditorField = React.memo(function CommandEditorField({
         variant="outline"
         onClick={openEditor}
       >
-        <SlidersHorizontal className="size-3.5 shrink-0" />
+        <SlidersHorizontal className="size-4 shrink-0" />
         <span className="hidden truncate sm:inline">Configure Command</span>
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
