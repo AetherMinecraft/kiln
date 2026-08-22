@@ -2589,7 +2589,7 @@ const CommandEditorField = React.memo(function CommandEditorField({
     <>
       <Button
         aria-label="Configure Command"
-        className="size-8 max-w-full min-w-0 justify-center truncate px-0 font-mono text-xs sm:w-fit sm:justify-start sm:px-2.5"
+        className="size-8 max-w-full min-w-0 justify-center truncate px-0 sm:w-fit sm:justify-start sm:px-2.5"
         type="button"
         title={value || "Configure Command"}
         variant="outline"
