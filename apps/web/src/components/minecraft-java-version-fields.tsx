@@ -15,6 +15,7 @@ import { BrickVersionPicker } from "@/components/brick-version-picker"
 import { brickArtifactCatalog } from "@/lib/brick-artifact"
 import {
   javaVersionSelectOptions,
+  latestStableVersion,
   recommendedSupportedJavaVersion,
   stringVariableAllows,
 } from "@/lib/brick-variables"
@@ -52,6 +53,7 @@ export const MinecraftJavaVersionFields = React.memo(
     javaVersion,
     onJavaVersionChange,
     onVersionChange,
+    selectLatestByDefault = false,
     variableDefinitions,
     version,
     versionInputName,
@@ -63,6 +65,7 @@ export const MinecraftJavaVersionFields = React.memo(
     javaVersion: string
     onJavaVersionChange: (value: string) => void
     onVersionChange: (value: string) => void
+    selectLatestByDefault?: boolean
     variableDefinitions: Brick["variables"]
     version: string
     versionInputName?: string
@@ -82,6 +85,12 @@ export const MinecraftJavaVersionFields = React.memo(
       versionDefinition?.default === undefined
         ? ""
         : String(versionDefinition.default)
+    const [draftVersion, setDraftVersion] = React.useState(version)
+    const [draftJavaVersion, setDraftJavaVersion] = React.useState(javaVersion)
+    const fieldVersion = selectLatestByDefault ? draftVersion : version
+    const fieldJavaVersion = selectLatestByDefault
+      ? draftJavaVersion
+      : javaVersion
     const versions = React.useMemo(
       () =>
         versionDefinition
@@ -93,6 +102,10 @@ export const MinecraftJavaVersionFields = React.memo(
           : [],
       [defaultVersion, versionDefinition, versionsQuery.data?.versions]
     )
+    const latestVersion = React.useMemo(
+      () => latestStableVersion(versions),
+      [versions]
+    )
     const usePicker =
       catalog !== null &&
       !versionsQuery.isError &&
@@ -103,22 +116,73 @@ export const MinecraftJavaVersionFields = React.memo(
     const javaVersions = React.useMemo(
       () =>
         javaDefinition
-          ? javaVersionSelectOptions(javaDefinition, javaVersion)
+          ? javaVersionSelectOptions(javaDefinition, fieldJavaVersion)
           : [],
-      [javaDefinition, javaVersion]
+      [fieldJavaVersion, javaDefinition]
+    )
+    const recommendedJavaForVersion = React.useCallback(
+      (nextVersion: string) =>
+        javaDefinition
+          ? recommendedSupportedJavaVersion(
+              brickId,
+              javaDefinition,
+              nextVersion
+            )
+          : null,
+      [brickId, javaDefinition]
     )
     const changeVersion = React.useCallback(
       (nextVersion: string) => {
+        if (selectLatestByDefault) setDraftVersion(nextVersion)
         onVersionChange(nextVersion)
-        if (!javaDefinition) return
-        const nextJava = recommendedSupportedJavaVersion(
-          brickId,
-          javaDefinition,
-          nextVersion
-        )
-        if (nextJava) onJavaVersionChange(nextJava)
+        const nextJava = recommendedJavaForVersion(nextVersion)
+        if (!nextJava) return
+        if (selectLatestByDefault) setDraftJavaVersion(nextJava)
+        onJavaVersionChange(nextJava)
       },
-      [brickId, javaDefinition, onJavaVersionChange, onVersionChange]
+      [
+        onJavaVersionChange,
+        onVersionChange,
+        recommendedJavaForVersion,
+        selectLatestByDefault,
+      ]
+    )
+    const handleJavaVersionChange = React.useCallback(
+      (nextJava: string) => {
+        if (selectLatestByDefault) setDraftJavaVersion(nextJava)
+        onJavaVersionChange(nextJava)
+      },
+      [onJavaVersionChange, selectLatestByDefault]
+    )
+    const automaticVersionRef = React.useRef<string | null>(fieldVersion)
+
+    React.useEffect(() => {
+      if (
+        !selectLatestByDefault ||
+        !latestVersion ||
+        automaticVersionRef.current !== fieldVersion ||
+        latestVersion === fieldVersion
+      ) {
+        return
+      }
+
+      automaticVersionRef.current = latestVersion
+      setDraftVersion(latestVersion)
+      const nextJava = recommendedJavaForVersion(latestVersion)
+      if (nextJava) setDraftJavaVersion(nextJava)
+    }, [
+      fieldVersion,
+      latestVersion,
+      recommendedJavaForVersion,
+      selectLatestByDefault,
+    ])
+
+    const handleVersionChange = React.useCallback(
+      (nextVersion: string) => {
+        automaticVersionRef.current = null
+        changeVersion(nextVersion)
+      },
+      [changeVersion]
     )
 
     if (!versionDefinition || versionDefinition.type !== "string") return null
@@ -136,7 +200,7 @@ export const MinecraftJavaVersionFields = React.memo(
               <BrickVersionPicker
                 labelledBy={labelId}
                 name={versionInputName ?? "version"}
-                value={version}
+                value={fieldVersion}
                 versions={versions}
                 disabled={disabled}
                 loading={versionsQuery.isPending}
@@ -144,14 +208,16 @@ export const MinecraftJavaVersionFields = React.memo(
                 minLength={versionDefinition.rules?.minLength}
                 pattern={versionDefinition.rules?.pattern}
                 required={required}
-                onChange={changeVersion}
+                onChange={handleVersionChange}
               />
             ) : (
               <Input
                 aria-labelledby={labelId}
                 name={versionInputName ?? "version"}
-                value={version}
-                onChange={(event) => changeVersion(event.currentTarget.value)}
+                value={fieldVersion}
+                onChange={(event) =>
+                  handleVersionChange(event.currentTarget.value)
+                }
                 placeholder="Enter a version"
                 pattern={versionDefinition.rules?.pattern}
                 minLength={versionDefinition.rules?.minLength}
@@ -180,12 +246,12 @@ export const MinecraftJavaVersionFields = React.memo(
                     <input
                       type="hidden"
                       name={javaInputName}
-                      value={javaVersion}
+                      value={fieldJavaVersion}
                     />
                   ) : null}
                   <Select
-                    value={javaVersion}
-                    onValueChange={onJavaVersionChange}
+                    value={fieldJavaVersion}
+                    onValueChange={handleJavaVersionChange}
                     disabled={disabled}
                   >
                     <SelectTrigger
@@ -211,9 +277,9 @@ export const MinecraftJavaVersionFields = React.memo(
                 <Input
                   aria-labelledby={javaLabelId}
                   name={javaInputName ?? "java_version"}
-                  value={javaVersion}
+                  value={fieldJavaVersion}
                   onChange={(event) =>
-                    onJavaVersionChange(event.currentTarget.value)
+                    handleJavaVersionChange(event.currentTarget.value)
                   }
                   placeholder="Java"
                   pattern={javaDefinition.rules?.pattern}

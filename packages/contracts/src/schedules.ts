@@ -12,16 +12,22 @@ export const scheduleActionTypeSchema = z.enum([
   "console_command",
   "backup",
   "power",
+  "wait",
 ])
 
 export type ScheduleActionType = z.infer<typeof scheduleActionTypeSchema>
 
 const scheduleActionIdSchema = z.uuid()
+const scheduleActionTargetKeysSchema = z
+  .array(z.string().trim().min(1).max(512))
+  .max(2_000)
+  .optional()
 
 export const scheduleConsoleCommandActionSchema = z
   .object({
     command: z.string().trim().min(1).max(4_096),
     id: scheduleActionIdSchema,
+    targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("console_command"),
   })
   .strict()
@@ -41,7 +47,13 @@ export const scheduleBackupActionSchema = z
       .default({ kind: "local" }),
     id: scheduleActionIdSchema,
     mode: backupModeSchema.default("full"),
-    name: z.string().trim().min(1).max(120).default("Scheduled backup"),
+    name: z
+      .string()
+      .trim()
+      .max(120)
+      .transform((name) => name || "Scheduled backup")
+      .default("Scheduled backup"),
+    targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("backup"),
   })
   .strict()
@@ -50,7 +62,31 @@ export const schedulePowerActionSchema = z
   .object({
     action: z.enum(["start", "stop", "restart", "kill"]),
     id: scheduleActionIdSchema,
+    targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("power"),
+  })
+  .strict()
+
+export const scheduleWaitUnitSchema = z.enum([
+  "milliseconds",
+  "seconds",
+  "minutes",
+  "hours",
+  "days",
+])
+
+export type ScheduleWaitUnit = z.infer<typeof scheduleWaitUnitSchema>
+
+export const scheduleWaitActionSchema = z
+  .object({
+    duration: z
+      .number()
+      .int()
+      .positive()
+      .max(Math.floor(Number.MAX_SAFE_INTEGER / 86_400_000)),
+    id: scheduleActionIdSchema,
+    type: z.literal("wait"),
+    unit: scheduleWaitUnitSchema.default("seconds"),
   })
   .strict()
 
@@ -58,6 +94,7 @@ export const scheduleActionSchema = z.discriminatedUnion("type", [
   scheduleConsoleCommandActionSchema,
   scheduleBackupActionSchema,
   schedulePowerActionSchema,
+  scheduleWaitActionSchema,
 ])
 
 export type ScheduleAction = z.infer<typeof scheduleActionSchema>
@@ -172,6 +209,28 @@ export const scheduleDefinitionSchema = scheduleInputSchema
         path: ["targets"],
       })
     }
+    for (const [actionIndex, action] of schedule.actions.entries()) {
+      if (action.type === "wait") continue
+      if (action.targetKeys === undefined) continue
+      const seenTargetKeys = new Set<string>()
+      for (const targetKey of action.targetKeys) {
+        if (seenTargetKeys.has(targetKey)) {
+          context.addIssue({
+            code: "custom",
+            message: "Action target overrides must be unique",
+            path: ["actions", actionIndex, "targetKeys"],
+          })
+        }
+        seenTargetKeys.add(targetKey)
+        if (!targetIds.has(targetKey)) {
+          context.addIssue({
+            code: "custom",
+            message: "Action target overrides must reference selected targets",
+            path: ["actions", actionIndex, "targetKeys"],
+          })
+        }
+      }
+    }
   })
 
 export type ScheduleDefinition = z.infer<typeof scheduleDefinitionSchema>
@@ -201,6 +260,7 @@ export const relayScheduleActionSchema = z.discriminatedUnion("type", [
   scheduleConsoleCommandActionSchema,
   relayScheduleBackupActionSchema,
   schedulePowerActionSchema,
+  scheduleWaitActionSchema,
 ])
 
 export type RelayScheduleAction = z.infer<typeof relayScheduleActionSchema>
@@ -255,6 +315,8 @@ export const scheduleActionAttemptSchema = z
   })
   .strict()
 
+export type ScheduleActionAttempt = z.infer<typeof scheduleActionAttemptSchema>
+
 export const scheduleTargetRunSchema = z
   .object({
     attempts: z.array(scheduleActionAttemptSchema).max(32),
@@ -274,6 +336,7 @@ export const scheduleRunSchema = z
     revision: z.number().int().positive(),
     scheduleId: z.uuid(),
     scheduledAt: z.number().int().nonnegative(),
+    sequenceAttempts: z.array(scheduleActionAttemptSchema).max(32).default([]),
     startedAt: z.number().int().nonnegative(),
     status: scheduleRunStatusSchema,
     targetRuns: z.array(scheduleTargetRunSchema).max(2_000),
@@ -325,6 +388,34 @@ export function scheduleDeterministicUuid(
   return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`
 }
 
+export function resolveScheduleBackupName(
+  template: string,
+  context: {
+    backupId: string
+    instanceId: string
+    runId: string
+    scheduleId: string
+    scheduleName: string
+    timestamp: number
+  }
+) {
+  const isoTimestamp = new Date(context.timestamp).toISOString()
+  const timestamp = `${isoTimestamp.slice(0, 10).replaceAll("-", ".")}-${isoTimestamp.slice(11, 19).replaceAll(":", ".")}Z`
+  const tags: Record<string, string> = {
+    "<backup_id>": context.backupId,
+    "<instance_id>": context.instanceId,
+    "<run_id>": context.runId,
+    "<schedule>": context.scheduleName,
+    "<schedule_id>": context.scheduleId,
+    "<timestamp>": timestamp,
+  }
+  const resolved = template.replaceAll(
+    /<(?:backup_id|instance_id|run_id|schedule|schedule_id|timestamp)>/gu,
+    (tag) => tags[tag] ?? tag
+  )
+  return resolved.slice(0, 120)
+}
+
 export function scheduleActionSupportsTarget(
   action: {
     action?: "kill" | "restart" | "start" | "stop"
@@ -333,6 +424,7 @@ export function scheduleActionSupportsTarget(
   },
   target: Pick<ScheduleTarget, "kind">
 ): boolean {
+  if (action.type === "wait") return true
   if (action.type === "console_command") return target.kind === "instance"
   if (action.type === "power") {
     return (
@@ -342,4 +434,27 @@ export function scheduleActionSupportsTarget(
   }
   if (action.mode === "incremental") return target.kind === "instance"
   return true
+}
+
+export function scheduleTargetKey(
+  target: Pick<ScheduleTarget, "id" | "kind" | "relayId">
+) {
+  return `${target.relayId}:${target.kind}:${target.id}`
+}
+
+export function scheduleActionAppliesToTarget(
+  action: {
+    targetKeys?: ReadonlyArray<string>
+    action?: "kill" | "restart" | "start" | "stop"
+    mode?: "full" | "incremental"
+    type: ScheduleActionType
+  },
+  target: ScheduleTarget
+) {
+  if (action.type === "wait") return true
+  return (
+    scheduleActionSupportsTarget(action, target) &&
+    (action.targetKeys === undefined ||
+      action.targetKeys.includes(scheduleTargetKey(target)))
+  )
 }

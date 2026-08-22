@@ -14,6 +14,8 @@ import {
   supportedJavaVersions,
   unavailableMinecraftJavaVersion,
   canPairMinecraftJavaVersionFields,
+  defaultBrickInstanceName,
+  latestStableVersion,
   interpolateBrickTemplate,
   javaVersionSelectOptions,
   usesLongStringBrickField,
@@ -63,6 +65,22 @@ const paper = brickRecipeSchema.parse({
 })
 
 describe("Minecraft Java defaults", () => {
+  it("selects the newest stable version over snapshots and prereleases", () => {
+    expect(
+      latestStableVersion(["26.3-snapshot-9", "26.2", "26.2-rc-2", "26.1.2"])
+    ).toBe("26.2")
+    expect(latestStableVersion(["1.21.9", "1.21.11", "1.21.10"])).toBe(
+      "1.21.11"
+    )
+    expect(latestStableVersion(["26.3-snapshot-9"])).toBeNull()
+  })
+
+  it("uses a brick name without its version for the server default", () => {
+    expect(defaultBrickInstanceName({ ...paper, source: "paper.yml" })).toBe(
+      "Your Paper Server"
+    )
+  })
+
   it.each([
     ["paper", "1.16.4", "11"],
     ["paper", "1.17.1", "17"],

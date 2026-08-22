@@ -6,6 +6,8 @@ import {
   useSuspenseQuery,
 } from "@tanstack/react-query"
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
   ChevronDown,
   CirclePause,
@@ -17,9 +19,9 @@ import {
   Copy,
   Database,
   EllipsisVertical,
+  GripVertical,
   HardDriveDownload,
   History,
-  GripVertical,
   LoaderCircle,
   Pencil,
   Play,
@@ -28,16 +30,23 @@ import {
   RefreshCw,
   Search,
   Server,
+  SlidersHorizontal,
+  Timer,
   Trash2,
+  TriangleAlert,
   X,
 } from "lucide-react"
 import { useNavigate, useSearch } from "@tanstack/react-router"
+import cronstrue from "cronstrue"
+import { Result } from "effect"
 
 import type { ScheduleAction, ScheduleTarget } from "@workspace/contracts"
 import {
   normalizeScheduleCron,
+  scheduleActionAppliesToTarget,
   scheduleActionSupportsTarget,
   scheduleCronAliases,
+  validateScheduleCron,
 } from "@workspace/contracts"
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
@@ -69,7 +78,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@workspace/ui/components/select"
+import { Separator } from "@workspace/ui/components/separator"
 import { showToast } from "@workspace/ui/components/sonner"
+import { Textarea } from "@workspace/ui/components/textarea"
 import {
   Tooltip,
   TooltipContent,
@@ -84,22 +95,32 @@ import {
   createWorkspaceTableSearchStore,
   useWorkspaceTableSearchInput,
 } from "@/components/workspace-data-table"
-import { BrickVersionPicker } from "@/components/brick-version-picker"
 import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
 import {
   ServerPickerList,
   serverPickerOptionKey,
   type ServerPickerOption,
 } from "@/components/server-picker-list"
+import {
+  BackupConfigurationDialog,
+  type BackupConfigurationTarget,
+} from "@/components/backup-configuration-dialog"
+import { BackupIcon } from "@/components/backup-icon"
 import { useScheduleScope } from "@/components/schedule-scope"
 import { forkPromise } from "@/effect/promise"
 import {
+  scheduleBackupAllowsIncremental,
+  scheduleBackupDestination,
+} from "@/lib/schedule-backup-configuration"
+import {
   backupStorageQueryOptions,
   queryKeys,
+  relaySnapshotQueryOptions,
   scheduleOptionsQueryOptions,
   schedulesQueryOptions,
 } from "@/lib/query-options"
 import { getBackupStorage } from "@/server/backup-storage"
+import { getRelaySnapshot } from "@/server/relay"
 import {
   createSchedule,
   deleteSchedule,
@@ -111,10 +132,12 @@ import {
 
 type Schedule = Awaited<ReturnType<typeof getSchedules>>[number]
 type ScheduleOption = Awaited<ReturnType<typeof getScheduleOptions>>[number]
+type RelaySnapshot = Awaited<ReturnType<typeof getRelaySnapshot>>
 type BackupStorage = Awaited<ReturnType<typeof getBackupStorage>>[number]
 type EditorMode = { kind: "create" } | { kind: "edit"; schedule: Schedule }
 type ScheduleRun = Schedule["runs"][number]
 type ScheduleRunWithRelay = ScheduleRun & { relayId: string }
+type ScheduleActionDraft = ScheduleAction | { id: string; type: null }
 
 const relativeFormatter = new Intl.RelativeTimeFormat("en-US", {
   numeric: "auto",
@@ -126,26 +149,33 @@ const relativeClockListeners = new Set<() => void>()
 let relativeClockSnapshot = Date.now()
 let relativeClockTimer: ReturnType<typeof setInterval> | null = null
 
-const timezones = Intl.supportedValuesOf("timeZone")
-
 export const SchedulesPage = React.memo(function SchedulesPage() {
   const { data: schedules } = useSuspenseQuery({
     ...schedulesQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
-  const { data: options } = useSuspenseQuery({
+  const { data: scheduleOptions } = useSuspenseQuery({
     ...scheduleOptionsQueryOptions(),
     notifyOnChangeProps: ["data"],
+  })
+  const { data: instances } = useSuspenseQuery({
+    ...relaySnapshotQueryOptions(),
+    notifyOnChangeProps: ["data"],
+    select: selectScheduleTargetInstances,
   })
   const { data: storage } = useSuspenseQuery({
     ...backupStorageQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
-  const navigate = useNavigate({ from: "/schedules" })
+  const navigate = useNavigate({ from: "/automations/schedules" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
   const [deleting, setDeleting] = React.useState<Schedule | null>(null)
+  const options = React.useMemo(
+    () => scheduleOptionsWithInstanceNames(scheduleOptions, instances),
+    [instances, scheduleOptions]
+  )
   const canCreate = options.some((option) => option.canCreate)
   const optionMap = React.useMemo(
     () => new Map(options.map((option) => [targetKey(option), option])),
@@ -172,7 +202,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   const viewHistory = React.useCallback(
     (schedule: Schedule) => {
       void navigate({
-        to: "/schedules/history",
+        to: "/automations/history",
         search: (previous) => ({
           ...previous,
           run: undefined,
@@ -186,7 +216,7 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   const viewRun = React.useCallback(
     (schedule: Schedule, run: ScheduleRunWithRelay) => {
       void navigate({
-        to: "/schedules/history",
+        to: "/automations/history",
         search: (previous) => ({
           ...previous,
           run: run.id,
@@ -749,7 +779,10 @@ function ScheduleLastRun({
 }
 
 function latestRunResult(run: ScheduleRunWithRelay) {
-  const attempts = run.targetRuns.flatMap((targetRun) => targetRun.attempts)
+  const attempts = [
+    ...run.sequenceAttempts,
+    ...run.targetRuns.flatMap((targetRun) => targetRun.attempts),
+  ]
   const passed = attempts.filter((attempt) => attempt.status === "succeeded")
   const failed = attempts.filter((attempt) =>
     ["failed", "interrupted", "not_run"].includes(attempt.status)
@@ -782,7 +815,7 @@ function EmptyScheduleTable({
       </p>
       <p className="mt-1 max-w-sm text-[0.625rem] leading-4 text-muted-foreground">
         {searchActive
-          ? "Try a schedule name, cron expression, timezone, action, or target."
+          ? "Try a schedule name, cron expression, action, or target."
           : scopeActive
             ? "Choose another instance or create a schedule for this target."
             : "Create Relay-owned automation that keeps running when Hearth is offline."}
@@ -801,8 +834,8 @@ export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
     ...schedulesQueryOptions(),
     notifyOnChangeProps: ["data"],
   })
-  const search = useSearch({ from: "/_app/schedules" })
-  const navigate = useNavigate({ from: "/schedules/history" })
+  const search = useSearch({ from: "/_app/automations" })
+  const navigate = useNavigate({ from: "/automations/history" })
   const selectedScope = useScheduleScope()
   const [searchStore] = React.useState(createWorkspaceTableSearchStore)
   const filteredSchedule = React.useMemo(
@@ -1207,6 +1240,34 @@ const ScheduleRunDialog = React.memo(function ScheduleRunDialog({
                 </dl>
               </section>
 
+              {run.sequenceAttempts.length > 0 ? (
+                <section className="border-b px-5 py-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <h3 className="text-xs font-semibold">
+                        Sequence activity
+                      </h3>
+                      <p className="mt-0.5 text-[0.625rem] text-muted-foreground">
+                        Waits pause the sequence once between target actions.
+                      </p>
+                    </div>
+                    <Badge
+                      variant="outline"
+                      className="font-mono text-[0.5625rem]"
+                    >
+                      {run.sequenceAttempts.length} attempts
+                    </Badge>
+                  </div>
+                  <div className="mt-4 overflow-hidden rounded-lg border bg-background/35">
+                    <ActionAttemptAudit
+                      actionsById={actionsById}
+                      attempts={run.sequenceAttempts}
+                      timezone={run.timezone}
+                    />
+                  </div>
+                </section>
+              ) : null}
+
               <section className="px-5 py-4">
                 <div className="flex items-center justify-between gap-4">
                   <div>
@@ -1342,44 +1403,62 @@ function TargetRunAudit({
           No actions were attempted.
         </p>
       ) : (
-        <ol className="divide-y divide-border/70">
-          {run.attempts.map((attempt, index) => {
-            const action = actionsById.get(attempt.actionId)
-            return (
-              <li key={attempt.id} className="flex gap-3 px-3 py-3">
-                <span className="relative mt-0.5 grid size-5 shrink-0 place-items-center rounded-full border bg-background font-mono text-[0.5rem] text-muted-foreground">
-                  {index + 1}
-                </span>
-                <ActionIcon
-                  type={attempt.actionType}
-                  className="mt-1 size-3.5 shrink-0 text-primary"
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <p className="text-[0.6875rem] font-semibold">
-                      {actionLabel(attempt.actionType)}
-                    </p>
-                    <AttemptStatus status={attempt.status} />
-                  </div>
-                  <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
-                    {actionAuditSummary(action, attempt.actionId)}
-                  </p>
-                  <p className="mt-1 text-[0.5625rem] text-muted-foreground">
-                    {timestampLabel(new Date(attempt.startedAt), timezone)} ·{" "}
-                    {durationLabel(attempt.finishedAt - attempt.startedAt)}
-                  </p>
-                  {attempt.error ? (
-                    <p className="mt-2 rounded-md border border-destructive/20 bg-destructive/5 px-2.5 py-2 text-[0.625rem] leading-4 text-destructive">
-                      {attempt.error}
-                    </p>
-                  ) : null}
-                </div>
-              </li>
-            )
-          })}
-        </ol>
+        <ActionAttemptAudit
+          actionsById={actionsById}
+          attempts={run.attempts}
+          timezone={timezone}
+        />
       )}
     </article>
+  )
+}
+
+function ActionAttemptAudit({
+  actionsById,
+  attempts,
+  timezone,
+}: {
+  actionsById: ReadonlyMap<string, ScheduleAction>
+  attempts: ReadonlyArray<ScheduleHistoryRun["sequenceAttempts"][number]>
+  timezone: string
+}) {
+  return (
+    <ol className="divide-y divide-border/70">
+      {attempts.map((attempt, index) => {
+        const action = actionsById.get(attempt.actionId)
+        return (
+          <li key={attempt.id} className="flex gap-3 px-3 py-3">
+            <span className="relative mt-0.5 grid size-5 shrink-0 place-items-center rounded-full border bg-background font-mono text-[0.5rem] text-muted-foreground">
+              {index + 1}
+            </span>
+            <ActionIcon
+              type={attempt.actionType}
+              className="mt-1 size-3.5 shrink-0 text-primary"
+            />
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <p className="text-[0.6875rem] font-semibold">
+                  {actionLabel(attempt.actionType)}
+                </p>
+                <AttemptStatus status={attempt.status} />
+              </div>
+              <p className="mt-0.5 truncate font-mono text-[0.5625rem] text-muted-foreground">
+                {actionAuditSummary(action, attempt.actionId)}
+              </p>
+              <p className="mt-1 text-[0.5625rem] text-muted-foreground">
+                {timestampLabel(new Date(attempt.startedAt), timezone)} ·{" "}
+                {durationLabel(attempt.finishedAt - attempt.startedAt)}
+              </p>
+              {attempt.error ? (
+                <p className="mt-2 rounded-md border border-destructive/20 bg-destructive/5 px-2.5 py-2 text-[0.625rem] leading-4 text-destructive">
+                  {attempt.error}
+                </p>
+              ) : null}
+            </div>
+          </li>
+        )
+      })}
+    </ol>
   )
 }
 
@@ -1421,55 +1500,63 @@ function ScheduleEditorDialog({
 }) {
   const queryClient = useQueryClient()
   const existing = mode.kind === "edit" ? mode.schedule : null
-  const isCreate = mode.kind === "create"
+  const permissionKey = mode.kind === "create" ? "canCreate" : "canUpdate"
   const [name, setName] = React.useState(existing?.name ?? "")
   const [cron, setCron] = React.useState(() =>
     normalizeScheduleCron(existing?.cron ?? "daily")
   )
-  const [timezone, setTimezone] = React.useState(
-    existing?.timezone ?? localTimezone()
-  )
-  const timezoneLabelId = React.useId()
   const [enabled, setEnabled] = React.useState(existing?.enabled ?? true)
-  const [selectedTargets, setSelectedTargets] = React.useState(
-    () => new Set(existing?.targets.map(targetKey) ?? [])
-  )
-  const [actions, setActions] = React.useState<Array<ScheduleAction>>(
+  const [selectedTargets, setSelectedTargets] = React.useState(() => {
+    if (existing) return new Set(existing.targets.map(targetKey))
+    const selectable = options.filter((option) => option[permissionKey])
+    const onlyTarget = selectable.length === 1 ? selectable[0] : undefined
+    return new Set(onlyTarget ? [targetKey(onlyTarget)] : [])
+  })
+  const [actions, setActions] = React.useState<Array<ScheduleActionDraft>>(
     existing?.actions ?? []
   )
-  const permissionKey = mode.kind === "create" ? "canCreate" : "canUpdate"
+  const cronSummary = React.useMemo(() => cronDescription(cron), [cron])
   const selectedOptions = React.useMemo(
     () => options.filter((option) => selectedTargets.has(targetKey(option))),
     [options, selectedTargets]
   )
-  const actionPermissions = React.useMemo(
-    () => ({
-      backup: scheduleActionAllowed("backup", selectedOptions, permissionKey),
-      console_command: scheduleActionAllowed(
-        "console_command",
-        selectedOptions,
-        permissionKey
-      ),
-      power: scheduleActionAllowed("power", selectedOptions, permissionKey),
-    }),
-    [permissionKey, selectedOptions]
-  )
-  const actionSelectionValid = actions.every((action) =>
-    scheduleActionAllowed(action, selectedOptions, permissionKey)
+  const completeActions = React.useMemo(() => {
+    const selectedTargetKeys = new Set(
+      selectedOptions.map((option) => targetKey(option))
+    )
+    const complete: Array<ScheduleAction> = []
+    for (const action of actions) {
+      if (!isCompleteScheduleAction(action)) continue
+      complete.push(
+        action.type === "wait" || action.targetKeys === undefined
+          ? action
+          : {
+              ...action,
+              targetKeys: action.targetKeys.filter((key) =>
+                selectedTargetKeys.has(key)
+              ),
+            }
+      )
+    }
+    return complete
+  }, [actions, selectedOptions])
+  const actionSelectionValid = completeActions.every((action) =>
+    scheduleActionPermitted(action, selectedOptions, permissionKey)
   )
   const canSave =
     name.trim().length > 0 &&
-    cron.trim().length > 0 &&
-    timezone.trim().length > 0 &&
+    cronSummary !== null &&
     selectedOptions.length > 0 &&
     selectedOptions.every((option) => option[permissionKey]) &&
     actions.length > 0 &&
+    actions.length === completeActions.length &&
+    completeActions.every(scheduleActionIsConfigured) &&
     actionSelectionValid
 
   const mutation = useMutation({
     mutationFn: async () => {
       const data = {
-        actions,
+        actions: completeActions,
         cron,
         enabled,
         name,
@@ -1484,7 +1571,9 @@ function ScheduleEditorDialog({
             ...target
           }) => target
         ),
-        timezone,
+        // Kept for persisted schedule compatibility. Relays evaluate cron in
+        // their own local timezone.
+        timezone: existing?.timezone ?? "UTC",
       }
       return existing
         ? updateSchedule({
@@ -1507,28 +1596,13 @@ function ScheduleEditorDialog({
       }),
   })
 
-  const addAction = React.useCallback(
-    (type: ScheduleAction["type"]) => {
-      if (!actionPermissions[type]) return
-      const id = crypto.randomUUID()
-      setActions((current) => [
-        ...current,
-        type === "console_command"
-          ? { command: "", id, type }
-          : type === "backup"
-            ? {
-                destination: { kind: "local" },
-                id,
-                mode: "full",
-                name: "Scheduled backup",
-                type,
-              }
-            : { action: "restart", id, type },
-      ])
-    },
-    [actionPermissions]
-  )
-  const updateAction = React.useCallback((next: ScheduleAction) => {
+  const addAction = React.useCallback(() => {
+    setActions((current) => [
+      ...current,
+      { id: crypto.randomUUID(), type: null },
+    ])
+  }, [])
+  const updateAction = React.useCallback((next: ScheduleActionDraft) => {
     setActions((current) =>
       current.map((item) => (item.id === next.id ? next : item))
     )
@@ -1551,26 +1625,30 @@ function ScheduleEditorDialog({
   const removeAction = React.useCallback((actionId: string) => {
     setActions((current) => current.filter((action) => action.id !== actionId))
   }, [])
-  const toggleTarget = React.useCallback((key: string, checked: boolean) => {
-    setSelectedTargets((current) => {
-      const next = new Set(current)
-      if (checked) next.add(key)
-      else next.delete(key)
-      return next
-    })
-  }, [])
+  const toggleTargets = React.useCallback(
+    (keys: ReadonlyArray<string>, checked: boolean) => {
+      setSelectedTargets((current) => {
+        const next = new Set(current)
+        for (const key of keys) {
+          if (checked) next.add(key)
+          else next.delete(key)
+        }
+        return next
+      })
+    },
+    []
+  )
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[min(90dvh,56rem)] overflow-y-auto sm:max-w-3xl">
+      <DialogContent className="grid h-[min(90dvh,56rem)] max-h-none grid-rows-[auto_minmax(0,1fr)] gap-4 overflow-hidden sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>
             {existing ? "Edit schedule" : "Create schedule"}
           </DialogTitle>
-          <DialogDescription>
-            {isCreate
-              ? "Automation that keeps running even when Hearth is offline."
-              : "Actions run in order on every compatible target. Unsupported actions are skipped without failing the run."}
+          <DialogDescription className="sr-only">
+            Configure when this schedule runs, which targets it applies to, and
+            the actions it performs.
           </DialogDescription>
         </DialogHeader>
 
@@ -1578,22 +1656,20 @@ function ScheduleEditorDialog({
           action={() => {
             if (canSave && !mutation.isPending) mutation.mutate()
           }}
-          className="space-y-6"
+          className="grid min-h-0 grid-rows-[minmax(0,1fr)_auto] gap-5"
         >
           <ScheduleEditorFields
-            actionPermissions={actionPermissions}
             actionSelectionValid={actionSelectionValid}
             actions={actions}
             cron={cron}
-            isCreate={isCreate}
+            cronSummary={cronSummary}
             name={name}
             options={options}
             permissionKey={permissionKey}
+            selectedOptions={selectedOptions}
             selectedOptionsCount={selectedOptions.length}
             selectedTargets={selectedTargets}
             storage={storage}
-            timezone={timezone}
-            timezoneLabelId={timezoneLabelId}
             onActionAdd={addAction}
             onActionChange={updateAction}
             onActionMove={moveEditorAction}
@@ -1601,40 +1677,48 @@ function ScheduleEditorDialog({
             onActionReorder={reorderEditorAction}
             onCronChange={setCron}
             onNameChange={setName}
-            onTargetToggle={toggleTarget}
-            onTimezoneChange={setTimezone}
+            onTargetToggle={toggleTargets}
           />
 
-          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-background/30 px-3 py-3">
-            <span>
-              <span className="block text-xs font-semibold">
-                Schedule enabled
-              </span>
-              <span className="block text-[0.625rem] text-muted-foreground">
-                Disabled schedules remain deployed but do not run.
-              </span>
-            </span>
-            <input
-              aria-label="Schedule enabled"
-              type="checkbox"
-              className="size-4 accent-primary"
-              checked={enabled}
-              onChange={(event) => setEnabled(event.target.checked)}
-            />
-          </label>
-
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={!canSave || mutation.isPending}>
-              {mutation.isPending ? (
-                <LoaderCircle className="size-4 animate-spin" />
+          <DialogFooter className="flex-row flex-nowrap items-center">
+            <Button
+              aria-label={`Schedule is ${enabled ? "enabled" : "disabled"}. Click to ${enabled ? "disable" : "enable"}.`}
+              aria-pressed={enabled}
+              className={`mr-auto ${enabled ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15 hover:text-emerald-300" : "text-muted-foreground"}`}
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => setEnabled((current) => !current)}
+            >
+              {enabled ? (
+                <CircleCheck className="size-3.5" />
               ) : (
-                <Check className="size-4" />
+                <CirclePause className="size-3.5" />
               )}
-              {existing ? "Save changes" : "Create schedule"}
+              {enabled ? "Enabled" : "Disabled"}
             </Button>
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                size="sm"
+                type="button"
+                variant="outline"
+                onClick={onClose}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                type="submit"
+                disabled={!canSave || mutation.isPending}
+              >
+                {mutation.isPending ? (
+                  <LoaderCircle className="size-3.5 animate-spin" />
+                ) : (
+                  <Check className="size-3.5" />
+                )}
+                {existing ? "Save changes" : "Create schedule"}
+              </Button>
+            </div>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -1643,19 +1727,17 @@ function ScheduleEditorDialog({
 }
 
 const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
-  actionPermissions,
   actionSelectionValid,
   actions,
   cron,
-  isCreate,
+  cronSummary,
   name,
   options,
   permissionKey,
+  selectedOptions,
   selectedOptionsCount,
   selectedTargets,
   storage,
-  timezone,
-  timezoneLabelId,
   onActionAdd,
   onActionChange,
   onActionMove,
@@ -1664,90 +1746,42 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
   onCronChange,
   onNameChange,
   onTargetToggle,
-  onTimezoneChange,
 }: {
-  actionPermissions: Readonly<Record<ScheduleAction["type"], boolean>>
   actionSelectionValid: boolean
-  actions: ReadonlyArray<ScheduleAction>
+  actions: ReadonlyArray<ScheduleActionDraft>
   cron: string
-  isCreate: boolean
+  cronSummary: string | null
   name: string
   options: ReadonlyArray<ScheduleOption>
   permissionKey: "canCreate" | "canUpdate"
+  selectedOptions: ReadonlyArray<ScheduleOption>
   selectedOptionsCount: number
   selectedTargets: ReadonlySet<string>
   storage: ReadonlyArray<BackupStorage>
-  timezone: string
-  timezoneLabelId: string
-  onActionAdd: (type: ScheduleAction["type"]) => void
-  onActionChange: (action: ScheduleAction) => void
+  onActionAdd: () => void
+  onActionChange: (action: ScheduleActionDraft) => void
   onActionMove: (actionId: string, direction: -1 | 1) => void
   onActionRemove: (actionId: string) => void
   onActionReorder: (actionId: string, targetId: string) => void
   onCronChange: React.Dispatch<React.SetStateAction<string>>
   onNameChange: React.Dispatch<React.SetStateAction<string>>
-  onTargetToggle: (key: string, checked: boolean) => void
-  onTimezoneChange: React.Dispatch<React.SetStateAction<string>>
+  onTargetToggle: (keys: ReadonlyArray<string>, checked: boolean) => void
 }) {
-  const details = (
-    <ScheduleDetailsFields
-      cron={cron}
-      name={name}
-      timezone={timezone}
-      timezoneLabelId={timezoneLabelId}
-      onCronChange={onCronChange}
-      onNameChange={onNameChange}
-      onTimezoneChange={onTimezoneChange}
-    />
-  )
-
-  if (!isCreate) {
-    return (
-      <>
-        {details}
-        <ScheduleTargetSelector
-          options={options}
-          permissionKey={permissionKey}
-          selectedOptionsCount={selectedOptionsCount}
-          selectedTargets={selectedTargets}
-          onToggle={onTargetToggle}
-        />
-        <ScheduleActionsEditor
-          actions={actions}
-          allowed={actionPermissions}
-          hideBackupName
-          storage={storage}
-          onAdd={onActionAdd}
-          onChange={onActionChange}
-          onMove={onActionMove}
-          onReorder={onActionReorder}
-          onRemove={onActionRemove}
-        />
-        <ScheduleActionValidationMessage
-          actions={actions}
-          valid={actionSelectionValid}
-        />
-      </>
-    )
-  }
-
   return (
-    <>
-      <CreateSection
-        description="Name this schedule and choose how often it runs."
-        step={1}
-        title="Details"
-      >
-        {details}
-      </CreateSection>
-      <CreateSection
+    <div className="grid min-h-0 grid-rows-[auto_auto_minmax(0,1fr)] gap-5">
+      <ScheduleDetailsFields
+        cron={cron}
+        cronSummary={cronSummary}
+        name={name}
+        onCronChange={onCronChange}
+        onNameChange={onNameChange}
+      />
+      <EditorSection
         aside={
           <span className="font-mono text-[0.625rem] text-muted-foreground">
             {selectedOptionsCount} selected
           </span>
         }
-        description="Each selected target runs through its Relay, even while Hearth is offline."
-        step={2}
         title="Targets"
       >
         <ScheduleTargetSelector
@@ -1758,53 +1792,40 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
           selectedTargets={selectedTargets}
           onToggle={onTargetToggle}
         />
-      </CreateSection>
-      <CreateSection
+      </EditorSection>
+      <EditorSection
+        className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]"
+        contentClassName="grid min-h-0 grid-rows-[minmax(0,1fr)_auto]"
         aside={
-          <div className="flex flex-wrap gap-1.5">
-            <AddActionButton
-              icon={Code2}
-              label="Command"
-              disabled={!actionPermissions.console_command}
-              onClick={() => onActionAdd("console_command")}
-            />
-            <AddActionButton
-              icon={HardDriveDownload}
-              label="Backup"
-              disabled={!actionPermissions.backup}
-              onClick={() => onActionAdd("backup")}
-            />
-            <AddActionButton
-              icon={Power}
-              label="Power"
-              disabled={!actionPermissions.power}
-              onClick={() => onActionAdd("power")}
-            />
-          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={onActionAdd}
+          >
+            <Plus className="size-3.5" />
+            Add Action
+          </Button>
         }
-        description="Run in order on every compatible target. Unsupported actions are skipped without failing the run."
-        step={3}
         title="Actions"
       >
         <ScheduleActionsEditor
           actions={actions}
-          allowed={actionPermissions}
-          hideBackupName
           hideHeader
-          showOrderTags
+          permissionKey={permissionKey}
+          selectedOptions={selectedOptions}
           storage={storage}
-          onAdd={onActionAdd}
           onChange={onActionChange}
           onMove={onActionMove}
-          onReorder={onActionReorder}
           onRemove={onActionRemove}
+          onReorder={onActionReorder}
         />
         <ScheduleActionValidationMessage
           actions={actions}
           valid={actionSelectionValid}
         />
-      </CreateSection>
-    </>
+      </EditorSection>
+    </div>
   )
 })
 
@@ -1812,57 +1833,59 @@ function ScheduleActionValidationMessage({
   actions,
   valid,
 }: {
-  actions: ReadonlyArray<ScheduleAction>
+  actions: ReadonlyArray<ScheduleActionDraft>
   valid: boolean
 }) {
-  return actions.length > 0 && !valid ? (
+  return actions.some((action) => action.type !== null) && !valid ? (
     <p className="mt-2 text-[0.625rem] leading-4 text-destructive" role="alert">
-      One or more actions are not supported or permitted by the selected
-      targets.
+      You do not have permission to configure one or more selected actions.
     </p>
   ) : null
 }
 
 const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
   cron,
+  cronSummary,
   name,
-  timezone,
-  timezoneLabelId,
   onCronChange,
   onNameChange,
-  onTimezoneChange,
 }: {
   cron: string
+  cronSummary: string | null
   name: string
-  timezone: string
-  timezoneLabelId: string
   onCronChange: React.Dispatch<React.SetStateAction<string>>
   onNameChange: React.Dispatch<React.SetStateAction<string>>
-  onTimezoneChange: React.Dispatch<React.SetStateAction<string>>
 }) {
+  const [timing, setTiming] = React.useState(() => cronPreset(cron))
   return (
-    <div className="space-y-4">
-      <Field label="Name">
-        <Input
-          aria-label="Schedule name"
-          value={name}
-          maxLength={120}
-          placeholder="Backup My Server Daily"
-          onChange={(event) => onNameChange(event.target.value)}
-        />
-      </Field>
-      <div className="grid gap-4 sm:grid-cols-3">
+    <div className="space-y-2.5">
+      <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem]">
+        <Field label="Name">
+          <Input
+            aria-label="Schedule name"
+            autoComplete="off"
+            data-1p-ignore
+            data-bwignore
+            data-lpignore="true"
+            name="schedule-name"
+            value={name}
+            maxLength={120}
+            placeholder="Daily server backup"
+            onChange={(event) => onNameChange(event.target.value)}
+          />
+        </Field>
         <Field label="Timing">
           <Select
-            value={cronPreset(cron)}
+            value={timing}
             onValueChange={(value) => {
+              setTiming(value)
               if (value === "custom") return
               onCronChange(
                 scheduleCronAliases[value as keyof typeof scheduleCronAliases]
               )
             }}
           >
-            <SelectTrigger>
+            <SelectTrigger className="w-full">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -1874,27 +1897,27 @@ const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
             </SelectContent>
           </Select>
         </Field>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-[minmax(12rem,0.8fr)_minmax(0,1.2fr)] sm:items-end">
         <Field label="Cron">
           <Input
             aria-label="Cron expression"
-            className="font-mono text-xs"
+            className="font-mono"
             value={cron}
             maxLength={120}
             placeholder="0 0 * * *"
-            onChange={(event) => onCronChange(event.target.value)}
+            onChange={(event) => {
+              setTiming("custom")
+              onCronChange(event.target.value)
+            }}
           />
         </Field>
-        <Field label="Timezone" labelId={timezoneLabelId}>
-          <BrickVersionPicker
-            labelledBy={timezoneLabelId}
-            maxLength={120}
-            name="timezone"
-            placeholder="Search timezones…"
-            value={timezone}
-            versions={timezones}
-            onChange={onTimezoneChange}
-          />
-        </Field>
+        <div
+          className={`flex min-h-8 items-center rounded-lg border px-3 py-1 text-xs leading-5 ${cronSummary !== null ? "bg-muted/25 text-foreground" : "border-destructive/35 bg-destructive/5 text-destructive"}`}
+          role={cronSummary === null ? "alert" : undefined}
+        >
+          {cronSummary ?? "Enter a valid five-part cron expression."}
+        </div>
       </div>
     </div>
   )
@@ -1913,14 +1936,17 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
   permissionKey: "canCreate" | "canUpdate"
   selectedOptionsCount: number
   selectedTargets: ReadonlySet<string>
-  onToggle: (key: string, checked: boolean) => void
+  onToggle: (keys: ReadonlyArray<string>, checked: boolean) => void
 }) {
   const [open, setOpen] = React.useState(false)
   const pickerOptions = React.useMemo(
     () =>
       options.map(
         (option): ServerPickerOption => ({
-          description: `${option.relayName} · ${option.kind}`,
+          description:
+            option.kind === "relay"
+              ? `Relay · ${option.id}`
+              : `${option.kind === "instance" ? "Server" : "Database"} · ${option.relayName} · ${option.id}`,
           disabled: !option[permissionKey],
           id: option.id,
           kind:
@@ -1955,10 +1981,65 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
   const selectTarget = React.useCallback(
     (option: ServerPickerOption) => {
       const key = scheduleTargetKey(option)
-      onToggle(key, !selectedTargets.has(key))
+      onToggle([key], !selectedTargets.has(key))
     },
     [onToggle, selectedTargets]
   )
+  const allOptions = React.useMemo(() => {
+    const selectable = pickerOptions.filter((option) => !option.disabled)
+    const aggregateOption = (
+      label: string,
+      description: string,
+      targets: ReadonlyArray<ServerPickerOption>,
+      kind?: "database" | "relay" | "server"
+    ) => {
+      const keys = targets.map(scheduleTargetKey)
+      const selected = keys.every((key) => selectedTargets.has(key))
+      return {
+        description,
+        kind,
+        label,
+        selected,
+        onSelect: () => onToggle(keys, !selected),
+      }
+    }
+    const servers = selectable.filter((option) => option.kind === "server")
+    const databases = selectable.filter((option) => option.kind === "database")
+    const relays = selectable.filter((option) => option.kind === "relay")
+    return [
+      selectable.length > 0
+        ? aggregateOption(
+            "All Instances",
+            "Every accessible server, database, and Relay",
+            selectable
+          )
+        : null,
+      servers.length > 0
+        ? aggregateOption(
+            "All Servers",
+            "Every accessible server",
+            servers,
+            "server"
+          )
+        : null,
+      databases.length > 0
+        ? aggregateOption(
+            "All Databases",
+            "Every accessible database",
+            databases,
+            "database"
+          )
+        : null,
+      relays.length > 0
+        ? aggregateOption(
+            "All Relays",
+            "Every accessible Relay",
+            relays,
+            "relay"
+          )
+        : null,
+    ].filter((option) => option !== null)
+  }, [onToggle, pickerOptions, selectedTargets])
   return (
     <div>
       {hideHeader ? null : (
@@ -1981,9 +2062,9 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
             variant="outline"
             role="combobox"
             aria-expanded={open}
-            className="mt-3 h-auto min-h-10 w-full justify-between gap-3 px-3 py-2 font-normal"
+            className={`${hideHeader ? "" : "mt-3"} h-auto min-h-10 w-full justify-between gap-3 px-3 py-2 font-normal`}
           >
-            <span className="min-w-0 truncate text-left text-xs">
+            <span className="min-w-0 truncate text-left">
               {selectedNames.length === 0
                 ? "Select servers, databases, or Relays"
                 : selectedNames.slice(0, 3).join(", ")}
@@ -1997,6 +2078,7 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
           className="z-[70] w-[min(34rem,calc(100vw-2rem))] p-1.5"
         >
           <ServerPickerList
+            allOptions={allOptions}
             multiple
             ariaLabel="Schedule targets"
             emptyMessage="No accessible schedule targets found."
@@ -2012,33 +2094,48 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
 
 const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
   actions,
-  allowed,
-  hideBackupName = true,
   hideHeader = false,
-  showOrderTags = false,
+  permissionKey,
+  selectedOptions,
   storage,
-  onAdd,
   onChange,
   onMove,
-  onReorder,
   onRemove,
+  onReorder,
 }: {
-  actions: ReadonlyArray<ScheduleAction>
-  allowed: Readonly<Record<ScheduleAction["type"], boolean>>
-  hideBackupName?: boolean
+  actions: ReadonlyArray<ScheduleActionDraft>
   hideHeader?: boolean
-  showOrderTags?: boolean
+  permissionKey: "canCreate" | "canUpdate"
+  selectedOptions: ReadonlyArray<ScheduleOption>
   storage: ReadonlyArray<BackupStorage>
-  onAdd: (type: ScheduleAction["type"]) => void
-  onChange: (action: ScheduleAction) => void
+  onChange: (action: ScheduleActionDraft) => void
   onMove: (actionId: string, direction: -1 | 1) => void
-  onReorder: (actionId: string, targetId: string) => void
   onRemove: (actionId: string) => void
+  onReorder: (actionId: string, targetId: string) => void
 }) {
   const [draggedActionId, setDraggedActionId] = React.useState<string | null>(
     null
   )
   const draggedActionIdRef = React.useRef<string | null>(null)
+  const actionViewportRef = React.useRef<HTMLDivElement>(null)
+  const previousActionCountRef = React.useRef(actions.length)
+  React.useEffect(() => {
+    const actionAdded = actions.length > previousActionCountRef.current
+    previousActionCountRef.current = actions.length
+    if (actionAdded && actionViewportRef.current) {
+      const viewport = actionViewportRef.current
+      const rows = viewport.querySelectorAll<HTMLElement>(
+        "[data-schedule-action-row]"
+      )
+      const lastRow = rows.item(rows.length - 1)
+      const revealThrough = lastRow
+        ? lastRow.offsetTop - viewport.offsetTop + lastRow.offsetHeight / 2
+        : 0
+      if (revealThrough > viewport.scrollTop + viewport.clientHeight) {
+        viewport.scrollTop = revealThrough - viewport.clientHeight
+      }
+    }
+  }, [actions.length])
   const startDragging = React.useCallback((actionId: string) => {
     draggedActionIdRef.current = actionId
     setDraggedActionId(actionId)
@@ -2055,99 +2152,65 @@ const ScheduleActionsEditor = React.memo(function ScheduleActionsEditor({
     [onReorder]
   )
   return (
-    <div>
-      {hideHeader ? null : (
-        <div className="flex flex-wrap items-end justify-between gap-3">
-          <div>
-            <h3 className="text-sm font-semibold">Ordered actions</h3>
+    <div className="h-full min-h-0">
+      {hideHeader ? null : <h3 className="text-sm font-semibold">Actions</h3>}
+      <div
+        ref={actionViewportRef}
+        aria-label="Schedule actions"
+        className={`${hideHeader ? "" : "mt-3"} h-full min-h-0 [scrollbar-gutter:stable] overflow-y-auto overscroll-contain pr-1`}
+        role="region"
+      >
+        {actions.length === 0 ? (
+          <div className="grid h-full place-items-center rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground">
+            Add an action to build this schedule.
           </div>
-          <div className="flex flex-wrap gap-1.5">
-            <AddActionButton
-              icon={Code2}
-              label="Command"
-              disabled={!allowed.console_command}
-              onClick={() => onAdd("console_command")}
-            />
-            <AddActionButton
-              icon={HardDriveDownload}
-              label="Backup"
-              disabled={!allowed.backup}
-              onClick={() => onAdd("backup")}
-            />
-            <AddActionButton
-              icon={Power}
-              label="Power"
-              disabled={!allowed.power}
-              onClick={() => onAdd("power")}
-            />
+        ) : (
+          <div className="space-y-2">
+            {actions.map((action, index) => (
+              <ActionEditor
+                key={action.id}
+                action={action}
+                dragging={draggedActionId === action.id}
+                index={index}
+                permissionKey={permissionKey}
+                selectedOptions={selectedOptions}
+                storage={storage}
+                total={actions.length}
+                onChange={onChange}
+                onDragEnd={stopDragging}
+                onDragOver={dragOverAction}
+                onDragStart={startDragging}
+                onMove={onMove}
+                onRemove={onRemove}
+              />
+            ))}
           </div>
-        </div>
-      )}
-      {actions.length === 0 ? (
-        <div className="mt-3 rounded-lg border border-dashed p-6 text-center text-xs text-muted-foreground">
-          Select a target, then add the first action.
-        </div>
-      ) : (
-        <div className="relative mt-3 space-y-2 before:absolute before:top-6 before:bottom-6 before:left-[1.3rem] before:w-px before:bg-border">
-          {actions.map((action, index) => (
-            <ActionEditor
-              key={action.id}
-              action={action}
-              dragging={draggedActionId === action.id}
-              hideBackupName={hideBackupName}
-              index={index}
-              showOrderTag={showOrderTags}
-              storage={storage}
-              total={actions.length}
-              onChange={onChange}
-              onDragEnd={stopDragging}
-              onDragStart={startDragging}
-              onDragOver={dragOverAction}
-              onMove={onMove}
-              onRemove={onRemove}
-            />
-          ))}
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 })
 
-function CreateSection({
+function EditorSection({
   aside,
   children,
-  description,
-  step,
+  className = "",
+  contentClassName = "space-y-3",
   title,
 }: {
   aside?: React.ReactNode
   children: React.ReactNode
-  description: string
-  step: number
+  className?: string
+  contentClassName?: string
   title: string
 }) {
   return (
-    <section>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span
-              aria-hidden="true"
-              className="grid size-5 shrink-0 place-items-center rounded-sm border border-border bg-muted/50 font-mono text-[0.5625rem] leading-none text-muted-foreground tabular-nums"
-            >
-              {step}
-            </span>
-            <h3 className="text-xs font-semibold">{title}</h3>
-          </div>
-          <p className="mt-1 text-[0.625rem] leading-4 text-muted-foreground">
-            {description}
-          </p>
-        </div>
-        {aside ? (
-          <div className="w-full shrink-0 sm:w-auto">{aside}</div>
-        ) : null}
+    <section className={className}>
+      <div className="flex items-center justify-between gap-4">
+        <h3 className="text-xs font-semibold">{title}</h3>
+        {aside ? <div className="shrink-0">{aside}</div> : null}
       </div>
-      <div className="mt-3 space-y-4">{children}</div>
+      <div className={`mt-2.5 ${contentClassName}`}>{children}</div>
     </section>
   )
 }
@@ -2181,37 +2244,12 @@ function Field({
   )
 }
 
-const AddActionButton = React.memo(function AddActionButton({
-  icon: Icon,
-  label,
-  disabled,
-  onClick,
-}: {
-  icon: typeof Code2
-  label: string
-  disabled: boolean
-  onClick: () => void
-}) {
-  return (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      disabled={disabled}
-      onClick={onClick}
-    >
-      <Icon className="size-3.5" />
-      {label}
-    </Button>
-  )
-})
-
 const ActionEditor = React.memo(function ActionEditor({
   action,
   dragging,
-  hideBackupName = false,
   index,
-  showOrderTag = false,
+  permissionKey,
+  selectedOptions,
   storage,
   total,
   onChange,
@@ -2221,186 +2259,137 @@ const ActionEditor = React.memo(function ActionEditor({
   onMove,
   onRemove,
 }: {
-  action: ScheduleAction
+  action: ScheduleActionDraft
   dragging: boolean
-  hideBackupName?: boolean
   index: number
-  showOrderTag?: boolean
+  permissionKey: "canCreate" | "canUpdate"
+  selectedOptions: ReadonlyArray<ScheduleOption>
   storage: ReadonlyArray<BackupStorage>
   total: number
-  onChange: (action: ScheduleAction) => void
+  onChange: (action: ScheduleActionDraft) => void
   onDragEnd: () => void
   onDragOver: (actionId: string) => void
   onDragStart: (actionId: string) => void
   onMove: (actionId: string, direction: -1 | 1) => void
   onRemove: (actionId: string) => void
 }) {
+  const [backupConfigOpen, setBackupConfigOpen] = React.useState(false)
+  const unsupportedTargets =
+    action.type === null || action.type === "wait"
+      ? []
+      : selectedOptions.filter(
+          (target) => !scheduleActionSupportsTarget(action, target)
+        )
+  const restrictedTargets =
+    action.type === null || action.type === "wait"
+      ? []
+      : selectedOptions.filter(
+          (target) =>
+            scheduleActionSupportsTarget(action, target) &&
+            (!target[permissionKey] ||
+              !target.permittedActions.includes(action.type))
+        )
+  const eligibleTargets =
+    action.type === null || action.type === "wait"
+      ? []
+      : selectedOptions.filter(
+          (target) =>
+            scheduleActionSupportsTarget(action, target) &&
+            target[permissionKey] &&
+            target.permittedActions.includes(action.type)
+        )
+  const actionTargetKeys =
+    action.type === null || action.type === "wait"
+      ? new Set<string>()
+      : new Set<string>(
+          action.targetKeys ??
+            eligibleTargets.map((target) => targetKey(target))
+        )
+  const selectedActionTargets = eligibleTargets.filter((target) =>
+    actionTargetKeys.has(targetKey(target))
+  )
+
   return (
     <div
-      className={`relative rounded-lg border bg-background/45 py-3 pr-3 pl-12 transition-opacity ${dragging ? "opacity-55" : ""}`}
+      data-schedule-action-row
+      className={`${action.type === "wait" ? "h-20" : "h-12"} rounded-lg border bg-background/45 p-1 transition-[border-color,opacity] sm:h-16 sm:p-2 ${dragging ? "border-primary/40 opacity-55" : ""}`}
       onDragOver={(event) => {
         event.preventDefault()
         onDragOver(action.id)
       }}
       onDrop={(event) => event.preventDefault()}
     >
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            draggable
-            aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
-            className="absolute top-3 left-2.5 z-10 grid size-7 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing"
-            onDragEnd={onDragEnd}
-            onDragStart={(event) => {
-              event.dataTransfer.effectAllowed = "move"
-              event.dataTransfer.setData("text/plain", action.id)
-              onDragStart(action.id)
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "ArrowUp" && index > 0) {
-                event.preventDefault()
-                onMove(action.id, -1)
-              }
-              if (event.key === "ArrowDown" && index < total - 1) {
-                event.preventDefault()
-                onMove(action.id, 1)
-              }
-            }}
-          >
-            <GripVertical className="size-4" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="left">
-          {showOrderTag
-            ? `Drag to reorder · position ${index + 1} of ${total}`
-            : "Drag to reorder"}
-        </TooltipContent>
-      </Tooltip>
-      <div className="flex items-start gap-3">
-        <ActionIcon
-          type={action.type}
-          className="mt-2 size-4 shrink-0 text-primary"
-        />
-        <div className="min-w-0 flex-1">
-          {showOrderTag ? (
-            <div className="mb-2 flex items-center gap-1.5">
-              <span
-                aria-hidden="true"
-                className="grid size-5 shrink-0 place-items-center rounded-sm border border-border bg-muted/50 font-mono text-[0.5625rem] leading-none text-muted-foreground tabular-nums"
-              >
-                {index + 1}
-              </span>
-              <p className="text-xs font-semibold">
-                {actionLabel(action.type)}
-              </p>
-            </div>
-          ) : (
-            <p className="mb-2 text-xs font-semibold">
-              {actionLabel(action.type)}
-            </p>
-          )}
+      <div
+        className={`grid h-full items-center gap-0.5 sm:grid-cols-[2rem_9rem_minmax(0,1fr)_auto] sm:grid-rows-1 sm:gap-2 ${action.type === "wait" ? "grid-cols-[1.25rem_minmax(0,1fr)_auto] grid-rows-2" : "grid-cols-[1.25rem_8rem_minmax(0,1fr)_auto]"}`}
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
+              className={`-my-1 grid h-[calc(100%+0.5rem)] w-5 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing sm:-my-2 sm:h-[calc(100%+1rem)] sm:w-8 ${action.type === "wait" ? "row-span-2 sm:row-span-1" : ""}`}
+              draggable
+              type="button"
+              onDragEnd={onDragEnd}
+              onDragStart={(event) => {
+                event.dataTransfer.effectAllowed = "move"
+                event.dataTransfer.setData("text/plain", action.id)
+                onDragStart(action.id)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowUp" && index > 0) {
+                  event.preventDefault()
+                  onMove(action.id, -1)
+                }
+                if (event.key === "ArrowDown" && index < total - 1) {
+                  event.preventDefault()
+                  onMove(action.id, 1)
+                }
+              }}
+            >
+              <GripVertical className="size-4" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="left">Drag to reorder</TooltipContent>
+        </Tooltip>
+        <div
+          className={`flex min-w-0 items-center ${action.type === "wait" ? "col-start-2 row-start-1 sm:col-start-auto sm:row-start-auto" : ""}`}
+        >
+          <ScheduleActionTypeSelect
+            action={action}
+            index={index}
+            onChange={onChange}
+          />
+        </div>
+        <div
+          className={`flex w-fit max-w-full min-w-0 items-center gap-1.5 justify-self-start ${action.type === "wait" ? "col-start-2 row-start-2 sm:col-start-auto sm:row-start-auto" : ""}`}
+        >
           {action.type === "console_command" ? (
-            <Input
-              className="font-mono text-xs"
+            <CommandEditorField
               value={action.command}
-              placeholder="say Server backing up..."
-              maxLength={4096}
-              onChange={(event) =>
-                onChange({ ...action, command: event.target.value })
-              }
+              onChange={(command) => onChange({ ...action, command })}
             />
           ) : action.type === "backup" ? (
-            <div>
-              <div
-                className={`grid gap-2 ${hideBackupName ? "sm:grid-cols-2" : "sm:grid-cols-3"}`}
-              >
-                {hideBackupName ? null : (
-                  <Input
-                    aria-label="Backup name"
-                    value={action.name}
-                    maxLength={120}
-                    placeholder="Scheduled backup"
-                    onChange={(event) =>
-                      onChange({ ...action, name: event.target.value })
-                    }
-                  />
-                )}
-                <Select
-                  value={action.mode}
-                  onValueChange={(value) => {
-                    const mode = value as typeof action.mode
-                    onChange({
-                      ...action,
-                      destination:
-                        mode === "full"
-                          ? { kind: "local" }
-                          : action.destination,
-                      mode,
-                    })
-                  }}
-                >
-                  <SelectTrigger aria-label="Backup mode">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="incremental">Incremental</SelectItem>
-                    <SelectItem value="full">Full archive</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Select
-                  value={
-                    action.destination.kind === "storage"
-                      ? action.destination.storageId
-                      : "local"
-                  }
-                  onValueChange={(value) =>
-                    onChange({
-                      ...action,
-                      destination:
-                        value === "local"
-                          ? { kind: "local" }
-                          : { kind: "storage", storageId: value },
-                    })
-                  }
-                >
-                  <SelectTrigger aria-label="Backup destination">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="local">Local Relay</SelectItem>
-                    {action.mode === "incremental"
-                      ? storage.flatMap((destination) =>
-                          destination.enabled && !destination.deleting
-                            ? [
-                                <SelectItem
-                                  key={destination.id}
-                                  value={destination.id}
-                                >
-                                  {destination.name}
-                                </SelectItem>,
-                              ]
-                            : []
-                        )
-                      : null}
-                  </SelectContent>
-                </Select>
-              </div>
-              {hideBackupName ? (
-                <p className="mt-2 text-[0.625rem] leading-4 text-muted-foreground">
-                  Backups are named automatically
-                  (scheduled-YYYY.MM.DD-HH.mm.ssZ).
-                </p>
-              ) : null}
-            </div>
-          ) : (
+            <Button
+              aria-label="Configure Backup"
+              className="size-8 max-w-full min-w-0 justify-center truncate px-0 sm:w-fit sm:justify-start sm:px-2.5"
+              type="button"
+              title={action.name}
+              variant="outline"
+              onClick={() => setBackupConfigOpen(true)}
+            >
+              <SlidersHorizontal className="size-4 shrink-0" />
+              <span className="hidden truncate sm:inline">
+                Configure Backup
+              </span>
+            </Button>
+          ) : action.type === "power" ? (
             <Select
               value={action.action}
               onValueChange={(value) =>
                 onChange({ ...action, action: value as typeof action.action })
               }
             >
-              <SelectTrigger>
+              <SelectTrigger className="h-8 w-20 min-w-0 font-medium sm:w-28 [&_[data-slot=select-value]]:truncate">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -2410,21 +2399,440 @@ const ActionEditor = React.memo(function ActionEditor({
                 <SelectItem value="kill">Kill</SelectItem>
               </SelectContent>
             </Select>
-          )}
+          ) : action.type === "wait" ? (
+            <WaitEditorFields action={action} onChange={onChange} />
+          ) : null}
         </div>
-        <div className="flex shrink-0 items-center gap-0.5">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
+        <div
+          className={`flex shrink-0 items-center gap-0.5 ${action.type === "wait" ? "col-start-3 row-span-2 row-start-1 sm:col-start-auto sm:row-span-1 sm:row-start-auto" : ""}`}
+        >
+          {action.type !== null && action.type !== "wait" ? (
+            <>
+              <ActionCompatibilityWarning
+                restrictedTargets={restrictedTargets}
+                unsupportedTargets={unsupportedTargets}
+              />
+              <ScheduleActionTargetsButton
+                action={action}
+                eligibleTargets={eligibleTargets}
+                targets={selectedOptions}
+                selectedTargets={selectedActionTargets}
+                onToggle={(targetKeyValue, checked) => {
+                  if (action.type === null) return
+                  const next = new Set(actionTargetKeys)
+                  if (checked) next.add(targetKeyValue)
+                  else next.delete(targetKeyValue)
+                  onChange({ ...action, targetKeys: [...next] })
+                }}
+              />
+              <Separator
+                className="mx-1 data-vertical:h-4 data-vertical:self-center"
+                orientation="vertical"
+              />
+            </>
+          ) : null}
+          <ActionRowButton
+            disabled={total === 1 || index === total - 1}
+            icon={ArrowDown}
+            label={`Move action ${index + 1} down`}
+            tooltip="Move down"
+            onClick={() => onMove(action.id, 1)}
+          />
+          <ActionRowButton
+            disabled={total === 1 || index === 0}
+            icon={ArrowUp}
+            label={`Move action ${index + 1} up`}
+            tooltip="Move up"
+            onClick={() => onMove(action.id, -1)}
+          />
+          <ActionRowButton
+            destructive
+            icon={Trash2}
+            label={`Delete action ${index + 1}`}
+            tooltip="Delete action"
             onClick={() => onRemove(action.id)}
-            aria-label="Remove action"
-          >
-            <X className="size-3.5" />
-          </Button>
+          />
         </div>
       </div>
+      {action.type === "backup" ? (
+        <BackupConfigurationDialog
+          allowDefaultDestination={false}
+          allowIncremental={scheduleBackupAllowsIncremental(
+            selectedActionTargets,
+            permissionKey
+          )}
+          fullDestination="local"
+          initialDestinationKeys={
+            action.destination.kind === "storage"
+              ? [action.destination.storageId]
+              : ["local"]
+          }
+          initialMode={action.mode}
+          initialName={action.name}
+          onOpenChange={setBackupConfigOpen}
+          onSubmit={(configuration) => {
+            onChange({
+              ...action,
+              destination: scheduleBackupDestination(
+                configuration.mode,
+                configuration.destinationKeys[0]
+              ),
+              mode: configuration.mode,
+              name: configuration.name,
+            })
+            setBackupConfigOpen(false)
+          }}
+          open={backupConfigOpen}
+          showTarget={false}
+          storage={storage}
+          submitLabel="Save backup"
+          targets={selectedOptions.map(scheduleBackupTarget)}
+          title="Configure Backup"
+        />
+      ) : null}
     </div>
+  )
+})
+
+function ScheduleActionTargetsButton({
+  action,
+  eligibleTargets,
+  onToggle,
+  selectedTargets,
+  targets,
+}: {
+  action: ScheduleAction
+  eligibleTargets: ReadonlyArray<ScheduleOption>
+  onToggle: (targetKey: string, checked: boolean) => void
+  selectedTargets: ReadonlyArray<ScheduleOption>
+  targets: ReadonlyArray<ScheduleOption>
+}) {
+  const [open, setOpen] = React.useState(false)
+  const eligibleKeys = new Set(
+    eligibleTargets.map((target) => targetKey(target))
+  )
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <Button
+              aria-expanded={open}
+              aria-label={`${selectedTargets.length} targets for ${actionLabel(action.type)}`}
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            >
+              <Server className="size-3.5" />
+            </Button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="top">
+          {selectedTargets.length} action targets
+        </TooltipContent>
+      </Tooltip>
+      <PopoverContent align="end" className="w-72 p-1.5">
+        <p className="px-2 py-1.5 text-[0.625rem] text-muted-foreground">
+          Choose which selected targets run this action.
+        </p>
+        <div className="space-y-0.5">
+          {targets.map((target) => {
+            const key = targetKey(target)
+            const eligible = eligibleKeys.has(key)
+            const checked = selectedTargets.some(
+              (selected) => targetKey(selected) === key
+            )
+            return (
+              <button
+                key={key}
+                aria-pressed={checked}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!eligible}
+                type="button"
+                onClick={() => onToggle(key, !checked)}
+              >
+                <span
+                  className={`grid size-4 shrink-0 place-items-center rounded-sm border ${checked ? "border-primary bg-primary text-primary-foreground" : "border-input"}`}
+                >
+                  {checked ? <Check className="size-3" /> : null}
+                </span>
+                <span className="min-w-0 flex-1 truncate">{target.name}</span>
+                <span className="shrink-0 text-[0.5625rem] text-muted-foreground">
+                  {target.kind}
+                </span>
+              </button>
+            )
+          })}
+          {targets.length === 0 ? (
+            <p className="px-2 py-2 text-xs text-muted-foreground">
+              No compatible targets selected.
+            </p>
+          ) : null}
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+function scheduleBackupTarget(
+  target: ScheduleOption
+): BackupConfigurationTarget {
+  return {
+    id: target.id,
+    key: targetKey(target),
+    kind: target.kind === "relay" ? "platform" : target.kind,
+    name: target.name,
+    relayId: target.relayId,
+    relayName: target.relayName,
+  }
+}
+
+const ActionRowButton = React.memo(function ActionRowButton({
+  destructive = false,
+  disabled = false,
+  icon: Icon,
+  label,
+  tooltip,
+  onClick,
+}: {
+  destructive?: boolean
+  disabled?: boolean
+  icon: typeof ArrowDown
+  label: string
+  tooltip: string
+  onClick: () => void
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-label={label}
+          className={
+            destructive ? "text-destructive hover:text-destructive" : undefined
+          }
+          disabled={disabled}
+          size="icon-sm"
+          type="button"
+          variant="ghost"
+          onClick={onClick}
+        >
+          <Icon className="size-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top">{tooltip}</TooltipContent>
+    </Tooltip>
+  )
+})
+
+function ActionCompatibilityWarning({
+  restrictedTargets,
+  unsupportedTargets,
+}: {
+  restrictedTargets: ReadonlyArray<ScheduleOption>
+  unsupportedTargets: ReadonlyArray<ScheduleOption>
+}) {
+  if (restrictedTargets.length === 0 && unsupportedTargets.length === 0) {
+    return null
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          aria-label="Action compatibility warning"
+          className="grid size-7 shrink-0 place-items-center rounded-md text-amber-400 outline-none hover:bg-amber-400/10 focus-visible:ring-2 focus-visible:ring-ring/40"
+          type="button"
+        >
+          <TriangleAlert className="size-4" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs space-y-1 text-pretty" side="top">
+        {unsupportedTargets.length > 0 ? (
+          <p>
+            This action will be skipped on {targetList(unsupportedTargets)}
+            because they do not support it.
+          </p>
+        ) : null}
+        {restrictedTargets.length > 0 ? (
+          <p>
+            You do not have permission to run this action on{" "}
+            {targetList(restrictedTargets)}.
+          </p>
+        ) : null}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+const ScheduleActionTypeSelect = React.memo(function ScheduleActionTypeSelect({
+  action,
+  index,
+  onChange,
+}: {
+  action: ScheduleActionDraft
+  index: number
+  onChange: (action: ScheduleActionDraft) => void
+}) {
+  return (
+    <Select
+      value={action.type ?? ""}
+      onValueChange={(value) =>
+        onChange(
+          createScheduleAction(value as ScheduleAction["type"], action.id)
+        )
+      }
+    >
+      <SelectTrigger
+        aria-label={`Action ${index + 1} type`}
+        className="h-8 min-w-0 flex-1 justify-start text-sm font-medium [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:flex-1 [&_[data-slot=select-value]]:truncate [&_[data-slot=select-value]]:text-left"
+      >
+        {action.type === null ? (
+          <SelectValue placeholder="Select Action" />
+        ) : (
+          <>
+            <ActionIcon
+              type={action.type}
+              className="size-4 shrink-0 text-primary"
+            />
+            <SelectValue>{actionLabel(action.type)}</SelectValue>
+          </>
+        )}
+      </SelectTrigger>
+      <SelectContent>
+        <ScheduleActionTypeOption type="console_command" />
+        <ScheduleActionTypeOption type="backup" />
+        <ScheduleActionTypeOption type="power" />
+        <ScheduleActionTypeOption type="wait" />
+      </SelectContent>
+    </Select>
+  )
+})
+
+function ScheduleActionTypeOption({ type }: { type: ScheduleAction["type"] }) {
+  return (
+    <SelectItem value={type}>
+      <span className="flex items-center gap-2">
+        <ActionIcon type={type} className="size-4 text-muted-foreground" />
+        {actionLabel(type)}
+      </span>
+    </SelectItem>
+  )
+}
+
+const CommandEditorField = React.memo(function CommandEditorField({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (value: string) => void
+}) {
+  const [open, setOpen] = React.useState(false)
+  const [draft, setDraft] = React.useState(value)
+  const openEditor = React.useCallback(() => {
+    setDraft(value)
+    setOpen(true)
+  }, [value])
+  return (
+    <>
+      <Button
+        aria-label="Configure Command"
+        className="size-8 max-w-full min-w-0 justify-center truncate px-0 sm:w-fit sm:justify-start sm:px-2.5"
+        type="button"
+        title={value || "Configure Command"}
+        variant="outline"
+        onClick={openEditor}
+      >
+        <SlidersHorizontal className="size-4 shrink-0" />
+        <span className="hidden truncate sm:inline">Configure Command</span>
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Configure Command</DialogTitle>
+            <DialogDescription className="sr-only">
+              Enter the console command this action should run.
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            autoFocus
+            aria-label="Console command editor"
+            className="min-h-40 resize-y font-mono text-xs"
+            maxLength={4096}
+            placeholder="say Server backing up..."
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                onChange(draft)
+                setOpen(false)
+              }}
+            >
+              Save command
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+})
+
+const WaitEditorFields = React.memo(function WaitEditorFields({
+  action,
+  onChange,
+}: {
+  action: Extract<ScheduleAction, { type: "wait" }>
+  onChange: (action: ScheduleActionDraft) => void
+}) {
+  return (
+    <>
+      <Input
+        aria-label="Wait duration"
+        className="h-8 w-20 font-mono sm:w-24"
+        inputMode="numeric"
+        min={1}
+        step={1}
+        type="number"
+        value={action.duration || ""}
+        onChange={(event) =>
+          onChange({
+            ...action,
+            duration: event.target.valueAsNumber || 0,
+          })
+        }
+      />
+      <Select
+        value={action.unit}
+        onValueChange={(value) =>
+          onChange({
+            ...action,
+            unit: value as typeof action.unit,
+          })
+        }
+      >
+        <SelectTrigger
+          aria-label="Wait time unit"
+          className="h-8 w-24 min-w-0 font-medium sm:w-32 [&_[data-slot=select-value]]:truncate"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="milliseconds">Milliseconds</SelectItem>
+          <SelectItem value="seconds">Seconds</SelectItem>
+          <SelectItem value="minutes">Minutes</SelectItem>
+          <SelectItem value="hours">Hours</SelectItem>
+          <SelectItem value="days">Days</SelectItem>
+        </SelectContent>
+      </Select>
+    </>
   )
 })
 
@@ -2583,15 +2991,18 @@ function ActionIcon({
     type === "console_command"
       ? Code2
       : type === "backup"
-        ? HardDriveDownload
-        : Power
+        ? BackupIcon
+        : type === "wait"
+          ? Timer
+          : Power
   return <Icon className={className} aria-hidden="true" />
 }
 
 function actionLabel(type: ScheduleAction["type"]) {
-  if (type === "console_command") return "Console command"
-  if (type === "backup") return "Trigger backup"
-  return "Power action"
+  if (type === "console_command") return "Command"
+  if (type === "backup") return "Backup"
+  if (type === "wait") return "Wait"
+  return "Power"
 }
 
 function actionAuditSummary(
@@ -2601,6 +3012,7 @@ function actionAuditSummary(
   if (!action) return `Action ${actionId}`
   if (action.type === "console_command") return action.command
   if (action.type === "backup") return action.name
+  if (action.type === "wait") return waitDurationLabel(action)
   return action.action
 }
 
@@ -2619,6 +3031,39 @@ function scheduleTargetKey(target: ServerPickerOption) {
   return `${target.relayId}:${kind ?? "instance"}:${target.id}`
 }
 
+function scheduleOptionsWithInstanceNames(
+  options: ReadonlyArray<ScheduleOption>,
+  instances: ReadonlyArray<{
+    id: string
+    name: string
+    relayId: string
+    relayName: string
+  }>
+): Array<ScheduleOption> {
+  const instancesById = new Map(
+    instances.map((instance) => [
+      `${instance.relayId}:${instance.id}`,
+      instance,
+    ])
+  )
+  return options.map((option) => {
+    if (option.kind !== "instance") return option
+    const instance = instancesById.get(`${option.relayId}:${option.id}`)
+    return instance
+      ? { ...option, name: instance.name, relayName: instance.relayName }
+      : option
+  })
+}
+
+function selectScheduleTargetInstances(snapshot: RelaySnapshot) {
+  return snapshot.instances.map(({ id, name, relayId, relayName }) => ({
+    id,
+    name,
+    relayId,
+    relayName,
+  }))
+}
+
 function canOperateSchedule(
   schedule: Pick<Schedule, "actions" | "targets">,
   options: ReadonlyMap<string, ScheduleOption>,
@@ -2630,36 +3075,29 @@ function canOperateSchedule(
     const permittedActions = new Set(option.permittedActions)
     return schedule.actions.every(
       (action) =>
-        !scheduleActionSupportsTarget(action, target) ||
+        !scheduleActionAppliesToTarget(action, target) ||
         permittedActions.has(action.type)
     )
   })
 }
 
-function scheduleActionAllowed(
-  actionOrType:
-    | ScheduleAction["type"]
-    | Pick<ScheduleAction, "type">
-    | Pick<Extract<ScheduleAction, { type: "backup" }>, "mode" | "type">,
+function scheduleActionPermitted(
+  action: ScheduleAction,
   targets: ReadonlyArray<ScheduleOption>,
   permission: "canCreate" | "canUpdate"
 ) {
-  const action =
-    typeof actionOrType === "string" ? { type: actionOrType } : actionOrType
+  if (action.type === "wait") return true
   const compatible = targets.filter((target) =>
-    scheduleActionSupportsTarget(action, target)
+    scheduleActionAppliesToTarget(action, target)
   )
-  return (
-    compatible.length > 0 &&
-    compatible.every(
-      (target) =>
-        target[permission] && target.permittedActions.includes(action.type)
-    )
+  return compatible.every(
+    (target) =>
+      target[permission] && target.permittedActions.includes(action.type)
   )
 }
 
 function moveAction(
-  actions: Array<ScheduleAction>,
+  actions: Array<ScheduleActionDraft>,
   index: number,
   direction: -1 | 1
 ) {
@@ -2675,7 +3113,7 @@ function moveAction(
 }
 
 function reorderAction(
-  actions: Array<ScheduleAction>,
+  actions: Array<ScheduleActionDraft>,
   actionId: string,
   targetId: string
 ) {
@@ -2689,6 +3127,53 @@ function reorderAction(
   if (!action) return actions
   next.splice(targetIndex, 0, action)
   return next
+}
+
+function createScheduleAction(
+  type: ScheduleAction["type"],
+  id: string
+): ScheduleAction {
+  if (type === "console_command") return { command: "", id, type }
+  if (type === "backup") {
+    return {
+      destination: { kind: "local" },
+      id,
+      mode: "full",
+      name: "scheduled-<schedule>-<timestamp>",
+      type,
+    }
+  }
+  if (type === "wait") return { duration: 1, id, type, unit: "seconds" }
+  return { action: "restart", id, type }
+}
+
+function isCompleteScheduleAction(
+  action: ScheduleActionDraft
+): action is ScheduleAction {
+  return action.type !== null
+}
+
+function scheduleActionIsConfigured(action: ScheduleAction) {
+  if (action.type === "console_command") return action.command.trim().length > 0
+  if (action.type === "wait") {
+    return Number.isSafeInteger(action.duration) && action.duration > 0
+  }
+  return true
+}
+
+function waitDurationLabel(
+  action: Pick<Extract<ScheduleAction, { type: "wait" }>, "duration" | "unit">
+) {
+  const unit =
+    action.duration === 1 ? action.unit.replace(/s$/u, "") : action.unit
+  return `${action.duration} ${unit}`
+}
+
+function targetList(targets: ReadonlyArray<ScheduleOption>) {
+  const names = [...new Set(targets.map((target) => target.name))]
+  if (names.length < 2) return names[0] ?? "this target"
+  if (names.length === 2) return `${names[0]} and ${names[1]}`
+  return `${names.slice(0, -1).join(", ")}, and ${names.at(-1)}`
 }
 
 function cronPreset(cron: string) {
@@ -2705,6 +3190,32 @@ function cronPreset(cron: string) {
     "0 0 1 * *": "monthly",
   }
   return presets[cron.trim().toLowerCase().replace(/\s+/gu, " ")] ?? "custom"
+}
+
+function cronDescription(cron: string) {
+  return Result.getOrElse(
+    Result.try(() => {
+      if (!validateScheduleCron(cron, "UTC")) return null
+      const normalizedCron = normalizeScheduleCron(cron)
+      const [minute = "", hour = "", dayOfMonth, month, dayOfWeek] =
+        normalizedCron.split(/\s+/u)
+      if (
+        /^\d+$/u.test(minute) &&
+        /^\d+$/u.test(hour) &&
+        dayOfMonth === "*" &&
+        month === "*" &&
+        dayOfWeek === "*"
+      ) {
+        const hourNumber = Number(hour)
+        const displayHour = hourNumber % 12 || 12
+        return `Every day at ${displayHour}:${minute.padStart(2, "0")} ${hourNumber >= 12 ? "PM" : "AM"}`
+      }
+      return cronstrue.toString(normalizedCron, {
+        throwExceptionOnParseError: true,
+      })
+    }),
+    () => null
+  )
 }
 
 function cronAliasLabel(cron: string) {
@@ -2762,7 +3273,9 @@ function scheduleSearchText(schedule: Schedule) {
         ? action.command
         : action.type === "backup"
           ? action.name
-          : action.action,
+          : action.type === "wait"
+            ? waitDurationLabel(action)
+            : action.action,
     ]),
     ...schedule.targets.flatMap((target) => [
       target.name,
@@ -2822,10 +3335,6 @@ function fullTimestampLabel(date: Date, timeZone: string) {
     fullTimestampFormatters.set(timeZone, formatter)
   }
   return formatter.format(date)
-}
-
-function localTimezone() {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
 }
 
 function scheduleNextRun(schedule: Schedule) {

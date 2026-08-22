@@ -1,7 +1,7 @@
 import * as React from "react"
 import { useSuspenseQuery } from "@tanstack/react-query"
 import { Link, Outlet, useNavigate, useSearch } from "@tanstack/react-router"
-import { CalendarDays, History, ListTodo } from "lucide-react"
+import { CalendarDays, History, ListTodo, RefreshCw } from "lucide-react"
 
 import type { ServerPickerOption } from "@/components/server-picker-list"
 import { ServerScopePicker } from "@/components/server-scope-picker"
@@ -16,23 +16,34 @@ import { getScheduleOptions } from "@/server/schedules"
 type ScheduleOption = Awaited<ReturnType<typeof getScheduleOptions>>[number]
 type RelaySnapshot = Awaited<ReturnType<typeof getRelaySnapshot>>
 
-const scheduleTabs = [
-  { label: "Schedules", to: "/schedules", icon: ListTodo, exact: true },
+const automationTabs = [
+  {
+    label: "Schedules",
+    to: "/automations/schedules",
+    icon: ListTodo,
+    exact: false,
+  },
+  {
+    label: "Sync",
+    to: "/automations/sync",
+    icon: RefreshCw,
+    exact: false,
+  },
   {
     label: "History",
-    to: "/schedules/history",
+    to: "/automations/history",
     icon: History,
     exact: false,
   },
   {
     label: "Calendar",
-    to: "/schedules/calendar",
+    to: "/automations/calendar",
     icon: CalendarDays,
     exact: false,
   },
 ] as const
 
-export const SchedulesShell = React.memo(function SchedulesShell({
+export const AutomationsShell = React.memo(function AutomationsShell({
   children,
 }: {
   children: React.ReactNode
@@ -47,18 +58,18 @@ export const SchedulesShell = React.memo(function SchedulesShell({
     select: selectScheduleScopeInstances,
   })
   const kind = useSearch({
-    from: "/_app/schedules",
+    from: "/_app/automations",
     select: (search) => search.kind,
   })
   const relay = useSearch({
-    from: "/_app/schedules",
+    from: "/_app/automations",
     select: (search) => search.relay,
   })
   const target = useSearch({
-    from: "/_app/schedules",
+    from: "/_app/automations",
     select: (search) => search.target,
   })
-  const navigate = useNavigate({ from: "/schedules" })
+  const navigate = useNavigate({ from: "/automations" })
   const options = React.useMemo(
     () => scheduleScopeOptions(targets, instances),
     [instances, targets]
@@ -103,9 +114,9 @@ export const SchedulesShell = React.memo(function SchedulesShell({
             servers={options}
             onSelect={selectScope}
           />
-          <SchedulesNavigation />
+          <AutomationsNavigation />
         </header>
-        <div data-slot="schedules-content" className="[contain:paint]">
+        <div data-slot="automations-content" className="[contain:paint]">
           {children}
         </div>
       </div>
@@ -113,17 +124,17 @@ export const SchedulesShell = React.memo(function SchedulesShell({
   )
 })
 
-export function SchedulesRouteOutlet() {
+export function AutomationsRouteOutlet() {
   return <Outlet />
 }
 
-const SchedulesNavigation = React.memo(function SchedulesNavigation() {
+const AutomationsNavigation = React.memo(function AutomationsNavigation() {
   return (
     <nav
-      aria-label="Schedule sections"
+      aria-label="Automation sections"
       className="mb-6 no-scrollbar flex gap-1 overflow-x-auto overflow-y-hidden border-b"
     >
-      {scheduleTabs.map((tab) => (
+      {automationTabs.map((tab) => (
         <Link
           key={tab.to}
           to={tab.to}

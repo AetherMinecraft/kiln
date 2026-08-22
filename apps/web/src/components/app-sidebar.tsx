@@ -5,7 +5,6 @@ import {
   useSuspenseQuery,
 } from "@tanstack/react-query"
 import {
-  Archive,
   CalendarClock,
   ChevronsUpDown,
   Database,
@@ -52,6 +51,7 @@ import {
 } from "@workspace/ui/components/tooltip"
 
 import { HearthMark } from "@/components/hearth-mark"
+import { BackupIcon } from "@/components/backup-icon"
 import { ServerTypeIcon } from "@/components/server-type-icon"
 import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
@@ -711,15 +711,15 @@ function AccountNavigation({
     <SidebarFooter>
       <SidebarMenu>
         <SidebarMenuItem>
-          <SidebarMenuButton asChild tooltip="Schedules">
+          <SidebarMenuButton asChild tooltip="Automations">
             <Link
-              to="/schedules"
+              to="/automations/schedules"
               activeOptions={{ includeSearch: false }}
               activeProps={{ "data-active": true }}
               preload="intent"
             >
               <CalendarClock />
-              <span>Schedules</span>
+              <span>Automations</span>
             </Link>
           </SidebarMenuButton>
         </SidebarMenuItem>
@@ -731,7 +731,7 @@ function AccountNavigation({
               activeProps={{ "data-active": true }}
               preload="intent"
             >
-              <Archive />
+              <BackupIcon />
               <span>Backups</span>
             </Link>
           </SidebarMenuButton>
@@ -889,8 +889,8 @@ function statusBorderTone(state: SidebarInstance["observedState"]): string {
 
 function globalSectionFromPathname(pathname: string): GlobalSection {
   if (pathname === "/infra" || pathname.startsWith("/infra/")) return "infra"
-  if (pathname === "/schedules" || pathname.startsWith("/schedules/")) {
-    return "schedules"
+  if (pathname === "/automations" || pathname.startsWith("/automations/")) {
+    return "automations"
   }
   if (pathname === "/backups") return "backups"
   if (pathname === "/access") return "access"

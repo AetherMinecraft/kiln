@@ -23,6 +23,7 @@ export interface ServerPickerOption {
 
 interface ServerPickerAllOption {
   description: string
+  kind?: "database" | "relay" | "server"
   label: string
   onSelect: () => void
   selected: boolean
@@ -35,6 +36,7 @@ export const serverPickerOptionKey = (server: ServerPickerOption) =>
 
 export const ServerPickerList = React.memo(function ServerPickerList({
   allOption,
+  allOptions,
   ariaLabel = "Accessible servers",
   emptyMessage = "No accessible servers found.",
   multiple,
@@ -45,6 +47,7 @@ export const ServerPickerList = React.memo(function ServerPickerList({
   servers,
 }: {
   allOption?: ServerPickerAllOption
+  allOptions?: ReadonlyArray<ServerPickerAllOption>
   ariaLabel?: string
   emptyMessage?: string
   multiple?: boolean
@@ -91,13 +94,28 @@ export const ServerPickerList = React.memo(function ServerPickerList({
         aria-multiselectable={(multiple ?? !allOption) ? true : undefined}
         className="no-scrollbar max-h-72 space-y-0.5 overflow-y-auto overscroll-contain"
       >
-        {allOption && normalizedQuery.length === 0 ? (
-          <ServerPickerRow
-            description={allOption.description}
-            name={allOption.label}
-            selected={allOption.selected}
-            onSelect={allOption.onSelect}
-          />
+        {normalizedQuery.length === 0 ? (
+          <>
+            {allOption ? (
+              <ServerPickerRow
+                description={allOption.description}
+                kind={allOption.kind}
+                name={allOption.label}
+                selected={allOption.selected}
+                onSelect={allOption.onSelect}
+              />
+            ) : null}
+            {allOptions?.map((option) => (
+              <ServerPickerRow
+                key={option.label}
+                description={option.description}
+                kind={option.kind}
+                name={option.label}
+                selected={option.selected}
+                onSelect={option.onSelect}
+              />
+            ))}
+          </>
         ) : null}
 
         {groups.map((group) => (

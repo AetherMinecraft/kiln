@@ -8,7 +8,7 @@ import { z } from "zod"
 import {
   normalizeScheduleCron,
   relayScheduleOverviewSchema,
-  scheduleActionSupportsTarget,
+  scheduleActionAppliesToTarget,
   scheduleActionSchema,
   scheduleDefinitionSchema,
   scheduleInputSchema,
@@ -140,7 +140,7 @@ export const getScheduleOptions = createServerFn({ method: "GET" }).handler(
         return []
       }
       const permittedActions = (
-        ["console_command", "backup", "power"] as const
+        ["console_command", "backup", "power", "wait"] as const
       ).filter((type) => {
         const permission = scheduleActionPermission({ type }, target)
         return (
@@ -736,7 +736,7 @@ async function prepareRelayScheduleActions(
         return Effect.forEach(
           targets,
           (target) =>
-            !scheduleActionSupportsTarget(action, target)
+            !scheduleActionAppliesToTarget(action, target)
               ? Effect.succeed(null)
               : promiseEffect(async () => ({
                   destination:

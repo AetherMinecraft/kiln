@@ -1,5 +1,6 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useNavigate } from "@tanstack/react-router"
 import { Effect } from "effect"
 import {
   ArrowLeftRight,
@@ -161,6 +162,7 @@ const StartupForm = React.memo(function StartupForm({
   observedState: string
   relayId: string
 }) {
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [view, setView] = React.useState(() =>
     brickViewFromBrick(initialBrick, initialBrickSource)
@@ -310,16 +312,24 @@ const StartupForm = React.memo(function StartupForm({
     await Effect.runPromise(
       Effect.tryPromise({
         try: () =>
-          saveMutation.mutateAsync({
-            data: {
-              diskLimitBytes,
-              instanceId,
-              recipe: view.source,
-              relayId,
-              start: true,
-              variables,
-            },
-          }),
+          saveMutation
+            .mutateAsync({
+              data: {
+                diskLimitBytes,
+                instanceId,
+                recipe: view.source,
+                relayId,
+                start: true,
+                variables,
+              },
+            })
+            .then(async () => {
+              if (isRunning) return
+              await navigate({
+                to: "/server/$serverId/console",
+                params: { serverId: instanceId },
+              })
+            }),
         catch: (cause) => cause,
       }).pipe(
         Effect.catch((cause) =>

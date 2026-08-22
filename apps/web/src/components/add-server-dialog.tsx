@@ -385,7 +385,7 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
           onProvision({
             data: {
               diskLimitBytes,
-              name: name.trim() || "New server",
+              name: name || selectionName || "New server",
               recipe,
               relayId,
               start: false,
@@ -677,6 +677,7 @@ const MinecraftVersionField = React.memo(function MinecraftVersionField({
       javaVersion={javaVersion}
       onJavaVersionChange={setJavaVersion}
       onVersionChange={setVersion}
+      selectLatestByDefault
       variableDefinitions={brick.variables}
       version={version}
       versionInputName="version"

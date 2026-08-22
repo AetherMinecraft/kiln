@@ -482,7 +482,7 @@ CREATE TABLE IF NOT EXISTS kiln_schedule_action (
   id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
   schedule_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   position SMALLINT UNSIGNED NOT NULL,
-  action_type ENUM('console_command', 'backup', 'power') NOT NULL,
+  action_type ENUM('console_command', 'backup', 'power', 'wait') NOT NULL,
   action_config JSON NOT NULL,
   created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   UNIQUE KEY kiln_schedule_action_position_unique (schedule_id, position),
