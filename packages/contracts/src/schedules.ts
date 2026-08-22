@@ -12,6 +12,7 @@ export const scheduleActionTypeSchema = z.enum([
   "console_command",
   "backup",
   "power",
+  "wait",
 ])
 
 export type ScheduleActionType = z.infer<typeof scheduleActionTypeSchema>
@@ -66,10 +67,34 @@ export const schedulePowerActionSchema = z
   })
   .strict()
 
+export const scheduleWaitUnitSchema = z.enum([
+  "milliseconds",
+  "seconds",
+  "minutes",
+  "hours",
+  "days",
+])
+
+export type ScheduleWaitUnit = z.infer<typeof scheduleWaitUnitSchema>
+
+export const scheduleWaitActionSchema = z
+  .object({
+    duration: z
+      .number()
+      .int()
+      .positive()
+      .max(Math.floor(Number.MAX_SAFE_INTEGER / 86_400_000)),
+    id: scheduleActionIdSchema,
+    type: z.literal("wait"),
+    unit: scheduleWaitUnitSchema.default("seconds"),
+  })
+  .strict()
+
 export const scheduleActionSchema = z.discriminatedUnion("type", [
   scheduleConsoleCommandActionSchema,
   scheduleBackupActionSchema,
   schedulePowerActionSchema,
+  scheduleWaitActionSchema,
 ])
 
 export type ScheduleAction = z.infer<typeof scheduleActionSchema>
@@ -185,6 +210,7 @@ export const scheduleDefinitionSchema = scheduleInputSchema
       })
     }
     for (const [actionIndex, action] of schedule.actions.entries()) {
+      if (action.type === "wait") continue
       if (action.targetKeys === undefined) continue
       const seenTargetKeys = new Set<string>()
       for (const targetKey of action.targetKeys) {
@@ -234,6 +260,7 @@ export const relayScheduleActionSchema = z.discriminatedUnion("type", [
   scheduleConsoleCommandActionSchema,
   relayScheduleBackupActionSchema,
   schedulePowerActionSchema,
+  scheduleWaitActionSchema,
 ])
 
 export type RelayScheduleAction = z.infer<typeof relayScheduleActionSchema>
@@ -288,6 +315,8 @@ export const scheduleActionAttemptSchema = z
   })
   .strict()
 
+export type ScheduleActionAttempt = z.infer<typeof scheduleActionAttemptSchema>
+
 export const scheduleTargetRunSchema = z
   .object({
     attempts: z.array(scheduleActionAttemptSchema).max(32),
@@ -307,6 +336,7 @@ export const scheduleRunSchema = z
     revision: z.number().int().positive(),
     scheduleId: z.uuid(),
     scheduledAt: z.number().int().nonnegative(),
+    sequenceAttempts: z.array(scheduleActionAttemptSchema).max(32).default([]),
     startedAt: z.number().int().nonnegative(),
     status: scheduleRunStatusSchema,
     targetRuns: z.array(scheduleTargetRunSchema).max(2_000),
@@ -394,6 +424,7 @@ export function scheduleActionSupportsTarget(
   },
   target: Pick<ScheduleTarget, "kind">
 ): boolean {
+  if (action.type === "wait") return true
   if (action.type === "console_command") return target.kind === "instance"
   if (action.type === "power") {
     return (
@@ -420,6 +451,7 @@ export function scheduleActionAppliesToTarget(
   },
   target: ScheduleTarget
 ) {
+  if (action.type === "wait") return true
   return (
     scheduleActionSupportsTarget(action, target) &&
     (action.targetKeys === undefined ||
