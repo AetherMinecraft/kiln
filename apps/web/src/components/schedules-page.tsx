@@ -2185,12 +2185,12 @@ const ActionEditor = React.memo(function ActionEditor({
       }}
       onDrop={(event) => event.preventDefault()}
     >
-      <div className="grid h-full grid-cols-[1.5rem_9rem_minmax(0,1fr)_auto] items-center gap-1 sm:grid-cols-[2rem_9rem_minmax(0,1fr)_auto] sm:gap-2">
+      <div className="grid h-full grid-cols-[1.25rem_8rem_minmax(0,1fr)_auto] items-center gap-0.5 sm:grid-cols-[2rem_9rem_minmax(0,1fr)_auto] sm:gap-2">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               aria-label={`Reorder action ${index + 1}. Use arrow keys or drag.`}
-              className="-my-1 grid h-[calc(100%+0.5rem)] w-6 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing sm:-my-2 sm:h-[calc(100%+1rem)] sm:w-8"
+              className="-my-1 grid h-[calc(100%+0.5rem)] w-5 cursor-grab place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 active:cursor-grabbing sm:-my-2 sm:h-[calc(100%+1rem)] sm:w-8"
               draggable
               type="button"
               onDragEnd={onDragEnd}
@@ -2313,6 +2313,8 @@ const ActionEditor = React.memo(function ActionEditor({
               </SelectContent>
             </Select>
           ) : null}
+        </div>
+        <div className="flex shrink-0 items-center gap-0.5">
           {action.type !== null ? (
             <ScheduleActionTargetsButton
               action={action}
@@ -2327,10 +2329,7 @@ const ActionEditor = React.memo(function ActionEditor({
               }}
             />
           ) : null}
-        </div>
-        <div className="flex shrink-0 items-center gap-0.5">
           <ActionRowButton
-            className="hidden sm:inline-flex"
             disabled={total === 1 || index === total - 1}
             icon={ArrowDown}
             label={`Move action ${index + 1} down`}
@@ -2338,7 +2337,6 @@ const ActionEditor = React.memo(function ActionEditor({
             onClick={() => onMove(action.id, 1)}
           />
           <ActionRowButton
-            className="hidden sm:inline-flex"
             disabled={total === 1 || index === 0}
             icon={ArrowUp}
             label={`Move action ${index + 1} up`}
@@ -2413,19 +2411,24 @@ function ScheduleActionTargetsButton({
   )
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          aria-expanded={open}
-          aria-label={`${selectedTargets.length} targets for ${actionLabel(action.type)}`}
-          className="h-8 shrink-0 gap-1 px-2 text-[0.6875rem]"
-          type="button"
-          variant="outline"
-        >
-          {selectedTargets.length}
-          <span className="hidden sm:inline">targets</span>
-          <ChevronDown className="size-3.5 text-muted-foreground" />
-        </Button>
-      </PopoverTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <Button
+              aria-expanded={open}
+              aria-label={`${selectedTargets.length} targets for ${actionLabel(action.type)}`}
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            >
+              <Server className="size-3.5" />
+            </Button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="top">
+          {selectedTargets.length} action targets
+        </TooltipContent>
+      </Tooltip>
       <PopoverContent align="end" className="w-72 p-1.5">
         <p className="px-2 py-1.5 text-[0.625rem] text-muted-foreground">
           Choose which selected targets run this action.
@@ -2483,7 +2486,6 @@ function scheduleBackupTarget(
 }
 
 const ActionRowButton = React.memo(function ActionRowButton({
-  className = "",
   destructive = false,
   disabled = false,
   icon: Icon,
@@ -2491,7 +2493,6 @@ const ActionRowButton = React.memo(function ActionRowButton({
   tooltip,
   onClick,
 }: {
-  className?: string
   destructive?: boolean
   disabled?: boolean
   icon: typeof ArrowDown
@@ -2504,7 +2505,9 @@ const ActionRowButton = React.memo(function ActionRowButton({
       <TooltipTrigger asChild>
         <Button
           aria-label={label}
-          className={`${className} ${destructive ? "text-destructive hover:text-destructive" : ""}`}
+          className={
+            destructive ? "text-destructive hover:text-destructive" : undefined
+          }
           disabled={disabled}
           size="icon-sm"
           type="button"
