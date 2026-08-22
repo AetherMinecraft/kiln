@@ -196,10 +196,34 @@ export function stringVariableAllows(
 }
 
 export function defaultBrickInstanceName(brick: Brick): string {
-  const version = Object.hasOwn(brick.variables, "version")
-    ? brick.variables.version.default
-    : undefined
-  return `${brick.metadata.name}${version === undefined ? "" : ` ${String(version)}`}`
+  return `Your ${brick.metadata.name} Server`
+}
+
+export function latestStableVersion(
+  versions: ReadonlyArray<string>
+): string | null {
+  const stableVersions = versions.flatMap((version) => {
+    const trimmed = version.trim()
+    return /^\d+(?:\.\d+)*$/u.test(trimmed) ? [trimmed] : []
+  })
+
+  if (stableVersions.length === 0) return null
+
+  return [...stableVersions].sort(compareNumericVersions)[0] ?? null
+}
+
+function compareNumericVersions(left: string, right: string): number {
+  const leftParts = left.split(".").map(Number)
+  const rightParts = right.split(".").map(Number)
+  const length = Math.max(leftParts.length, rightParts.length)
+
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = leftParts[index] ?? 0
+    const rightPart = rightParts[index] ?? 0
+    if (leftPart !== rightPart) return rightPart - leftPart
+  }
+
+  return rightParts.length - leftParts.length
 }
 
 export function interpolateBrickTemplate(
