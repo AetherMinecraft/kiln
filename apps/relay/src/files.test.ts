@@ -21,6 +21,163 @@ import type { RelayInstanceConfig } from "./config.js"
 
 const describeLinux = process.platform === "linux" ? describe : describe.skip
 
+describe("Relay paged file index", () => {
+  it.effect("pages directories and searches every matching path", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        yield* fromPromise(() =>
+          Promise.all(
+            Array.from({ length: 600 }, (_, index) =>
+              writeFile(
+                resolve(
+                  root,
+                  "world",
+                  `match-${index.toString().padStart(3, "0")}.txt`
+                ),
+                String(index)
+              )
+            )
+          )
+        )
+
+        const listed: Array<string> = []
+        let directoryCursor: string | undefined
+        do {
+          const page = yield* driver.directory(instance, {
+            ...(directoryCursor ? { cursor: directoryCursor } : {}),
+            instanceId: instance.id,
+            path: "world/",
+          })
+          listed.push(...page.entries.map((entry) => entry.path))
+          directoryCursor = page.cursor ?? undefined
+        } while (directoryCursor)
+
+        assert.lengthOf(listed, 600)
+        assert.strictEqual(new Set(listed).size, 600)
+        assert.include(listed, "world/match-599.txt")
+
+        const metadata = yield* driver.entry(instance, "world/match-599.txt")
+        assert.strictEqual(metadata.kind, "file")
+        assert.strictEqual(metadata.path, "world/match-599.txt")
+        assert.strictEqual(metadata.size, 3)
+
+        const matches: Array<string> = []
+        let searchCursor: string | undefined
+        do {
+          const page = yield* driver.search(instance, {
+            ...(searchCursor ? { cursor: searchCursor } : {}),
+            instanceId: instance.id,
+            query: "match-",
+          })
+          matches.push(...page.entries.map((entry) => entry.path))
+          searchCursor = page.cursor ?? undefined
+        } while (searchCursor)
+
+        assert.deepEqual(new Set(matches), new Set(listed))
+      })
+    )
+  )
+
+  it.effect("caps scan sessions without expiring existing cursors", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        yield* fromPromise(() =>
+          Promise.all(
+            Array.from({ length: 128 }, (_, index) =>
+              writeFile(resolve(root, "world", `entry-${index}.txt`), "")
+            )
+          )
+        )
+
+        const cursors: Array<string> = []
+        for (let index = 0; index < 256; index += 1) {
+          const page = yield* driver.directory(instance, {
+            instanceId: instance.id,
+            path: "world/",
+          })
+          assert.isString(page.cursor)
+          if (page.cursor) cursors.push(page.cursor)
+        }
+
+        const failure = yield* driver
+          .directory(instance, {
+            instanceId: instance.id,
+            path: "world/",
+          })
+          .pipe(Effect.flip)
+        assert.instanceOf(failure, RelayFilesystemError)
+        assert.strictEqual(failure.operation, "directory.open")
+
+        const firstCursor = cursors[0]
+        assert.isString(firstCursor)
+        const resumed = yield* driver.directory(instance, {
+          cursor: firstCursor,
+          instanceId: instance.id,
+          path: "world/",
+        })
+        assert.isNull(resumed.cursor)
+
+        yield* Effect.forEach(
+          cursors.slice(1),
+          (cursor) =>
+            driver.directory(instance, {
+              cursor,
+              instanceId: instance.id,
+              path: "world/",
+            }),
+          { concurrency: 16, discard: true }
+        )
+      })
+    )
+  )
+})
+
+describe("Relay legacy file tree", () => {
+  it.effect("stops collecting paths at the compatibility limit", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        for (let offset = 0; offset < 5_001; offset += 256) {
+          yield* fromPromise(() =>
+            Promise.all(
+              Array.from(
+                { length: Math.min(256, 5_001 - offset) },
+                (_, index) =>
+                  writeFile(resolve(root, `entry-${offset + index}.txt`), "")
+              )
+            )
+          )
+        }
+
+        const tree = yield* driver.tree(instance)
+
+        assert.lengthOf(tree.paths, 5_000)
+        assert.isTrue(tree.truncated)
+      })
+    )
+  )
+
+  it.effect("stops walking below the compatibility depth", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        let directory = resolve(root, "world")
+        for (let depth = 0; depth < 12; depth += 1) {
+          directory = resolve(directory, `level-${depth}`)
+          yield* fromPromise(() => mkdir(directory))
+        }
+
+        const tree = yield* driver.tree(instance)
+
+        assert.isTrue(tree.truncated)
+        assert.include(tree.paths, "world/level-0/level-1/")
+        assert.notInclude(
+          tree.paths,
+          "world/level-0/level-1/level-2/level-3/level-4/level-5/level-6/level-7/level-8/level-9/level-10/"
+        )
+      })
+    )
+  )
+})
+
 describeLinux("Relay direct file transfers", () => {
   it.effect("renames, duplicates, archives, and deletes entries", () =>
     withSetup(({ driver, instance, root }) =>
@@ -37,11 +194,12 @@ describeLinux("Relay direct file transfers", () => {
           operation: "duplicate",
           paths: ["world/server.txt"],
         })
-        const archived = yield* driver.mutate(instance, {
+        yield* driver.mutate(instance, {
           operation: "archive",
           paths: ["world/server.txt", "world/server copy.txt"],
           destination: "world/configs.zip",
         })
+        const archived = yield* driver.tree(instance)
         assert.include(archived.paths, "world/configs.zip")
         assert.strictEqual(archived.sizes["world/server.txt"], 8)
         assert.isAtLeast(archived.sizes["world/"] ?? 0, 16)
@@ -53,10 +211,11 @@ describeLinux("Relay direct file transfers", () => {
         )
         assert.strictEqual(archive.subarray(0, 2).toString(), "PK")
 
-        const deleted = yield* driver.mutate(instance, {
+        yield* driver.mutate(instance, {
           operation: "delete",
           paths: ["world/server.txt", "world/server copy.txt"],
         })
+        const deleted = yield* driver.tree(instance)
         assert.notInclude(deleted.paths, "world/server.txt")
         assert.notInclude(deleted.paths, "world/server copy.txt")
       })
