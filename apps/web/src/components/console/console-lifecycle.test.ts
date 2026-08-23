@@ -2,6 +2,8 @@ import { describe, expect, it } from "vite-plus/test"
 
 import {
   consoleRecoveryLine,
+  consoleSessionAcceptedAheadOfRuntime,
+  consoleSessionIsCurrent,
   consoleStateLine,
   initialConsoleStateLines,
   isConsoleRecoveryLine,
@@ -9,7 +11,9 @@ import {
   isConsoleStateLineFor,
   mergeConsoleHistory,
   mergeConsoleStateLines,
+  reconcileConsoleLifecycleLines,
   retimestampConsoleStateLine,
+  shouldAwaitConsoleRecoverySession,
   shouldRecordConsoleStateTransition,
 } from "./console-lifecycle"
 
@@ -148,6 +152,100 @@ describe("console lifecycle lines", () => {
       "Server is running",
       "Player joined",
     ])
+  })
+
+  it("keeps replacement-session output when its starting snapshot arrives later", () => {
+    const replacementStartedAt = "2026-07-28T20:10:00.000Z"
+    const lines = [
+      consoleStateLine("stopped", null),
+      {
+        id: "replacement-output",
+        level: "info" as const,
+        text: "Loading properties",
+        timestamp: "2026-07-28T20:10:01.000Z",
+      },
+    ]
+
+    const acceptedAheadOfRuntime = consoleSessionAcceptedAheadOfRuntime(
+      false,
+      startedAt,
+      replacementStartedAt,
+      "starting",
+      null
+    )
+
+    expect(acceptedAheadOfRuntime).toBe(true)
+    expect(
+      consoleSessionIsCurrent(
+        false,
+        acceptedAheadOfRuntime,
+        replacementStartedAt,
+        null
+      )
+    ).toBe(true)
+    expect(
+      consoleSessionIsCurrent(
+        false,
+        acceptedAheadOfRuntime,
+        replacementStartedAt,
+        startedAt
+      )
+    ).toBe(true)
+    expect(
+      reconcileConsoleLifecycleLines(
+        lines,
+        replacementStartedAt,
+        "starting"
+      ).map((line) => line.text)
+    ).toEqual(["Server is starting", "Loading properties"])
+  })
+
+  it("continues awaiting a replacement when the current session is unchanged", () => {
+    expect(consoleSessionIsCurrent(true, false, startedAt, startedAt)).toBe(
+      false
+    )
+    expect(
+      consoleSessionIsCurrent(
+        false,
+        false,
+        startedAt,
+        "2026-07-28T20:10:00.000Z"
+      )
+    ).toBe(false)
+  })
+
+  it("does not re-arm pending recovery after accepting its replacement session", () => {
+    const replacementStartedAt = "2026-07-28T20:10:00.000Z"
+    const acceptedAheadOfRuntime = consoleSessionAcceptedAheadOfRuntime(
+      false,
+      startedAt,
+      replacementStartedAt,
+      "starting",
+      null
+    )
+
+    expect(
+      shouldAwaitConsoleRecoverySession("pending", acceptedAheadOfRuntime)
+    ).toBe(false)
+    expect(shouldAwaitConsoleRecoverySession("pending", false)).toBe(true)
+    expect(
+      consoleSessionAcceptedAheadOfRuntime(
+        acceptedAheadOfRuntime,
+        replacementStartedAt,
+        replacementStartedAt,
+        "starting",
+        null
+      )
+    ).toBe(true)
+    expect(
+      consoleSessionAcceptedAheadOfRuntime(
+        acceptedAheadOfRuntime,
+        replacementStartedAt,
+        replacementStartedAt,
+        "running",
+        replacementStartedAt
+      )
+    ).toBe(false)
   })
 
   it("inserts a live running transition at its readiness timestamp", () => {

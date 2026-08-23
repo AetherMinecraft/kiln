@@ -43,6 +43,67 @@ export function mergeConsoleStateLines(
   ].sort(compareConsoleLineOrder)
 }
 
+export function reconcileConsoleLifecycleLines(
+  lines: ReadonlyArray<RelayConsoleLine>,
+  startedAt: string | null,
+  state: RelayObservedState | undefined,
+  readyAt: string | null = null,
+  recovery: RelayInstanceRecovery | null = null
+): Array<RelayConsoleLine> {
+  return mergeConsoleStateLines(
+    lines.filter(
+      (line) => !isConsoleStateLine(line) && !isConsoleRecoveryLine(line)
+    ),
+    startedAt,
+    state,
+    readyAt,
+    recovery
+  )
+}
+
+export function consoleSessionIsCurrent(
+  awaitingNewSession: boolean,
+  sessionAcceptedAheadOfRuntime: boolean,
+  consoleStartedAt: string | null | undefined,
+  runtimeStartedAt: string | null | undefined
+): boolean {
+  return (
+    !awaitingNewSession &&
+    consoleStartedAt !== null &&
+    consoleStartedAt !== undefined &&
+    (sessionAcceptedAheadOfRuntime || consoleStartedAt === runtimeStartedAt)
+  )
+}
+
+export function consoleSessionAcceptedAheadOfRuntime(
+  wasAcceptedAheadOfRuntime: boolean,
+  previousConsoleStartedAt: string | null | undefined,
+  nextConsoleStartedAt: string | null,
+  runtimeState: RelayObservedState | undefined,
+  runtimeStartedAt: string | null | undefined
+): boolean {
+  if (nextConsoleStartedAt !== previousConsoleStartedAt) {
+    return (
+      nextConsoleStartedAt !== null &&
+      (runtimeState !== "running" || runtimeStartedAt !== nextConsoleStartedAt)
+    )
+  }
+  if (
+    runtimeState === "running" &&
+    runtimeStartedAt === nextConsoleStartedAt
+  ) {
+    return false
+  }
+  return wasAcceptedAheadOfRuntime
+}
+
+export function shouldAwaitConsoleRecoverySession(
+  recoveryPhase: RelayInstanceRecovery["phase"] | undefined,
+  sessionAcceptedAheadOfRuntime: boolean
+): boolean {
+  return recoveryPhase === "pending" && !sessionAcceptedAheadOfRuntime
+}
+
 export function consoleRecoveryLine(
   recovery: RelayInstanceRecovery,
   timestamp: string | null
