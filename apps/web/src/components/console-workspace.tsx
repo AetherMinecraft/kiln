@@ -60,6 +60,8 @@ import type {
 } from "@/components/console/console-stores"
 import {
   consoleRecoveryLine,
+  consoleSessionAcceptedAheadOfRuntime,
+  consoleSessionIsCurrent,
   consoleStateLine,
   initialConsoleStateLines,
   isConsoleRecoveryLine,
@@ -67,7 +69,9 @@ import {
   isConsoleStateLineFor,
   mergeConsoleHistory,
   mergeConsoleStateLines,
+  reconcileConsoleLifecycleLines,
   retimestampConsoleStateLine,
+  shouldAwaitConsoleRecoverySession,
   shouldRecordConsoleStateTransition,
 } from "@/components/console/console-lifecycle"
 import {
@@ -1145,10 +1149,6 @@ function ConsoleLogViewport({
     if (!active || !autoScroll || filteredLines.length === 0 || loading) return
     programmaticScroll.current = true
     rowVirtualizer.scrollToIndex(filteredLines.length - 1, { align: "end" })
-    // Chromium can defer this programmatic scroll event until pointer movement.
-    queueMicrotask(() => {
-      parentRef.current?.dispatchEvent(new Event("scroll"))
-    })
     const frame = window.requestAnimationFrame(() => {
       programmaticScroll.current = false
     })
@@ -1160,9 +1160,6 @@ function ConsoleLogViewport({
     programmaticScroll.current = true
     if (filteredLines.length > 0) {
       rowVirtualizer.scrollToIndex(filteredLines.length - 1, { align: "end" })
-      queueMicrotask(() => {
-        parentRef.current?.dispatchEvent(new Event("scroll"))
-      })
     }
     window.requestAnimationFrame(() => {
       programmaticScroll.current = false
@@ -1364,7 +1361,7 @@ const ConsoleLogRow = React.memo(function ConsoleLogRow({
       data-index={index}
       className={`absolute top-0 left-0 flex min-h-[30px] transition-colors ${stateLine ? "border-l-0 pr-0 text-center" : "border-l-2 pr-5 text-left"} ${wrapLines ? "w-full items-start py-1.5 whitespace-pre-wrap" : "h-[30px] min-w-full items-center whitespace-nowrap"} ${lineTone(line.level, selected, stateLine)}`}
       style={{
-        transform: `translateY(${start}px)`,
+        top: start,
         width: wrapLines ? "100%" : "max(100%, max-content)",
       }}
       onClick={(event) => toggle(event.shiftKey)}
@@ -2172,6 +2169,7 @@ function useRelayConsoleStream(
   )
   const sessionInitializedRef = React.useRef(Boolean(consoleDataRef.current))
   const awaitingNewSessionRef = React.useRef(false)
+  const sessionAcceptedAheadOfRuntimeRef = React.useRef(false)
   const previousStateRef = React.useRef<RelayObservedState | undefined>(
     runtime?.observedState
   )
@@ -2204,6 +2202,13 @@ function useRelayConsoleStream(
     if (!state) return
 
     const current = consoleDataRef.current
+    if (
+      state === "running" &&
+      runtime.startedAt &&
+      runtime.startedAt === sessionStartedAtRef.current
+    ) {
+      sessionAcceptedAheadOfRuntimeRef.current = false
+    }
     if (state === "running" && runtime.readyAt && current) {
       const retimestampedLines = retimestampConsoleStateLine(
         current.lines,
@@ -2226,6 +2231,31 @@ function useRelayConsoleStream(
     previousStateRef.current = state
 
     if (state === "starting") {
+      if (
+        current &&
+        consoleSessionIsCurrent(
+          awaitingNewSessionRef.current,
+          sessionAcceptedAheadOfRuntimeRef.current,
+          current.startedAt,
+          runtime.startedAt
+        )
+      ) {
+        // The console stream can observe the replacement container before the
+        // runtime snapshot. Keep its lines and only reconcile stale lifecycle
+        // markers from the older snapshot.
+        sessionInitializedRef.current = true
+        commitConsole({
+          ...current,
+          lines: reconcileConsoleLifecycleLines(
+            current.lines,
+            current.startedAt ?? runtime.startedAt ?? null,
+            state,
+            runtime.readyAt,
+            runtime.recovery
+          ),
+        })
+        return
+      }
       awaitingNewSessionRef.current = true
       // Preserve the crashed session until Docker has actually started the
       // replacement process, so the failure context remains visible.
@@ -2264,7 +2294,8 @@ function useRelayConsoleStream(
     instanceId,
     runtime?.observedState,
     runtime?.readyAt,
-    runtime?.recovery?.phase,
+    runtime?.recovery,
+    runtime?.startedAt,
   ])
 
   React.useEffect(() => {
@@ -2302,7 +2333,14 @@ function useRelayConsoleStream(
   React.useEffect(() => {
     const recovery = runtime?.recovery
     if (!recovery) return
-    if (recovery.phase === "pending") awaitingNewSessionRef.current = true
+    if (
+      shouldAwaitConsoleRecoverySession(
+        recovery.phase,
+        sessionAcceptedAheadOfRuntimeRef.current
+      )
+    ) {
+      awaitingNewSessionRef.current = true
+    }
     const current = consoleDataRef.current
     if (!current) return
     const line = consoleRecoveryLine(recovery, new Date().toISOString())
@@ -2388,9 +2426,17 @@ function useRelayConsoleStream(
         flushTimer = null
       }
       pending.length = 0
-      awaitingNewSessionRef.current =
-        runtimeRef.current?.recovery?.phase === "pending" ||
-        runtimeRef.current?.recovery?.phase === "restarting"
+      sessionAcceptedAheadOfRuntimeRef.current =
+        consoleSessionAcceptedAheadOfRuntime(
+          sessionAcceptedAheadOfRuntimeRef.current,
+          sessionStartedAtRef.current,
+          startedAt,
+          runtimeRef.current?.observedState,
+          runtimeRef.current?.startedAt
+        )
+      // A reset is the authoritative session boundary. Runtime snapshots can
+      // arrive later, but must not put an accepted session back into waiting.
+      awaitingNewSessionRef.current = false
       sessionStartedAtRef.current = startedAt
       sessionInitializedRef.current = true
       const nextLines = mergeConsoleStateLines(
