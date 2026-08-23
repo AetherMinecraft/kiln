@@ -1,5 +1,6 @@
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
+import { Effect } from "effect"
 import QRCode from "react-qr-code"
 import {
   Check,
@@ -25,11 +26,18 @@ import {
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
 import { showToast } from "@workspace/ui/components/sonner"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@workspace/ui/components/tooltip"
 
 import { ensuringPromise, recoverPromise } from "@/effect/promise"
 import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { clearAppearanceCache } from "@/lib/appearance"
+import { DISPLAY_NAME_MAX_LENGTH, parseDisplayName } from "@/lib/display-name"
+import { queryKeys } from "@/lib/query-options"
 import { getCliCredentials, revokeCliCredential } from "@/server/cli"
 import { getActiveSessions, revokeActiveSession } from "@/server/sessions"
 import type { AccountSessionSummary } from "@/effect/account-sessions"
@@ -40,6 +48,7 @@ const accountDateFormatter = new Intl.DateTimeFormat(undefined, {
 })
 const activeSessionsQueryKey = ["account", "active-sessions"] as const
 const linkedCliQueryKey = ["account", "linked-clis"] as const
+const redactedTextAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
 
 type ActiveSession = AccountSessionSummary
 
@@ -82,6 +91,7 @@ export function AccountSettingsPage({ user }: { user: AuthenticatedUser }) {
         className={`min-w-0 border-0 p-0 ${user.isDevelopmentBypass ? "opacity-45" : ""}`}
       >
         <div className="border-b">
+          <DisplayNameCard initialDisplayName={user.name} />
           <EmailAddressCard initialEmail={user.email} />
           <PasswordCard />
           <TwoFactorCard />
@@ -95,6 +105,141 @@ export function AccountSettingsPage({ user }: { user: AuthenticatedUser }) {
         </div>
       </fieldset>
     </div>
+  )
+}
+
+function DisplayNameCard({
+  initialDisplayName,
+}: {
+  initialDisplayName: string
+}) {
+  const queryClient = useQueryClient()
+  const session = authClient.useSession()
+  const [open, setOpen] = React.useState(false)
+  const [currentDisplayName, setCurrentDisplayName] =
+    React.useState(initialDisplayName)
+  const [displayName, setDisplayName] = React.useState(initialDisplayName)
+  const [pending, setPending] = React.useState(false)
+
+  async function updateDisplayName(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const nextDisplayName = await Effect.runPromise(
+      Effect.try({
+        try: () => parseDisplayName(displayName),
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.match({
+          onFailure: (cause) => {
+            showToast({
+              message:
+                cause instanceof Error ? cause.message : "Enter a display name",
+              type: "error",
+            })
+            return null
+          },
+          onSuccess: (name) => name,
+        })
+      )
+    )
+    if (!nextDisplayName) return
+
+    setPending(true)
+    const result = await ensuringPromise(
+      () =>
+        recoverPromise(
+          () => authClient.updateUser({ name: nextDisplayName }),
+          (cause) =>
+            failedAuthResult(cause, "Could not update your display name")
+        ),
+      () => setPending(false)
+    )
+    if (result.error) {
+      showToast({
+        message: authErrorMessage(
+          result.error,
+          "Could not update your display name"
+        ),
+        type: "error",
+      })
+      return
+    }
+
+    setCurrentDisplayName(nextDisplayName)
+    setDisplayName(nextDisplayName)
+    setOpen(false)
+    showToast({ message: "Display name updated.", type: "success" })
+    await Promise.all([
+      session.refetch(),
+      queryClient.invalidateQueries({ queryKey: queryKeys.auth.state }),
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.access.capabilities,
+      }),
+    ])
+  }
+
+  function changeOpen(nextOpen: boolean) {
+    if (pending) return
+    setOpen(nextOpen)
+    if (!nextOpen) setDisplayName(currentDisplayName)
+  }
+
+  return (
+    <AccountSection title="Display Name">
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <p className="truncate text-xs text-muted-foreground">
+          {currentDisplayName}
+        </p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="shrink-0"
+          onClick={() => setOpen(true)}
+        >
+          Change
+        </Button>
+      </div>
+
+      <Dialog open={open} onOpenChange={changeOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Change display name</DialogTitle>
+            <DialogDescription>
+              This is how your name appears to other Kiln users.
+            </DialogDescription>
+          </DialogHeader>
+          <form className="grid gap-4" onSubmit={updateDisplayName}>
+            <Field label="Display Name" htmlFor="account-display-name">
+              <Input
+                id="account-display-name"
+                type="text"
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                autoComplete="name"
+                maxLength={DISPLAY_NAME_MAX_LENGTH}
+                className="h-10 bg-background/70"
+                required
+                autoFocus
+              />
+            </Field>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => changeOpen(false)}
+                disabled={pending}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={pending || !displayName.trim()}>
+                {pending ? <LoaderCircle className="animate-spin" /> : null}
+                Save name
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </AccountSection>
   )
 }
 
@@ -192,7 +337,7 @@ function EmailAddressCard({ initialEmail }: { initialEmail: string }) {
   return (
     <AccountSection title="Email address">
       <div className="flex min-w-0 items-center justify-between gap-3">
-        <p className="truncate text-xs text-muted-foreground">{currentEmail}</p>
+        <RedactedEmail value={currentEmail} />
         <Button
           type="button"
           variant="outline"
@@ -288,6 +433,53 @@ function EmailAddressCard({ initialEmail }: { initialEmail: string }) {
       </Dialog>
     </AccountSection>
   )
+}
+
+function RedactedEmail({ value }: { value: string }) {
+  const [revealed, setRevealed] = React.useState(false)
+  const redacted = React.useMemo(() => redactedPlaceholder(value), [value])
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className={`min-w-0 cursor-pointer truncate rounded-sm font-mono text-[11px] leading-none transition hover:text-foreground ${revealed ? "text-muted-foreground" : "text-muted-foreground blur-[2px] select-none"}`}
+          aria-label={
+            revealed ? `${value}. Hide email address` : "Reveal email address"
+          }
+          aria-pressed={revealed}
+          onClick={() => setRevealed((current) => !current)}
+        >
+          {revealed ? value : redacted}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" sideOffset={6}>
+        {revealed ? "Click to hide email" : "Click to reveal email"}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function redactedPlaceholder(value: string): string {
+  let state = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    state ^= value.charCodeAt(index)
+    state = Math.imul(state, 0x01000193)
+  }
+
+  const nextCharacter = () => {
+    state = Math.imul(state ^ (state >>> 13), 0x85ebca6b)
+    state = Math.imul(state ^ (state >>> 16), 0xc2b2ae35)
+    return (
+      redactedTextAlphabet[Math.abs(state) % redactedTextAlphabet.length] ?? "x"
+    )
+  }
+
+  return Array.from(value, (character) => {
+    if (["@", ".", "-", "_"].includes(character)) return character
+    return nextCharacter()
+  }).join("")
 }
 
 function PasswordCard() {
