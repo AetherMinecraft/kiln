@@ -261,7 +261,7 @@ function InstanceWorkspaceHeader() {
 
   return (
     <header className="shrink-0 border-b bg-background/90 backdrop-blur-xl">
-      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-3 px-3 py-3 sm:px-5 lg:min-h-20 lg:py-2 xl:grid-cols-[minmax(0,1fr)_39rem_auto] xl:gap-x-5">
+      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-3 px-3 py-3 sm:px-5 lg:min-h-20 lg:py-2 xl:grid-cols-[minmax(0,1fr)_36rem_auto] xl:gap-x-3">
         <div className="col-start-1 row-start-1 flex min-w-0 items-center gap-4">
           <ToolbarSidebarTrigger />
           <span className="h-8 w-px shrink-0 bg-border/80" aria-hidden="true" />
@@ -605,7 +605,7 @@ function ServerPowerControls({
               <Button
                 variant="outline"
                 size="icon-lg"
-                className="bg-card shadow-none"
+                className="h-9 w-8 bg-card shadow-none"
                 aria-label="Server actions"
                 disabled={controlsUnavailable}
               >
@@ -966,7 +966,7 @@ function LiveResourceMeters({
       className="hidden min-w-0 md:col-span-2 md:block xl:col-span-1 xl:col-start-2 xl:row-start-1"
       aria-label="Server resource usage"
     >
-      <div className="grid h-14 min-w-0 grid-cols-[repeat(3,minmax(0,1fr))_minmax(0,1.25fr)_5.5rem] divide-x divide-border/60 border border-border/80 bg-card/40 px-1.5 py-2 xl:grid-cols-[repeat(3,minmax(0,1fr))_minmax(0,1.15fr)_5.75rem]">
+      <div className="grid h-14 min-w-0 grid-cols-[repeat(4,minmax(0,1fr))_5.5rem] divide-x divide-border/60 border border-border/80 bg-card/40 px-1.5 py-2 xl:grid-cols-[repeat(4,minmax(0,1fr))_5.75rem]">
         {RESOURCE_IDS.map((resourceId) => (
           <LiveResourceMeter
             key={resourceId}
@@ -1019,14 +1019,11 @@ function LiveResourceMeter({
             {resource.label}
           </span>
           {resource.id === "network" ? (
-            <span className="flex min-w-0 items-center gap-1 font-medium tracking-[-0.045em] tabular-nums xl:gap-1.5">
-              <span className="truncate text-cyan-200/95">
-                ↓ {resource.receivedDisplayValue}
-              </span>
-              <span className="truncate text-primary/90">
-                ↑ {resource.sentDisplayValue}
-              </span>
-            </span>
+            <NetworkTransferValue
+              historyStore={historyStore}
+              received={resource.receivedDisplayValue ?? "—"}
+              sent={resource.sentDisplayValue ?? "—"}
+            />
           ) : (
             <span
               className={`truncate font-medium tabular-nums ${resource.valueClassName}`}
@@ -1035,9 +1032,34 @@ function LiveResourceMeter({
             </span>
           )}
         </div>
-        <ResourceBar resource={resource} className="mt-3" />
+        <ResourceBar resource={resource} className="mt-2" />
       </button>
     </ResourceHistoryPopover>
+  )
+}
+
+function NetworkTransferValue({
+  historyStore,
+  received,
+  sent,
+}: {
+  historyStore: ResourceHistoryStore
+  received: string
+  sent: string
+}) {
+  const sampleSequence = React.useSyncExternalStore(
+    historyStore.subscribe,
+    historyStore.getLatestSampleSequence,
+    () => 0
+  )
+  const isReceived = sampleSequence % 2 === 0
+  return (
+    <span
+      className={`min-w-0 truncate font-medium tracking-[-0.045em] tabular-nums ${isReceived ? "text-cyan-200/95" : "text-primary/90"}`}
+      aria-label={`Download ${received}, upload ${sent}`}
+    >
+      {isReceived ? "↓" : "↑"} {isReceived ? received : sent}
+    </span>
   )
 }
 
@@ -1307,7 +1329,7 @@ function ResourceBar({
 }) {
   return (
     <div
-      className={`h-2 ${resource.id === "network" ? "grid grid-rows-2 gap-px" : "overflow-hidden bg-muted/55"} ${className}`}
+      className={`h-3 ${resource.id === "network" ? "grid grid-rows-2 gap-px" : "overflow-hidden bg-muted/55"} ${className}`}
       role="progressbar"
       aria-label={`${resource.label} usage`}
       aria-valuemin={0}
@@ -1414,12 +1436,6 @@ function ResourceHistoryCard({
     : null
   const peak = values.length ? Math.max(...values) : null
   const latest = visibleHistory.at(-1)
-  const receivedStats = historyStatistics(
-    visibleHistory.map((sample) => sample.networkReceived)
-  )
-  const sentStats = historyStatistics(
-    visibleHistory.map((sample) => sample.networkSent)
-  )
   const chartData = visibleHistory.map((sample) => ({
     timestamp: sample.timestamp,
     value: sample[resource.id],
@@ -1436,8 +1452,6 @@ function ResourceHistoryCard({
         peak={peak}
         networkReceived={latest?.networkReceived ?? null}
         networkSent={latest?.networkSent ?? null}
-        receivedStats={receivedStats}
-        sentStats={sentStats}
       />
 
       <div className="px-1.5 pt-2.5">
@@ -1471,80 +1485,57 @@ function ResourceHistoryHeader({
   peak,
   networkReceived,
   networkSent,
-  receivedStats,
-  sentStats,
 }: {
   resource: ResourceItem
   average: number | null
   peak: number | null
   networkReceived: number | null
   networkSent: number | null
-  receivedStats: ReturnType<typeof historyStatistics>
-  sentStats: ReturnType<typeof historyStatistics>
 }) {
-  return (
-    <div className="h-[61px] border-b border-border/70 bg-muted/[0.08]">
-      <div className="flex h-6 items-center justify-between border-b border-border/45 px-3">
-        <span className="type-technical-label text-foreground">
-          {resource.label}
-        </span>
-        <span className="type-meta font-mono tracking-[0.08em] text-muted-foreground">
-          6m window
-        </span>
+  if (resource.id === "network") {
+    return (
+      <div className="grid h-12 grid-cols-2 divide-x divide-border/55 border-b border-border/70 bg-muted/[0.08]">
+        <NetworkHistoryValue direction="down" value={networkReceived} />
+        <NetworkHistoryValue direction="up" value={networkSent} />
       </div>
+    )
+  }
 
-      {resource.id === "network" ? (
-        <div className="grid h-9 grid-cols-2 divide-x divide-border/55">
-          <NetworkHistoryValue
-            direction="down"
-            value={networkReceived}
-            average={receivedStats.average}
-            peak={receivedStats.peak}
-          />
-          <NetworkHistoryValue
-            direction="up"
-            value={networkSent}
-            average={sentStats.average}
-            peak={sentStats.peak}
-          />
-        </div>
-      ) : resource.id === "storage" ? (
-        <div className="grid h-9 grid-cols-2 divide-x divide-border/55">
-          <DiskHistoryValue
-            label="Server"
-            value={resource.historyDisplayValue ?? "—"}
-            valueClassName={resource.valueClassName}
-          />
-          <DiskHistoryValue
-            label="Node"
-            value={resource.historySecondaryDisplayValue ?? "—"}
-            valueClassName="text-foreground"
-          />
-        </div>
-      ) : (
-        <div className="grid h-9 grid-cols-[1fr_4.5rem_4.5rem] divide-x divide-border/55">
-          <div className="flex min-w-0 items-center gap-2 px-3">
-            <span
-              className={`truncate font-mono font-semibold tracking-[-0.04em] tabular-nums ${resource.id === "memory" ? "type-code" : "text-xl"} ${resource.valueClassName}`}
-            >
-              {resource.historyDisplayValue ?? resource.displayValue}
-            </span>
-            <span className="type-technical-label text-muted-foreground">
-              Now
-            </span>
-          </div>
-          <HistoryStat
-            label="Avg"
-            value={
-              average === null ? "—" : formatHistoryValue(resource.id, average)
-            }
-          />
-          <HistoryStat
-            label="Peak"
-            value={peak === null ? "—" : formatHistoryValue(resource.id, peak)}
-          />
-        </div>
-      )}
+  if (resource.id === "storage") {
+    return (
+      <div className="grid h-12 grid-cols-2 divide-x divide-border/55 border-b border-border/70 bg-muted/[0.08]">
+        <DiskHistoryValue
+          label="Server"
+          value={resource.historyDisplayValue ?? "—"}
+          valueClassName={resource.valueClassName}
+        />
+        <DiskHistoryValue
+          label="Node"
+          value={resource.historySecondaryDisplayValue ?? "—"}
+          valueClassName="text-foreground"
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="grid h-12 grid-cols-[minmax(0,1.6fr)_minmax(0,0.7fr)_minmax(0,0.7fr)] divide-x divide-border/55 border-b border-border/70 bg-muted/[0.08]">
+      <HistoryStat
+        align="left"
+        label="Now"
+        value={resource.historyDisplayValue ?? resource.displayValue}
+        valueClassName={resource.valueClassName}
+      />
+      <HistoryStat
+        label="Avg"
+        value={
+          average === null ? "—" : formatHistoryValue(resource.id, average)
+        }
+      />
+      <HistoryStat
+        label="Peak"
+        value={peak === null ? "—" : formatHistoryValue(resource.id, peak)}
+      />
     </div>
   )
 }
@@ -1559,12 +1550,12 @@ function DiskHistoryValue({
   valueClassName: string
 }) {
   return (
-    <div className="flex min-w-0 flex-col justify-center px-3">
+    <div className="flex min-w-0 flex-col justify-center gap-1 px-3">
       <span className="type-technical-label text-muted-foreground">
         {label}
       </span>
       <span
-        className={`mt-1 truncate font-mono text-xs leading-none font-semibold tracking-[-0.035em] tabular-nums ${valueClassName}`}
+        className={`type-code truncate leading-none font-medium tracking-[-0.035em] tabular-nums ${valueClassName}`}
       >
         {value}
       </span>
@@ -1572,13 +1563,27 @@ function DiskHistoryValue({
   )
 }
 
-function HistoryStat({ label, value }: { label: string; value: string }) {
+function HistoryStat({
+  align = "right",
+  label,
+  value,
+  valueClassName = "text-foreground",
+}: {
+  align?: "left" | "right"
+  label: string
+  value: string
+  valueClassName?: string
+}) {
   return (
-    <div className="flex min-w-0 flex-col justify-center px-2 text-right">
+    <div
+      className={`flex min-w-0 flex-col justify-center gap-1 px-2 ${align === "left" ? "text-left" : "text-right"}`}
+    >
       <span className="type-technical-label text-muted-foreground">
         {label}
       </span>
-      <span className="type-code mt-1 truncate font-medium text-foreground tabular-nums">
+      <span
+        className={`type-code truncate leading-none font-medium tracking-[-0.025em] tabular-nums ${valueClassName}`}
+      >
         {value}
       </span>
     </div>
@@ -1588,47 +1593,22 @@ function HistoryStat({ label, value }: { label: string; value: string }) {
 function NetworkHistoryValue({
   direction,
   value,
-  average,
-  peak,
 }: {
   direction: "down" | "up"
   value: number | null
-  average: number | null
-  peak: number | null
 }) {
   return (
-    <div className="min-w-0 px-3 py-1.5">
-      <div className="flex items-baseline justify-between gap-2">
-        <span className="type-technical-label text-muted-foreground">
-          {direction === "down" ? "↓ In" : "↑ Out"}
-        </span>
-        <span
-          className={`type-code truncate font-semibold tracking-[-0.03em] tabular-nums ${direction === "down" ? "text-cyan-200" : "text-primary"}`}
-        >
-          {value === null ? "—" : formatBytesPerSecond(value)}
-        </span>
-      </div>
-      <div className="type-meta mt-1 flex items-center justify-between gap-2 font-mono tracking-[0.02em] text-muted-foreground uppercase tabular-nums">
-        <span>
-          Avg {average === null ? "—" : formatBytesPerSecond(average)}
-        </span>
-        <span>Peak {peak === null ? "—" : formatBytesPerSecond(peak)}</span>
-      </div>
+    <div className="flex min-w-0 flex-col justify-center gap-1 px-3">
+      <span className="type-technical-label text-muted-foreground">
+        {direction === "down" ? "↓ In" : "↑ Out"}
+      </span>
+      <span
+        className={`type-code truncate leading-none font-medium tracking-[-0.035em] tabular-nums ${direction === "down" ? "text-cyan-200" : "text-primary"}`}
+      >
+        {value === null ? "—" : formatBytesPerSecond(value)}
+      </span>
     </div>
   )
-}
-
-function historyStatistics(values: Array<number | null>): {
-  average: number | null
-  peak: number | null
-} {
-  const samples = values.filter((value): value is number => value !== null)
-  return {
-    average: samples.length
-      ? samples.reduce((total, value) => total + value, 0) / samples.length
-      : null,
-    peak: samples.length ? Math.max(...samples) : null,
-  }
 }
 
 function formatHistoryValue(
