@@ -5,14 +5,10 @@ import { useIsMobile } from "@workspace/ui/hooks/use-mobile"
 import {
   EditorDownloadButton,
   EditorSaveButton,
-  StableEditorCopyButton,
-  StableEditorFontSizeButton,
   StableEditorMobileOverflowMenu,
   StableEditorOverflowMenu,
   StableEditorShareButton,
-  StableEditorWrapButton,
 } from "@/components/files/file-editor-toolbar-actions"
-import { EditorSearchToggleButton } from "@/components/files/file-editor-search"
 import type { SaveFileRevision } from "@/components/files/file-editor-save"
 import type {
   EditorSessionStore,
@@ -44,10 +40,6 @@ export function EditorResponsiveActions({
   if (isMobile) {
     return (
       <div className="ml-auto flex shrink-0 items-center gap-1 md:hidden">
-        <EditorSearchToggleButton
-          loading={loading}
-          sessionStore={sessionStore}
-        />
         <EditorSaveButton
           canWrite={canWrite}
           file={file}
@@ -84,10 +76,6 @@ export function EditorResponsiveActions({
           sessionStore={sessionStore}
         />
       ) : null}
-      <EditorSearchToggleButton loading={loading} sessionStore={sessionStore} />
-      <StableEditorFontSizeButton preferencesStore={preferencesStore} />
-      <StableEditorWrapButton sessionStore={sessionStore} />
-      <StableEditorCopyButton sessionStore={sessionStore} />
       <EditorDownloadButton
         instance={instance}
         loading={loading}
@@ -107,6 +95,7 @@ export function EditorResponsiveActions({
         file={file}
         instance={instance}
         loading={loading}
+        preferencesStore={preferencesStore}
         saveFile={saveFile}
         sessionStore={sessionStore}
       />
