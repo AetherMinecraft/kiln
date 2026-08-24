@@ -66,6 +66,25 @@ export const relayObservedStateSchema = z
 
 export const relayDesiredStateSchema = z.enum(["stopped", "running"])
 
+export const relayInstanceProvisioningSchema = z
+  .object({
+    attempt: z.number().int().nonnegative(),
+    error: z.string().max(2_048).nullable(),
+    failedPhase: z
+      .enum(["preparing", "pulling_image", "creating_container", "finalizing"])
+      .optional(),
+    phase: z.enum([
+      "awaiting_claim",
+      "queued",
+      "preparing",
+      "pulling_image",
+      "creating_container",
+      "finalizing",
+      "failed",
+    ]),
+  })
+  .strict()
+
 export const relayInstanceRecoverySchema = z
   .object({
     attempt: z.number().int().nonnegative(),
@@ -422,6 +441,15 @@ export const relayCreateInstanceSchema = z.object({
     .optional(),
   variables: brickVariableValuesSchema,
   start: z.boolean().default(true),
+})
+
+export const relayPrepareInstanceSchema = relayCreateInstanceSchema.extend({
+  idempotencyKey: z.uuid(),
+  instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+})
+
+export const relayProvisionInstanceSchema = z.object({
+  instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
 })
 
 export const relayUpdateInstanceStartupSchema = z
@@ -933,6 +961,7 @@ export const relayInstanceSchema = z.object({
     memoryBytes: 0,
   }),
   resources: relayInstanceResourcesSchema.nullable().default(null),
+  provisioning: relayInstanceProvisioningSchema.optional(),
 })
 
 export const relayTailscaleStackBindingSchema =
@@ -1410,6 +1439,13 @@ export type BrickCatalogDocument = z.infer<typeof brickCatalogDocumentSchema>
 export type Brick = z.infer<typeof brickSchema>
 export type RelayCatalog = z.infer<typeof relayCatalogSchema>
 export type RelayCreateInstance = z.infer<typeof relayCreateInstanceSchema>
+export type RelayPrepareInstance = z.infer<typeof relayPrepareInstanceSchema>
+export type RelayProvisionInstance = z.infer<
+  typeof relayProvisionInstanceSchema
+>
+export type RelayInstanceProvisioning = z.infer<
+  typeof relayInstanceProvisioningSchema
+>
 export type RelayUpdateInstanceStartup = z.infer<
   typeof relayUpdateInstanceStartupSchema
 >
