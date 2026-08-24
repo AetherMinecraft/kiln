@@ -1,5 +1,8 @@
 import { createServerFn } from "@tanstack/react-start"
+import { Effect } from "effect"
 import {
+  type Brick,
+  type BrickRecipe,
   brickSchema,
   brickSourceSchema,
   brickVariableValuesSchema,
@@ -22,6 +25,7 @@ import {
 } from "@/lib/access-control"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { hydrateBrickVariables } from "@/lib/brick-variables"
+import { hydrateBrickIcon } from "@/lib/brick-catalog-source.server"
 import {
   listCustomBricksEffect,
   saveCustomBrickEffect,
@@ -29,8 +33,13 @@ import {
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { listMcJarVersionsEffect } from "@/effect/mcjarfiles"
-import { runAppEffect } from "@/effect/runtime"
-import { registerInstance } from "@/lib/instance-registry"
+import { promiseEffect } from "@/effect/promise"
+import { forkAppEffect, runAppEffect } from "@/effect/runtime"
+import {
+  registerPreparedInstance,
+  reservePreparedInstance,
+  unregisterInstance,
+} from "@/lib/instance-registry"
 import {
   invalidateRelayCache,
   relayCachePolicy,
@@ -51,6 +60,7 @@ export const hearthCreateInstanceInputSchema = relayCreateInstanceSchema
   .omit({ recipeDefinition: true })
   .extend({
     ...relayInputSchema.shape,
+    idempotencyKey: z.uuid(),
     name: relayInstanceNameSchema,
   })
   .strict()
@@ -60,6 +70,10 @@ const networkingInputSchema = relayNetworkingSchema.extend(
 const recipeInputSchema = relayInputSchema.extend({ source: brickSourceSchema })
 const instanceInputSchema = relayInputSchema.extend({
   instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+})
+const cancelProvisioningResultSchema = z.object({
+  cancelled: z.boolean(),
+  instanceId: instanceInputSchema.shape.instanceId,
 })
 export const hearthUpdateInstanceStartupInputSchema =
   relayUpdateInstanceStartupSchema
@@ -83,7 +97,10 @@ export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
       "platform.bricks.add-custom"
     )
     const customBricksPromise = canAddCustomBrick
-      ? runAppEffect("customBricks.list", listCustomBricksEffect(user.id))
+      ? runAppEffect("customBricks.list", listCustomBricksEffect(user.id)).then(
+          (bricks) =>
+            Promise.all(bricks.map((brick) => hydrateBrickIcon(brick)))
+        )
       : Promise.resolve([])
     const catalogsPromise = visibleBrickCatalogs(user)
     const candidates = (await listPersistedRelays()).filter(
@@ -118,6 +135,40 @@ export const getBrickCatalog = createServerFn({ method: "GET" }).handler(
   }
 )
 
+export const getBrickIconPresentations = createServerFn({
+  method: "GET",
+}).handler(async () => {
+  const user = await requireAuthenticatedUser()
+  const canUseCustomBricks = hasPlatformPermission(
+    user,
+    "platform.bricks.add-custom"
+  )
+  const [catalogs, customBricks] = await Promise.all([
+    visibleBrickCatalogs(user),
+    canUseCustomBricks
+      ? runAppEffect("customBricks.list", listCustomBricksEffect(user.id)).then(
+          (bricks) =>
+            Promise.all(bricks.map((brick) => hydrateBrickIcon(brick)))
+        )
+      : Promise.resolve([]),
+  ])
+  const sources = new Set<string>()
+  const bricks = catalogs.flatMap((catalog) => catalog.bricks)
+  bricks.push(...customBricks)
+  const presentations = []
+  for (const brick of bricks) {
+    if (sources.has(brick.source)) continue
+    sources.add(brick.source)
+    presentations.push({
+      id: brick.metadata.id,
+      source: brick.source,
+      ...(brick.metadata.color ? { color: brick.metadata.color } : {}),
+      ...(brick.iconSvg ? { iconSvg: brick.iconSvg } : {}),
+    })
+  }
+  return presentations
+})
+
 export const getBrickVersions = createServerFn({ method: "GET" })
   .validator(brickVersionCatalogSchema)
   .handler(async ({ data }) => {
@@ -138,30 +189,123 @@ export const createBrickInstance = createServerFn({ method: "POST" })
       user,
       data.recipe
     )
+    const { idempotencyKey, relayId: _, ...createInput } = data
     const input = relayCreateInstanceSchema.parse({
-      ...data,
+      ...createInput,
       recipeDefinition,
     })
-    const instance = relayInstanceSchema.parse(
-      await requestRelay(
+    const instanceId = provisioningInstanceId(idempotencyKey)
+    const cancel = () =>
+      requestRelay(
         relay,
-        "/v1/instances",
-        {
-          method: "POST",
-          body: JSON.stringify(input),
-        },
-        360_000,
+        `/v1/instances/${encodeURIComponent(instanceId)}/provision`,
+        { method: "DELETE" },
+        30_000,
         user.id
+      ).then((result) => cancelProvisioningResultSchema.parse(result).cancelled)
+    const unregister = () => unregisterInstance(relay.id, instanceId)
+    await reservePreparedInstance(relay.id, { id: instanceId }, user.id)
+    const instance = await Effect.runPromise(
+      promiseEffect(() =>
+        requestRelay(
+          relay,
+          "/v1/instance-provisioning",
+          {
+            method: "POST",
+            body: JSON.stringify({ ...input, idempotencyKey, instanceId }),
+          },
+          30_000,
+          user.id
+        )
+      ).pipe(
+        Effect.map(relayInstanceSchema.parse),
+        Effect.tapError(() =>
+          compensatePreparedProvisioning(cancel, unregister)
+        )
       )
     )
-    await registerInstance(relay.id, instance, user.id)
-    await provisionInstanceDomainBestEffort(instance, relay.id)
-    await runAppEffect(
+    await Effect.runPromise(
+      promiseEffect(() =>
+        registerPreparedInstance(relay.id, instance, user.id)
+      ).pipe(
+        Effect.tapError(() =>
+          compensatePreparedProvisioning(cancel, unregister)
+        )
+      )
+    )
+    await claimPreparedProvisioning({
+      cancel,
+      claim: () =>
+        requestRelay(
+          relay,
+          `/v1/instances/${encodeURIComponent(instance.id)}/provision`,
+          { method: "POST" },
+          30_000,
+          user.id
+        ),
+      unregister,
+    })
+    forkAppEffect(
       "relay.snapshot.invalidate",
       invalidateRelayCache(relayCachePolicy.snapshot(relay.id))
     )
     return instance
   })
+
+export function compensatePreparedProvisioning(
+  cancel: () => Promise<boolean>,
+  unregister: () => Promise<void>
+) {
+  return promiseEffect(cancel).pipe(
+    Effect.flatMap((cancelled) =>
+      cancelled ? promiseEffect(unregister) : Effect.void
+    ),
+    Effect.catch(() => Effect.void)
+  )
+}
+
+export function provisioningInstanceId(idempotencyKey: string): string {
+  const hex = idempotencyKey.replaceAll("-", "")
+  return `${hex}${hex.slice(0, 8)}`
+}
+
+export function claimPreparedProvisioning(input: {
+  cancel: () => Promise<boolean>
+  claim: () => Promise<unknown>
+  unregister: () => Promise<void>
+}): Promise<void> {
+  return Effect.runPromise(
+    promiseEffect(input.claim).pipe(
+      Effect.asVoid,
+      Effect.matchEffect({
+        onFailure: (claimFailure) =>
+          promiseEffect(input.cancel).pipe(
+            Effect.matchEffect({
+              onFailure: () =>
+                Effect.fail(
+                  new Error(
+                    `Kiln could not confirm whether Relay accepted provisioning. Retry the unchanged request to resume the same server. ${
+                      claimFailure instanceof Error
+                        ? claimFailure.message
+                        : "Relay claim failed"
+                    }`,
+                    { cause: claimFailure }
+                  )
+                ),
+              onSuccess: (cancelled) =>
+                cancelled
+                  ? promiseEffect(input.unregister).pipe(
+                      Effect.catch(() => Effect.void),
+                      Effect.andThen(Effect.fail(claimFailure))
+                    )
+                  : Effect.void,
+            })
+          ),
+        onSuccess: () => Effect.void,
+      })
+    )
+  )
+}
 
 export const getInstanceRecipe = createServerFn({ method: "GET" })
   .validator(instanceInputSchema)
@@ -300,22 +444,25 @@ async function loadInstanceRecipe(
   if (!brickSource) {
     throw new Error("This server has no Brick recipe")
   }
-  const brick = brickSchema.parse(
-    await requestRelay(
-      relay,
-      `/v1/bricks/recipe?source=${encodeURIComponent(brickSource)}${
-        instance.brickSnapshotSha256
-          ? `&snapshotSha256=${encodeURIComponent(instance.brickSnapshotSha256)}`
-          : ""
-      }`
+  const brick = await hydrateBrickIcon(
+    brickSchema.parse(
+      await requestRelay(
+        relay,
+        `/v1/bricks/recipe?source=${encodeURIComponent(brickSource)}${
+          instance.brickSnapshotSha256
+            ? `&snapshotSha256=${encodeURIComponent(instance.brickSnapshotSha256)}`
+            : ""
+        }`
+      )
     )
   )
   return { brick, brickSource }
 }
 
 function recipePreview(brick: z.infer<typeof brickSchema>) {
+  const { iconSvg: _iconSvg, ...recipe } = brick
   return {
-    ...brick,
+    ...recipe,
     variables: Object.fromEntries(
       Object.entries(brick.variables).map(([name, variable]) => [
         name,
@@ -347,10 +494,12 @@ export const loadBrickRecipe = createServerFn({ method: "POST" })
     requireBrickSourcePermission(user, "platform.bricks.add-custom")
     const relay = await requiredRelay(data.relayId)
     requireRelayProvisionAccess(user, relay)
-    return brickSchema.parse(
-      await requestRelay(
-        relay,
-        `/v1/bricks/recipe?source=${encodeURIComponent(data.source)}`
+    return hydrateBrickIcon(
+      brickSchema.parse(
+        await requestRelay(
+          relay,
+          `/v1/bricks/recipe?source=${encodeURIComponent(data.source)}`
+        )
       )
     )
   })
@@ -363,10 +512,12 @@ export const saveCustomBrick = createServerFn({ method: "POST" })
     const relay = await requiredRelay(data.relayId)
     requireRelayProvisionAccess(user, relay)
 
-    const brick = brickSchema.parse(
-      await requestRelay(
-        relay,
-        `/v1/bricks/recipe?source=${encodeURIComponent(data.source)}`
+    const brick = await hydrateBrickIcon(
+      brickSchema.parse(
+        await requestRelay(
+          relay,
+          `/v1/bricks/recipe?source=${encodeURIComponent(data.source)}`
+        )
       )
     )
     return runAppEffect(
@@ -455,6 +606,11 @@ async function requiredVisibleRecipeDefinition(
   return definition
 }
 
+export function brickRecipeDefinition(brick: Brick): BrickRecipe {
+  const { iconSvg: _iconSvg, source: _source, ...definition } = brick
+  return definition
+}
+
 async function visibleRecipeDefinition(
   user: AuthenticatedUser,
   source: string
@@ -474,8 +630,7 @@ async function visibleRecipeDefinition(
     ...customBricks,
   ].find((candidate) => candidate.source === source)
   if (!brick) return null
-  const { source: _source, ...definition } = brick
-  return definition
+  return brickRecipeDefinition(brick)
 }
 
 async function requiredRelayInstance(

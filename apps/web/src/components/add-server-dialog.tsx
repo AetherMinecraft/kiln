@@ -282,6 +282,10 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
   const relayConnected = useSelectedRelayConnected(relayId)
 
   const submittingRef = React.useRef(false)
+  const provisioningAttemptRef = React.useRef<{
+    fingerprint: string
+    idempotencyKey: string
+  } | null>(null)
 
   async function provision(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -313,6 +317,21 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
     const name = typeof submittedName === "string" ? submittedName.trim() : ""
     const variables =
       selection.kind === "catalog" ? defaultBrickVariables(selection.brick) : {}
+    const provisioningInput = {
+      diskLimitBytes: DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
+      name: name || selectionName || "New server",
+      recipe,
+      relayId,
+      start: false,
+      variables,
+    }
+    const fingerprint = JSON.stringify(provisioningInput)
+    const previousAttempt = provisioningAttemptRef.current
+    const idempotencyKey =
+      previousAttempt?.fingerprint === fingerprint
+        ? previousAttempt.idempotencyKey
+        : randomIdempotencyKey()
+    provisioningAttemptRef.current = { fingerprint, idempotencyKey }
 
     submittingRef.current = true
     await Effect.runPromise(
@@ -320,12 +339,8 @@ const AddServerConfiguration = React.memo(function AddServerConfiguration({
         try: () =>
           onProvision({
             data: {
-              diskLimitBytes: DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
-              name: name || selectionName || "New server",
-              recipe,
-              relayId,
-              start: false,
-              variables,
+              ...provisioningInput,
+              idempotencyKey,
             },
           }),
         catch: (cause) => cause,
@@ -504,6 +519,16 @@ function normalizeArchitecture(architecture: string): string {
     default:
       return architecture.trim().toLowerCase()
   }
+}
+
+function randomIdempotencyKey(): string {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80
+  const hex = Array.from(bytes, (value) =>
+    value.toString(16).padStart(2, "0")
+  ).join("")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
 function displayArchitecture(architecture: string | null): string {

@@ -155,9 +155,41 @@ export class BrickCatalog {
           .join("; ")
       )
     }
-    validateRecipeSemantics(parsed.data, source)
-    return parsed.data
+    const recipe = resolveRecipeIconSource(parsed.data, source, fromCatalog)
+    validateRecipeSemantics(recipe, source)
+    return recipe
   }
+}
+
+export function resolveRecipeIconSource(
+  recipe: BrickRecipe,
+  recipeSource: URL,
+  fromCatalog: boolean
+): BrickRecipe {
+  const reference = recipe.metadata.icon
+  if (!reference) return recipe
+  const parsedSource = Result.try(() => new URL(reference, recipeSource))
+  if (Result.isFailure(parsedSource)) return withoutRecipeIcon(recipe)
+  const source = parsedSource.success
+  if (
+    source.protocol !== "https:" &&
+    !(
+      fromCatalog &&
+      recipeSource.protocol === "file:" &&
+      source.protocol === "file:"
+    )
+  ) {
+    return withoutRecipeIcon(recipe)
+  }
+  return {
+    ...recipe,
+    metadata: { ...recipe.metadata, icon: source.href },
+  }
+}
+
+function withoutRecipeIcon(recipe: BrickRecipe): BrickRecipe {
+  const { icon: _icon, ...metadata } = recipe.metadata
+  return { ...recipe, metadata }
 }
 
 export function brickSnapshotDirectory(dataDirectory: string): string {

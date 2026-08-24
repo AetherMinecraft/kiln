@@ -1,5 +1,7 @@
 import { z } from "zod"
 
+export { validateBrickIconSvg } from "./brick-icons"
+
 import { MINIMUM_INSTANCE_DISK_LIMIT_BYTES } from "./instance-limits.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
 import {
@@ -64,6 +66,25 @@ export const relayObservedStateSchema = z
   .transform((state) => (state === "offline" ? ("stopped" as const) : state))
 
 export const relayDesiredStateSchema = z.enum(["stopped", "running"])
+
+export const relayInstanceProvisioningSchema = z
+  .object({
+    attempt: z.number().int().nonnegative(),
+    error: z.string().max(2_048).nullable(),
+    failedPhase: z
+      .enum(["preparing", "pulling_image", "creating_container", "finalizing"])
+      .optional(),
+    phase: z.enum([
+      "awaiting_claim",
+      "queued",
+      "preparing",
+      "pulling_image",
+      "creating_container",
+      "finalizing",
+      "failed",
+    ]),
+  })
+  .strict()
 
 export const relayInstanceRecoverySchema = z
   .object({
@@ -221,6 +242,11 @@ export const brickRecipeSchema = z
         description: z.string().min(1).max(280),
         game: z.string().min(1).max(80),
         author: z.string().min(1).max(80),
+        icon: z.string().trim().min(1).max(2_048).optional(),
+        color: z
+          .string()
+          .regex(/^#[\da-f]{6}$/iu, "Brick colors must use #rrggbb")
+          .optional(),
         documentation: z.url().max(2_048).optional(),
         tags: z
           .array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/u))
@@ -330,6 +356,10 @@ export function relayDiskAllocationAvailableBytes(
 }
 
 export const brickSchema = brickRecipeSchema.extend({
+  iconSvg: z
+    .string()
+    .max(64 * 1024)
+    .optional(),
   source: brickSourceSchema,
 })
 
@@ -412,6 +442,15 @@ export const relayCreateInstanceSchema = z.object({
     .optional(),
   variables: brickVariableValuesSchema,
   start: z.boolean().default(true),
+})
+
+export const relayPrepareInstanceSchema = relayCreateInstanceSchema.extend({
+  idempotencyKey: z.uuid(),
+  instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+})
+
+export const relayProvisionInstanceSchema = z.object({
+  instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
 })
 
 export const relayUpdateInstanceStartupSchema = z
@@ -923,6 +962,7 @@ export const relayInstanceSchema = z.object({
     memoryBytes: 0,
   }),
   resources: relayInstanceResourcesSchema.nullable().default(null),
+  provisioning: relayInstanceProvisioningSchema.optional(),
 })
 
 export const relayTailscaleStackBindingSchema =
@@ -1400,6 +1440,13 @@ export type BrickCatalogDocument = z.infer<typeof brickCatalogDocumentSchema>
 export type Brick = z.infer<typeof brickSchema>
 export type RelayCatalog = z.infer<typeof relayCatalogSchema>
 export type RelayCreateInstance = z.infer<typeof relayCreateInstanceSchema>
+export type RelayPrepareInstance = z.infer<typeof relayPrepareInstanceSchema>
+export type RelayProvisionInstance = z.infer<
+  typeof relayProvisionInstanceSchema
+>
+export type RelayInstanceProvisioning = z.infer<
+  typeof relayInstanceProvisioningSchema
+>
 export type RelayUpdateInstanceStartup = z.infer<
   typeof relayUpdateInstanceStartupSchema
 >

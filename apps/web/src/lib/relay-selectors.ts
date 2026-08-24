@@ -13,6 +13,7 @@ export type RelayConnectionSummary =
 export type SidebarInstance = Pick<
   RelayInstance,
   | "brickId"
+  | "brickSource"
   | "id"
   | "implementation"
   | "name"
@@ -31,6 +32,8 @@ export type RouteInstance = SidebarInstance & {
 
 export type ServerListInstance = Pick<
   RelayInstance,
+  | "brickId"
+  | "brickSource"
   | "connectAddress"
   | "game"
   | "id"
@@ -55,11 +58,14 @@ export type InstanceWorkspaceInstance = Pick<
   | "javaVersion"
   | "managedByRelay"
   | "name"
+  | "observedState"
   | "pendingPrimaryPort"
   | "ports"
   | "publicHost"
   | "service"
   | "shortId"
+  | "status"
+  | "provisioning"
   | "version"
 > & {
   relayId: string
@@ -136,6 +142,8 @@ export function selectServerListInstances(
   snapshot: RelayFleetSnapshot
 ): Array<ServerListInstance> {
   return snapshot.instances.map((instance) => ({
+    brickId: instance.brickId,
+    brickSource: instance.brickSource,
     connectAddress: instance.connectAddress,
     game: instance.game,
     id: instance.id,
@@ -156,6 +164,7 @@ function sidebarInstance(
 ): SidebarInstance {
   return {
     brickId: instance.brickId,
+    brickSource: instance.brickSource,
     id: instance.id,
     implementation: instance.implementation,
     name: instance.name,
@@ -193,6 +202,7 @@ export function selectInstanceWorkspaceInstance(identifier: string) {
       javaVersion: instance.javaVersion,
       managedByRelay: instance.managedByRelay,
       name: instance.name,
+      observedState: instance.observedState,
       pendingPrimaryPort: instance.pendingPrimaryPort,
       ports: instance.ports,
       publicHost: instance.publicHost,
@@ -201,6 +211,8 @@ export function selectInstanceWorkspaceInstance(identifier: string) {
       routeId: instance.routeId,
       service: instance.service,
       shortId: instance.shortId,
+      status: instance.status,
+      provisioning: instance.provisioning,
       version: instance.version,
     }
   }
