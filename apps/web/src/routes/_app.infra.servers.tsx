@@ -3,6 +3,7 @@ import { createFileRoute } from "@tanstack/react-router"
 import { z } from "zod"
 
 import { ServersPage, createServerSearchStore } from "@/components/servers-page"
+import { isDevelopmentBypassIdentity } from "@/lib/development-bypass"
 import { pageTitle } from "@/lib/page-title"
 import { requireInfrastructureDestinationAccess } from "@/lib/route-access"
 
@@ -36,6 +37,7 @@ function ServersRoute() {
         user.role === "admin" ||
         user.role === "relay_creator"
       }
+      passwordRequired={!isDevelopmentBypassIdentity(user)}
       searchStore={searchStore}
     />
   )

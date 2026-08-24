@@ -40,6 +40,7 @@ export type ServerListInstance = Pick<
   | "implementation"
   | "name"
   | "observedState"
+  | "provisioning"
   | "shortId"
   | "version"
 > & {
@@ -91,6 +92,7 @@ export type InstanceSettingsInstance = Pick<
   | "implementation"
   | "javaVersion"
   | "name"
+  | "provisioning"
   | "publicHost"
   | "publicPort"
   | "service"
@@ -150,6 +152,7 @@ export function selectServerListInstances(
     implementation: instance.implementation,
     name: instance.name,
     observedState: instance.observedState,
+    provisioning: instance.provisioning,
     relayId: instance.relayId,
     relayName: instance.relayName,
     relayStatus: instance.relayStatus,
@@ -271,6 +274,7 @@ export function selectInstanceSettings(instanceId: string, relayId?: string) {
         implementation: instance.implementation,
         javaVersion: instance.javaVersion,
         name: instance.name,
+        provisioning: instance.provisioning,
         publicHost: instance.publicHost,
         publicPort: instance.publicPort,
         relayId: instance.relayId,

@@ -55,6 +55,7 @@ import type {
 } from "@/components/instance-workspace-context"
 import { WorkspaceFrame } from "@/components/workspace-frame"
 import { roleHasPermission } from "@/lib/permissions"
+import { provisioningFailureDiagnostics } from "@/lib/provisioning-diagnostics"
 import {
   beginPendingPowerAction,
   finishPendingPowerAction,
@@ -236,7 +237,11 @@ function InstanceProvisioningBoundary({
   children: React.ReactNode
   instance: InstanceWorkspaceInstance
 }) {
+  const isInfoRoute = useRouterState({
+    select: (state) => state.location.pathname.endsWith("/info"),
+  })
   if (!instance.provisioning) return children
+  if (isInfoRoute) return children
   return <InstanceProvisioningState instance={instance} />
 }
 
@@ -262,13 +267,14 @@ const InstanceProvisioningState = React.memo(
     const failureGuidance = failed
       ? PROVISIONING_FAILURE_GUIDANCE[provisioning.failedPhase ?? "preparing"]
       : null
-    const diagnostics = [
-      `Server: ${instance.name} (${instance.id})`,
-      `Relay: ${instance.relayId}`,
-      `Failed phase: ${activeStep?.label ?? "Provisioning"}`,
-      `Attempt: ${Math.max(1, provisioning.attempt)}`,
-      `Reason: ${provisioning.error ?? "The Relay did not provide an error message."}`,
-    ].join("\n")
+    const diagnostics = provisioningFailureDiagnostics({
+      attempt: provisioning.attempt,
+      error: provisioning.error,
+      failedPhase: provisioning.failedPhase,
+      instanceId: instance.id,
+      instanceName: instance.name,
+      relayId: instance.relayId,
+    })
 
     function copyDiagnostics() {
       Effect.runFork(
@@ -321,7 +327,13 @@ const InstanceProvisioningState = React.memo(
                   <p className="type-technical-label text-destructive">
                     Failed during {activeStep?.label ?? "provisioning"}
                   </p>
-                  <p className="mt-2 text-sm leading-6 text-foreground">
+                  <p
+                    className="mt-2 line-clamp-3 text-sm leading-6 break-words text-foreground"
+                    title={
+                      provisioning.error ??
+                      "The Relay did not provide an error message."
+                    }
+                  >
                     {provisioning.error ??
                       "The Relay did not provide an error message."}
                   </p>
@@ -770,7 +782,7 @@ function ServerPowerControls({
 }: {
   action: ServerAction | null
   canControlPower: boolean
-  instance: Pick<InstanceWorkspaceInstance, "id" | "name"> &
+  instance: Pick<InstanceWorkspaceInstance, "id" | "name" | "provisioning"> &
     Pick<InstanceRuntime, "observedState">
   onAction: (action: ServerAction) => Promise<void>
   relayConnected: boolean
@@ -782,7 +794,10 @@ function ServerPowerControls({
   const isRunning = instance.observedState === "running"
   const isStarting = instance.observedState === "starting"
   const isStopping = instance.observedState === "stopping"
-  const isProvisioning = isPowerControlLocked(instance.observedState)
+  const isProvisioning =
+    Boolean(instance.provisioning) ||
+    isPowerControlLocked(instance.observedState)
+  const provisioningFailed = instance.provisioning?.phase === "failed"
   const powerIsOn = isRunning || isStarting
   const powerIsTransitioning =
     action === "start" ||
@@ -826,7 +841,9 @@ function ServerPowerControls({
           : action === "stop" || action === "restart" || isStopping
             ? "Stopping"
             : isProvisioning
-              ? "Provisioning"
+              ? provisioningFailed
+                ? "Failed"
+                : "Provisioning"
               : powerIsOn
                 ? "Stop"
                 : "Start"}
@@ -983,6 +1000,7 @@ function InstancePowerControls({
       if (
         !relayConnected ||
         !observedState ||
+        instance.provisioning ||
         isPowerControlLocked(observedState)
       ) {
         return
@@ -1051,6 +1069,7 @@ function InstancePowerControls({
     },
     [
       instance.id,
+      instance.provisioning,
       instance.relayId,
       mutateRelayAction,
       onError,
@@ -1076,7 +1095,12 @@ function InstancePowerControls({
     <ServerPowerControls
       action={action}
       canControlPower={canControlPower}
-      instance={{ id: instance.id, name: instance.name, observedState }}
+      instance={{
+        id: instance.id,
+        name: instance.name,
+        observedState,
+        provisioning: instance.provisioning,
+      }}
       onAction={handleAction}
       relayConnected={relayConnected}
     />

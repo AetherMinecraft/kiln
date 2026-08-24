@@ -85,9 +85,11 @@ export function createServerSearchStore(
 
 export const ServersPage = React.memo(function ServersPage({
   canProvision,
+  passwordRequired,
   searchStore,
 }: {
   canProvision: boolean
+  passwordRequired: boolean
   searchStore: ServerSearchStore
 }) {
   const queryClient = useQueryClient()
@@ -158,6 +160,7 @@ export const ServersPage = React.memo(function ServersPage({
           key={`${deleteTarget.relayId}:${deleteTarget.id}`}
           open
           target={deleteTarget}
+          passwordRequired={passwordRequired}
           onOpenChange={(open) => {
             if (!open) setDeleteTarget(null)
           }}
@@ -711,6 +714,7 @@ const ServerActions = React.memo(function ServerActions({
               disabled={!deleteEnabled}
               onClick={() =>
                 onDelete({
+                  backupAvailable: !server.provisioning,
                   id: server.id,
                   name: server.name,
                   relayId: server.relayId,
