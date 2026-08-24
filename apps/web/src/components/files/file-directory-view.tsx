@@ -5,7 +5,6 @@ import {
   ArrowUp,
   ChevronDown,
   ChevronUp,
-  FileIcon,
   FilePlus,
   Folder,
   FolderPlus,
@@ -27,6 +26,7 @@ import {
 } from "@workspace/ui/components/tooltip"
 
 import { FileActionsDropdown } from "@/components/files/file-actions"
+import { FileTypeIcon } from "@/components/files/file-type-icon"
 import { selectedUploadFiles } from "@/components/files/file-upload-selection"
 import {
   type FileActionsController,
@@ -296,7 +296,7 @@ export function RootDirectoryList({
   }
 
   return (
-    <div className="mt-8">
+    <div className="mt-5">
       <div className="mb-2 flex min-h-8 items-center gap-2 px-1">
         <Folder className="size-3.5 text-primary" />
         <h2 className="type-technical-label text-muted-foreground">
@@ -370,7 +370,7 @@ export function RootDirectoryList({
               {entry.kind === "directory" ? (
                 <Folder className="size-4 shrink-0 text-primary/80" />
               ) : (
-                <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+                <FileTypeIcon path={entry.path} />
               )}
               <span className="truncate">{entry.name}</span>
             </button>
@@ -636,7 +636,7 @@ function DirectoryViewContent({
                 {entry.kind === "directory" ? (
                   <Folder className="size-4 shrink-0 text-primary/80" />
                 ) : (
-                  <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+                  <FileTypeIcon path={entry.path} />
                 )}
                 <span className="truncate">{entry.name}</span>
               </button>
