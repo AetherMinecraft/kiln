@@ -260,7 +260,7 @@ jobs:
                 hearth: { image: ($imagePrefix + "/hearth"), digest: $hearthDigest },
                 relay: { image: ($imagePrefix + "/relay"), digest: $relayDigest }
               },
-              compatibility: { relayProtocol: 2 }
+              compatibility: { relayProtocol: 3 }
             }' > release-manifest.json
 
       - name: Publish prerelease

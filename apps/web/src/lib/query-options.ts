@@ -27,11 +27,15 @@ import {
   getManagedDatabaseDirectory,
   getManagedDatabases,
 } from "@/server/databases"
+import { isMinecraftUsername } from "@/lib/minecraft-profile"
 import { getUiPreferences } from "@/server/preferences"
+import { getMinecraftProfile } from "@/server/minecraft"
 import { reconcilePendingPowerSnapshot } from "@/lib/instance-power-state"
 import { systemUpdateOverviewRefetchPolicy } from "@/lib/system-update-presence"
 import {
   getRelayConnectionState,
+  getRelayDirectoryPage,
+  getRelayFileEntry,
   getRelayFile,
   getRelayFileActivity,
   getRelaySnapshot,
@@ -57,6 +61,10 @@ const relayPollHeaders = { "x-kiln-request-purpose": "relay-poll" }
 export const queryKeys = {
   auth: {
     state: ["auth", "state"] as const,
+  },
+  minecraft: {
+    profile: (displayName: string) =>
+      ["minecraft", "profile", displayName] as const,
   },
   access: {
     capabilities: ["access", "capabilities"] as const,
@@ -180,6 +188,15 @@ export function authStateQueryOptions() {
     queryKey: queryKeys.auth.state,
     queryFn: () => getAuthState(),
     staleTime: 30_000,
+  })
+}
+
+export function minecraftProfileQueryOptions(displayName: string) {
+  return queryOptions({
+    queryKey: queryKeys.minecraft.profile(displayName),
+    queryFn: () => getMinecraftProfile(),
+    enabled: isMinecraftUsername(displayName),
+    staleTime: 60 * 60_000,
   })
 }
 
@@ -458,6 +475,23 @@ export function relayTreeQueryOptions(relayId: string, instanceId: string) {
   })
 }
 
+export function relayRootDirectoryQueryOptions(
+  relayId: string,
+  instanceId: string
+) {
+  return queryOptions({
+    queryKey: [
+      ...queryKeys.relay.tree(relayId, instanceId),
+      "directory",
+      "root",
+    ] as const,
+    queryFn: () =>
+      getRelayDirectoryPage({ data: { instanceId, path: "", relayId } }),
+    retry: false,
+    staleTime: 15_000,
+  })
+}
+
 export function relayFileQueryOptions(
   relayId: string,
   instanceId: string,
@@ -466,6 +500,19 @@ export function relayFileQueryOptions(
   return queryOptions({
     queryKey: queryKeys.relay.file(relayId, instanceId, path),
     queryFn: () => getRelayFile({ data: { instanceId, path, relayId } }),
+    staleTime: 15_000,
+  })
+}
+
+export function relayFileEntryQueryOptions(
+  relayId: string,
+  instanceId: string,
+  path: string
+) {
+  return queryOptions({
+    queryKey: [...queryKeys.relay.file(relayId, instanceId, path), "stat"],
+    queryFn: () => getRelayFileEntry({ data: { instanceId, path, relayId } }),
+    retry: false,
     staleTime: 15_000,
   })
 }

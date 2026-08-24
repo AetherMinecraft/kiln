@@ -116,7 +116,7 @@ export function StartupWorkspace() {
         <div className="max-w-sm">
           <CircleAlert className="mx-auto size-5 text-amber-300" />
           <p className="mt-3 text-sm font-semibold">Startup unavailable</p>
-          <p className="mt-1 text-[0.6875rem] leading-5 text-muted-foreground">
+          <p className="type-support mt-1 text-muted-foreground">
             {startupQuery.error?.message ??
               "This server does not expose Brick startup variables yet."}
           </p>
@@ -382,9 +382,11 @@ const StartupForm = React.memo(function StartupForm({
     )
   }
 
+  const memoryValue = resolvedMemoryValue(view.memoryTemplate, variables)
   const configuredMemoryBytes =
-    resolvedMemoryBytes(view.memoryTemplate, variables) ??
+    (memoryValue ? dockerMemoryBytes(memoryValue) : null) ??
     initialLimits.memoryBytes
+  const memoryVariable = brickMemoryVariable(view.memoryTemplate)
   const catalogBrick =
     [
       ...(catalogQuery.data?.bricks ?? emptyBricks),
@@ -402,32 +404,23 @@ const StartupForm = React.memo(function StartupForm({
   return (
     <section className="min-h-0 flex-1 overflow-y-auto bg-card">
       <div className="mx-auto max-w-3xl space-y-6 px-5 py-6 sm:px-8 sm:py-8">
-        <StartupSection title="Brick Selection">
-          <BrickSummary
-            view={view}
-            canEdit={canEdit}
-            pending={pending}
-            onReinstall={() => setReinstallOpen(true)}
-            onSwap={() => setSwapOpen(true)}
-          />
-        </StartupSection>
-
         <StartupSettingsForm
           allocation={allocation}
-          brickId={view.id}
-          brickName={view.name}
           canEdit={canEdit}
           configuredMemoryBytes={configuredMemoryBytes}
           diskLimitGiB={diskLimitGiB}
-          environment={view.environment}
           error={reinstallOpen ? null : error}
           isRunning={isRunning}
           pending={pending}
           saved={saved}
-          variableDefinitions={view.variables}
+          memoryVariable={memoryVariable}
+          memoryValue={memoryValue}
           variables={variables}
+          view={view}
           onDiskLimitChange={setDiskLimitGiB}
+          onReinstall={() => setReinstallOpen(true)}
           onSubmit={onSubmit}
+          onSwap={() => setSwapOpen(true)}
           onVariableChange={(name, value) => {
             if (!canEdit) return
             setVariables((current) => {
@@ -476,47 +469,51 @@ const StartupForm = React.memo(function StartupForm({
 
 function StartupSettingsForm({
   allocation,
-  brickId,
-  brickName,
   canEdit,
   configuredMemoryBytes,
   diskLimitGiB,
-  environment,
   error,
   isRunning,
   pending,
   saved,
-  variableDefinitions,
+  memoryVariable,
+  memoryValue,
   variables,
+  view,
   onDiskLimitChange,
+  onReinstall,
   onSubmit,
+  onSwap,
   onVariableChange,
 }: {
   allocation: StartupResourceAllocation
-  brickId: string
-  brickName: string
   canEdit: boolean
   configuredMemoryBytes: number
   diskLimitGiB: string
-  environment: Brick["runtime"]["environment"]
   error: string | null
   isRunning: boolean
   pending: boolean
   saved: boolean
-  variableDefinitions: Brick["variables"]
+  memoryVariable: string | null
+  memoryValue: string | undefined
   variables: Record<string, BrickVariableValue>
+  view: BrickView
   onDiskLimitChange: (value: string) => void
+  onReinstall: () => void
   onSubmit: React.FormEventHandler<HTMLFormElement>
+  onSwap: () => void
   onVariableChange: (
     name: string,
     value: BrickVariableValue | undefined
   ) => void
 }) {
+  const variableDefinitions = view.variables
   const javaArgsDefinition = variableDefinitions.java_args
   const pairVersionAndJava =
     canPairMinecraftJavaVersionFields(variableDefinitions)
   const groupedNames = new Set(
     [
+      memoryVariable,
       pairVersionAndJava ? "version" : null,
       pairVersionAndJava ? "java_version" : null,
       javaArgsDefinition ? "java_args" : null,
@@ -525,12 +522,13 @@ function StartupSettingsForm({
   const entries = Object.entries(variableDefinitions).filter(
     ([name]) => !groupedNames.has(name)
   )
-  const memory =
-    typeof variables.memory === "string" ? variables.memory : undefined
+  const memoryDefinition = memoryVariable
+    ? variableDefinitions[memoryVariable]
+    : undefined
   const managedFlags = javaArgsDefinition
-    ? managedJavaStartupFlags(environment, memory, variables, {
-        id: brickId,
-        name: brickName,
+    ? managedJavaStartupFlags(view.environment, memoryValue, variables, {
+        id: view.id,
+        name: view.name,
       })
     : null
   const hasFields =
@@ -540,11 +538,10 @@ function StartupSettingsForm({
     <form className="space-y-6" onSubmit={onSubmit}>
       <StartupSection
         accessory={
-          <span className="font-mono text-[0.5rem] tracking-[0.08em] text-muted-foreground/60 uppercase">
+          <span className="type-technical-label text-muted-foreground">
             Node capacity
           </span>
         }
-        description="Limits are validated against every server on this node."
         title="Resource Allocation"
       >
         <ResourceAllocationCard
@@ -552,59 +549,90 @@ function StartupSettingsForm({
           configuredMemoryBytes={configuredMemoryBytes}
           diskLimitGiB={diskLimitGiB}
           disabled={!canEdit || pending}
+          memoryMaxLength={memoryDefinition?.rules?.maxLength}
+          memoryPattern={memoryDefinition?.rules?.pattern}
+          memoryRequired={memoryDefinition?.required}
+          memoryValue={
+            memoryDefinition?.type === "string"
+              ? (memoryValue ?? "")
+              : undefined
+          }
           onDiskLimitChange={onDiskLimitChange}
+          onMemoryChange={
+            memoryDefinition?.type === "string" && memoryVariable
+              ? (value) => onVariableChange(memoryVariable, value)
+              : undefined
+          }
         />
       </StartupSection>
 
       <StartupSection title="Brick Configuration">
-        {hasFields ? (
-          <div className="space-y-3 rounded-xl border border-border/75 bg-background/45 p-4">
-            {entries.map(([name, definition]) => (
-              <BrickVariableField
-                key={name}
-                name={name}
-                definition={definition}
-                value={variables[name]}
-                onChange={(value) => onVariableChange(name, value)}
-              />
-            ))}
-            {pairVersionAndJava ? (
-              <MinecraftJavaVersionFields
-                brickId={brickId}
-                disabled={!canEdit || pending}
-                environment={environment}
-                javaVersion={
-                  typeof variables.java_version === "string"
-                    ? variables.java_version
-                    : ""
-                }
-                onJavaVersionChange={(value) =>
-                  onVariableChange("java_version", value)
-                }
-                onVersionChange={(value) => onVariableChange("version", value)}
-                variableDefinitions={variableDefinitions}
-                version={
-                  typeof variables.version === "string" ? variables.version : ""
-                }
-              />
-            ) : null}
-            {javaArgsDefinition ? (
-              <>
-                <ManagedJavaFlagsField value={managedFlags ?? ""} />
-                <BrickVariableField
-                  name="java_args"
-                  definition={javaArgsDefinition}
-                  value={variables.java_args}
-                  onChange={(value) => onVariableChange("java_args", value)}
+        <div className="overflow-hidden rounded-xl border border-border/75 bg-background/45">
+          <BrickSummary
+            view={view}
+            canEdit={canEdit}
+            pending={pending}
+            onReinstall={onReinstall}
+            onSwap={onSwap}
+          />
+          {hasFields ? (
+            <div className="space-y-3 border-t border-border/65 p-4">
+              {pairVersionAndJava ? (
+                <MinecraftJavaVersionFields
+                  brickId={view.id}
+                  disabled={!canEdit || pending}
+                  environment={view.environment}
+                  javaVersion={
+                    typeof variables.java_version === "string"
+                      ? variables.java_version
+                      : ""
+                  }
+                  onJavaVersionChange={(value) =>
+                    onVariableChange("java_version", value)
+                  }
+                  onVersionChange={(value) =>
+                    onVariableChange("version", value)
+                  }
+                  showDescriptions={false}
+                  variableDefinitions={variableDefinitions}
+                  version={
+                    typeof variables.version === "string"
+                      ? variables.version
+                      : ""
+                  }
                 />
-              </>
-            ) : null}
-          </div>
-        ) : (
-          <div className="rounded-xl border border-border/75 bg-background/45 px-4 py-8 text-center text-xs text-muted-foreground">
-            This Brick has no configurable Startup variables.
-          </div>
-        )}
+              ) : null}
+              {entries.map(([name, definition]) => (
+                <BrickVariableField
+                  key={name}
+                  name={name}
+                  definition={definition}
+                  value={variables[name]}
+                  onChange={(value) => onVariableChange(name, value)}
+                />
+              ))}
+              {javaArgsDefinition ? (
+                <>
+                  <ManagedJavaFlagsField value={managedFlags ?? ""} />
+                  <BrickVariableField
+                    description={javaArgsDefinition.description.replace(
+                      /^Extra JVM flags\.\s*/u,
+                      ""
+                    )}
+                    name="java_args"
+                    definition={javaArgsDefinition}
+                    value={variables.java_args}
+                    onChange={(value) => onVariableChange("java_args", value)}
+                  />
+                </>
+              ) : null}
+            </div>
+          ) : (
+            <div className="border-t border-border/65 px-4 py-8 text-center text-xs text-muted-foreground">
+              This Brick has no configurable Startup variables.
+            </div>
+          )}
+        </div>
       </StartupSection>
 
       {error ? (
@@ -616,7 +644,7 @@ function StartupSettingsForm({
 
       <div className="flex flex-wrap items-center justify-end gap-2">
         {!canEdit ? (
-          <p className="mr-auto text-[0.6875rem] text-muted-foreground">
+          <p className="type-support mr-auto text-muted-foreground">
             Connect the Relay and use an account with settings access to change
             Startup.
           </p>
@@ -651,12 +679,10 @@ const ManagedJavaFlagsField = React.memo(function ManagedJavaFlagsField({
 }) {
   const labelId = React.useId()
   return (
-    <div className="block space-y-1.5 text-[0.625rem] font-medium text-muted-foreground">
+    <div className="type-label block space-y-1.5 text-muted-foreground">
       <span className="flex items-center justify-between gap-2">
         <span id={labelId}>Managed flags</span>
-        <span className="font-mono text-[0.5rem] text-muted-foreground/55">
-          ember
-        </span>
+        <span className="type-meta font-mono text-muted-foreground">ember</span>
       </span>
       <Input
         aria-labelledby={labelId}
@@ -684,11 +710,9 @@ function StartupSection({
     <section className="space-y-2">
       <div className="flex items-end justify-between gap-3">
         <div>
-          <p className="font-mono text-[0.5625rem] tracking-[0.14em] text-primary uppercase">
-            {title}
-          </p>
+          <p className="type-technical-label text-primary">{title}</p>
           {description ? (
-            <p className="mt-0.5 text-[0.625rem] text-muted-foreground">
+            <p className="type-meta mt-0.5 text-muted-foreground">
               {description}
             </p>
           ) : null}
@@ -741,19 +765,19 @@ function BrickSummary({
           </div>
         ) : null
       }
-      className="bg-background/45"
+      className="rounded-none border-0 bg-transparent"
       icon={<ServerTypeIcon implementation={view.id} className="size-5" />}
       title={view.name}
       titleAccessory={
-        <Badge variant="outline" className="font-mono text-[0.5625rem]">
+        <Badge variant="outline" className="type-meta font-mono">
           {view.game}
         </Badge>
       }
     >
-      <p className="mt-0.5 truncate text-[0.625rem] text-muted-foreground">
+      <p className="type-meta mt-0.5 truncate text-muted-foreground">
         {view.description}
       </p>
-      <p className="mt-1 truncate font-mono text-[0.5625rem] text-muted-foreground/70">
+      <p className="type-meta mt-1 truncate font-mono text-muted-foreground">
         {view.source}
       </p>
     </WorkspaceSummaryCard>
@@ -764,11 +788,24 @@ function resolvedMemoryBytes(
   template: string,
   variables: Readonly<Record<string, BrickVariableValue>>
 ): number | null {
-  const variable = template.match(
-    /^\{\{\s*variables\.([a-z][a-z0-9_]{0,47})\s*\}\}$/u
-  )?.[1]
+  const value = resolvedMemoryValue(template, variables)
+  return value ? dockerMemoryBytes(value) : null
+}
+
+function resolvedMemoryValue(
+  template: string,
+  variables: Readonly<Record<string, BrickVariableValue>>
+): string | undefined {
+  const variable = brickMemoryVariable(template)
   const value = variable ? variables[variable] : template
-  return typeof value === "string" ? dockerMemoryBytes(value) : null
+  return typeof value === "string" ? value : undefined
+}
+
+function brickMemoryVariable(template: string): string | null {
+  return (
+    template.match(/^\{\{\s*variables\.([a-z][a-z0-9_]{0,47})\s*\}\}$/u)?.[1] ??
+    null
+  )
 }
 
 function gibibytesToBytes(value: string): number | null {

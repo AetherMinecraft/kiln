@@ -19,6 +19,7 @@ export * from "./git-repository.js"
 export * from "./file-sync.js"
 export * from "./tailscale.js"
 export * from "./schedules.js"
+export * from "./snbt.js"
 
 export const relayIdSchema = z.string().regex(/^[A-Za-z\d_-]{43}$/u)
 
@@ -1045,13 +1046,65 @@ export const relayFileTreeSchema = z.object({
   truncated: z.boolean(),
 })
 
+export const relayFileEntrySchema = z
+  .object({
+    kind: z.enum(["directory", "file"]),
+    modifiedAt: z.number().nonnegative(),
+    path: z.string().min(1).max(8_192),
+    size: z.number().int().nonnegative().nullable(),
+  })
+  .strict()
+
+const relayFileCursorSchema = z.string().uuid().nullable()
+
+export const relayDirectoryPageInputSchema = z
+  .object({
+    cursor: z.string().uuid().optional(),
+    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    path: z.string().max(8_192),
+  })
+  .strict()
+
+export const relayFileStatInputSchema = z
+  .object({
+    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    path: z.string().min(1).max(8_192),
+  })
+  .strict()
+
+export const relayDirectoryPageSchema = z
+  .object({
+    cursor: relayFileCursorSchema,
+    directory: z.string().max(8_192),
+    entries: z.array(relayFileEntrySchema),
+    instanceId: z.string(),
+  })
+  .strict()
+
+export const relayFileSearchPageInputSchema = z
+  .object({
+    cursor: z.string().uuid().optional(),
+    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    query: z.string().trim().min(1).max(256),
+  })
+  .strict()
+
+export const relayFileSearchPageSchema = z
+  .object({
+    cursor: relayFileCursorSchema,
+    entries: z.array(relayFileEntrySchema),
+    instanceId: z.string(),
+    query: z.string().min(1).max(256),
+  })
+  .strict()
+
 export const relayFileContentSchema = z.object({
   instanceId: z.string(),
   path: z.string(),
   content: z.string(),
   size: z.number().int().nonnegative(),
   decodedSize: z.number().int().nonnegative(),
-  encoding: z.enum(["utf8", "gzip"]),
+  encoding: z.enum(["utf8", "gzip", "nbt", "nbt-gzip", "snbt", "snbt-gzip"]),
   readOnly: z.boolean(),
   modifiedAt: z.string().datetime(),
 })
@@ -1059,6 +1112,7 @@ export const relayFileContentSchema = z.object({
 export const relaySaveFileInputSchema = z.object({
   content: z.string().max(2 * 1024 * 1024),
   expectedModifiedAt: z.string().datetime().optional(),
+  force: z.boolean().optional(),
 })
 
 const relayFileMutationPathSchema = z
@@ -1122,6 +1176,10 @@ export const relayFileMutationInputSchema = z.discriminatedUnion("operation", [
     destination: relayFileMutationPathSchema,
   }),
 ])
+
+export const relayFileMutationResultSchema = z
+  .object({ mutated: z.literal(true) })
+  .strict()
 
 export const relayFileActivityEntrySchema = z.object({
   instanceId: z.string(),
@@ -1420,10 +1478,23 @@ export type RelaySftpPublicationStatus = z.infer<
   typeof relaySftpPublicationStatusSchema
 >
 export type RelayFileTree = z.infer<typeof relayFileTreeSchema>
+export type RelayFileEntry = z.infer<typeof relayFileEntrySchema>
+export type RelayFileStatInput = z.infer<typeof relayFileStatInputSchema>
+export type RelayDirectoryPageInput = z.infer<
+  typeof relayDirectoryPageInputSchema
+>
+export type RelayDirectoryPage = z.infer<typeof relayDirectoryPageSchema>
+export type RelayFileSearchPageInput = z.infer<
+  typeof relayFileSearchPageInputSchema
+>
+export type RelayFileSearchPage = z.infer<typeof relayFileSearchPageSchema>
 export type RelayFileContent = z.infer<typeof relayFileContentSchema>
 export type RelaySaveFileInput = z.infer<typeof relaySaveFileInputSchema>
 export type RelayFileMutationInput = z.infer<
   typeof relayFileMutationInputSchema
+>
+export type RelayFileMutationResult = z.infer<
+  typeof relayFileMutationResultSchema
 >
 export type RelayRemoteFileUpload = z.infer<typeof relayRemoteFileUploadSchema>
 export type RelayRemoteFileUploadResult = z.infer<

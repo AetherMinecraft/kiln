@@ -1,5 +1,6 @@
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
+import { Effect } from "effect"
 import QRCode from "react-qr-code"
 import {
   Check,
@@ -25,12 +26,21 @@ import {
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
 import { showToast } from "@workspace/ui/components/sonner"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@workspace/ui/components/tooltip"
 
 import { ensuringPromise, recoverPromise } from "@/effect/promise"
 import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { clearAppearanceCache } from "@/lib/appearance"
+import { DISPLAY_NAME_MAX_LENGTH, parseDisplayName } from "@/lib/display-name"
+import { queryKeys } from "@/lib/query-options"
 import { getCliCredentials, revokeCliCredential } from "@/server/cli"
+import { getActiveSessions, revokeActiveSession } from "@/server/sessions"
+import type { AccountSessionSummary } from "@/effect/account-sessions"
 
 const accountDateFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -38,9 +48,9 @@ const accountDateFormatter = new Intl.DateTimeFormat(undefined, {
 })
 const activeSessionsQueryKey = ["account", "active-sessions"] as const
 const linkedCliQueryKey = ["account", "linked-clis"] as const
+const redactedTextAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
 
-type SessionListResult = Awaited<ReturnType<typeof authClient.listSessions>>
-type ActiveSession = NonNullable<SessionListResult["data"]>[number]
+type ActiveSession = AccountSessionSummary
 
 interface SetupState {
   backupCodes: Array<string>
@@ -81,6 +91,7 @@ export function AccountSettingsPage({ user }: { user: AuthenticatedUser }) {
         className={`min-w-0 border-0 p-0 ${user.isDevelopmentBypass ? "opacity-45" : ""}`}
       >
         <div className="border-b">
+          <DisplayNameCard initialDisplayName={user.name} />
           <EmailAddressCard initialEmail={user.email} />
           <PasswordCard />
           <TwoFactorCard />
@@ -94,6 +105,141 @@ export function AccountSettingsPage({ user }: { user: AuthenticatedUser }) {
         </div>
       </fieldset>
     </div>
+  )
+}
+
+function DisplayNameCard({
+  initialDisplayName,
+}: {
+  initialDisplayName: string
+}) {
+  const queryClient = useQueryClient()
+  const session = authClient.useSession()
+  const [open, setOpen] = React.useState(false)
+  const [currentDisplayName, setCurrentDisplayName] =
+    React.useState(initialDisplayName)
+  const [displayName, setDisplayName] = React.useState(initialDisplayName)
+  const [pending, setPending] = React.useState(false)
+
+  async function updateDisplayName(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const nextDisplayName = await Effect.runPromise(
+      Effect.try({
+        try: () => parseDisplayName(displayName),
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.match({
+          onFailure: (cause) => {
+            showToast({
+              message:
+                cause instanceof Error ? cause.message : "Enter a display name",
+              type: "error",
+            })
+            return null
+          },
+          onSuccess: (name) => name,
+        })
+      )
+    )
+    if (!nextDisplayName) return
+
+    setPending(true)
+    const result = await ensuringPromise(
+      () =>
+        recoverPromise(
+          () => authClient.updateUser({ name: nextDisplayName }),
+          (cause) =>
+            failedAuthResult(cause, "Could not update your display name")
+        ),
+      () => setPending(false)
+    )
+    if (result.error) {
+      showToast({
+        message: authErrorMessage(
+          result.error,
+          "Could not update your display name"
+        ),
+        type: "error",
+      })
+      return
+    }
+
+    setCurrentDisplayName(nextDisplayName)
+    setDisplayName(nextDisplayName)
+    setOpen(false)
+    showToast({ message: "Display name updated.", type: "success" })
+    await Promise.all([
+      session.refetch(),
+      queryClient.invalidateQueries({ queryKey: queryKeys.auth.state }),
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.access.capabilities,
+      }),
+    ])
+  }
+
+  function changeOpen(nextOpen: boolean) {
+    if (pending) return
+    setOpen(nextOpen)
+    if (!nextOpen) setDisplayName(currentDisplayName)
+  }
+
+  return (
+    <AccountSection title="Display Name">
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <p className="truncate text-xs text-muted-foreground">
+          {currentDisplayName}
+        </p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="shrink-0"
+          onClick={() => setOpen(true)}
+        >
+          Change
+        </Button>
+      </div>
+
+      <Dialog open={open} onOpenChange={changeOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Change display name</DialogTitle>
+            <DialogDescription>
+              This is how your name appears to other Kiln users.
+            </DialogDescription>
+          </DialogHeader>
+          <form className="grid gap-4" onSubmit={updateDisplayName}>
+            <Field label="Display Name" htmlFor="account-display-name">
+              <Input
+                id="account-display-name"
+                type="text"
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                autoComplete="name"
+                maxLength={DISPLAY_NAME_MAX_LENGTH}
+                className="h-10 bg-background/70"
+                required
+                autoFocus
+              />
+            </Field>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => changeOpen(false)}
+                disabled={pending}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={pending || !displayName.trim()}>
+                {pending ? <LoaderCircle className="animate-spin" /> : null}
+                Save name
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </AccountSection>
   )
 }
 
@@ -191,7 +337,7 @@ function EmailAddressCard({ initialEmail }: { initialEmail: string }) {
   return (
     <AccountSection title="Email address">
       <div className="flex min-w-0 items-center justify-between gap-3">
-        <p className="truncate text-xs text-muted-foreground">{currentEmail}</p>
+        <RedactedEmail value={currentEmail} />
         <Button
           type="button"
           variant="outline"
@@ -287,6 +433,53 @@ function EmailAddressCard({ initialEmail }: { initialEmail: string }) {
       </Dialog>
     </AccountSection>
   )
+}
+
+function RedactedEmail({ value }: { value: string }) {
+  const [revealed, setRevealed] = React.useState(false)
+  const redacted = React.useMemo(() => redactedPlaceholder(value), [value])
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className={`min-w-0 cursor-pointer truncate rounded-sm font-mono text-[11px] leading-none transition hover:text-foreground ${revealed ? "text-muted-foreground" : "text-muted-foreground blur-[2px] select-none"}`}
+          aria-label={
+            revealed ? `${value}. Hide email address` : "Reveal email address"
+          }
+          aria-pressed={revealed}
+          onClick={() => setRevealed((current) => !current)}
+        >
+          {revealed ? value : redacted}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" sideOffset={6}>
+        {revealed ? "Click to hide email" : "Click to reveal email"}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function redactedPlaceholder(value: string): string {
+  let state = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    state ^= value.charCodeAt(index)
+    state = Math.imul(state, 0x01000193)
+  }
+
+  const nextCharacter = () => {
+    state = Math.imul(state ^ (state >>> 13), 0x85ebca6b)
+    state = Math.imul(state ^ (state >>> 16), 0xc2b2ae35)
+    return (
+      redactedTextAlphabet[Math.abs(state) % redactedTextAlphabet.length] ?? "x"
+    )
+  }
+
+  return Array.from(value, (character) => {
+    if (["@", ".", "-", "_"].includes(character)) return character
+    return nextCharacter()
+  }).join("")
 }
 
 function PasswordCard() {
@@ -577,7 +770,7 @@ function TwoFactorCard() {
                   <QRCode value={setup.totpURI} className="h-auto w-full" />
                 </div>
                 <div className="min-w-0">
-                  <code className="block truncate border bg-background px-2 py-1.5 font-mono text-[0.5625rem] text-muted-foreground">
+                  <code className="type-code block truncate border bg-background px-2 py-1.5 text-muted-foreground">
                     {readTotpSecret(setup.totpURI)}
                   </code>
                   <Field label="Six-digit code" htmlFor="account-totp-code">
@@ -602,7 +795,7 @@ function TwoFactorCard() {
               </div>
               <div>
                 <div className="flex items-center justify-between gap-3">
-                  <p className="text-[0.625rem] font-medium">Recovery codes</p>
+                  <p className="type-label">Recovery codes</p>
                   <Button
                     type="button"
                     variant="ghost"
@@ -616,7 +809,7 @@ function TwoFactorCard() {
                   {setup.backupCodes.map((code) => (
                     <code
                       key={code}
-                      className="text-center font-mono text-[0.5625rem] text-foreground/80"
+                      className="type-meta text-center font-mono text-foreground"
                     >
                       {code}
                     </code>
@@ -696,8 +889,11 @@ function TwoFactorCard() {
 
 function PasskeysCard() {
   const passkeys = authClient.useListPasskeys()
+  const session = authClient.useSession()
+  const queryClient = useQueryClient()
   const [open, setOpen] = React.useState(false)
   const [passkeyName, setPasskeyName] = React.useState("")
+  const [password, setPassword] = React.useState("")
   const [pending, setPending] = React.useState<string | null>(null)
 
   async function addPasskey(event: React.FormEvent<HTMLFormElement>) {
@@ -710,6 +906,30 @@ function PasskeysCard() {
       return
     }
     setPending("add")
+    const confirmation = await recoverPromise(
+      () => authClient.passwordConfirmation.confirm({ password }),
+      (cause) => failedAuthResult(cause, "Could not confirm your password")
+    )
+    if (confirmation.error) {
+      setPending(null)
+      setPassword("")
+      showToast({
+        message: hasAuthErrorCode(confirmation.error, "INVALID_PASSWORD")
+          ? "Incorrect password. Try again."
+          : authErrorMessage(
+              confirmation.error,
+              "Could not confirm your password"
+            ),
+        type: "error",
+      })
+      return
+    }
+
+    setPassword("")
+    await Promise.all([
+      session.refetch(),
+      queryClient.invalidateQueries({ queryKey: activeSessionsQueryKey }),
+    ])
     const result = await recoverPromise(
       () =>
         authClient.passkey.addPasskey({
@@ -719,6 +939,14 @@ function PasskeysCard() {
     )
     setPending(null)
     if (result.error) {
+      if (isSessionNotFresh(result.error)) {
+        showToast({
+          message:
+            "Your password confirmation expired. Enter your password and try again.",
+          type: "error",
+        })
+        return
+      }
       showToast({
         message: authErrorMessage(result.error, "Could not add the passkey"),
         type: "error",
@@ -726,9 +954,18 @@ function PasskeysCard() {
       return
     }
     setPasskeyName("")
-    setOpen(false)
+    changeOpen(false)
     showToast({ message: "Passkey added.", type: "success" })
     await passkeys.refetch()
+  }
+
+  function changeOpen(nextOpen: boolean) {
+    if (pending) return
+    setOpen(nextOpen)
+    if (!nextOpen) {
+      setPasskeyName("")
+      setPassword("")
+    }
   }
 
   async function deletePasskey(id: string) {
@@ -780,7 +1017,7 @@ function PasskeysCard() {
                 <span className="block truncate text-xs font-medium">
                   {passkey.name || "Unnamed passkey"}
                 </span>
-                <span className="mt-0.5 block font-mono text-[0.5rem] text-muted-foreground uppercase">
+                <span className="type-technical-label mt-0.5 block text-muted-foreground">
                   {passkey.deviceType || "Authenticator"} · Added{" "}
                   {formatDate(passkey.createdAt)}
                 </span>
@@ -804,12 +1041,13 @@ function PasskeysCard() {
         </div>
       ) : null}
 
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={open} onOpenChange={changeOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Add a passkey</DialogTitle>
             <DialogDescription>
-              Use this device’s fingerprint, face recognition, or security key.
+              Confirm your password, then use this device’s fingerprint, face
+              recognition, or security key.
             </DialogDescription>
           </DialogHeader>
           <form className="grid gap-4" onSubmit={addPasskey}>
@@ -824,11 +1062,22 @@ function PasskeysCard() {
                 autoFocus
               />
             </Field>
+            <Field label="Current password" htmlFor="passkey-password">
+              <Input
+                id="passkey-password"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="current-password"
+                className="h-10 bg-background/70"
+                required
+              />
+            </Field>
             <DialogFooter>
               <Button
                 type="button"
                 variant="ghost"
-                onClick={() => setOpen(false)}
+                onClick={() => changeOpen(false)}
                 disabled={pending !== null}
               >
                 Cancel
@@ -940,7 +1189,7 @@ function CliCredentialsCard({ enabled }: { enabled: boolean }) {
                     <span className="block truncate text-xs font-medium">
                       {credential.name}
                     </span>
-                    <span className="mt-0.5 block font-mono text-[0.5rem] text-muted-foreground uppercase">
+                    <span className="type-technical-label mt-0.5 block text-muted-foreground">
                       {credential.mode === "read_only"
                         ? "Read-only"
                         : "Full access"}
@@ -950,7 +1199,7 @@ function CliCredentialsCard({ enabled }: { enabled: boolean }) {
                     </span>
                   </span>
                 </div>
-                <div className="text-[0.625rem] leading-4 text-muted-foreground sm:text-right">
+                <div className="type-meta text-muted-foreground sm:text-right">
                   <span className="block">
                     Last used {formatDate(credential.lastUsedAt)}
                   </span>
@@ -991,42 +1240,38 @@ function CliCredentialsCard({ enabled }: { enabled: boolean }) {
 function SessionsCard({ enabled }: { enabled: boolean }) {
   const session = authClient.useSession()
   const queryClient = useQueryClient()
-  const [pendingToken, setPendingToken] = React.useState<string | null>(null)
+  const [pendingSessionId, setPendingSessionId] = React.useState<string | null>(
+    null
+  )
   const [logoutDialogOpen, setLogoutDialogOpen] = React.useState(false)
   const [loggingOut, setLoggingOut] = React.useState(false)
   const sessions = useQuery({
     queryKey: activeSessionsQueryKey,
     enabled,
-    queryFn: async () => {
-      const result = await authClient.listSessions()
-      if (result.error) {
-        throw new Error(
-          authErrorMessage(result.error, "Could not load active sessions")
-        )
-      }
-      return result.data ?? []
-    },
+    queryFn: () => getActiveSessions(),
   })
-  const currentToken = session.data?.session.token
+  const currentSessionId = session.data?.session.id
 
   const revokeSession = React.useCallback(
     async (activeSession: ActiveSession) => {
-      const isCurrent = activeSession.token === currentToken
-      setPendingToken(activeSession.token)
-      const error = isCurrent
-        ? (
-            await recoverPromise(
-              () => authClient.signOut(),
-              (cause) => failedAuthResult(cause, "Could not sign out")
-            )
-          ).error
-        : (
-            await recoverPromise(
-              () => authClient.revokeSession({ token: activeSession.token }),
-              (cause) => failedAuthResult(cause, "Could not revoke the session")
-            )
-          ).error
-      setPendingToken(null)
+      const isCurrent = activeSession.id === currentSessionId
+      setPendingSessionId(activeSession.id)
+      const result = await recoverPromise(
+        async () => {
+          if (isCurrent) {
+            const signOutResult = await authClient.signOut()
+            if (signOutResult.error) throw signOutResult.error
+          } else {
+            await revokeActiveSession({
+              data: { sessionId: activeSession.id },
+            })
+          }
+          return { error: null }
+        },
+        (cause) => failedAuthResult(cause, "Could not revoke the session")
+      )
+      setPendingSessionId(null)
+      const { error } = result
       if (error) {
         showToast({
           message: authErrorMessage(error, "Could not revoke the session"),
@@ -1042,7 +1287,7 @@ function SessionsCard({ enabled }: { enabled: boolean }) {
       showToast({ message: "Session revoked.", type: "success" })
       await queryClient.invalidateQueries({ queryKey: activeSessionsQueryKey })
     },
-    [currentToken, queryClient]
+    [currentSessionId, queryClient]
   )
 
   async function logoutEverywhere() {
@@ -1119,9 +1364,9 @@ function SessionsCard({ enabled }: { enabled: boolean }) {
             <SessionRow
               key={activeSession.id}
               activeSession={activeSession}
-              current={activeSession.token === currentToken}
-              pending={pendingToken === activeSession.token}
-              disabled={pendingToken !== null || loggingOut}
+              current={activeSession.id === currentSessionId}
+              pending={pendingSessionId === activeSession.id}
+              disabled={pendingSessionId !== null || loggingOut}
               onRevoke={revokeSession}
             />
           ))
@@ -1198,17 +1443,17 @@ const SessionRow = React.memo(function SessionRow({
               {device.browser} on {device.platform}
             </span>
             {current ? (
-              <span className="shrink-0 border border-emerald-500/25 bg-emerald-500/8 px-1.5 py-0.5 font-mono text-[0.4375rem] tracking-wider text-emerald-500 uppercase">
+              <span className="type-technical-label shrink-0 border border-emerald-500/25 bg-emerald-500/8 px-1.5 py-0.5 text-emerald-500">
                 Current
               </span>
             ) : null}
           </span>
-          <span className="mt-0.5 block truncate font-mono text-[0.5rem] text-muted-foreground uppercase">
+          <span className="type-technical-label mt-0.5 block truncate text-muted-foreground">
             {activeSession.ipAddress || "IP unavailable"}
           </span>
         </span>
       </div>
-      <div className="text-[0.625rem] leading-4 text-muted-foreground sm:text-right">
+      <div className="type-meta text-muted-foreground sm:text-right">
         <span className="block">
           Started {formatDate(activeSession.createdAt)}
         </span>
@@ -1270,9 +1515,7 @@ function Field({
 }) {
   return (
     <label className="grid gap-1.5" htmlFor={htmlFor}>
-      <span className="text-[0.625rem] font-medium text-foreground/85">
-        {label}
-      </span>
+      <span className="type-label text-foreground">{label}</span>
       {children}
     </label>
   )
@@ -1292,6 +1535,20 @@ function authErrorMessage(error: unknown, fallback: string): string {
   if (typeof message === "string" && message) return message
   const statusText = Reflect.get(error, "statusText")
   return typeof statusText === "string" && statusText ? statusText : fallback
+}
+
+function isSessionNotFresh(error: unknown): boolean {
+  if (hasAuthErrorCode(error, "SESSION_NOT_FRESH")) return true
+  if (typeof error !== "object" || error === null) return false
+  return Reflect.get(error, "message") === "Session is not fresh"
+}
+
+function hasAuthErrorCode(error: unknown, expectedCode: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    Reflect.get(error, "code") === expectedCode
+  )
 }
 
 function validateNewPassword(

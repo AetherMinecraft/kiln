@@ -13,6 +13,7 @@ import { Resend } from "resend"
 import { AuthCodeEmail } from "@/emails/auth-code-email"
 import { databasePool } from "@/lib/database"
 import { databaseTable, databaseTableName } from "@/lib/database-config"
+import { parseDisplayName } from "@/lib/display-name"
 import {
   betterAuthSecrets,
   betterAuthUrl,
@@ -21,9 +22,11 @@ import {
   parseTrustedOrigins,
   publicSignupEnabled,
 } from "@/lib/environment"
+import { passwordConfirmation } from "@/lib/password-confirmation"
 
 const publicUrl = kilnPublicUrl()
 const authUrl = betterAuthUrl()
+const emailDeliveryEnabled = emailDeliveryConfig() !== null
 const UNVERIFIED_ACCOUNT_TTL_MS = 1000 * 60 * 60 * 24
 
 type PendingUser = {
@@ -50,7 +53,7 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
     autoSignIn: false,
-    requireEmailVerification: true,
+    requireEmailVerification: emailDeliveryEnabled,
     minPasswordLength: 12,
     maxPasswordLength: 128,
     resetPasswordTokenExpiresIn: 60 * 30,
@@ -66,9 +69,31 @@ export const auth = betterAuth({
     }),
   },
   emailVerification: {
-    sendOnSignUp: true,
+    sendOnSignUp: emailDeliveryEnabled,
     autoSignInAfterVerification: false,
     expiresIn: 60 * 10,
+  },
+  databaseHooks: {
+    user: {
+      create: {
+        before: async (user) => {
+          const name = parseDisplayName(user.name)
+          return {
+            data: emailDeliveryEnabled
+              ? { ...user, name }
+              : { ...user, name, emailVerified: true },
+          }
+        },
+      },
+      update: {
+        before: async (user) => ({
+          data:
+            typeof user.name === "string"
+              ? { ...user, name: parseDisplayName(user.name) }
+              : user,
+        }),
+      },
+    },
   },
   rateLimit: {
     modelName: databaseTableName("rateLimit"),
@@ -82,6 +107,7 @@ export const auth = betterAuth({
       "/email-otp/send-verification-otp": { window: 60, max: 3 },
       "/email-otp/request-password-reset": { window: 60, max: 3 },
       "/email-otp/reset-password": { window: 60, max: 5 },
+      "/password-confirmation/confirm": { window: 60, max: 5 },
     },
   },
   hooks: {
@@ -209,6 +235,7 @@ export const auth = betterAuth({
         userVerification: "required",
       },
     }),
+    passwordConfirmation(),
     tanstackStartCookies(),
   ],
 })
@@ -216,7 +243,3 @@ export const auth = betterAuth({
 export type AuthSession = typeof auth.$Infer.Session
 
 export { publicSignupEnabled }
-
-export function displayNameFromEmail(email: string): string {
-  return email.trim().toLowerCase().split("@")[0] || "Kiln operator"
-}

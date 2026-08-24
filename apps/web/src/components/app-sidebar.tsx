@@ -8,22 +8,21 @@ import {
   CalendarClock,
   ChevronsUpDown,
   Database,
-  Folder,
   ListTodo,
   LoaderCircle,
   LogOut,
-  Network,
-  Rocket,
   Server as ServerIcon,
   Settings,
-  SlidersHorizontal,
-  TerminalSquare,
   UserRoundCog,
 } from "lucide-react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
 import { forkPromise } from "@/effect/promise"
 
-import { Avatar, AvatarFallback } from "@workspace/ui/components/avatar"
+import {
+  Avatar,
+  AvatarFallback,
+  AvatarImage,
+} from "@workspace/ui/components/avatar"
 import {
   Popover,
   PopoverContent,
@@ -49,16 +48,21 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@workspace/ui/components/tooltip"
-
 import { HearthMark } from "@/components/hearth-mark"
 import { BackupIcon } from "@/components/backup-icon"
+import {
+  RouteCommandMenuProvider,
+  RouteCommandMenuTrigger,
+} from "@/components/route-command-menu"
 import { ServerTypeIcon } from "@/components/server-type-icon"
 import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { clearAppearanceCache } from "@/lib/appearance"
+import { minecraftHeadUrl } from "@/lib/minecraft-profile"
 import {
   accessCapabilitiesQueryOptions,
   managedDatabaseDirectoryQueryOptions,
+  minecraftProfileQueryOptions,
   relayConnectionQueryOptions,
   relaySnapshotQueryOptions,
 } from "@/lib/query-options"
@@ -75,48 +79,25 @@ import type { SidebarInstance } from "@/lib/relay-selectors"
 import { globalSectionFromRouteId } from "@/lib/route-sections"
 import type { GlobalSection } from "@/lib/route-sections"
 import {
-  selectedInstanceCookieName,
-  uiPreferenceCookieMaxAge,
+  destinationsForServer,
+  serverDestinations,
+  type ServerDestination,
+  type ServerDestinationId,
+} from "@/lib/navigation-destinations"
+import {
+  persistSelectedInstanceRouteId,
+  readSelectedInstanceRouteId,
 } from "@/lib/ui-preference-cookies"
 import { warmFileWorkspaceModule } from "@/lib/workspace-module-preloads"
 
-export type InstanceTab = "console" | "files" | "info" | "network" | "startup"
-
-const instanceItems: Array<{
-  title: string
-  value: InstanceTab
-  icon: typeof TerminalSquare
-}> = [
-  { title: "Console", value: "console", icon: TerminalSquare },
-  { title: "Files", value: "files", icon: Folder },
-  { title: "Startup", value: "startup", icon: Rocket },
-  { title: "Network", value: "network", icon: Network },
-  { title: "Info", value: "info", icon: SlidersHorizontal },
-]
-
-function readSelectedInstance(): string | null {
-  if (typeof document === "undefined") return null
-
-  return (
-    document.cookie
-      .split(";")
-      .map((cookie) => cookie.trim())
-      .find((cookie) => cookie.startsWith(`${selectedInstanceCookieName}=`))
-      ?.slice(selectedInstanceCookieName.length + 1) ?? null
-  )
-}
-
-function persistSelectedInstance(routeId: string) {
-  const currentRouteId = readSelectedInstance()
-  if (currentRouteId === routeId) return
-
-  document.cookie = `${selectedInstanceCookieName}=${routeId}; path=/; max-age=${uiPreferenceCookieMaxAge}; SameSite=Lax`
-}
+export type InstanceTab = ServerDestinationId
 
 interface AppSidebarViewProps {
   user: AuthenticatedUser
   canManageAccess: boolean
+  canManageRelays: boolean
   initialSelectedInstanceRouteId: string | null
+  isPlatformAdmin: boolean
   relayConfigured: boolean
 }
 
@@ -139,7 +120,9 @@ export const AppSidebar = React.memo(function AppSidebar({
   return (
     <AppSidebarView
       canManageAccess={capabilities.canManageAccess}
+      canManageRelays={capabilities.canManageRelays}
       initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
+      isPlatformAdmin={capabilities.isPlatformAdmin}
       relayConfigured={relayConfigured}
       user={capabilities.user}
     />
@@ -149,39 +132,52 @@ export const AppSidebar = React.memo(function AppSidebar({
 const AppSidebarView = React.memo(function AppSidebarView({
   user,
   canManageAccess,
+  canManageRelays,
   initialSelectedInstanceRouteId,
+  isPlatformAdmin,
   relayConfigured,
 }: AppSidebarViewProps) {
   return (
-    <Sidebar collapsible="icon" className="border-sidebar-border/80">
-      <SidebarHeader className="gap-1 px-2 pt-3">
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              size="lg"
-              className="h-11 data-[state=open]:bg-sidebar-accent"
-              tooltip="Kiln"
-            >
-              <HearthMark className="group-data-[collapsible=icon]:size-[32px]!" />
-              <span className="min-w-0 flex-1 truncate font-heading text-[0.9375rem] font-semibold tracking-[-0.02em]">
-                Kiln
-              </span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarHeader>
+    <RouteCommandMenuProvider
+      canManageAccess={canManageAccess}
+      canManageRelays={canManageRelays}
+      initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
+      isPlatformAdmin={isPlatformAdmin}
+      relayConfigured={relayConfigured}
+    >
+      <Sidebar collapsible="icon" className="border-sidebar-border/80">
+        <SidebarHeader className="gap-1.5 px-2 py-2">
+          <SidebarMenu className="h-16 justify-center">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                size="lg"
+                className="h-11 hover:bg-transparent active:bg-transparent data-[state=open]:bg-transparent"
+                tooltip="Kiln"
+              >
+                <HearthMark className="group-data-[collapsible=icon]:size-[32px]!" />
+                <span className="min-w-0 flex-1 truncate font-heading text-lg font-semibold tracking-[0.04em]">
+                  KILN
+                </span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </SidebarMenu>
+          <RouteCommandMenuTrigger />
+        </SidebarHeader>
 
-      <SidebarContent>
-        <InfrastructureNavigation relayConfigured={relayConfigured} />
+        <SidebarSeparator />
 
-        <SidebarInstanceNavigation
-          initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
-          relayConfigured={relayConfigured}
-        />
-      </SidebarContent>
+        <SidebarContent>
+          <InfrastructureNavigation relayConfigured={relayConfigured} />
 
-      <AccountNavigation canManageAccess={canManageAccess} user={user} />
-    </Sidebar>
+          <SidebarInstanceNavigation
+            initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
+            relayConfigured={relayConfigured}
+          />
+        </SidebarContent>
+
+        <AccountNavigation canManageAccess={canManageAccess} user={user} />
+      </Sidebar>
+    </RouteCommandMenuProvider>
   )
 })
 
@@ -192,7 +188,7 @@ function InfrastructureNavigation({
 }) {
   return (
     <SidebarGroup className="pt-2">
-      <SidebarGroupLabel className="text-[0.625rem] tracking-[0.12em] uppercase">
+      <SidebarGroupLabel className="type-technical-label">
         Infrastructure
       </SidebarGroupLabel>
       <SidebarGroupContent>
@@ -223,7 +219,7 @@ function DatabasesNavigationItem({
           <span>Databases</span>
         </Link>
       </SidebarMenuButton>
-      <SidebarMenuBadge className="text-sidebar-foreground/25">
+      <SidebarMenuBadge className="text-sidebar-muted-foreground">
         <DatabaseCount relayConfigured={relayConfigured} />
       </SidebarMenuBadge>
     </SidebarMenuItem>
@@ -262,7 +258,7 @@ function ServersNavigationItem({
           <span>Servers</span>
         </Link>
       </SidebarMenuButton>
-      <SidebarMenuBadge className="text-sidebar-foreground/25">
+      <SidebarMenuBadge className="text-sidebar-muted-foreground">
         <InfrastructureInstanceCount relayConfigured={relayConfigured} />
       </SidebarMenuBadge>
     </SidebarMenuItem>
@@ -303,7 +299,10 @@ function SidebarInstanceNavigation({
         ?.serverId,
   })
   const selectedInstanceRouteId = React.useMemo(
-    () => serverId ?? readSelectedInstance() ?? initialSelectedInstanceRouteId,
+    () =>
+      serverId ??
+      readSelectedInstanceRouteId() ??
+      initialSelectedInstanceRouteId,
     [initialSelectedInstanceRouteId, serverId]
   )
   const preferredResolution = resolveCanonicalRelayInstance(
@@ -346,7 +345,7 @@ function RememberSelectedInstance({
   instanceRouteId: string
 }) {
   React.useEffect(() => {
-    persistSelectedInstance(instanceRouteId)
+    persistSelectedInstanceRouteId(instanceRouteId)
   }, [instanceRouteId])
 
   return null
@@ -406,8 +405,8 @@ const InstanceNavigation = React.memo(function InstanceNavigation({
 
   return (
     <SidebarGroup>
-      <SidebarGroupLabel className="text-[0.625rem] tracking-[0.12em] uppercase">
-        Selected server
+      <SidebarGroupLabel className="type-technical-label">
+        Server
       </SidebarGroupLabel>
       <SidebarGroupContent>
         <SidebarMenu>
@@ -417,7 +416,7 @@ const InstanceNavigation = React.memo(function InstanceNavigation({
             navigateToTab={navigateToTab}
           />
           <InstanceTabNavigation
-            isTailscale={instance?.implementation.toLowerCase() === "tailscale"}
+            instance={instance}
             instanceRouteId={instanceRouteId}
             unresolvedServerId={unresolvedServerId}
           />
@@ -484,7 +483,7 @@ const ServerSelector = React.memo(function ServerSelector({
           <SidebarMenuButton
             size="lg"
             tooltip="Switch server"
-            className={`mb-2 h-auto min-h-13 border border-l-2 border-sidebar-border/80 bg-background/45 py-2 ${instance ? statusBorderTone(instance.observedState) : "border-l-muted-foreground/25"} group-data-[collapsible=icon]:min-h-[32px]! group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:p-[8px]!`}
+            className={`mb-2 h-auto min-h-13 border border-l-2 border-sidebar-border/80 bg-background/45 py-2 ${instance ? statusBorderTone(instance.observedState) : "border-l-muted-foreground/25"} group-data-[collapsible=icon]:min-h-[32px]! group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-black/10 group-data-[collapsible=icon]:p-[8px]! group-data-[collapsible=icon]:shadow-[0_0_0_0.5px_color-mix(in_oklab,var(--sidebar-foreground)_16%,transparent)]! group-data-[collapsible=icon]:hover:bg-black/15 group-data-[collapsible=icon]:hover:shadow-[0_0_0_0.5px_color-mix(in_oklab,var(--sidebar-foreground)_24%,transparent)]! dark:group-data-[collapsible=icon]:bg-black/25 dark:group-data-[collapsible=icon]:hover:bg-black/35`}
           >
             <ServerTypeIcon
               implementation={instance?.implementation ?? ""}
@@ -495,7 +494,7 @@ const ServerSelector = React.memo(function ServerSelector({
               <span className="w-full truncate text-xs font-semibold">
                 {instance?.name ?? "Choose a server"}
               </span>
-              <span className="mt-1 truncate font-mono text-[0.5625rem] text-sidebar-foreground/60">
+              <span className="type-meta mt-1 truncate font-mono text-sidebar-muted-foreground">
                 {instance
                   ? `${instance.implementation} ${instance.version} · ${instance.shortId}`
                   : instances.length === 0
@@ -514,7 +513,7 @@ const ServerSelector = React.memo(function ServerSelector({
         >
           <div className="flex items-center justify-between px-2 py-1.5 text-sm font-semibold">
             <span>Managed servers</span>
-            <span className="font-mono text-[0.625rem] font-normal text-muted-foreground">
+            <span className="type-meta font-mono text-muted-foreground">
               {instances.length} discovered
             </span>
           </div>
@@ -536,12 +535,12 @@ const ServerSelector = React.memo(function ServerSelector({
           ) : (
             <div className="px-2 py-3">
               <p className="text-xs font-medium">No managed servers</p>
-              <p className="mt-1 text-[0.625rem] leading-4 text-muted-foreground">
+              <p className="type-meta mt-1 text-muted-foreground">
                 Open the server workspace to provision or discover a server.
               </p>
               <Link
                 to="/infra/servers"
-                className="mt-2 inline-flex text-[0.625rem] font-medium text-primary hover:underline"
+                className="type-label mt-2 inline-flex text-primary hover:underline"
               >
                 View servers
               </Link>
@@ -577,34 +576,30 @@ const ServerSelectorItem = React.memo(function ServerSelectorItem({
       />
       <span className="min-w-0 flex-1">
         <span className="block truncate text-xs font-medium">{item.name}</span>
-        <span className="block truncate font-mono text-[0.5625rem] text-muted-foreground">
+        <span className="type-meta block truncate font-mono text-muted-foreground">
           {item.implementation} {item.version} · {item.shortId}
         </span>
       </span>
       {active ? (
-        <span className="font-mono text-[0.5625rem] text-primary">ACTIVE</span>
+        <span className="type-technical-label text-primary">Active</span>
       ) : null}
     </button>
   )
 })
 
 const InstanceTabNavigation = React.memo(function InstanceTabNavigation({
-  isTailscale,
+  instance,
   instanceRouteId,
   unresolvedServerId,
 }: {
-  isTailscale: boolean
+  instance: SidebarInstance | null
   instanceRouteId: string | null
   unresolvedServerId: string | undefined
 }) {
-  const items = isTailscale
-    ? instanceItems.filter(
-        (item) => item.value !== "startup" && item.value !== "info"
-      )
-    : instanceItems
+  const items = instance ? destinationsForServer(instance) : serverDestinations
   return items.map((item) => (
     <InstanceTabNavigationItem
-      key={item.value}
+      key={item.id}
       item={item}
       instanceRouteId={instanceRouteId}
       unresolvedServerId={unresolvedServerId}
@@ -618,20 +613,20 @@ const InstanceTabNavigationItem = React.memo(
     instanceRouteId,
     unresolvedServerId,
   }: {
-    item: (typeof instanceItems)[number]
+    item: ServerDestination
     instanceRouteId: string | null
     unresolvedServerId: string | undefined
   }) {
     const content = (
       <>
         <item.icon />
-        <span>{item.title}</span>
+        <span>{item.label}</span>
       </>
     )
 
     return (
       <SidebarMenuItem>
-        <SidebarMenuButton asChild tooltip={item.title}>
+        <SidebarMenuButton asChild tooltip={item.label}>
           {!instanceRouteId ? (
             <Link
               to="/infra/servers"
@@ -640,7 +635,7 @@ const InstanceTabNavigationItem = React.memo(
             >
               {content}
             </Link>
-          ) : item.value === "console" ? (
+          ) : item.id === "console" ? (
             <Link
               to="/server/$serverId/console"
               params={{ serverId: instanceRouteId }}
@@ -650,7 +645,7 @@ const InstanceTabNavigationItem = React.memo(
             >
               {content}
             </Link>
-          ) : item.value === "files" ? (
+          ) : item.id === "files" ? (
             <Link
               to="/server/$serverId/files/$"
               params={{ serverId: instanceRouteId, _splat: "" }}
@@ -662,7 +657,7 @@ const InstanceTabNavigationItem = React.memo(
             >
               {content}
             </Link>
-          ) : item.value === "network" ? (
+          ) : item.id === "network" ? (
             <Link
               to="/server/$serverId/network"
               params={{ serverId: instanceRouteId }}
@@ -672,7 +667,7 @@ const InstanceTabNavigationItem = React.memo(
             >
               {content}
             </Link>
-          ) : item.value === "startup" ? (
+          ) : item.id === "startup" ? (
             <Link
               to="/server/$serverId/startup"
               params={{ serverId: instanceRouteId }}
@@ -706,81 +701,201 @@ function AccountNavigation({
   canManageAccess: boolean
   user: AuthenticatedUser
 }) {
-  const { isMobile } = useSidebar()
+  const { isMobile, state } = useSidebar()
   return (
     <SidebarFooter>
+      <SidebarGroup className="p-0">
+        <SidebarGroupLabel className="type-technical-label">
+          Manage
+        </SidebarGroupLabel>
+        <SidebarGroupContent>
+          <SidebarMenu>
+            <SidebarMenuItem>
+              <SidebarMenuButton asChild tooltip="Automations">
+                <Link
+                  to="/automations/schedules"
+                  activeOptions={{ includeSearch: false }}
+                  activeProps={{ "data-active": true }}
+                  preload="intent"
+                >
+                  <CalendarClock />
+                  <span>Automations</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton asChild tooltip="Backups">
+                <Link
+                  to="/backups"
+                  activeOptions={{ exact: true, includeSearch: false }}
+                  activeProps={{ "data-active": true }}
+                  preload="intent"
+                >
+                  <BackupIcon />
+                  <span>Backups</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton asChild tooltip="Activity">
+                <Link
+                  to="/activity"
+                  activeOptions={{ exact: true, includeSearch: false }}
+                  activeProps={{ "data-active": true }}
+                  preload="intent"
+                >
+                  <ListTodo />
+                  <span>Activity</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              {canManageAccess ? <AccessNavigationButton /> : null}
+            </SidebarMenuItem>
+          </SidebarMenu>
+        </SidebarGroupContent>
+      </SidebarGroup>
+      <SidebarSeparator />
       <SidebarMenu>
         <SidebarMenuItem>
-          <SidebarMenuButton asChild tooltip="Automations">
-            <Link
-              to="/automations/schedules"
-              activeOptions={{ includeSearch: false }}
-              activeProps={{ "data-active": true }}
-              preload="intent"
-            >
-              <CalendarClock />
-              <span>Automations</span>
-            </Link>
-          </SidebarMenuButton>
-        </SidebarMenuItem>
-        <SidebarMenuItem>
-          <SidebarMenuButton asChild tooltip="Backups">
-            <Link
-              to="/backups"
-              activeOptions={{ exact: true, includeSearch: false }}
-              activeProps={{ "data-active": true }}
-              preload="intent"
-            >
-              <BackupIcon />
-              <span>Backups</span>
-            </Link>
-          </SidebarMenuButton>
-        </SidebarMenuItem>
-        <SidebarMenuItem>
-          <SidebarMenuButton asChild tooltip="Activity">
-            <Link
-              to="/activity"
-              activeOptions={{ exact: true, includeSearch: false }}
-              activeProps={{ "data-active": true }}
-              preload="intent"
-            >
-              <ListTodo />
-              <span>Activity</span>
-            </Link>
-          </SidebarMenuButton>
-        </SidebarMenuItem>
-        <SidebarMenuItem>
-          {canManageAccess ? <AccessNavigationButton /> : null}
-        </SidebarMenuItem>
-        <SidebarMenuItem>
-          <SettingsNavigationButton />
-        </SidebarMenuItem>
-        <SidebarMenuItem>
-          <div className="flex h-11 items-center gap-2 px-2 group-data-[collapsible=icon]:h-[44px] group-data-[collapsible=icon]:px-0">
-            <Avatar
-              size="sm"
-              className="rounded-none group-data-[collapsible=icon]:hidden"
-            >
-              <AvatarFallback className="rounded-none bg-primary/12 text-[0.625rem] font-bold text-primary">
-                {initials(user.name)}
-              </AvatarFallback>
-            </Avatar>
-            <span className="flex min-w-0 flex-1 flex-col items-start leading-none group-data-[collapsible=icon]:hidden">
-              <span className="w-full truncate text-xs font-semibold">
-                {user.name}
-              </span>
-              <span className="mt-1 w-full truncate text-[0.625rem] text-sidebar-foreground/60">
-                {user.isDevelopmentBypass ? "Development bypass" : user.email}
-              </span>
-            </span>
-            <SignOutButton
-              developmentBypass={user.isDevelopmentBypass}
-              tooltipHidden={isMobile}
-            />
-          </div>
+          {state === "collapsed" && !isMobile ? (
+            <CollapsedAccountMenu user={user} />
+          ) : (
+            <ExpandedAccountRow isMobile={isMobile} user={user} />
+          )}
         </SidebarMenuItem>
       </SidebarMenu>
     </SidebarFooter>
+  )
+}
+
+const AccountAvatar = React.memo(function AccountAvatar({
+  name,
+}: {
+  name: string
+}) {
+  const { data: profile } = useQuery(minecraftProfileQueryOptions(name))
+
+  return (
+    <Avatar size="sm" className="rounded-none">
+      {profile ? (
+        <AvatarImage
+          src={minecraftHeadUrl(profile.id)}
+          alt=""
+          referrerPolicy="no-referrer"
+        />
+      ) : null}
+      <AvatarFallback className="type-label rounded-none bg-primary/12 font-bold text-primary">
+        {initials(name)}
+      </AvatarFallback>
+    </Avatar>
+  )
+})
+
+function CollapsedAccountMenu({ user }: { user: AuthenticatedUser }) {
+  const [open, setOpen] = React.useState(false)
+  const [signingOut, setSigningOut] = React.useState(false)
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="grid size-[32px] place-items-center transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none data-[state=open]:bg-sidebar-accent"
+          aria-label={`Open account menu for ${user.name}`}
+        >
+          <AccountAvatar name={user.name} />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        aria-label="Account menu"
+        side="right"
+        align="end"
+        className="w-48 p-1"
+      >
+        <p className="truncate px-2 py-2 text-xs text-muted-foreground">
+          {user.name}
+        </p>
+        <div className="-mx-1 mb-1 h-px bg-border" />
+        <Link
+          to="/settings/account"
+          preload="intent"
+          className="flex h-9 w-full items-center gap-2 px-2 text-sm transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring/45 focus-visible:outline-none"
+          onClick={() => setOpen(false)}
+        >
+          <Settings className="size-4" />
+          <span>Settings</span>
+        </Link>
+        <button
+          type="button"
+          className="flex h-9 w-full items-center gap-2 px-2 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45"
+          aria-label={signingOut ? "Signing out" : "Logout"}
+          disabled={signingOut}
+          onClick={() => {
+            setSigningOut(true)
+            forkPromise(
+              () => signOut(user.isDevelopmentBypass),
+              () => setSigningOut(false)
+            )
+          }}
+        >
+          {signingOut ? (
+            <LoaderCircle className="size-4 animate-spin" />
+          ) : (
+            <LogOut className="size-4" />
+          )}
+          <span>{signingOut ? "Signing out" : "Logout"}</span>
+        </button>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+function ExpandedAccountRow({
+  isMobile,
+  user,
+}: {
+  isMobile: boolean
+  user: AuthenticatedUser
+}) {
+  return (
+    <div className="flex h-11 items-center gap-1 px-2">
+      <Link
+        to="/settings/account"
+        preload="intent"
+        className="flex min-w-0 flex-1 items-center gap-2 text-sidebar-foreground transition-colors hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none"
+      >
+        <AccountAvatar name={user.name} />
+        <span className="min-w-0 flex-1 truncate text-xs font-semibold">
+          {user.name}
+        </span>
+      </Link>
+      <SettingsIconButton tooltipHidden={isMobile} />
+      <SignOutButton
+        developmentBypass={user.isDevelopmentBypass}
+        tooltipHidden={isMobile}
+      />
+    </div>
+  )
+}
+
+function SettingsIconButton({ tooltipHidden }: { tooltipHidden: boolean }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Link
+          to="/settings/account"
+          preload="intent"
+          className="grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none"
+          aria-label="Settings"
+        >
+          <Settings className="size-4" />
+        </Link>
+      </TooltipTrigger>
+      <TooltipContent side="right" align="center" hidden={tooltipHidden}>
+        Settings
+      </TooltipContent>
+    </Tooltip>
   )
 }
 
@@ -798,7 +913,7 @@ function SignOutButton({
       <TooltipTrigger asChild>
         <button
           type="button"
-          className="ml-auto grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors group-data-[collapsible=icon]:mx-auto group-data-[collapsible=icon]:size-[28px]! hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45"
+          className="ml-auto grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45"
           aria-label={signingOut ? "Signing out" : "Sign out"}
           disabled={signingOut}
           onClick={() => {
@@ -810,9 +925,9 @@ function SignOutButton({
           }}
         >
           {signingOut ? (
-            <LoaderCircle className="size-4 animate-spin group-data-[collapsible=icon]:size-[16px]!" />
+            <LoaderCircle className="size-4 animate-spin" />
           ) : (
-            <LogOut className="size-4 group-data-[collapsible=icon]:size-[16px]!" />
+            <LogOut className="size-4" />
           )}
         </button>
       </TooltipTrigger>
@@ -838,25 +953,6 @@ function AccessNavigationButton() {
     >
       <UserRoundCog />
       <span>Access</span>
-    </SidebarMenuButton>
-  )
-}
-
-function SettingsNavigationButton() {
-  const navigate = useNavigate()
-  const isActive = useRouterState({
-    select: (state) =>
-      globalSectionFromRouteId(state.matches.at(-1)?.routeId) === "settings",
-  })
-  return (
-    <SidebarMenuButton
-      tooltip="Settings"
-      type="button"
-      isActive={isActive}
-      onClick={() => void navigate({ to: "/settings" })}
-    >
-      <Settings />
-      <span>Settings</span>
     </SidebarMenuButton>
   )
 }
