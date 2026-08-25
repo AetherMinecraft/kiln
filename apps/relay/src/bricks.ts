@@ -75,8 +75,9 @@ export class BrickCatalog {
     const bricks = await Promise.all(
       document.recipes.map(async (reference) => {
         const source = parseUrl(reference, this.#catalogUrl)
+        const recipe = await this.#loadRecipe(source, true)
         return {
-          ...(await this.#loadRecipe(source, true)),
+          ...recipe,
           source: source.href,
         } satisfies Brick
       })
@@ -138,11 +139,9 @@ export class BrickCatalog {
         "Custom Brick recipes must use HTTPS"
       )
     }
-    const input = parseYaml(
-      await readDocument(source, this.#catalogUrl),
-      source
+    const parsed = brickRecipeSchema.safeParse(
+      parseYaml(await readDocument(source, this.#catalogUrl), source)
     )
-    const parsed = brickRecipeSchema.safeParse(input)
     if (!parsed.success) {
       throw recipeError(
         "invalid_recipe",

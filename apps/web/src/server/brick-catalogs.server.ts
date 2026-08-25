@@ -110,7 +110,10 @@ export async function addBrickCatalogHandler(data: { source: string }) {
       source: loaded.source,
     })
   )
-  return catalogSummary(await requiredCatalog(catalogId), isPlatformAdmin(user))
+  return {
+    ...catalogSummary(await requiredCatalog(catalogId), isPlatformAdmin(user)),
+    overlongBrickIds: loaded.overlongBrickIds,
+  }
 }
 
 export async function deleteBrickCatalogHandler(data: { catalogId: string }) {

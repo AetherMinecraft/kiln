@@ -2,7 +2,10 @@ import { z } from "zod"
 
 export { validateBrickIconSvg } from "./brick-icons"
 
-import { MINIMUM_INSTANCE_DISK_LIMIT_BYTES } from "./instance-limits.js"
+import {
+  MAXIMUM_INSTANCE_NAME_LENGTH,
+  MINIMUM_INSTANCE_DISK_LIMIT_BYTES,
+} from "./instance-limits.js"
 import { relayInstanceLifecycleEventSchema } from "./instance-lifecycle.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
 import {
@@ -191,7 +194,15 @@ export const relayDatabaseExportSchema = relayDatabaseDumpSchema.omit({
   content: true,
 })
 
+export const BRICK_INSTANCE_NAME_SUFFIX = " Server"
+export const RECOMMENDED_MAXIMUM_BRICK_ID_LENGTH =
+  MAXIMUM_INSTANCE_NAME_LENGTH - BRICK_INSTANCE_NAME_SUFFIX.length
+
 export const brickIdSchema = z.string().regex(/^[a-z0-9][a-z0-9.-]{0,63}$/u)
+
+export function brickIdExceedsRecommendedLength(id: string): boolean {
+  return id.length > RECOMMENDED_MAXIMUM_BRICK_ID_LENGTH
+}
 
 export const brickVariableValueSchema = z.union([
   z.string().max(8_192),
@@ -326,7 +337,14 @@ export const brickRecipeSchema = z
   .strict()
 
 export const brickSourceSchema = z.string().trim().url().max(2_048)
-export const relayInstanceNameSchema = z.string().trim().min(1).max(120)
+export const relayInstanceNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(
+    MAXIMUM_INSTANCE_NAME_LENGTH,
+    `Names must be ${MAXIMUM_INSTANCE_NAME_LENGTH} characters or fewer`
+  )
 export const DEFAULT_INSTANCE_DISK_LIMIT_BYTES = 25 * 1024 ** 3
 export const RELAY_NODE_DISK_RESERVE_BYTES = 10 * 1024 ** 3
 
