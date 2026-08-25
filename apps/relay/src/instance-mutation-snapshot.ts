@@ -16,12 +16,11 @@ function provisioningInstance(instance: RelayInstance): RelayInstance {
   return {
     ...instance,
     containerId: null,
+    lifecycle: [],
     observedState: "provisioning",
     stateReason: null,
-    readyAt: null,
     recovery: null,
     resources: null,
-    startedAt: null,
     status: "Reprovisioning",
   }
 }

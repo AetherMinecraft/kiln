@@ -14,6 +14,11 @@ import type { BrickCatalog } from "./bricks.js"
 import { directoryApparentSizeEffect } from "./disk-usage.js"
 import { ensuringPromise } from "./effect/promise.js"
 import type {
+  RelayStateStore,
+  RelayStoredLifecycleSession,
+} from "./effect/state.js"
+import type {
+  BrickReadiness,
   BrickVariableValue,
   RelayConsole,
   RelayConsoleCompletion,
@@ -23,6 +28,8 @@ import type {
   RelayDesiredState,
   RelayInstanceRecovery,
   RelayInstance,
+  RelayInstanceLifecycleEvent,
+  RelayInstanceLifecycleState,
   RelayInstancePortProtocol,
   RelayInstanceResources,
   RelaySftpPublicationStatus,
@@ -35,6 +42,7 @@ import {
   DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
   MINIMUM_INSTANCE_DISK_LIMIT_BYTES,
   relayDiskAllocationAvailableBytes,
+  relayInstanceLifecycleEventTime as lifecycleEventTime,
   relayInstanceTailscaleSchema,
 } from "@workspace/contracts"
 
@@ -551,6 +559,7 @@ export function initialDiskUsageCacheEntry(): DiskUsageCacheEntry {
 
 export class DockerDriver {
   readonly #bricks: BrickCatalog | null
+  readonly #brickReadinessCache = new Map<string, BrickReadiness | null>()
   readonly #config: RelayConfig
   readonly #resources: RelayResourceNames
   #cachedDockerVersion: string | null | undefined
@@ -560,29 +569,32 @@ export class DockerDriver {
   readonly #diskUsageCache = new Map<string, DiskUsageCacheEntry>()
   readonly #powerTransitions = new Map<string, InstancePowerTransition>()
   readonly #runtimeRecovery: RuntimeRecoveryManager | null
-  readonly #readySessions = new Map<
-    string,
-    { readonly readyAt: string | null; readonly startedAt: string }
-  >()
+  readonly #lifecycleSessions = new Map<string, RelayStoredLifecycleSession>()
+  #lifecycleSessionsInitialization: Promise<void> | null = null
   readonly #diskUsageSemaphore = Semaphore.makeUnsafe(1)
   #relayStartedAt: Promise<string | null> | undefined
   #relaySftpPublication: Promise<RelaySftpPublication> | undefined
   readonly #resourceCache = new Map<string, ResourceCacheEntry>()
   readonly #resourceHistory = new Map<string, Array<RelayInstanceResources>>()
+  readonly #state: RelayStateStore["Service"] | null
 
   constructor(
     config: RelayConfig,
     runtimeRecovery: RuntimeRecoveryManager | null = null,
-    bricks: BrickCatalog | null = null
+    bricks: BrickCatalog | null = null,
+    state: RelayStateStore["Service"] | null = null
   ) {
     this.#bricks = bricks
     this.#config = config
     this.#resources = relayResourceNames(config)
     this.#runtimeRecovery = runtimeRecovery
+    this.#state = state
   }
 
   async inspectInstances(): Promise<Array<RelayInstance>> {
+    await this.#initializeLifecycleSessions()
     const discovered = await this.#discover()
+    const lifecycleSessionUpdates: Array<Promise<void>> = []
     const activeContainerIds = new Set(
       discovered.map(({ container }) => container.Id)
     )
@@ -599,6 +611,10 @@ export class DockerDriver {
       if (!activeInstanceIds.has(instanceId))
         this.#diskUsageCache.delete(instanceId)
     }
+    for (const instanceId of this.#brickReadinessCache.keys()) {
+      if (!activeInstanceIds.has(instanceId))
+        this.#brickReadinessCache.delete(instanceId)
+    }
     for (const instanceId of this.#resourceHistory.keys()) {
       if (!activeInstanceIds.has(instanceId))
         this.#resourceHistory.delete(instanceId)
@@ -607,9 +623,11 @@ export class DockerDriver {
       if (!activeInstanceIds.has(instanceId))
         this.#powerTransitions.delete(instanceId)
     }
-    for (const instanceId of this.#readySessions.keys()) {
-      if (!activeInstanceIds.has(instanceId))
-        this.#readySessions.delete(instanceId)
+    for (const instanceId of this.#lifecycleSessions.keys()) {
+      if (!activeInstanceIds.has(instanceId)) {
+        this.#lifecycleSessions.delete(instanceId)
+        lifecycleSessionUpdates.push(this.#deleteLifecycleSession(instanceId))
+      }
     }
     await runEffect(
       Effect.forEach(
@@ -646,29 +664,41 @@ export class DockerDriver {
     await Promise.all(
       discovered.map(async ({ config, container }) => {
         const transition = this.#powerTransitions.get(config.id)
-        const readySession = this.#readySessions.get(config.id)
-        const readySessionMatches =
-          readySession?.startedAt === container.State.StartedAt
-        if (readySessionMatches && container.State.Running) {
+        const lifecycleSession = this.#lifecycleSessions.get(config.id)
+        const lifecycleSessionMatches =
+          lifecycleEventTime(lifecycleSession?.events ?? [], "started") ===
+          container.State.StartedAt
+        if (
+          lifecycleSessionMatches &&
+          lifecycleEventTime(lifecycleSession?.events ?? [], "ready") &&
+          container.State.Running
+        ) {
           readiness.set(config.id, true)
           return
         }
+        const brickReadiness = await this.#brickReadiness(config)
         const startedAt = Date.parse(container.State.StartedAt)
         const startedRecently =
           Number.isFinite(startedAt) &&
           now - startedAt < INSTANCE_STARTUP_READINESS_TIMEOUT_MS
-        const readinessProbe = instanceReadinessProbe({
-          hasHealthCheck: container.State.Health !== undefined,
-          hasLogReadiness: config.brickReadiness !== undefined,
-          running: container.State.Running,
-          startedRecently,
-          transitionAction: transition?.action,
-        })
+        const readinessProbe =
+          !container.State.Running &&
+          brickReadiness !== undefined &&
+          !lifecycleEventTime(lifecycleSession?.events ?? [], "ready")
+            ? "historical"
+            : instanceReadinessProbe({
+                hasHealthCheck: container.State.Health !== undefined,
+                hasLogReadiness: brickReadiness !== undefined,
+                running: container.State.Running,
+                startedRecently,
+                transitionAction: transition?.action,
+              })
         if (!readinessProbe) return
         const result = await this.#instanceReady(
           config,
           container,
-          readinessProbe
+          readinessProbe,
+          brickReadiness
         )
         if (!result) return
         readiness.set(config.id, result.ready)
@@ -749,27 +779,28 @@ export class DockerDriver {
       if (powerState.transitionComplete) {
         this.#powerTransitions.delete(config.id)
       }
-      const containerStartedAt = container.State.StartedAt
-      const readySession = this.#readySessions.get(config.id)
-      if (
-        powerState.observedState === "running" &&
-        (!readySession || readySession.startedAt !== containerStartedAt)
-      ) {
-        this.#readySessions.set(config.id, {
-          readyAt: observedSessionReadyAt(
-            readyAt.get(config.id),
-            transition !== undefined,
-            now
-          ),
-          startedAt: containerStartedAt,
-        })
-      } else if (
-        powerState.observedState === "starting" &&
-        readySession?.startedAt !== containerStartedAt
-      ) {
-        this.#readySessions.delete(config.id)
+      const previousLifecycleSession = this.#lifecycleSessions.get(config.id)
+      const lifecycleSession = observedLifecycleSession({
+        container,
+        instanceId: config.id,
+        now,
+        observedReadyAt: readyAt.get(config.id),
+        observedState: powerState.observedState,
+        previous: previousLifecycleSession,
+        recovery: recoveryState?.recovery ?? null,
+        transition,
+      })
+      if (lifecycleSession) {
+        this.#lifecycleSessions.set(config.id, lifecycleSession)
+        if (!sameLifecycleSession(previousLifecycleSession, lifecycleSession)) {
+          lifecycleSessionUpdates.push(
+            this.#persistLifecycleSession(lifecycleSession)
+          )
+        }
+      } else if (previousLifecycleSession) {
+        this.#lifecycleSessions.delete(config.id)
+        lifecycleSessionUpdates.push(this.#deleteLifecycleSession(config.id))
       }
-      const currentReadySession = this.#readySessions.get(config.id)
       const resources = this.#resourcesFor({ config, container })
 
       return {
@@ -786,11 +817,7 @@ export class DockerDriver {
           desiredState
         ),
         recovery: recoveryState?.recovery ?? null,
-        startedAt: container.State.Running ? container.State.StartedAt : null,
-        readyAt:
-          currentReadySession?.startedAt === containerStartedAt
-            ? currentReadySession.readyAt
-            : null,
+        lifecycle: lifecycleSession?.events ?? [],
         status:
           recoveryStatus(recoveryState?.recovery, now) ??
           (powerState.observedState === "running"
@@ -806,6 +833,8 @@ export class DockerDriver {
         resources,
       }
     })
+
+    await Promise.all(lifecycleSessionUpdates)
 
     return instances.sort((a, b) =>
       `${a.implementation}-${a.version}`.localeCompare(
@@ -859,8 +888,13 @@ export class DockerDriver {
   }
 
   async forgetRecoveryState(instanceId: string): Promise<void> {
-    if (!this.#runtimeRecovery) return
-    await runEffect(this.#runtimeRecovery.forget(instanceId))
+    this.#lifecycleSessions.delete(instanceId)
+    await Promise.all([
+      this.#runtimeRecovery
+        ? runEffect(this.#runtimeRecovery.forget(instanceId))
+        : Promise.resolve(),
+      this.#deleteLifecycleSession(instanceId),
+    ])
   }
 
   async webRouteLabelSnapshots(): Promise<Array<RelayWebRouteLabelSnapshot>> {
@@ -876,6 +910,10 @@ export class DockerDriver {
     action: InstancePowerAction
   ): Promise<RelayInstance> {
     const discovered = await this.#findDiscovered(instance.id)
+    await this.#initializeLifecycleSessions()
+    const lifecycleSessionBeforeTransition = this.#lifecycleSessions.get(
+      instance.id
+    )
     const previousRecovery =
       instance.managedByRelay && this.#runtimeRecovery
         ? await runEffect(
@@ -891,6 +929,13 @@ export class DockerDriver {
       requestedAt: Date.now(),
     }
     this.#powerTransitions.set(instance.id, transition)
+    if (action !== "start") {
+      await this.#recordStoppingSession(
+        instance.id,
+        discovered.container,
+        transition
+      )
+    }
 
     await runEffect(
       promiseEffect(async () => {
@@ -944,6 +989,14 @@ export class DockerDriver {
                 ? this.#runtimeRecovery
                     .restore(instance.id, previousRecovery)
                     .pipe(Effect.ignore)
+                : Effect.void,
+              action !== "start"
+                ? promiseEffect(() =>
+                    this.#restoreLifecycleSession(
+                      instance.id,
+                      lifecycleSessionBeforeTransition
+                    )
+                  ).pipe(Effect.ignore)
                 : Effect.void,
             ],
             { discard: true }
@@ -1244,6 +1297,7 @@ export class DockerDriver {
 
     return {
       instanceId: instance.id,
+      lifecycle: startedAt ? [{ state: "started", time: startedAt }] : [],
       lines: rawLines.map((line) => {
         const hash = createHash("sha1")
           .update(`${line.timestamp ?? ""}\u0000${line.text}`)
@@ -1253,7 +1307,6 @@ export class DockerDriver {
         occurrences.set(hash, occurrence + 1)
         return { ...line, id: `${hash}-${occurrence}` }
       }),
-      startedAt,
       truncated: rawLines.length >= boundedLimit,
     }
   }
@@ -1261,7 +1314,6 @@ export class DockerDriver {
   async consoleLog(instance: RelayInstanceConfig): Promise<DockerConsoleLog> {
     const discovered = await this.#findDiscovered(instance.id)
     const targets = await this.#consoleTargets(instance, discovered)
-    const startedAt = consoleStartedAt(discovered.container)
     const results = await Promise.all(
       targets.map(async (target) => {
         const targetSince = dockerLogSinceArguments(
@@ -1302,7 +1354,6 @@ export class DockerDriver {
       path: "console.log",
       content,
       size,
-      startedAt,
     }
   }
 
@@ -1782,44 +1833,41 @@ export class DockerDriver {
   async #instanceReady(
     instance: RelayInstanceConfig,
     container: DockerInspect,
-    probe: InstanceReadinessProbe
+    probe: InstanceReadinessProbe,
+    brickReadiness: BrickReadiness | undefined
   ): Promise<InstanceReadiness | undefined> {
-    if (instance.brickReadiness) {
-      return this.#startupLogReady(instance, container, probe)
+    if (brickReadiness) {
+      return this.#startupLogReady(brickReadiness, container, probe)
     }
     const ready = await this.#primaryPortReady(instance, container)
     return ready === undefined ? undefined : { ready }
   }
 
   async #startupLogReady(
-    instance: RelayInstanceConfig,
+    readiness: BrickReadiness,
     container: DockerInspect,
     probe: InstanceReadinessProbe
   ): Promise<InstanceReadiness | undefined> {
     const historical = probe === "historical"
+    const logWindowArguments = historical
+      ? historicalReadinessLogArguments(container.State.StartedAt)
+      : [
+          ...dockerLogSinceArguments(container.State.StartedAt),
+          "--tail",
+          String(STARTUP_READINESS_LOG_LINES),
+        ]
     return runEffect(
       promiseEffect(() =>
         command(
           "docker",
-          [
-            "logs",
-            "--timestamps",
-            ...dockerLogSinceArguments(container.State.StartedAt),
-            "--tail",
-            String(
-              historical
-                ? MAX_CONSOLE_HISTORY_LINES
-                : STARTUP_READINESS_LOG_LINES
-            ),
-            container.Id,
-          ],
+          ["logs", "--timestamps", ...logWindowArguments, container.Id],
           { timeout: historical ? 15_000 : 2_000 }
         )
       ).pipe(
         Effect.map((result) => {
           const match = matchingReadyLogLine(
             parseConsoleOutput(result),
-            instance.brickReadiness?.logs ?? []
+            readiness.logs
           )
           return match
             ? {
@@ -1859,6 +1907,95 @@ export class DockerDriver {
     }
     const listening = await containerPortListening(container.Id, port)
     return listening ?? (attempts.length > 0 ? false : undefined)
+  }
+
+  async #initializeLifecycleSessions(): Promise<void> {
+    if (!this.#state) return
+    this.#lifecycleSessionsInitialization ??= runEffect(
+      this.#state.listLifecycleSessions()
+    ).then((sessions) => {
+      for (const session of sessions) {
+        this.#lifecycleSessions.set(session.instanceId, session)
+      }
+    })
+    await this.#lifecycleSessionsInitialization
+  }
+
+  #persistLifecycleSession(
+    session: RelayStoredLifecycleSession
+  ): Promise<void> {
+    if (!this.#state) return Promise.resolve()
+    return runEffect(this.#state.setLifecycleSession(session))
+  }
+
+  async #recordStoppingSession(
+    instanceId: string,
+    container: DockerInspect,
+    transition: InstancePowerTransition
+  ): Promise<void> {
+    const session = observedLifecycleSession({
+      container,
+      instanceId,
+      now: transition.requestedAt,
+      observedReadyAt: undefined,
+      observedState: "stopping",
+      previous: this.#lifecycleSessions.get(instanceId),
+      recovery: null,
+      transition,
+    })
+    if (!session) return
+    this.#lifecycleSessions.set(instanceId, session)
+    await this.#persistLifecycleSession(session)
+  }
+
+  async #restoreLifecycleSession(
+    instanceId: string,
+    session: RelayStoredLifecycleSession | undefined
+  ): Promise<void> {
+    if (session) {
+      this.#lifecycleSessions.set(instanceId, session)
+      await this.#persistLifecycleSession(session)
+      return
+    }
+    this.#lifecycleSessions.delete(instanceId)
+    await this.#deleteLifecycleSession(instanceId)
+  }
+
+  #deleteLifecycleSession(instanceId: string): Promise<void> {
+    return this.#state
+      ? runEffect(this.#state.deleteLifecycleSession(instanceId))
+      : Promise.resolve()
+  }
+
+  async #brickReadiness(
+    instance: RelayInstanceConfig
+  ): Promise<BrickReadiness | undefined> {
+    if (instance.brickReadiness) return instance.brickReadiness
+    const cached = this.#brickReadinessCache.get(instance.id)
+    if (cached !== undefined) return cached ?? undefined
+    const bricks = this.#bricks
+    const source = instance.brickSource
+    if (!bricks || !source) {
+      this.#brickReadinessCache.set(instance.id, null)
+      return undefined
+    }
+
+    const readiness = await runEffect(
+      promiseEffect(
+        async () =>
+          (await bricks.recipe(source, instance.brickSnapshotSha256)).readiness
+      ).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Could not recover legacy Brick readiness", {
+            cause,
+            instanceId: instance.id,
+            source,
+          }).pipe(Effect.as(undefined))
+        )
+      )
+    )
+    this.#brickReadinessCache.set(instance.id, readiness ?? null)
+    return readiness
   }
 
   #resourcesFor(instance: DiscoveredInstance): RelayInstanceResources | null {
@@ -2750,13 +2887,139 @@ export const resolveConsoleStopCommands = Effect.fn(
 
 export function observedSessionReadyAt(
   detectedReadyAt: string | undefined,
-  transitionActive: boolean,
+  observedDuringStartup: boolean,
   now = Date.now()
 ): string | null {
   if (detectedReadyAt) return detectedReadyAt
   // A rediscovered session has no trustworthy historical probe time. Keep it
   // unknown so restored console history does not place readiness at startup.
-  return transitionActive ? new Date(now).toISOString() : null
+  return observedDuringStartup ? new Date(now).toISOString() : null
+}
+
+function observedLifecycleSession({
+  container,
+  instanceId,
+  now,
+  observedReadyAt,
+  observedState,
+  previous,
+  recovery,
+  transition,
+}: {
+  readonly container: DockerInspect
+  readonly instanceId: string
+  readonly now: number
+  readonly observedReadyAt: string | undefined
+  readonly observedState: RelayInstance["observedState"]
+  readonly previous: RelayStoredLifecycleSession | undefined
+  readonly recovery: RelayInstanceRecovery | null
+  readonly transition: InstancePowerTransition | undefined
+}): RelayStoredLifecycleSession | null {
+  const startedAt = consoleStartedAt(container)
+  if (!startedAt) return null
+
+  const session: RelayStoredLifecycleSession =
+    previous && lifecycleEventTime(previous.events, "started") === startedAt
+      ? previous
+      : {
+          events: [{ state: "started", time: startedAt }],
+          instanceId,
+        }
+  let events = session.events
+  if (observedState === "running" && !lifecycleEventTime(events, "ready")) {
+    const startedAtMs = Date.parse(startedAt)
+    const observedDuringStartup =
+      Number.isFinite(startedAtMs) &&
+      now - startedAtMs < INSTANCE_STARTUP_READINESS_TIMEOUT_MS
+    events = addLifecycleEvent(
+      events,
+      "ready",
+      observedSessionReadyAt(
+        observedReadyAt,
+        transition !== undefined || observedDuringStartup,
+        now
+      )
+    )
+  } else if (observedReadyAt && !lifecycleEventTime(events, "ready")) {
+    // Legacy stopped sessions can still recover the exact declared ready log.
+    events = addLifecycleEvent(events, "ready", observedReadyAt)
+  }
+
+  if (
+    !lifecycleEventTime(events, "stopping") &&
+    transition &&
+    (transition.action === "stop" ||
+      transition.action === "restart" ||
+      transition.action === "kill")
+  ) {
+    events = addLifecycleEvent(
+      events,
+      "stopping",
+      new Date(transition.requestedAt).toISOString()
+    )
+  }
+
+  const finishedAt = consoleFinishedAt(container)
+  if (!container.State.Running && finishedAt && recovery) {
+    events = addLifecycleEvent(
+      events,
+      recovery.reason === "clean_exit" ? "stopped" : "failed",
+      finishedAt
+    )
+  } else if (observedState === "stopped") {
+    events = addLifecycleEvent(
+      events,
+      "stopped",
+      finishedAt ?? new Date(now).toISOString()
+    )
+  } else if (observedState === "failed") {
+    events = addLifecycleEvent(
+      events,
+      "failed",
+      finishedAt ?? new Date(now).toISOString()
+    )
+  }
+  return events === session.events ? session : { ...session, events }
+}
+
+function sameLifecycleSession(
+  left: RelayStoredLifecycleSession | undefined,
+  right: RelayStoredLifecycleSession
+): boolean {
+  return (
+    left?.instanceId === right.instanceId &&
+    left.events.length === right.events.length &&
+    left.events.every(
+      (event, index) =>
+        event.state === right.events[index]?.state &&
+        event.time === right.events[index]?.time
+    )
+  )
+}
+
+function addLifecycleEvent(
+  events: Array<RelayInstanceLifecycleEvent>,
+  state: RelayInstanceLifecycleState,
+  time: string | null
+): Array<RelayInstanceLifecycleEvent> {
+  return !time || lifecycleEventTime(events, state)
+    ? events
+    : [...events, { state, time }]
+}
+
+export function historicalReadinessLogArguments(
+  startedAt: string
+): Array<string> {
+  const since = dockerLogSinceArguments(startedAt)
+  const parsed = Date.parse(startedAt)
+  if (since.length === 0 || !Number.isFinite(parsed)) {
+    return ["--tail", String(MAX_CONSOLE_HISTORY_LINES)]
+  }
+  return [
+    ...since,
+    "--until",
+    new Date(parsed + INSTANCE_STARTUP_READINESS_TIMEOUT_MS).toISOString(),
+  ]
 }
 
 export type InstanceReadinessProbe = "historical" | "live"
@@ -2791,8 +3054,8 @@ export function instanceReadinessProbe({
     return "live"
   }
 
-  // A configured startup log is historical evidence. Re-read the complete
-  // restorable console window once when Relay rediscovers an existing session.
+  // A configured startup log is historical evidence. Re-read the bounded
+  // startup window once when Relay rediscovers an existing session.
   return hasLogReadiness ? "historical" : null
 }
 
@@ -2907,7 +3170,6 @@ export interface DockerConsoleLog {
   instanceId: string
   path: "console.log"
   size: number
-  startedAt: string | null
 }
 
 const ANSI_COLORS = [
@@ -3116,6 +3378,13 @@ function consoleStartedAt(container: DockerInspect): string | null {
   const timestamp = Date.parse(container.State.StartedAt)
   return Number.isFinite(timestamp) && timestamp > 0
     ? container.State.StartedAt
+    : null
+}
+
+function consoleFinishedAt(container: DockerInspect): string | null {
+  const timestamp = Date.parse(container.State.FinishedAt)
+  return Number.isFinite(timestamp) && timestamp > 0
+    ? container.State.FinishedAt
     : null
 }
 

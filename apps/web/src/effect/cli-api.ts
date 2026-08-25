@@ -1484,7 +1484,7 @@ function cliServerMetadata(instance: z.infer<typeof relayInstanceSchema>) {
       instance.publicHost && instance.publicPort
         ? `${instance.publicHost}:${instance.publicPort}`
         : null,
-    readyAt: instance.readyAt,
+    lifecycle: instance.lifecycle,
     resources: instance.resources
       ? {
           cpuPercent: instance.resources.cpu.percent,
@@ -1497,7 +1497,6 @@ function cliServerMetadata(instance: z.infer<typeof relayInstanceSchema>) {
         }
       : null,
     shortId: instance.shortId,
-    startedAt: instance.startedAt,
     version: instance.version,
   }
 }
