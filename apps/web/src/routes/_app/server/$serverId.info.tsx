@@ -8,17 +8,28 @@ import {
   useInstanceRelayConnected,
 } from "@/components/instance-workspace-context"
 import { SettingsWorkspace } from "@/components/settings-workspace"
+import { isDevelopmentBypassIdentity } from "@/lib/development-bypass"
 import { pageTitle } from "@/lib/page-title"
 import { relaySnapshotQueryOptions } from "@/lib/query-options"
 import { selectInstanceSettings } from "@/lib/relay-selectors"
+import { requireServerDestinationAccess } from "@/lib/route-access"
 
 export const Route = createFileRoute("/_app/server/$serverId/info")({
+  beforeLoad: async ({ context, params }) => {
+    await requireServerDestinationAccess(
+      context.queryClient,
+      context.instance,
+      "info",
+      params.serverId
+    )
+  },
   component: InfoRoute,
   head: () => ({ meta: [{ title: pageTitle("Info") }] }),
 })
 
 function InfoRoute() {
   const navigate = Route.useNavigate()
+  const { user } = Route.useRouteContext()
   const workspaceInstance = useInstanceIdentity()
   const permissions = useInstancePermissions()
   const relayConnected = useInstanceRelayConnected()
@@ -41,9 +52,8 @@ function InfoRoute() {
       key={`${data.instance.relayId}:${data.instance.id}`}
       instance={data.instance}
       node={data.node}
-      canDelete={permissions.deleteServer}
-      canRename={permissions.settings}
-      canShare={permissions.shareLogs}
+      permissions={permissions}
+      passwordRequired={!isDevelopmentBypassIdentity(user)}
       relayConnected={relayConnected}
       onDeleted={returnToServers}
     />

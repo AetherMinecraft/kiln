@@ -333,6 +333,40 @@ describe("Relay state", () => {
       })
     )
 
+    it.effect("persists lifecycle events by exact container session", () =>
+      Effect.gen(function* () {
+        const store = yield* RelayStateStore
+        const first = {
+          events: [
+            { state: "started" as const, time: "2026-08-24T01:00:00.000Z" },
+            { state: "ready" as const, time: "2026-08-24T01:00:15.000Z" },
+          ],
+          instanceId: "ready-instance",
+        }
+        yield* store.setLifecycleSession(first)
+        assert.deepStrictEqual(yield* store.listLifecycleSessions(), [first])
+
+        const replacement = {
+          events: [
+            { state: "started" as const, time: "2026-08-24T02:00:00.000Z" },
+            {
+              state: "stopping" as const,
+              time: "2026-08-24T02:00:55.000Z",
+            },
+            { state: "failed" as const, time: "2026-08-24T02:01:00.000Z" },
+          ],
+          instanceId: first.instanceId,
+        }
+        yield* store.setLifecycleSession(replacement)
+        assert.deepStrictEqual(yield* store.listLifecycleSessions(), [
+          replacement,
+        ])
+
+        yield* store.deleteLifecycleSession(first.instanceId)
+        assert.isEmpty(yield* store.listLifecycleSessions())
+      })
+    )
+
     it.effect(
       "replaces instance web routes and rejects hostname collisions",
       () =>

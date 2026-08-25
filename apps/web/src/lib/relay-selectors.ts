@@ -1,4 +1,5 @@
 import type { RelayInstance, RelayNode } from "@workspace/contracts"
+import { relayInstanceLifecycleEventTime } from "@workspace/contracts"
 
 import type { RelayConnection } from "@/lib/query-options"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
@@ -40,6 +41,7 @@ export type ServerListInstance = Pick<
   | "implementation"
   | "name"
   | "observedState"
+  | "provisioning"
   | "shortId"
   | "version"
 > & {
@@ -75,7 +77,7 @@ export type InstanceWorkspaceInstance = Pick<
 
 export type InstanceRuntime = Pick<
   RelayInstance,
-  "id" | "observedState" | "readyAt" | "recovery" | "resources" | "startedAt"
+  "id" | "lifecycle" | "observedState" | "recovery" | "resources"
 > & { relayId: string }
 
 export type InstanceSettingsInstance = Pick<
@@ -91,6 +93,7 @@ export type InstanceSettingsInstance = Pick<
   | "implementation"
   | "javaVersion"
   | "name"
+  | "provisioning"
   | "publicHost"
   | "publicPort"
   | "service"
@@ -150,6 +153,7 @@ export function selectServerListInstances(
     implementation: instance.implementation,
     name: instance.name,
     observedState: instance.observedState,
+    provisioning: instance.provisioning,
     relayId: instance.relayId,
     relayName: instance.relayName,
     relayStatus: instance.relayStatus,
@@ -241,12 +245,11 @@ export function selectInstanceRuntime(instanceId: string, relayId?: string) {
     return instance
       ? {
           id: instance.id,
+          lifecycle: instance.lifecycle,
           observedState: instance.observedState,
-          readyAt: instance.readyAt,
           recovery: instance.recovery,
           relayId: instance.relayId,
           resources: instance.resources,
-          startedAt: instance.startedAt,
         }
       : null
   }
@@ -271,6 +274,7 @@ export function selectInstanceSettings(instanceId: string, relayId?: string) {
         implementation: instance.implementation,
         javaVersion: instance.javaVersion,
         name: instance.name,
+        provisioning: instance.provisioning,
         publicHost: instance.publicHost,
         publicPort: instance.publicPort,
         relayId: instance.relayId,
@@ -314,6 +318,18 @@ export function selectInstanceStateReason(
     )?.stateReason ?? null
 }
 
+export function selectInstanceLifecycleStartedAt(
+  instanceId: string,
+  relayId?: string
+) {
+  return (snapshot: RelayFleetSnapshot) => {
+    const instance = snapshot.instances.find(
+      (item) => item.id === instanceId && (!relayId || item.relayId === relayId)
+    )
+    return relayInstanceLifecycleEventTime(instance?.lifecycle, "started")
+  }
+}
+
 export function selectInstanceContainerRunning(
   instanceId: string,
   relayId?: string
@@ -323,7 +339,11 @@ export function selectInstanceContainerRunning(
       (instance) =>
         instance.id === instanceId &&
         (!relayId || instance.relayId === relayId) &&
-        instance.startedAt !== null
+        relayInstanceLifecycleEventTime(instance.lifecycle, "started") !==
+          null &&
+        (instance.observedState === "starting" ||
+          instance.observedState === "running" ||
+          instance.observedState === "stopping")
     )
 }
 

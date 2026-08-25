@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vite-plus/test"
+import type { RelayInstanceLifecycleEvent } from "@workspace/contracts"
 
 import {
+  CONSOLE_STARTUP_REASON_DELAY_MS,
+  consoleRuntimeReasonDelayRemaining,
   consoleRecoveryLine,
   consoleSessionAcceptedAheadOfRuntime,
   consoleSessionIsCurrent,
@@ -20,10 +23,51 @@ import {
 const startedAt = "2026-07-28T19:57:00.000Z"
 const readyAt = "2026-07-28T19:57:15.000Z"
 
+function lifecycle(
+  readyTime: string | null = null,
+  rest: ReadonlyArray<RelayInstanceLifecycleEvent> = []
+): Array<RelayInstanceLifecycleEvent> {
+  return [
+    { state: "started", time: startedAt },
+    ...(readyTime ? [{ state: "ready" as const, time: readyTime }] : []),
+    ...rest,
+  ]
+}
+
 describe("console lifecycle lines", () => {
+  it("delays only the expected startup readiness notice", () => {
+    const startedAtMs = Date.parse(startedAt)
+    const reason = { code: "waiting_for_readiness" } as const
+
+    expect(
+      consoleRuntimeReasonDelayRemaining(reason, startedAt, startedAtMs)
+    ).toBe(CONSOLE_STARTUP_REASON_DELAY_MS)
+    expect(
+      consoleRuntimeReasonDelayRemaining(
+        reason,
+        startedAt,
+        startedAtMs + CONSOLE_STARTUP_REASON_DELAY_MS - 1
+      )
+    ).toBe(1)
+    expect(
+      consoleRuntimeReasonDelayRemaining(
+        reason,
+        startedAt,
+        startedAtMs + CONSOLE_STARTUP_REASON_DELAY_MS
+      )
+    ).toBe(0)
+    expect(
+      consoleRuntimeReasonDelayRemaining(
+        { code: "health_check_failed" },
+        startedAt,
+        startedAtMs
+      )
+    ).toBe(0)
+  })
+
   it("shows starting and running for a ready server", () => {
     expect(
-      initialConsoleStateLines(startedAt, "running", readyAt).map(
+      initialConsoleStateLines(lifecycle(readyAt), "running").map(
         (line) => line.text
       )
     ).toEqual(["Server is starting", "Server is running"])
@@ -46,7 +90,7 @@ describe("console lifecycle lines", () => {
     ]
 
     expect(
-      mergeConsoleStateLines(lines, startedAt, "running", readyAt).map(
+      mergeConsoleStateLines(lines, lifecycle(readyAt), "running").map(
         (line) => line.text
       )
     ).toEqual([
@@ -81,7 +125,7 @@ describe("console lifecycle lines", () => {
     ]
 
     expect(
-      mergeConsoleStateLines(lines, startedAt, "running", doneAt).map(
+      mergeConsoleStateLines(lines, lifecycle(doneAt), "running").map(
         (line) => line.text
       )
     ).toEqual([
@@ -90,6 +134,35 @@ describe("console lifecycle lines", () => {
       "Server is running",
       "Server is Backing up...",
       "Backup Completed!",
+    ])
+  })
+
+  it("preserves Docker nanosecond ordering within one millisecond", () => {
+    const doneAt = "2026-08-24T14:48:22.051488536Z"
+    const lines = [
+      {
+        id: "done",
+        level: "info" as const,
+        text: 'Done (10.617s)! For help, type "help"',
+        timestamp: doneAt,
+      },
+      {
+        id: "first-start-help",
+        level: "info" as const,
+        text: "This is the first time you're starting this server.",
+        timestamp: "2026-08-24T14:48:22.051821247Z",
+      },
+    ]
+
+    expect(
+      mergeConsoleStateLines(lines, lifecycle(doneAt), "running").map(
+        (line) => line.text
+      )
+    ).toEqual([
+      "Server is starting",
+      'Done (10.617s)! For help, type "help"',
+      "Server is running",
+      "This is the first time you're starting this server.",
     ])
   })
 
@@ -110,7 +183,7 @@ describe("console lifecycle lines", () => {
     ]
 
     expect(
-      mergeConsoleStateLines(lines, startedAt, "running").map(
+      mergeConsoleStateLines(lines, lifecycle(), "running").map(
         (line) => line.text
       )
     ).toEqual([
@@ -131,9 +204,8 @@ describe("console lifecycle lines", () => {
           timestamp: "2026-07-28T19:57:20.000Z",
         },
       ],
-      startedAt,
-      "running",
-      readyAt
+      lifecycle(readyAt),
+      "running"
     )
     const history = [
       {
@@ -194,7 +266,7 @@ describe("console lifecycle lines", () => {
     expect(
       reconcileConsoleLifecycleLines(
         lines,
-        replacementStartedAt,
+        [{ state: "started", time: replacementStartedAt }],
         "starting"
       ).map((line) => line.text)
     ).toEqual(["Server is starting", "Loading properties"])
@@ -306,12 +378,57 @@ describe("console lifecycle lines", () => {
 
   it("does not invent a running transition while the server is stopping", () => {
     expect(
-      initialConsoleStateLines(startedAt, "stopping").map((line) => line.text)
+      initialConsoleStateLines(lifecycle(), "stopping").map((line) => line.text)
     ).toEqual(["Server is starting", "Server is stopping"])
   })
 
+  it("restores the complete stopped session in chronological order", () => {
+    const stoppingAt = "2026-07-28T20:10:00.000Z"
+    const stoppedAt = "2026-07-28T20:10:04.000Z"
+    const lines = initialConsoleStateLines(
+      lifecycle(readyAt, [
+        { state: "stopping", time: stoppingAt },
+        { state: "stopped", time: stoppedAt },
+      ]),
+      "stopped"
+    )
+
+    expect(lines.map((line) => [line.text, line.timestamp])).toEqual([
+      ["Server is starting", startedAt],
+      ["Server is running", readyAt],
+      ["Server is stopping", stoppingAt],
+      ["Server stopped", stoppedAt],
+    ])
+  })
+
+  it("keeps a crash marker while automatic recovery awaits a new session", () => {
+    const failedAt = "2026-07-28T20:10:04.000Z"
+    const lines = initialConsoleStateLines(
+      lifecycle(readyAt, [{ state: "failed", time: failedAt }]),
+      "starting",
+      {
+        attempt: 1,
+        exitCode: 137,
+        maxAttempts: 2,
+        nextAttemptAt: "2026-07-28T20:10:09.000Z",
+        oomKilled: true,
+        phase: "pending",
+        reason: "out_of_memory",
+        runtimeMs: 780_000,
+      }
+    )
+
+    expect(lines.slice(0, 3).map((line) => line.text)).toEqual([
+      "Server is starting",
+      "Server is running",
+      "Server failed",
+    ])
+    expect(lines[2]?.timestamp).toBe(failedAt)
+    expect(lines[3]?.text).toContain("ran out of memory")
+  })
+
   it("identifies synthetic lifecycle lines for centered rendering", () => {
-    const [line] = initialConsoleStateLines(null, "stopped")
+    const [line] = initialConsoleStateLines([], "stopped")
 
     expect(line?.text).toBe("Server stopped")
     expect(line && isConsoleStateLine(line)).toBe(true)
@@ -342,7 +459,7 @@ describe("console lifecycle lines", () => {
   })
 
   it("gives an actionable message when automatic recovery is exhausted", () => {
-    const lines = initialConsoleStateLines(null, "failed", null, {
+    const lines = initialConsoleStateLines([], "failed", {
       attempt: 2,
       exitCode: 137,
       maxAttempts: 2,

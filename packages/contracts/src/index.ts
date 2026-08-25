@@ -3,6 +3,7 @@ import { z } from "zod"
 export { validateBrickIconSvg } from "./brick-icons"
 
 import { MINIMUM_INSTANCE_DISK_LIMIT_BYTES } from "./instance-limits.js"
+import { relayInstanceLifecycleEventSchema } from "./instance-lifecycle.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
 import {
   relayTailscaleDomainSchema,
@@ -15,6 +16,7 @@ export * from "./release-version.js"
 export * from "./minecraft-java.js"
 export * from "./cli.js"
 export * from "./instance-limits.js"
+export * from "./instance-lifecycle.js"
 export * from "./instance-state-reason.js"
 export * from "./backups.js"
 export * from "./git-repository.js"
@@ -935,8 +937,7 @@ export const relayInstanceSchema = z.object({
   observedState: relayObservedStateSchema,
   stateReason: relayInstanceStateReasonSchema.nullable().default(null),
   recovery: relayInstanceRecoverySchema.nullable().default(null),
-  startedAt: z.string().datetime().nullable().default(null),
-  readyAt: z.string().datetime().nullable().default(null),
+  lifecycle: z.array(relayInstanceLifecycleEventSchema).default([]),
   containerId: z.string().nullable(),
   status: z.string(),
   brickId: brickIdSchema.optional(),
@@ -1268,8 +1269,8 @@ export const relayConsoleLineSchema = z.object({
 
 export const relayConsoleSchema = z.object({
   instanceId: z.string().min(1),
+  lifecycle: z.array(relayInstanceLifecycleEventSchema).default([]),
   lines: z.array(relayConsoleLineSchema),
-  startedAt: z.string().datetime().nullable().optional(),
   truncated: z.boolean(),
 })
 
@@ -1277,19 +1278,19 @@ export const relayConsoleStreamEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("ready"),
     instanceId: z.string().min(1),
-    startedAt: z.string().datetime().nullable().optional(),
+    lifecycle: z.array(relayInstanceLifecycleEventSchema).default([]),
   }),
   z.object({
     type: z.literal("reset"),
     instanceId: z.string().min(1),
-    startedAt: z.string().datetime().nullable(),
+    lifecycle: z.array(relayInstanceLifecycleEventSchema),
     lines: z.array(relayConsoleLineSchema),
     truncated: z.boolean(),
   }),
   z.object({
     type: z.literal("history"),
     instanceId: z.string().min(1),
-    startedAt: z.string().datetime().nullable(),
+    lifecycle: z.array(relayInstanceLifecycleEventSchema),
     lines: z.array(relayConsoleLineSchema),
     truncated: z.boolean(),
   }),

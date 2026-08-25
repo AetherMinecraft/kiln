@@ -4,8 +4,11 @@ import { Effect } from "effect"
 import type {
   RelayConsole,
   RelayConsoleLine,
+  RelayInstanceLifecycleEvent,
+  RelayInstanceLifecycleState,
   RelayObservedState,
 } from "@workspace/contracts"
+import { relayInstanceLifecycleEventTime as lifecycleEventTime } from "@workspace/contracts"
 
 import {
   consoleRecoveryLine,
@@ -50,9 +53,6 @@ export function useRelayConsoleStream(
   const consoleDataRef = React.useRef<RelayConsole | null>(
     consoleMatchesRuntime(cachedConsole, runtime) ? cachedConsole : null
   )
-  const sessionStartedAtRef = React.useRef<string | null>(
-    consoleDataRef.current?.startedAt ?? null
-  )
   const sessionInitializedRef = React.useRef(Boolean(consoleDataRef.current))
   const awaitingNewSessionRef = React.useRef(false)
   const sessionAcceptedAheadOfRuntimeRef = React.useRef(false)
@@ -90,40 +90,39 @@ export function useRelayConsoleStream(
     const current = consoleDataRef.current
     if (
       state === "running" &&
-      runtime.startedAt &&
-      runtime.startedAt === sessionStartedAtRef.current
+      lifecycleEventTime(runtime.lifecycle, "started") ===
+        consoleLifecycleTime(consoleDataRef.current)
     ) {
       sessionAcceptedAheadOfRuntimeRef.current = false
     }
-    if (state === "running" && runtime.readyAt && current) {
-      const retimestampedLines = retimestampConsoleStateLine(
-        current.lines,
-        "running",
-        runtime.readyAt
-      )
-      if (retimestampedLines) {
-        if (shouldRecordConsoleStateTransition(previous, state)) {
-          previousStateRef.current = state
-        }
-        commitConsole({
-          ...current,
-          lines: retimestampedLines,
-        })
-        return
-      }
-    }
+    const retimestampedLines = current
+      ? retimestampRuntimeLifecycleLines(
+          current.lines,
+          consoleLifecycleTime(current),
+          runtime.lifecycle
+        )
+      : null
+    const currentWithTimestamps =
+      current && retimestampedLines
+        ? { ...current, lines: retimestampedLines }
+        : current
 
-    if (!shouldRecordConsoleStateTransition(previous, state)) return
+    if (!shouldRecordConsoleStateTransition(previous, state)) {
+      if (currentWithTimestamps && retimestampedLines) {
+        commitConsole(currentWithTimestamps)
+      }
+      return
+    }
     previousStateRef.current = state
 
     if (state === "starting") {
       if (
-        current &&
+        currentWithTimestamps &&
         consoleSessionIsCurrent(
           awaitingNewSessionRef.current,
           sessionAcceptedAheadOfRuntimeRef.current,
-          current.startedAt,
-          runtime.startedAt
+          consoleLifecycleTime(currentWithTimestamps),
+          lifecycleEventTime(runtime.lifecycle, "started")
         )
       ) {
         // The console stream can observe the replacement container before the
@@ -131,12 +130,11 @@ export function useRelayConsoleStream(
         // markers from the older snapshot.
         sessionInitializedRef.current = true
         commitConsole({
-          ...current,
+          ...currentWithTimestamps,
           lines: reconcileConsoleLifecycleLines(
-            current.lines,
-            current.startedAt ?? runtime.startedAt ?? null,
+            currentWithTimestamps.lines,
+            runtime.lifecycle,
             state,
-            runtime.readyAt,
             runtime.recovery
           ),
         })
@@ -146,11 +144,15 @@ export function useRelayConsoleStream(
       // Preserve the crashed session until Docker has actually started the
       // replacement process, so the failure context remains visible.
       if (runtime?.recovery?.phase === "pending") return
-      const line = consoleStateLine("starting", new Date().toISOString())
+      const line = consoleStateLine(
+        "starting",
+        runtimeLifecycleTimestamp("starting", runtime.lifecycle) ??
+          new Date().toISOString()
+      )
       const next = {
         instanceId,
+        lifecycle: [],
         lines: [line],
-        startedAt: null,
         truncated: false,
       }
       sessionInitializedRef.current = true
@@ -158,62 +160,66 @@ export function useRelayConsoleStream(
       return
     }
 
-    if (!sessionInitializedRef.current && previous === undefined) return
-    if (!current) return
+    if (!sessionInitializedRef.current && previous === undefined) {
+      if (currentWithTimestamps && retimestampedLines) {
+        commitConsole(currentWithTimestamps)
+      }
+      return
+    }
+    if (!currentWithTimestamps) return
     const line = consoleStateLine(
       state,
-      state === "running"
-        ? (runtime?.readyAt ?? new Date().toISOString())
-        : new Date().toISOString()
+      runtimeLifecycleTimestamp(state, runtime.lifecycle) ??
+        new Date().toISOString()
     )
     if (
-      current.lines.some((existing) => isConsoleStateLineFor(existing, state))
+      currentWithTimestamps.lines.some((existing) =>
+        isConsoleStateLineFor(existing, state)
+      )
     ) {
+      if (retimestampedLines) commitConsole(currentWithTimestamps)
       return
     }
     commitConsole({
-      ...current,
-      lines: mergeConsoleHistory(current.lines, [line]),
+      ...currentWithTimestamps,
+      lines: mergeConsoleHistory(currentWithTimestamps.lines, [line]),
     })
   }, [
     commitConsole,
     instanceId,
+    runtime?.lifecycle,
     runtime?.observedState,
-    runtime?.readyAt,
     runtime?.recovery,
-    runtime?.startedAt,
   ])
 
   React.useEffect(() => {
-    const startedAt = runtime?.startedAt
+    const startedAt = lifecycleEventTime(runtime?.lifecycle, "started")
     if (
+      !runtime ||
       !awaitingNewSessionRef.current ||
       !startedAt ||
-      startedAt === sessionStartedAtRef.current
+      startedAt === consoleLifecycleTime(consoleDataRef.current)
     ) {
       return
     }
     awaitingNewSessionRef.current = false
-    sessionStartedAtRef.current = startedAt
     sessionInitializedRef.current = true
     commitConsole({
       instanceId,
+      lifecycle: runtime.lifecycle,
       lines: initialConsoleStateLines(
-        startedAt,
+        runtime.lifecycle,
         runtime.observedState,
-        runtime.readyAt,
         runtime.recovery
       ),
-      startedAt,
       truncated: false,
     })
   }, [
     commitConsole,
     instanceId,
+    runtime?.lifecycle,
     runtime?.observedState,
-    runtime?.readyAt,
     runtime?.recovery,
-    runtime?.startedAt,
   ])
 
   React.useEffect(() => {
@@ -282,8 +288,8 @@ export function useRelayConsoleStream(
       const current = consoleDataRef.current
       const next = {
         instanceId,
+        lifecycle: current?.lifecycle ?? [],
         lines: capConsoleLines([...(current?.lines ?? []), ...fresh]),
-        startedAt: current?.startedAt ?? sessionStartedAtRef.current,
         truncated: Boolean(current?.truncated) || seen.size > 5_000,
       }
       consoleDataRef.current = next
@@ -303,7 +309,7 @@ export function useRelayConsoleStream(
     }
 
     function replaceSession(
-      startedAt: string | null,
+      lifecycle: ReadonlyArray<RelayInstanceLifecycleEvent>,
       lines: ReadonlyArray<RelayConsoleLine>,
       truncated: boolean
     ) {
@@ -312,32 +318,44 @@ export function useRelayConsoleStream(
         flushTimer = null
       }
       pending.length = 0
+      const startedAt = lifecycleEventTime(lifecycle, "started")
       sessionAcceptedAheadOfRuntimeRef.current =
         consoleSessionAcceptedAheadOfRuntime(
           sessionAcceptedAheadOfRuntimeRef.current,
-          sessionStartedAtRef.current,
+          consoleLifecycleTime(consoleDataRef.current),
           startedAt,
           runtimeRef.current?.observedState,
-          runtimeRef.current?.startedAt
+          lifecycleEventTime(runtimeRef.current?.lifecycle, "started")
         )
       // A reset is the authoritative session boundary. Runtime snapshots can
       // arrive later, but must not put an accepted session back into waiting.
       awaitingNewSessionRef.current = false
-      sessionStartedAtRef.current = startedAt
       sessionInitializedRef.current = true
+      const currentRuntime = runtimeRef.current
+      const runtimeMatchesSession = Boolean(
+        startedAt &&
+        lifecycleEventTime(currentRuntime?.lifecycle, "started") === startedAt
+      )
       const nextLines = mergeConsoleStateLines(
         lines,
-        startedAt,
-        runtimeRef.current?.observedState,
-        runtimeRef.current?.readyAt ?? null,
-        runtimeRef.current?.recovery ?? null
+        runtimeMatchesSession
+          ? (currentRuntime?.lifecycle ?? [])
+          : startedAt
+            ? [{ state: "started", time: startedAt }]
+            : [],
+        runtimeMatchesSession
+          ? currentRuntime?.observedState
+          : startedAt
+            ? "starting"
+            : currentRuntime?.observedState,
+        runtimeMatchesSession ? (currentRuntime?.recovery ?? null) : null
       )
       seen.clear()
       for (const line of nextLines) seen.add(line.id)
       const nextConsole = {
         instanceId,
+        lifecycle: [...lifecycle],
         lines: nextLines,
-        startedAt,
         truncated,
       }
       consoleDataRef.current = nextConsole
@@ -377,21 +395,41 @@ export function useRelayConsoleStream(
                   })
                 } else if (event.type === "ready") {
                   hasEverBeenLiveRef.current = true
+                  const eventStartedAt = lifecycleEventTime(
+                    event.lifecycle,
+                    "started"
+                  )
                   if (
                     awaitingNewSessionRef.current &&
-                    event.startedAt !== undefined &&
-                    event.startedAt !== sessionStartedAtRef.current
+                    eventStartedAt !==
+                      consoleLifecycleTime(consoleDataRef.current)
                   ) {
-                    replaceSession(event.startedAt, [], false)
+                    replaceSession(event.lifecycle, [], false)
                   }
-                  const nextConsole = consoleDataRef.current ?? {
+                  let nextConsole = consoleDataRef.current ?? {
                     instanceId,
+                    lifecycle: event.lifecycle,
                     lines: [],
-                    startedAt: event.startedAt ?? null,
                     truncated: false,
                   }
-                  if (event.startedAt !== undefined) {
-                    sessionStartedAtRef.current = event.startedAt
+                  const readyRuntime = runtimeRef.current
+                  const readyStartedAt = readyRuntime
+                    ? lifecycleEventTime(readyRuntime.lifecycle, "started")
+                    : null
+                  if (
+                    readyRuntime &&
+                    readyStartedAt &&
+                    readyStartedAt === consoleLifecycleTime(nextConsole)
+                  ) {
+                    nextConsole = {
+                      ...nextConsole,
+                      lines: reconcileConsoleLifecycleLines(
+                        nextConsole.lines,
+                        readyRuntime.lifecycle,
+                        readyRuntime.observedState,
+                        readyRuntime.recovery
+                      ),
+                    }
                   }
                   sessionInitializedRef.current = true
                   consoleDataRef.current = nextConsole
@@ -409,15 +447,17 @@ export function useRelayConsoleStream(
                 } else if (event.type === "reset") {
                   if (
                     awaitingNewSessionRef.current &&
-                    event.startedAt === sessionStartedAtRef.current
+                    lifecycleEventTime(event.lifecycle, "started") ===
+                      consoleLifecycleTime(consoleDataRef.current)
                   ) {
                     continue
                   }
-                  replaceSession(event.startedAt, event.lines, event.truncated)
+                  replaceSession(event.lifecycle, event.lines, event.truncated)
                 } else if (event.type === "history") {
                   if (
                     awaitingNewSessionRef.current ||
-                    event.startedAt !== sessionStartedAtRef.current
+                    lifecycleEventTime(event.lifecycle, "started") !==
+                      consoleLifecycleTime(consoleDataRef.current)
                   ) {
                     continue
                   }
@@ -442,14 +482,21 @@ export function useRelayConsoleStream(
                   commitSnapshot({ consoleData: nextConsole })
                 } else {
                   if (awaitingNewSessionRef.current) {
-                    const startedAt = runtimeRef.current?.startedAt
+                    const startedAt = lifecycleEventTime(
+                      runtimeRef.current?.lifecycle,
+                      "started"
+                    )
                     if (
                       !startedAt ||
-                      startedAt === sessionStartedAtRef.current
+                      startedAt === consoleLifecycleTime(consoleDataRef.current)
                     ) {
                       continue
                     }
-                    replaceSession(startedAt, [event.line], false)
+                    replaceSession(
+                      [{ state: "started", time: startedAt }],
+                      [event.line],
+                      false
+                    )
                   } else {
                     append(event.line)
                   }
@@ -496,8 +543,71 @@ function consoleMatchesRuntime(
   consoleData: RelayConsole | null,
   runtime: InstanceRuntime | null | undefined
 ): boolean {
-  if (!consoleData || !runtime?.startedAt) return Boolean(consoleData)
-  return consoleData.startedAt === runtime.startedAt
+  if (!consoleData) return false
+  const expectedStartedAt = lifecycleEventTime(runtime?.lifecycle, "started")
+  return (
+    !expectedStartedAt ||
+    consoleLifecycleTime(consoleData) === expectedStartedAt
+  )
+}
+
+function consoleLifecycleTime(consoleData: RelayConsole | null): string | null {
+  return lifecycleEventTime(consoleData?.lifecycle, "started")
+}
+
+function runtimeLifecycleTimestamp(
+  state: RelayObservedState,
+  lifecycle: ReadonlyArray<RelayInstanceLifecycleEvent>
+): string | null {
+  const lifecycleState = observedLifecycleState(state)
+  return lifecycleState ? lifecycleEventTime(lifecycle, lifecycleState) : null
+}
+
+function retimestampRuntimeLifecycleLines(
+  lines: ReadonlyArray<RelayConsoleLine>,
+  consoleStartedTime: string | null,
+  lifecycle: ReadonlyArray<RelayInstanceLifecycleEvent>
+): Array<RelayConsoleLine> | null {
+  const sessionStartedAt = lifecycleEventTime(lifecycle, "started")
+  if (
+    sessionStartedAt &&
+    consoleStartedTime &&
+    sessionStartedAt !== consoleStartedTime
+  ) {
+    return null
+  }
+  let next = [...lines]
+  let changed = false
+  for (const event of lifecycle) {
+    const retimestamped = retimestampConsoleStateLine(
+      next,
+      lifecycleObservedState(event.state),
+      event.time
+    )
+    if (!retimestamped) continue
+    next = retimestamped
+    changed = true
+  }
+  return changed ? next : null
+}
+
+function observedLifecycleState(
+  state: RelayObservedState
+): RelayInstanceLifecycleState | null {
+  if (state === "starting") return "started"
+  if (state === "running") return "ready"
+  if (state === "stopping" || state === "stopped" || state === "failed") {
+    return state
+  }
+  return null
+}
+
+function lifecycleObservedState(
+  state: RelayInstanceLifecycleState
+): RelayObservedState {
+  if (state === "started") return "starting"
+  if (state === "ready") return "running"
+  return state
 }
 
 function prependConsoleHistory(

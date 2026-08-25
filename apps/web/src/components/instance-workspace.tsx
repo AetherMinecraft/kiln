@@ -12,6 +12,7 @@ import type {
   RelayInstanceResources,
   RelayObservedState,
 } from "@workspace/contracts"
+import { relayInstanceLifecycleEventTime } from "@workspace/contracts"
 import {
   Check,
   CircleStop,
@@ -55,6 +56,7 @@ import type {
 } from "@/components/instance-workspace-context"
 import { WorkspaceFrame } from "@/components/workspace-frame"
 import { roleHasPermission } from "@/lib/permissions"
+import { provisioningFailureDiagnostics } from "@/lib/provisioning-diagnostics"
 import {
   beginPendingPowerAction,
   finishPendingPowerAction,
@@ -236,7 +238,11 @@ function InstanceProvisioningBoundary({
   children: React.ReactNode
   instance: InstanceWorkspaceInstance
 }) {
+  const isInfoRoute = useRouterState({
+    select: (state) => state.location.pathname.endsWith("/info"),
+  })
   if (!instance.provisioning) return children
+  if (isInfoRoute) return children
   return <InstanceProvisioningState instance={instance} />
 }
 
@@ -262,13 +268,14 @@ const InstanceProvisioningState = React.memo(
     const failureGuidance = failed
       ? PROVISIONING_FAILURE_GUIDANCE[provisioning.failedPhase ?? "preparing"]
       : null
-    const diagnostics = [
-      `Server: ${instance.name} (${instance.id})`,
-      `Relay: ${instance.relayId}`,
-      `Failed phase: ${activeStep?.label ?? "Provisioning"}`,
-      `Attempt: ${Math.max(1, provisioning.attempt)}`,
-      `Reason: ${provisioning.error ?? "The Relay did not provide an error message."}`,
-    ].join("\n")
+    const diagnostics = provisioningFailureDiagnostics({
+      attempt: provisioning.attempt,
+      error: provisioning.error,
+      failedPhase: provisioning.failedPhase,
+      instanceId: instance.id,
+      instanceName: instance.name,
+      relayId: instance.relayId,
+    })
 
     function copyDiagnostics() {
       Effect.runFork(
@@ -321,7 +328,13 @@ const InstanceProvisioningState = React.memo(
                   <p className="type-technical-label text-destructive">
                     Failed during {activeStep?.label ?? "provisioning"}
                   </p>
-                  <p className="mt-2 text-sm leading-6 text-foreground">
+                  <p
+                    className="mt-2 line-clamp-3 text-sm leading-6 break-words text-foreground"
+                    title={
+                      provisioning.error ??
+                      "The Relay did not provide an error message."
+                    }
+                  >
                     {provisioning.error ??
                       "The Relay did not provide an error message."}
                   </p>
@@ -770,7 +783,7 @@ function ServerPowerControls({
 }: {
   action: ServerAction | null
   canControlPower: boolean
-  instance: Pick<InstanceWorkspaceInstance, "id" | "name"> &
+  instance: Pick<InstanceWorkspaceInstance, "id" | "name" | "provisioning"> &
     Pick<InstanceRuntime, "observedState">
   onAction: (action: ServerAction) => Promise<void>
   relayConnected: boolean
@@ -782,7 +795,10 @@ function ServerPowerControls({
   const isRunning = instance.observedState === "running"
   const isStarting = instance.observedState === "starting"
   const isStopping = instance.observedState === "stopping"
-  const isProvisioning = isPowerControlLocked(instance.observedState)
+  const isProvisioning =
+    Boolean(instance.provisioning) ||
+    isPowerControlLocked(instance.observedState)
+  const provisioningFailed = instance.provisioning?.phase === "failed"
   const powerIsOn = isRunning || isStarting
   const powerIsTransitioning =
     action === "start" ||
@@ -826,7 +842,9 @@ function ServerPowerControls({
           : action === "stop" || action === "restart" || isStopping
             ? "Stopping"
             : isProvisioning
-              ? "Provisioning"
+              ? provisioningFailed
+                ? "Failed"
+                : "Provisioning"
               : powerIsOn
                 ? "Stop"
                 : "Start"}
@@ -983,6 +1001,7 @@ function InstancePowerControls({
       if (
         !relayConnected ||
         !observedState ||
+        instance.provisioning ||
         isPowerControlLocked(observedState)
       ) {
         return
@@ -997,7 +1016,10 @@ function InstancePowerControls({
         instance.relayId,
         instance.id,
         nextAction,
-        previousInstance?.startedAt ?? null
+        relayInstanceLifecycleEventTime(
+          previousInstance?.lifecycle ?? [],
+          "started"
+        )
       )
       queryClient.setQueryData<RelayFleetSnapshot>(
         queryKeys.relay.snapshot,
@@ -1006,8 +1028,7 @@ function InstancePowerControls({
             snapshot,
             instance.id,
             instance.relayId,
-            pendingPowerAction.phase,
-            nextAction === "start" ? null : undefined
+            pendingPowerAction.phase
           )
       )
       setAction(nextAction)
@@ -1035,8 +1056,7 @@ function InstancePowerControls({
                       snapshot,
                       instance.id,
                       instance.relayId,
-                      previousInstance.observedState,
-                      previousInstance.startedAt
+                      previousInstance.observedState
                     )
                 )
               }
@@ -1051,6 +1071,7 @@ function InstancePowerControls({
     },
     [
       instance.id,
+      instance.provisioning,
       instance.relayId,
       mutateRelayAction,
       onError,
@@ -1076,7 +1097,12 @@ function InstancePowerControls({
     <ServerPowerControls
       action={action}
       canControlPower={canControlPower}
-      instance={{ id: instance.id, name: instance.name, observedState }}
+      instance={{
+        id: instance.id,
+        name: instance.name,
+        observedState,
+        provisioning: instance.provisioning,
+      }}
       onAction={handleAction}
       relayConnected={relayConnected}
     />
@@ -1087,8 +1113,7 @@ function updateInstancePowerState(
   snapshot: RelayFleetSnapshot | undefined,
   instanceId: string,
   relayId: string,
-  observedState: RelayObservedState,
-  startedAt: string | null | undefined
+  observedState: RelayObservedState
 ): RelayFleetSnapshot | undefined {
   if (!snapshot) return snapshot
   return {
@@ -1098,7 +1123,6 @@ function updateInstancePowerState(
         ? {
             ...instance,
             observedState,
-            ...(startedAt !== undefined ? { startedAt } : {}),
           }
         : instance
     ),
@@ -1318,10 +1342,9 @@ function InstanceUptimeMeter({
         ? {
             id: instance.id,
             observedState: instance.observedState,
-            readyAt: instance.readyAt,
             relayId: instance.relayId,
             resources: null,
-            startedAt: instance.startedAt,
+            lifecycle: instance.lifecycle,
           }
         : null
     },
@@ -1332,7 +1355,11 @@ function InstanceUptimeMeter({
     select: selectRuntime,
   })
   const uptime = useInstanceUptime(instance)
-  const startedAt = useBrowserLocalTimestamp(instance?.startedAt ?? null)
+  const sessionStartedAt = relayInstanceLifecycleEventTime(
+    instance?.lifecycle ?? [],
+    "started"
+  )
+  const startedAt = useBrowserLocalTimestamp(sessionStartedAt)
 
   return (
     <HoverCard openDelay={160} closeDelay={100}>
@@ -1365,7 +1392,7 @@ function InstanceUptimeMeter({
               Started on
             </p>
             <time
-              dateTime={instance?.startedAt ?? undefined}
+              dateTime={sessionStartedAt ?? undefined}
               className="type-code mt-1 block whitespace-nowrap text-foreground"
             >
               {startedAt}
@@ -1399,12 +1426,14 @@ interface ResourceItem {
 
 function useInstanceUptime(
   instance:
-    | Pick<InstanceRuntime, "id" | "observedState" | "startedAt">
+    | Pick<InstanceRuntime, "id" | "lifecycle" | "observedState">
     | null
     | undefined
 ): string | null {
   const [now, setNow] = React.useState<number | null>(null)
-  const startedAt = instance?.startedAt ? Date.parse(instance.startedAt) : NaN
+  const startedAt = Date.parse(
+    relayInstanceLifecycleEventTime(instance?.lifecycle ?? [], "started") ?? ""
+  )
   const running = instance?.observedState === "running"
 
   React.useEffect(() => {
