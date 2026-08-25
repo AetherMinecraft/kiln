@@ -639,12 +639,12 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
                             disabled && "pointer-events-none opacity-50"
                           )}
                         >
-                          <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-muted-foreground">
+                          <span className="grid size-[40px] shrink-0 place-items-center rounded-lg border border-border/70 bg-background/70 text-muted-foreground">
                             <BrickIcon
                               id={brick.metadata.id}
                               color={brick.metadata.color}
                               iconSvg={brick.iconSvg}
-                              className="size-4"
+                              className="size-[30px]"
                             />
                           </span>
                           <span className="min-w-0 flex-1">
@@ -1035,16 +1035,21 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                       key={brick.source}
                       className="flex items-center gap-2 rounded-md border border-border/60 px-2.5 py-2"
                     >
-                      <BrickIcon
-                        id={brick.metadata.id}
-                        color={brick.metadata.color}
-                        iconSvg={brick.iconSvg}
-                        className="size-3.5 shrink-0 text-muted-foreground"
-                      />
+                      <span className="grid size-[32px] shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-muted-foreground">
+                        <BrickIcon
+                          id={brick.metadata.id}
+                          color={brick.metadata.color}
+                          iconSvg={brick.iconSvg}
+                          className="size-[24px]"
+                        />
+                      </span>
                       <span className="min-w-0 flex-1 truncate text-xs font-medium">
                         {brick.metadata.name}
                       </span>
-                      <span className="type-meta font-mono text-muted-foreground">
+                      <span
+                        className="type-meta max-w-[40%] shrink-0 truncate font-mono text-muted-foreground"
+                        title={brick.metadata.id}
+                      >
                         {brick.metadata.id}
                       </span>
                     </li>
@@ -1338,12 +1343,12 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
     <aside className="flex min-h-96 flex-col md:min-h-0">
       <div className="min-h-0 flex-1 overflow-y-auto p-4 pr-11">
         <div className="flex items-start gap-3">
-          <span className="grid size-11 shrink-0 place-items-center rounded-lg border border-border/70 bg-background/70 text-muted-foreground">
+          <span className="grid size-[40px] shrink-0 place-items-center rounded-lg border border-border/70 bg-background/70 text-muted-foreground">
             <BrickIcon
               id={brick.metadata.id}
               color={brick.metadata.color}
               iconSvg={brick.iconSvg}
-              className="size-5"
+              className="size-[30px]"
             />
           </span>
           <div className="min-w-0">
