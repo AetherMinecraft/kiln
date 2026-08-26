@@ -36,6 +36,8 @@ import ZipStream from "zip-stream"
 import type {
   RelayDirectoryPage,
   RelayDirectoryPageInput,
+  RelayDirectorySizes,
+  RelayDirectorySizesInput,
   RelayFileContent,
   RelayFileEntry,
   RelayFileMutationInput,
@@ -49,6 +51,7 @@ import type {
 import { formatSnbt, parseSnbt } from "@workspace/contracts"
 
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
+import { directoryApparentSizeEffect } from "./disk-usage.js"
 import { RelayFilesystemError } from "./effect/errors.js"
 import { decodeNbt, encodeNbt } from "./nbt.js"
 
@@ -63,6 +66,10 @@ const FILE_SEARCH_PAGE_ITEMS = 512
 const FILE_SEARCH_PAGE_VISITS = 8_192
 const FILE_SCAN_SESSION_TTL_MS = 2 * 60_000
 const FILE_SCAN_MAX_SESSIONS = 256
+const FILE_DIRECTORY_SIZE_CACHE_TTL_MS = 30_000
+const FILE_DIRECTORY_SIZE_CACHE_MAX_ENTRIES = 4_096
+const FILE_DIRECTORY_SIZE_MAX_SCANS = 4
+const FILE_DIRECTORY_SIZE_MAX_PENDING = 512
 export const MAX_TRANSFER_BYTES = 20 * 1024 * 1024 * 1024
 const gunzipAsync = promisify(gunzip)
 const gzipAsync = promisify(gzip)
@@ -70,6 +77,12 @@ const gzipAsync = promisify(gzip)
 export class FilesystemDriver {
   readonly #config: RelayConfig
   readonly #directoryScans = new Map<string, DirectoryScan>()
+  readonly #directorySizeCache = new Map<string, DirectorySizeCacheEntry>()
+  readonly #directorySizeEpochs = new Map<string, number>()
+  readonly #directorySizeQueue: Array<DirectorySizeScan> = []
+  readonly #directorySizeScans = new Set<string>()
+  readonly #activeDirectorySizeScans = new Map<string, DirectorySizeScan>()
+  readonly #directorySizeRescans = new Map<string, DirectorySizeScan>()
   readonly #searchScans = new Map<string, SearchScan>()
   #openingDirectoryScans = 0
 
@@ -247,6 +260,66 @@ export class FilesystemDriver {
         )
       )
     }).pipe(Effect.withSpan("relay.files.directory"))
+  }
+
+  directorySizes(
+    instance: RelayInstanceConfig,
+    input: RelayDirectorySizesInput
+  ) {
+    return Effect.gen({ self: this }, function* () {
+      const root = yield* this.#instanceRoot(instance)
+      const paths = [...new Set(input.paths.map(normalizeDirectoryPath))]
+      if (paths.some((path) => !path)) {
+        return yield* filesystemFailure(
+          "invalid_path",
+          "directorySizes.path",
+          "Select a directory below the instance root"
+        )
+      }
+      yield* Effect.forEach(
+        paths,
+        (path) => validateRelativePath(path.replace(/\/$/u, "")),
+        { concurrency: 16, discard: true }
+      )
+      const resolvedDirectories = yield* Effect.forEach(
+        paths,
+        (path) =>
+          resolveInstanceDirectory(root, path).pipe(
+            Effect.map((absolute) => ({ absolute, path })),
+            Effect.catch(() => Effect.succeed(null))
+          ),
+        { concurrency: 16 }
+      )
+      const directories = resolvedDirectories.filter(
+        (directory) => directory !== null
+      )
+      const now = Date.now()
+      const pending: Array<string> = []
+      const sizes: Record<string, number> = {}
+
+      for (const directory of directories) {
+        const key = directorySizeCacheKey(instance.id, directory.path)
+        const cached = this.#directorySizeCache.get(key)
+        if (cached && cached.size !== null) {
+          sizes[directory.path] = cached.size
+        }
+        if (!cached || cached.expiresAt <= now) {
+          const queued = this.#queueDirectorySizeScan({
+            ...directory,
+            epoch: this.#directorySizeEpoch(instance.id),
+            instanceId: instance.id,
+            key,
+          })
+          if (queued) pending.push(directory.path)
+        }
+      }
+
+      return {
+        instanceId: instance.id,
+        pending,
+        sizes,
+      } satisfies RelayDirectorySizes
+    }).pipe(Effect.withSpan("relay.files.directorySizes"))
   }
 
   search(instance: RelayInstanceConfig, input: RelayFileSearchPageInput) {
@@ -511,7 +584,12 @@ export class FilesystemDriver {
           ),
         () => cleanupPathEffect(temporary)
       )
-    }).pipe(Effect.withSpan("relay.files.write"))
+    }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => this.#invalidateDirectorySizes(instance.id))
+      ),
+      Effect.withSpan("relay.files.write")
+    )
   }
 
   latestLog(instance: RelayInstanceConfig) {
@@ -659,7 +737,12 @@ export class FilesystemDriver {
           )
         )
       )
-    }).pipe(Effect.withSpan("relay.files.upload"))
+    }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => this.#invalidateDirectorySizes(instance.id))
+      ),
+      Effect.withSpan("relay.files.upload")
+    )
   }
 
   mutate(instance: RelayInstanceConfig, input: RelayFileMutationInput) {
@@ -736,7 +819,99 @@ export class FilesystemDriver {
       }
 
       return { mutated: true } satisfies RelayFileMutationResult
-    }).pipe(Effect.withSpan("relay.files.mutate"))
+    }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => this.#invalidateDirectorySizes(instance.id))
+      ),
+      Effect.withSpan("relay.files.mutate")
+    )
+  }
+
+  #directorySizeEpoch(instanceId: string) {
+    return this.#directorySizeEpochs.get(instanceId) ?? 0
+  }
+
+  #invalidateDirectorySizes(instanceId: string) {
+    const epoch = this.#directorySizeEpoch(instanceId) + 1
+    this.#directorySizeEpochs.set(instanceId, epoch)
+    const prefix = `${instanceId}\0`
+    for (const key of this.#directorySizeCache.keys()) {
+      if (key.startsWith(prefix)) this.#directorySizeCache.delete(key)
+    }
+    for (let index = this.#directorySizeQueue.length - 1; index >= 0; index--) {
+      const scan = this.#directorySizeQueue[index]
+      if (!scan || scan.instanceId !== instanceId) continue
+      this.#directorySizeQueue.splice(index, 1)
+      this.#directorySizeScans.delete(scan.key)
+    }
+    for (const scan of this.#activeDirectorySizeScans.values()) {
+      if (scan.instanceId !== instanceId) continue
+      this.#directorySizeRescans.set(scan.key, { ...scan, epoch })
+    }
+  }
+
+  #queueDirectorySizeScan(scan: DirectorySizeScan) {
+    if (this.#directorySizeScans.has(scan.key)) {
+      const active = this.#activeDirectorySizeScans.get(scan.key)
+      if (active && active.epoch !== scan.epoch) {
+        this.#directorySizeRescans.set(scan.key, scan)
+      }
+      return true
+    }
+    if (this.#directorySizeScans.size >= FILE_DIRECTORY_SIZE_MAX_PENDING) {
+      return false
+    }
+    this.#directorySizeScans.add(scan.key)
+    this.#directorySizeQueue.push(scan)
+    this.#drainDirectorySizeQueue()
+    return true
+  }
+
+  #drainDirectorySizeQueue() {
+    while (
+      this.#activeDirectorySizeScans.size < FILE_DIRECTORY_SIZE_MAX_SCANS &&
+      this.#directorySizeQueue.length
+    ) {
+      const scan = this.#directorySizeQueue.shift()
+      if (!scan) return
+      this.#activeDirectorySizeScans.set(scan.key, scan)
+      Effect.runFork(
+        directoryApparentSizeEffect(scan.absolute).pipe(
+          Effect.tap((size) =>
+            Effect.sync(() => this.#cacheDirectorySize(scan, size))
+          ),
+          Effect.catch(() =>
+            Effect.sync(() => this.#cacheDirectorySize(scan, null))
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              const rescan = this.#directorySizeRescans.get(scan.key)
+              this.#directorySizeRescans.delete(scan.key)
+              this.#activeDirectorySizeScans.delete(scan.key)
+              this.#directorySizeScans.delete(scan.key)
+              if (rescan) this.#queueDirectorySizeScan(rescan)
+              this.#drainDirectorySizeQueue()
+            })
+          )
+        )
+      )
+    }
+  }
+
+  #cacheDirectorySize(scan: DirectorySizeScan, size: number | null) {
+    if (scan.epoch !== this.#directorySizeEpoch(scan.instanceId)) return
+    this.#directorySizeCache.delete(scan.key)
+    this.#directorySizeCache.set(scan.key, {
+      expiresAt: Date.now() + FILE_DIRECTORY_SIZE_CACHE_TTL_MS,
+      size,
+    })
+    while (
+      this.#directorySizeCache.size > FILE_DIRECTORY_SIZE_CACHE_MAX_ENTRIES
+    ) {
+      const oldest = this.#directorySizeCache.keys().next().value
+      if (oldest === undefined) break
+      this.#directorySizeCache.delete(oldest)
+    }
   }
 
   #existingFile(instance: RelayInstanceConfig, requestedPath: string) {
@@ -850,6 +1025,23 @@ interface SearchScan {
   queryLower: string
   queue: Array<SearchDirectory>
   root: string
+}
+
+interface DirectorySizeCacheEntry {
+  expiresAt: number
+  size: number | null
+}
+
+interface DirectorySizeScan {
+  absolute: string
+  epoch: number
+  instanceId: string
+  key: string
+  path: string
+}
+
+function directorySizeCacheKey(instanceId: string, path: string) {
+  return `${instanceId}\0${path}`
 }
 
 function normalizeDirectoryPath(path: string): string {
