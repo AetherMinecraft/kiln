@@ -990,6 +990,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     }
     case "instance.files.list":
     case "instance.files.directory.list":
+    case "instance.files.directory.sizes":
     case "instance.files.search":
       return "instance.files.list"
     case "instance.files.stat":

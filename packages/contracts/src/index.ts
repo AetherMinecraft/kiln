@@ -1124,6 +1124,21 @@ export const relayDirectoryPageInputSchema = z
   })
   .strict()
 
+export const relayDirectorySizesInputSchema = z
+  .object({
+    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    paths: z.array(z.string().min(1).max(8_192)).min(1).max(128),
+  })
+  .strict()
+
+export const relayDirectorySizesSchema = z
+  .object({
+    instanceId: z.string(),
+    pending: z.array(z.string().min(1).max(8_192)),
+    sizes: z.record(z.string(), z.number().int().nonnegative()),
+  })
+  .strict()
+
 export const relayFileStatInputSchema = z
   .object({
     instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -1234,11 +1249,28 @@ export const relayFileMutationInputSchema = z.discriminatedUnion("operation", [
     paths: z.array(relayFileMutationPathSchema).min(1).max(500),
     destination: relayFileMutationPathSchema,
   }),
+  z.object({
+    operation: z.literal("unarchive"),
+    path: relayFileMutationPathSchema,
+    destination: relayFileMutationPathSchema,
+  }),
 ])
 
 export const relayFileMutationResultSchema = z
   .object({ mutated: z.literal(true) })
   .strict()
+
+export type RelayFileUnarchiveSuffix = ".tar.gz" | ".tgz" | ".zip"
+
+export function relayFileUnarchiveSuffix(
+  path: string
+): RelayFileUnarchiveSuffix | null {
+  const lowerPath = path.toLowerCase()
+  if (lowerPath.endsWith(".tar.gz")) return ".tar.gz"
+  if (lowerPath.endsWith(".tgz")) return ".tgz"
+  if (lowerPath.endsWith(".zip")) return ".zip"
+  return null
+}
 
 export const relayFileActivityEntrySchema = z.object({
   instanceId: z.string(),
@@ -1550,6 +1582,10 @@ export type RelayDirectoryPageInput = z.infer<
   typeof relayDirectoryPageInputSchema
 >
 export type RelayDirectoryPage = z.infer<typeof relayDirectoryPageSchema>
+export type RelayDirectorySizesInput = z.infer<
+  typeof relayDirectorySizesInputSchema
+>
+export type RelayDirectorySizes = z.infer<typeof relayDirectorySizesSchema>
 export type RelayFileSearchPageInput = z.infer<
   typeof relayFileSearchPageInputSchema
 >

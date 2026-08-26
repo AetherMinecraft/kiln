@@ -5,6 +5,7 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   symlink,
   truncate,
   writeFile,
@@ -12,10 +13,13 @@ import {
 import { createHash, randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
 import { resolve } from "node:path"
+import { buffer as consumeBuffer } from "node:stream/consumers"
 import { gzipSync, gunzipSync } from "node:zlib"
 import type { FileHandle } from "node:fs/promises"
 import { assert, describe, it } from "@effect/vitest"
 import { Deferred, Effect, Fiber } from "effect"
+import { pack as createTarPack, type Headers as TarHeaders } from "tar-stream"
+import ZipStream from "zip-stream"
 import { parseSnbt } from "@workspace/contracts"
 
 import { loadConfig } from "./config.js"
@@ -28,6 +32,118 @@ import type { RelayInstanceConfig } from "./config.js"
 const describeLinux = process.platform === "linux" ? describe : describe.skip
 
 describe("Relay paged file index", () => {
+  it.effect("caches recursive directory sizes outside the listing path", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        yield* fromPromise(() =>
+          Promise.all([
+            writeFile(resolve(root, "world", "level.dat"), "level"),
+            mkdir(resolve(root, "world", "region")),
+          ])
+        )
+        yield* fromPromise(() =>
+          writeFile(resolve(root, "world", "region", "r.0.0.mca"), "region")
+        )
+
+        const rootPage = yield* driver.directory(instance, {
+          instanceId: instance.id,
+          path: "",
+        })
+        const world = rootPage.entries.find((entry) => entry.path === "world/")
+        assert.deepInclude(world, {
+          kind: "directory",
+          path: "world/",
+          size: null,
+        })
+
+        const queued = yield* driver.directorySizes(instance, {
+          instanceId: instance.id,
+          paths: ["world/"],
+        })
+        assert.deepEqual(queued.sizes, {})
+        assert.deepEqual(queued.pending, ["world/"])
+
+        let completed = queued
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          yield* fromPromise(
+            () => new Promise((resolveDelay) => setTimeout(resolveDelay, 10))
+          )
+          completed = yield* driver.directorySizes(instance, {
+            instanceId: instance.id,
+            paths: ["world/"],
+          })
+          if (!completed.pending.length) break
+        }
+        assert.deepEqual(completed.pending, [])
+        assert.strictEqual(completed.sizes["world/"], 11)
+
+        const shared = yield* driver.directorySizes(instance, {
+          instanceId: instance.id,
+          paths: ["world/"],
+        })
+        assert.deepEqual(shared.pending, [])
+        assert.strictEqual(shared.sizes["world/"], 11)
+
+        yield* driver.write(instance, "world/level.dat", {
+          content: "levels",
+        })
+        const invalidated = yield* driver.directorySizes(instance, {
+          instanceId: instance.id,
+          paths: ["world/"],
+        })
+        assert.deepEqual(invalidated.sizes, {})
+        assert.deepEqual(invalidated.pending, ["world/"])
+
+        const worldPage = yield* driver.directory(instance, {
+          instanceId: instance.id,
+          path: "world/",
+        })
+        assert.deepInclude(
+          worldPage.entries.find((entry) => entry.path === "world/region/"),
+          { kind: "directory", path: "world/region/", size: null }
+        )
+      })
+    )
+  )
+
+  it.effect("skips missing directories without blocking valid sizes", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        yield* fromPromise(() =>
+          Promise.all([
+            writeFile(resolve(root, "world", "level.dat"), "level"),
+            mkdir(resolve(root, "plugins")),
+          ])
+        )
+        yield* fromPromise(() =>
+          writeFile(resolve(root, "plugins", "plugin.jar"), "plugin")
+        )
+
+        const input = {
+          instanceId: instance.id,
+          paths: ["missing/", "world/", "plugins/"],
+        }
+        const queued = yield* driver.directorySizes(instance, input)
+        assert.deepEqual(queued.sizes, {})
+        assert.deepEqual(queued.pending, ["world/", "plugins/"])
+
+        let completed = queued
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          yield* fromPromise(
+            () => new Promise((resolveDelay) => setTimeout(resolveDelay, 10))
+          )
+          completed = yield* driver.directorySizes(instance, input)
+          if (!completed.pending.length) break
+        }
+        assert.deepEqual(completed.pending, [])
+        assert.deepEqual(completed.sizes, {
+          "plugins/": 6,
+          "world/": 5,
+        })
+      })
+    )
+  )
+
   it.effect("pages directories and searches every matching path", () =>
     withSetup(({ driver, instance, root }) =>
       Effect.gen(function* () {
@@ -305,47 +421,160 @@ describe("Relay NBT file editing", () => {
 })
 
 describeLinux("Relay direct file transfers", () => {
-  it.effect("renames, duplicates, archives, and deletes entries", () =>
-    withSetup(({ driver, instance, root }) =>
-      Effect.gen(function* () {
-        yield* fromPromise(() =>
-          writeFile(resolve(root, "world", "data.txt"), "settings")
-        )
-        yield* driver.mutate(instance, {
-          operation: "rename",
-          path: "world/data.txt",
-          destination: "world/server.txt",
-        })
-        yield* driver.mutate(instance, {
-          operation: "duplicate",
-          paths: ["world/server.txt"],
-        })
-        yield* driver.mutate(instance, {
-          operation: "archive",
-          paths: ["world/server.txt", "world/server copy.txt"],
-          destination: "world/configs.zip",
-        })
-        const archived = yield* driver.tree(instance)
-        assert.include(archived.paths, "world/configs.zip")
-        assert.strictEqual(archived.sizes["world/server.txt"], 8)
-        assert.isAtLeast(archived.sizes["world/"] ?? 0, 16)
-        assert.strictEqual(archived.sizes[""], archived.sizes["world/"])
-        assert.isAbove(archived.modifiedAt["world/server.txt"] ?? 0, 0)
-        assert.isAbove(archived.modifiedAt["world/"] ?? 0, 0)
-        const archive = yield* fromPromise(() =>
-          readFile(resolve(root, "world", "configs.zip"))
-        )
-        assert.strictEqual(archive.subarray(0, 2).toString(), "PK")
+  it.effect(
+    "renames, duplicates, archives, unarchives, and deletes entries",
+    () =>
+      withSetup(({ driver, instance, root }) =>
+        Effect.gen(function* () {
+          yield* fromPromise(() =>
+            writeFile(resolve(root, "world", "data.txt"), "settings")
+          )
+          yield* driver.mutate(instance, {
+            operation: "rename",
+            path: "world/data.txt",
+            destination: "world/server.txt",
+          })
+          yield* driver.mutate(instance, {
+            operation: "duplicate",
+            paths: ["world/server.txt"],
+          })
+          yield* driver.mutate(instance, {
+            operation: "archive",
+            paths: ["world/server.txt", "world/server copy.txt"],
+            destination: "world/configs.zip",
+          })
+          const archived = yield* driver.tree(instance)
+          assert.include(archived.paths, "world/configs.zip")
+          assert.strictEqual(archived.sizes["world/server.txt"], 8)
+          assert.isAtLeast(archived.sizes["world/"] ?? 0, 16)
+          assert.strictEqual(archived.sizes[""], archived.sizes["world/"])
+          assert.isAbove(archived.modifiedAt["world/server.txt"] ?? 0, 0)
+          assert.isAbove(archived.modifiedAt["world/"] ?? 0, 0)
+          const archive = yield* fromPromise(() =>
+            readFile(resolve(root, "world", "configs.zip"))
+          )
+          assert.strictEqual(archive.subarray(0, 2).toString(), "PK")
 
-        yield* driver.mutate(instance, {
-          operation: "delete",
-          paths: ["world/server.txt", "world/server copy.txt"],
+          yield* driver.mutate(instance, {
+            operation: "unarchive",
+            path: "world/configs.zip",
+            destination: "world/configs",
+          })
+          assert.strictEqual(
+            yield* fromPromise(() =>
+              readFile(resolve(root, "world", "configs", "server.txt"), "utf8")
+            ),
+            "settings"
+          )
+          assert.strictEqual(
+            yield* fromPromise(() =>
+              readFile(
+                resolve(root, "world", "configs", "server copy.txt"),
+                "utf8"
+              )
+            ),
+            "settings"
+          )
+          for (const suffix of [" (1)", " (2)"]) {
+            yield* driver.mutate(instance, {
+              operation: "unarchive",
+              path: "world/configs.zip",
+              destination: "world/configs",
+            })
+            assert.strictEqual(
+              yield* fromPromise(() =>
+                readFile(
+                  resolve(root, "world", `configs${suffix}`, "server.txt"),
+                  "utf8"
+                )
+              ),
+              "settings"
+            )
+          }
+
+          yield* driver.mutate(instance, {
+            operation: "delete",
+            paths: ["world/server.txt", "world/server copy.txt"],
+          })
+          const deleted = yield* driver.tree(instance)
+          assert.notInclude(deleted.paths, "world/server.txt")
+          assert.notInclude(deleted.paths, "world/server copy.txt")
         })
-        const deleted = yield* driver.tree(instance)
-        assert.notInclude(deleted.paths, "world/server.txt")
-        assert.notInclude(deleted.paths, "world/server copy.txt")
-      })
-    )
+      )
+  )
+
+  it.effect(
+    "extracts one root file directly and preserves archived directories",
+    () =>
+      withSetup(({ driver, instance, root }) =>
+        Effect.gen(function* () {
+          yield* fromPromise(() =>
+            writeFile(resolve(root, "world", "readme.txt"), "single file")
+          )
+          yield* driver.mutate(instance, {
+            operation: "archive",
+            paths: ["world/readme.txt"],
+            destination: "world/bundle.zip",
+          })
+          for (const suffix of ["", " (1)", " (2)"]) {
+            yield* driver.mutate(instance, {
+              operation: "unarchive",
+              path: "world/bundle.zip",
+              destination: "world/bundle",
+            })
+            assert.strictEqual(
+              yield* fromPromise(() =>
+                readFile(resolve(root, "world", `bundle${suffix}.txt`), "utf8")
+              ),
+              "single file"
+            )
+          }
+
+          yield* driver.mutate(instance, {
+            operation: "archive",
+            paths: ["world/readme.txt"],
+            destination: "world/bundle.v1.zip",
+          })
+          yield* driver.mutate(instance, {
+            operation: "unarchive",
+            path: "world/bundle.v1.zip",
+            destination: "world/bundle.v1",
+          })
+          assert.strictEqual(
+            yield* fromPromise(() =>
+              readFile(resolve(root, "world", "bundle.v1.txt"), "utf8")
+            ),
+            "single file"
+          )
+
+          yield* fromPromise(async () => {
+            await mkdir(resolve(root, "world", "only"))
+            await writeFile(
+              resolve(root, "world", "only", "inside.txt"),
+              "nested"
+            )
+          })
+          yield* driver.mutate(instance, {
+            operation: "archive",
+            paths: ["world/only"],
+            destination: "world/only.zip",
+          })
+          yield* driver.mutate(instance, {
+            operation: "unarchive",
+            path: "world/only.zip",
+            destination: "world/only-extracted",
+          })
+          assert.strictEqual(
+            yield* fromPromise(() =>
+              readFile(
+                resolve(root, "world", "only-extracted", "only", "inside.txt"),
+                "utf8"
+              )
+            ),
+            "nested"
+          )
+        })
+      )
   )
 
   it.effect("atomically uploads and reads through a pinned file handle", () =>
@@ -372,6 +601,199 @@ describeLinux("Relay direct file transfers", () => {
         assert.isNotEmpty(root)
       })
     )
+  )
+
+  it.effect(
+    "unarchives compressed TAR files with direct files and wrapped trees",
+    () =>
+      withSetup(({ driver, instance, root }) =>
+        Effect.gen(function* () {
+          yield* fromPromise(() =>
+            writeTarGzArchive(resolve(root, "world", "bundle.tar.gz"), [
+              { content: "single tar file", name: "readme.txt" },
+            ])
+          )
+          for (const suffix of ["", " (1)"]) {
+            yield* driver.mutate(instance, {
+              operation: "unarchive",
+              path: "world/bundle.tar.gz",
+              destination: "world/bundle",
+            })
+            assert.strictEqual(
+              yield* fromPromise(() =>
+                readFile(resolve(root, "world", `bundle${suffix}.txt`), "utf8")
+              ),
+              "single tar file"
+            )
+          }
+
+          yield* fromPromise(() =>
+            writeTarGzArchive(resolve(root, "world", "tree.tgz"), [
+              { name: "only/", type: "directory" },
+              { content: "nested tar file", name: "only/inside.txt" },
+            ])
+          )
+          yield* driver.mutate(instance, {
+            operation: "unarchive",
+            path: "world/tree.tgz",
+            destination: "world/tree",
+          })
+          assert.strictEqual(
+            yield* fromPromise(() =>
+              readFile(
+                resolve(root, "world", "tree", "only", "inside.txt"),
+                "utf8"
+              )
+            ),
+            "nested tar file"
+          )
+
+          yield* fromPromise(() =>
+            writeTarGzArchive(resolve(root, "world", "executable.tar.gz"), [
+              { content: "#!/bin/sh\n", mode: 0o711, name: "run.sh" },
+            ])
+          )
+          const previousUmask = process.umask(0o177)
+          yield* driver
+            .mutate(instance, {
+              operation: "unarchive",
+              path: "world/executable.tar.gz",
+              destination: "world/executable",
+            })
+            .pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  process.umask(previousUmask)
+                })
+              )
+            )
+          const executable = yield* fromPromise(() =>
+            stat(resolve(root, "world", "executable.sh"))
+          )
+          assert.strictEqual(executable.mode & 0o777, 0o711)
+        })
+      )
+  )
+
+  it.effect("returns a filesystem error for a malformed archive", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        yield* fromPromise(() =>
+          writeFile(resolve(root, "world", "broken.tar.gz"), "not an archive")
+        )
+
+        const failure = yield* driver
+          .mutate(instance, {
+            operation: "unarchive",
+            path: "world/broken.tar.gz",
+            destination: "world/broken",
+          })
+          .pipe(Effect.flip)
+
+        assert.instanceOf(failure, RelayFilesystemError)
+        assert.strictEqual(failure.code, "invalid_archive")
+        assert.strictEqual(failure.operation, "mutation.unarchive")
+      })
+    )
+  )
+
+  it.effect(
+    "rejects unsafe, duplicate, and link archive entries without output",
+    () =>
+      withSetup(({ driver, instance, root }) =>
+        Effect.gen(function* () {
+          const cases = [
+            {
+              archive: "unsafe.tar.gz",
+              destination: "unsafe-tar",
+              expectedCode: "unsafe_archive_path",
+              write: () =>
+                writeTarGzArchive(resolve(root, "world", "unsafe.tar.gz"), [
+                  { content: "safe", name: "first.txt" },
+                  { content: "escape", name: "../escape.txt" },
+                ]),
+            },
+            {
+              archive: "duplicate.tar.gz",
+              destination: "duplicate-tar",
+              expectedCode: "duplicate_archive_path",
+              write: () =>
+                writeTarGzArchive(resolve(root, "world", "duplicate.tar.gz"), [
+                  { content: "first", name: "same.txt" },
+                  { content: "second", name: "same.txt" },
+                ]),
+            },
+            {
+              archive: "link.tar.gz",
+              destination: "link-tar",
+              expectedCode: "unsupported_archive_entry",
+              write: () =>
+                writeTarGzArchive(resolve(root, "world", "link.tar.gz"), [
+                  {
+                    linkname: "target.txt",
+                    name: "linked.txt",
+                    type: "symlink",
+                  },
+                ]),
+            },
+            {
+              archive: "unsafe.zip",
+              destination: "unsafe-zip",
+              expectedCode: "invalid_archive",
+              write: () =>
+                writeUnsafeZipArchive(resolve(root, "world", "unsafe.zip")),
+            },
+            {
+              archive: "duplicate.zip",
+              destination: "duplicate-zip",
+              expectedCode: "duplicate_archive_path",
+              write: () =>
+                writeZipArchive(resolve(root, "world", "duplicate.zip"), [
+                  { content: "first", name: "same.txt" },
+                  { content: "second", name: "same.txt" },
+                ]),
+            },
+            {
+              archive: "link.zip",
+              destination: "link-zip",
+              expectedCode: "unsupported_archive_entry",
+              write: () =>
+                writeZipArchive(resolve(root, "world", "link.zip"), [
+                  {
+                    linkname: "target.txt",
+                    name: "linked.txt",
+                    type: "symlink",
+                  },
+                ]),
+            },
+          ] as const
+
+          for (const archiveCase of cases) {
+            yield* fromPromise(archiveCase.write)
+            const failure = yield* driver
+              .mutate(instance, {
+                operation: "unarchive",
+                path: `world/${archiveCase.archive}`,
+                destination: `world/${archiveCase.destination}`,
+              })
+              .pipe(Effect.flip)
+
+            assert.instanceOf(failure, RelayFilesystemError)
+            assert.strictEqual(failure.code, archiveCase.expectedCode)
+            const worldEntries = yield* fromPromise(() =>
+              readdir(resolve(root, "world"))
+            )
+            assert.notInclude(worldEntries, "escape.txt")
+            assert.isFalse(
+              worldEntries.some(
+                (entry) =>
+                  entry === archiveCase.destination ||
+                  entry.startsWith(`${archiveCase.destination}.`)
+              )
+            )
+          }
+        })
+      )
   )
 
   it.effect("creates missing parents for concurrent nested uploads", () =>
@@ -945,6 +1367,86 @@ async function* chunks(value: string): AsyncIterable<Uint8Array> {
 async function* failingChunks(): AsyncIterable<Uint8Array> {
   yield Buffer.from("partial")
   throw new Error("upload stream failed")
+}
+
+async function writeTarGzArchive(
+  path: string,
+  entries: ReadonlyArray<{
+    content?: string
+    linkname?: string
+    mode?: number
+    name: string
+    type?: TarHeaders["type"]
+  }>
+): Promise<void> {
+  const archive = createTarPack()
+  const packed = consumeBuffer(archive)
+  for (const entry of entries) {
+    archive.entry(
+      {
+        linkname: entry.linkname,
+        mode: entry.mode,
+        name: entry.name,
+        type: entry.type ?? "file",
+      },
+      Buffer.from(entry.content ?? "")
+    )
+  }
+  archive.finalize()
+  await writeFile(path, gzipSync(await packed))
+}
+
+async function writeZipArchive(
+  path: string,
+  entries: ReadonlyArray<{
+    content?: string
+    linkname?: string
+    name: string
+    type?: "directory" | "file" | "symlink"
+  }>
+): Promise<void> {
+  const archive = new ZipStream({ forceZip64: true })
+  const packed = consumeBuffer(archive)
+  for (const entry of entries) {
+    await new Promise<void>((resolveEntry, rejectEntry) => {
+      archive.entry(
+        Buffer.from(entry.content ?? ""),
+        {
+          linkname: entry.linkname,
+          name: entry.name,
+          type: entry.type ?? "file",
+        },
+        (cause) => {
+          if (cause) rejectEntry(cause)
+          else resolveEntry()
+        }
+      )
+    })
+  }
+  archive.finalize()
+  await writeFile(path, await packed)
+}
+
+async function writeUnsafeZipArchive(path: string): Promise<void> {
+  const safeName = "aa/escape.txt"
+  const unsafeName = "../escape.txt"
+  await writeZipArchive(path, [
+    { content: "safe", name: "first.txt" },
+    { content: "escape", name: safeName },
+  ])
+  const archive = await readFile(path)
+  const safeBytes = Buffer.from(safeName)
+  const unsafeBytes = Buffer.from(unsafeName)
+  assert.strictEqual(safeBytes.length, unsafeBytes.length)
+  let replacements = 0
+  let offset = archive.indexOf(safeBytes)
+  while (offset >= 0) {
+    unsafeBytes.copy(archive, offset)
+    replacements += 1
+    offset = archive.indexOf(safeBytes, offset + safeBytes.length)
+  }
+  assert.isAtLeast(replacements, 2)
+  await writeFile(path, archive)
 }
 
 function fromPromise<TResult>(run: () => Promise<TResult>) {

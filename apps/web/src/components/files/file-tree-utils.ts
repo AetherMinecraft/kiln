@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 
+import { relayFileUnarchiveSuffix } from "@workspace/contracts"
 import { showToast } from "@workspace/ui/components/sonner"
 
 import type { UploadFile } from "@/components/files/file-upload-selection"
@@ -21,6 +22,15 @@ export function normalizeDirectoryPath(path: string): string {
 
 export function joinFilePath(directory: string, name: string): string {
   return `${normalizeDirectoryPath(directory)}${name}`
+}
+
+export function isUnarchiveSupportedPath(path: string): boolean {
+  return !path.endsWith("/") && relayFileUnarchiveSuffix(path) !== null
+}
+
+export function unarchiveDestinationPath(path: string): string {
+  const suffix = relayFileUnarchiveSuffix(path)
+  return suffix ? path.slice(0, -suffix.length) : path
 }
 
 export function hasDraggedFiles(event: {
@@ -51,14 +61,12 @@ export type FileWorkspaceAction =
   | "download"
   | "duplicate"
   | "rename"
+  | "unarchive"
 
 export interface FileActionsController {
   busy: boolean
   canWrite: boolean
-  request: (
-    action: FileWorkspaceAction,
-    paths: ReadonlyArray<string>
-  ) => void
+  request: (action: FileWorkspaceAction, paths: ReadonlyArray<string>) => void
 }
 
 export async function uploadDroppedFiles(

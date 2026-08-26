@@ -2,16 +2,7 @@ import * as React from "react"
 import { useMutation } from "@tanstack/react-query"
 import { Effect } from "effect"
 import type { RelayFileMutationInput } from "@workspace/contracts"
-import {
-  ALargeSmall,
-  Archive,
-  Check,
-  Copy,
-  Download,
-  EllipsisVertical,
-  LoaderCircle,
-  Trash2,
-} from "lucide-react"
+import { Check, LoaderCircle } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
 import {
@@ -22,19 +13,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@workspace/ui/components/dialog"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
 import { dismissToast, showToast } from "@workspace/ui/components/sonner"
 
 import {
   directoryPath,
+  isUnarchiveSupportedPath,
   joinFilePath,
+  unarchiveDestinationPath,
   type FileActionsController,
   type FileWorkspaceAction,
 } from "@/components/files/file-tree-utils"
@@ -208,6 +194,22 @@ export function useFileActions({
         setDialog({ kind: "archive", paths })
         return
       }
+      if (
+        action === "unarchive" &&
+        paths.length === 1 &&
+        isUnarchiveSupportedPath(paths[0] ?? "")
+      ) {
+        const path = paths[0] ?? ""
+        void runMutation(
+          {
+            operation: "unarchive",
+            path,
+            destination: unarchiveDestinationPath(path),
+          },
+          "Archive unarchived"
+        )
+        return
+      }
       if (action === "delete") {
         setDialog({ kind: "delete", paths })
         return
@@ -359,63 +361,6 @@ export function FileActionDialogHost({
         </DialogFooter>
       </DialogContent>
     </Dialog>
-  )
-}
-
-export function FileActionsDropdown({
-  controller,
-  paths,
-}: {
-  controller: FileActionsController
-  paths: ReadonlyArray<string>
-}) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="File actions"
-          disabled={!paths.length || controller.busy}
-        >
-          <EllipsisVertical className="size-4" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-44">
-        <DropdownMenuItem
-          disabled={!controller.canWrite || paths.length !== 1}
-          onSelect={() => controller.request("rename", paths)}
-        >
-          <ALargeSmall /> Rename
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={() => controller.request("download", paths)}
-        >
-          <Download /> Download
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          disabled={!controller.canWrite}
-          onSelect={() => controller.request("archive", paths)}
-        >
-          <Archive /> Archive
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          disabled={!controller.canWrite}
-          onSelect={() => controller.request("duplicate", paths)}
-        >
-          <Copy /> Duplicate
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          variant="destructive"
-          disabled={!controller.canWrite}
-          onSelect={() => controller.request("delete", paths)}
-        >
-          <Trash2 /> Delete
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
   )
 }
 

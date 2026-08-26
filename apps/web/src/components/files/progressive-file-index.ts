@@ -2,10 +2,17 @@ import type { RelayDirectoryPage, RelayFileEntry } from "@workspace/contracts"
 import { Effect, Result } from "effect"
 
 import { ensuringPromise, promiseEffect } from "@/effect/promise"
-import { getRelayDirectoryPage, searchRelayFiles } from "@/server/relay"
+import {
+  getRelayDirectoryPage,
+  getRelayDirectorySizes,
+  searchRelayFiles,
+} from "@/server/relay"
 
 const emptyEntries: ReadonlyArray<RelayFileEntry> = []
 const fileTreeInitialLoadingDelayMs = 160
+const directorySizePollInitialDelayMs = 1_000
+const directorySizePollMaxDelayMs = 10_000
+const directorySizePollMaxAttempts = 30
 const emptyDirectorySnapshot: FileDirectorySnapshot = {
   complete: false,
   entries: emptyEntries,
@@ -46,7 +53,10 @@ export class ProgressiveFileIndex {
   readonly #relayId: string
   readonly #directories = new Map<string, MutableDirectorySnapshot>()
   readonly #directoryListeners = new Map<string, Set<() => void>>()
-  readonly #knownPaths = new Set<string>()
+  readonly #directorySizes = new Map<string, number>()
+  readonly #directorySizeListeners = new Map<string, Set<() => void>>()
+  readonly #directorySizePolls = new Set<ReturnType<typeof setTimeout>>()
+  readonly #knownEntries = new Map<string, RelayFileEntry>()
   readonly #pathListeners = new Set<(event: FileIndexPathEvent) => void>()
   readonly #statusListeners = new Set<() => void>()
   readonly #loads = new Map<string, Promise<void>>()
@@ -87,9 +97,11 @@ export class ProgressiveFileIndex {
     this.#epoch += 1
     this.#searchGeneration += 1
     this.#directoryListeners.clear()
+    this.#directorySizeListeners.clear()
     this.#pathListeners.clear()
     this.#statusListeners.clear()
     this.#loads.clear()
+    this.#clearDirectorySizePolls()
     this.#clearTreeLoadingTimers()
     this.#treePendingDirectories.clear()
   }
@@ -100,8 +112,10 @@ export class ProgressiveFileIndex {
     this.#epoch += 1
     this.#searchGeneration += 1
     this.#directories.clear()
-    this.#knownPaths.clear()
+    this.#directorySizes.clear()
+    this.#knownEntries.clear()
     this.#loads.clear()
+    this.#clearDirectorySizePolls()
     this.#clearTreeLoadingTimers()
     this.#treePendingDirectories.clear()
     this.#setStatus({ ...initialStatus, refreshing: true })
@@ -109,6 +123,9 @@ export class ProgressiveFileIndex {
       listener({ entries: emptyEntries, type: "reset" })
     )
     this.#directoryListeners.forEach((listeners) =>
+      listeners.forEach((listener) => listener())
+    )
+    this.#directorySizeListeners.forEach((listeners) =>
       listeners.forEach((listener) => listener())
     )
     const epoch = this.#epoch
@@ -123,7 +140,7 @@ export class ProgressiveFileIndex {
   }
 
   getPaths(): ReadonlyArray<string> {
-    return [...this.#knownPaths]
+    return [...this.#knownEntries.keys()]
   }
 
   getTreePendingDirectories(): ReadonlyArray<string> {
@@ -141,6 +158,10 @@ export class ProgressiveFileIndex {
     )
   }
 
+  getDirectorySize(path: string): number | null {
+    return this.#directorySizes.get(normalizeDirectoryPath(path)) ?? null
+  }
+
   getStatusSnapshot(): FileIndexStatusSnapshot {
     return this.#status
   }
@@ -156,8 +177,22 @@ export class ProgressiveFileIndex {
     }
   }
 
+  subscribeDirectorySize(path: string, listener: () => void): () => void {
+    const normalized = normalizeDirectoryPath(path)
+    const listeners = this.#directorySizeListeners.get(normalized) ?? new Set()
+    listeners.add(listener)
+    this.#directorySizeListeners.set(normalized, listeners)
+    return () => {
+      listeners.delete(listener)
+      if (!listeners.size) this.#directorySizeListeners.delete(normalized)
+    }
+  }
+
   subscribePaths(listener: (event: FileIndexPathEvent) => void): () => void {
     this.#pathListeners.add(listener)
+    if (this.#knownEntries.size) {
+      listener({ entries: [...this.#knownEntries.values()], type: "add" })
+    }
     return () => this.#pathListeners.delete(listener)
   }
 
@@ -265,6 +300,11 @@ export class ProgressiveFileIndex {
       previous?.entries ?? emptyEntries,
       page.entries
     )
+    for (const entry of page.entries) {
+      if (entry.kind === "directory" && entry.size !== null) {
+        this.#setDirectorySize(entry.path, entry.size)
+      }
+    }
     this.#setDirectory(directory, {
       complete: page.cursor === null,
       cursor: page.cursor,
@@ -273,14 +313,103 @@ export class ProgressiveFileIndex {
       loading: false,
     })
     this.#discover(page.entries)
+    void this.#loadDirectorySizes(
+      directory,
+      page.entries.flatMap((entry) =>
+        entry.kind === "directory" ? [entry.path] : []
+      ),
+      this.#epoch
+    )
     this.#setTreeDirectoryHasMore(directory, page.cursor !== null)
+  }
+
+  async #loadDirectorySizes(
+    directory: string,
+    paths: ReadonlyArray<string>,
+    epoch: number,
+    pollAttempt = 0,
+    backoffAttempt = 0
+  ): Promise<void> {
+    if (!paths.length || this.#disposed || epoch !== this.#epoch) return
+    const result = await promiseResult(() =>
+      getRelayDirectorySizes({
+        data: {
+          instanceId: this.#instanceId,
+          paths: [...paths],
+          relayId: this.#relayId,
+        },
+      })
+    )
+    if (this.#disposed || epoch !== this.#epoch || Result.isFailure(result)) {
+      return
+    }
+    const sizesChanged = this.#applyDirectorySizes(
+      directory,
+      result.success.sizes
+    )
+    if (
+      !result.success.pending.length ||
+      pollAttempt >= directorySizePollMaxAttempts
+    ) {
+      return
+    }
+    const madeProgress =
+      sizesChanged || !sameDirectorySizePaths(paths, result.success.pending)
+    const nextBackoffAttempt = madeProgress ? 0 : backoffAttempt + 1
+    const delay = Math.min(
+      directorySizePollInitialDelayMs *
+        2 ** (madeProgress ? 0 : backoffAttempt),
+      directorySizePollMaxDelayMs
+    )
+    const timer = setTimeout(() => {
+      this.#directorySizePolls.delete(timer)
+      void this.#loadDirectorySizes(
+        directory,
+        result.success.pending,
+        epoch,
+        pollAttempt + 1,
+        nextBackoffAttempt
+      )
+    }, delay)
+    this.#directorySizePolls.add(timer)
+  }
+
+  #applyDirectorySizes(
+    directory: string,
+    sizes: Readonly<Record<string, number>>
+  ): boolean {
+    const snapshot = this.#directories.get(directory)
+    if (!snapshot) return false
+    let changed = false
+    for (const entry of snapshot.entries) {
+      const size = sizes[entry.path]
+      if (
+        entry.kind !== "directory" ||
+        size === undefined ||
+        !this.#setDirectorySize(entry.path, size)
+      ) {
+        continue
+      }
+      changed = true
+    }
+    return changed
+  }
+
+  #setDirectorySize(path: string, size: number): boolean {
+    const normalized = normalizeDirectoryPath(path)
+    if (size === this.#directorySizes.get(normalized)) return false
+    this.#directorySizes.set(normalized, size)
+    this.#directorySizeListeners
+      .get(normalized)
+      ?.forEach((listener) => listener())
+    return true
   }
 
   #discover(entries: ReadonlyArray<RelayFileEntry>): void {
     const additions: Array<RelayFileEntry> = []
     for (const entry of entries) {
-      if (this.#knownPaths.has(entry.path)) continue
-      this.#knownPaths.add(entry.path)
+      if (this.#knownEntries.has(entry.path)) continue
+      this.#knownEntries.set(entry.path, entry)
       additions.push(entry)
     }
     if (!additions.length) return
@@ -371,6 +500,11 @@ export class ProgressiveFileIndex {
     this.#treeLoadingTimers.forEach((timer) => clearTimeout(timer))
     this.#treeLoadingTimers.clear()
   }
+
+  #clearDirectorySizePolls(): void {
+    this.#directorySizePolls.forEach((timer) => clearTimeout(timer))
+    this.#directorySizePolls.clear()
+  }
 }
 
 function promiseResult<TResult>(run: () => Promise<TResult>) {
@@ -380,6 +514,15 @@ function promiseResult<TResult>(run: () => Promise<TResult>) {
 function normalizeDirectoryPath(path: string): string {
   const normalized = path.replace(/^\/+|\/+$/gu, "")
   return normalized ? `${normalized}/` : ""
+}
+
+function sameDirectorySizePaths(
+  left: ReadonlyArray<string>,
+  right: ReadonlyArray<string>
+): boolean {
+  if (left.length !== right.length) return false
+  const rightPaths = new Set(right)
+  return left.every((path) => rightPaths.has(path))
 }
 
 function mergeEntries(
