@@ -25,7 +25,7 @@ import {
   TooltipTrigger,
 } from "@workspace/ui/components/tooltip"
 
-import { FileActionsDropdown } from "@/components/files/file-actions"
+import { FileActionsMenu } from "@/components/files/file-actions-menu"
 import { FileTypeIcon } from "@/components/files/file-type-icon"
 import { selectedUploadFiles } from "@/components/files/file-upload-selection"
 import {
@@ -371,7 +371,11 @@ export function RootDirectoryList({
         ) : (
           <span className="ml-auto" />
         )}
-        <FileActionsDropdown controller={actions} paths={selectedPaths} />
+        <FileActionsMenu
+          surface="dropdown"
+          controller={actions}
+          paths={selectedPaths}
+        />
       </div>
       <div className="overflow-hidden border border-border/75 bg-muted/[0.025]">
         <div className="type-technical-label grid h-9 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/75 bg-muted/10 px-2 text-muted-foreground">
@@ -411,35 +415,48 @@ export function RootDirectoryList({
           <span />
         </div>
         {visibleEntries.map((entry) => (
-          <div
+          <FileActionsMenu
+            surface="context"
             key={entry.path}
-            className="grid min-h-11 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/55 px-2 last:border-b-0 hover:bg-accent/30 has-checked:bg-primary/[0.07]"
+            controller={actions}
+            directory={entry.kind === "directory"}
+            label={`Actions for ${entry.name}`}
+            paths={[entry.path]}
+            onOpen={() => onOpen(entry.path)}
           >
-            <label className="grid size-7 place-items-center">
-              <input
-                type="checkbox"
-                className="size-3.5 accent-primary"
-                aria-label={`Select ${entry.name}`}
-                checked={selected.has(entry.path)}
-                onChange={() => toggle(entry.path)}
+            <div className="grid min-h-11 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/55 px-2 last:border-b-0 hover:bg-accent/30 has-checked:bg-primary/[0.07]">
+              <label className="grid size-7 place-items-center">
+                <input
+                  type="checkbox"
+                  className="size-3.5 accent-primary"
+                  aria-label={`Select ${entry.name}`}
+                  checked={selected.has(entry.path)}
+                  onChange={() => toggle(entry.path)}
+                />
+              </label>
+              <button
+                type="button"
+                className="flex min-w-0 items-center gap-2.5 self-stretch text-left text-sm font-medium focus-visible:ring-1 focus-visible:ring-ring/60 focus-visible:outline-none focus-visible:ring-inset"
+                onClick={() => onOpen(entry.path)}
+              >
+                {entry.kind === "directory" ? (
+                  <Folder className="size-4 shrink-0 text-primary/80" />
+                ) : (
+                  <FileTypeIcon path={entry.path} />
+                )}
+                <span className="truncate">{entry.name}</span>
+              </button>
+              <FileSizeCell entry={entry} fileIndex={fileIndex} />
+              <FileModifiedAtTime modifiedAt={entry.modifiedAt} />
+              <FileActionsMenu
+                surface="dropdown"
+                controller={actions}
+                directory={entry.kind === "directory"}
+                paths={[entry.path]}
+                onOpen={() => onOpen(entry.path)}
               />
-            </label>
-            <button
-              type="button"
-              className="flex min-w-0 items-center gap-2.5 self-stretch text-left text-sm font-medium focus-visible:ring-1 focus-visible:ring-ring/60 focus-visible:outline-none focus-visible:ring-inset"
-              onClick={() => onOpen(entry.path)}
-            >
-              {entry.kind === "directory" ? (
-                <Folder className="size-4 shrink-0 text-primary/80" />
-              ) : (
-                <FileTypeIcon path={entry.path} />
-              )}
-              <span className="truncate">{entry.name}</span>
-            </button>
-            <FileSizeCell entry={entry} fileIndex={fileIndex} />
-            <FileModifiedAtTime modifiedAt={entry.modifiedAt} />
-            <FileActionsDropdown controller={actions} paths={[entry.path]} />
-          </div>
+            </div>
+          </FileActionsMenu>
         ))}
         {loadError ? (
           <div
@@ -635,7 +652,11 @@ function DirectoryViewContent({
               aria-label={`Upload folder to /data/${path}`}
               onChange={handleUploadInput}
             />
-            <FileActionsDropdown controller={actions} paths={selectedPaths} />
+            <FileActionsMenu
+              surface="dropdown"
+              controller={actions}
+              paths={selectedPaths}
+            />
           </div>
         </div>
       </div>
@@ -698,35 +719,48 @@ function DirectoryViewContent({
           </button>
 
           {visibleEntries.map((entry) => (
-            <div
+            <FileActionsMenu
+              surface="context"
               key={entry.path}
-              className="group/row grid min-h-11 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/55 px-2 last:border-b-0 hover:bg-accent/30 has-checked:bg-primary/[0.07]"
+              controller={actions}
+              directory={entry.kind === "directory"}
+              label={`Actions for ${entry.name}`}
+              paths={[entry.path]}
+              onOpen={() => onOpen(entry.path)}
             >
-              <label className="grid size-7 place-items-center">
-                <input
-                  type="checkbox"
-                  className="size-3.5 accent-primary"
-                  aria-label={`Select ${entry.name}`}
-                  checked={selected.has(entry.path)}
-                  onChange={() => toggle(entry.path)}
+              <div className="group/row grid min-h-11 grid-cols-[2.25rem_minmax(12rem,1fr)_7rem_11rem_2.5rem] items-center border-b border-border/55 px-2 last:border-b-0 hover:bg-accent/30 has-checked:bg-primary/[0.07]">
+                <label className="grid size-7 place-items-center">
+                  <input
+                    type="checkbox"
+                    className="size-3.5 accent-primary"
+                    aria-label={`Select ${entry.name}`}
+                    checked={selected.has(entry.path)}
+                    onChange={() => toggle(entry.path)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="flex min-w-0 items-center gap-2.5 self-stretch text-left text-sm font-medium focus-visible:ring-1 focus-visible:ring-ring/60 focus-visible:outline-none focus-visible:ring-inset"
+                  onClick={() => onOpen(entry.path)}
+                >
+                  {entry.kind === "directory" ? (
+                    <Folder className="size-4 shrink-0 text-primary/80" />
+                  ) : (
+                    <FileTypeIcon path={entry.path} />
+                  )}
+                  <span className="truncate">{entry.name}</span>
+                </button>
+                <FileSizeCell entry={entry} fileIndex={fileIndex} />
+                <FileModifiedAtTime modifiedAt={entry.modifiedAt} />
+                <FileActionsMenu
+                  surface="dropdown"
+                  controller={actions}
+                  directory={entry.kind === "directory"}
+                  paths={[entry.path]}
+                  onOpen={() => onOpen(entry.path)}
                 />
-              </label>
-              <button
-                type="button"
-                className="flex min-w-0 items-center gap-2.5 self-stretch text-left text-sm font-medium focus-visible:ring-1 focus-visible:ring-ring/60 focus-visible:outline-none focus-visible:ring-inset"
-                onClick={() => onOpen(entry.path)}
-              >
-                {entry.kind === "directory" ? (
-                  <Folder className="size-4 shrink-0 text-primary/80" />
-                ) : (
-                  <FileTypeIcon path={entry.path} />
-                )}
-                <span className="truncate">{entry.name}</span>
-              </button>
-              <FileSizeCell entry={entry} fileIndex={fileIndex} />
-              <FileModifiedAtTime modifiedAt={entry.modifiedAt} />
-              <FileActionsDropdown controller={actions} paths={[entry.path]} />
-            </div>
+              </div>
+            </FileActionsMenu>
           ))}
 
           {directory.loading && !hasBufferedEntries ? (
