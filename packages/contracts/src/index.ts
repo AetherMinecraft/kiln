@@ -1248,11 +1248,28 @@ export const relayFileMutationInputSchema = z.discriminatedUnion("operation", [
     paths: z.array(relayFileMutationPathSchema).min(1).max(500),
     destination: relayFileMutationPathSchema,
   }),
+  z.object({
+    operation: z.literal("unarchive"),
+    path: relayFileMutationPathSchema,
+    destination: relayFileMutationPathSchema,
+  }),
 ])
 
 export const relayFileMutationResultSchema = z
   .object({ mutated: z.literal(true) })
   .strict()
+
+export type RelayFileUnarchiveSuffix = ".tar.gz" | ".tgz" | ".zip"
+
+export function relayFileUnarchiveSuffix(
+  path: string
+): RelayFileUnarchiveSuffix | null {
+  const lowerPath = path.toLowerCase()
+  if (lowerPath.endsWith(".tar.gz")) return ".tar.gz"
+  if (lowerPath.endsWith(".tgz")) return ".tgz"
+  if (lowerPath.endsWith(".zip")) return ".zip"
+  return null
+}
 
 export const relayFileActivityEntrySchema = z.object({
   instanceId: z.string(),

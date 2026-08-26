@@ -1,4 +1,5 @@
 import {
+  chmod,
   cp,
   lstat,
   mkdir,
@@ -28,9 +29,21 @@ import {
   sep,
 } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
-import { gzip, gunzip, constants as zlibConstants } from "node:zlib"
+import {
+  createGunzip,
+  gzip,
+  gunzip,
+  constants as zlibConstants,
+} from "node:zlib"
 import { promisify } from "node:util"
+import { pipeline } from "node:stream/promises"
 import { Effect, Result, Stream } from "effect"
+import { openPromise, type Entry, type ZipFile } from "yauzl"
+import {
+  extract as createTarExtractor,
+  type Entry as TarEntry,
+  type Headers as TarHeaders,
+} from "tar-stream"
 import ZipStream from "zip-stream"
 
 import type {
@@ -48,11 +61,16 @@ import type {
   RelayLatestLog,
   RelaySaveFileInput,
 } from "@workspace/contracts"
-import { formatSnbt, parseSnbt } from "@workspace/contracts"
+import {
+  formatSnbt,
+  parseSnbt,
+  relayFileUnarchiveSuffix,
+} from "@workspace/contracts"
 
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
 import { directoryApparentSizeEffect } from "./disk-usage.js"
 import { RelayFilesystemError } from "./effect/errors.js"
+import { ensuringPromise, promiseEffect } from "./effect/promise.js"
 import { decodeNbt, encodeNbt } from "./nbt.js"
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -814,6 +832,63 @@ export class FilesystemDriver {
             Effect.suspend(() =>
               completed ? Effect.void : cleanupPathEffect(destination)
             )
+          )
+        )
+      }
+
+      if (input.operation === "unarchive") {
+        const archiveSuffix = relayFileUnarchiveSuffix(input.path)
+        if (!archiveSuffix) {
+          return yield* filesystemFailure(
+            "unsupported_archive",
+            "mutation.unarchive",
+            "Only ZIP and compressed TAR archives can be unarchived"
+          )
+        }
+        const source = yield* existingMutationEntry(root, input.path)
+        if (source.kind !== "file") {
+          return yield* filesystemFailure(
+            "unsupported_archive",
+            "mutation.unarchive",
+            "Only ZIP and compressed TAR files can be unarchived"
+          )
+        }
+        const requestedDestination = yield* mutationDestination(
+          root,
+          input.destination
+        )
+        let destination: string | null = null
+        let completed = false
+        yield* filesystemOperation("mutation.unarchive", async (signal) => {
+          const onDestinationCreated = (createdDestination: string) => {
+            destination = createdDestination
+          }
+          if (archiveSuffix === ".zip") {
+            await extractZipArchive(
+              source.absolute,
+              requestedDestination,
+              signal,
+              onDestinationCreated
+            )
+          } else {
+            await extractTarGzArchive(
+              source.absolute,
+              requestedDestination,
+              signal,
+              onDestinationCreated
+            )
+          }
+        }).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              completed = true
+            })
+          ),
+          Effect.ensuring(
+            Effect.suspend(() => {
+              if (completed || !destination) return Effect.void
+              return cleanupExtractionEffect(destination)
+            })
           )
         )
       }
@@ -1715,6 +1790,614 @@ function writeZipArchive(
   })
 }
 
+async function createAvailableUnarchiveDirectory(
+  requestedDestination: string
+): Promise<string> {
+  for (let index = 0; index <= 1_000; index += 1) {
+    const destination =
+      index === 0 ? requestedDestination : `${requestedDestination} (${index})`
+    const created = await Effect.runPromise(
+      Effect.result(
+        promiseEffect(() =>
+          mkdir(destination, { mode: 0o700, recursive: false })
+        )
+      )
+    )
+    if (Result.isSuccess(created)) return destination
+    if (isAlreadyExists(created.failure)) continue
+    throw archiveExtractionError(
+      "io_error",
+      "Could not create the archive destination",
+      created.failure
+    )
+  }
+  throw archiveExtractionError(
+    "target_exists",
+    "Could not find an available folder name for the archive"
+  )
+}
+
+async function extractZipArchive(
+  source: string,
+  requestedDestination: string,
+  signal: AbortSignal,
+  onDestinationCreated: (destination: string) => void
+): Promise<void> {
+  const zip = await archiveExtractionResult(
+    openPromise(source, {
+      autoClose: false,
+      decodeStrings: true,
+      lazyEntries: true,
+      strictFileNames: true,
+      validateEntrySizes: true,
+    }),
+    signal
+  )
+  return archiveExtractionResult(
+    ensuringPromise(
+      async () => {
+        const entries: Array<Entry> = []
+        const names = new Set<string>()
+        let totalSize = 0
+        for await (const entry of zip.eachEntry()) {
+          if (signal.aborted) throw archiveExtractionCancelled()
+          if (entries.length >= MAX_ARCHIVE_ITEMS) {
+            throw archiveExtractionError(
+              "archive_too_large",
+              `Archives cannot contain more than ${MAX_ARCHIVE_ITEMS.toLocaleString("en-US")} entries`
+            )
+          }
+          validateZipEntry(entry, names)
+          totalSize += entry.uncompressedSize
+          if (
+            !Number.isSafeInteger(totalSize) ||
+            totalSize > MAX_TRANSFER_BYTES
+          ) {
+            throw archiveExtractionError(
+              "archive_too_large",
+              "The archive expands beyond the 20 GiB transfer limit"
+            )
+          }
+          entries.push(entry)
+        }
+
+        const singleEntry = entries.length === 1 ? entries[0] : undefined
+        if (singleEntry && isRootFileEntry(singleEntry)) {
+          await extractSingleZipEntry(
+            zip,
+            singleEntry,
+            requestedDestination,
+            signal,
+            onDestinationCreated
+          )
+          return
+        }
+
+        const destination =
+          await createAvailableUnarchiveDirectory(requestedDestination)
+        onDestinationCreated(destination)
+        for (const entry of entries) {
+          if (signal.aborted) throw archiveExtractionCancelled()
+          await extractZipEntry(zip, entry, destination, signal)
+        }
+      },
+      () => zip.close()
+    ),
+    signal
+  )
+}
+
+interface TarArchiveEntry {
+  kind: "directory" | "file"
+  mode: number
+  name: string
+  size: number
+}
+
+async function extractTarGzArchive(
+  source: string,
+  requestedDestination: string,
+  signal: AbortSignal,
+  onDestinationCreated: (destination: string) => void
+): Promise<void> {
+  // TAR has no central directory. Validate the complete stream before creating
+  // user-visible output so a bad final entry cannot leave earlier files behind.
+  // This intentionally trades a second gzip pass for atomic validation without
+  // writing another full copy of the archive into a staging directory.
+  const entries = await inspectTarGzArchive(source, signal)
+  const singleEntry = entries.length === 1 ? entries[0] : undefined
+  if (
+    singleEntry &&
+    singleEntry.kind === "file" &&
+    !singleEntry.name.includes("/")
+  ) {
+    const destinationWithExtension = directUnarchiveDestination(
+      requestedDestination,
+      singleEntry.name
+    )
+    const { destination, file } = await createAvailableUnarchiveFile(
+      destinationWithExtension,
+      singleEntry.mode
+    )
+    onDestinationCreated(destination)
+    const extracted = await Effect.runPromise(
+      Effect.result(
+        promiseEffect(() =>
+          extractTarGzEntries(source, entries, signal, async (entry) => {
+            await writeTarEntryToFile(entry, file, signal)
+            await file.chmod(singleEntry.mode)
+          })
+        )
+      )
+    )
+    const closed = await Effect.runPromise(
+      Effect.result(promiseEffect(() => file.close()))
+    )
+    if (Result.isFailure(extracted)) {
+      if (Result.isFailure(closed)) {
+        await Effect.runPromise(
+          Effect.logWarning(
+            "Relay extracted-file cleanup failed after extraction failed",
+            closed.failure
+          )
+        )
+      }
+      throw archiveExtractionCause(extracted.failure, signal)
+    }
+    if (Result.isFailure(closed)) {
+      throw archiveExtractionError(
+        "io_error",
+        "Could not close the extracted file",
+        closed.failure
+      )
+    }
+    return
+  }
+
+  const destination =
+    await createAvailableUnarchiveDirectory(requestedDestination)
+  onDestinationCreated(destination)
+  await extractTarGzEntries(source, entries, signal, (entry, inspected) =>
+    extractTarEntry(entry, inspected, destination, signal)
+  )
+}
+
+async function inspectTarGzArchive(
+  source: string,
+  signal: AbortSignal
+): Promise<Array<TarArchiveEntry>> {
+  const entries: Array<TarArchiveEntry> = []
+  const names = new Set<string>()
+  let totalSize = 0
+  await consumeTarGzArchive(source, signal, async (entry) => {
+    if (entries.length >= MAX_ARCHIVE_ITEMS) {
+      throw archiveExtractionError(
+        "archive_too_large",
+        `Archives cannot contain more than ${MAX_ARCHIVE_ITEMS.toLocaleString("en-US")} entries`
+      )
+    }
+    const inspected = validateTarEntry(entry.header, names)
+    totalSize += inspected.size
+    if (!Number.isSafeInteger(totalSize) || totalSize > MAX_TRANSFER_BYTES) {
+      throw archiveExtractionError(
+        "archive_too_large",
+        "The archive expands beyond the 20 GiB transfer limit"
+      )
+    }
+    entries.push(inspected)
+    await drainTarEntry(entry, signal)
+  })
+  return entries
+}
+
+async function extractTarGzEntries(
+  source: string,
+  expectedEntries: ReadonlyArray<TarArchiveEntry>,
+  signal: AbortSignal,
+  extractEntry: (entry: TarEntry, inspected: TarArchiveEntry) => Promise<void>
+): Promise<void> {
+  const names = new Set<string>()
+  let index = 0
+  await consumeTarGzArchive(source, signal, async (entry) => {
+    const inspected = validateTarEntry(entry.header, names)
+    const expected = expectedEntries[index]
+    if (!expected || !tarEntriesMatch(inspected, expected)) {
+      throw archiveExtractionError(
+        "archive_changed",
+        "The archive changed while it was being extracted"
+      )
+    }
+    index += 1
+    await extractEntry(entry, inspected)
+  })
+  if (index !== expectedEntries.length) {
+    throw archiveExtractionError(
+      "archive_changed",
+      "The archive changed while it was being extracted"
+    )
+  }
+}
+
+async function consumeTarGzArchive(
+  source: string,
+  signal: AbortSignal,
+  visit: (entry: TarEntry) => Promise<void>
+): Promise<void> {
+  const extractor = createTarExtractor()
+  const streamed = Effect.runPromise(
+    Effect.result(
+      promiseEffect(() =>
+        pipeline(createReadStream(source), createGunzip(), extractor, {
+          signal,
+        })
+      )
+    )
+  )
+  const consumed = await Effect.runPromise(
+    Effect.result(
+      promiseEffect(async () => {
+        for await (const entry of extractor) {
+          if (signal.aborted) throw archiveExtractionCancelled()
+          await visit(entry)
+        }
+      })
+    )
+  )
+  if (Result.isFailure(consumed)) {
+    extractor.destroy(archiveExtractionCause(consumed.failure, signal))
+  }
+  const completed = await streamed
+  if (Result.isFailure(consumed)) {
+    throw archiveExtractionCause(consumed.failure, signal)
+  }
+  if (Result.isFailure(completed)) {
+    throw archiveExtractionCause(completed.failure, signal)
+  }
+}
+
+function validateTarEntry(
+  header: TarHeaders,
+  names: Set<string>
+): TarArchiveEntry {
+  const type = header.type ?? "file"
+  if (type !== "file" && type !== "contiguous-file" && type !== "directory") {
+    throw archiveExtractionError(
+      "unsupported_archive_entry",
+      "The archive contains a link or special file"
+    )
+  }
+  const kind = type === "directory" ? "directory" : "file"
+  const name = validateArchiveEntryPath(
+    header.name,
+    kind === "directory",
+    names
+  )
+  const size = header.size ?? 0
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw archiveExtractionError(
+      "invalid_archive_size",
+      "The archive contains an invalid entry size"
+    )
+  }
+  return {
+    kind,
+    mode: kind === "directory" ? 0o700 : 0o600 | ((header.mode ?? 0) & 0o111),
+    name,
+    size,
+  }
+}
+
+function tarEntriesMatch(
+  left: TarArchiveEntry,
+  right: TarArchiveEntry
+): boolean {
+  return (
+    left.kind === right.kind &&
+    left.mode === right.mode &&
+    left.name === right.name &&
+    left.size === right.size
+  )
+}
+
+async function drainTarEntry(
+  entry: TarEntry,
+  signal: AbortSignal
+): Promise<void> {
+  for await (const _chunk of entry) {
+    if (signal.aborted) throw archiveExtractionCancelled()
+  }
+}
+
+async function writeTarEntryToFile(
+  entry: TarEntry,
+  file: FileHandle,
+  signal: AbortSignal
+): Promise<void> {
+  let position = 0
+  for await (const chunk of entry) {
+    if (signal.aborted) throw archiveExtractionCancelled()
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    let offset = 0
+    while (offset < buffer.length) {
+      const written = await file.write(
+        buffer,
+        offset,
+        buffer.length - offset,
+        position
+      )
+      if (!written.bytesWritten) {
+        throw archiveExtractionError(
+          "io_error",
+          "Filesystem stopped before the archive entry was completely written"
+        )
+      }
+      offset += written.bytesWritten
+      position += written.bytesWritten
+    }
+  }
+  if (position !== (entry.header.size ?? 0)) {
+    throw archiveExtractionError(
+      "invalid_archive_size",
+      "The archive entry ended before its declared size"
+    )
+  }
+}
+
+async function extractTarEntry(
+  entry: TarEntry,
+  inspected: TarArchiveEntry,
+  root: string,
+  signal: AbortSignal
+): Promise<void> {
+  const destination = resolve(root, inspected.name)
+  requireExtractedPathContained(root, destination)
+  if (inspected.kind === "directory") {
+    await drainTarEntry(entry, signal)
+    await mkdir(destination, { mode: inspected.mode, recursive: true })
+    return
+  }
+  await mkdir(dirname(destination), { mode: 0o700, recursive: true })
+  await pipeline(
+    entry,
+    createWriteStream(destination, { flags: "wx", mode: inspected.mode }),
+    { signal }
+  )
+  await chmod(destination, inspected.mode)
+}
+
+async function createAvailableUnarchiveFile(
+  requestedDestination: string,
+  mode: number
+): Promise<{ destination: string; file: FileHandle }> {
+  const extension = extname(requestedDestination)
+  const stem = extension
+    ? requestedDestination.slice(0, -extension.length)
+    : requestedDestination
+  for (let index = 0; index <= 1_000; index += 1) {
+    const destination =
+      index === 0 ? requestedDestination : `${stem} (${index})${extension}`
+    const created = await Effect.runPromise(
+      Effect.result(promiseEffect(() => open(destination, "wx", mode)))
+    )
+    if (Result.isSuccess(created)) {
+      return { destination, file: created.success }
+    }
+    if (isAlreadyExists(created.failure)) continue
+    throw archiveExtractionError(
+      "io_error",
+      "Could not create the extracted file",
+      created.failure
+    )
+  }
+  throw archiveExtractionError(
+    "target_exists",
+    "Could not find an available file name for the archive"
+  )
+}
+
+function isRootFileEntry(entry: Entry): boolean {
+  return !entry.fileName.endsWith("/") && !entry.fileName.includes("/")
+}
+
+async function extractSingleZipEntry(
+  zip: ZipFile,
+  entry: Entry,
+  requestedDestination: string,
+  signal: AbortSignal,
+  onDestinationCreated: (destination: string) => void
+): Promise<void> {
+  const destinationWithExtension = directUnarchiveDestination(
+    requestedDestination,
+    entry.fileName
+  )
+  const mode = zipEntryMode(entry)
+  const extension = extname(destinationWithExtension)
+  const stem = extension
+    ? destinationWithExtension.slice(0, -extension.length)
+    : destinationWithExtension
+  for (let index = 0; index <= 1_000; index += 1) {
+    const destination =
+      index === 0 ? destinationWithExtension : `${stem} (${index})${extension}`
+    const source = await zip.openReadStreamPromise(entry)
+    const output = createWriteStream(destination, { flags: "wx", mode })
+    let created = false
+    output.once("open", () => {
+      created = true
+      onDestinationCreated(destination)
+    })
+    const extracted = await Effect.runPromise(
+      Effect.result(
+        promiseEffect(async () => {
+          await pipeline(source, output, { signal })
+          await chmod(destination, mode)
+        })
+      )
+    )
+    if (Result.isSuccess(extracted)) return
+    if (!created && isAlreadyExists(extracted.failure)) continue
+    throw archiveExtractionCause(extracted.failure, signal)
+  }
+  throw archiveExtractionError(
+    "target_exists",
+    "Could not find an available file name for the archive"
+  )
+}
+
+function validateZipEntry(entry: Entry, names: Set<string>): void {
+  const directory = entry.fileName.endsWith("/")
+  validateArchiveEntryPath(entry.fileName, directory, names)
+  if (
+    !Number.isSafeInteger(entry.uncompressedSize) ||
+    entry.uncompressedSize < 0 ||
+    !Number.isSafeInteger(entry.compressedSize) ||
+    entry.compressedSize < 0
+  ) {
+    throw archiveExtractionError(
+      "invalid_archive_size",
+      "The archive contains an invalid entry size"
+    )
+  }
+  const unixMode = (entry.externalFileAttributes >>> 16) & 0xffff
+  const fileType = unixMode & 0o170000
+  if (
+    fileType !== 0 &&
+    fileType !== 0o100000 &&
+    !(directory && fileType === 0o040000)
+  ) {
+    throw archiveExtractionError(
+      "unsupported_archive_entry",
+      "The archive contains a symbolic link or special file"
+    )
+  }
+}
+
+function validateArchiveEntryPath(
+  fileName: string,
+  directory: boolean,
+  names: Set<string>
+): string {
+  const name = directory ? fileName.replace(/\/+$/u, "") : fileName
+  const segments = name.split("/")
+  if (
+    !name ||
+    fileName.includes("\\") ||
+    fileName.includes("\0") ||
+    fileName.startsWith("/") ||
+    segments.some((segment) => !segment || segment === "." || segment === "..")
+  ) {
+    throw archiveExtractionError(
+      "unsafe_archive_path",
+      "The archive contains an unsafe path"
+    )
+  }
+  if (names.has(name)) {
+    throw archiveExtractionError(
+      "duplicate_archive_path",
+      "The archive contains duplicate paths"
+    )
+  }
+  names.add(name)
+  return name
+}
+
+async function extractZipEntry(
+  zip: ZipFile,
+  entry: Entry,
+  root: string,
+  signal: AbortSignal
+): Promise<void> {
+  const directory = entry.fileName.endsWith("/")
+  const name = directory ? entry.fileName.slice(0, -1) : entry.fileName
+  const destination = resolve(root, name)
+  requireExtractedPathContained(root, destination)
+  if (directory) {
+    await mkdir(destination, { mode: 0o700, recursive: true })
+    return
+  }
+  await mkdir(dirname(destination), { mode: 0o700, recursive: true })
+  const source = await zip.openReadStreamPromise(entry)
+  const mode = zipEntryMode(entry)
+  await pipeline(
+    source,
+    createWriteStream(destination, { flags: "wx", mode }),
+    {
+      signal,
+    }
+  )
+  await chmod(destination, mode)
+}
+
+function zipEntryMode(entry: Entry): number {
+  const unixMode = (entry.externalFileAttributes >>> 16) & 0xffff
+  return 0o600 | (unixMode & 0o111)
+}
+
+function requireExtractedPathContained(root: string, candidate: string): void {
+  const normalizedRoot = resolve(root)
+  const normalizedCandidate = resolve(candidate)
+  if (
+    normalizedCandidate !== normalizedRoot &&
+    !normalizedCandidate.startsWith(`${normalizedRoot}${sep}`)
+  ) {
+    throw archiveExtractionError(
+      "unsafe_archive_path",
+      "The archive contains a path outside its destination"
+    )
+  }
+}
+
+function directUnarchiveDestination(
+  requestedDestination: string,
+  archivedName: string
+): string {
+  const archivedExtension = extname(archivedName)
+  return !archivedExtension ||
+    basename(requestedDestination)
+      .toLowerCase()
+      .endsWith(archivedExtension.toLowerCase())
+    ? requestedDestination
+    : `${requestedDestination}${archivedExtension}`
+}
+
+function archiveExtractionError(code: string, reason: string, cause?: unknown) {
+  return makeFilesystemError(code, "mutation.unarchive", reason, cause)
+}
+
+async function archiveExtractionResult<TResult>(
+  promise: PromiseLike<TResult>,
+  signal: AbortSignal
+): Promise<TResult> {
+  const result = await Effect.runPromise(
+    Effect.result(promiseEffect(() => promise))
+  )
+  if (Result.isFailure(result)) {
+    throw archiveExtractionCause(result.failure, signal)
+  }
+  return result.success
+}
+
+function archiveExtractionCause(
+  cause: unknown,
+  signal: AbortSignal
+): RelayFilesystemError {
+  if (cause instanceof RelayFilesystemError) return cause
+  if (signal.aborted) return archiveExtractionCancelled()
+  return isFilesystemIoError(cause)
+    ? archiveExtractionError("io_error", errorMessage(cause), cause)
+    : archiveExtractionError(
+        "invalid_archive",
+        "The archive could not be extracted",
+        cause
+      )
+}
+
+function archiveExtractionCancelled() {
+  return archiveExtractionError(
+    "archive_cancelled",
+    "Archive extraction was cancelled"
+  )
+}
+
 function closeHandleEffect(file: FileHandle, operation: string) {
   return filesystemOperation(operation, () => file.close()).pipe(
     Effect.catch((cause) =>
@@ -1729,6 +2412,16 @@ function cleanupPathEffect(path: string) {
   ).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("Relay temporary-file cleanup failed", cause)
+    )
+  )
+}
+
+function cleanupExtractionEffect(path: string) {
+  return filesystemOperation("cleanup.extraction", () =>
+    rm(path, { force: true, recursive: true })
+  ).pipe(
+    Effect.catch((cause) =>
+      Effect.logWarning("Relay extraction cleanup failed", cause)
     )
   )
 }
@@ -1853,6 +2546,16 @@ function isAlreadyExists(cause: unknown): boolean {
     typeof cause === "object" &&
     "code" in cause &&
     cause.code === "EEXIST"
+  )
+}
+
+function isFilesystemIoError(cause: unknown): boolean {
+  return Boolean(
+    cause &&
+    typeof cause === "object" &&
+    "code" in cause &&
+    typeof cause.code === "string" &&
+    /^E[A-Z\d]+$/u.test(cause.code)
   )
 }
 
