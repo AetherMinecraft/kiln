@@ -770,12 +770,13 @@ function BrickSummary({
         ) : null
       }
       className="rounded-none border-0 bg-transparent"
+      iconClassName="size-[56px]!"
       icon={
         <BrickIcon
           id={view.id}
           color={view.color}
           iconSvg={view.iconSvg}
-          className="size-5"
+          className="size-[42px]"
         />
       }
       title={view.name}
@@ -787,9 +788,6 @@ function BrickSummary({
     >
       <p className="type-meta mt-0.5 truncate text-muted-foreground">
         {view.description}
-      </p>
-      <p className="type-meta mt-1 truncate font-mono text-muted-foreground">
-        {view.source}
       </p>
     </WorkspaceSummaryCard>
   )

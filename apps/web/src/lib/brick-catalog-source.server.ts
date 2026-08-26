@@ -8,6 +8,7 @@ import { dirname, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import {
+  brickIdExceedsRecommendedLength,
   brickCatalogDocumentSchema,
   brickRecipeSchema,
   relayCatalogSchema,
@@ -50,6 +51,7 @@ export interface LoadedBrickCatalog {
   snapshot: RelayCatalog
   snapshotSha256: string
   source: string
+  overlongBrickIds: Array<string>
 }
 
 interface ResolvedCatalogSource {
@@ -82,7 +84,7 @@ export async function loadBrickCatalogSource(
       resolvedSource.catalogUrl
     )
   )
-  const bricks = await mapConcurrent(
+  const loadedBricks = await mapConcurrent(
     document.recipes,
     FETCH_CONCURRENCY,
     async (reference): Promise<Brick> => {
@@ -107,6 +109,7 @@ export async function loadBrickCatalogSource(
       return { ...recipe, source: source.href }
     }
   )
+  const bricks = loadedBricks
   const ids = new Set<string>()
   for (const brick of bricks) {
     if (ids.has(brick.metadata.id)) {
@@ -137,6 +140,11 @@ export async function loadBrickCatalogSource(
     ...resolvedSource,
     snapshot,
     snapshotSha256: createHash("sha256").update(encoded).digest("hex"),
+    overlongBrickIds: loadedBricks.flatMap((brick) =>
+      brickIdExceedsRecommendedLength(brick.metadata.id)
+        ? [brick.metadata.id]
+        : []
+    ),
   }
 }
 

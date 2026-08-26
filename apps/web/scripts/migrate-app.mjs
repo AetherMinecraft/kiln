@@ -387,6 +387,19 @@ async function ensureTailscaleNetworkSchema(database) {
         .join(", ")}`
     )
   }
+  const nameColumn = columns.find((column) => column.Field === "name")
+  if (nameColumn?.Type?.toLowerCase() !== "varchar(32)") {
+    await assertNoOversizedNames(
+      database,
+      databaseTable("tailscale_network"),
+      "name",
+      "Tailscale network names"
+    )
+    await database.query(
+      `ALTER TABLE ${databaseTable("tailscale_network")}
+       MODIFY name VARCHAR(32) NOT NULL`
+    )
+  }
   await ensureTailscaleNetworkDomainUnique(database)
 }
 
@@ -428,9 +441,18 @@ async function ensureFileActivitySchema(database) {
   const [displayNameColumns] = await database.query(
     `SHOW COLUMNS FROM ${databaseTable("instance")} LIKE 'display_name'`
   )
-  if (displayNameColumns[0]?.Null === "NO") {
+  if (
+    displayNameColumns[0]?.Null === "NO" ||
+    displayNameColumns[0]?.Type?.toLowerCase() !== "varchar(32)"
+  ) {
+    await assertNoOversizedNames(
+      database,
+      databaseTable("instance"),
+      "display_name",
+      "server names"
+    )
     await database.query(
-      `ALTER TABLE ${databaseTable("instance")} MODIFY display_name VARCHAR(120) NULL`
+      `ALTER TABLE ${databaseTable("instance")} MODIFY display_name VARCHAR(32) NULL`
     )
   }
   await database.query(
@@ -472,5 +494,20 @@ async function ensureFileActivitySchema(database) {
      FOREIGN KEY (relay_id, instance_id)
      REFERENCES ${databaseTable("instance")} (relay_id, instance_id)
      ON DELETE CASCADE`
+  )
+}
+
+async function assertNoOversizedNames(database, table, column, label) {
+  const [rows] = await database.query(
+    `SELECT ${column} AS name
+       FROM ${table}
+      WHERE ${column} IS NOT NULL
+        AND CHAR_LENGTH(${column}) > 32
+      LIMIT 1`
+  )
+  const name = rows[0]?.name
+  if (name === undefined) return
+  throw new Error(
+    `Cannot reduce ${label} to 32 characters while an existing name is longer than 32 characters. Rename it before upgrading.`
   )
 }

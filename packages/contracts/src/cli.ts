@@ -9,7 +9,10 @@ import {
   backupTargetKindSchema,
   backupTaskStatusSchema,
 } from "./backups.js"
-import { MINIMUM_INSTANCE_DISK_LIMIT_BYTES } from "./instance-limits.js"
+import {
+  MAXIMUM_INSTANCE_NAME_LENGTH,
+  MINIMUM_INSTANCE_DISK_LIMIT_BYTES,
+} from "./instance-limits.js"
 import { relayInstanceLifecycleEventSchema } from "./instance-lifecycle.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
 import {
@@ -101,11 +104,13 @@ export const cliServerReferenceSchema = z
   .string()
   .regex(/^[A-Za-z\d_-]{43}:[a-f\d]{40}$/u)
 
+const cliStoredServerNameSchema = z.string().min(1).max(120)
+
 export const cliServerSchema = z
   .object({
     id: cliServerReferenceSchema,
     instanceId: z.string().regex(/^[a-f\d]{40}$/u),
-    name: z.string().min(1).max(120),
+    name: cliStoredServerNameSchema,
     relayId: z.string().regex(/^[A-Za-z\d_-]{43}$/u),
     relayName: z.string().min(1).max(120),
     shortId: z.string().min(1).max(40),
@@ -227,7 +232,7 @@ export const cliServerInfoResponseSchema = z
         implementation: z.string().min(1),
         javaVersion: z.string().min(1),
         memoryLimitBytes: z.number().int().nonnegative(),
-        name: z.string().min(1).max(120),
+        name: cliStoredServerNameSchema,
         observedState: z.string().min(1),
         stateReason: relayInstanceStateReasonSchema.nullable().default(null),
         publicAddress: z.string().nullable(),
@@ -244,7 +249,14 @@ export const cliCreateServerRequestSchema = z
   .object({
     brick: cliBrickReferenceSchema,
     diskLimitBytes: cliDiskLimitBytesSchema,
-    name: z.string().trim().min(1).max(120),
+    name: z
+      .string()
+      .trim()
+      .min(1)
+      .max(
+        MAXIMUM_INSTANCE_NAME_LENGTH,
+        `Names must be ${MAXIMUM_INSTANCE_NAME_LENGTH} characters or fewer`
+      ),
     relayId: z.string().regex(/^[A-Za-z\d_-]{43}$/u),
     start: z.boolean().default(true),
     variables: z
@@ -417,7 +429,10 @@ export const cliActivityEntrySchema = z
     permission: z.string().nullable(),
     relay: z.object({ id: z.string(), name: z.string().min(1) }).strict(),
     server: z
-      .object({ id: z.string(), name: z.string().min(1) })
+      .object({
+        id: z.string(),
+        name: cliStoredServerNameSchema,
+      })
       .strict()
       .nullable(),
     source: z.enum(["web", "cli"]),

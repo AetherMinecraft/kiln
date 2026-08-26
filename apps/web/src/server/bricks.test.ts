@@ -16,6 +16,7 @@ import {
   hearthCreateInstanceInputSchema,
   hearthUpdateInstanceStartupInputSchema,
   isBrickSourceChange,
+  parseImportedBrickFromRelay,
   provisioningInstanceId,
 } from "@/server/bricks"
 
@@ -86,6 +87,19 @@ describe("Hearth Brick mutation inputs", () => {
 
     expect(definition).not.toHaveProperty("iconSvg")
     expect(definition.metadata.id).toBe(builtinTailscaleBrick.metadata.id)
+  })
+
+  it("preserves ids beyond the recommendation returned by a Relay", () => {
+    const imported = parseImportedBrickFromRelay({
+      ...builtinTailscaleBrick,
+      metadata: {
+        ...builtinTailscaleBrick.metadata,
+        id: "abcdefghijklmnopqrstuvwxyz",
+      },
+    })
+
+    expect(imported.brick.metadata.id).toBe("abcdefghijklmnopqrstuvwxyz")
+    expect(imported.brickIdExceedsRecommendation).toBe(true)
   })
 
   it("rejects browser-supplied recipes during server creation", () => {

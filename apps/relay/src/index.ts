@@ -1220,14 +1220,16 @@ async function executeControlRequest(
     }
     case "brick.catalog":
       return bricks.catalog()
-    case "brick.recipe":
+    case "brick.recipe": {
+      const source = requiredString(payload, "source")
       return {
         ...(await bricks.recipe(
-          requiredString(payload, "source"),
+          source,
           optionalString(payload, "snapshotSha256")
         )),
-        source: requiredString(payload, "source"),
+        source,
       }
+    }
     case "database.list":
       return databases.list()
     case "database.create":

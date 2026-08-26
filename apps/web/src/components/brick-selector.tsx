@@ -1,6 +1,9 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import type { Brick } from "@workspace/contracts"
+import {
+  RECOMMENDED_MAXIMUM_BRICK_ID_LENGTH,
+  type Brick,
+} from "@workspace/contracts"
 import { Result } from "effect"
 import {
   BadgeCheck,
@@ -346,12 +349,16 @@ function useSaveCustomBrick(
   return useMutation({
     mutationFn: (source: string) =>
       saveCustomBrick({ data: { relayId, source } }),
-    onSuccess: async (brick) => {
+    onSuccess: async ({ brick, brickIdExceedsRecommendation }) => {
       onSelectionChange({ kind: "catalog", brick })
       showToast({
-        type: "success",
-        message: `${brick.metadata.name} saved`,
-        description: "This custom Brick is now available in your catalog.",
+        type: brickIdExceedsRecommendation ? "warning" : "success",
+        message: brickIdExceedsRecommendation
+          ? `${brick.metadata.name} saved with a nonstandard id`
+          : `${brick.metadata.name} saved`,
+        description: brickIdExceedsRecommendation
+          ? `Its Brick id exceeds the recommended ${RECOMMENDED_MAXIMUM_BRICK_ID_LENGTH} characters, but was preserved and remains usable.`
+          : "This custom Brick is now available in your catalog.",
       })
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.bricks }),
@@ -632,12 +639,12 @@ export const BrickCatalogBrowser = React.memo(function BrickCatalogBrowser({
                             disabled && "pointer-events-none opacity-50"
                           )}
                         >
-                          <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-muted-foreground">
+                          <span className="grid size-[40px] shrink-0 place-items-center rounded-lg border border-border/70 bg-background/70 text-muted-foreground">
                             <BrickIcon
                               id={brick.metadata.id}
                               color={brick.metadata.color}
                               iconSvg={brick.iconSvg}
-                              className="size-4"
+                              className="size-[30px]"
                             />
                           </span>
                           <span className="min-w-0 flex-1">
@@ -709,25 +716,33 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
     ...brickCatalogDetailsQueryOptions(selectedId),
     enabled: selectedId.length > 0,
   })
-  const refreshCatalogQueries = React.useCallback(async () => {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: queryKeys.brickCatalogs.all }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.bricks }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.brickIcons }),
-    ])
-  }, [queryClient])
   const addMutation = useMutation({
     mutationFn: (nextSource: string) =>
       addBrickCatalog({ data: { source: nextSource } }),
     onSuccess: async (catalog) => {
       setSource("")
       setSelectedId(catalog.id)
+      const overlongCount = catalog.overlongBrickIds.length
+      const overlongPreview = catalog.overlongBrickIds.slice(0, 3).join(", ")
+      const remainingOverlong = overlongCount - 3
       showToast({
-        type: "success",
-        message: "Catalog added",
-        description: `${catalog.brickCount} Brick${catalog.brickCount === 1 ? "" : "s"} saved in this snapshot.`,
+        type: overlongCount > 0 ? "warning" : "success",
+        message:
+          overlongCount > 0
+            ? "Catalog added with nonstandard Brick ids"
+            : "Catalog added",
+        description:
+          overlongCount > 0
+            ? `${overlongCount} Brick id${overlongCount === 1 ? " exceeds" : "s exceed"} the recommended ${RECOMMENDED_MAXIMUM_BRICK_ID_LENGTH} characters and remain usable: ${overlongPreview}${remainingOverlong > 0 ? `, and ${remainingOverlong} more` : ""}.`
+            : `${catalog.brickCount} Brick${catalog.brickCount === 1 ? "" : "s"} saved in this snapshot.`,
       })
-      await refreshCatalogQueries()
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.brickCatalogs.all,
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.bricks }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.brickIcons }),
+      ])
     },
     onError: (cause) =>
       showToast({
@@ -752,7 +767,13 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
             ? "Every account can now use this immutable snapshot."
             : "Only its owner can use this catalog now.",
       })
-      await refreshCatalogQueries()
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.brickCatalogs.all,
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.bricks }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.brickIcons }),
+      ])
     },
     onError: catalogMutationError,
   })
@@ -763,7 +784,13 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
       setDeleteCandidateId(null)
       setSelectedId("default")
       showToast({ type: "success", message: "Catalog deleted" })
-      await refreshCatalogQueries()
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.brickCatalogs.all,
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.bricks }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.brickIcons }),
+      ])
     },
     onError: catalogMutationError,
   })
@@ -1008,16 +1035,21 @@ const BrickCatalogManager = React.memo(function BrickCatalogManager({
                       key={brick.source}
                       className="flex items-center gap-2 rounded-md border border-border/60 px-2.5 py-2"
                     >
-                      <BrickIcon
-                        id={brick.metadata.id}
-                        color={brick.metadata.color}
-                        iconSvg={brick.iconSvg}
-                        className="size-3.5 shrink-0 text-muted-foreground"
-                      />
+                      <span className="grid size-[32px] shrink-0 place-items-center rounded-md border border-border/70 bg-background/70 text-muted-foreground">
+                        <BrickIcon
+                          id={brick.metadata.id}
+                          color={brick.metadata.color}
+                          iconSvg={brick.iconSvg}
+                          className="size-[24px]"
+                        />
+                      </span>
                       <span className="min-w-0 flex-1 truncate text-xs font-medium">
                         {brick.metadata.name}
                       </span>
-                      <span className="type-meta font-mono text-muted-foreground">
+                      <span
+                        className="type-meta max-w-[40%] shrink-0 truncate font-mono text-muted-foreground"
+                        title={brick.metadata.id}
+                      >
                         {brick.metadata.id}
                       </span>
                     </li>
@@ -1311,12 +1343,12 @@ const BrickDetailsPanel = React.memo(function BrickDetailsPanel({
     <aside className="flex min-h-96 flex-col md:min-h-0">
       <div className="min-h-0 flex-1 overflow-y-auto p-4 pr-11">
         <div className="flex items-start gap-3">
-          <span className="grid size-11 shrink-0 place-items-center rounded-lg border border-border/70 bg-background/70 text-muted-foreground">
+          <span className="grid size-[40px] shrink-0 place-items-center rounded-lg border border-border/70 bg-background/70 text-muted-foreground">
             <BrickIcon
               id={brick.metadata.id}
               color={brick.metadata.color}
               iconSvg={brick.iconSvg}
-              className="size-5"
+              className="size-[30px]"
             />
           </span>
           <div className="min-w-0">
