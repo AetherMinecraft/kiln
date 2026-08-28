@@ -1,6 +1,8 @@
+import { DbClient } from "@tanstack/db"
 import { QueryClient } from "@tanstack/react-query"
 
 export interface AppRouterContext {
+  dbClient: DbClient
   queryClient: QueryClient
 }
 
@@ -17,4 +19,12 @@ export function createAppQueryClient() {
       },
     },
   })
+}
+
+export function createAppClients(): AppRouterContext {
+  const queryClient = createAppQueryClient()
+  return {
+    dbClient: new DbClient({ queryClient }),
+    queryClient,
+  }
 }

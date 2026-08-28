@@ -80,6 +80,7 @@ import {
 } from "@/lib/relay-client"
 import type { RelayEndpoint } from "@/lib/relay-client"
 import {
+  relayFleetInstance,
   relayInstanceRouteId,
   type RelayFleetSnapshot,
   type RelayReachability,
@@ -87,6 +88,7 @@ import {
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { resolveMclogsApiUrl } from "@/lib/mclogs"
+import { publishRealtimeChange } from "@/lib/realtime-source.server"
 
 const instanceInputSchema = z.object({
   instanceId: z.string().min(1),
@@ -215,65 +217,54 @@ export const getRelaySnapshot = createServerFn({ method: "POST" }).handler(
   }
 )
 
+export const getFreshRelayConnectionState = createServerFn({
+  method: "POST",
+}).handler(async () => {
+  const user = await requireAuthenticatedUser()
+  return authorizedRelayConnectionState(user, {
+    fallbackOnError: true,
+    fresh: true,
+    warnOnUnavailable: false,
+  })
+})
+
+export const getFreshRelayInstance = createServerFn({ method: "POST" })
+  .validator(instanceInputSchema)
+  .handler(async ({ data }) => {
+    const { relay, user } = await instanceRelayAccess(data.relayId)
+    await requireRelayPermission({
+      user,
+      relayId: relay.id,
+      permission: "instance.read",
+      instanceId: data.instanceId,
+    })
+    const instance = (await freshRelaySnapshot(relay)).instances.find(
+      (candidate) => candidate.id === data.instanceId
+    )
+    if (!instance) return null
+    const [managed] = await runAppEffect(
+      "domains.assignments.applyInstance",
+      applyManagedDomainAddressesEffect([relayFleetInstance(instance, relay)])
+    )
+    return managed ?? null
+  })
+
+export const getRelayInstances = createServerFn({ method: "POST" }).handler(
+  async () => {
+    const user = await requireAuthenticatedUser()
+    return (await authorizedFleetSnapshot(user, true)).instances
+  }
+)
+
 export const getRelayConnectionState = createServerFn({
   method: "GET",
 }).handler(async () => {
   const user = await requireAuthenticatedUser()
-  const configuredRelays = await authorizedRelays(
-    user,
-    await listPersistedRelays()
-  )
-
-  if (configuredRelays.length === 0) {
-    return {
-      status: "unconfigured" as const,
-      message: "No Relay has been configured yet.",
-      relay: null,
-    }
-  }
-
-  const relays = configuredRelays.filter((relay) => relay.enabled)
-  if (relays.length === 0) {
-    return {
-      status: "paused" as const,
-      message: "All configured Relays are paused.",
-      relay: publicPausedFleetRelay(configuredRelays),
-      relays: configuredRelays.map((relay) =>
-        publicRelayState({ relay, status: "paused" })
-      ),
-    }
-  }
-
-  const entries = await Promise.all(
-    relays.map((relay) =>
-      authorizedRelayEntry(relay, user, {
-        fallbackOnError: true,
-        warnOnUnavailable: true,
-      })
-    )
-  )
-  const connectedCount = entries.filter(
-    (entry) => entry.status === "connected"
-  ).length
-  const snapshot = await mergeRelaySnapshots(entries)
-  const relay = publicFleetRelay(relays, connectedCount)
-  if (connectedCount === 0) {
-    return {
-      status: "unreachable" as const,
-      message:
-        relays.length === 1
-          ? "The Relay is configured, but Hearth cannot reach it right now."
-          : "Hearth cannot reach any configured Relay right now.",
-      relay,
-      relays: entries.map(publicRelayState),
-    }
-  }
-  return {
-    status: "connected" as const,
-    relay,
-    relays: entries.map(publicRelayState),
-    snapshot,
-  }
+  return authorizedRelayConnectionState(user, {
+    fallbackOnError: true,
+    fresh: false,
+    warnOnUnavailable: true,
+  })
 })
 
 function warnRelayUnavailable(relayId: string, cause: unknown) {
@@ -318,6 +309,11 @@ export const updateInstanceName = createServerFn({ method: "POST" })
       "relay.snapshot.invalidate",
       invalidateRelayCache(relayCachePolicy.snapshot(relay.id))
     )
+    publishRealtimeChange({
+      instance: renamed,
+      relayId: relay.id,
+      type: "instance.upsert",
+    })
     return { ...renamed, relayId: relay.id }
   })
 
@@ -353,6 +349,11 @@ export const deleteInstance = createServerFn({ method: "POST" })
         requestedBy: user.id,
       })
     }
+    publishRealtimeChange({
+      instanceId: data.instanceId,
+      relayId: relay.id,
+      type: "instance.delete",
+    })
     return {
       ...deleteInstanceResultSchema.parse({
         deleted: true,
@@ -437,7 +438,14 @@ export const updateInstanceWebRoutes = createServerFn({ method: "POST" })
       data.relayId,
       240_000
     )
-    return relayInstanceWebRouteStateSchema.parse(value)
+    const routes = relayInstanceWebRouteStateSchema.parse(value)
+    publishRealtimeChange({
+      audience: { kind: "relays", relayIds: [data.relayId] },
+      scope: { instanceId: data.instanceId, relayId: data.relayId },
+      topics: ["instance-web-routes"],
+      type: "hearth.invalidate",
+    })
+    return routes
   })
 
 export const updateInstancePorts = createServerFn({ method: "POST" })
@@ -466,6 +474,11 @@ export const updateInstancePorts = createServerFn({ method: "POST" })
       "relay.snapshot.invalidate",
       invalidateRelayCache(relayCachePolicy.snapshot(data.relayId))
     )
+    publishRealtimeChange({
+      instance,
+      relayId: data.relayId,
+      type: "instance.upsert",
+    })
     return { ...instance, relayId: data.relayId }
   })
 
@@ -650,12 +663,26 @@ export const getRelayFile = createServerFn({ method: "GET" })
       relay,
       `/v1/instances/${encodeURIComponent(data.instanceId)}/file?path=${encodeURIComponent(data.path)}`
     )
-    const file = relayFileContentSchema.parse(await response.json())
+    return relayFileContentSchema.parse(await response.json())
+  })
+
+export const recordRelayFileView = createServerFn({ method: "POST" })
+  .validator(fileInputSchema)
+  .handler(async ({ data }) => {
+    const { relay, user } = await instanceRelayAccess(data.relayId)
+    await requireRelayPermission({
+      user,
+      relayId: relay.id,
+      permission: "instance.files.read",
+      instanceId: data.instanceId,
+    })
     await recordFileActivityBestEffort(
       "view",
-      recordFileViewed(relay.id, data.instanceId, data.path)
+      recordFileViewed(relay.id, data.instanceId, data.path),
+      relay.id,
+      data.instanceId
     )
-    return file
+    return { recorded: true }
   })
 
 export const saveRelayFile = createServerFn({ method: "POST" })
@@ -679,7 +706,9 @@ export const saveRelayFile = createServerFn({ method: "POST" })
     const file = relayFileContentSchema.parse(await response.json())
     await recordFileActivityBestEffort(
       "edit",
-      recordFileEdited(relay.id, instanceId, path)
+      recordFileEdited(relay.id, instanceId, path),
+      relay.id,
+      instanceId
     )
     return file
   })
@@ -776,7 +805,7 @@ export const updateRelayFilePin = createServerFn({ method: "POST" })
       validPinnedPaths.filter((path): path is string => path !== null)
     )
     validPaths.add(data.path)
-    return relayFileActivitySchema.parse(
+    const nextActivity = relayFileActivitySchema.parse(
       await setFilePinned(
         relay.id,
         data.instanceId,
@@ -785,6 +814,8 @@ export const updateRelayFilePin = createServerFn({ method: "POST" })
         validPaths
       )
     )
+    publishFileActivityChange(relay.id, data.instanceId)
+    return nextActivity
   })
 
 export const performRelayAction = createServerFn({ method: "POST" })
@@ -813,6 +844,11 @@ export const performRelayAction = createServerFn({ method: "POST" })
       "relay.snapshot.invalidate",
       invalidateRelayCache(relayCachePolicy.snapshot(relay.id))
     )
+    publishRealtimeChange({
+      instance,
+      relayId: relay.id,
+      type: "instance.upsert",
+    })
     return { ...instance, relayId: relay.id }
   })
 
@@ -938,13 +974,18 @@ function errorMessage(cause: unknown): string {
 
 async function recordFileActivityBestEffort(
   kind: "edit" | "view",
-  operation: Promise<void>
+  operation: Promise<void>,
+  relayId: string,
+  instanceId: string
 ): Promise<void> {
   await Effect.runPromise(
     Effect.tryPromise({
       try: () => operation,
       catch: (cause) => cause,
     }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => publishFileActivityChange(relayId, instanceId))
+      ),
       Effect.catch((cause) =>
         Effect.sync(() => {
           console.warn(
@@ -955,6 +996,15 @@ async function recordFileActivityBestEffort(
       )
     )
   )
+}
+
+function publishFileActivityChange(relayId: string, instanceId: string): void {
+  publishRealtimeChange({
+    audience: { kind: "relays", relayIds: [relayId] },
+    scope: { instanceId, relayId },
+    topics: ["file-activity"],
+    type: "hearth.invalidate",
+  })
 }
 
 async function relayRequest(
@@ -1001,6 +1051,10 @@ async function relaySnapshot(relay: RelayEndpoint) {
   )
 }
 
+async function freshRelaySnapshot(relay: RelayEndpoint) {
+  return relaySnapshotSchema.parse(await relayRequestRaw(relay, "/v1/snapshot"))
+}
+
 async function relayFallbackSnapshot(relay: RelayEndpoint) {
   return runAppEffect(
     "relay.snapshotFallback",
@@ -1031,11 +1085,16 @@ async function authorizeRelaySnapshot(
 async function authorizedRelayEntry(
   relay: PersistedRelay,
   user: AuthenticatedUser,
-  options: { fallbackOnError: boolean; warnOnUnavailable: boolean }
+  options: {
+    fallbackOnError: boolean
+    fresh?: boolean
+    warnOnUnavailable: boolean
+  }
 ) {
   return Effect.runPromise(
     Effect.tryPromise({
-      try: () => relaySnapshot(relay),
+      try: () =>
+        options.fresh ? freshRelaySnapshot(relay) : relaySnapshot(relay),
       catch: (cause) => cause,
     }).pipe(
       Effect.map((snapshot) => ({
@@ -1126,7 +1185,8 @@ async function instanceRelayAccess(relayId: string) {
 
 async function authorizedFleetSnapshot(
   user: AuthenticatedUser,
-  fallbackOnError: boolean
+  fallbackOnError: boolean,
+  fresh = false
 ): Promise<RelayFleetSnapshot> {
   const relays = (
     await authorizedRelays(user, await listPersistedRelays())
@@ -1135,11 +1195,72 @@ async function authorizedFleetSnapshot(
     relays.map((relay) =>
       authorizedRelayEntry(relay, user, {
         fallbackOnError,
+        fresh,
         warnOnUnavailable: false,
       })
     )
   )
   return mergeRelaySnapshots(entries)
+}
+
+async function authorizedRelayConnectionState(
+  user: AuthenticatedUser,
+  options: {
+    fallbackOnError: boolean
+    fresh: boolean
+    warnOnUnavailable: boolean
+  }
+) {
+  const configuredRelays = await authorizedRelays(
+    user,
+    await listPersistedRelays()
+  )
+  if (configuredRelays.length === 0) {
+    return {
+      status: "unconfigured" as const,
+      message: "No Relay has been configured yet.",
+      relay: null,
+    }
+  }
+
+  const relays = configuredRelays.filter((relay) => relay.enabled)
+  if (relays.length === 0) {
+    return {
+      status: "paused" as const,
+      message: "All configured Relays are paused.",
+      relay: publicPausedFleetRelay(configuredRelays),
+      relays: configuredRelays.map((relay) =>
+        publicRelayState({ relay, status: "paused" })
+      ),
+    }
+  }
+
+  const entries = await Promise.all(
+    relays.map((relay) => authorizedRelayEntry(relay, user, options))
+  )
+  const connectedCount = entries.filter(
+    (entry) => entry.status === "connected"
+  ).length
+  const snapshot = await mergeRelaySnapshots(entries)
+  const relay = publicFleetRelay(relays, connectedCount)
+  if (connectedCount === 0) {
+    return {
+      status: "unreachable" as const,
+      message:
+        relays.length === 1
+          ? "The Relay is configured, but Hearth cannot reach it right now."
+          : "Hearth cannot reach any configured Relay right now.",
+      relay,
+      relays: entries.map(publicRelayState),
+      snapshot,
+    }
+  }
+  return {
+    status: "connected" as const,
+    relay,
+    relays: entries.map(publicRelayState),
+    snapshot,
+  }
 }
 
 async function authorizedRelays(

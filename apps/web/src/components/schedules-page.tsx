@@ -1,4 +1,5 @@
 import * as React from "react"
+import { useLiveSuspenseQuery } from "@tanstack/react-db"
 import {
   useMutation,
   useQuery,
@@ -110,6 +111,11 @@ import { useScheduleScope } from "@/components/schedule-scope"
 import { forkPromise } from "@/effect/promise"
 import { scheduleBackupDestination } from "@/lib/schedule-backup-configuration"
 import {
+  removeScheduleFromCache,
+  schedulesCollectionOptions,
+  upsertScheduleCache,
+} from "@/lib/collections/schedules"
+import {
   backupStorageQueryOptions,
   queryKeys,
   relaySnapshotQueryOptions,
@@ -147,9 +153,12 @@ let relativeClockSnapshot = Date.now()
 let relativeClockTimer: ReturnType<typeof setInterval> | null = null
 
 export const SchedulesPage = React.memo(function SchedulesPage() {
-  const { data: schedules } = useSuspenseQuery({
-    ...schedulesQueryOptions(),
-    notifyOnChangeProps: ["data"],
+  const { data: schedules } = useLiveSuspenseQuery({
+    query: (query) =>
+      query
+        .from({ schedule: schedulesCollectionOptions })
+        .orderBy(({ schedule }) => schedule.updatedAt, "desc")
+        .orderBy(({ schedule }) => schedule.id, "desc"),
   })
   const { data: scheduleOptions } = useSuspenseQuery({
     ...scheduleOptionsQueryOptions(),
@@ -439,12 +448,17 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
   const canDelete = schedule.targets.every(
     (target) => optionMap.get(targetKey(target))?.canDelete
   )
+  const targetsAvailable = schedule.targets.every(
+    (target) => optionMap.get(targetKey(target))?.available
+  )
   const canRun = canOperateSchedule(schedule, optionMap, "canExecute")
   const canDuplicate = canOperateSchedule(schedule, optionMap, "canCreate")
   const runMutation = useMutation({
     mutationFn: () => runScheduleNow({ data: { id: schedule.id } }),
     onSuccess: async (result) => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.schedules.all,
+      })
       showToast({
         message:
           result.started === result.total
@@ -469,8 +483,8 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
           revision: schedule.revision,
         },
       }),
-    onSuccess: async (_updated, enabled) => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
+    onSuccess: (updated, enabled) => {
+      upsertScheduleCache(queryClient, updated)
       showToast({
         message: enabled ? "Schedule enabled" : "Schedule disabled",
         type: "success",
@@ -494,8 +508,8 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
           enabled: false,
         },
       }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
+    onSuccess: (created) => {
+      upsertScheduleCache(queryClient, created)
       showToast({ message: "Schedule duplicated", type: "success" })
     },
     onError: (cause) =>
@@ -631,7 +645,7 @@ const ScheduleTableRow = React.memo(function ScheduleTableRow({
               <DropdownMenuItem onSelect={() => onViewHistory(schedule)}>
                 <History /> View history
               </DropdownMenuItem>
-              {canEdit ? (
+              {canEdit && targetsAvailable ? (
                 <>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
@@ -782,7 +796,9 @@ function latestRunResult(run: ScheduleRunWithRelay) {
   ]
   const passed = attempts.filter((attempt) => attempt.status === "succeeded")
   const failed = attempts.filter((attempt) =>
-    ["failed", "interrupted", "not_run"].includes(attempt.status)
+    ["failed", "interrupted", "not_run", "skipped_missing"].includes(
+      attempt.status
+    )
   )
   if (passed.length === 0) return "Failed" as const
   if (failed.length > 0) return "Errored" as const
@@ -827,9 +843,12 @@ function EmptyScheduleTable({
 }
 
 export const ScheduleHistoryPage = React.memo(function ScheduleHistoryPage() {
-  const { data: schedules } = useSuspenseQuery({
-    ...schedulesQueryOptions(),
-    notifyOnChangeProps: ["data"],
+  const { data: schedules } = useLiveSuspenseQuery({
+    query: (query) =>
+      query
+        .from({ schedule: schedulesCollectionOptions })
+        .orderBy(({ schedule }) => schedule.updatedAt, "desc")
+        .orderBy(({ schedule }) => schedule.id, "desc"),
   })
   const search = useSearch({ from: "/_app/automations" })
   const navigate = useNavigate({ from: "/automations/history" })
@@ -1488,6 +1507,12 @@ function ScheduleEditorDialog({
   const queryClient = useQueryClient()
   const existing = mode.kind === "edit" ? mode.schedule : null
   const permissionKey = mode.kind === "create" ? "canCreate" : "canUpdate"
+  const editorOptions = React.useMemo(() => {
+    const referenced = new Set(existing?.targets.map(targetKey) ?? [])
+    return options.filter(
+      (option) => option.available || referenced.has(targetKey(option))
+    )
+  }, [existing, options])
   const [name, setName] = React.useState(existing?.name ?? "")
   const [cron, setCron] = React.useState(() =>
     normalizeScheduleCron(existing?.cron ?? "daily")
@@ -1495,7 +1520,7 @@ function ScheduleEditorDialog({
   const [enabled, setEnabled] = React.useState(existing?.enabled ?? true)
   const [selectedTargets, setSelectedTargets] = React.useState(() => {
     if (existing) return new Set(existing.targets.map(targetKey))
-    const selectable = options.filter((option) => option[permissionKey])
+    const selectable = editorOptions.filter((option) => option[permissionKey])
     const onlyTarget = selectable.length === 1 ? selectable[0] : undefined
     return new Set(onlyTarget ? [targetKey(onlyTarget)] : [])
   })
@@ -1504,8 +1529,9 @@ function ScheduleEditorDialog({
   )
   const cronSummary = React.useMemo(() => cronDescription(cron), [cron])
   const selectedOptions = React.useMemo(
-    () => options.filter((option) => selectedTargets.has(targetKey(option))),
-    [options, selectedTargets]
+    () =>
+      editorOptions.filter((option) => selectedTargets.has(targetKey(option))),
+    [editorOptions, selectedTargets]
   )
   const completeActions = React.useMemo(() => {
     const selectedTargetKeys = new Set(
@@ -1534,6 +1560,7 @@ function ScheduleEditorDialog({
     name.trim().length > 0 &&
     cronSummary !== null &&
     selectedOptions.length > 0 &&
+    selectedOptions.every((option) => option.available) &&
     selectedOptions.every((option) => option[permissionKey]) &&
     actions.length > 0 &&
     actions.length === completeActions.length &&
@@ -1553,8 +1580,9 @@ function ScheduleEditorDialog({
             canDelete: __,
             canExecute: ___,
             canUpdate: ____,
-            permittedActions: _____,
-            relayName: ______,
+            available: _____,
+            permittedActions: ______,
+            relayName: _______,
             ...target
           }) => target
         ),
@@ -1568,8 +1596,8 @@ function ScheduleEditorDialog({
           })
         : createSchedule({ data })
     },
-    onSuccess: async (schedule) => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
+    onSuccess: (schedule) => {
+      upsertScheduleCache(queryClient, schedule)
       showToast({
         message: existing ? "Schedule updated" : "Schedule created",
         type: "success",
@@ -1651,7 +1679,7 @@ function ScheduleEditorDialog({
             cron={cron}
             cronSummary={cronSummary}
             name={name}
-            options={options}
+            options={editorOptions}
             permissionKey={permissionKey}
             selectedOptions={selectedOptions}
             selectedOptionsCount={selectedOptions.length}
@@ -1779,6 +1807,11 @@ const ScheduleEditorFields = React.memo(function ScheduleEditorFields({
           selectedTargets={selectedTargets}
           onToggle={onTargetToggle}
         />
+        {selectedOptions.some((option) => !option.available) ? (
+          <p className="type-meta mt-2 text-destructive" role="alert">
+            Remove unavailable targets before saving this schedule.
+          </p>
+        ) : null}
       </EditorSection>
       <EditorSection
         className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)]"
@@ -1928,13 +1961,21 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
   const [open, setOpen] = React.useState(false)
   const pickerOptions = React.useMemo(
     () =>
-      options.map(
-        (option): ServerPickerOption => ({
-          description:
-            option.kind === "relay"
+      options.map((option): ServerPickerOption => {
+        const kind =
+          option.kind === "instance"
+            ? "Server"
+            : option.kind === "database"
+              ? "Database"
+              : "Relay"
+        return {
+          allowDeselectWhenDisabled: !option.available,
+          description: option.available
+            ? option.kind === "relay"
               ? `Relay · ${option.id}`
-              : `${option.kind === "instance" ? "Server" : "Database"} · ${option.relayName} · ${option.id}`,
-          disabled: !option[permissionKey],
+              : `${kind} · ${option.relayName} · ${option.id}`
+            : `Unavailable · ${kind} · ${option.relayName} · ${option.id}`,
+          disabled: !option[permissionKey] || !option.available,
           id: option.id,
           kind:
             option.kind === "instance"
@@ -1945,8 +1986,8 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
           name: option.name,
           relayId: option.relayId,
           relayName: option.relayName,
-        })
-      ),
+        }
+      }),
     [options, permissionKey]
   )
   const selectedPickerKeys = React.useMemo(() => {
@@ -2832,8 +2873,8 @@ function DeleteScheduleDialog({
       schedule
         ? deleteSchedule({ data: { id: schedule.id } })
         : Promise.resolve(null),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.schedules.all })
+    onSuccess: () => {
+      if (schedule) removeScheduleFromCache(queryClient, schedule.id)
       showToast({ message: "Schedule deleted", type: "success" })
       onClose()
     },

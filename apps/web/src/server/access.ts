@@ -29,6 +29,7 @@ import { databaseTable } from "@/lib/database-config"
 import { emailDeliveryConfig, kilnPublicUrl } from "@/lib/environment"
 import { invitationDestination } from "@/lib/invitation-auth"
 import { accessRoles, isAccessRole, roleHasPermission } from "@/lib/permissions"
+import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { requireAuthenticatedUser } from "@/server/auth"
@@ -610,6 +611,7 @@ export const grantOrInviteAccess = createServerFn({ method: "POST" })
             userId: existingUser.id,
           })
         )
+        publishAccessPolicyChange([existingUser.id], true)
         const notificationStatus = await runAppEffect(
           "access.notifyExistingPlatformUser",
           sendAccessGrantedNotification({
@@ -663,6 +665,7 @@ export const grantOrInviteAccess = createServerFn({ method: "POST" })
           userId: existingUser.id,
         })
       )
+      publishAccessPolicyChange([existingUser.id], false, relay.id)
       const notificationStatus = await runAppEffect(
         "access.notifyExistingUser",
         sendAccessGrantedNotification({
@@ -803,6 +806,7 @@ export const grantOrInviteAccess = createServerFn({ method: "POST" })
     } else {
       console.info(`[Kiln access] Invitation for ${data.email}: ${inviteUrl}`)
     }
+    publishAccessCollectionChange(scoped ? data.relayId : undefined)
     return {
       expiresAt: expiresAt.toISOString(),
       id,
@@ -851,7 +855,7 @@ export const acceptAccessInvitation = createServerFn({ method: "POST" })
     const user = await requireAuthenticatedUser()
     if (!user.emailVerified)
       throw new Error("Verify your email before accepting")
-    return runAppEffect(
+    const result = await runAppEffect(
       "access.invitation.accept",
       Effect.gen(function* () {
         const database = yield* Database
@@ -925,7 +929,7 @@ export const acceptAccessInvitation = createServerFn({ method: "POST" })
                 `UPDATE ${databaseTable("invitation")} SET accepted_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
                 [invitation.id]
               )
-              return { accepted: true }
+              return { accepted: true, relayId: invitation.relay_id }
             }
             if (currentRole === "admin" || currentRole === "relay_creator") {
               return yield* Effect.fail(
@@ -977,11 +981,17 @@ export const acceptAccessInvitation = createServerFn({ method: "POST" })
               `UPDATE ${databaseTable("invitation")} SET accepted_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
               [invitation.id]
             )
-            return { accepted: true }
+            return { accepted: true, relayId: invitation.relay_id }
           })
         )
       })
     )
+    publishAccessPolicyChange(
+      [user.id],
+      true,
+      result.relayId ?? undefined
+    )
+    return { accepted: result.accepted }
   })
 
 export const removePlatformAccess = createServerFn({ method: "POST" })
@@ -993,7 +1003,7 @@ export const removePlatformAccess = createServerFn({ method: "POST" })
         "Only a platform administrator can remove platform access"
       )
     }
-    return runAppEffect(
+    const result = await runAppEffect(
       "access.platform.remove",
       removePlatformAccessEffect({
         actingUserId: user.id,
@@ -1001,6 +1011,8 @@ export const removePlatformAccess = createServerFn({ method: "POST" })
         targetUserId: data.userId,
       })
     )
+    publishAccessPolicyChange([data.userId], true)
+    return result
   })
 
 export const updateAccessGrant = createServerFn({ method: "POST" })
@@ -1017,7 +1029,7 @@ export const updateAccessGrant = createServerFn({ method: "POST" })
     if (!initialGrant) return { updated: true }
     await ensureInstanceGrantOwner(relay, initialGrant)
     const ownerAccess = await canManageOwners(user, relay.id)
-    return runAppEffect(
+    const result = await runAppEffect(
       "access.updateGrant",
       withLockedAccessGrant({
         grantId: data.id,
@@ -1043,6 +1055,8 @@ export const updateAccessGrant = createServerFn({ method: "POST" })
           }),
       })
     )
+    publishAccessPolicyChange([initialGrant.user_id], false, relay.id)
+    return result
   })
 
 export const removeAccessGrant = createServerFn({ method: "POST" })
@@ -1059,7 +1073,7 @@ export const removeAccessGrant = createServerFn({ method: "POST" })
     if (!initialGrant) return { removed: true }
     await ensureInstanceGrantOwner(relay, initialGrant)
     const ownerAccess = await canManageOwners(user, relay.id)
-    return runAppEffect(
+    const result = await runAppEffect(
       "access.removeGrant",
       withLockedAccessGrant({
         grantId: data.id,
@@ -1098,6 +1112,8 @@ export const removeAccessGrant = createServerFn({ method: "POST" })
           }),
       })
     )
+    publishAccessPolicyChange([initialGrant.user_id], false, relay.id)
+    return result
   })
 
 export const removeInstanceAccessGrant = createServerFn({ method: "POST" })
@@ -1105,7 +1121,10 @@ export const removeInstanceAccessGrant = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
     const relay = await requiredRelay(data.relayId)
-    const ownerId = await instanceOwnerId(relay, data.instanceId)
+    const [ownerId, initialGrant] = await Promise.all([
+      instanceOwnerId(relay, data.instanceId),
+      accessGrantMutationTarget(data.id, relay.id),
+    ])
     if (!isPlatformAdmin(user) && ownerId !== user.id) {
       await requireRelayPermission({
         user,
@@ -1114,7 +1133,7 @@ export const removeInstanceAccessGrant = createServerFn({ method: "POST" })
         instanceId: data.instanceId,
       })
     }
-    return runAppEffect(
+    const result = await runAppEffect(
       "access.instance.removeGrant",
       Effect.gen(function* () {
         const database = yield* Database
@@ -1160,6 +1179,10 @@ export const removeInstanceAccessGrant = createServerFn({ method: "POST" })
         )
       })
     )
+    if (initialGrant) {
+      publishAccessPolicyChange([initialGrant.user_id], false, relay.id)
+    }
+    return result
   })
 
 export const transferInstanceOwnership = createServerFn({ method: "POST" })
@@ -1167,10 +1190,10 @@ export const transferInstanceOwnership = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const user = await requireAuthenticatedUser()
     const relay = await requiredRelay(data.relayId)
-    await instanceOwnerId(relay, data.instanceId)
+    const previousOwnerId = await instanceOwnerId(relay, data.instanceId)
     const platformAdmin = isPlatformAdmin(user)
 
-    return runAppEffect(
+    const result = await runAppEffect(
       "access.instance.transferOwnership",
       Effect.gen(function* () {
         const database = yield* Database
@@ -1237,6 +1260,14 @@ export const transferInstanceOwnership = createServerFn({ method: "POST" })
         )
       })
     )
+    publishAccessPolicyChange(
+      [previousOwnerId, data.userId].filter(
+        (userId): userId is string => userId !== null
+      ),
+      false,
+      relay.id
+    )
+    return result
   })
 
 export const revokeAccessInvitation = createServerFn({ method: "POST" })
@@ -1254,6 +1285,7 @@ export const revokeAccessInvitation = createServerFn({ method: "POST" })
           WHERE id = ? AND relay_id IS NULL AND accepted_at IS NULL`,
         [data.id]
       )
+      publishAccessCollectionChange()
       return { revoked: true }
     }
     const relay = await requiredRelay(data.relayId)
@@ -1281,6 +1313,7 @@ export const revokeAccessInvitation = createServerFn({ method: "POST" })
         WHERE id = ? AND relay_id = ? AND accepted_at IS NULL`,
       [data.id, relay.id]
     )
+    publishAccessCollectionChange(relay.id)
     return { revoked: true }
   })
 
@@ -1500,6 +1533,32 @@ function isInvitationPending(invitation: InvitationRow): boolean {
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex")
+}
+
+function publishAccessPolicyChange(
+  userIds: Array<string>,
+  reauthenticate = false,
+  relayId?: string
+): void {
+  const uniqueUserIds = [...new Set(userIds)]
+  if (uniqueUserIds.length === 0) return
+  publishRealtimeChange({
+    reauthenticate,
+    type: "access.changed",
+    userIds: uniqueUserIds,
+  })
+  publishAccessCollectionChange(relayId)
+}
+
+function publishAccessCollectionChange(relayId?: string): void {
+  publishRealtimeChange({
+    audience: relayId
+      ? { kind: "relays", relayIds: [relayId] }
+      : { kind: "relay-managers" },
+    scope: relayId ? { relayId } : undefined,
+    topics: ["access"],
+    type: "hearth.invalidate",
+  })
 }
 
 function publicUrl(): string {

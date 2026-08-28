@@ -1,0 +1,514 @@
+import type { AuthenticatedUser } from "@/lib/auth-session"
+import { accountSessionActiveEffect } from "@/effect/account-sessions"
+import { ensuringPromise, recoverPromise } from "@/effect/promise"
+import { runAppEffect } from "@/effect/runtime"
+import {
+  isPlatformAdmin,
+  isRelayCreator,
+  listUserGrants,
+  visibleRelaysForUser,
+} from "@/lib/access-control"
+import { roleHasPermission } from "@/lib/permissions"
+import { hearthAudienceAllows } from "@/lib/hearth-realtime-topics"
+import { relayConnectionState } from "@/lib/relay-connection"
+import {
+  allocateRealtimeCursor,
+  classifyRealtimeEvent,
+  realtimeSourceEventRefreshesHearth,
+  subscribeRealtimeChanges,
+  type RealtimeSourceEvent,
+} from "@/lib/realtime-source.server"
+import { relayInstanceRouteId, type RelayReachability } from "@/lib/relay-fleet"
+import { listPersistedRelays, type PersistedRelay } from "@/lib/relay-registry"
+import type { RelayInstance, RelayNode } from "@workspace/contracts"
+import { Result } from "effect"
+import type {
+  FleetInstance,
+  FleetNode,
+  RealtimeClientEvent,
+} from "@/lib/realtime-events"
+import { realtimeEventRefreshesHearth } from "@/lib/realtime-events"
+import {
+  encodeRealtimeHeartbeat,
+  realtimeHeartbeatIntervalMs,
+} from "@/lib/realtime-heartbeat"
+
+const maximumProcessingBacklog = 64
+const maximumStreamBufferBytes = 256 * 1024
+const sessionValidationIntervalMs = 60_000
+const encoder = new TextEncoder()
+const heartbeatFrame = encodeRealtimeHeartbeat(encoder)
+
+type RealtimeCursor = Pick<RealtimeSourceEvent, "epoch" | "sequence">
+
+interface RealtimeAccessPolicy {
+  canManageRelays: boolean
+  isPlatformAdmin: boolean
+  readableInstances: Map<string, Set<string>>
+  readableRelays: Set<string>
+  relayWideRead: Set<string>
+  relays: Map<string, PersistedRelay>
+}
+
+export async function openAuthorizedRealtimeStream(input: {
+  sessionId: string | null
+  signal: AbortSignal
+  user: AuthenticatedUser
+}): Promise<ReadableStream<Uint8Array>> {
+  let policy = await loadRealtimeAccessPolicy(input.user)
+  let closed = false
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null
+  let heartbeat: ReturnType<typeof setInterval> | null = null
+  let sessionValidation: ReturnType<typeof setInterval> | null = null
+  let validatingSession: Promise<void> | null = null
+  let queuedEvents = 0
+  let pendingRecovery:
+    | (RealtimeCursor & { clear: boolean; hearth: boolean })
+    | null = null
+  let processing = Promise.resolve()
+  let unsubscribe: () => void = () => undefined
+
+  const tryEnqueue = (chunk: Uint8Array, force = false): boolean => {
+    if (closed || !controller) return false
+    const desiredSize = controller.desiredSize
+    if (!force && desiredSize !== null && desiredSize < chunk.byteLength) {
+      return false
+    }
+    controller.enqueue(chunk)
+    return true
+  }
+  const flushRecovery = () => {
+    if (!pendingRecovery) return
+    const recovery = pendingRecovery
+    // Clear this before enqueueing because ReadableStream may synchronously
+    // call pull() as the consumer drains the chunk. Leaving it set lets that
+    // re-entrant pull enqueue the same reset twice.
+    pendingRecovery = null
+    if (
+      !tryEnqueue(
+        encodeServerEvent({
+          clear: recovery.clear,
+          epoch: recovery.epoch,
+          hearth: recovery.hearth,
+          sequence: recovery.sequence,
+          type: "reset",
+        }),
+        recovery.clear
+      )
+    ) {
+      pendingRecovery = recovery
+    }
+  }
+  const enqueueReset = (
+    cursor: RealtimeCursor = allocateRealtimeCursor(),
+    clear = false,
+    hearth = false
+  ) => {
+    pendingRecovery =
+      pendingRecovery?.epoch === cursor.epoch
+        ? {
+            clear: pendingRecovery.clear || clear,
+            epoch: cursor.epoch,
+            hearth: pendingRecovery.hearth || hearth,
+            sequence: Math.max(pendingRecovery.sequence, cursor.sequence),
+          }
+        : { ...cursor, clear, hearth }
+    flushRecovery()
+  }
+  const enqueue = (event: RealtimeClientEvent) => {
+    if (pendingRecovery) {
+      enqueueReset(
+        event,
+        pendingRecovery.clear,
+        pendingRecovery.hearth || realtimeEventRefreshesHearth(event)
+      )
+      return
+    }
+    if (!tryEnqueue(encodeServerEvent(event))) {
+      enqueueReset(event, false, realtimeEventRefreshesHearth(event))
+    }
+  }
+
+  const processEvent = async (event: RealtimeSourceEvent) => {
+    if (event.type === "access.changed") {
+      if (!event.userIds.includes(input.user.id)) return
+      if (event.reauthenticate) {
+        finish(true)
+        return
+      }
+      // Revoke the browser's current view before any fallible policy work. If
+      // the database is unavailable, closing the stream prevents later Relay
+      // events from being projected through the stale policy; EventSource will
+      // reconnect and rebuild it from scratch.
+      enqueueReset(event, true, true)
+      const refreshedPolicy = await recoverPromise(
+        () => loadRealtimeAccessPolicy(input.user),
+        (cause) => {
+          console.warn("[Kiln realtime] Could not refresh access policy", cause)
+          finish(true)
+          return null
+        }
+      )
+      if (refreshedPolicy) policy = refreshedPolicy
+      return
+    }
+
+    // classifyRealtimeEvent closes or ignores these before projection. Keep the
+    // guard here so processEvent remains exhaustively safe if called elsewhere.
+    if (event.type === "session.revoked") return
+
+    if (event.type === "hearth.invalidate") {
+      if (
+        !hearthAudienceAllows(
+          {
+            canManageRelays: policy.canManageRelays,
+            isPlatformAdmin: policy.isPlatformAdmin,
+            readableRelays: policy.readableRelays,
+            userId: input.user.id,
+          },
+          event.audience
+        )
+      ) {
+        return
+      }
+      enqueue({
+        epoch: event.epoch,
+        scope: event.scope,
+        sequence: event.sequence,
+        topics: event.topics,
+        type: "collections.invalidate",
+      })
+      return
+    }
+
+    if (event.type === "relay.metadata") {
+      const previouslyReadable = policy.readableRelays.has(event.relayId)
+      if (
+        !previouslyReadable &&
+        !policy.isPlatformAdmin &&
+        !event.userIds?.includes(input.user.id)
+      ) {
+        return
+      }
+      const refreshedPolicy = await recoverPromise(
+        () => loadRealtimeAccessPolicy(input.user),
+        (cause) => {
+          console.warn("[Kiln realtime] Could not refresh Relay policy", cause)
+          finish(true)
+          return null
+        }
+      )
+      if (!refreshedPolicy) return
+      policy = refreshedPolicy
+      if (!previouslyReadable && !policy.readableRelays.has(event.relayId)) {
+        return
+      }
+      // Identity writes can add or remove a Relay from this stream. Refresh
+      // authorization before projecting later deltas, then refresh both the
+      // control-plane queries and the derived fleet snapshot.
+      enqueue({
+        epoch: event.epoch,
+        scope: { relayId: event.relayId },
+        sequence: event.sequence,
+        topics: ["relays"],
+        type: "relay.invalidate",
+      })
+      return
+    }
+
+    const relay = policy.relays.get(event.relayId)
+    if (!relay || !policy.readableRelays.has(relay.id)) return
+
+    if (event.type === "relay.state") {
+      enqueue({
+        epoch: event.epoch,
+        relayId: event.relayId,
+        sequence: event.sequence,
+        status: event.status,
+        type: "relay.status",
+      })
+      return
+    }
+    if (event.type === "relay.snapshot.reset") {
+      enqueueReset(event)
+      return
+    }
+
+    if (event.type === "instance.upsert") {
+      if (!canReadInstance(policy, event.relayId, event.instance.id)) return
+      enqueue({
+        deleted: [],
+        epoch: event.epoch,
+        sequence: event.sequence,
+        type: "instances.delta",
+        upserted: [fleetInstance(event.instance, relay)],
+      })
+      if (event.directoryChanged) {
+        enqueue({
+          epoch: event.epoch,
+          scope: { relayId: event.relayId },
+          sequence: event.sequence,
+          topics: ["instance-directory"],
+          type: "collections.invalidate",
+        })
+      }
+      return
+    }
+
+    if (event.type === "instance.delete") {
+      if (!canReadInstance(policy, event.relayId, event.instanceId)) return
+      enqueue({
+        deleted: [{ instanceId: event.instanceId, relayId: event.relayId }],
+        epoch: event.epoch,
+        sequence: event.sequence,
+        type: "instances.delta",
+        upserted: [],
+      })
+      enqueue({
+        epoch: event.epoch,
+        scope: { relayId: event.relayId },
+        sequence: event.sequence,
+        topics: ["instance-directory"],
+        type: "collections.invalidate",
+      })
+      return
+    }
+
+    const upserted = event.delta.instances.flatMap((instance) =>
+      canReadInstance(policy, relay.id, instance.id)
+        ? [fleetInstance(instance, relay)]
+        : []
+    )
+    const deleted = event.delta.deletedInstanceIds.flatMap((instanceId) =>
+      canReadInstance(policy, relay.id, instanceId)
+        ? [{ instanceId, relayId: relay.id }]
+        : []
+    )
+    if (upserted.length > 0 || deleted.length > 0) {
+      enqueue({
+        deleted,
+        epoch: event.epoch,
+        sequence: event.sequence,
+        type: "instances.delta",
+        upserted,
+      })
+    }
+    if (event.directoryChanged) {
+      enqueue({
+        epoch: event.epoch,
+        scope: { relayId: event.relayId },
+        sequence: event.sequence,
+        topics: ["instance-directory"],
+        type: "collections.invalidate",
+      })
+    }
+    if (event.delta.node) {
+      enqueue({
+        epoch: event.epoch,
+        nodes: [fleetNode(event.delta.node, relay)],
+        sequence: event.sequence,
+        type: "nodes.delta",
+      })
+    }
+  }
+
+  unsubscribe = subscribeRealtimeChanges((event) => {
+    if (closed) return
+    const delivery = classifyRealtimeEvent(event, {
+      sessionId: input.sessionId,
+      userId: input.user.id,
+    })
+    if (delivery === "ignore") return
+    if (delivery === "close") {
+      if (event.type === "access.changed") enqueueReset(event, true, true)
+      finish(true)
+      return
+    }
+    if (delivery === "normal" && queuedEvents >= maximumProcessingBacklog) {
+      enqueueReset(event, false, realtimeSourceEventRefreshesHearth(event))
+      return
+    }
+    queuedEvents += 1
+    const previousProcessing = processing
+    processing = ensuringPromise(
+      () =>
+        recoverPromise(
+          () => previousProcessing.then(() => processEvent(event)),
+          (cause) => {
+            console.error("[Kiln realtime] Could not project event", cause)
+            enqueueReset(
+              event,
+              false,
+              realtimeSourceEventRefreshesHearth(event)
+            )
+          }
+        ),
+      () => {
+        queuedEvents -= 1
+      }
+    )
+  })
+
+  function finish(closeController: boolean) {
+    if (closed) return
+    closed = true
+    unsubscribe()
+    if (heartbeat) clearInterval(heartbeat)
+    if (sessionValidation) clearInterval(sessionValidation)
+    input.signal.removeEventListener("abort", abort)
+    if (closeController && controller) {
+      const activeController = controller
+      Result.try(() => activeController.close())
+    }
+    controller = null
+  }
+  function abort() {
+    finish(true)
+  }
+  input.signal.addEventListener("abort", abort, { once: true })
+
+  const validateSession = () => {
+    if (!input.sessionId || closed || validatingSession) return
+    const validation = runAppEffect(
+      "auth.sessions.realtimeValidate",
+      accountSessionActiveEffect(input.user.id, input.sessionId)
+    )
+    validatingSession = ensuringPromise(
+      () =>
+        recoverPromise(
+          () =>
+            validation.then((active) => {
+              if (!active) finish(true)
+            }),
+          (cause) => {
+            console.warn("[Kiln realtime] Session validation failed", cause)
+            finish(true)
+          }
+        ),
+      () => {
+        validatingSession = null
+      }
+    )
+  }
+  if (input.sessionId) {
+    sessionValidation = setInterval(
+      validateSession,
+      sessionValidationIntervalMs
+    )
+  }
+
+  return new ReadableStream<Uint8Array>(
+    {
+      start(nextController) {
+        controller = nextController
+        // The stream is intentionally not replayed. Refresh active Hearth
+        // collections on every connection so a mutation that happened while
+        // this tab was disconnected cannot leave an Infinity-stale domain.
+        enqueueReset(undefined, false, true)
+        heartbeat = setInterval(() => {
+          if (!closed) tryEnqueue(heartbeatFrame)
+        }, realtimeHeartbeatIntervalMs)
+        if (input.signal.aborted) abort()
+      },
+      pull() {
+        flushRecovery()
+      },
+      cancel() {
+        finish(false)
+      },
+    },
+    {
+      highWaterMark: maximumStreamBufferBytes,
+      size: (chunk) => chunk.byteLength,
+    }
+  )
+}
+
+async function loadRealtimeAccessPolicy(
+  user: AuthenticatedUser
+): Promise<RealtimeAccessPolicy> {
+  const [relays, grants] = await Promise.all([
+    listPersistedRelays(),
+    isPlatformAdmin(user) ? Promise.resolve([]) : listUserGrants(user.id),
+  ])
+  const visibleRelays = visibleRelaysForUser(user, relays, grants)
+  const readableRelays = new Set(visibleRelays.map((relay) => relay.id))
+  const relayWideRead = new Set<string>()
+  const readableInstances = new Map<string, Set<string>>()
+  for (const grant of grants) {
+    if (!roleHasPermission(grant.role, "instance.read")) continue
+    if (grant.resourceType === "relay") {
+      relayWideRead.add(grant.relayId)
+      continue
+    }
+    if (grant.resourceType !== "instance") continue
+    let ids = readableInstances.get(grant.relayId)
+    if (!ids) {
+      ids = new Set()
+      readableInstances.set(grant.relayId, ids)
+    }
+    ids.add(grant.resourceId)
+  }
+  return {
+    canManageRelays: isPlatformAdmin(user) || isRelayCreator(user),
+    isPlatformAdmin: isPlatformAdmin(user),
+    readableInstances,
+    readableRelays,
+    relayWideRead,
+    relays: new Map(visibleRelays.map((relay) => [relay.id, relay])),
+  }
+}
+
+function canReadInstance(
+  policy: RealtimeAccessPolicy,
+  relayId: string,
+  instanceId: string
+): boolean {
+  if (policy.isPlatformAdmin) return true
+  return (
+    hasReadableRelayGrant(policy, relayId) ||
+    policy.readableInstances.get(relayId)?.has(instanceId) === true
+  )
+}
+
+function hasReadableRelayGrant(
+  policy: RealtimeAccessPolicy,
+  relayId: string
+): boolean {
+  // A Relay is visible to creators without implicitly granting instance read.
+  return policy.relayWideRead.has(relayId)
+}
+
+function fleetInstance(
+  instance: RelayInstance,
+  relay: PersistedRelay
+): FleetInstance {
+  return {
+    ...instance,
+    relayId: relay.id,
+    relayName: relay.name,
+    relayStatus: reachability(relay.id),
+    routeId: relayInstanceRouteId(relay.id, instance.shortId),
+  }
+}
+
+function fleetNode(node: RelayNode, relay: PersistedRelay): FleetNode {
+  return {
+    ...node,
+    relayId: relay.id,
+    relayName: relay.name,
+    relayStatus: reachability(relay.id),
+  }
+}
+
+function reachability(relayId: string): RelayReachability {
+  return relayConnectionState(relayId).status === "authenticated"
+    ? "connected"
+    : "unreachable"
+}
+
+function encodeServerEvent(event: RealtimeClientEvent): Uint8Array {
+  return encoder.encode(
+    `id: ${event.sequence}\nevent: kiln\ndata: ${JSON.stringify(event)}\n\n`
+  )
+}

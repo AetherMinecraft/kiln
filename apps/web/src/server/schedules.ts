@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
 import { Data, Effect, Result } from "effect"
-import type { RowDataPacket } from "mysql2/promise"
+import type { ResultSetHeader, RowDataPacket } from "mysql2/promise"
 import { z } from "zod"
 
 import {
@@ -33,6 +33,7 @@ import { Database, type DatabaseTransaction } from "@/effect/database"
 import { forkAppEffect, runAppEffect } from "@/effect/runtime"
 import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
+import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { kilnInstallationId } from "@/lib/environment"
 import {
   hasPlatformPermission,
@@ -48,6 +49,7 @@ import {
 } from "@/lib/schedule-permissions"
 import { relayRpc } from "@/lib/relay-connection"
 import { listPersistedRelays } from "@/lib/relay-registry"
+import { scheduleTargetsWithAvailability } from "@/lib/schedule-target-options"
 import { promiseEffect } from "@/effect/promise"
 import { requireAuthenticatedUser } from "@/server/auth"
 
@@ -111,6 +113,10 @@ interface ScheduleRunRow extends RowDataPacket {
   schedule_id: string
 }
 
+interface StoredScheduleIdRow extends RowDataPacket {
+  id: string
+}
+
 interface ScheduleTombstoneRow extends RowDataPacket {
   desired_revision: number
   relay_id: string
@@ -127,12 +133,18 @@ interface TargetDirectoryRow extends RowDataPacket {
 export const getScheduleOptions = createServerFn({ method: "GET" }).handler(
   async () => {
     const user = await requireAuthenticatedUser()
-    const [grants, targets, relays] = await Promise.all([
-      isPlatformAdmin(user) ? Promise.resolve([]) : listUserGrants(user.id),
-      loadTargetDirectory(),
-      listPersistedRelays(),
-    ])
+    const [grants, availableTargets, referencedTargets, relays] =
+      await Promise.all([
+        isPlatformAdmin(user) ? Promise.resolve([]) : listUserGrants(user.id),
+        loadTargetDirectory(),
+        loadReferencedScheduleTargets(),
+        listPersistedRelays(),
+      ])
     const relayNames = new Map(relays.map((relay) => [relay.id, relay.name]))
+    const targets = scheduleTargetsWithAvailability(
+      availableTargets,
+      referencedTargets
+    )
     return targets.flatMap((target) => {
       if (
         !hasScheduleTargetPermission({
@@ -157,12 +169,14 @@ export const getScheduleOptions = createServerFn({ method: "GET" }).handler(
         {
           ...target,
           relayName: relayNames.get(target.relayId) ?? target.relayId,
-          canCreate: hasScheduleTargetPermission({
-            grants,
-            permission: "schedule.create",
-            target,
-            user,
-          }),
+          canCreate:
+            target.available &&
+            hasScheduleTargetPermission({
+              grants,
+              permission: "schedule.create",
+              target,
+              user,
+            }),
           canDelete: hasScheduleTargetPermission({
             grants,
             permission: "schedule.delete",
@@ -230,9 +244,13 @@ export const createSchedule = createServerFn({ method: "POST" })
     await requireScheduleBackupDestinations(definition.actions, user)
     await saveNewSchedule(definition, user.id)
     await deploySchedule(definition, user.id)
-    return (await loadSchedules()).find(
+    const created = (await loadSchedules()).find(
       (schedule) => schedule.id === definition.id
     )
+    publishScheduleCollectionChange(
+      definition.targets.map((target) => target.relayId)
+    )
+    return created
   })
 
 export const updateSchedule = createServerFn({ method: "POST" })
@@ -289,9 +307,11 @@ export const updateSchedule = createServerFn({ method: "POST" })
       [...previousRelayIds].filter((relayId) => !nextRelayIds.has(relayId)),
       user.id
     )
-    return (await loadSchedules()).find(
+    const updated = (await loadSchedules()).find(
       (schedule) => schedule.id === definition.id
     )
+    publishScheduleCollectionChange([...previousRelayIds, ...nextRelayIds])
+    return updated
   })
 
 export const deleteSchedule = createServerFn({ method: "POST" })
@@ -316,6 +336,9 @@ export const deleteSchedule = createServerFn({ method: "POST" })
           SET enabled = FALSE, revision = ?, deleted_at = CURRENT_TIMESTAMP(3)
         WHERE id = ? AND deleted_at IS NULL`,
       [revision, schedule.id]
+    )
+    publishScheduleCollectionChange(
+      schedule.targets.map((target) => target.relayId)
     )
     await removeRelayProjections(
       schedule.id,
@@ -370,14 +393,29 @@ export const runScheduleNow = createServerFn({ method: "POST" })
             )
           )
         )
-        return Result.isSuccess(started)
-          ? { error: null, relayId, started: true }
-          : {
-              error: errorMessage(started.failure),
-              relayId,
-              started: false,
-            }
+        if (Result.isFailure(started)) {
+          return {
+            error: errorMessage(started.failure),
+            relayId,
+            started: false,
+          }
+        }
+        const imported = await Effect.runPromise(
+          Effect.result(
+            promiseEffect(() => importScheduleRun(relayId, started.success))
+          )
+        )
+        if (Result.isFailure(imported)) {
+          console.warn(
+            "[Kiln schedules] A started run could not be imported immediately",
+            imported.failure
+          )
+        }
+        return { error: null, relayId, started: true }
       })
+    )
+    publishScheduleCollectionChange(
+      results.flatMap((result) => (result.started ? [result.relayId] : []))
     )
     return {
       relays: results,
@@ -421,6 +459,26 @@ async function loadTargetDirectory(): Promise<Array<ScheduleTarget>> {
        JOIN ${databaseTable("relay")} relay ON relay.id = managed.relay_id
       WHERE relay.enabled = TRUE
       ORDER BY relay_id, kind, name`
+  )
+  return rows.map((row) =>
+    scheduleTargetSchema.parse({
+      id: row.id,
+      kind: row.kind,
+      name: row.name,
+      relayId: row.relay_id,
+    })
+  )
+}
+
+async function loadReferencedScheduleTargets(): Promise<Array<ScheduleTarget>> {
+  const [rows] = await databasePool.query<TargetDirectoryRow[]>(
+    `SELECT DISTINCT target.target_id AS id, target.target_kind AS kind,
+            target.target_name AS name, target.relay_id
+       FROM ${databaseTable("schedule_target")} target
+       JOIN ${databaseTable("schedule")} schedule
+         ON schedule.id = target.schedule_id
+      WHERE schedule.deleted_at IS NULL
+      ORDER BY target.relay_id, target.target_kind, target.target_name`
   )
   return rows.map((row) =>
     scheduleTargetSchema.parse({
@@ -1081,8 +1139,23 @@ async function importRelayScheduleOverview(
   relayId: string,
   overview: z.infer<typeof relayScheduleOverviewSchema>
 ) {
+  const [storedDeploymentIds, storedRunIds] = await Promise.all([
+    loadStoredScheduleIds(
+      "schedule_deployment",
+      "schedule_id",
+      relayId,
+      overview.deployments.map((deployment) => deployment.scheduleId)
+    ),
+    loadStoredScheduleIds(
+      "schedule_run",
+      "id",
+      relayId,
+      overview.runs.map((run) => run.id)
+    ),
+  ])
+  let changed = false
   for (const deployment of overview.deployments) {
-    await databasePool.execute(
+    const [result] = await databasePool.execute<ResultSetHeader>(
       `INSERT INTO ${databaseTable("schedule_deployment")}
          (schedule_id, relay_id, desired_revision, acknowledged_revision,
           status, next_run_at, last_error)
@@ -1105,12 +1178,46 @@ async function importRelayScheduleOverview(
         deployment.nextRunAt,
       ]
     )
+    changed ||=
+      !storedDeploymentIds.has(deployment.scheduleId) || result.affectedRows > 1
   }
-  for (const run of overview.runs) await importScheduleRun(relayId, run)
+  for (const run of overview.runs) {
+    const result = await importScheduleRun(relayId, run)
+    changed ||= !storedRunIds.has(run.id) || result.affectedRows > 1
+  }
+  if (changed) publishScheduleCollectionChange([relayId])
+}
+
+async function loadStoredScheduleIds(
+  table: "schedule_deployment" | "schedule_run",
+  idColumn: "id" | "schedule_id",
+  relayId: string,
+  ids: ReadonlyArray<string>
+): Promise<Set<string>> {
+  if (ids.length === 0) return new Set()
+  const placeholders = ids.map(() => "?").join(", ")
+  const [rows] = await databasePool.query<StoredScheduleIdRow[]>(
+    `SELECT ${idColumn} AS id
+       FROM ${databaseTable(table)}
+      WHERE relay_id = ?
+        AND ${idColumn} IN (${placeholders})`,
+    [relayId, ...ids]
+  )
+  return new Set(rows.map((row) => row.id))
+}
+
+function publishScheduleCollectionChange(relayIds: Iterable<string>): void {
+  const uniqueRelayIds = [...new Set(relayIds)]
+  if (uniqueRelayIds.length === 0) return
+  publishRealtimeChange({
+    audience: { kind: "relays", relayIds: uniqueRelayIds },
+    topics: ["schedules"],
+    type: "hearth.invalidate",
+  })
 }
 
 async function importScheduleRun(relayId: string, run: ScheduleRun) {
-  await databasePool.execute(
+  const [result] = await databasePool.execute<ResultSetHeader>(
     `INSERT INTO ${databaseTable("schedule_run")}
        (id, schedule_id, relay_id, scheduled_at, status, run_json)
      VALUES (?, ?, ?, FROM_UNIXTIME(? / 1000), ?, ?)
@@ -1125,6 +1232,7 @@ async function importScheduleRun(relayId: string, run: ScheduleRun) {
       JSON.stringify(run),
     ]
   )
+  return result
 }
 
 async function upsertDeployment(

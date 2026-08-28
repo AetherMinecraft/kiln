@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test"
 import type { RelayInstance, RelaySnapshot } from "@workspace/contracts"
+import { builtinTailscaleBrickId } from "@workspace/contracts"
 
 import {
   addRelayInstanceToSnapshot,
@@ -22,6 +23,7 @@ import {
   selectInstanceWorkspaceInstance,
   selectRouteInstances,
   selectServerListInstances,
+  selectSidebarInstanceCount,
   selectSidebarInstances,
 } from "@/lib/relay-selectors"
 
@@ -107,6 +109,24 @@ describe("Relay render selectors", () => {
     ).toMatchObject({ status: "found", instance: { id: created.id } })
   })
 
+  it("never replaces a canonical live instance with a stale create response", () => {
+    const snapshot = snapshotWithCpu(1)
+    const staleCreateResponse = {
+      ...instance,
+      name: "Stale provisioning response",
+      provisioning: { attempt: 1, error: null, phase: "preparing" },
+    } satisfies RelayInstance
+
+    const updated = addRelayInstanceToSnapshot(snapshot, staleCreateResponse, {
+      id: "relay-one",
+      name: "Relay one",
+    })
+
+    expect(updated).toBe(snapshot)
+    expect(updated?.instances[0]).toMatchObject({ name: "Test server" })
+    expect(updated?.instances[0]).not.toHaveProperty("provisioning")
+  })
+
   it("keeps sidebar and workspace data unchanged across resource samples", () => {
     const before = snapshotWithCpu(1)
     const after = snapshotWithCpu(2)
@@ -123,6 +143,22 @@ describe("Relay render selectors", () => {
     expect(selectInstanceSettings(instance.id)(after)).toEqual(
       selectInstanceSettings(instance.id)(before)
     )
+  })
+
+  it("keeps internal Tailscale nodes out of server navigation", () => {
+    const snapshot = snapshotWithCpu(1)
+    snapshot.instances.push({
+      ...snapshot.instances[0]!,
+      brickId: builtinTailscaleBrickId,
+      id: "b".repeat(40),
+      routeId: "relay-one-bbbbbbbb",
+      shortId: "bbbbbbbb",
+    })
+
+    expect(selectSidebarInstanceCount(snapshot)).toBe(1)
+    expect(selectSidebarInstances(snapshot).map(({ id }) => id)).toEqual([
+      instance.id,
+    ])
   })
 
   it("continues publishing each resource sample to the runtime subscriber", () => {
@@ -218,6 +254,29 @@ describe("Relay render selectors", () => {
     })
 
     expect(updated?.instances[0]?.connectAddress).toBe("ember-falls.kiln.site")
+  })
+
+  it("clears optional Relay fields while retaining fleet metadata", () => {
+    const current = snapshotWithCpu(1)
+    const first = current.instances[0]
+    if (!first) throw new Error("Expected Relay fixture")
+    current.instances[0] = {
+      ...first,
+      provisioning: {
+        attempt: 1,
+        error: null,
+        phase: "finalizing",
+      },
+    }
+
+    const updated = replaceRelaySnapshotInstance(current, first)
+
+    expect(updated?.instances[0]).not.toHaveProperty("provisioning")
+    expect(updated?.instances[0]).toMatchObject({
+      relayName: "Relay one",
+      relayStatus: "connected",
+      routeId: "relay-one-aaaaaaaa",
+    })
   })
 
   it("selects connectivity from the instance's Relay when IDs collide", () => {
