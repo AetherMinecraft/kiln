@@ -5,6 +5,9 @@ import { WebSocket } from "ws"
 
 import {
   RelayControlServerMessageSchema,
+  applyRelaySnapshotDelta,
+  createRelaySnapshotDelta,
+  isAuditedRelayControlOperation,
   relayAuthenticationWindowMs,
   relayAuthChallengeTranscript,
   relayAuthResponseTranscript,
@@ -12,11 +15,16 @@ import {
   relayControlMaxFrameBytes,
   relayControlRequestTimeoutMs,
   relayControlProtocol,
+  relaySnapshotDeltaFeature,
+  relaySnapshotDeltaSchema,
+  relaySnapshotSchema,
 } from "@workspace/contracts"
 import type {
   RelayAuthChallenge,
   RelayControlOperation,
   RelayControlRequest,
+  RelaySnapshot,
+  RelaySnapshotDelta,
 } from "@workspace/contracts"
 import { relayTailscaleStackIdSchema } from "@workspace/contracts"
 import { z } from "zod"
@@ -30,6 +38,7 @@ import { forkAppEffect, runAppEffect } from "@/effect/runtime"
 import type { RelayCredentials } from "@/lib/relay-registry"
 import { resolveSftpAuthorization } from "@/lib/sftp-authorization"
 import { relayControlFailureError } from "@/lib/relay-control-errors"
+import { publishRealtimeChange } from "@/lib/realtime-source.server"
 
 export { relayControlEndpoint }
 export type { RelayEndpoint }
@@ -74,12 +83,10 @@ export async function relayRpc(
 ): Promise<unknown> {
   const effectiveRelay = relayControlEndpoint(relay)
   let connection = connections.get(relay.id)
-  // Vite preserves global state across SSR reloads, but class prototypes change.
-  if (connection && !(connection instanceof RelayConnection)) {
-    connection.close()
-    connections.delete(relay.id)
-    connection = undefined
-  }
+  // Vite preserves this global registry across SSR reloads. Existing instances
+  // remain usable through their own prototype; replacing them based on
+  // instanceof lets old and new module generations continuously evict each
+  // other while long-lived requests are still active.
   if (connection && !connection.matches(effectiveRelay)) {
     connection.close()
     connections.delete(relay.id)
@@ -89,10 +96,19 @@ export async function relayRpc(
     connection = new RelayConnection(effectiveRelay)
     connections.set(relay.id, connection)
   }
-  return runAppEffect(
+  const result = await runAppEffect(
     `relay.rpc.${operation}`,
     connection.request(operation, payload, timeoutMs, subject)
   )
+  if (subject && isAuditedRelayControlOperation(operation)) {
+    publishRealtimeChange({
+      audience: { kind: "relays", relayIds: [relay.id] },
+      scope: { relayId: relay.id },
+      topics: ["activity"],
+      type: "hearth.invalidate",
+    })
+  }
+  return result
 }
 
 export function relayConnectionState(relayId: string): RelayConnectionState {
@@ -106,8 +122,9 @@ export function relayConnectionState(relayId: string): RelayConnectionState {
 }
 
 export function closeRelayConnection(relayId: string): void {
-  connections.get(relayId)?.close()
+  const connection = connections.get(relayId)
   connections.delete(relayId)
+  connection?.close()
 }
 
 class RelayConnection {
@@ -129,7 +146,7 @@ class RelayConnection {
     }
   >()
   #hasPushedSnapshot = false
-  #pushedSnapshot: unknown = null
+  #pushedSnapshot: RelaySnapshot | null = null
   #eventSequence = 0
   #relay: RelayEndpoint
   #reconnectFiber: Fiber.Fiber<void, unknown> | null = null
@@ -285,6 +302,7 @@ class RelayConnection {
       this.#setState("connecting", null)
       this.#eventSequence = 0
       this.#hasPushedSnapshot = false
+      this.#pushedSnapshot = null
       this.#socket = null
       const { loadRelayCredentials } = yield* Effect.tryPromise({
         try: () => import("@/lib/relay-registry"),
@@ -432,9 +450,62 @@ class RelayConnection {
           }
           this.#eventSequence = message.seq
           if (message.event === "relay.snapshot") {
-            this.#pushedSnapshot = message.payload
+            const snapshot = relaySnapshotSchema.safeParse(message.payload)
+            if (!snapshot.success) {
+              resume(relayConnectionFailure("Relay sent an invalid snapshot"))
+              activeSocket.close(4400, "Relay snapshot is invalid")
+              return
+            }
+            const previousSnapshot = this.#pushedSnapshot
+            this.#pushedSnapshot = snapshot.data
             this.#hasPushedSnapshot = true
+            if (!previousSnapshot) {
+              publishRealtimeChange({
+                relayId: this.#relay.id,
+                type: "relay.snapshot.reset",
+              })
+            } else {
+              const delta = createRelaySnapshotDelta(
+                previousSnapshot,
+                snapshot.data
+              )
+              if (delta) {
+                publishRealtimeChange({
+                  delta,
+                  directoryChanged: snapshotDeltaChangesDirectory(
+                    previousSnapshot,
+                    delta
+                  ),
+                  relayId: this.#relay.id,
+                  type: "relay.snapshot.delta",
+                })
+              }
+            }
             if (authenticated) resume(Effect.void)
+          } else if (message.event === "relay.snapshot.delta") {
+            const delta = relaySnapshotDeltaSchema.safeParse(message.payload)
+            if (!delta.success || !this.#pushedSnapshot) {
+              resume(
+                relayConnectionFailure("Relay sent an invalid snapshot delta")
+              )
+              activeSocket.close(4400, "Relay snapshot delta is invalid")
+              return
+            }
+            const previousSnapshot = this.#pushedSnapshot
+            this.#pushedSnapshot = applyRelaySnapshotDelta(
+              previousSnapshot,
+              delta.data
+            )
+            this.#hasPushedSnapshot = true
+            publishRealtimeChange({
+              delta: delta.data,
+              directoryChanged: snapshotDeltaChangesDirectory(
+                previousSnapshot,
+                delta.data
+              ),
+              relayId: this.#relay.id,
+              type: "relay.snapshot.delta",
+            })
           }
           return
         }
@@ -488,6 +559,7 @@ class RelayConnection {
     socket.send(
       JSON.stringify({
         clientId: credentials.clientId,
+        features: [relaySnapshotDeltaFeature],
         signature: sign(
           null,
           Buffer.from(
@@ -703,6 +775,8 @@ class RelayConnection {
   #setState(status: RelayConnectionStatus, lastError: string | null): void {
     const becameAuthenticated =
       status === "authenticated" && this.#state.status !== "authenticated"
+    const wasReachable = this.#state.status === "authenticated"
+    const isReachable = status === "authenticated"
     this.#state = { lastError, status, updatedAt: Date.now() }
     Sentry.addBreadcrumb({
       category: "relay.connection",
@@ -710,6 +784,16 @@ class RelayConnection {
       level: status === "unreachable" ? "warning" : "info",
       message: status,
     })
+    if (
+      wasReachable !== isReachable &&
+      connections.get(this.#relay.id) === this
+    ) {
+      publishRealtimeChange({
+        relayId: this.#relay.id,
+        status: isReachable ? "connected" : "unreachable",
+        type: "relay.state",
+      })
+    }
     if (becameAuthenticated) {
       forkAppEffect(
         "backups.reconcileOnConnect",
@@ -756,6 +840,17 @@ class RelayConnection {
     )
     this.#reconnectFiber = reconnecting
   }
+}
+
+function snapshotDeltaChangesDirectory(
+  previous: RelaySnapshot,
+  delta: RelaySnapshotDelta
+): boolean {
+  if (delta.deletedInstanceIds.length > 0) return true
+  return delta.instances.some(
+    (instance) =>
+      !previous.instances.some((candidate) => candidate.id === instance.id)
+  )
 }
 
 function formatHost(hostname: string): string {

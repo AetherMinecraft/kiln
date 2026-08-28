@@ -15,6 +15,7 @@ import {
 import type {
   RelayAuthChallenge,
   RelayControlClientMessage,
+  RelaySnapshot,
 } from "@workspace/contracts"
 
 vi.mock("@/lib/relay-registry", () => ({
@@ -31,8 +32,28 @@ import {
   relayRpc,
 } from "@/lib/relay-connection"
 import { loadRelayCredentials } from "@/lib/relay-registry"
+import { subscribeRealtimeChanges } from "@/lib/realtime-source.server"
 
 const relayId = "relay-connection-effect-test"
+const pushedSnapshot = {
+  instances: [],
+  node: {
+    arch: "arm64",
+    canProvisionInstances: true,
+    capabilities: [],
+    connectedAt: "2026-01-01T00:00:00.000Z",
+    cpu: { cores: 4, loadPercent: 0 },
+    docker: { available: true, version: "test" },
+    id: "node-a",
+    memory: { totalBytes: 1, usedBytes: 0 },
+    name: "Relay test node",
+    platform: "linux",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    storage: { totalBytes: 1, usedBytes: 0 },
+    uptimeSeconds: 0,
+    version: "test",
+  },
+} satisfies RelaySnapshot
 
 afterEach(() => {
   closeRelayConnection(relayId)
@@ -45,11 +66,20 @@ effectIt.effect(
     withRelayServer(
       ({ cancelled, disconnect, endpoint, reconnected, requests }) =>
         Effect.gen(function* () {
+          const activityEvents: Array<string> = []
+          const relayStates: Array<"connected" | "unreachable"> = []
+          const unsubscribe = subscribeRealtimeChanges((event) => {
+            if (event.type === "hearth.invalidate") {
+              activityEvents.push(...event.topics)
+            }
+            if (event.type === "relay.state") relayStates.push(event.status)
+          })
           const snapshot = yield* promiseEffect(() =>
             relayRpc(endpoint, "relay.snapshot", {}, 1_000)
           )
-          expect(snapshot).toEqual({ instances: [{ id: "instance-a" }] })
+          expect(snapshot).toEqual(pushedSnapshot)
           expect(requests).toHaveLength(0)
+          expect(relayStates).toEqual(["connected"])
 
           const inspection = yield* promiseEffect(() =>
             relayRpc(endpoint, "relay.system.inspect", {}, 1_000)
@@ -57,15 +87,29 @@ effectIt.effect(
           expect(inspection).toEqual({ eligible: true })
           expect(requests).toHaveLength(1)
 
+          yield* promiseEffect(() =>
+            relayRpc(
+              endpoint,
+              "relay.proxy.write",
+              { mode: "none" },
+              1_000,
+              "user-a"
+            )
+          )
+          expect(activityEvents).toEqual(["activity"])
+
           vi.spyOn(Math, "random").mockReturnValue(0)
           disconnect()
           yield* Effect.promise(() => reconnected)
           const reconnectedSnapshot = yield* promiseEffect(() =>
             relayRpc(endpoint, "relay.snapshot", {}, 1_000)
           )
-          expect(reconnectedSnapshot).toEqual({
-            instances: [{ id: "instance-a" }],
-          })
+          expect(reconnectedSnapshot).toEqual(pushedSnapshot)
+          expect(relayStates).toEqual([
+            "connected",
+            "unreachable",
+            "connected",
+          ])
 
           const timeout = yield* promiseEffect(() =>
             relayRpc(endpoint, "relay.update.status", { ignored: true }, 20)
@@ -77,6 +121,12 @@ effectIt.effect(
 
           closeRelayConnection(relayId)
           expect(relayConnectionState(relayId).status).toBe("disconnected")
+          expect(relayStates).toEqual([
+            "connected",
+            "unreachable",
+            "connected",
+          ])
+          unsubscribe()
         })
     )
 )
@@ -223,7 +273,7 @@ function authenticateRelaySocket(
         JSON.stringify({
           event: "relay.snapshot",
           id: randomUUID(),
-          payload: { instances: [{ id: "instance-a" }] },
+          payload: pushedSnapshot,
           seq: 1,
           type: "event",
           v: 1,

@@ -41,6 +41,7 @@ import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import { betterAuthSecrets, kilnPublicUrl } from "@/lib/environment"
 import { syncInstanceRegistry } from "@/lib/instance-registry"
+import { publishRealtimeChange } from "@/lib/realtime-source.server"
 
 import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
 
@@ -441,7 +442,9 @@ export async function renamePersistedRelay(
     `UPDATE ${databaseTable("relay")} SET name = ? WHERE id = ?`,
     [renamed.name, relay.id]
   )
-  return requiredPersistedRelay(relay.id)
+  const updated = await requiredPersistedRelay(relay.id)
+  publishRelayCollectionChange(relay.id)
+  return updated
 }
 
 export async function initializeRelayFromEnvironment(): Promise<PersistedRelay | null> {
@@ -684,7 +687,12 @@ async function pairWithEnvelope(
           subject
         )
       }
-      return checkPersistedRelay(envelope.relayFingerprint)
+      const checked = await inspectPersistedRelay(envelope.relayFingerprint)
+      publishRelayCollectionChange(
+        checked.id,
+        creatorUserId ? [creatorUserId] : []
+      )
+      return checked
     }).pipe(
       Effect.catch((cause) =>
         (existing
@@ -839,17 +847,21 @@ export async function updatePersistedRelay(input: {
     [input.hostname, input.port, input.useTls, input.id]
   )
   if (result.affectedRows !== 1) throw new Error("Relay not found")
-  return checkPersistedRelay(input.id)
+  const relay = await inspectPersistedRelay(input.id)
+  publishRelayCollectionChange(relay.id)
+  return relay
 }
 
-export function setPersistedRelayEnabled(
+export async function setPersistedRelayEnabled(
   id: string,
   enabled: boolean
 ): Promise<PersistedRelay> {
-  return runAppEffect(
+  const relay = await runAppEffect(
     "relays.setEnabled",
     setPersistedRelayEnabledEffect(id, enabled)
   )
+  publishRelayCollectionChange(id)
+  return relay
 }
 
 export const setPersistedRelayEnabledEffect = Effect.fn("relays.setEnabled")(
@@ -916,9 +928,16 @@ export async function deletePersistedRelay(id: string): Promise<void> {
   await runAppEffect("relay.deletePersisted", deletePersistedRelayEffect(id))
   const { closeRelayConnection } = await import("@/lib/relay-connection")
   closeRelayConnection(id)
+  publishRelayCollectionChange(id)
 }
 
 export async function checkPersistedRelay(id: string): Promise<PersistedRelay> {
+  const checked = await inspectPersistedRelay(id)
+  if (checked.enabled) publishRelayHealthChange(id)
+  return checked
+}
+
+async function inspectPersistedRelay(id: string): Promise<PersistedRelay> {
   const relay = (await listPersistedRelays()).find((item) => item.id === id)
   if (!relay) throw new Error("Relay not found")
   if (!relay.enabled) return relay
@@ -933,12 +952,11 @@ export async function checkPersistedRelay(id: string): Promise<PersistedRelay> {
       await databasePool.execute(
         `UPDATE ${databaseTable("relay")}
           SET last_connected_at = ?, last_error = NULL,
-              name = ?, managed_ember_count = ?, node_arch = ?,
+              managed_ember_count = ?, node_arch = ?,
               node_platform = ?, node_version = ?
         WHERE id = ?`,
         [
           new Date(),
-          snapshot.node.name,
           snapshot.instances.filter((instance) => instance.managedByRelay)
             .length,
           snapshot.node.arch,
@@ -962,6 +980,26 @@ export async function checkPersistedRelay(id: string): Promise<PersistedRelay> {
   const checked = (await listPersistedRelays()).find((item) => item.id === id)
   if (!checked) throw new Error("Relay not found")
   return checked
+}
+
+function publishRelayCollectionChange(
+  relayId: string,
+  userIds: Array<string> = []
+): void {
+  publishRealtimeChange({
+    relayId,
+    type: "relay.metadata",
+    ...(userIds.length > 0 ? { userIds: [...new Set(userIds)] } : {}),
+  })
+}
+
+function publishRelayHealthChange(relayId: string): void {
+  publishRealtimeChange({
+    audience: { kind: "relays", relayIds: [relayId] },
+    scope: { relayId },
+    topics: ["relay-health"],
+    type: "hearth.invalidate",
+  })
 }
 
 export async function resolveDefaultRelay(): Promise<PersistedRelay | null> {

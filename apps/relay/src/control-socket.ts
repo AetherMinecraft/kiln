@@ -19,6 +19,8 @@ import {
   relayControlMaxFrameBytes,
   relayControlRequestTimeoutMs,
   relayControlProtocol,
+  relaySnapshotDeltaFeature,
+  isAuditedRelayControlOperation,
 } from "@workspace/contracts"
 import type {
   RelayAuthChallenge,
@@ -28,11 +30,13 @@ import type {
   RelayControlRequest,
   RelayControlResponse,
   RelayControlOperation,
+  RelaySnapshot,
 } from "@workspace/contracts"
 
 import { actionsForRole, isActionAllowed } from "./permissions.js"
 import { relayBuildLabel } from "./build-info.js"
 import { isSourceAllowed } from "./source-policy.js"
+import { createRelaySnapshotDelta } from "./snapshot-delta.js"
 import type { RelayAction } from "./permissions.js"
 import type { RelayIdentity } from "./effect/identity.js"
 import type { RelayClientGrant, RelayStateStore } from "./effect/state.js"
@@ -257,6 +261,8 @@ function authenticateSocket(
   let authenticatedClient: RelayClientGrant | null = null
   let unsubscribeSnapshots: (() => void) | null = null
   let eventSequence = 0
+  let previousSnapshot: RelaySnapshot | null = null
+  let snapshotDeltasEnabled = false
   const inFlight = new Map<
     string,
     {
@@ -305,7 +311,11 @@ function authenticateSocket(
         return
       }
       authenticationAttempt = Effect.runFork(
-        authenticateClientEffect(message.clientId, message.signature).pipe(
+        authenticateClientEffect(
+          message.clientId,
+          message.signature,
+          message.features ?? []
+        ).pipe(
           Effect.catch(() =>
             Effect.sync(() => {
               socket.close(4401, "Authentication failed")
@@ -399,7 +409,8 @@ function authenticateSocket(
 
   function authenticateClientEffect(
     clientId: string,
-    signature: string
+    signature: string,
+    features: ReadonlyArray<string>
   ): EffectType.Effect<void, Error> {
     return Effect.gen(function* () {
       if (Date.now() > challenge.expiresAt || authenticatedClient) {
@@ -421,6 +432,7 @@ function authenticateSocket(
       ) {
         return yield* controlFailure("Invalid Hearth identity proof")
       }
+      snapshotDeltasEnabled = features.includes(relaySnapshotDeltaFeature)
       yield* completedAuthenticationEffect(client)
     })
   }
@@ -609,10 +621,14 @@ function authenticateSocket(
         v: 1,
       }
       send(socket, ready)
+      const initialSnapshot = (yield* promiseOperation(
+        options.initialSnapshot
+      )) as RelaySnapshot
+      previousSnapshot = initialSnapshot
       const snapshot: RelayControlEvent = {
         event: "relay.snapshot",
         id: randomUUID(),
-        payload: yield* promiseOperation(options.initialSnapshot),
+        payload: initialSnapshot,
         seq: ++eventSequence,
         type: "event",
         v: 1,
@@ -620,10 +636,28 @@ function authenticateSocket(
       send(socket, snapshot)
       if (socket.readyState !== WebSocket.OPEN) return
       unsubscribeSnapshots = options.subscribeSnapshots((payload) => {
+        const previous = previousSnapshot
+        const next = payload as RelaySnapshot
+        previousSnapshot = next
+        if (!previous) return
+        if (!snapshotDeltasEnabled) {
+          const update: RelayControlEvent = {
+            event: "relay.snapshot",
+            id: randomUUID(),
+            payload: next,
+            seq: ++eventSequence,
+            type: "event",
+            v: 1,
+          }
+          send(socket, update)
+          return
+        }
+        const delta = createRelaySnapshotDelta(previous, next)
+        if (!delta) return
         const update: RelayControlEvent = {
-          event: "relay.snapshot",
+          event: "relay.snapshot.delta",
           id: randomUUID(),
-          payload,
+          payload: delta,
           seq: ++eventSequence,
           type: "event",
           v: 1,
@@ -708,47 +742,7 @@ function reverseRequestCancellationGraceMs(
 }
 
 export function isAuditedOperation(operation: RelayControlOperation): boolean {
-  return (
-    operation === "relay.rename" ||
-    operation === "relay.update.apply" ||
-    operation === "relay.pairing.create" ||
-    operation === "relay.pairing.revoke" ||
-    operation === "relay.clients.update" ||
-    operation === "relay.clients.revoke" ||
-    operation === "relay.networking.write" ||
-    operation === "relay.tailscale.install" ||
-    operation === "relay.tailscale.stack.apply" ||
-    operation === "relay.tailscale.stack.dns" ||
-    operation === "relay.tailscale.stack.remove" ||
-    operation === "relay.tailscale.write" ||
-    operation === "relay.proxy.write" ||
-    operation === "instance.create" ||
-    operation === "instance.provision.prepare" ||
-    operation === "instance.provision.claim" ||
-    operation === "instance.provision.cancel" ||
-    operation === "instance.startup.write" ||
-    operation === "instance.rename" ||
-    operation === "instance.delete" ||
-    operation === "instance.action" ||
-    operation === "instance.files.write" ||
-    operation === "instance.files.upload-url" ||
-    operation === "instance.files.mutate" ||
-    operation === "instance.console.write" ||
-    operation === "instance.network.ports.write" ||
-    operation === "instance.network.routes.write" ||
-    operation === "database.create" ||
-    operation === "database.delete" ||
-    operation === "database.action" ||
-    operation === "database.credentials.rotate" ||
-    operation === "database.network.write" ||
-    operation === "database.dump.export" ||
-    operation === "database.dump.import" ||
-    operation === "backup.task.enqueue" ||
-    operation === "backup.task.cancel" ||
-    operation === "schedule.apply" ||
-    operation === "schedule.run" ||
-    operation === "schedule.remove"
-  )
+  return isAuditedRelayControlOperation(operation)
 }
 
 export function auditDetailsForRequest(

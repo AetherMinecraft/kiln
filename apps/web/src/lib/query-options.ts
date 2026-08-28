@@ -101,6 +101,8 @@ export const queryKeys = {
     directory: ["databases", "directory"] as const,
     list: ["databases", "list"] as const,
   },
+  fileActivity: (relayId: string, instanceId: string) =>
+    ["file-activity", relayId, instanceId] as const,
   relay: {
     all: ["relay"] as const,
     connection: ["relay", "connection"] as const,
@@ -116,11 +118,12 @@ export const queryKeys = {
         "content",
         path,
       ] as const,
-    fileActivity: (relayId: string, instanceId: string) =>
-      ["relay", relayId, "instances", instanceId, "files", "activity"] as const,
     recipe: (relayId: string, instanceId: string) =>
       ["relay", relayId, "instances", instanceId, "recipe"] as const,
     snapshot: ["relay", "snapshot"] as const,
+    instances: ["relay", "instances"] as const,
+    webRoutes: (relayId: string, instanceId: string) =>
+      ["web-routes", relayId, instanceId] as const,
     tree: (relayId: string, instanceId: string) =>
       ["relay", relayId, "instances", instanceId, "files", "tree"] as const,
   },
@@ -129,7 +132,7 @@ export const queryKeys = {
     options: ["schedules", "options"] as const,
   },
   relays: ["relays"] as const,
-  tailscale: (relayId: string) => ["relays", relayId, "tailscale"] as const,
+  tailscale: (relayId: string) => ["tailscale", "relays", relayId] as const,
   tailscaleStacks: ["tailscale", "stacks"] as const,
   updates: ["updates", "overview"] as const,
   uiPreferences: ["ui", "preferences"] as const,
@@ -177,11 +180,13 @@ function mergeRelaySnapshotInstance(
     current.publicHost === updated.publicHost &&
     current.publicPort === updated.publicPort
   return {
-    ...current,
     ...updated,
     connectAddress: endpointUnchanged
       ? current.connectAddress
       : updated.connectAddress,
+    relayName: current.relayName,
+    relayStatus: current.relayStatus,
+    routeId: current.routeId,
   }
 }
 
@@ -248,25 +253,29 @@ export function relayConnectionQueryOptions(queryClient: QueryClient) {
       const connection = await getRelayConnectionState({
         headers: relayPollHeaders,
       })
-      if (connection.status === "connected") {
+      if (
+        connection.status === "connected" ||
+        connection.status === "unreachable"
+      ) {
         // Each router owns one QueryClient per SSR request or browser session.
         // Prime that same client from the connection's canonical snapshot so
         // snapshot consumers do not make a second Relay request.
-        queryClient.setQueryData(
-          queryKeys.relay.snapshot,
-          reconcilePendingPowerSnapshot(connection.snapshot)
-        )
+        const snapshot = reconcilePendingPowerSnapshot(connection.snapshot)
+        return connectionWithCanonicalSnapshot(queryClient, {
+          ...connection,
+          snapshot,
+        })
       }
       return connection
     },
     refetchInterval: (query) => {
       if (query.state.data?.status === "paused") return false
       return query.state.data?.status === "connected"
-        ? connectedRelayPollDelayMs
+        ? false
         : disconnectedRelayPollDelayMs
     },
     refetchIntervalInBackground: false,
-    refetchOnWindowFocus: "always",
+    refetchOnWindowFocus: (query) => query.state.data?.status !== "connected",
     staleTime: connectedRelayPollDelayMs,
   })
 }
@@ -274,10 +283,49 @@ export function relayConnectionQueryOptions(queryClient: QueryClient) {
 export function relaySnapshotQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.relay.snapshot,
-    queryFn: async () =>
-      reconcilePendingPowerSnapshot(await getRelaySnapshot()),
+    queryFn: async ({ client }) =>
+      snapshotWithCanonicalState(
+        client,
+        reconcilePendingPowerSnapshot(await getRelaySnapshot())
+      ),
+    refetchOnWindowFocus: false,
     staleTime: connectedRelayPollDelayMs,
   })
+}
+
+export function snapshotWithCanonicalState(
+  queryClient: QueryClient,
+  fetched: RelayFleetSnapshot
+): RelayFleetSnapshot {
+  const connection = queryClient.getQueryData<RelayConnection>(
+    queryKeys.relay.connection
+  )
+  const cached = queryClient.getQueryData<RelayFleetSnapshot>(
+    queryKeys.relay.snapshot
+  )
+  // A connection poll can finish behind newer SSE deltas. Keep the live
+  // snapshot canonical even while every Relay is unreachable; the stream
+  // watchdog performs the authoritative recovery if SSE itself has stalled.
+  const snapshot =
+    (connection?.status === "connected" ||
+      connection?.status === "unreachable") &&
+    cached
+      ? cached
+      : fetched
+  queryClient.setQueryData(queryKeys.relay.instances, snapshot.instances)
+  return snapshot
+}
+
+export function connectionWithCanonicalSnapshot(
+  queryClient: QueryClient,
+  connection: Extract<
+    RelayConnection,
+    { status: "connected" | "unreachable" }
+  >
+): Extract<RelayConnection, { status: "connected" | "unreachable" }> {
+  const snapshot = snapshotWithCanonicalState(queryClient, connection.snapshot)
+  queryClient.setQueryData(queryKeys.relay.snapshot, snapshot)
+  return { ...connection, snapshot }
 }
 
 export function managedDatabasesQueryOptions() {
@@ -535,7 +583,7 @@ export function relayFileActivityQueryOptions(
   instanceId: string
 ) {
   return queryOptions({
-    queryKey: queryKeys.relay.fileActivity(relayId, instanceId),
+    queryKey: queryKeys.fileActivity(relayId, instanceId),
     queryFn: () => getRelayFileActivity({ data: { instanceId, relayId } }),
     staleTime: 15_000,
   })
