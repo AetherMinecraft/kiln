@@ -513,8 +513,11 @@ export const relayTailscaleInstallSchema = z
 
 export const relayTailscaleStackIdSchema = z.string().regex(/^[a-f0-9]{40}$/u)
 
+export const MAXIMUM_TAILSCALE_STACK_BINDINGS = 245
+
 export const relayTailscaleStackBindingInputSchema = z
   .object({
+    enabled: z.boolean().default(true),
     hostname: relayTailscaleSubdomainSchema,
     instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
   })
@@ -523,7 +526,9 @@ export const relayTailscaleStackBindingInputSchema = z
 export const relayTailscaleStackApplySchema = z
   .object({
     authKey: relayTailscaleInstallSchema.shape.authKey.optional(),
-    bindings: z.array(relayTailscaleStackBindingInputSchema).max(245),
+    bindings: z
+      .array(relayTailscaleStackBindingInputSchema)
+      .max(MAXIMUM_TAILSCALE_STACK_BINDINGS),
     domain: relayTailscaleDomainSchema,
     hostname: relayTailscaleHostnameSchema,
     id: relayTailscaleStackIdSchema,
@@ -990,7 +995,9 @@ export const relayTailscaleStackBindingSchema =
 
 export const relayTailscaleStackConfigSchema = z
   .object({
-    bindings: z.array(relayTailscaleStackBindingSchema).max(245),
+    bindings: z
+      .array(relayTailscaleStackBindingSchema)
+      .max(MAXIMUM_TAILSCALE_STACK_BINDINGS),
     domain: relayTailscaleDomainSchema,
     hostname: relayTailscaleHostnameSchema,
     id: relayTailscaleStackIdSchema,

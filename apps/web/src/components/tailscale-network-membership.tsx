@@ -6,29 +6,25 @@ import {
   useSuspenseQuery,
 } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
-import { Effect } from "effect"
 import {
-  Check,
-  CheckCircle2,
-  ChevronLeft,
-  ChevronRight,
+  CircleAlert,
+  Copy,
+  EllipsisVertical,
   ExternalLink,
-  Globe2,
   KeyRound,
   LoaderCircle,
   Network,
+  Pause,
   Pencil,
-  RefreshCw,
-  Route,
-  Search,
+  Play,
+  Plus,
+  Server,
   Settings2,
-  ShieldCheck,
-  TriangleAlert,
   Unplug,
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
-import { ensuringPromise, forkPromise } from "@/effect/promise"
+import { forkPromise, recoverPromise } from "@/effect/promise"
 import {
   Dialog,
   DialogContent,
@@ -37,9 +33,20 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@workspace/ui/components/dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
-import { dismissToast, showToast } from "@workspace/ui/components/sonner"
-import { Switch } from "@workspace/ui/components/switch"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@workspace/ui/components/popover"
+import { showToast } from "@workspace/ui/components/sonner"
 import {
   Tooltip,
   TooltipContent,
@@ -51,13 +58,22 @@ import {
   WorkspaceTableCell,
   WorkspaceTableHead,
   WorkspaceTableHeading,
-  createWorkspaceTableSearchStore,
-  useWorkspaceTableSearchInput,
 } from "@/components/workspace-data-table"
 import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
-import { TailscaleRelayUpdateHint } from "@/components/tailscale-relay-update-hint"
-import { relayInstanceRouteId } from "@/lib/relay-fleet"
 import {
+  BrickIcon,
+  brickIconPresentation,
+  type BrickIconDefinition,
+  type BrickIconPresentation,
+} from "@/components/brick-icon"
+import {
+  ServerPickerList,
+  serverPickerOptionKey,
+  type ServerPickerOption,
+} from "@/components/server-picker-list"
+import { TailscaleRelayUpdateHint } from "@/components/tailscale-relay-update-hint"
+import {
+  brickIconPresentationsQueryOptions,
   queryKeys,
   relaySnapshotQueryOptions,
   tailscaleStacksQueryOptions,
@@ -77,50 +93,80 @@ import {
   type TailscaleOperation,
 } from "@/lib/tailscale-operation-toasts"
 import {
-  configureTailscaleIntegration,
-  getTailscaleIntegrationStatus,
-  previewTailscaleIntegration,
   saveTailscaleStack,
-  syncTailscaleIntegration,
   type TailscaleStackOverview,
+  type TailscaleStacksResult,
 } from "@/server/tailscale"
 
 type StackBinding = TailscaleStackOverview["bindings"][number]
 type SaveStackInput = Parameters<typeof saveTailscaleStack>[0]["data"]
 
 const emptyServers: Array<TailscaleServer> = []
+const emptyBrickIcons: Array<BrickIconDefinition> = []
+const emptyServerKeys = new Set<string>()
 
-export function TailscaleNetworkMembershipPage({
-  highlightedServerKey,
-  stackId,
+export function TailscaleConnectedServersTable({
+  searchStore,
+  stack,
+  onAddServers,
+  onSetup,
 }: {
-  highlightedServerKey?: string
-  stackId: string
+  searchStore: WorkspaceTableSearchStore
+  stack: TailscaleStackOverview | null
+  onAddServers: () => void
+  onSetup: () => void
 }) {
-  const [searchStore] = React.useState(createWorkspaceTableSearchStore)
-  const { data } = useSuspenseQuery(tailscaleStacksQueryOptions())
-  const { stacks } = data
-  const { data: servers = emptyServers, isPending: serversPending } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    notifyOnChangeProps: ["data", "isPending"],
-    select: selectTailscaleServers,
-  })
-  const stack = stacks.find((candidate) => candidate.id === stackId)
-  const save = useStackMembershipMutation()
-
   if (!stack) {
     return (
-      <CenteredNetworkState>
-        This Tailscale network is no longer available.
-      </CenteredNetworkState>
+      <TailscaleEmptyTable
+        actionLabel="Setup Tailscale"
+        description="Setup Tailscale before connecting servers"
+        icon="network"
+        title="No Tailscale networks"
+        onAction={onSetup}
+      />
     )
   }
-
+  if (stack.cleanup) {
+    return <TailscaleCleanupState stack={stack} />
+  }
   return (
-    <main className="min-h-0 flex-1 overflow-y-auto bg-background/55 p-3 sm:p-5">
-      <section className="mx-auto max-w-[90rem] overflow-hidden rounded-xl border bg-card/45 [contain:paint]">
-        <TailscaleOAuthSetup key={stack.id} stack={stack} />
-        <MembershipToolbar searchStore={searchStore} stackName={stack.name} />
+    <ConnectedServersTableContent
+      searchStore={searchStore}
+      stack={stack}
+      onAddServers={onAddServers}
+    />
+  )
+}
+
+const ConnectedServersTableContent = React.memo(
+  function ConnectedServersTableContent({
+    searchStore,
+    stack,
+    onAddServers,
+  }: {
+    searchStore: WorkspaceTableSearchStore
+    stack: TailscaleStackOverview
+    onAddServers: () => void
+  }) {
+    const { data: servers = emptyServers, isPending: serversPending } =
+      useQuery({
+        ...relaySnapshotQueryOptions(),
+        notifyOnChangeProps: ["data", "isPending"],
+        select: selectTailscaleServers,
+      })
+    const connectedServers = React.useMemo(
+      () => servers.filter((server) => Boolean(findBinding(stack, server))),
+      [servers, stack]
+    )
+    const { data: bricks = emptyBrickIcons } = useQuery({
+      ...brickIconPresentationsQueryOptions(),
+      notifyOnChangeProps: ["data"],
+    })
+    const save = useStackMembershipMutation()
+
+    return (
+      <>
         {save.error ? (
           <p
             className="border-b border-destructive/25 bg-destructive/5 px-4 py-2 text-xs text-destructive"
@@ -130,917 +176,153 @@ export function TailscaleNetworkMembershipPage({
           </p>
         ) : null}
         <TailscaleMembershipTable
-          highlightedServerKey={highlightedServerKey}
+          bricks={bricks}
+          emptyActionLabel="Connect Servers"
+          emptyDescription="Connect a server to reach it through this tailnet"
+          emptyMessage="No connected servers"
           pending={save.isPending}
           searchStore={searchStore}
-          servers={servers}
+          servers={connectedServers}
           serversPending={serversPending}
           stack={stack}
           onSave={(bindings, authKey) =>
             save.mutateAsync({ authKey, bindings, stack })
           }
+          onEmptyAction={onAddServers}
         />
-      </section>
-    </main>
-  )
-}
+      </>
+    )
+  }
+)
 
-const TailscaleOAuthSetup = React.memo(function TailscaleOAuthSetup({
-  stack,
-}: {
-  stack: TailscaleStackOverview
-}) {
-  const queryClient = useQueryClient()
-  const sync = useMutation({
-    mutationFn: () => syncTailscaleIntegration({ data: { id: stack.id } }),
-    onMutate: () => {
-      showToast({
-        id: tailscaleSetupToastId(stack.id),
-        message: "Syncing Tailscale…",
-        type: "loading",
+export const TailscaleConnectServersPopover = React.memo(
+  function TailscaleConnectServersPopover({
+    open,
+    stack,
+    onOpenChange,
+  }: {
+    open: boolean
+    stack: TailscaleStackOverview | null
+    onOpenChange: (open: boolean) => void
+  }) {
+    const { data: servers = emptyServers, isPending: serversPending } =
+      useQuery({
+        ...relaySnapshotQueryOptions(),
+        notifyOnChangeProps: ["data", "isPending"],
+        select: selectTailscaleServers,
       })
-    },
-    onSuccess: (next) => {
-      queryClient.setQueryData(queryKeys.tailscaleStacks, next)
-      dismissToast(tailscaleSetupToastId(stack.id))
-      showToast({
-        id: tailscaleSetupToastId(stack.id),
-        message: "Tailscale configuration synced",
-        type: "success",
-      })
-    },
-    onError: async (cause) => {
-      await queryClient.invalidateQueries({
-        queryKey: queryKeys.tailscaleStacks,
-      })
-      dismissToast(tailscaleSetupToastId(stack.id))
-      showToast({
-        id: tailscaleSetupToastId(stack.id),
-        message: errorMessage(cause),
-        type: "error",
-      })
-    },
-  })
-  const [open, setOpen] = React.useState(false)
-  const integration = stack.integration
-  const needsAttention = Boolean(integration?.lastError)
+    const availableServers = React.useMemo(
+      () =>
+        stack
+          ? servers.filter((server) => !findBinding(stack, server))
+          : emptyServers,
+      [servers, stack]
+    )
+    const options = React.useMemo<Array<ServerPickerOption>>(
+      () =>
+        availableServers.map((server) => ({
+          description: `${server.relayName} · ${server.shortId}`,
+          disabled: !server.tailscaleSupported,
+          id: server.id,
+          kind: "server",
+          name: server.name,
+          relayId: server.relayId,
+          relayName: server.relayName,
+        })),
+      [availableServers]
+    )
+    const save = useStackMembershipMutation()
+    const pendingBinding =
+      stack && save.variables
+        ? save.variables.bindings.find(
+            (binding) =>
+              !stack.bindings.some(
+                (candidate) =>
+                  stackBindingKey(candidate) === stackBindingKey(binding)
+              )
+          )
+        : undefined
+    const pendingKey = pendingBinding
+      ? serverPickerOptionKey({
+          id: pendingBinding.instanceId,
+          name: "",
+          relayId: pendingBinding.relayId,
+          relayName: "",
+          kind: "server",
+        })
+      : undefined
 
-  return (
-    <>
-      <div className="flex min-h-16 items-center gap-3 border-b bg-background/40 px-4 py-3">
-        <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border/70 bg-background/60">
-          {needsAttention ? (
-            <TriangleAlert className="size-4 text-amber-400" />
-          ) : integration ? (
-            <ShieldCheck className="size-4 text-emerald-400" />
-          ) : (
-            <KeyRound className="size-4 text-primary" />
-          )}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <h2 className="truncate text-xs font-semibold">Tailnet setup</h2>
-            <span
-              className={
-                needsAttention
-                  ? "type-technical-label text-amber-400"
-                  : integration
-                    ? "type-technical-label text-emerald-400"
-                    : "type-technical-label text-muted-foreground"
-              }
-            >
-              {needsAttention
-                ? "Needs attention"
-                : integration
-                  ? "Connected"
-                  : "Not configured"}
-            </span>
-          </div>
-          <p className="type-meta truncate font-mono text-muted-foreground">
-            {integration
-              ? `${integration.clientId} · ${integration.tags.join(", ")}`
-              : `*.${stack.domain}`}
-          </p>
-        </div>
-        {integration ? (
+    const connectServer = React.useCallback(
+      (option: ServerPickerOption) => {
+        if (!stack) return
+        const server = availableServers.find(
+          (candidate) =>
+            candidate.id === option.id && candidate.relayId === option.relayId
+        )
+        if (!server) return
+        const hostname = uniqueHostname(stack, server)
+        save.mutate({
+          bindings: [
+            ...stack.bindings,
+            {
+              address: "",
+              enabled: true,
+              hostname,
+              instanceId: server.id,
+              relayId: server.relayId,
+              relayName: server.relayName,
+            },
+          ],
+          stack,
+        })
+        onOpenChange(false)
+      },
+      [availableServers, onOpenChange, save, stack]
+    )
+
+    return (
+      <Popover open={open && Boolean(stack)} onOpenChange={onOpenChange}>
+        <PopoverTrigger asChild>
           <Button
             type="button"
             size="sm"
-            variant={needsAttention ? "default" : "outline"}
-            disabled={sync.isPending}
-            onClick={() => sync.mutate()}
+            disabled={!stack || Boolean(stack.cleanup) || save.isPending}
           >
-            {sync.isPending ? (
+            {save.isPending ? (
               <LoaderCircle className="animate-spin" />
             ) : (
-              <RefreshCw />
+              <Plus />
             )}
-            Sync
+            Connect Servers
           </Button>
-        ) : null}
-        <Button
-          type="button"
-          size="sm"
-          variant={integration ? "ghost" : "default"}
-          onClick={() => setOpen(true)}
+        </PopoverTrigger>
+        <PopoverContent
+          align="end"
+          className="w-[min(28rem,calc(100vw-2rem))] p-1.5"
         >
-          {integration ? <Settings2 /> : <KeyRound />}
-          {integration ? "Manage" : "Set up"}
-        </Button>
-      </div>
-      {open ? (
-        <TailscaleSetupDialog open stack={stack} onOpenChange={setOpen} />
-      ) : null}
-    </>
-  )
-})
-
-type SetupPreview = Awaited<ReturnType<typeof previewTailscaleIntegration>>
-
-const setupSteps = ["Credentials", "Domain", "DNS", "Routes", "Ready"] as const
-
-const TailscaleSetupDialog = React.memo(function TailscaleSetupDialog({
-  open,
-  stack,
-  onOpenChange,
-}: {
-  open: boolean
-  stack: TailscaleStackOverview
-  onOpenChange: (open: boolean) => void
-}) {
-  const queryClient = useQueryClient()
-  const [step, setStep] = React.useState(0)
-  const [clientId, setClientId] = React.useState(
-    stack.integration?.clientId ?? ""
-  )
-  const [clientSecret, setClientSecret] = React.useState("")
-  const [tag, setTag] = React.useState(stack.integration?.tags[0] ?? "tag:kiln")
-  const [domain, setDomain] = React.useState(stack.domain)
-  const [preview, setPreview] = React.useState<SetupPreview | null>(null)
-  const [dnsApproved, setDnsApproved] = React.useState(false)
-  const [routesApproved, setRoutesApproved] = React.useState(false)
-  const [complete, setComplete] = React.useState(false)
-  const clientIdFieldId = React.useId()
-  const clientSecretFieldId = React.useId()
-  const tagFieldId = React.useId()
-  const domainFieldId = React.useId()
-
-  const authenticate = useMutation({
-    mutationFn: (candidateDomain: string) =>
-      previewTailscaleIntegration({
-        data: {
-          clientId: clientId.trim(),
-          clientSecret: clientSecret.trim(),
-          domain: normalizeTailscaleDomain(candidateDomain),
-          id: stack.id,
-          tag: tag.trim(),
-        },
-      }),
-    onSuccess: (result) => setPreview(result),
-  })
-  const apply = useMutation({
-    mutationFn: async () => {
-      const nextDomain = normalizeTailscaleDomain(domain)
-      if (nextDomain !== stack.domain) {
-        await saveTailscaleStack({
-          data: stackSaveInput(stack, stack.bindings, undefined, nextDomain),
-        })
-      }
-      const input = {
-        clientId: clientId.trim(),
-        clientSecret: clientSecret.trim(),
-        domain: nextDomain,
-        id: stack.id,
-        previousDomain: stack.domain,
-        tag: tag.trim(),
-      }
-      const result = await Effect.runPromise(
-        Effect.tryPromise({
-          try: () => configureTailscaleIntegration({ data: input }),
-          catch: (cause) => cause,
-        }).pipe(
-          Effect.catch((cause) =>
-            isNetworkChangeError(cause)
-              ? Effect.tryPromise({
-                  try: () => recoverTailscaleIntegrationStatus(stack.id, cause),
-                  catch: (recoveryCause) => recoveryCause,
-                })
-              : Effect.fail(cause)
-          )
-        )
-      )
-      if (!tailscaleSetupVerified(result.inspection)) {
-        throw new Error(
-          "Tailscale accepted the changes, but DNS or route verification is still pending"
-        )
-      }
-      return result
-    },
-    onMutate: () => {
-      showToast({
-        id: tailscaleSetupToastId(stack.id),
-        message: "Configuring your Tailnet…",
-        type: "loading",
-      })
-    },
-    onSuccess: (result) => {
-      queryClient.setQueryData(queryKeys.tailscaleStacks, result.stacks)
-      setPreview((current) =>
-        current ? { ...current, inspection: result.inspection } : current
-      )
-      setClientSecret("")
-      setComplete(true)
-      dismissToast(tailscaleSetupToastId(stack.id))
-      showToast({
-        id: tailscaleSetupToastId(stack.id),
-        message: "Your Tailscale network is ready",
-        type: "success",
-      })
-    },
-    onError: async (cause) => {
-      await queryClient.invalidateQueries({
-        queryKey: queryKeys.tailscaleStacks,
-      })
-      dismissToast(tailscaleSetupToastId(stack.id))
-      showToast({
-        id: tailscaleSetupToastId(stack.id),
-        message: errorMessage(cause),
-        type: "error",
-      })
-    },
-  })
-
-  const inspection = preview?.inspection
-  const pending = authenticate.isPending || apply.isPending
-  const error = authenticate.error ?? apply.error
-
-  const goBack = () => {
-    if (pending || complete) return
-    setStep((current) => Math.max(0, current - 1))
-  }
-
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(nextOpen) => {
-        if (!pending) onOpenChange(nextOpen)
-      }}
-    >
-      <DialogContent className="overflow-hidden p-0 sm:max-w-2xl">
-        <DialogHeader className="border-b border-border/70 px-5 pt-5 pb-4">
-          <DialogTitle>Set up Tailscale</DialogTitle>
-          <DialogDescription>
-            Connect {stack.name} to its private DNS and routes.
-          </DialogDescription>
-        </DialogHeader>
-        <SetupStepRail activeStep={step} complete={complete} />
-        <div className="min-h-[22rem] px-5 py-5">
-          {step === 0 ? (
-            <SetupCredentialsStep
-              authenticated={Boolean(preview)}
-              clientId={clientId}
-              clientIdFieldId={clientIdFieldId}
-              clientSecret={clientSecret}
-              clientSecretFieldId={clientSecretFieldId}
-              error={authenticate.error}
-              pending={authenticate.isPending}
-              tag={tag}
-              tagFieldId={tagFieldId}
-              onClientIdChange={(value) => {
-                setClientId(value)
-                setPreview(null)
-                authenticate.reset()
-              }}
-              onClientSecretChange={(value) => {
-                setClientSecret(value)
-                setPreview(null)
-                authenticate.reset()
-              }}
-              onTagChange={(value) => {
-                setTag(value)
-                setPreview(null)
-                authenticate.reset()
-              }}
-              onAuthenticate={() =>
-                authenticate.mutate(normalizeTailscaleDomain(domain))
-              }
-            />
-          ) : null}
-          {step === 1 ? (
-            <SetupDomainStep
-              domain={domain}
-              fieldId={domainFieldId}
-              onChange={(value) => {
-                setDomain(value)
-                setDnsApproved(false)
-                setRoutesApproved(false)
-              }}
-            />
-          ) : null}
-          {step === 2 && inspection ? (
-            <SetupDnsStep
-              approved={dnsApproved}
-              domain={normalizeTailscaleDomain(domain)}
-              inspection={inspection}
-              onApprovedChange={setDnsApproved}
-            />
-          ) : null}
-          {step === 3 && inspection ? (
-            <SetupRoutesStep
-              approved={routesApproved}
-              routes={inspection.routes}
-              onApprovedChange={setRoutesApproved}
-            />
-          ) : null}
-          {step === 4 ? (
-            <SetupReadyStep
-              complete={complete}
-              domain={normalizeTailscaleDomain(domain)}
-              inspection={inspection}
-              networkName={stack.name}
-              pending={apply.isPending}
-            />
-          ) : null}
-          {error && step !== 0 ? (
-            <SetupResult
-              tone="error"
-              title="Setup could not continue"
-              value={errorMessage(error)}
-            />
-          ) : null}
-        </div>
-        <DialogFooter className="sm:justify-between">
-          <Button
-            type="button"
-            variant="ghost"
-            disabled={pending || complete || step === 0}
-            onClick={goBack}
-          >
-            <ChevronLeft />
-            Back
-          </Button>
-          <div className="flex flex-col-reverse gap-2 sm:flex-row">
-            <Button
-              type="button"
-              variant="ghost"
-              disabled={pending}
-              onClick={() => onOpenChange(false)}
-            >
-              {complete ? "Close" : "Cancel"}
-            </Button>
-            {!complete ? (
-              <Button
-                type="button"
-                disabled={
-                  pending ||
-                  (step === 0 && !preview) ||
-                  (step === 1 && !normalizeTailscaleDomain(domain)) ||
-                  (step === 2 && !dnsApproved) ||
-                  (step === 3 && !routesApproved)
-                }
-                onClick={() => {
-                  if (step === 1) {
-                    authenticate.mutate(normalizeTailscaleDomain(domain), {
-                      onSuccess: () => setStep(2),
-                    })
-                    return
-                  }
-                  if (step === 4) {
-                    apply.mutate()
-                    return
-                  }
-                  setStep((current) =>
-                    Math.min(setupSteps.length - 1, current + 1)
-                  )
-                }}
-              >
-                {pending ? (
-                  <LoaderCircle className="animate-spin" />
-                ) : step === 4 ? (
-                  <Check />
-                ) : (
-                  <ChevronRight />
-                )}
-                {step === 0
-                  ? "Continue"
-                  : step === 1
-                    ? "Review DNS"
-                    : step === 2
-                      ? "Review routes"
-                      : step === 3
-                        ? "Final review"
-                        : "Apply setup"}
-              </Button>
-            ) : null}
-          </div>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-})
-
-function SetupStepRail({
-  activeStep,
-  complete,
-}: {
-  activeStep: number
-  complete: boolean
-}) {
-  return (
-    <ol
-      className="grid grid-cols-5 border-b border-border/70 bg-background/35"
-      aria-label="Tailscale setup progress"
-    >
-      {setupSteps.map((label, index) => {
-        const finished = complete || index < activeStep
-        const active = index === activeStep
-        return (
-          <li
-            key={label}
-            aria-current={active ? "step" : undefined}
-            className="relative flex min-w-0 flex-col items-center gap-1 px-1 py-3"
-          >
-            <span
-              className={
-                finished
-                  ? "grid size-5 place-items-center rounded-full bg-emerald-500/15 text-emerald-400"
-                  : active
-                    ? "grid size-5 place-items-center rounded-full bg-primary text-primary-foreground"
-                    : "grid size-5 place-items-center rounded-full border border-border text-muted-foreground"
-              }
-            >
-              {finished ? (
-                <Check className="size-3" />
-              ) : (
-                <span className="type-meta font-mono">{index + 1}</span>
-              )}
-            </span>
-            <span
-              className={
-                active || finished
-                  ? "type-label truncate"
-                  : "type-meta truncate text-muted-foreground"
-              }
-            >
-              {label}
-            </span>
-            {active ? (
-              <span className="absolute inset-x-3 bottom-0 h-0.5 bg-primary" />
-            ) : null}
-          </li>
-        )
-      })}
-    </ol>
-  )
-}
-
-function SetupCredentialsStep({
-  authenticated,
-  clientId,
-  clientIdFieldId,
-  clientSecret,
-  clientSecretFieldId,
-  error,
-  pending,
-  tag,
-  tagFieldId,
-  onAuthenticate,
-  onClientIdChange,
-  onClientSecretChange,
-  onTagChange,
-}: {
-  authenticated: boolean
-  clientId: string
-  clientIdFieldId: string
-  clientSecret: string
-  clientSecretFieldId: string
-  error: Error | null
-  pending: boolean
-  tag: string
-  tagFieldId: string
-  onAuthenticate: () => void
-  onClientIdChange: (value: string) => void
-  onClientSecretChange: (value: string) => void
-  onTagChange: (value: string) => void
-}) {
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-3">
-        <SetupHeading icon={KeyRound} title="OAuth credentials" />
-        <Button asChild type="button" size="sm" variant="ghost">
-          <a
-            href="https://login.tailscale.com/admin/settings/oauth"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Create credential
-            <ExternalLink />
-          </a>
-        </Button>
-      </div>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <SetupField label="Client ID" fieldId={clientIdFieldId}>
-          <Input
-            id={clientIdFieldId}
-            aria-label="OAuth client ID"
-            value={clientId}
-            onChange={(event) => onClientIdChange(event.target.value)}
-            autoCapitalize="none"
-            autoCorrect="off"
-            autoComplete="off"
-            placeholder="k…CNTRL"
-            className="font-mono"
+          <ServerPickerList
+            ariaLabel="Servers available to connect"
+            emptyMessage={
+              serversPending
+                ? "Loading servers…"
+                : "Every available server is already connected."
+            }
+            pendingKey={pendingKey}
+            searchPlaceholder="Search servers"
+            selectedKeys={emptyServerKeys}
+            servers={options}
+            onSelect={connectServer}
           />
-        </SetupField>
-        <SetupField label="Client secret" fieldId={clientSecretFieldId}>
-          <Input
-            id={clientSecretFieldId}
-            aria-label="OAuth client secret"
-            value={clientSecret}
-            onChange={(event) => onClientSecretChange(event.target.value)}
-            type="password"
-            autoCapitalize="none"
-            autoCorrect="off"
-            autoComplete="off"
-            placeholder="tskey-client-…"
-            className="font-mono"
-          />
-        </SetupField>
-      </div>
-      <SetupField label="Device tag" fieldId={tagFieldId}>
-        <Input
-          id={tagFieldId}
-          aria-label="Tailscale device tag"
-          value={tag}
-          onChange={(event) => onTagChange(event.target.value)}
-          autoCapitalize="none"
-          autoCorrect="off"
-          autoComplete="off"
-          placeholder="tag:kiln"
-          className="max-w-xs font-mono"
-        />
-      </SetupField>
-      <div className="flex min-h-16 items-center gap-3 border border-border/70 bg-background/35 p-3">
-        <div className="min-w-0 flex-1">
-          {authenticated ? (
-            <SetupResult
-              tone="success"
-              title="Authentication successful"
-              value="The credential has every scope and the selected device tag Kiln needs."
-            />
-          ) : error ? (
-            <SetupResult
-              tone="error"
-              title="Authentication failed"
-              value={errorMessage(error)}
-            />
-          ) : (
-            <p className="type-meta font-mono text-muted-foreground">
-              auth_keys · devices:core · devices:routes · dns
+          {save.error ? (
+            <p className="px-2.5 py-2 text-xs text-destructive" role="alert">
+              {errorMessage(save.error)}
             </p>
-          )}
-        </div>
-        <Button
-          type="button"
-          size="sm"
-          variant={authenticated ? "outline" : "default"}
-          disabled={
-            pending || !clientId.trim() || !clientSecret.trim() || !tag.trim()
-          }
-          onClick={onAuthenticate}
-        >
-          {pending ? (
-            <LoaderCircle className="animate-spin" />
-          ) : authenticated ? (
-            <Check />
-          ) : (
-            <KeyRound />
-          )}
-          {authenticated ? "Verified" : "Authenticate"}
-        </Button>
-      </div>
-    </div>
-  )
-}
-
-function SetupDomainStep({
-  domain,
-  fieldId,
-  onChange,
-}: {
-  domain: string
-  fieldId: string
-  onChange: (value: string) => void
-}) {
-  return (
-    <div className="space-y-5">
-      <SetupHeading icon={Globe2} title="Private domain" />
-      <SetupField label="Network TLD or subdomain" fieldId={fieldId}>
-        <Input
-          id={fieldId}
-          aria-label="Network TLD or subdomain"
-          value={domain}
-          onChange={(event) => onChange(event.target.value)}
-          autoCapitalize="none"
-          autoCorrect="off"
-          placeholder="test or mc.server"
-          className="max-w-sm font-mono"
-          autoFocus
-        />
-      </SetupField>
-      <div className="border border-border/70 bg-background/35 p-4">
-        <span className="type-technical-label text-muted-foreground">
-          Server address
-        </span>
-        <p className="mt-2 truncate font-mono text-sm">
-          1.21.11.paper.{normalizeTailscaleDomain(domain) || "test"}
-        </p>
-      </div>
-    </div>
-  )
-}
-
-function SetupDnsStep({
-  approved,
-  domain,
-  inspection,
-  onApprovedChange,
-}: {
-  approved: boolean
-  domain: string
-  inspection: SetupPreview["inspection"]
-  onApprovedChange: (approved: boolean) => void
-}) {
-  const {
-    currentResolvers,
-    desiredResolvers,
-    previousDomain,
-    previousResolvers,
-  } = inspection.dns
-  const replaces =
-    currentResolvers.length > 0 &&
-    !sameStrings(currentResolvers, desiredResolvers)
-  return (
-    <div className="space-y-4">
-      <SetupHeading icon={Globe2} title="Split DNS" />
-      <div className="divide-y divide-border/70 border border-border/70">
-        <SetupChangeRow
-          label={`.${domain}`}
-          before={
-            currentResolvers.length ? currentResolvers.join(", ") : "Not set"
-          }
-          after={desiredResolvers.join(", ") || "Waiting for a Tailnet IP"}
-          tone={replaces ? "warning" : "default"}
-        />
-        {previousDomain && previousResolvers.length ? (
-          <SetupChangeRow
-            label={`.${previousDomain}`}
-            before={previousResolvers.join(", ")}
-            after="Removed"
-            tone="warning"
-          />
-        ) : null}
-      </div>
-      {replaces ? (
-        <SetupResult
-          tone="warning"
-          title={`.${domain} already points somewhere else`}
-          value="Continuing replaces that Tailnet DNS entry. It does not change DNS outside Tailscale."
-        />
-      ) : null}
-      <SetupApproval
-        checked={approved}
-        title={replaces ? "Replace this DNS entry" : "Create this DNS entry"}
-        onCheckedChange={onApprovedChange}
-      />
-    </div>
-  )
-}
-
-function SetupRoutesStep({
-  approved,
-  routes,
-  onApprovedChange,
-}: {
-  approved: boolean
-  routes: SetupPreview["inspection"]["routes"]
-  onApprovedChange: (approved: boolean) => void
-}) {
-  return (
-    <div className="space-y-4">
-      <SetupHeading icon={Route} title="Private routes" />
-      <div className="divide-y divide-border/70 border border-border/70">
-        {routes.map((route) => (
-          <div
-            key={`${route.hostname}:${route.subnet}`}
-            className="flex items-center gap-3 px-3 py-3"
-          >
-            <span
-              className={
-                route.approved
-                  ? "size-2 rounded-full bg-emerald-400"
-                  : route.advertised
-                    ? "size-2 rounded-full bg-amber-400"
-                    : "size-2 rounded-full bg-muted-foreground"
-              }
-            />
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-xs font-medium">{route.hostname}</p>
-              <p className="type-meta font-mono text-muted-foreground">
-                {route.subnet}
-              </p>
-            </div>
-            <span className="type-technical-label text-muted-foreground">
-              {route.approved
-                ? "Approved"
-                : route.advertised
-                  ? "Ready to approve"
-                  : "Waiting to advertise"}
-            </span>
-          </div>
-        ))}
-      </div>
-      <SetupApproval
-        checked={approved}
-        title="Allow Kiln to approve these private routes"
-        onCheckedChange={onApprovedChange}
-      />
-    </div>
-  )
-}
-
-function SetupReadyStep({
-  complete,
-  domain,
-  inspection,
-  networkName,
-  pending,
-}: {
-  complete: boolean
-  domain: string
-  inspection: SetupPreview["inspection"] | undefined
-  networkName: string
-  pending: boolean
-}) {
-  if (complete) {
-    return (
-      <div className="grid min-h-[18rem] place-items-center text-center">
-        <div>
-          <span className="mx-auto grid size-14 place-items-center rounded-full bg-emerald-500/15 text-emerald-400">
-            <CheckCircle2 className="size-7" />
-          </span>
-          <h3 className="mt-4 text-lg font-semibold">Tailnet ready</h3>
-          <p className="mt-2 font-mono text-xs text-muted-foreground">
-            *.{domain}
-          </p>
-        </div>
-      </div>
+          ) : null}
+        </PopoverContent>
+      </Popover>
     )
   }
-  return (
-    <div className="space-y-5">
-      <SetupHeading icon={CheckCircle2} title="Ready to apply" />
-      <div className="divide-y divide-border/70 border border-border/70">
-        <SetupSummaryRow label="Network" value={networkName} />
-        <SetupSummaryRow label="Private domain" value={`*.${domain}`} />
-        <SetupSummaryRow
-          label="DNS resolvers"
-          value={inspection?.dns.desiredResolvers.join(", ") || "Pending"}
-        />
-        <SetupSummaryRow
-          label="Private routes"
-          value={`${inspection?.routes.length ?? 0} node${inspection?.routes.length === 1 ? "" : "s"}`}
-        />
-      </div>
-      {pending ? (
-        <SetupResult
-          tone="pending"
-          title="Applying Tailnet configuration"
-          value="Kiln is updating DNS, approving routes, and verifying every node."
-        />
-      ) : null}
-    </div>
-  )
-}
-
-function SetupHeading({
-  icon: Icon,
-  title,
-}: {
-  icon: React.ComponentType<{ className?: string }>
-  title: string
-}) {
-  return (
-    <div className="flex items-center gap-2">
-      <Icon className="size-4 text-primary" />
-      <h3 className="text-sm font-semibold">{title}</h3>
-    </div>
-  )
-}
-
-function SetupField({
-  children,
-  fieldId,
-  label,
-}: {
-  children: React.ReactNode
-  fieldId: string
-  label: string
-}) {
-  return (
-    <label className="block min-w-0" htmlFor={fieldId}>
-      <span className="type-label mb-1.5 block">{label}</span>
-      {children}
-    </label>
-  )
-}
-
-function SetupResult({
-  title,
-  tone,
-  value,
-}: {
-  title: string
-  tone: "error" | "pending" | "success" | "warning"
-  value: string
-}) {
-  return (
-    <div
-      role={tone === "error" ? "alert" : "status"}
-      className={
-        tone === "success"
-          ? "border border-emerald-500/25 bg-emerald-500/8 px-3 py-2.5 text-emerald-300"
-          : tone === "error"
-            ? "border border-destructive/30 bg-destructive/8 px-3 py-2.5 text-destructive"
-            : tone === "warning"
-              ? "border border-amber-500/25 bg-amber-500/8 px-3 py-2.5 text-amber-300"
-              : "border border-primary/25 bg-primary/8 px-3 py-2.5 text-foreground"
-      }
-    >
-      <p className="text-xs font-semibold">{title}</p>
-      <p className="type-meta mt-1">{value}</p>
-    </div>
-  )
-}
-
-function SetupApproval({
-  checked,
-  title,
-  onCheckedChange,
-}: {
-  checked: boolean
-  title: string
-  onCheckedChange: (checked: boolean) => void
-}) {
-  return (
-    <label className="flex cursor-pointer items-center justify-between gap-4 border border-border/70 bg-background/35 px-3 py-3">
-      <span className="text-xs font-medium">{title}</span>
-      <Switch
-        checked={checked}
-        aria-label={title}
-        onCheckedChange={onCheckedChange}
-      />
-    </label>
-  )
-}
-
-function SetupChangeRow({
-  after,
-  before,
-  label,
-  tone,
-}: {
-  after: string
-  before: string
-  label: string
-  tone: "default" | "warning"
-}) {
-  return (
-    <div className="grid gap-2 px-3 py-3 sm:grid-cols-[minmax(0,0.7fr)_minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center">
-      <span className="truncate font-mono text-xs">{label}</span>
-      <span
-        className={
-          tone === "warning"
-            ? "type-code truncate text-amber-300"
-            : "type-code truncate text-muted-foreground"
-        }
-      >
-        {before}
-      </span>
-      <ChevronRight className="hidden size-3 text-muted-foreground sm:block" />
-      <span className="type-code truncate text-foreground">{after}</span>
-    </div>
-  )
-}
-
-function SetupSummaryRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-center justify-between gap-4 px-3 py-3">
-      <span className="text-xs text-muted-foreground">{label}</span>
-      <span className="type-code truncate">{value}</span>
-    </div>
-  )
-}
+)
 
 export function GameServerTailscaleSection({
   server,
@@ -1049,6 +331,10 @@ export function GameServerTailscaleSection({
 }) {
   const { data } = useSuspenseQuery(tailscaleStacksQueryOptions())
   const { stacks, unsupportedRelays } = data
+  const availableStacks = React.useMemo(
+    () => stacks.filter((stack) => !stack.cleanup),
+    [stacks]
+  )
   const relayUnsupported = unsupportedRelays.some(
     ({ id }) => id === server.relayId
   )
@@ -1060,6 +346,41 @@ export function GameServerTailscaleSection({
     setJoiningStackId(stackId)
   }, [])
   const joiningStack = stacks.find(({ id }) => id === joiningStackId)
+  const joiningBinding = joiningStack
+    ? findBinding(joiningStack, server)
+    : undefined
+  const closeJoinDialog = React.useCallback((open: boolean) => {
+    if (!open) setJoiningStackId(null)
+  }, [])
+  const joinNetwork = React.useCallback(
+    async (hostname: string, authKey?: string) => {
+      if (!joiningStack) return
+      await save.mutateAsync({
+        authKey,
+        bindings: joiningBinding
+          ? joiningStack.bindings.map((binding) =>
+              binding.relayId === server.relayId &&
+              binding.instanceId === server.id
+                ? { ...binding, hostname }
+                : binding
+            )
+          : [
+              ...joiningStack.bindings,
+              {
+                address: "",
+                enabled: true,
+                hostname,
+                instanceId: server.id,
+                relayId: server.relayId,
+                relayName: server.relayName,
+              },
+            ],
+        stack: joiningStack,
+      })
+      setJoiningStackId(null)
+    },
+    [joiningBinding, joiningStack, save, server]
+  )
 
   return (
     <section className="overflow-hidden border border-border/80 bg-card/45">
@@ -1082,9 +403,9 @@ export function GameServerTailscaleSection({
           </Button>
         </div>
       </div>
-      {stacks.length ? (
+      {availableStacks.length ? (
         <div className="divide-y divide-border/65">
-          {stacks.map((stack) => {
+          {availableStacks.map((stack) => {
             const binding = findBinding(stack, server)
             return (
               <GameServerMembershipRow
@@ -1123,157 +444,111 @@ export function GameServerTailscaleSection({
         <JoinNetworkDialog
           key={joiningStack.id}
           network={joiningStack}
+          initialHostname={joiningBinding?.hostname}
           open
           pending={save.isPending}
           server={server}
-          onOpenChange={(open) => {
-            if (!open) setJoiningStackId(null)
-          }}
-          onJoin={async (hostname, authKey) => {
-            await save.mutateAsync({
-              authKey,
-              bindings: [
-                ...joiningStack.bindings,
-                {
-                  address: "",
-                  hostname,
-                  instanceId: server.id,
-                  relayId: server.relayId,
-                  relayName: server.relayName,
-                },
-              ],
-              stack: joiningStack,
-            })
-            setJoiningStackId(null)
-          }}
+          onOpenChange={closeJoinDialog}
+          onJoin={joinNetwork}
         />
       ) : null}
     </section>
   )
 }
 
-const MembershipToolbar = React.memo(function MembershipToolbar({
-  searchStore,
-  stackName,
-}: {
-  searchStore: WorkspaceTableSearchStore
-  stackName: string
-}) {
-  const inputRef = React.useRef<HTMLInputElement>(null)
-  useWorkspaceTableSearchInput(inputRef, searchStore)
-
-  return (
-    <div className="flex min-w-0 items-center gap-2 border-b bg-background/25 p-3">
-      <TailscaleMembershipSyncButton />
-      <div className="relative min-w-0 flex-1 sm:max-w-md">
-        <Search className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted-foreground" />
-        <Input
-          ref={inputRef}
-          type="search"
-          defaultValue={searchStore.getServerSnapshot()}
-          onChange={(event) => searchStore.set(event.currentTarget.value)}
-          placeholder="Search servers"
-          aria-label={`Search servers in ${stackName}`}
-          className="pl-9 text-base md:text-sm"
-        />
-      </div>
-      <span className="ml-auto hidden truncate px-2 text-xs font-semibold sm:block">
-        {stackName}
-      </span>
-    </div>
-  )
-})
-
-const TailscaleMembershipSyncButton = React.memo(
-  function TailscaleMembershipSyncButton() {
-    const queryClient = useQueryClient()
-    const [syncing, setSyncing] = React.useState(false)
-
-    return (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            type="button"
-            size="icon"
-            variant="outline"
-            aria-label="Refresh servers"
-            aria-busy={syncing}
-            disabled={syncing}
-            onClick={() => {
-              setSyncing(true)
-              forkPromise(() =>
-                ensuringPromise(
-                  () =>
-                    Promise.all([
-                      queryClient.invalidateQueries({
-                        queryKey: queryKeys.tailscaleStacks,
-                      }),
-                      queryClient.invalidateQueries({
-                        queryKey: queryKeys.relay.snapshot,
-                      }),
-                    ]),
-                  () => setSyncing(false)
-                )
-              )
-            }}
-          >
-            <RefreshCw className={syncing ? "animate-spin" : undefined} />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">Refresh servers</TooltipContent>
-      </Tooltip>
-    )
-  }
-)
-
 const TailscaleMembershipTable = React.memo(function TailscaleMembershipTable({
-  highlightedServerKey,
+  bricks,
+  emptyActionLabel,
+  emptyDescription,
+  emptyMessage,
   pending,
   searchStore,
   servers,
   serversPending,
   stack,
+  onEmptyAction,
   onSave,
 }: {
-  highlightedServerKey?: string
+  bricks: Array<BrickIconDefinition>
+  emptyActionLabel?: string
+  emptyDescription: string
+  emptyMessage: string
   pending: boolean
   searchStore: WorkspaceTableSearchStore
   servers: Array<TailscaleServer>
   serversPending: boolean
   stack: TailscaleStackOverview
+  onEmptyAction?: () => void
   onSave: (bindings: Array<StackBinding>, authKey?: string) => Promise<unknown>
 }) {
   const renderRow = React.useCallback(
-    (server: TailscaleServer) => (
-      <TailscaleMembershipRow
-        highlighted={
-          highlightedServerKey === tailscaleServerKey(server.relayId, server.id)
-        }
-        pending={pending}
-        server={server}
-        stack={stack}
-        onSave={onSave}
-      />
-    ),
-    [highlightedServerKey, onSave, pending, stack]
+    (server: TailscaleServer) => {
+      const icon = brickIconPresentation(bricks, {
+        brickId: server.brickId,
+        brickSource: server.brickSource,
+        implementation: server.implementation,
+      })
+      return (
+        <TailscaleMembershipRow
+          icon={icon}
+          pending={pending}
+          server={server}
+          stack={stack}
+          onSave={onSave}
+        />
+      )
+    },
+    [bricks, onSave, pending, stack]
   )
   const renderEmpty = React.useCallback(
     (searchActive: boolean) => (
-      <div className="grid min-h-52 place-items-center px-6 text-center text-xs text-muted-foreground">
-        {serversPending
-          ? "Loading servers…"
-          : searchActive
-            ? "No servers match your search."
-            : "No servers are available."}
-      </div>
+      <TailscaleEmptyTable
+        actionLabel={
+          searchActive || serversPending ? undefined : emptyActionLabel
+        }
+        description={
+          serversPending
+            ? "Loading the server inventory."
+            : searchActive
+              ? "Try a server name, short ID, or Relay."
+              : emptyDescription
+        }
+        icon="server"
+        title={
+          serversPending
+            ? "Loading servers…"
+            : searchActive
+              ? "No servers match your search"
+              : emptyMessage
+        }
+        onAction={searchActive || serversPending ? undefined : onEmptyAction}
+      />
     ),
-    [serversPending]
+    [
+      emptyActionLabel,
+      emptyDescription,
+      emptyMessage,
+      onEmptyAction,
+      serversPending,
+    ]
+  )
+  const getRowKey = React.useCallback(
+    (server: TailscaleServer) =>
+      `${stack.id}:${serverRowKey(server)}:${findBinding(stack, server)?.hostname ?? ""}:${findBinding(stack, server)?.enabled ?? true}`,
+    [stack]
+  )
+  const getSearchText = React.useCallback(
+    (server: TailscaleServer) => {
+      const binding = findBinding(stack, server)
+      return `${serverSearchText(server)} ${binding?.hostname ?? ""} ${binding?.enabled === false ? "paused" : "connected"}`
+    },
+    [stack]
   )
 
   return (
     <WorkspaceDataTable
-      getRowKey={serverRowKey}
-      getSearchText={serverSearchText}
+      getRowKey={getRowKey}
+      getSearchText={getSearchText}
       head={<MembershipTableHead />}
       items={servers}
       renderEmpty={renderEmpty}
@@ -1285,102 +560,128 @@ const TailscaleMembershipTable = React.memo(function TailscaleMembershipTable({
 
 const MembershipTableHead = React.memo(function MembershipTableHead() {
   return (
-    <WorkspaceTableHead>
-      <WorkspaceTableHeading className="w-auto sm:w-[32%]">
+    <WorkspaceTableHead className="sticky top-0 z-10">
+      <WorkspaceTableHeading className="w-32">Status</WorkspaceTableHeading>
+      <WorkspaceTableHeading className="w-auto sm:w-[28%]">
         Server
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[20%] sm:table-cell">
-        Node
+      <WorkspaceTableHeading className="hidden w-[22%] md:table-cell">
+        Relay name
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-[44%] sm:w-[36%]">
+      <WorkspaceTableHeading className="hidden w-[30%] sm:table-cell">
         Hostname
       </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-16 text-center sm:w-24">
-        Connected
+      <WorkspaceTableHeading className="w-32 text-right">
+        Actions
       </WorkspaceTableHeading>
     </WorkspaceTableHead>
   )
 })
 
 const TailscaleMembershipRow = React.memo(function TailscaleMembershipRow({
-  highlighted,
+  icon,
   pending,
   server,
   stack,
   onSave,
 }: {
-  highlighted: boolean
+  icon: BrickIconPresentation
   pending: boolean
   server: TailscaleServer
   stack: TailscaleStackOverview
   onSave: (bindings: Array<StackBinding>, authKey?: string) => Promise<unknown>
 }) {
   const binding = findBinding(stack, server)
-  const initialHostname = binding?.hostname ?? defaultTailscaleHostname(server)
-  const [hostname, setHostname] = React.useState(initialHostname)
-  const [authOpen, setAuthOpen] = React.useState(false)
-  const hostnameRef = React.useRef<HTMLInputElement>(null)
-  const rowRef = React.useRef<HTMLTableRowElement>(null)
-  const deploymentExists = stack.deployments.some(
+  const [hostname, setHostname] = React.useState(binding?.hostname ?? "")
+  const [disconnectOpen, setDisconnectOpen] = React.useState(false)
+  const deployment = stack.deployments.find(
     (deployment) => deployment.relayId === server.relayId
   )
   const disabled = pending || !server.tailscaleSupported
   const dirty = Boolean(binding && hostname.trim() !== binding.hostname)
+  const status = tailscaleMembershipStatus(binding, deployment, server)
+  const onlyBindingOnRelay =
+    stack.bindings.filter((candidate) => candidate.relayId === server.relayId)
+      .length === 1
 
-  React.useEffect(() => {
-    setHostname(initialHostname)
-  }, [initialHostname])
+  if (!binding) return null
 
-  React.useEffect(() => {
-    if (!highlighted) return
-    rowRef.current?.scrollIntoView({ block: "center", inline: "nearest" })
-    hostnameRef.current?.focus({ preventScroll: true })
-    hostnameRef.current?.select()
-  }, [highlighted])
-
-  const enable = async (authKey?: string) => {
-    await onSave(
-      [
-        ...stack.bindings,
-        {
-          address: "",
-          hostname: hostname.trim(),
-          instanceId: server.id,
-          relayId: server.relayId,
-          relayName: server.relayName,
-        },
-      ],
-      authKey
+  const updateBinding = (next: Partial<StackBinding>) =>
+    onSave(
+      stack.bindings.map((candidate) =>
+        stackBindingKey(candidate) === stackBindingKey(binding)
+          ? { ...candidate, ...next }
+          : candidate
+      )
     )
-    setAuthOpen(false)
+
+  const saveHostname = () => {
+    const nextHostname = hostname.trim()
+    if (!dirty || !nextHostname || disabled) return
+    forkPromise(() => updateBinding({ hostname: nextHostname }))
   }
+
+  const disconnect = () =>
+    onSave(
+      stack.bindings.filter(
+        (candidate) => stackBindingKey(candidate) !== stackBindingKey(binding)
+      )
+    )
 
   return (
     <>
-      <tr
-        ref={rowRef}
-        className={
-          highlighted
-            ? "group bg-primary/10 outline-1 -outline-offset-1 outline-primary/40 transition-colors"
-            : "group transition-colors hover:bg-accent/25"
-        }
-      >
+      <tr className="group transition-colors hover:bg-accent/25">
         <WorkspaceTableCell>
-          <div className="min-w-0">
-            <div className="flex min-w-0 items-center gap-1.5">
-              <p className="truncate text-xs font-semibold">{server.name}</p>
-              <span className="grid size-4 shrink-0 place-items-center sm:hidden">
-                {!server.tailscaleSupported ? (
-                  <TailscaleRelayUpdateHint relayName={server.relayName} />
-                ) : null}
-              </span>
-            </div>
-            <p className="type-meta truncate font-mono text-muted-foreground">
-              {server.shortId}
-            </p>
+          <div className="flex items-center gap-2">
+            <span
+              className={`size-1.5 shrink-0 rounded-full ${status.dotClass}`}
+            />
+            <span className="truncate text-xs font-medium">{status.label}</span>
           </div>
         </WorkspaceTableCell>
-        <WorkspaceTableCell className="hidden sm:table-cell">
+        <WorkspaceTableCell className="px-0">
+          <Link
+            to="/server/$serverId/console"
+            params={{ serverId: server.routeId }}
+            preload="intent"
+            aria-label={`Open ${server.name}`}
+            className="group/server-link flex min-h-[3.25rem] w-fit max-w-full min-w-0 flex-col justify-center px-3 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+          >
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 bg-background/35 text-muted-foreground">
+                <BrickIcon
+                  id={icon.id}
+                  color={icon.color}
+                  iconSvg={icon.iconSvg}
+                  className="size-6"
+                  aria-hidden="true"
+                />
+              </span>
+              <div className="min-w-0">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <p className="truncate text-xs font-semibold text-foreground transition-colors group-hover/server-link:text-primary">
+                    {server.name}
+                  </p>
+                  <span className="grid size-4 shrink-0 place-items-center md:hidden">
+                    {!server.tailscaleSupported ? (
+                      <TailscaleRelayUpdateHint relayName={server.relayName} />
+                    ) : null}
+                  </span>
+                </div>
+                <p className="type-meta truncate text-muted-foreground">
+                  {server.implementation} {server.version}
+                </p>
+              </div>
+            </div>
+            <p className="type-meta truncate text-muted-foreground md:hidden">
+              {server.relayName}
+            </p>
+            <p className="type-meta truncate font-mono text-muted-foreground sm:hidden">
+              {binding.hostname}.{stack.domain}
+            </p>
+          </Link>
+        </WorkspaceTableCell>
+        <WorkspaceTableCell className="hidden md:table-cell">
           <div className="flex min-w-0 items-center gap-1.5">
             <span className="truncate text-xs text-muted-foreground">
               {server.relayName}
@@ -1392,75 +693,168 @@ const TailscaleMembershipRow = React.memo(function TailscaleMembershipRow({
             </span>
           </div>
         </WorkspaceTableCell>
-        <WorkspaceTableCell>
+        <WorkspaceTableCell className="hidden sm:table-cell">
           <div className="flex min-w-0 items-center gap-1.5">
             <Input
-              ref={hostnameRef}
               value={hostname}
               disabled={disabled}
+              onBlur={saveHostname}
               onChange={(event) => setHostname(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur()
+                if (event.key === "Escape") {
+                  setHostname(binding.hostname)
+                  event.currentTarget.blur()
+                }
+              }}
               aria-label={`Hostname for ${server.name}`}
               className="h-8 min-w-0 font-mono text-xs"
             />
             <span className="type-meta hidden shrink-0 font-mono text-muted-foreground lg:inline">
               .{stack.domain}
             </span>
-            {dirty ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={disabled || !hostname.trim()}
-                onClick={() =>
-                  void onSave(
-                    stack.bindings.map((candidate) =>
-                      candidate.relayId === server.relayId &&
-                      candidate.instanceId === server.id
-                        ? { ...candidate, hostname: hostname.trim() }
-                        : candidate
-                    )
-                  )
-                }
-              >
-                Save
-              </Button>
-            ) : null}
           </div>
         </WorkspaceTableCell>
-        <WorkspaceTableCell className="text-center">
-          <Switch
-            checked={Boolean(binding)}
-            disabled={disabled || !hostname.trim()}
-            aria-label={`${binding ? "Disconnect" : "Connect"} ${server.name}`}
-            onCheckedChange={(checked) => {
-              if (!checked) {
-                void onSave(
-                  stack.bindings.filter(
-                    (candidate) =>
-                      candidate.relayId !== server.relayId ||
-                      candidate.instanceId !== server.id
-                  )
-                )
-                return
-              }
-              if (deploymentExists || stack.integration) void enable()
-              else setAuthOpen(true)
-            }}
-          />
+        <WorkspaceTableCell>
+          <div className="flex items-center justify-end gap-0.5">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  disabled={disabled}
+                  aria-label={`${binding.enabled ? "Pause" : "Resume"} ${server.name}`}
+                  onClick={() =>
+                    forkPromise(() =>
+                      updateBinding({ enabled: !binding.enabled })
+                    )
+                  }
+                >
+                  {pending ? (
+                    <LoaderCircle className="animate-spin" />
+                  ) : binding.enabled ? (
+                    <Pause />
+                  ) : (
+                    <Play />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                {binding.enabled ? "Pause connection" : "Resume connection"}
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  disabled={disabled}
+                  aria-label={`Disconnect ${server.name} from ${stack.name}`}
+                  onClick={() => setDisconnectOpen(true)}
+                >
+                  <Unplug />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top">Disconnect server</TooltipContent>
+            </Tooltip>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label={`More actions for ${server.name}`}
+                >
+                  <EllipsisVertical />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuItem asChild>
+                  <Link
+                    to="/server/$serverId/console"
+                    params={{ serverId: server.routeId }}
+                    preload="intent"
+                  >
+                    <ExternalLink />
+                    Go to server
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <CopyIdentifierMenuItem label="server ID" value={server.id} />
+                <CopyIdentifierMenuItem
+                  label="Relay ID"
+                  value={server.relayId}
+                />
+                <CopyIdentifierMenuItem label="tailnet ID" value={stack.id} />
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </WorkspaceTableCell>
       </tr>
-      {authOpen ? (
-        <AuthKeyDialog
-          networkName={stack.name}
-          open
-          pending={pending}
-          onOpenChange={setAuthOpen}
-          onSubmit={enable}
-        />
-      ) : null}
+      <Dialog open={disconnectOpen} onOpenChange={setDisconnectOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Disconnect {server.name}?</DialogTitle>
+            <DialogDescription>
+              {onlyBindingOnRelay
+                ? `This removes the server from ${stack.name}. Because it is the last connected server on ${server.relayName}, Tailscale will also be removed from that Relay in the background.`
+                : `This removes the server from ${stack.name}. Tailscale will stay installed on ${server.relayName} for its other connected servers.`}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={pending}
+              onClick={() => setDisconnectOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={disabled}
+              onClick={() =>
+                forkPromise(async () => {
+                  await disconnect()
+                  setDisconnectOpen(false)
+                })
+              }
+            >
+              {pending ? <LoaderCircle className="animate-spin" /> : <Unplug />}
+              Disconnect Server
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   )
 })
+
+function CopyIdentifierMenuItem({
+  label,
+  value,
+}: {
+  label: string
+  value: string
+}) {
+  return (
+    <DropdownMenuItem
+      onSelect={() => {
+        forkPromise(async () => {
+          await navigator.clipboard.writeText(value)
+          showToast({ message: `Copied ${label}`, type: "success" })
+        })
+      }}
+    >
+      <Copy />
+      Copy {label}
+    </DropdownMenuItem>
+  )
+}
 
 const GameServerMembershipRow = React.memo(function GameServerMembershipRow({
   binding,
@@ -1483,93 +877,128 @@ const GameServerMembershipRow = React.memo(function GameServerMembershipRow({
   onJoin: (stackId: string) => void
   onSave: ReturnType<typeof useStackMembershipMutation>["mutateAsync"]
 }) {
-  const deployment =
-    stack.deployments.find((candidate) => candidate.relayId === relayId) ??
-    stack.deployments[0]
-  const routeId = deployment
-    ? relayInstanceRouteId(deployment.relayId, deployment.instance.shortId)
-    : null
-  const highlightedServerKey = tailscaleServerKey(relayId, serverId)
+  const [leaveOpen, setLeaveOpen] = React.useState(false)
+  const onlyBindingOnRelay =
+    stack.bindings.filter((candidate) => candidate.relayId === relayId)
+      .length === 1
+  const leave = React.useCallback(
+    () =>
+      onSave({
+        bindings: stack.bindings.filter(
+          (candidate) =>
+            candidate.relayId !== relayId || candidate.instanceId !== serverId
+        ),
+        stack,
+      }),
+    [onSave, relayId, serverId, stack]
+  )
 
   return (
-    <div className="grid items-center gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
-      <div className="min-w-0">
-        <p className="truncate text-xs font-semibold">{stack.name}</p>
-        <p className="type-meta mt-0.5 truncate font-mono text-muted-foreground">
-          {binding ? binding.address : `*.${stack.domain}`}
+    <>
+      <div className="grid items-center gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+        <div className="min-w-0">
+          <p className="truncate text-xs font-semibold">{stack.name}</p>
+          <p className="type-meta mt-0.5 truncate font-mono text-muted-foreground">
+            {binding ? binding.address : `*.${stack.domain}`}
+          </p>
+        </div>
+        <p className="type-code min-w-0 truncate text-muted-foreground">
+          {binding ? `${binding.hostname}.${stack.domain}` : "Not connected"}
         </p>
-      </div>
-      <p className="type-code min-w-0 truncate text-muted-foreground">
-        {binding ? `${binding.hostname}.${stack.domain}` : "Not connected"}
-      </p>
-      <div className="flex items-center justify-end gap-1">
-        {binding ? (
-          <>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  asChild={Boolean(routeId)}
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  disabled={disabled || !routeId}
-                  aria-label={`Edit ${binding.hostname}.${stack.domain}`}
-                >
-                  {routeId ? (
-                    <Link
-                      to="/server/$serverId/network"
-                      params={{ serverId: routeId }}
-                      search={{ member: highlightedServerKey }}
-                    >
-                      <Pencil />
-                    </Link>
-                  ) : (
+        <div className="flex items-center justify-end gap-1">
+          {binding ? (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    disabled={disabled}
+                    aria-label={`Edit ${binding.hostname}.${stack.domain}`}
+                    onClick={() => onJoin(stack.id)}
+                  >
                     <Pencil />
-                  )}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="top">Edit hostname</TooltipContent>
-            </Tooltip>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Edit hostname</TooltipContent>
+              </Tooltip>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                disabled={disabled}
+                onClick={() => setLeaveOpen(true)}
+              >
+                {pending ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : (
+                  <Unplug />
+                )}
+                Leave
+              </Button>
+            </>
+          ) : (
             <Button
               type="button"
               size="sm"
+              variant="outline"
+              disabled={disabled || joinDisabled}
+              onClick={() => onJoin(stack.id)}
+            >
+              {pending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Network />
+              )}
+              Join
+            </Button>
+          )}
+        </div>
+      </div>
+      <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Leave {stack.name}?</DialogTitle>
+            <DialogDescription>
+              {onlyBindingOnRelay
+                ? `This disconnects this server from ${stack.name}. Because it is the last server on this Relay, Tailscale will also be removed from the Relay in the background.`
+                : `This disconnects this server from ${stack.name}. Tailscale will remain installed on the Relay for its other servers.`}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
               variant="ghost"
+              disabled={pending}
+              onClick={() => setLeaveOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
               disabled={disabled}
               onClick={() =>
-                forkPromise(() =>
-                  onSave({
-                    bindings: stack.bindings.filter(
-                      (candidate) =>
-                        candidate.relayId !== relayId ||
-                        candidate.instanceId !== serverId
-                    ),
-                    stack,
-                  })
-                )
+                forkPromise(async () => {
+                  await leave()
+                  setLeaveOpen(false)
+                })
               }
             >
               {pending ? <LoaderCircle className="animate-spin" /> : <Unplug />}
-              Leave
+              Leave Tailnet
             </Button>
-          </>
-        ) : (
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={disabled || joinDisabled}
-            onClick={() => onJoin(stack.id)}
-          >
-            {pending ? <LoaderCircle className="animate-spin" /> : <Network />}
-            Join
-          </Button>
-        )}
-      </div>
-    </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 })
 
 const JoinNetworkDialog = React.memo(function JoinNetworkDialog({
+  initialHostname,
   network,
   open,
   pending,
@@ -1577,6 +1006,7 @@ const JoinNetworkDialog = React.memo(function JoinNetworkDialog({
   onOpenChange,
   onJoin,
 }: {
+  initialHostname?: string
   network: TailscaleStackOverview
   open: boolean
   pending: boolean
@@ -1584,11 +1014,12 @@ const JoinNetworkDialog = React.memo(function JoinNetworkDialog({
   onOpenChange: (open: boolean) => void
   onJoin: (hostname: string, authKey?: string) => Promise<void>
 }) {
-  const [hostname, setHostname] = React.useState(() =>
-    defaultTailscaleHostname(server)
+  const [hostname, setHostname] = React.useState(
+    () => initialHostname ?? defaultTailscaleHostname(server)
   )
   const [authKey, setAuthKey] = React.useState("")
   const needsAuth = Boolean(
+    !initialHostname &&
     !network.integration &&
     !network.deployments.some(
       (deployment) => deployment.relayId === server.relayId
@@ -1599,7 +1030,9 @@ const JoinNetworkDialog = React.memo(function JoinNetworkDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Join {network.name}</DialogTitle>
+          <DialogTitle>
+            {initialHostname ? "Edit hostname" : `Join ${network.name}`}
+          </DialogTitle>
         </DialogHeader>
         <div className="space-y-4 py-2">
           <label className="block">
@@ -1652,65 +1085,7 @@ const JoinNetworkDialog = React.memo(function JoinNetworkDialog({
             }
           >
             {pending ? <LoaderCircle className="animate-spin" /> : <Network />}
-            Join
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-})
-
-const AuthKeyDialog = React.memo(function AuthKeyDialog({
-  networkName,
-  open,
-  pending,
-  onOpenChange,
-  onSubmit,
-}: {
-  networkName: string
-  open: boolean
-  pending: boolean
-  onOpenChange: (open: boolean) => void
-  onSubmit: (authKey: string) => Promise<unknown>
-}) {
-  const [authKey, setAuthKey] = React.useState("")
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Add a node to {networkName}</DialogTitle>
-        </DialogHeader>
-        <label className="block py-2">
-          <span className="mb-2 flex items-center gap-1.5 text-xs font-medium">
-            <KeyRound className="size-3.5" />
-            Auth key
-          </span>
-          <Input
-            type="password"
-            autoComplete="off"
-            value={authKey}
-            onChange={(event) => setAuthKey(event.target.value)}
-            placeholder="tskey-auth-…"
-            className="font-mono"
-            autoFocus
-          />
-        </label>
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="ghost"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            disabled={pending || !authKey.trim()}
-            onClick={() => forkPromise(() => onSubmit(authKey.trim()))}
-          >
-            {pending ? <LoaderCircle className="animate-spin" /> : <Network />}
-            Add node
+            {initialHostname ? "Save hostname" : "Join"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1721,7 +1096,7 @@ const AuthKeyDialog = React.memo(function AuthKeyDialog({
 function useStackMembershipMutation() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({
+    mutationFn: async ({
       authKey,
       bindings,
       stack,
@@ -1729,26 +1104,78 @@ function useStackMembershipMutation() {
       authKey?: string
       bindings: Array<StackBinding>
       stack: TailscaleStackOverview
-    }) =>
-      saveTailscaleStack({
-        data: stackSaveInput(stack, bindings, authKey),
-      }),
-    onMutate: ({ bindings, stack }) => {
+    }) => {
+      return recoverPromise(
+        async () => ({
+          data: await saveTailscaleStack({
+            data: stackSaveInput(stack, bindings, authKey),
+          }),
+          reconcile: false,
+        }),
+        (cause) => {
+          if (!isFailedFetch(cause)) throw cause
+          const pending = queryClient.getQueryData<TailscaleStacksResult>(
+            queryKeys.tailscaleStacks
+          )
+          if (pending) {
+            return { data: pending, reconcile: true }
+          }
+          throw cause
+        }
+      )
+    },
+    onMutate: async ({ bindings, stack }) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.tailscaleStacks })
+      const previous = queryClient.getQueryData<TailscaleStacksResult>(
+        queryKeys.tailscaleStacks
+      )
+      queryClient.setQueryData<TailscaleStacksResult>(
+        queryKeys.tailscaleStacks,
+        (current) =>
+          current
+            ? {
+                ...current,
+                stacks: current.stacks.map((candidate) =>
+                  candidate.id === stack.id
+                    ? { ...candidate, bindings }
+                    : candidate
+                ),
+              }
+            : current
+      )
       const toast = membershipOperationToast(stack, bindings)
       showTailscaleOperationProgress(toast)
-      return toast
+      return { previous, toast }
     },
-    onSuccess: async (next) => {
-      queryClient.setQueryData(queryKeys.tailscaleStacks, next)
-      await queryClient.invalidateQueries({
-        queryKey: queryKeys.relay.snapshot,
+    onSuccess: (next) => {
+      queryClient.setQueryData(queryKeys.tailscaleStacks, next.data)
+      forkPromise(async () => {
+        await queryClient.invalidateQueries({
+          queryKey: queryKeys.relay.snapshot,
+        })
+        if (next.reconcile) {
+          await new Promise((resolve) => setTimeout(resolve, 1_500))
+          await queryClient.invalidateQueries({
+            queryKey: queryKeys.tailscaleStacks,
+          })
+        }
       })
     },
-    onError: (cause, _input, toast) => {
-      if (toast) showTailscaleOperationError(toast, cause)
+    onError: (cause, _input, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(queryKeys.tailscaleStacks, context.previous)
+      }
+      if (context?.toast) {
+        showTailscaleOperationError(context.toast, cause)
+      }
+      forkPromise(() =>
+        queryClient.invalidateQueries({ queryKey: queryKeys.tailscaleStacks })
+      )
     },
-    onSettled: (_data, error, _input, toast) => {
-      if (!error && toast) showTailscaleOperationSuccess(toast)
+    onSettled: (_data, error, _input, context) => {
+      if (!error && context?.toast) {
+        showTailscaleOperationSuccess(context.toast)
+      }
     },
   })
 }
@@ -1798,6 +1225,15 @@ function stackBindingKey({
   return `${relayId}:${instanceId}`
 }
 
+function isFailedFetch(cause: unknown): boolean {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "message" in cause &&
+    cause.message === "Failed to fetch"
+  )
+}
+
 function stackSaveInput(
   stack: TailscaleStackOverview,
   bindings: Array<StackBinding>,
@@ -1806,7 +1242,8 @@ function stackSaveInput(
 ): SaveStackInput {
   return {
     ...(authKey ? { authKey } : {}),
-    bindings: bindings.map(({ hostname, instanceId, relayId }) => ({
+    bindings: bindings.map(({ enabled, hostname, instanceId, relayId }) => ({
+      enabled,
       hostname,
       instanceId,
       relayId,
@@ -1815,77 +1252,6 @@ function stackSaveInput(
     id: stack.id,
     name: stack.name,
   }
-}
-
-function normalizeTailscaleDomain(value: string): string {
-  return value
-    .trim()
-    .replace(/^[.]+|[.]+$/gu, "")
-    .toLowerCase()
-}
-
-function sameStrings(
-  left: ReadonlyArray<string>,
-  right: ReadonlyArray<string>
-): boolean {
-  const sortedLeft = [...left].sort()
-  const sortedRight = [...right].sort()
-  return (
-    sortedLeft.length === sortedRight.length &&
-    sortedLeft.every((value, index) => value === sortedRight[index])
-  )
-}
-
-function tailscaleSetupVerified(
-  inspection: SetupPreview["inspection"]
-): boolean {
-  return (
-    inspection.dns.desiredResolvers.length > 0 &&
-    sameStrings(
-      inspection.dns.currentResolvers,
-      inspection.dns.desiredResolvers
-    ) &&
-    inspection.routes.length > 0 &&
-    inspection.routes.every((route) => route.advertised && route.approved)
-  )
-}
-
-function isNetworkChangeError(cause: unknown): boolean {
-  return (
-    cause instanceof TypeError &&
-    cause.message.toLowerCase().includes("failed to fetch")
-  )
-}
-
-async function recoverTailscaleIntegrationStatus(
-  stackId: string,
-  originalError: unknown
-) {
-  // Applying split DNS briefly changes the browser's network configuration on
-  // the same Mac. Chromium cancels the successful request with
-  // ERR_NETWORK_CHANGED, so verify the persisted result once networking settles.
-  return Effect.runPromise(
-    Effect.gen(function* () {
-      for (const delay of [250, 500, 1_000, 2_000, 3_000]) {
-        yield* Effect.sleep(delay)
-        const result = yield* Effect.tryPromise({
-          try: () =>
-            getTailscaleIntegrationStatus({
-              data: { id: stackId },
-            }),
-          catch: (cause) => cause,
-        }).pipe(Effect.option)
-        if (
-          result._tag === "Some" &&
-          tailscaleSetupVerified(result.value.inspection)
-        ) {
-          return result.value
-        }
-        // The DNS transition may cancel more than one request.
-      }
-      return yield* Effect.fail(originalError)
-    })
-  )
 }
 
 function findBinding(
@@ -1898,6 +1264,52 @@ function findBinding(
   )
 }
 
+function uniqueHostname(
+  stack: TailscaleStackOverview,
+  server: TailscaleServer
+): string {
+  const base = defaultTailscaleHostname(server)
+  const hostnames = new Set(
+    stack.bindings.map((binding) => binding.hostname.toLowerCase())
+  )
+  if (!hostnames.has(base.toLowerCase())) return base
+  const suffix = server.shortId.toLowerCase().replace(/[^a-z0-9-]/gu, "")
+  const candidate = `${base}-${suffix}`
+  if (!hostnames.has(candidate)) return candidate
+  for (let index = 2; index < 1_000; index += 1) {
+    const indexedCandidate = `${candidate}-${index}`
+    if (!hostnames.has(indexedCandidate)) return indexedCandidate
+  }
+  return `${candidate}-${Date.now().toString(36)}`
+}
+
+function tailscaleMembershipStatus(
+  binding: StackBinding | undefined,
+  deployment: TailscaleStackOverview["deployments"][number] | undefined,
+  server: TailscaleServer
+) {
+  if (!binding?.enabled) {
+    return { dotClass: "bg-muted-foreground/55", label: "Paused" }
+  }
+  if (!server.tailscaleSupported) {
+    return { dotClass: "bg-amber-400", label: "Update required" }
+  }
+  if (!deployment) {
+    return { dotClass: "animate-pulse bg-primary", label: "Provisioning" }
+  }
+  if (
+    deployment.status.connected &&
+    deployment.components.coreDnsRunning &&
+    deployment.components.tailscaleRunning
+  ) {
+    return { dotClass: "bg-emerald-400", label: "Connected" }
+  }
+  if (deployment.status.message) {
+    return { dotClass: "bg-destructive", label: "Needs attention" }
+  }
+  return { dotClass: "bg-amber-400", label: "Connecting" }
+}
+
 function serverRowKey(server: TailscaleServer) {
   return tailscaleServerKey(server.relayId, server.id)
 }
@@ -1906,10 +1318,78 @@ function serverSearchText(server: TailscaleServer) {
   return `${server.name} ${server.shortId} ${server.relayName}`
 }
 
-function CenteredNetworkState({ children }: { children: React.ReactNode }) {
+const cleanupRetryFormatter = new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium",
+  timeStyle: "short",
+})
+
+function TailscaleCleanupState({ stack }: { stack: TailscaleStackOverview }) {
+  const cleanup = stack.cleanup
+  if (!cleanup) return null
+  const pendingRelays = `${cleanup.pendingRelays} ${cleanup.pendingRelays === 1 ? "Relay" : "Relays"} pending`
+  const nextAttemptAt = cleanup.nextAttemptAt
+    ? cleanupRetryFormatter.format(new Date(cleanup.nextAttemptAt))
+    : null
+
   return (
-    <div className="grid min-h-0 flex-1 place-items-center bg-background/55">
-      <p className="text-sm text-muted-foreground">{children}</p>
+    <div className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center">
+      <LoaderCircle className="size-6 animate-spin text-primary" />
+      <p className="mt-3 text-sm font-semibold">Removing {stack.name}</p>
+      <p className="type-support mt-1 text-muted-foreground">
+        {pendingRelays}. Cleanup will continue automatically.
+      </p>
+      {cleanup.lastError ? (
+        <div
+          className="mt-4 flex max-w-lg items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5 text-left"
+          role="status"
+        >
+          <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <div className="min-w-0">
+            <p className="text-xs break-words text-destructive">
+              {cleanup.lastError}
+            </p>
+            <p className="type-meta mt-1 text-muted-foreground">
+              {nextAttemptAt
+                ? `Next automatic retry: ${nextAttemptAt}`
+                : "The next retry is queued automatically"}
+              {cleanup.attempts > 0
+                ? ` · ${cleanup.attempts} ${cleanup.attempts === 1 ? "attempt" : "attempts"}`
+                : ""}
+            </p>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function TailscaleEmptyTable({
+  actionLabel,
+  description,
+  icon,
+  title,
+  onAction,
+}: {
+  actionLabel?: string
+  description: string
+  icon: "network" | "server"
+  title: string
+  onAction?: () => void
+}) {
+  const Icon = icon === "network" ? Network : Server
+
+  return (
+    <div className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center">
+      <Icon className="size-6 text-muted-foreground/45" />
+      <p className="mt-3 text-sm font-semibold">{title}</p>
+      <p className="type-support mt-1 max-w-sm text-muted-foreground">
+        {description}
+      </p>
+      {actionLabel && onAction ? (
+        <Button type="button" size="sm" className="mt-4" onClick={onAction}>
+          <Plus /> {actionLabel}
+        </Button>
+      ) : null}
     </div>
   )
 }
@@ -1918,8 +1398,4 @@ function errorMessage(cause: unknown) {
   return cause instanceof Error
     ? cause.message
     : "The Tailscale network could not be updated."
-}
-
-function tailscaleSetupToastId(stackId: string) {
-  return `kiln-tailscale-setup-${stackId}`
 }
