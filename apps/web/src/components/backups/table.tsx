@@ -1,8 +1,8 @@
 import * as React from "react"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import {
-  type FilterFn,
   type RowSelectionState,
+  type SortingState,
   type Table,
 } from "@tanstack/react-table"
 import { Archive, ArchiveX, LoaderCircle, Trash2, X } from "lucide-react"
@@ -25,8 +25,12 @@ import {
 
 import {
   DataTable,
+  DataTableErrorState,
+  DataTableLoadMoreTrigger,
+  DataTableLoadingState,
   DataTableRowCheckbox,
   DataTableSelectAllCheckbox,
+  type DataTablePaginationOptions,
 } from "@/components/data-table"
 import {
   BackupAvailabilityTags,
@@ -38,7 +42,6 @@ import {
   BackupTaskFeedback,
   DesktopBackupTaskFeedback,
   backupCanBeRemoved,
-  backupMatchesStatusFilter,
   backupTargetName,
   backupTargetPresentation,
   backupTargetSortName,
@@ -49,7 +52,6 @@ import type {
   BackupAvailabilityDestination,
   BackupDeleteFeedbackStore,
   BackupDialogStore,
-  BackupFilters,
   BackupNameStore,
   BackupSearchStore,
   BackupSelectionStore,
@@ -64,9 +66,10 @@ import {
   dataTableFeatures,
   useDataTable,
 } from "@/lib/data-table"
-import { queryKeys } from "@/lib/query-options"
+import { resetActiveBackupRunsToFirstPage } from "@/lib/backup-runs-cache"
 import { settlePromises } from "@/effect/promise"
 import { deleteBackup } from "@/server/backups"
+import type { BackupRunSort, BackupRunSortDirection } from "@/lib/backup-runs"
 
 type BackupBulkDeleteOutcome =
   | {
@@ -89,39 +92,50 @@ const backupSelectionBlockingOverlaySelector = [
 const backupTableColumnHelper = createDataTableColumnHelper<Backup>()
 const backupTableGridClassName =
   "grid-cols-[2.5rem_minmax(0,1.2fr)_minmax(0,1fr)_12rem_11.25rem] xl:grid-cols-[2.5rem_minmax(0,1.2fr)_minmax(0,1fr)_12rem_6.5rem_11.25rem]"
-type BackupDesktopFilter = {
-  nameRevision?: number
-  search: string
-  status: BackupFilters["status"]
-}
-
 export const BackupTable = React.memo(function BackupTable({
   backups,
   canCreate,
   currentUserId,
   destinations,
   dialogStore,
+  error,
+  loading,
   nameStore,
+  onRetry,
+  onSortChange,
+  pagination,
   relayNames,
   scopeFiltered,
   searchStore,
   selectionStore,
+  sort,
+  sortDirection,
   statusFilterStore,
   targetNames,
+  updating,
 }: {
   backups: Array<Backup>
   canCreate: (backup: Backup) => boolean
   currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
+  error?: Error | null
+  loading?: boolean
   nameStore: BackupNameStore
+  onRetry?: () => void
+  onSortChange: (sort: BackupRunSort, direction: BackupRunSortDirection) => void
+  pagination: DataTablePaginationOptions
   relayNames: ReadonlyMap<string, string>
   scopeFiltered: boolean
   searchStore: BackupSearchStore
   selectionStore: BackupSelectionStore
+  sort: BackupRunSort
+  sortDirection: BackupRunSortDirection
   statusFilterStore: BackupStatusFilterStore
   targetNames: ReadonlyMap<string, string>
+  updating: boolean
 }) {
+  const mobileScrollRootRef = React.useRef<HTMLDivElement>(null)
   const mobileLayout = React.useSyncExternalStore(
     subscribeToMobileBackupLayout,
     getMobileBackupLayoutSnapshot,
@@ -183,18 +197,23 @@ export const BackupTable = React.memo(function BackupTable({
   return (
     <div id="backup-table-root" className="min-h-0 flex-1">
       {mobileLayout ? (
-        <div className="h-full overflow-y-auto overscroll-contain">
+        <div
+          ref={mobileScrollRootRef}
+          className="h-full overflow-y-auto overscroll-contain"
+        >
           <BackupMobileList
             backups={backups}
-            nameStore={nameStore}
-            relayNames={relayNames}
+            error={error}
+            loading={loading}
+            onRetry={onRetry}
+            pagination={pagination}
             renderEmpty={renderEmpty}
             renderRow={renderMobileRow}
             scopeFiltered={scopeFiltered}
+            scrollRootRef={mobileScrollRootRef}
             searchStore={searchStore}
             selectionStore={selectionStore}
             statusFilterStore={statusFilterStore}
-            targetNames={targetNames}
           />
         </div>
       ) : (
@@ -204,14 +223,22 @@ export const BackupTable = React.memo(function BackupTable({
           currentUserId={currentUserId}
           destinations={destinations}
           dialogStore={dialogStore}
+          error={error}
+          loading={loading}
           nameStore={nameStore}
+          onRetry={onRetry}
+          onSortChange={onSortChange}
+          pagination={pagination}
           relayNames={relayNames}
           renderEmpty={renderEmpty}
           scopeFiltered={scopeFiltered}
           searchStore={searchStore}
           selectionStore={selectionStore}
+          sort={sort}
+          sortDirection={sortDirection}
           statusFilterStore={statusFilterStore}
           targetNames={targetNames}
+          updating={updating}
         />
       )}
     </div>
@@ -224,54 +251,49 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
   currentUserId,
   destinations,
   dialogStore,
+  error,
+  loading,
   nameStore,
+  onRetry,
+  onSortChange,
+  pagination,
   relayNames,
   renderEmpty,
   scopeFiltered,
   searchStore,
   selectionStore,
+  sort,
+  sortDirection,
   statusFilterStore,
   targetNames,
+  updating,
 }: {
   backups: Array<Backup>
   canCreate: (backup: Backup) => boolean
   currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
+  error?: Error | null
+  loading?: boolean
   nameStore: BackupNameStore
+  onRetry?: () => void
+  onSortChange: (sort: BackupRunSort, direction: BackupRunSortDirection) => void
+  pagination: DataTablePaginationOptions
   relayNames: ReadonlyMap<string, string>
   renderEmpty: (searchActive: boolean, filterActive: boolean) => React.ReactNode
   scopeFiltered: boolean
   searchStore: BackupSearchStore
   selectionStore: BackupSelectionStore
+  sort: BackupRunSort
+  sortDirection: BackupRunSortDirection
   statusFilterStore: BackupStatusFilterStore
   targetNames: ReadonlyMap<string, string>
+  updating: boolean
 }) {
   const [initialTableState] = React.useState(() => ({
-    globalFilter: {
-      search: searchStore.getNormalizedSnapshot(),
-      status: statusFilterStore.getSnapshot(),
-    } satisfies BackupDesktopFilter,
     rowSelection: backupRowSelectionState(selectionStore.getSnapshot()),
+    sorting: [{ desc: sortDirection === "desc", id: sort }],
   }))
-  const globalFilter = React.useCallback<
-    FilterFn<typeof dataTableFeatures, Backup>
-  >(
-    (row, _columnId, filterValue) => {
-      const filter = filterValue as BackupDesktopFilter
-      return (
-        backupMatchesStatusFilter(row.original, filter.status) &&
-        backupMatchesSearch(
-          row.original,
-          filter.search,
-          relayNames,
-          targetNames,
-          nameStore.get(row.original.id, row.original.name)
-        )
-      )
-    },
-    [nameStore, relayNames, targetNames]
-  )
   const columns = React.useMemo(
     () =>
       backupTableColumnHelper.columns([
@@ -465,8 +487,9 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
       enableSubRowSelection: false,
       getColumnCanGlobalFilter: (column) => column.id === "name",
       getRowId: backupRowKey,
-      globalFilterFn: globalFilter,
       initialState: initialTableState,
+      manualFiltering: true,
+      manualSorting: true,
     },
     selectNoDataTableState
   )
@@ -478,10 +501,8 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
   return (
     <>
       <BackupDesktopTableStateSync
-        nameStore={nameStore}
-        searchStore={searchStore}
+        onSortChange={onSortChange}
         selectionStore={selectionStore}
-        statusFilterStore={statusFilterStore}
         table={table}
       />
       <DataTable
@@ -494,9 +515,14 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
             statusFilterStore={statusFilterStore}
           />
         }
+        error={error}
         getRowClassName={backupTableRowClassName}
         gridClassName={backupTableGridClassName}
+        loading={loading}
+        onRetry={onRetry}
+        pagination={pagination}
         table={table}
+        updating={updating}
         virtualization={virtualization}
       />
     </>
@@ -505,74 +531,38 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
 
 const BackupDesktopTableStateSync = React.memo(
   function BackupDesktopTableStateSync({
-    nameStore,
-    searchStore,
+    onSortChange,
     selectionStore,
-    statusFilterStore,
     table,
   }: {
-    nameStore: BackupNameStore
-    searchStore: BackupSearchStore
+    onSortChange: (
+      sort: BackupRunSort,
+      direction: BackupRunSortDirection
+    ) => void
     selectionStore: BackupSelectionStore
-    statusFilterStore: BackupStatusFilterStore
     table: Table<typeof dataTableFeatures, Backup>
   }) {
-    const normalizedSearch = React.useSyncExternalStore(
-      searchStore.subscribe,
-      searchStore.getNormalizedSnapshot,
-      searchStore.getNormalizedServerSnapshot
-    )
     const selectedBackupIds = React.useSyncExternalStore(
       selectionStore.subscribe,
       selectionStore.getSnapshot,
       selectionStore.getServerSnapshot
     )
-    const status = React.useSyncExternalStore(
-      statusFilterStore.subscribe,
-      statusFilterStore.getSnapshot,
-      statusFilterStore.getServerSnapshot
-    )
-    const nameRevision = React.useSyncExternalStore(
-      nameStore.subscribe,
-      nameStore.getRevision,
-      () => 0
-    )
-    const subscribeToSorting = React.useCallback(
-      (listener: () => void) => {
-        const subscription = table.atoms.sorting.subscribe(listener)
-        return () => subscription.unsubscribe()
-      },
-      [table]
-    )
-    const getSorting = React.useCallback(
-      () => table.atoms.sorting.get(),
-      [table]
-    )
-    const sorting = React.useSyncExternalStore(
-      subscribeToSorting,
-      getSorting,
-      getSorting
-    )
-
-    React.useLayoutEffect(() => {
-      const current = table.atoms.globalFilter.get() as BackupDesktopFilter
-      const nameAffectsRows =
-        normalizedSearch.length > 0 ||
-        sorting.some((sort) => sort.id === "name")
-      const nextNameRevision = nameAffectsRows ? nameRevision : undefined
-      if (
-        current.search === normalizedSearch &&
-        current.status === status &&
-        current.nameRevision === nextNameRevision
-      ) {
-        return
+    const handleSortingChange = React.useEffectEvent(
+      (sorting: SortingState) => {
+        const next = sorting[0]
+        if (
+          !next ||
+          !["name", "target", "size", "createdAt"].includes(next.id)
+        ) {
+          return
+        }
+        onSortChange(next.id as BackupRunSort, next.desc ? "desc" : "asc")
       }
-      table.setGlobalFilter({
-        nameRevision: nextNameRevision,
-        search: normalizedSearch,
-        status,
-      })
-    }, [nameRevision, normalizedSearch, sorting, status, table])
+    )
+    React.useLayoutEffect(() => {
+      const subscription = table.atoms.sorting.subscribe(handleSortingChange)
+      return () => subscription.unsubscribe()
+    }, [table])
 
     React.useLayoutEffect(() => {
       const current = table.atoms.rowSelection.get()
@@ -617,26 +607,30 @@ const BackupDesktopEmptyState = React.memo(function BackupDesktopEmptyState({
 
 const BackupMobileList = React.memo(function BackupMobileList({
   backups,
-  nameStore,
-  relayNames,
+  error,
+  loading,
+  onRetry,
+  pagination,
   renderEmpty,
   renderRow,
   scopeFiltered,
+  scrollRootRef,
   searchStore,
   selectionStore,
   statusFilterStore,
-  targetNames,
 }: {
   backups: Array<Backup>
-  nameStore: BackupNameStore
-  relayNames: ReadonlyMap<string, string>
+  error?: Error | null
+  loading?: boolean
+  onRetry?: () => void
+  pagination: DataTablePaginationOptions
   renderEmpty: (searchActive: boolean, filterActive: boolean) => React.ReactNode
   renderRow: (backup: Backup) => React.ReactNode
   scopeFiltered: boolean
+  scrollRootRef: React.RefObject<Element | null>
   searchStore: BackupSearchStore
   selectionStore: BackupSelectionStore
   statusFilterStore: BackupStatusFilterStore
-  targetNames: ReadonlyMap<string, string>
 }) {
   const search = React.useSyncExternalStore(
     searchStore.subscribe,
@@ -648,50 +642,23 @@ const BackupMobileList = React.memo(function BackupMobileList({
     statusFilterStore.getSnapshot,
     statusFilterStore.getServerSnapshot
   )
-  const normalizedSearch = search.trim().toLowerCase()
-  const getSearchNameRevision = React.useCallback(
-    () => (normalizedSearch.length > 0 ? nameStore.getRevision() : 0),
-    [nameStore, normalizedSearch.length]
-  )
-  const nameRevision = React.useSyncExternalStore(
-    nameStore.subscribe,
-    getSearchNameRevision,
-    () => 0
-  )
-  const visible = React.useMemo(
-    () =>
-      backups.filter(
-        (backup) =>
-          backupMatchesStatusFilter(backup, status) &&
-          backupMatchesSearch(
-            backup,
-            normalizedSearch,
-            relayNames,
-            targetNames,
-            nameStore.get(backup.id, backup.name)
-          )
-      ),
-    [
-      backups,
-      nameRevision,
-      nameStore,
-      normalizedSearch,
-      relayNames,
-      status,
-      targetNames,
-    ]
-  )
-
-  if (visible.length === 0) {
+  if (loading) return <DataTableLoadingState />
+  if (error) return <DataTableErrorState onRetry={onRetry} />
+  if (backups.length === 0) {
     return renderEmpty(
-      normalizedSearch.length > 0,
+      search.trim().length > 0,
       scopeFiltered || Boolean(status)
     )
   }
   return (
     <div>
-      <BackupMobileSelectAll backups={visible} store={selectionStore} />
-      <div className="divide-y divide-border/70">{visible.map(renderRow)}</div>
+      <BackupMobileSelectAll backups={backups} store={selectionStore} />
+      <div className="divide-y divide-border/70">{backups.map(renderRow)}</div>
+      <DataTableLoadMoreTrigger
+        pagination={pagination}
+        rowCount={backups.length}
+        scrollRootRef={scrollRootRef}
+      />
     </div>
   )
 })
@@ -1064,7 +1031,7 @@ export const BackupBulkActions = React.memo(function BackupBulkActions({
       if (deleted.length > 0) {
         selectionStore.deselect(deleted.map((outcome) => outcome.backup.id))
       }
-      await queryClient.invalidateQueries({ queryKey: queryKeys.backups.all })
+      await resetActiveBackupRunsToFirstPage(queryClient)
 
       if (failed.length > 0) {
         showToast({
@@ -1253,46 +1220,5 @@ function backupSelectionMatchesState(
   return (
     selectedBackupIds.size === selectedRowIds.length &&
     selectedRowIds.every((backupId) => selectedBackupIds.has(backupId))
-  )
-}
-
-function backupSearchText(
-  backup: Backup,
-  relayNames: ReadonlyMap<string, string>,
-  targetNames: ReadonlyMap<string, string>,
-  backupName: string = backup.name
-): string {
-  const relayDisplayName = relayNames.get(backup.relayId)
-  const targetDisplayName =
-    backup.targetKind === "platform"
-      ? relayDisplayName
-      : targetNames.get(
-          targetKey(backup.targetKind, backup.relayId, backup.targetId)
-        )
-
-  return [
-    backupName,
-    backup.id,
-    backup.targetId,
-    backup.relayId,
-    targetDisplayName,
-    relayDisplayName,
-  ]
-    .filter(Boolean)
-    .join(" ")
-}
-
-export function backupMatchesSearch(
-  backup: Backup,
-  normalizedSearch: string,
-  relayNames: ReadonlyMap<string, string>,
-  targetNames: ReadonlyMap<string, string>,
-  backupName: string = backup.name
-): boolean {
-  return (
-    normalizedSearch.length === 0 ||
-    backupSearchText(backup, relayNames, targetNames, backupName)
-      .toLowerCase()
-      .includes(normalizedSearch)
   )
 }

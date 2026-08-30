@@ -1,5 +1,5 @@
 import * as React from "react"
-import { useQuery } from "@tanstack/react-query"
+import { useQueryClient } from "@tanstack/react-query"
 import {
   Check,
   Plus,
@@ -17,6 +17,7 @@ import {
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
+import { showToast } from "@workspace/ui/components/sonner"
 import {
   Tooltip,
   TooltipContent,
@@ -25,7 +26,9 @@ import {
 
 import { useWorkspaceTableSearchInput } from "@/components/workspace-data-table"
 import { ensuringPromise, forkPromise } from "@/effect/promise"
-import { backupsQueryOptions } from "@/lib/query-options"
+import { backupRunsSearchMaxLength } from "@/lib/backup-runs"
+import { resetActiveBackupRunsToFirstPage } from "@/lib/backup-runs-cache"
+import { syncBackupRuns } from "@/server/backups"
 import type {
   BackupDialogStore,
   BackupFilters,
@@ -90,6 +93,7 @@ export const BackupToolbar = React.memo(function BackupToolbar({
           aria-label="Search backups"
           className="pl-9 text-base md:text-sm"
           defaultValue={searchStore.getServerSnapshot()}
+          maxLength={backupRunsSearchMaxLength}
           placeholder="Search backups"
           type="search"
           onChange={(event) => searchStore.set(event.currentTarget.value)}
@@ -183,20 +187,19 @@ const BackupStatusFilter = React.memo(function BackupStatusFilter({
 })
 
 const BackupSyncButton = React.memo(function BackupSyncButton() {
-  const { refetch } = useQuery({
-    ...backupsQueryOptions(),
-    notifyOnChangeProps: [],
-  })
+  const queryClient = useQueryClient()
   const [spinning, setSpinning] = React.useState(false)
   const fetchDoneRef = React.useRef(true)
   const fallbackTimeoutRef = React.useRef<number>(undefined)
   const mountedRef = React.useRef(true)
+  const syncControllerRef = React.useRef<AbortController>(undefined)
   const syncing = spinning
 
   React.useEffect(() => {
     mountedRef.current = true
     return () => {
       mountedRef.current = false
+      syncControllerRef.current?.abort()
       if (fallbackTimeoutRef.current !== undefined) {
         window.clearTimeout(fallbackTimeoutRef.current)
       }
@@ -213,19 +216,42 @@ const BackupSyncButton = React.memo(function BackupSyncButton() {
   }, [])
 
   const syncBackups = React.useCallback(() => {
-    if (spinning) return
+    if (spinning || syncControllerRef.current) return
+    const controller = new AbortController()
+    syncControllerRef.current = controller
     fetchDoneRef.current = false
     setSpinning(true)
-    forkPromise(() =>
-      ensuringPromise(refetch, () => {
-        fetchDoneRef.current = true
-        fallbackTimeoutRef.current = window.setTimeout(
-          stopSpinIfDone,
-          minimumBackupSyncFeedbackMs
-        )
-      })
+    forkPromise(
+      () =>
+        ensuringPromise(
+          async () => {
+            await syncBackupRuns({ signal: controller.signal })
+            await resetActiveBackupRunsToFirstPage(
+              queryClient,
+              controller.signal
+            )
+          },
+          () => {
+            if (syncControllerRef.current === controller) {
+              syncControllerRef.current = undefined
+            }
+            fetchDoneRef.current = true
+            if (!mountedRef.current) return
+            fallbackTimeoutRef.current = window.setTimeout(
+              stopSpinIfDone,
+              minimumBackupSyncFeedbackMs
+            )
+          }
+        ),
+      (cause) => {
+        if (controller.signal.aborted) return
+        showToast({
+          message: `Backup sync failed: ${cause instanceof Error ? cause.message : "Unknown error"}`,
+          type: "error",
+        })
+      }
     )
-  }, [refetch, spinning, stopSpinIfDone])
+  }, [queryClient, spinning, stopSpinIfDone])
 
   return (
     <Tooltip>
