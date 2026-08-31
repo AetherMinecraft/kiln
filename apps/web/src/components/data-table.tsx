@@ -6,49 +6,48 @@ import {
   type Row,
   type RowData,
   type SortingState,
-  type Table,
 } from "@tanstack/react-table"
 import { ArrowDown, ArrowUp, ArrowUpDown, LoaderCircle } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
 import { Skeleton } from "@workspace/ui/components/skeleton"
 import { cn } from "@workspace/ui/lib/utils"
-import { dataTableFeatures } from "@/lib/data-table"
+import {
+  dataTableFeatures,
+  type DataTableBreakpoint,
+  type DataTableDefinition,
+  type DataTableInstance,
+  type DataTableVirtualizationOptions,
+} from "@/lib/data-table"
+import {
+  type DataTableBodyState,
+  type DataTableLoadMoreSource,
+  type DataTableSource,
+  shouldRenderDataTableLoadMore,
+} from "@/lib/data-table-source"
 import { forkPromise } from "@/effect/promise"
 
-type DataTableInstance<TData extends RowData> = Table<
-  typeof dataTableFeatures,
-  TData
->
-
-interface DataTableVirtualizationOptions {
-  estimateRowHeight?: number
-  overscan?: number
-}
-
-export interface DataTablePaginationOptions {
-  error?: Error | null
-  hasMore: boolean
-  isLoading: boolean
-  onLoadMore: () => Promise<unknown> | void
-  resetKey: string
-}
-
 export function DataTableLoadMoreTrigger({
-  pagination,
+  loadMoreSource,
   rowCount,
   scrollRootRef,
 }: {
-  pagination: DataTablePaginationOptions
+  loadMoreSource: DataTableLoadMoreSource
   rowCount: number
   scrollRootRef: React.RefObject<Element | null>
 }) {
   const triggerRef = React.useRef<HTMLDivElement>(null)
-  const requestKey = `${pagination.resetKey}:${rowCount}`
+  const requestKey = `${loadMoreSource.resetKey}:${rowCount}`
   const requestedKeyRef = React.useRef<string | null>(null)
 
   React.useEffect(() => {
-    if (!pagination.hasMore || pagination.isLoading || pagination.error) return
+    if (
+      !loadMoreSource.hasMore ||
+      loadMoreSource.state.kind === "loading" ||
+      loadMoreSource.state.kind === "error"
+    ) {
+      return
+    }
     const target = triggerRef.current
     const scrollRoot = scrollRootRef.current
     if (!target || !scrollRoot) return
@@ -58,24 +57,24 @@ export function DataTableLoadMoreTrigger({
           return
         }
         requestedKeyRef.current = requestKey
-        forkPromise(() => Promise.resolve(pagination.onLoadMore()))
+        forkPromise(() => Promise.resolve(loadMoreSource.loadMore()))
       },
       { root: scrollRoot, rootMargin: "320px 0px" }
     )
     observer.observe(target)
     return () => observer.disconnect()
-  }, [pagination, requestKey, scrollRootRef])
+  }, [loadMoreSource, requestKey, scrollRootRef])
 
-  if (!pagination.hasMore && !pagination.isLoading && !pagination.error) {
+  if (!loadMoreSource.hasMore && loadMoreSource.state.kind === "idle") {
     return null
   }
   return (
     <div ref={triggerRef} className="grid h-12 place-items-center">
-      {pagination.error ? (
+      {loadMoreSource.state.kind === "error" ? (
         <button
           className="text-xs font-medium text-muted-foreground hover:text-foreground"
           type="button"
-          onClick={() => void pagination.onLoadMore()}
+          onClick={() => void loadMoreSource.loadMore()}
         >
           Loading failed. Try again
         </button>
@@ -89,36 +88,71 @@ export function DataTableLoadMoreTrigger({
   )
 }
 
-interface DataTableProps<TData extends RowData> {
-  ariaLabel: string
+export function DataTableCompactList<TItem>({
+  emptyState,
+  header,
+  renderRow,
+  scrollRootRef,
+  source,
+}: {
   emptyState: React.ReactNode
-  error?: Error | null
-  getRowClassName?: (row: Row<typeof dataTableFeatures, TData>) => string
-  gridClassName: string
-  loading?: boolean
-  loadingRowCount?: number
-  onRetry?: () => void
-  pagination?: DataTablePaginationOptions
-  scrollResetKey?: string
-  table: DataTableInstance<TData>
-  updating?: boolean
-  virtualization?: DataTableVirtualizationOptions
+  header?: React.ReactNode
+  renderRow: (item: TItem) => React.ReactNode
+  scrollRootRef: React.RefObject<Element | null>
+  source: DataTableSource<TItem>
+}) {
+  if (source.body.kind === "loading") {
+    return <DataTableLoadingState rowCount={source.body.rowCount} />
+  }
+  if (source.body.kind === "error") {
+    return (
+      <DataTableCenteredState>
+        <DataTableErrorState onRetry={source.body.retry} />
+      </DataTableCenteredState>
+    )
+  }
+  if (source.rows.length === 0) {
+    return <DataTableCenteredState>{emptyState}</DataTableCenteredState>
+  }
+
+  return (
+    <div
+      aria-busy={
+        source.refreshing ||
+        source.loadMore?.state.kind === "loading" ||
+        undefined
+      }
+    >
+      {header}
+      <div className="divide-y divide-border/70 border-b border-border/70">
+        {source.rows.map(renderRow)}
+      </div>
+      {source.loadMore && shouldRenderDataTableLoadMore(source.loadMore) ? (
+        <DataTableLoadMoreTrigger
+          loadMoreSource={source.loadMore}
+          rowCount={source.rows.length}
+          scrollRootRef={scrollRootRef}
+        />
+      ) : null}
+    </div>
+  )
 }
 
+interface DataTableProps<TData extends RowData> {
+  definition: DataTableDefinition<TData>
+  emptyState: React.ReactNode
+  source: DataTableSource<TData>
+  table: DataTableInstance<TData>
+}
+
+const dataTableScrollAreaClassName =
+  "block min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-y-contain border-b border-border/70"
+
 export function DataTable<TData extends RowData>({
-  ariaLabel,
+  definition,
   emptyState,
-  error,
-  getRowClassName,
-  gridClassName,
-  loading,
-  loadingRowCount,
-  onRetry,
-  pagination,
-  scrollResetKey,
+  source,
   table,
-  updating,
-  virtualization,
 }: DataTableProps<TData>) {
   return (
     <Subscribe source={table.atoms.sorting} selector={dataTableSortingResetKey}>
@@ -129,20 +163,11 @@ export function DataTable<TData extends RowData>({
         >
           {() => (
             <DataTableRowModel
-              ariaLabel={ariaLabel}
+              definition={definition}
               emptyState={emptyState}
-              error={error}
-              getRowClassName={getRowClassName}
-              gridClassName={gridClassName}
-              loading={loading}
-              loadingRowCount={loadingRowCount}
-              onRetry={onRetry}
-              pagination={pagination}
-              scrollResetKey={scrollResetKey}
+              source={source}
               sortingResetKey={sortingResetKey}
               table={table}
-              updating={updating}
-              virtualization={virtualization}
             />
           )}
         </Subscribe>
@@ -158,36 +183,25 @@ interface DataTableRowModelProps<
 }
 
 function DataTableRowModel<TData extends RowData>({
-  ariaLabel,
+  definition,
   emptyState,
-  error,
-  getRowClassName,
-  gridClassName,
-  loading,
-  loadingRowCount,
-  onRetry,
-  pagination,
-  scrollResetKey,
+  source,
   sortingResetKey,
   table,
-  updating,
-  virtualization,
 }: DataTableRowModelProps<TData>) {
   const rows = table.getRowModel().rows
   const columnCount = table.getAllLeafColumns().length
   const scrollElementRef = React.useRef<HTMLTableSectionElement>(null)
-  const hasBodyState = Boolean(loading || error || rows.length === 0)
+  const hasBodyState = source.body.kind !== "ready" || rows.length === 0
   const scrollbarWidth = useScrollbarWidth(
     scrollElementRef,
     hasBodyState ? -1 : rows.length
   )
-  const bodyState = loading ? (
-    <DataTableLoadingState rowCount={loadingRowCount} />
-  ) : error ? (
-    <DataTableErrorState onRetry={onRetry} />
-  ) : rows.length === 0 ? (
-    emptyState
-  ) : null
+  const bodyState = dataTableBodyState(source.body, emptyState, rows.length)
+  const gridStyle = React.useMemo(
+    () => dataTableGridStyle(table),
+    [table, table.options.columns]
+  )
 
   React.useLayoutEffect(() => {
     const scrollElement = scrollElementRef.current
@@ -197,14 +211,19 @@ function DataTableRowModel<TData extends RowData>({
       scrollElement.scrollTop = 0
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [pagination?.resetKey, scrollResetKey, sortingResetKey])
+  }, [source.resetKey, sortingResetKey])
 
   return (
     <div
-      aria-busy={loading || updating || pagination?.isLoading || undefined}
-      className="relative flex h-full min-h-0 w-full min-w-0 flex-col"
+      aria-busy={
+        source.body.kind === "loading" ||
+        source.refreshing ||
+        source.loadMore?.state.kind === "loading" ||
+        undefined
+      }
+      className="relative flex h-full min-h-0 w-full min-w-0 flex-1 flex-col"
     >
-      {updating ? (
+      {source.refreshing ? (
         <span
           aria-live="polite"
           className="pointer-events-none absolute top-3 right-3 z-30 inline-flex items-center gap-1.5 text-xs text-muted-foreground"
@@ -214,43 +233,39 @@ function DataTableRowModel<TData extends RowData>({
           Updating
         </span>
       ) : null}
-      {!updating && pagination?.isLoading ? (
+      {!source.refreshing && source.loadMore?.state.kind === "loading" ? (
         <span aria-live="polite" className="sr-only" role="status">
           Loading more rows
         </span>
       ) : null}
       <table
         aria-colcount={columnCount}
-        aria-label={ariaLabel}
+        aria-label={definition.ariaLabel}
         aria-rowcount={hasBodyState ? 2 : rows.length + 1}
         className="flex h-full min-h-0 w-full min-w-0 border-collapse flex-col overflow-hidden pb-px text-left"
+        style={gridStyle}
       >
-        <MemoizedDataTableHead
-          gridClassName={gridClassName}
-          scrollbarWidth={scrollbarWidth}
-          table={table}
-        />
+        <MemoizedDataTableHead scrollbarWidth={scrollbarWidth} table={table} />
         {hasBodyState ? (
           <DataTableStateBody
+            centered={source.body.kind !== "loading"}
             colSpan={columnCount}
             scrollElementRef={scrollElementRef}
           >
             {bodyState}
           </DataTableStateBody>
-        ) : virtualization ? (
+        ) : definition.virtualization ? (
           <VirtualDataTableBody
-            getRowClassName={getRowClassName}
-            gridClassName={gridClassName}
-            pagination={pagination}
+            getRowClassName={definition.getRowClassName}
+            loadMoreSource={source.loadMore}
             rows={rows}
             scrollElementRef={scrollElementRef}
-            virtualization={virtualization}
+            virtualization={definition.virtualization}
           />
         ) : (
           <DataTableBody
-            getRowClassName={getRowClassName}
-            gridClassName={gridClassName}
-            pagination={pagination}
+            getRowClassName={definition.getRowClassName}
+            loadMoreSource={source.loadMore}
             rows={rows}
             scrollElementRef={scrollElementRef}
           />
@@ -266,27 +281,135 @@ function dataTableSortingResetKey(sorting: SortingState): string {
     .join("|")
 }
 
+function dataTableBodyState(
+  body: DataTableBodyState,
+  emptyState: React.ReactNode,
+  rowCount: number
+): React.ReactNode {
+  if (body.kind === "loading") {
+    return <DataTableLoadingState rowCount={body.rowCount} />
+  }
+  if (body.kind === "error") {
+    return <DataTableErrorState onRetry={body.retry} />
+  }
+  return rowCount === 0 ? emptyState : null
+}
+
+const dataTableBreakpoints: ReadonlyArray<DataTableBreakpoint> = [
+  "base",
+  "sm",
+  "md",
+  "lg",
+  "xl",
+]
+
+type DataTableGridStyle = React.CSSProperties &
+  Record<`--data-table-grid-${DataTableBreakpoint}`, string>
+
+function dataTableGridStyle<TData extends RowData>(
+  table: DataTableInstance<TData>
+): DataTableGridStyle {
+  const columns = table.getAllLeafColumns()
+  const grids = Object.fromEntries(
+    dataTableBreakpoints.map((breakpoint) => [
+      `--data-table-grid-${breakpoint}`,
+      columns
+        .filter(
+          (column) =>
+            !dataTableColumnIsHidden(
+              column.columnDef.meta?.layout?.hideBelow,
+              breakpoint
+            )
+        )
+        .map((column) =>
+          dataTableColumnWidth(column.columnDef.meta?.layout?.width, breakpoint)
+        )
+        .join(" "),
+    ])
+  )
+  return grids as unknown as DataTableGridStyle
+}
+
+function dataTableColumnWidth(
+  width: string | Partial<Record<DataTableBreakpoint, string>> | undefined,
+  breakpoint: DataTableBreakpoint
+): string {
+  if (typeof width === "string") return width
+  if (!width) return "minmax(0,1fr)"
+  const breakpointIndex = dataTableBreakpoints.indexOf(breakpoint)
+  for (let index = breakpointIndex; index >= 0; index -= 1) {
+    const resolved = width[dataTableBreakpoints[index] ?? "base"]
+    if (resolved) return resolved
+  }
+  return "minmax(0,1fr)"
+}
+
+function dataTableColumnIsHidden(
+  hideBelow: Exclude<DataTableBreakpoint, "base"> | undefined,
+  breakpoint: DataTableBreakpoint
+): boolean {
+  return Boolean(
+    hideBelow &&
+    dataTableBreakpoints.indexOf(breakpoint) <
+      dataTableBreakpoints.indexOf(hideBelow)
+  )
+}
+
+function dataTableColumnVisibilityClass(
+  hideBelow: Exclude<DataTableBreakpoint, "base"> | undefined,
+  element: "cell" | "header"
+): string | undefined {
+  if (!hideBelow) return undefined
+  return dataTableVisibilityClasses[hideBelow][element]
+}
+
+const dataTableVisibilityClasses = {
+  sm: {
+    cell: "hidden sm:flex",
+    header: "hidden sm:flex sm:items-center",
+  },
+  md: {
+    cell: "hidden md:flex",
+    header: "hidden md:flex md:items-center",
+  },
+  lg: {
+    cell: "hidden lg:flex",
+    header: "hidden lg:flex lg:items-center",
+  },
+  xl: {
+    cell: "hidden xl:flex",
+    header: "hidden xl:flex xl:items-center",
+  },
+} as const
+
 function DataTableStateBody({
+  centered,
   children,
   colSpan,
   scrollElementRef,
 }: {
+  centered: boolean
   children: React.ReactNode
   colSpan: number
   scrollElementRef: React.RefObject<HTMLTableSectionElement | null>
 }) {
   return (
-    <tbody
-      ref={scrollElementRef}
-      className="block min-h-0 flex-1 overflow-y-auto overscroll-contain border-b border-border/70"
-    >
-      <tr className="block">
-        <td className="block p-0" colSpan={colSpan}>
-          {children}
+    <tbody ref={scrollElementRef} className={dataTableScrollAreaClassName}>
+      <tr className={cn("block", centered && "h-full")}>
+        <td className={cn("block p-0", centered && "h-full")} colSpan={colSpan}>
+          {centered ? (
+            <DataTableCenteredState>{children}</DataTableCenteredState>
+          ) : (
+            children
+          )}
         </td>
       </tr>
     </tbody>
   )
+}
+
+function DataTableCenteredState({ children }: { children: React.ReactNode }) {
+  return <div className="grid h-full place-items-center">{children}</div>
 }
 
 export function DataTableLoadingState({ rowCount = 7 }: { rowCount?: number }) {
@@ -303,26 +426,68 @@ export function DataTableLoadingState({ rowCount = 7 }: { rowCount?: number }) {
   )
 }
 
+export const DataTableTextCell = React.memo(function DataTableTextCell({
+  className,
+  monospace = false,
+  title,
+  value,
+}: {
+  className?: string
+  monospace?: boolean
+  title?: string
+  value: string
+}) {
+  return (
+    <span
+      className={cn(
+        "type-meta block min-w-0 truncate text-foreground",
+        monospace && "font-mono",
+        className
+      )}
+      title={title ?? value}
+    >
+      {value}
+    </span>
+  )
+})
+
+export function DataTableEmptyState({
+  action,
+  description,
+  icon,
+  title,
+}: {
+  action?: React.ReactNode
+  description: React.ReactNode
+  icon?: React.ReactNode
+  title: React.ReactNode
+}) {
+  return (
+    <div className="px-6 py-12 text-center">
+      {icon ? <div className="flex justify-center">{icon}</div> : null}
+      <p className="mt-3 text-sm font-semibold">{title}</p>
+      <div className="type-support mt-1 text-muted-foreground">
+        {description}
+      </div>
+      {action ? <div className="mt-4 flex justify-center">{action}</div> : null}
+    </div>
+  )
+}
+
 export function DataTableErrorState({ onRetry }: { onRetry?: () => void }) {
   return (
-    <div className="grid h-64 place-items-center px-6 text-center" role="alert">
-      <div>
-        <p className="text-sm font-semibold">Could not load this table</p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Check your connection and try again.
-        </p>
-        {onRetry ? (
-          <Button
-            className="mt-4"
-            size="sm"
-            type="button"
-            variant="outline"
-            onClick={onRetry}
-          >
-            Try again
-          </Button>
-        ) : null}
-      </div>
+    <div role="alert">
+      <DataTableEmptyState
+        action={
+          onRetry ? (
+            <Button size="sm" type="button" variant="outline" onClick={onRetry}>
+              Try again
+            </Button>
+          ) : null
+        }
+        description="Check your connection and try again."
+        title="Could not load this table"
+      />
     </div>
   )
 }
@@ -354,11 +519,9 @@ function useScrollbarWidth(
 }
 
 function DataTableHead<TData extends RowData>({
-  gridClassName,
   scrollbarWidth,
   table,
 }: {
-  gridClassName: string
   scrollbarWidth: number
   table: DataTableInstance<TData>
 }) {
@@ -371,10 +534,7 @@ function DataTableHead<TData extends RowData>({
         <tr
           key={headerGroup.id}
           aria-rowindex={1}
-          className={cn(
-            "type-technical-label grid bg-muted/20 text-muted-foreground",
-            gridClassName
-          )}
+          className="type-technical-label grid grid-cols-[var(--data-table-grid-base)] bg-muted/20 text-muted-foreground sm:grid-cols-[var(--data-table-grid-sm)] md:grid-cols-[var(--data-table-grid-md)] lg:grid-cols-[var(--data-table-grid-lg)] xl:grid-cols-[var(--data-table-grid-xl)]"
         >
           {headerGroup.headers.map((header) => (
             <MemoizedDataTableHeaderCell
@@ -394,7 +554,6 @@ function areDataTableHeadPropsEqual<TData extends RowData>(
   next: React.ComponentProps<typeof DataTableHead<TData>>
 ) {
   return (
-    previous.gridClassName === next.gridClassName &&
     previous.scrollbarWidth === next.scrollbarWidth &&
     previous.table.store === next.table.store &&
     previous.table.options.columns === next.table.options.columns
@@ -481,6 +640,7 @@ function DataTableHeaderCellContent<TData extends RowData>({
       }
       className={cn(
         "h-10 min-w-0 px-3 text-left font-medium whitespace-nowrap",
+        dataTableColumnVisibilityClass(meta?.layout?.hideBelow, "header"),
         meta?.headerClassName
       )}
       scope="col"
@@ -529,35 +689,31 @@ function DataTableSortIcon({
 
 function DataTableBody<TData extends RowData>({
   getRowClassName,
-  gridClassName,
-  pagination,
+  loadMoreSource,
   rows,
   scrollElementRef,
 }: {
   getRowClassName?: (row: Row<typeof dataTableFeatures, TData>) => string
-  gridClassName: string
-  pagination?: DataTablePaginationOptions
+  loadMoreSource?: DataTableLoadMoreSource
   rows: Array<Row<typeof dataTableFeatures, TData>>
   scrollElementRef: React.RefObject<HTMLTableSectionElement | null>
 }) {
+  const showLoadMoreRow = shouldRenderDataTableLoadMore(loadMoreSource)
+
   return (
-    <tbody
-      ref={scrollElementRef}
-      className="block min-h-0 flex-1 overflow-y-auto overscroll-contain border-b border-border/70"
-    >
+    <tbody ref={scrollElementRef} className={dataTableScrollAreaClassName}>
       {rows.map((row) => (
         <DataTableRowSelectionBoundary
           key={row.id}
           canSelect={row.getCanSelect()}
-          gridClassName={gridClassName}
           row={row}
           rowClassName={getRowClassName?.(row)}
         />
       ))}
-      {pagination ? (
-        <DataTablePaginationRow
+      {loadMoreSource && showLoadMoreRow ? (
+        <DataTableLoadMoreRow
           colSpan={rows[0]?.getAllCells().length ?? 1}
-          pagination={pagination}
+          loadMoreSource={loadMoreSource}
           rowCount={rows.length}
         />
       ) : null}
@@ -567,26 +723,22 @@ function DataTableBody<TData extends RowData>({
 
 function VirtualDataTableBody<TData extends RowData>({
   getRowClassName,
-  gridClassName,
-  pagination,
+  loadMoreSource,
   rows,
   scrollElementRef,
   virtualization,
 }: {
   getRowClassName?: (row: Row<typeof dataTableFeatures, TData>) => string
-  gridClassName: string
-  pagination?: DataTablePaginationOptions
+  loadMoreSource?: DataTableLoadMoreSource
   rows: Array<Row<typeof dataTableFeatures, TData>>
   scrollElementRef: React.RefObject<HTMLTableSectionElement | null>
   virtualization: DataTableVirtualizationOptions
 }) {
-  const showPagination = Boolean(
-    pagination?.hasMore || pagination?.isLoading || pagination?.error
-  )
+  const showLoadMoreRow = shouldRenderDataTableLoadMore(loadMoreSource)
   const rowVirtualizer = useVirtualizer({
-    count: rows.length + (showPagination ? 1 : 0),
+    count: rows.length + (showLoadMoreRow ? 1 : 0),
     estimateSize: () => virtualization.estimateRowHeight ?? 72,
-    getItemKey: (index) => rows[index]?.id ?? `pagination-${index}`,
+    getItemKey: (index) => rows[index]?.id ?? `load-more-${index}`,
     getScrollElement: () => scrollElementRef.current,
     overscan: virtualization.overscan ?? 6,
   })
@@ -594,7 +746,7 @@ function VirtualDataTableBody<TData extends RowData>({
   return (
     <tbody
       ref={scrollElementRef}
-      className="relative block min-h-0 flex-1 overflow-y-auto overscroll-contain border-b border-border/70"
+      className={cn("relative", dataTableScrollAreaClassName)}
     >
       <tr
         aria-hidden="true"
@@ -604,14 +756,18 @@ function VirtualDataTableBody<TData extends RowData>({
         <td className="block p-0" />
       </tr>
       {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-        if (virtualRow.index === rows.length && pagination && showPagination) {
+        if (
+          virtualRow.index === rows.length &&
+          loadMoreSource &&
+          showLoadMoreRow
+        ) {
           return (
-            <DataTablePaginationRow
-              key="pagination"
+            <DataTableLoadMoreRow
+              key="load-more"
               ref={rowVirtualizer.measureElement}
               colSpan={rows[0]?.getAllCells().length ?? 1}
               dataIndex={virtualRow.index}
-              pagination={pagination}
+              loadMoreSource={loadMoreSource}
               rowCount={rows.length}
               virtualStart={virtualRow.start}
             />
@@ -627,7 +783,6 @@ function VirtualDataTableBody<TData extends RowData>({
             ariaRowIndex={virtualRow.index + 2}
             canSelect={row.getCanSelect()}
             dataIndex={virtualRow.index}
-            gridClassName={gridClassName}
             row={row}
             rowClassName={getRowClassName?.(row)}
             virtualStart={virtualRow.start}
@@ -638,27 +793,33 @@ function VirtualDataTableBody<TData extends RowData>({
   )
 }
 
-function DataTablePaginationRow({
+function DataTableLoadMoreRow({
   colSpan,
   dataIndex,
-  pagination,
+  loadMoreSource,
   rowCount,
   virtualStart,
   ref,
 }: {
   colSpan: number
   dataIndex?: number
-  pagination: DataTablePaginationOptions
+  loadMoreSource: DataTableLoadMoreSource
   rowCount: number
   virtualStart?: number
   ref?: React.Ref<HTMLTableRowElement>
 }) {
   const triggerRef = React.useRef<HTMLTableCellElement>(null)
-  const requestKey = `${pagination.resetKey}:${rowCount}`
+  const requestKey = `${loadMoreSource.resetKey}:${rowCount}`
   const requestedKeyRef = React.useRef<string | null>(null)
 
   React.useEffect(() => {
-    if (!pagination.hasMore || pagination.isLoading || pagination.error) return
+    if (
+      !loadMoreSource.hasMore ||
+      loadMoreSource.state.kind === "loading" ||
+      loadMoreSource.state.kind === "error"
+    ) {
+      return
+    }
     const target = triggerRef.current
     if (!target) return
     const observer = new IntersectionObserver(
@@ -667,21 +828,21 @@ function DataTablePaginationRow({
           return
         }
         requestedKeyRef.current = requestKey
-        forkPromise(() => Promise.resolve(pagination.onLoadMore()))
+        forkPromise(() => Promise.resolve(loadMoreSource.loadMore()))
       },
       { root: target.closest("tbody"), rootMargin: "320px 0px" }
     )
     observer.observe(target)
     return () => observer.disconnect()
-  }, [pagination, requestKey])
+  }, [loadMoreSource, requestKey])
 
-  if (!pagination.hasMore && !pagination.isLoading && !pagination.error) {
+  if (!loadMoreSource.hasMore && loadMoreSource.state.kind === "idle") {
     return null
   }
   return (
     <tr
       ref={ref}
-      aria-hidden={!pagination.error}
+      aria-hidden={loadMoreSource.state.kind !== "error"}
       className="grid h-12 place-items-center"
       data-index={dataIndex}
       style={
@@ -697,11 +858,11 @@ function DataTablePaginationRow({
       }
     >
       <td ref={triggerRef} className="col-span-full" colSpan={colSpan}>
-        {pagination.error ? (
+        {loadMoreSource.state.kind === "error" ? (
           <button
             className="text-xs font-medium text-muted-foreground hover:text-foreground"
             type="button"
-            onClick={() => void pagination.onLoadMore()}
+            onClick={() => void loadMoreSource.loadMore()}
           >
             Loading failed. Try again
           </button>
@@ -720,7 +881,6 @@ interface DataTableRowProps<TData extends RowData> {
   ariaRowIndex?: number
   canSelect: boolean
   dataIndex?: number
-  gridClassName: string
   isSelected: boolean
   row: Row<typeof dataTableFeatures, TData>
   rowClassName?: string
@@ -731,6 +891,9 @@ interface DataTableRowProps<TData extends RowData> {
 function DataTableRowSelectionBoundaryComponent<TData extends RowData>(
   props: Omit<DataTableRowProps<TData>, "isSelected">
 ) {
+  if (!props.canSelect) {
+    return <MemoizedDataTableRow {...props} isSelected={false} />
+  }
   return (
     <Subscribe
       source={props.row.table.atoms.rowSelection}
@@ -751,7 +914,6 @@ function areDataTableRowBoundaryPropsEqual<TData extends RowData>(
     previous.ariaRowIndex === next.ariaRowIndex &&
     previous.canSelect === next.canSelect &&
     previous.dataIndex === next.dataIndex &&
-    previous.gridClassName === next.gridClassName &&
     previous.ref === next.ref &&
     previous.row.id === next.row.id &&
     previous.row.index === next.row.index &&
@@ -770,7 +932,6 @@ const DataTableRowSelectionBoundary = React.memo(
 function DataTableRow<TData extends RowData>({
   ariaRowIndex,
   dataIndex,
-  gridClassName,
   isSelected,
   row,
   rowClassName,
@@ -782,8 +943,7 @@ function DataTableRow<TData extends RowData>({
       ref={ref}
       aria-rowindex={ariaRowIndex}
       className={cn(
-        "grid border-b border-border/70 transition-colors last:border-b-0",
-        gridClassName,
+        "grid grid-cols-[var(--data-table-grid-base)] border-b border-border/70 transition-colors sm:grid-cols-[var(--data-table-grid-sm)] md:grid-cols-[var(--data-table-grid-md)] lg:grid-cols-[var(--data-table-grid-lg)] xl:grid-cols-[var(--data-table-grid-xl)]",
         rowClassName
       )}
       data-index={dataIndex}
@@ -805,6 +965,10 @@ function DataTableRow<TData extends RowData>({
           key={cell.id}
           className={cn(
             "flex h-14 min-w-0 items-center px-3",
+            dataTableColumnVisibilityClass(
+              cell.column.columnDef.meta?.layout?.hideBelow,
+              "cell"
+            ),
             cell.column.columnDef.meta?.cellClassName
           )}
         >
@@ -823,7 +987,6 @@ function areDataTableRowPropsEqual<TData extends RowData>(
     previous.ariaRowIndex === next.ariaRowIndex &&
     previous.canSelect === next.canSelect &&
     previous.dataIndex === next.dataIndex &&
-    previous.gridClassName === next.gridClassName &&
     previous.isSelected === next.isSelected &&
     previous.ref === next.ref &&
     previous.row.id === next.row.id &&
