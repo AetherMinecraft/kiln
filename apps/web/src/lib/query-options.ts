@@ -343,21 +343,21 @@ export function connectionWithCanonicalSnapshot(
   return { ...connection, snapshot }
 }
 
-export function managedDatabasesQueryOptions() {
-  return queryOptions({
-    queryKey: queryKeys.databases.list,
-    queryFn: () => getManagedDatabases(),
-    refetchOnWindowFocus: "always",
-    staleTime: 5_000,
-  })
-}
-
 export function managedDatabaseDirectoryQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.databases.directory,
     queryFn: () => getManagedDatabaseDirectory(),
     refetchOnWindowFocus: false,
     staleTime: 30_000,
+  })
+}
+
+export function managedDatabasesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.databases.list,
+    queryFn: () => getManagedDatabases(),
+    refetchOnWindowFocus: "always",
+    staleTime: 5_000,
   })
 }
 
