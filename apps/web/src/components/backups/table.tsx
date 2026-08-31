@@ -42,11 +42,10 @@ import {
   BackupTaskFeedback,
   DesktopBackupTaskFeedback,
   backupCanBeRemoved,
-  backupTargetName,
   backupTargetPresentation,
-  backupTargetSortName,
   targetKey,
 } from "@/components/backups/table-row"
+import type { InstanceNameInstance } from "@/components/instance-name"
 import type {
   Backup,
   BackupAvailabilityDestination,
@@ -93,46 +92,48 @@ const backupTableColumnHelper = createDataTableColumnHelper<Backup>()
 const backupTableGridClassName =
   "grid-cols-[2.5rem_minmax(0,1.2fr)_minmax(0,1fr)_12rem_11.25rem] xl:grid-cols-[2.5rem_minmax(0,1.2fr)_minmax(0,1fr)_12rem_6.5rem_11.25rem]"
 export const BackupTable = React.memo(function BackupTable({
+  availableRelayIds,
+  availableTargetKeys,
   backups,
   canCreate,
   currentUserId,
   destinations,
   dialogStore,
   error,
+  targetInstances,
   loading,
   nameStore,
   onRetry,
   onSortChange,
   pagination,
-  relayNames,
   scopeFiltered,
   searchStore,
   selectionStore,
   sort,
   sortDirection,
   statusFilterStore,
-  targetNames,
   updating,
 }: {
+  availableRelayIds: ReadonlySet<string>
+  availableTargetKeys: ReadonlySet<string>
   backups: Array<Backup>
   canCreate: (backup: Backup) => boolean
   currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
   error?: Error | null
+  targetInstances: ReadonlyMap<string, InstanceNameInstance>
   loading?: boolean
   nameStore: BackupNameStore
   onRetry?: () => void
   onSortChange: (sort: BackupRunSort, direction: BackupRunSortDirection) => void
   pagination: DataTablePaginationOptions
-  relayNames: ReadonlyMap<string, string>
   scopeFiltered: boolean
   searchStore: BackupSearchStore
   selectionStore: BackupSelectionStore
   sort: BackupRunSort
   sortDirection: BackupRunSortDirection
   statusFilterStore: BackupStatusFilterStore
-  targetNames: ReadonlyMap<string, string>
   updating: boolean
 }) {
   const mobileScrollRootRef = React.useRef<HTMLDivElement>(null)
@@ -150,17 +151,24 @@ export const BackupTable = React.memo(function BackupTable({
         currentUserId={currentUserId}
         destinations={destinations}
         dialogStore={dialogStore}
+        instance={targetInstances.get(
+          targetKey(
+            backup.targetKind,
+            backup.relayId,
+            backup.targetKind === "platform" ? "kiln" : backup.targetId
+          )
+        )}
         nameStore={nameStore}
-        relayName={relayNames.get(backup.relayId) ?? backup.relayId}
+        relayName={backup.relayId}
         selectionStore={selectionStore}
         targetAvailable={
           backup.targetKind === "platform"
-            ? relayNames.has(backup.relayId)
-            : targetNames.has(
+            ? availableRelayIds.has(backup.relayId)
+            : availableTargetKeys.has(
                 targetKey(backup.targetKind, backup.relayId, backup.targetId)
               )
         }
-        targetName={backupTargetName(backup, targetNames)}
+        targetName={backup.targetId}
       />
     ),
     [
@@ -168,10 +176,11 @@ export const BackupTable = React.memo(function BackupTable({
       currentUserId,
       destinations,
       dialogStore,
+      targetInstances,
       nameStore,
-      relayNames,
+      availableRelayIds,
+      availableTargetKeys,
       selectionStore,
-      targetNames,
     ]
   )
   const renderEmpty = React.useCallback(
@@ -218,18 +227,20 @@ export const BackupTable = React.memo(function BackupTable({
         </div>
       ) : (
         <BackupDesktopTable
+          availableRelayIds={availableRelayIds}
+          availableTargetKeys={availableTargetKeys}
           backups={backups}
           canCreate={canCreate}
           currentUserId={currentUserId}
           destinations={destinations}
           dialogStore={dialogStore}
           error={error}
+          targetInstances={targetInstances}
           loading={loading}
           nameStore={nameStore}
           onRetry={onRetry}
           onSortChange={onSortChange}
           pagination={pagination}
-          relayNames={relayNames}
           renderEmpty={renderEmpty}
           scopeFiltered={scopeFiltered}
           searchStore={searchStore}
@@ -237,7 +248,6 @@ export const BackupTable = React.memo(function BackupTable({
           sort={sort}
           sortDirection={sortDirection}
           statusFilterStore={statusFilterStore}
-          targetNames={targetNames}
           updating={updating}
         />
       )}
@@ -246,18 +256,20 @@ export const BackupTable = React.memo(function BackupTable({
 })
 
 const BackupDesktopTable = React.memo(function BackupDesktopTable({
+  availableRelayIds,
+  availableTargetKeys,
   backups,
   canCreate,
   currentUserId,
   destinations,
   dialogStore,
   error,
+  targetInstances,
   loading,
   nameStore,
   onRetry,
   onSortChange,
   pagination,
-  relayNames,
   renderEmpty,
   scopeFiltered,
   searchStore,
@@ -265,21 +277,22 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
   sort,
   sortDirection,
   statusFilterStore,
-  targetNames,
   updating,
 }: {
+  availableRelayIds: ReadonlySet<string>
+  availableTargetKeys: ReadonlySet<string>
   backups: Array<Backup>
   canCreate: (backup: Backup) => boolean
   currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
   error?: Error | null
+  targetInstances: ReadonlyMap<string, InstanceNameInstance>
   loading?: boolean
   nameStore: BackupNameStore
   onRetry?: () => void
   onSortChange: (sort: BackupRunSort, direction: BackupRunSortDirection) => void
   pagination: DataTablePaginationOptions
-  relayNames: ReadonlyMap<string, string>
   renderEmpty: (searchActive: boolean, filterActive: boolean) => React.ReactNode
   scopeFiltered: boolean
   searchStore: BackupSearchStore
@@ -287,7 +300,6 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
   sort: BackupRunSort
   sortDirection: BackupRunSortDirection
   statusFilterStore: BackupStatusFilterStore
-  targetNames: ReadonlyMap<string, string>
   updating: boolean
 }) {
   const [initialTableState] = React.useState(() => ({
@@ -353,44 +365,49 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
             meta: { cellClassName: "h-auto py-2.5" },
           }
         ),
-        backupTableColumnHelper.accessor(
-          (backup) => backupTargetSortName(backup, relayNames, targetNames),
-          {
-            id: "target",
-            header: "Target",
-            sortFn: "text",
-            cell: ({ row }) => {
-              const backup = row.original
-              const targetName = backupTargetName(backup, targetNames)
-              const target = backupTargetPresentation(
-                backup,
-                relayNames.get(backup.relayId) ?? backup.relayId,
-                targetName
-              )
-              const targetAvailable =
-                backup.targetKind === "platform"
-                  ? relayNames.has(backup.relayId)
-                  : targetNames.has(
-                      targetKey(
-                        backup.targetKind,
-                        backup.relayId,
-                        backup.targetId
-                      )
+        backupTableColumnHelper.accessor((backup) => backup.targetId, {
+          id: "target",
+          header: "Target",
+          sortFn: "text",
+          cell: ({ row }) => {
+            const backup = row.original
+            const target = backupTargetPresentation(
+              backup,
+              backup.relayId,
+              backup.targetId
+            )
+            const targetAvailable =
+              backup.targetKind === "platform"
+                ? availableRelayIds.has(backup.relayId)
+                : availableTargetKeys.has(
+                    targetKey(
+                      backup.targetKind,
+                      backup.relayId,
+                      backup.targetId
                     )
+                  )
 
-              return (
-                <BackupTargetLink
-                  available={targetAvailable}
-                  relayId={backup.relayId}
-                  target={target}
-                  targetId={backup.targetId}
-                  targetKind={backup.targetKind}
-                />
-              )
-            },
-            meta: { cellClassName: "h-auto py-2.5" },
-          }
-        ),
+            return (
+              <BackupTargetLink
+                available={targetAvailable}
+                displayId={target.id}
+                instance={targetInstances.get(
+                  targetKey(
+                    backup.targetKind,
+                    backup.relayId,
+                    backup.targetKind === "platform" ? "kiln" : backup.targetId
+                  )
+                )}
+                kindLabel={target.kindLabel}
+                name={target.name}
+                relayId={backup.relayId}
+                targetId={backup.targetId}
+                targetKind={backup.targetKind}
+              />
+            )
+          },
+          meta: { cellClassName: "h-auto py-2.5" },
+        }),
         backupTableColumnHelper.accessor(
           (backup) => backupDisplayBytes(backup) ?? undefined,
           {
@@ -447,8 +464,8 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
             const backup = row.original
             const targetAvailable =
               backup.targetKind === "platform"
-                ? relayNames.has(backup.relayId)
-                : targetNames.has(
+                ? availableRelayIds.has(backup.relayId)
+                : availableTargetKeys.has(
                     targetKey(
                       backup.targetKind,
                       backup.relayId,
@@ -473,9 +490,10 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
       currentUserId,
       destinations,
       dialogStore,
+      targetInstances,
       nameStore,
-      relayNames,
-      targetNames,
+      availableRelayIds,
+      availableTargetKeys,
     ]
   )
   const table = useDataTable(
@@ -756,6 +774,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
   currentUserId,
   destinations,
   dialogStore,
+  instance,
   nameStore,
   relayName,
   selectionStore,
@@ -767,6 +786,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
   currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
+  instance?: InstanceNameInstance
   nameStore: BackupNameStore
   relayName: string
   selectionStore: BackupSelectionStore
@@ -795,8 +815,11 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
       <div className="mt-2.5 overflow-hidden rounded-lg border bg-background/45 px-3 py-2.5">
         <BackupTargetLink
           available={targetAvailable}
+          displayId={target.id}
+          instance={instance}
+          kindLabel={target.kindLabel}
+          name={target.name}
           relayId={backup.relayId}
-          target={target}
           targetId={backup.targetId}
           targetKind={backup.targetKind}
         />

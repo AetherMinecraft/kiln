@@ -1,4 +1,5 @@
 import * as React from "react"
+import { useLiveSuspenseQuery } from "@tanstack/react-db"
 import {
   useMutation,
   useQuery,
@@ -72,6 +73,9 @@ import {
   useWorkspaceTableSearchInput,
 } from "@/components/workspace-data-table"
 import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
+import { InstanceName } from "@/components/instance-name"
+import { instanceStatusPresentation } from "@/components/instance-name-presentation"
+import { managedDatabasesCollectionOptions } from "@/lib/collections/managed-databases"
 import {
   ServerPickerList,
   serverPickerOptionKey,
@@ -144,7 +148,10 @@ export const DatabasesPage = React.memo(function DatabasesPage({
 }: {
   searchStore: DatabaseSearchStore
 }) {
-  const { data } = useSuspenseQuery(managedDatabasesQueryOptions())
+  const { data } = useSuspenseQuery({
+    ...managedDatabasesQueryOptions(),
+    select: selectDatabasePageMeta,
+  })
   const [createOpen, setCreateOpen] = React.useState(false)
   const [dialog, setDialog] = React.useState<DatabaseDialog>(null)
   const openDialog = React.useCallback((next: DatabaseDialog) => {
@@ -181,7 +188,6 @@ export const DatabasesPage = React.memo(function DatabasesPage({
         />
         <DatabaseTable
           canCreate={canCreate}
-          databases={data.databases}
           searchStore={searchStore}
           onCreate={() => setCreateOpen(true)}
           onDialog={openDialog}
@@ -228,6 +234,10 @@ export const DatabasesPage = React.memo(function DatabasesPage({
     </div>
   )
 })
+
+function selectDatabasePageMeta(data: ManagedDatabaseOverview) {
+  return { relayErrors: data.relayErrors, relays: data.relays }
+}
 
 const DatabaseToolbar = React.memo(function DatabaseToolbar({
   canCreate,
@@ -332,17 +342,21 @@ const DatabaseToolbar = React.memo(function DatabaseToolbar({
 
 const DatabaseTable = React.memo(function DatabaseTable({
   canCreate,
-  databases,
   onCreate,
   onDialog,
   searchStore,
 }: {
   canCreate: boolean
-  databases: Array<ManagedDatabase>
   onCreate: () => void
   onDialog: (dialog: DatabaseDialog) => void
   searchStore: DatabaseSearchStore
 }) {
+  const { data: databases } = useLiveSuspenseQuery({
+    query: (query) =>
+      query
+        .from({ database: managedDatabasesCollectionOptions })
+        .orderBy(({ database }) => database.name),
+  })
   const renderRow = React.useCallback(
     (database: ManagedDatabase) => (
       <DatabaseTableRow database={database} onDialog={onDialog} />
@@ -405,28 +419,28 @@ const DatabaseTableRow = React.memo(function DatabaseTableRow({
   database: ManagedDatabase
   onDialog: (dialog: DatabaseDialog) => void
 }) {
+  const status = databaseStatusPresentation(
+    database.inventoryStatus,
+    database.observedState
+  )
   return (
     <tr className="group transition-colors hover:bg-accent/25">
       <WorkspaceTableCell className="px-2 sm:px-3">
-        <DatabaseStatus
-          inventoryStatus={database.inventoryStatus}
-          state={database.observedState}
-        />
+        <DatabaseStatus status={status} />
       </WorkspaceTableCell>
       <WorkspaceTableCell>
-        <div className="flex min-w-0 items-center gap-2.5">
-          <span className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border/70 bg-background/35 text-muted-foreground">
-            <Database className="size-3.5" />
-          </span>
-          <div className="min-w-0">
-            <p className="truncate text-xs font-semibold text-foreground">
-              {database.name}
-            </p>
-            <p className="type-meta truncate font-mono text-muted-foreground">
-              {database.shortId} · {database.databaseName}
-            </p>
-          </div>
-        </div>
+        <InstanceName
+          instance={{
+            id: database.id,
+            inventoryStatus: database.inventoryStatus,
+            kind: "database",
+            observedState: database.observedState,
+            relayId: database.relayId,
+          }}
+          name={database.name}
+          meta={`${database.shortId} · ${database.databaseName}`}
+          metaClassName="font-mono"
+        />
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden md:table-cell">
         <Badge
@@ -1237,41 +1251,40 @@ function DeleteDatabaseDialog({
   )
 }
 
+function databaseStatusPresentation(
+  inventoryStatus: ManagedDatabase["inventoryStatus"],
+  state: ManagedDatabase["observedState"]
+) {
+  const status = instanceStatusPresentation({
+    id: "status-presentation",
+    inventoryStatus,
+    kind: "database",
+    observedState: state,
+    relayId: "status-presentation",
+  })
+  return {
+    dot: databaseStatusToneClasses[status.tone].dot,
+    label: status.label,
+    text: databaseStatusToneClasses[status.tone].text,
+  }
+}
+
+const databaseStatusToneClasses = {
+  danger: { dot: "bg-destructive", text: "text-destructive" },
+  info: { dot: "bg-sky-400", text: "text-sky-300" },
+  neutral: {
+    dot: "bg-muted-foreground",
+    text: "text-muted-foreground",
+  },
+  success: { dot: "bg-emerald-400", text: "text-emerald-300" },
+  warning: { dot: "bg-amber-300", text: "text-amber-200" },
+} as const
+
 function DatabaseStatus({
-  inventoryStatus,
-  state,
+  status,
 }: {
-  inventoryStatus: ManagedDatabase["inventoryStatus"]
-  state: string
+  status: ReturnType<typeof databaseStatusPresentation>
 }) {
-  const status =
-    inventoryStatus === "missing"
-      ? { dot: "bg-destructive", label: "Missing", text: "text-destructive" }
-      : inventoryStatus === "unavailable"
-        ? {
-            dot: "bg-amber-300",
-            label: "Unavailable",
-            text: "text-amber-200",
-          }
-        : state === "running"
-          ? {
-              dot: "bg-emerald-400",
-              label: "Running",
-              text: "text-emerald-300",
-            }
-          : state === "starting"
-            ? { dot: "bg-amber-300", label: "Starting", text: "text-amber-200" }
-            : state === "failed"
-              ? {
-                  dot: "bg-destructive",
-                  label: "Failed",
-                  text: "text-destructive",
-                }
-              : {
-                  dot: "bg-muted-foreground",
-                  label: "Stopped",
-                  text: "text-muted-foreground",
-                }
   return (
     <span
       aria-label={status.label}

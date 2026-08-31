@@ -1,11 +1,7 @@
 import * as React from "react"
 import { eq, not } from "@tanstack/db"
 import { useDbClient, useLiveQuery } from "@tanstack/react-db"
-import {
-  useQuery,
-  useQueryClient,
-  useSuspenseQuery,
-} from "@tanstack/react-query"
+import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import { ensuringPromise, forkPromise } from "@/effect/promise"
 import {
@@ -39,12 +35,7 @@ import {
   ServerDeleteDialog,
   type ServerDeleteTarget,
 } from "@/components/server-delete-dialog"
-import {
-  BrickIcon,
-  brickIconPresentation,
-  type BrickIconDefinition,
-  type BrickIconPresentation,
-} from "@/components/brick-icon"
+import { InstanceName } from "@/components/instance-name"
 import {
   WorkspaceDataTable,
   WorkspaceTableCell,
@@ -57,7 +48,6 @@ import type { WorkspaceTableSearchStore } from "@/components/workspace-data-tabl
 import {
   accessCapabilitiesQueryOptions,
   brickCatalogQueryOptions,
-  brickIconPresentationsQueryOptions,
   relayConnectionQueryOptions,
 } from "@/lib/query-options"
 import {
@@ -69,7 +59,6 @@ import { selectRelayConfigured } from "@/lib/relay-selectors"
 import type { ServerListInstance } from "@/lib/relay-selectors"
 
 const emptyServers: Array<ServerListInstance> = []
-const emptyBrickIcons: Array<BrickIconDefinition> = []
 const minimumManualSyncFeedbackMs = 500
 
 interface ServerDeleteAccess {
@@ -426,7 +415,6 @@ const AddServerButton = React.memo(function AddServerButton({
 
 const ServerTableSearchBoundary = React.memo(
   function ServerTableSearchBoundary({
-    bricks,
     canProvision,
     deleteAccess,
     dialogStore,
@@ -434,7 +422,6 @@ const ServerTableSearchBoundary = React.memo(
     searchStore,
     servers,
   }: {
-    bricks: Array<BrickIconDefinition>
     canProvision: boolean
     deleteAccess: ServerDeleteAccess
     dialogStore: AddServerDialogStore
@@ -450,28 +437,20 @@ const ServerTableSearchBoundary = React.memo(
       return counts
     }, [servers])
     const renderRow = React.useCallback(
-      (server: ServerListInstance) => {
-        const icon = brickIconPresentation(bricks, {
-          brickId: server.brickId,
-          brickSource: server.brickSource,
-          implementation: server.implementation,
-        })
-        return (
-          <ServerTableRow
-            canonical={shortIdCounts.get(server.shortId) === 1}
-            canDelete={canDeleteServer(deleteAccess, server)}
-            icon={icon}
-            onDelete={onDelete}
-            routeIdentifier={
-              shortIdCounts.get(server.shortId) === 1
-                ? server.shortId
-                : server.routeId
-            }
-            server={server}
-          />
-        )
-      },
-      [bricks, deleteAccess, onDelete, shortIdCounts]
+      (server: ServerListInstance) => (
+        <ServerTableRow
+          canonical={shortIdCounts.get(server.shortId) === 1}
+          canDelete={canDeleteServer(deleteAccess, server)}
+          onDelete={onDelete}
+          routeIdentifier={
+            shortIdCounts.get(server.shortId) === 1
+              ? server.shortId
+              : server.routeId
+          }
+          server={server}
+        />
+      ),
+      [deleteAccess, onDelete, shortIdCounts]
     )
     const renderEmpty = React.useCallback(
       (searchActive: boolean) => (
@@ -524,7 +503,6 @@ const FilteredServerTableBoundary = React.memo(
           )
           .select(({ instance }) => ({
             brickId: instance.brickId,
-            brickSource: instance.brickSource,
             connectAddress: instance.connectAddress,
             game: instance.game,
             id: instance.id,
@@ -541,13 +519,8 @@ const FilteredServerTableBoundary = React.memo(
           }))
       },
     })
-    const { data: bricks = emptyBrickIcons } = useQuery({
-      ...brickIconPresentationsQueryOptions(),
-      notifyOnChangeProps: ["data"],
-    })
     return (
       <ServerTableSearchBoundary
-        bricks={bricks}
         canProvision={canProvision}
         deleteAccess={deleteAccess}
         dialogStore={dialogStore}
@@ -590,14 +563,12 @@ const ServerTableHead = React.memo(function ServerTableHead() {
 const ServerTableRow = React.memo(function ServerTableRow({
   canonical,
   canDelete,
-  icon,
   onDelete,
   routeIdentifier,
   server,
 }: {
   canonical: boolean
   canDelete: boolean
-  icon: BrickIconPresentation
   onDelete: (target: ServerDeleteTarget) => void
   routeIdentifier: string
   server: ServerListInstance
@@ -607,31 +578,27 @@ const ServerTableRow = React.memo(function ServerTableRow({
       <WorkspaceTableCell className="px-2 sm:px-3">
         <ServerStatus server={server} />
       </WorkspaceTableCell>
-      <WorkspaceTableCell>
-        <div className="flex min-w-0 items-center gap-2.5">
-          <span className="flex size-[32px] shrink-0 items-center justify-center rounded-md border border-border/70 bg-background/35 text-muted-foreground">
-            <BrickIcon
-              id={icon.id}
-              color={icon.color}
-              iconSvg={icon.iconSvg}
-              className="size-[24px]"
-              aria-hidden="true"
-            />
-          </span>
-          <div className="min-w-0">
-            <Link
-              to="/server/$serverId/console"
-              params={{ serverId: routeIdentifier }}
-              preload="intent"
-              className="block truncate text-xs font-semibold text-foreground hover:text-primary"
-            >
-              {server.name}
-            </Link>
-            <p className="type-meta truncate font-mono text-muted-foreground">
-              {server.game} · {server.implementation}
-            </p>
-          </div>
-        </div>
+      <WorkspaceTableCell className="!px-0">
+        <Link
+          to="/server/$serverId/console"
+          params={{ serverId: routeIdentifier }}
+          preload="intent"
+          className="group/server-link flex min-h-14 w-full min-w-0 items-center px-3 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+        >
+          <InstanceName
+            instance={{
+              id: server.id,
+              kind: "server",
+              observedState: server.observedState,
+              relayId: server.relayId,
+              relayStatus: server.relayStatus,
+            }}
+            name={server.name}
+            nameClassName="transition-colors group-hover/server-link:text-primary"
+            meta={`${server.game} · ${server.implementation}`}
+            metaClassName="font-mono"
+          />
+        </Link>
       </WorkspaceTableCell>
       <WorkspaceTableCell className="hidden lg:table-cell">
         <span
@@ -823,14 +790,7 @@ function canDeleteServer(
 }
 
 function ServerStatus({ server }: { server: ServerListInstance }) {
-  const status =
-    server.relayStatus === "unreachable"
-      ? {
-          dot: "bg-destructive",
-          label: "Relay unavailable",
-          text: "text-destructive",
-        }
-      : serverStatusTone(server.observedState)
+  const status = serverStatus(server)
   return (
     <span
       aria-label={status.label}
@@ -840,6 +800,16 @@ function ServerStatus({ server }: { server: ServerListInstance }) {
       <span className="hidden sm:inline">{status.label}</span>
     </span>
   )
+}
+
+function serverStatus(server: ServerListInstance) {
+  return server.relayStatus === "unreachable"
+    ? {
+        dot: "bg-destructive",
+        label: "Relay unavailable",
+        text: "text-destructive",
+      }
+    : serverStatusTone(server.observedState)
 }
 
 function EmptyServerTable({

@@ -48,6 +48,7 @@ import { Switch } from "@workspace/ui/components/switch"
 import { Textarea } from "@workspace/ui/components/textarea"
 import { ServerScopePicker } from "@/components/server-scope-picker"
 import type { ServerPickerOption } from "@/components/server-picker-list"
+import type { InstanceNameInstance } from "@/components/instance-name"
 import { backupHasReportedDeleteArtifactProgress } from "@/lib/backup-progress-presentation"
 import {
   readFileDownloadPreferences,
@@ -146,6 +147,25 @@ function selectBackupScope(
       relayName,
     })),
   }
+}
+
+function selectBackupTopology(
+  snapshot: Awaited<ReturnType<typeof getRelaySnapshot>>
+) {
+  return {
+    nodes: snapshot.nodes.map(({ relayId }) => ({ relayId })),
+    servers: snapshot.instances.map(({ id, relayId }) => ({ id, relayId })),
+  }
+}
+
+function selectBackupDatabaseTopology(
+  databases: Awaited<ReturnType<typeof getManagedDatabaseDirectory>>
+) {
+  return databases.map(({ id, relayId, supportsImportExport }) => ({
+    id,
+    relayId,
+    supportsImportExport,
+  }))
 }
 
 function completedDeleteFeedback(backup: Backup): Backup {
@@ -291,6 +311,194 @@ export const BackupsPage = React.memo(function BackupsPage({
   searchStore: BackupSearchStore
 }) {
   const { data: storage } = useSuspenseQuery(backupStorageQueryOptions())
+  const { data: topology } = useSuspenseQuery({
+    ...relaySnapshotQueryOptions(),
+    notifyOnChangeProps: ["data"],
+    select: selectBackupTopology,
+  })
+  const { data: databases } = useSuspenseQuery({
+    ...managedDatabaseDirectoryQueryOptions(),
+    select: selectBackupDatabaseTopology,
+  })
+  const { data: capabilities } = useSuspenseQuery(
+    accessCapabilitiesQueryOptions()
+  )
+  const [dialogStore] = React.useState(createBackupDialogStore)
+  const [deleteFeedbackStore] = React.useState(createBackupDeleteFeedbackStore)
+  const [selectionStore] = React.useState(createBackupSelectionStore)
+  const [nameStore] = React.useState(createBackupNameStore)
+  const [statusFilterStore] = React.useState(() =>
+    createBackupStatusFilterStore(filters.status)
+  )
+  const selectedServer = React.useMemo((): ServerPickerOption | null => {
+    if (!filters.relay || !filters.server) return null
+    const kind = filters.kind ?? "server"
+    const exists =
+      kind === "database"
+        ? databases.some(
+            (item) =>
+              item.id === filters.server && item.relayId === filters.relay
+          )
+        : kind === "relay"
+          ? topology.nodes.some((item) => item.relayId === filters.relay)
+          : topology.servers.some(
+              (item) =>
+                item.id === filters.server && item.relayId === filters.relay
+            )
+    return exists
+      ? {
+          id: filters.server,
+          kind,
+          name: filters.server,
+          relayId: filters.relay,
+          relayName: filters.relay,
+        }
+      : null
+  }, [databases, filters.kind, filters.relay, filters.server, topology])
+  const availableTargetKeys = React.useMemo(() => {
+    const keys = new Set<string>()
+    for (const server of topology.servers) {
+      keys.add(targetKey("instance", server.relayId, server.id))
+    }
+    for (const database of databases) {
+      keys.add(targetKey("database", database.relayId, database.id))
+    }
+    return keys
+  }, [databases, topology.servers])
+  const targetInstances = React.useMemo(() => {
+    const instances = new Map<string, InstanceNameInstance>()
+    for (const server of topology.servers) {
+      instances.set(targetKey("instance", server.relayId, server.id), {
+        id: server.id,
+        kind: "server",
+        relayId: server.relayId,
+      })
+    }
+    for (const database of databases) {
+      instances.set(targetKey("database", database.relayId, database.id), {
+        id: database.id,
+        kind: "database",
+        relayId: database.relayId,
+      })
+    }
+    for (const relay of topology.nodes) {
+      instances.set(targetKey("platform", relay.relayId, "kiln"), {
+        id: relay.relayId,
+        kind: "relay",
+        relayId: relay.relayId,
+      })
+    }
+    return instances
+  }, [databases, topology.nodes, topology.servers])
+  const availableRelayIds = React.useMemo(
+    () =>
+      new Set(
+        [...topology.nodes, ...topology.servers].map((item) => item.relayId)
+      ),
+    [topology.nodes, topology.servers]
+  )
+  const availabilityDestinations = React.useMemo(
+    (): Array<BackupAvailabilityDestination> => [
+      { enabled: true, id: null, name: "Local", ownerUserId: null },
+      ...storage.map((destination) => ({
+        enabled: destination.enabled && !destination.deleting,
+        id: destination.id,
+        name: destination.name,
+        ownerUserId: destination.ownerUserId,
+      })),
+    ],
+    [storage]
+  )
+  React.useLayoutEffect(() => {
+    statusFilterStore.set(filters.status)
+  }, [filters.status, statusFilterStore])
+  const canCreateAny = React.useMemo(
+    () =>
+      (capabilities.isPlatformAdmin && topology.nodes.length > 0) ||
+      topology.servers.some((server) =>
+        canCreateForResource(
+          capabilities,
+          server.relayId,
+          "instance",
+          server.id
+        )
+      ) ||
+      databases.some(
+        (database) =>
+          database.supportsImportExport &&
+          canCreateForResource(
+            capabilities,
+            database.relayId,
+            "database",
+            database.id
+          )
+      ),
+    [capabilities, databases, topology.nodes.length, topology.servers]
+  )
+  const canCreateBackup = React.useCallback(
+    (backup: Backup) =>
+      backup.targetKind === "platform"
+        ? capabilities.isPlatformAdmin
+        : canCreateForResource(
+            capabilities,
+            backup.relayId,
+            backup.targetKind,
+            backup.targetId
+          ),
+    [capabilities]
+  )
+
+  return (
+    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-3 pb-3 sm:px-5 sm:pb-5">
+      <BackupScopeControls
+        deleteFeedbackStore={deleteFeedbackStore}
+        dialogStore={dialogStore}
+        filters={filters}
+        onFiltersChange={onFiltersChange}
+        storage={storage}
+      />
+
+      <section className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border bg-card/45 [contain:paint]">
+        <BackupRunsSyncKick />
+        <BackupToolbar
+          canCreate={canCreateAny}
+          dialogStore={dialogStore}
+          searchStore={searchStore}
+          statusFilterStore={statusFilterStore}
+        />
+        <BackupDataSurface
+          availableRelayIds={availableRelayIds}
+          availableTargetKeys={availableTargetKeys}
+          canCreate={canCreateBackup}
+          currentUserId={capabilities.user.id}
+          deleteFeedbackStore={deleteFeedbackStore}
+          destinations={availabilityDestinations}
+          dialogStore={dialogStore}
+          targetInstances={targetInstances}
+          nameStore={nameStore}
+          searchStore={searchStore}
+          selectedServer={selectedServer}
+          selectionStore={selectionStore}
+          statusFilterStore={statusFilterStore}
+        />
+      </section>
+    </div>
+  )
+})
+
+const BackupScopeControls = React.memo(function BackupScopeControls({
+  deleteFeedbackStore,
+  dialogStore,
+  filters,
+  onFiltersChange,
+  storage,
+}: {
+  deleteFeedbackStore: BackupDeleteFeedbackStore
+  dialogStore: BackupDialogStore
+  filters: BackupFilters
+  onFiltersChange: (change: Partial<BackupFilters>) => void
+  storage: Array<BackupStorage>
+}) {
   const { data: backupScope } = useSuspenseQuery({
     ...relaySnapshotQueryOptions(),
     notifyOnChangeProps: ["data"],
@@ -302,14 +510,6 @@ export const BackupsPage = React.memo(function BackupsPage({
   const { data: capabilities } = useSuspenseQuery(
     accessCapabilitiesQueryOptions()
   )
-  const [dialogStore] = React.useState(createBackupDialogStore)
-  const [deleteFeedbackStore] = React.useState(createBackupDeleteFeedbackStore)
-  const [selectionStore] = React.useState(createBackupSelectionStore)
-  const [nameStore] = React.useState(createBackupNameStore)
-  const [statusFilterStore] = React.useState(() =>
-    createBackupStatusFilterStore(filters.status)
-  )
-
   const scopeOptions = React.useMemo(
     () =>
       backupScopeOptions({
@@ -335,15 +535,15 @@ export const BackupsPage = React.memo(function BackupsPage({
       ) ?? null,
     [filters.kind, filters.relay, filters.server, scopeOptions]
   )
-  const selectServer = React.useCallback(
-    (server: ServerPickerOption | null) => {
-      onFiltersChange({
-        kind: server?.kind,
-        relay: server?.relayId,
-        server: server?.id,
-      })
-    },
-    [onFiltersChange]
+  const createTargets = React.useMemo(
+    () =>
+      availableCreateTargets({
+        capabilities,
+        databases,
+        nodes: backupScope.nodes,
+        servers: backupScope.servers,
+      }),
+    [backupScope.nodes, backupScope.servers, capabilities, databases]
   )
   const targetNames = React.useMemo(() => {
     const names = new Map<string, string>()
@@ -358,47 +558,10 @@ export const BackupsPage = React.memo(function BackupsPage({
     }
     return names
   }, [backupScope.servers, databases])
-  const relayNames = React.useMemo(
-    () =>
-      new Map([
-        ...backupScope.nodes.map(
-          (relay) => [relay.relayId, relay.relayName] as const
-        ),
-        ...backupScope.servers.map(
-          (instance) => [instance.relayId, instance.relayName] as const
-        ),
-      ]),
-    [backupScope.nodes, backupScope.servers]
-  )
   const storageNames = React.useMemo(
     () =>
       new Map(storage.map((destination) => [destination.id, destination.name])),
     [storage]
-  )
-  const availabilityDestinations = React.useMemo(
-    (): Array<BackupAvailabilityDestination> => [
-      { enabled: true, id: null, name: "Local", ownerUserId: null },
-      ...storage.map((destination) => ({
-        enabled: destination.enabled && !destination.deleting,
-        id: destination.id,
-        name: destination.name,
-        ownerUserId: destination.ownerUserId,
-      })),
-    ],
-    [storage]
-  )
-  React.useLayoutEffect(() => {
-    statusFilterStore.set(filters.status)
-  }, [filters.status, statusFilterStore])
-  const createTargets = React.useMemo(
-    () =>
-      availableCreateTargets({
-        capabilities,
-        databases,
-        nodes: backupScope.nodes,
-        servers: backupScope.servers,
-      }),
-    [backupScope.nodes, backupScope.servers, capabilities, databases]
   )
   const scopedCreateTargetKey = selectedServer
     ? selectedBackupCreateTargetKey(selectedServer)
@@ -414,21 +577,19 @@ export const BackupsPage = React.memo(function BackupsPage({
       (target) => target.key === selectedBackupCreateTargetKey(selectedServer)
     )
   )
-  const canCreateBackup = React.useCallback(
-    (backup: Backup) =>
-      backup.targetKind === "platform"
-        ? capabilities.isPlatformAdmin
-        : canCreateForResource(
-            capabilities,
-            backup.relayId,
-            backup.targetKind,
-            backup.targetId
-          ),
-    [capabilities]
+  const selectServer = React.useCallback(
+    (server: ServerPickerOption | null) => {
+      onFiltersChange({
+        kind: server?.kind,
+        relay: server?.relayId,
+        server: server?.id,
+      })
+    },
+    [onFiltersChange]
   )
 
   return (
-    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-3 pb-3 sm:px-5 sm:pb-5">
+    <>
       <ServerScopePicker
         allDescription="Every accessible server, database, and Relay"
         allLabel="All instances"
@@ -472,31 +633,6 @@ export const BackupsPage = React.memo(function BackupsPage({
         }
         onSelect={selectServer}
       />
-
-      <section className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border bg-card/45 [contain:paint]">
-        <BackupRunsSyncKick />
-        <BackupToolbar
-          canCreate={createTargets.length > 0}
-          dialogStore={dialogStore}
-          searchStore={searchStore}
-          statusFilterStore={statusFilterStore}
-        />
-        <BackupDataSurface
-          canCreate={canCreateBackup}
-          currentUserId={capabilities.user.id}
-          deleteFeedbackStore={deleteFeedbackStore}
-          destinations={availabilityDestinations}
-          dialogStore={dialogStore}
-          nameStore={nameStore}
-          relayNames={relayNames}
-          searchStore={searchStore}
-          selectedServer={selectedServer}
-          selectionStore={selectionStore}
-          statusFilterStore={statusFilterStore}
-          targetNames={targetNames}
-        />
-      </section>
-
       <BackupDialogHost
         deleteFeedbackStore={deleteFeedbackStore}
         dialogStore={dialogStore}
@@ -506,7 +642,7 @@ export const BackupsPage = React.memo(function BackupsPage({
         targetNames={targetNames}
         targets={createTargets}
       />
-    </div>
+    </>
   )
 })
 
@@ -541,31 +677,33 @@ const BackupRunsSyncKick = React.memo(function BackupRunsSyncKick() {
 })
 
 const BackupDataSurface = React.memo(function BackupDataSurface({
+  availableRelayIds,
+  availableTargetKeys,
   canCreate,
   currentUserId,
   deleteFeedbackStore,
   destinations,
   dialogStore,
+  targetInstances,
   nameStore,
-  relayNames,
   searchStore,
   selectedServer,
   selectionStore,
   statusFilterStore,
-  targetNames,
 }: {
+  availableRelayIds: ReadonlySet<string>
+  availableTargetKeys: ReadonlySet<string>
   canCreate: (backup: Backup) => boolean
   currentUserId: string
   deleteFeedbackStore: BackupDeleteFeedbackStore
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
+  targetInstances: ReadonlyMap<string, InstanceNameInstance>
   nameStore: BackupNameStore
-  relayNames: ReadonlyMap<string, string>
   searchStore: BackupSearchStore
   selectedServer: ServerPickerOption | null
   selectionStore: BackupSelectionStore
   statusFilterStore: BackupStatusFilterStore
-  targetNames: ReadonlyMap<string, string>
 }) {
   const search = React.useSyncExternalStore(
     searchStore.subscribe,
@@ -700,11 +838,14 @@ const BackupDataSurface = React.memo(function BackupDataSurface({
   return (
     <>
       <BackupTable
+        availableRelayIds={availableRelayIds}
+        availableTargetKeys={availableTargetKeys}
         backups={visibleBackups}
         canCreate={canCreate}
         currentUserId={currentUserId}
         destinations={destinations}
         dialogStore={dialogStore}
+        targetInstances={targetInstances}
         error={
           query.isError && !query.data && !query.isFetchNextPageError
             ? query.error
@@ -715,14 +856,12 @@ const BackupDataSurface = React.memo(function BackupDataSurface({
         onRetry={retry}
         onSortChange={changeSort}
         pagination={pagination}
-        relayNames={relayNames}
         scopeFiltered={Boolean(selectedServer)}
         searchStore={searchStore}
         selectionStore={selectionStore}
         sort={sorting.sort}
         sortDirection={sorting.direction}
         statusFilterStore={statusFilterStore}
-        targetNames={targetNames}
         updating={isUpdating}
       />
       <BackupBulkActions

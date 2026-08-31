@@ -46,6 +46,10 @@ import { cn } from "@workspace/ui/lib/utils"
 
 import { ServerScopePicker } from "@/components/server-scope-picker"
 import {
+  InstanceName,
+  type InstanceNameInstance,
+} from "@/components/instance-name"
+import {
   activityLocalRangeToUtc,
   activityTypes,
   isActivitySource,
@@ -720,7 +724,9 @@ const ActivityServerFilter = React.memo(function ActivityServerFilter({
         const relayName = relayNameById.get(server.relayId) ?? "Relay"
         return [
           {
-            ...server,
+            id: server.id,
+            name: server.name,
+            relayId: server.relayId,
             relayName,
           },
         ]
@@ -1633,11 +1639,8 @@ const ActivityRow = React.memo(function ActivityRow({
         </span>
       </time>
 
-      <div className="hidden min-w-0 pr-3 md:block">
+      <div className="hidden min-w-0 md:block">
         <ActivityWhereLink entry={entry} />
-        <p className="type-meta truncate font-mono text-muted-foreground">
-          {entry.server ? entry.relay.name : "Relay-wide"}
-        </p>
       </div>
 
       <div className="hidden min-w-0 pr-3 md:block">
@@ -1685,9 +1688,57 @@ function ActivityWhereLink({
   compact?: boolean
   entry: ActivityEntry
 }) {
-  const className = compact
-    ? "min-w-0 truncate text-muted-foreground hover:text-primary"
-    : "type-label block truncate hover:text-primary"
+  if (compact) {
+    return entry.server ? (
+      <Link
+        to="/server/$serverId/console"
+        params={{
+          serverId: relayInstanceRouteId(
+            entry.relay.id,
+            entry.server.id.slice(0, 8)
+          ),
+        }}
+        preload="intent"
+        className="min-w-0 truncate text-muted-foreground hover:text-primary"
+        aria-label={`Open ${entry.server.name}`}
+      >
+        {entry.server.name}
+      </Link>
+    ) : (
+      <Link
+        to="/infra/servers"
+        search={{ search: entry.relay.name }}
+        preload="intent"
+        className="min-w-0 truncate text-muted-foreground hover:text-primary"
+        aria-label={`View servers on ${entry.relay.name}`}
+      >
+        {entry.relay.name}
+      </Link>
+    )
+  }
+
+  const instance: InstanceNameInstance = entry.server
+    ? {
+        id: entry.server.id,
+        kind: "server",
+        relayId: entry.relay.id,
+      }
+    : {
+        id: entry.relay.id,
+        kind: "relay",
+        relayId: entry.relay.id,
+      }
+  const identity = (
+    <InstanceName
+      instance={instance}
+      name={entry.server?.name ?? entry.relay.name}
+      nameClassName="transition-colors group-hover/where-link:text-primary"
+      meta={entry.server ? entry.relay.name : "Relay-wide"}
+      metaClassName="font-mono"
+    />
+  )
+  const className =
+    "group/where-link -my-2.5 flex min-h-16 min-w-0 items-center py-2.5 pr-3 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
 
   if (entry.server) {
     return (
@@ -1701,9 +1752,8 @@ function ActivityWhereLink({
         }}
         preload="intent"
         className={className}
-        aria-label={`Open ${entry.server.name}`}
       >
-        {entry.server.name}
+        {identity}
       </Link>
     )
   }
@@ -1714,9 +1764,8 @@ function ActivityWhereLink({
       search={{ search: entry.relay.name }}
       preload="intent"
       className={className}
-      aria-label={`View servers on ${entry.relay.name}`}
     >
-      {entry.relay.name}
+      {identity}
     </Link>
   )
 }
@@ -1839,6 +1888,7 @@ function activityEntriesEqual(
     previousEntry.actor.email === nextEntry.actor.email &&
     previousEntry.relay.id === nextEntry.relay.id &&
     previousEntry.relay.name === nextEntry.relay.name &&
+    previousEntry.relay.unavailable === nextEntry.relay.unavailable &&
     previousEntry.server?.id === nextEntry.server?.id &&
     previousEntry.server?.name === nextEntry.server?.name
   )

@@ -183,7 +183,11 @@ export async function getActivityForUser(
         occurredAt: record.occurredAt,
         permission: activityPermissionForAudit(record),
         rawEvent: record.event,
-        relay: { id: relay.id, name: relay.name },
+        relay: {
+          id: relay.id,
+          name: relay.name,
+          unavailable: unavailableRelayIds.has(relay.id),
+        },
         server: instanceId
           ? {
               id: instanceId,

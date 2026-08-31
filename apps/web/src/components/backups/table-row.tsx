@@ -6,14 +6,10 @@ import {
   CircleAlert,
   CircleOff,
   CircleStop,
-  Copy,
-  Database,
   Download,
   LoaderCircle,
   Pencil,
   Plus,
-  RadioTower,
-  Server,
   History as RotateCcwClock,
   Trash2,
   X,
@@ -36,10 +32,13 @@ import {
 } from "@workspace/ui/components/tooltip"
 
 import {
+  InstanceName,
+  type InstanceNameInstance,
+} from "@/components/instance-name"
+import {
   backupShowsArchivedLocalArtifact,
   backupTaskUploadProgressPercent,
 } from "@/lib/backup-progress-presentation"
-import { forkPromise } from "@/effect/promise"
 import { relayInstanceRouteId } from "@/lib/relay-fleet"
 import { resetActiveBackupRunsToFirstPage } from "@/lib/backup-runs-cache"
 import {
@@ -77,7 +76,6 @@ type BackupTargetPresentation = {
   kindLabel: "Database" | "Relay" | "Server"
   name: string
 }
-
 const activeStatuses = new Set(["queued", "running", "deleting"])
 const backupDate = new Intl.DateTimeFormat(undefined, {
   dateStyle: "full",
@@ -782,159 +780,96 @@ function BackupMissingTargetTooltip({
   )
 }
 
-const BackupTargetIcon = React.memo(function BackupTargetIcon({
-  kind,
-}: {
-  kind: Backup["targetKind"]
-}) {
-  const Icon =
-    kind === "database" ? Database : kind === "platform" ? RadioTower : Server
-  return (
-    <span className="grid size-9 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
-      <Icon className="size-[1.125rem]" />
-    </span>
-  )
-})
-
-function BackupTargetLayout({
-  copyButton,
-  icon,
-  name,
-}: {
-  copyButton: React.ReactNode
-  icon: React.ReactNode
-  name: React.ReactNode
-}) {
-  return (
-    <div className="-mx-3 -my-2.5 grid grid-cols-[auto_minmax(0,1fr)] grid-rows-[1.25rem_1.25rem] items-center gap-x-2.5 gap-y-0.5 px-3 py-2.5">
-      <span className="row-span-2">{icon}</span>
-      {name}
-      {copyButton}
-    </div>
-  )
-}
-
-const BackupCopyIdButton = React.memo(function BackupCopyIdButton({
-  id,
-  kindLabel,
-}: {
-  id: string
-  kindLabel: BackupTargetPresentation["kindLabel"]
-}) {
-  const [copied, setCopied] = React.useState(false)
-  const copiedTimer = React.useRef<number | null>(null)
-  React.useEffect(
-    () => () => {
-      if (copiedTimer.current) window.clearTimeout(copiedTimer.current)
-    },
-    []
-  )
-  const copyId = React.useCallback(
-    (event: React.MouseEvent<HTMLButtonElement>) => {
-      event.preventDefault()
-      event.stopPropagation()
-      forkPromise(async () => {
-        await navigator.clipboard.writeText(id)
-        setCopied(true)
-        if (copiedTimer.current) window.clearTimeout(copiedTimer.current)
-        copiedTimer.current = window.setTimeout(() => setCopied(false), 1_800)
-      })
-    },
-    [id]
-  )
-
-  return (
-    <button
-      type="button"
-      aria-label={copied ? `${kindLabel} ID copied` : `Copy ${kindLabel} ID`}
-      className={`inline-flex items-center gap-1 text-xs transition-colors ${
-        copied
-          ? "text-emerald-400"
-          : "text-muted-foreground hover:text-foreground"
-      }`}
-      onClick={copyId}
-    >
-      Copy ID
-      {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-    </button>
-  )
-})
-
 export const BackupTargetLink = React.memo(function BackupTargetLink({
   available,
+  displayId,
+  instance,
+  kindLabel,
+  name,
   relayId,
-  target,
   targetId,
   targetKind,
 }: {
   available: boolean
+  displayId: string
+  instance?: InstanceNameInstance
+  kindLabel: BackupTargetPresentation["kindLabel"]
+  name: string
   relayId: string
-  target: BackupTargetPresentation
   targetId: string
   targetKind: Backup["targetKind"]
 }) {
-  const name = (
-    <span className="flex min-w-0 items-center gap-1.5 text-sm">
-      {available ? (
-        <BackupTargetNameAnchor
-          relayId={relayId}
-          searchId={target.id}
-          targetId={targetId}
-          targetKind={targetKind}
-          targetName={target.name}
-        />
-      ) : (
-        <span className="min-w-0 truncate text-muted-foreground">
-          {target.name}
-        </span>
-      )}
-    </span>
-  )
-  const layout = (
-    <BackupTargetLayout
-      copyButton={
-        <BackupCopyIdButton id={target.id} kindLabel={target.kindLabel} />
+  const identity = (
+    <InstanceName
+      className="w-full"
+      instance={
+        instance ?? {
+          id: targetKind === "platform" ? relayId : targetId,
+          kind:
+            targetKind === "database"
+              ? "database"
+              : targetKind === "platform"
+                ? "relay"
+                : "server",
+          relayId,
+        }
       }
-      icon={<BackupTargetIcon kind={targetKind} />}
       name={name}
+      nameClassName={
+        available
+          ? "transition-colors group-hover/target-link:text-primary"
+          : "text-muted-foreground"
+      }
+      meta={`${kindLabel} · ${displayId.slice(0, 8)}`}
+      metaClassName="font-mono"
     />
   )
-
-  if (available) return layout
-
-  return (
+  const targetContent = available ? (
+    <BackupTargetAnchor
+      relayId={relayId}
+      searchId={displayId}
+      targetId={targetId}
+      targetKind={targetKind}
+    >
+      {identity}
+    </BackupTargetAnchor>
+  ) : (
     <BackupMissingTargetTooltip kind={targetKind} missing>
       <div
         aria-label={missingTargetMessage(targetKind)}
-        className="cursor-help"
+        className="flex min-h-14 min-w-0 flex-1 cursor-help items-center px-3 py-2.5"
       >
-        {layout}
+        {identity}
       </div>
     </BackupMissingTargetTooltip>
   )
+
+  return (
+    <div className="-mx-3 -my-2.5 flex w-[calc(100%+1.5rem)] min-w-0 items-stretch">
+      {targetContent}
+    </div>
+  )
 })
 
-const BackupTargetNameAnchor = React.memo(function BackupTargetNameAnchor({
+const BackupTargetAnchor = React.memo(function BackupTargetAnchor({
+  children,
   relayId,
   searchId,
   targetId,
   targetKind,
-  targetName,
 }: {
+  children: React.ReactNode
   relayId: string
   searchId: string
   targetId: string
   targetKind: Backup["targetKind"]
-  targetName: string
 }) {
   const className =
-    "inline-flex min-w-0 items-center text-primary outline-none transition-colors hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring/40"
-  const label = <span className="truncate">{targetName}</span>
+    "group/target-link flex min-h-14 min-w-0 flex-1 items-center px-3 py-2.5 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
 
   if (targetKind === "instance") {
     return (
       <Link
-        aria-label={`Open ${targetName}`}
         className={className}
         params={{
           serverId: relayInstanceRouteId(relayId, targetId.slice(0, 8)),
@@ -942,7 +877,7 @@ const BackupTargetNameAnchor = React.memo(function BackupTargetNameAnchor({
         preload="intent"
         to="/server/$serverId/console"
       >
-        {label}
+        {children}
       </Link>
     )
   }
@@ -950,25 +885,19 @@ const BackupTargetNameAnchor = React.memo(function BackupTargetNameAnchor({
   if (targetKind === "database") {
     return (
       <Link
-        aria-label={`Open ${targetName}`}
         className={className}
         preload="intent"
         search={{ search: searchId }}
         to="/infra/databases"
       >
-        {label}
+        {children}
       </Link>
     )
   }
 
   return (
-    <Link
-      aria-label={`View ${targetName}`}
-      className={className}
-      preload="intent"
-      to="/infra/relays"
-    >
-      {label}
+    <Link className={className} preload="intent" to="/infra/relays">
+      {children}
     </Link>
   )
 })
@@ -1101,21 +1030,6 @@ export function backupTargetName(
     targetNames.get(
       targetKey(backup.targetKind, backup.relayId, backup.targetId)
     ) ?? backup.targetId
-  )
-}
-
-export function backupTargetSortName(
-  backup: Backup,
-  relayNames: ReadonlyMap<string, string>,
-  targetNames: ReadonlyMap<string, string>
-): string {
-  if (backup.targetKind === "platform") {
-    return relayNames.get(backup.relayId) ?? ""
-  }
-  return (
-    targetNames.get(
-      targetKey(backup.targetKind, backup.relayId, backup.targetId)
-    ) ?? ""
   )
 }
 
