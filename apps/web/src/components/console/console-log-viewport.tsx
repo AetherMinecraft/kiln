@@ -16,15 +16,18 @@ import type {
   ConsoleUiStore,
 } from "@/components/console/console-stores"
 import { ConsoleTooltip } from "@/components/console/console-tooltip"
+import type { ConsoleLoadTiming } from "@/lib/console-performance"
 import { redactSensitiveTextWithRanges } from "@/lib/redaction"
 
 export const ConsoleLogViewportController = React.memo(
   function ConsoleLogViewportController({
     active,
+    loadTiming,
     streamStore,
     uiStore,
   }: {
     active: boolean
+    loadTiming?: ConsoleLoadTiming
     streamStore: ConsoleStreamStore
     uiStore: ConsoleUiStore
   }) {
@@ -84,6 +87,30 @@ export const ConsoleLogViewportController = React.memo(
     React.useLayoutEffect(() => {
       uiStore.setFilteredLines(filteredLines)
     }, [filteredLines, uiStore])
+
+    const firstRowsPaintedRef = React.useRef(false)
+    const consoleLineCount = consoleData?.lines.length ?? 0
+    const hasConsoleLines = consoleLineCount > 0
+    const consoleLineCountRef = React.useRef(consoleLineCount)
+    React.useLayoutEffect(() => {
+      consoleLineCountRef.current = consoleLineCount
+    }, [consoleLineCount])
+    React.useLayoutEffect(() => {
+      if (firstRowsPaintedRef.current || !active || !hasConsoleLines) {
+        return
+      }
+      let secondFrame: number | undefined
+      const firstFrame = window.requestAnimationFrame(() => {
+        secondFrame = window.requestAnimationFrame(() => {
+          firstRowsPaintedRef.current = true
+          loadTiming?.markFirstRowsPainted(consoleLineCountRef.current)
+        })
+      })
+      return () => {
+        window.cancelAnimationFrame(firstFrame)
+        if (secondFrame !== undefined) window.cancelAnimationFrame(secondFrame)
+      }
+    }, [active, hasConsoleLines, loadTiming])
 
     return (
       <ConsoleLogViewport
