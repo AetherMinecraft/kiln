@@ -78,6 +78,7 @@ import {
   relayFetchEffect,
   relayJsonEffect,
 } from "@/lib/relay-client"
+import { relayConsoleTransport } from "@/lib/relay-console-route"
 import type { RelayEndpoint } from "@/lib/relay-client"
 import {
   relayFleetInstance,
@@ -1336,10 +1337,14 @@ function publicPausedFleetRelay(relays: Array<PersistedRelay>) {
 
 function publicRelayState<TStatus extends RelayReachability | "paused">(entry: {
   relay: PersistedRelay
+  snapshot?: Awaited<ReturnType<typeof authorizeRelaySnapshot>> | null
   status: TStatus
 }) {
+  const proxyMode = entry.snapshot?.relay?.proxyMode
   return {
-    browserOrigin: entry.relay.browserOrigin,
+    browserOrigin:
+      entry.snapshot?.relay?.browserOrigin ?? entry.relay.browserOrigin,
+    consoleTransport: relayConsoleTransport(proxyMode),
     id: entry.relay.id,
     name: entry.relay.name,
     status: entry.status,
