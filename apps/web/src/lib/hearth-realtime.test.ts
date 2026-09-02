@@ -4,17 +4,37 @@ import { describe, expect, it, vi } from "vite-plus/test"
 import { queryKeys } from "@/lib/query-options"
 import { refreshHearthRealtimeTopics } from "./hearth-realtime"
 
+const backupRunsKey = queryKeys.backups.runs({
+  direction: "desc",
+  scope: null,
+  search: "",
+  sort: "createdAt",
+  status: null,
+})
+const searchedBackupRunsKey = queryKeys.backups.runs({
+  direction: "desc",
+  scope: null,
+  search: "alpha",
+  sort: "createdAt",
+  status: null,
+})
+const targetSortedBackupRunsKey = queryKeys.backups.runs({
+  direction: "asc",
+  scope: null,
+  search: "",
+  sort: "target",
+  status: null,
+})
+
 describe("Hearth realtime query refresh", () => {
   it("invalidates only the requested domain", async () => {
     const queryClient = new QueryClient()
-    queryClient.setQueryData(queryKeys.backups.all, [{ id: "backup-a" }])
+    queryClient.setQueryData(backupRunsKey, { pageParams: [null], pages: [] })
     queryClient.setQueryData(queryKeys.schedules.all, [{ id: "schedule-a" }])
 
     await refreshHearthRealtimeTopics(queryClient, ["backups", "backups"])
 
-    expect(
-      queryClient.getQueryState(queryKeys.backups.all)?.isInvalidated
-    ).toBe(true)
+    expect(queryClient.getQueryState(backupRunsKey)?.isInvalidated).toBe(true)
     expect(
       queryClient.getQueryState(queryKeys.schedules.all)?.isInvalidated
     ).toBe(false)
@@ -26,7 +46,10 @@ describe("Hearth realtime query refresh", () => {
 
     await expect(
       refreshHearthRealtimeTopics(
-        { invalidateQueries } as unknown as QueryClient,
+        {
+          getQueryCache: () => ({ findAll: () => [] }),
+          invalidateQueries,
+        } as unknown as QueryClient,
         ["relays"]
       )
     ).rejects.toBe(cause)
@@ -86,6 +109,29 @@ describe("Hearth realtime query refresh", () => {
     ).toBe(true)
   })
 
+  it("refreshes only backup views whose results depend on target names", async () => {
+    const queryClient = new QueryClient()
+    queryClient.setQueryData(backupRunsKey, { pageParams: [null], pages: [] })
+    queryClient.setQueryData(searchedBackupRunsKey, {
+      pageParams: [null],
+      pages: [],
+    })
+    queryClient.setQueryData(targetSortedBackupRunsKey, {
+      pageParams: [null],
+      pages: [],
+    })
+
+    await refreshHearthRealtimeTopics(queryClient, ["database-directory"])
+
+    expect(queryClient.getQueryState(backupRunsKey)?.isInvalidated).toBe(false)
+    expect(
+      queryClient.getQueryState(searchedBackupRunsKey)?.isInvalidated
+    ).toBe(true)
+    expect(
+      queryClient.getQueryState(targetSortedBackupRunsKey)?.isInvalidated
+    ).toBe(true)
+  })
+
   it("refreshes access capabilities but keeps invitation previews out", async () => {
     const queryClient = new QueryClient()
     const relayAUsers = queryKeys.access.instanceUsers("relay-a", "instance-a")
@@ -120,7 +166,10 @@ describe("Hearth realtime query refresh", () => {
       ["databases", "database-directory", "database-credentials"]
     )
 
-    expect(invalidateQueries).toHaveBeenCalledTimes(2)
+    expect(invalidateQueries).toHaveBeenCalledTimes(3)
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      predicate: expect.any(Function),
+    })
     expect(invalidateQueries).toHaveBeenCalledWith(
       { exact: false, queryKey: ["databases"] },
       { throwOnError: true }
@@ -134,7 +183,7 @@ describe("Hearth realtime query refresh", () => {
   it("keeps Relay health checks out of mounted control-plane catalogs", async () => {
     const queryClient = new QueryClient()
     queryClient.setQueryData(queryKeys.relays, [{ id: "relay-a" }])
-    queryClient.setQueryData(queryKeys.backups.all, [{ id: "backup-a" }])
+    queryClient.setQueryData(backupRunsKey, { pageParams: [null], pages: [] })
     queryClient.setQueryData(queryKeys.databases.list, [{ id: "database-a" }])
 
     await refreshHearthRealtimeTopics(queryClient, ["relay-health"], {
@@ -144,9 +193,7 @@ describe("Hearth realtime query refresh", () => {
     expect(queryClient.getQueryState(queryKeys.relays)?.isInvalidated).toBe(
       true
     )
-    expect(
-      queryClient.getQueryState(queryKeys.backups.all)?.isInvalidated
-    ).toBe(false)
+    expect(queryClient.getQueryState(backupRunsKey)?.isInvalidated).toBe(false)
     expect(
       queryClient.getQueryState(queryKeys.databases.list)?.isInvalidated
     ).toBe(false)
@@ -225,7 +272,7 @@ describe("Hearth realtime query refresh", () => {
       id: "instance-b",
       kind: "instance",
     })
-    queryClient.setQueryData(queryKeys.backups.all, [])
+    queryClient.setQueryData(backupRunsKey, { pageParams: [null], pages: [] })
     queryClient.setQueryData(queryKeys.backups.storage, [])
     queryClient.setQueryData(relayAPolicy, {})
     queryClient.setQueryData(relayBPolicy, {})
@@ -239,9 +286,7 @@ describe("Hearth realtime query refresh", () => {
     ).toBe(false)
     expect(queryClient.getQueryState(relayAPolicy)?.isInvalidated).toBe(true)
     expect(queryClient.getQueryState(relayBPolicy)?.isInvalidated).toBe(false)
-    expect(
-      queryClient.getQueryState(queryKeys.backups.all)?.isInvalidated
-    ).toBe(false)
+    expect(queryClient.getQueryState(backupRunsKey)?.isInvalidated).toBe(false)
 
     await refreshHearthRealtimeTopics(queryClient, ["backup-storage"])
 
@@ -290,7 +335,7 @@ describe("Hearth realtime query refresh", () => {
     const relayAProxy = ["relays", "proxy", "relay-a"] as const
     const relayBProxy = ["relays", "proxy", "relay-b"] as const
     queryClient.setQueryData(queryKeys.relays, [])
-    queryClient.setQueryData(queryKeys.backups.all, [])
+    queryClient.setQueryData(backupRunsKey, { pageParams: [null], pages: [] })
     queryClient.setQueryData(relayAProxy, {})
     queryClient.setQueryData(relayBProxy, {})
 
@@ -303,9 +348,7 @@ describe("Hearth realtime query refresh", () => {
     expect(queryClient.getQueryState(queryKeys.relays)?.isInvalidated).toBe(
       false
     )
-    expect(
-      queryClient.getQueryState(queryKeys.backups.all)?.isInvalidated
-    ).toBe(false)
+    expect(queryClient.getQueryState(backupRunsKey)?.isInvalidated).toBe(false)
   })
 
   it("expires credentials for an affected Relay identity change", async () => {

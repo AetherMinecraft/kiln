@@ -9,7 +9,10 @@ import {
   type BackupDispatch,
 } from "@/effect/backups"
 import { runAppEffect } from "@/effect/runtime"
-import { publishBackupChange } from "@/lib/backup-realtime.server"
+import {
+  publishBackupChange,
+  publishBackupChanges,
+} from "@/lib/backup-realtime.server"
 import { prepareBackupTaskEffect } from "@/lib/backup-task-prepare"
 import { relayRpc } from "@/lib/relay-connection"
 import { listPersistedRelays, type PersistedRelay } from "@/lib/relay-registry"
@@ -43,7 +46,13 @@ export async function reconcileRelayBackups(
       )
     )
   )
-  if (reconciled.some(Boolean)) publishBackupChange(relay.id)
+  publishBackupChanges(
+    relay.id,
+    reconciled.flatMap((changed, index) => {
+      const backupId = tasks[index]?.backupId
+      return changed && backupId ? [backupId] : []
+    })
+  )
   const dispatchable = await runAppEffect(
     "backups.dispatchable",
     listDispatchableBackupTasksEffect(relay.id)
@@ -83,10 +92,12 @@ export async function dispatchBackupTask(
   const task = relayBackupTaskSchema.parse(
     await relayRpc(relay, "backup.task.enqueue", relayInput, 15_000, subject)
   )
-  await runAppEffect(
+  scheduleBackupReconciliation(relay, subject)
+  const changed = await runAppEffect(
     "backups.reconcileEnqueue",
     reconcileBackupTaskEffect(task, relay.id)
   )
+  if (changed) publishBackupChange(relay.id, task.backupId)
 }
 
 export { prepareBackupTaskEffect }

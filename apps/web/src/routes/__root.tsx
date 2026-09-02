@@ -45,23 +45,23 @@ export const Route = createRootRouteWithContext<AppRouterContext>()({
       },
       {
         rel: "icon",
-        href: "/favicon.ico?v=2",
-        sizes: "16x16 32x32 48x48",
-      },
-      {
-        rel: "icon",
-        href: "/favicon.svg?v=2",
+        href: "/favicon.svg",
         type: "image/svg+xml",
         sizes: "any",
       },
       {
+        rel: "icon",
+        href: "/favicon.ico",
+        sizes: "16x16 32x32 48x48",
+      },
+      {
         rel: "apple-touch-icon",
-        href: "/apple-touch-icon.png?v=2",
-        sizes: "180x180",
+        href: "/apple-touch-icon.png",
+        sizes: "192x192",
       },
       {
         rel: "manifest",
-        href: "/manifest.json?v=2",
+        href: "/manifest.json",
       },
       {
         rel: "stylesheet",

@@ -1,6 +1,6 @@
 import * as React from "react"
 import { useQueryClient } from "@tanstack/react-query"
-import { Effect } from "effect"
+import { Effect, Stream } from "effect"
 import type {
   RelayConsole,
   RelayConsoleLine,
@@ -31,6 +31,7 @@ import {
   openRelayConsoleStream,
   RelayConsoleConnectionError,
 } from "@/lib/relay-console-stream"
+import type { ConsoleLoadTiming } from "@/lib/console-performance"
 import { queryKeys } from "@/lib/query-options"
 import type { InstanceRuntime } from "@/lib/relay-selectors"
 
@@ -38,7 +39,10 @@ export function useRelayConsoleStream(
   relayId: string,
   instanceId: string,
   relayConnected: boolean,
-  runtime: InstanceRuntime | null | undefined
+  browserOrigin: string | null,
+  consoleTransport: "direct" | "hearth" | null,
+  runtime: InstanceRuntime | null | undefined,
+  loadTiming?: ConsoleLoadTiming
 ) {
   const queryClient = useQueryClient()
   const hasEverBeenLiveRef = React.useRef(false)
@@ -245,6 +249,7 @@ export function useRelayConsoleStream(
 
   React.useEffect(() => {
     if (!relayConnected) {
+      loadTiming?.markRetryableFailure(new Error("Relay is unavailable"))
       setSnapshot((current) =>
         updateConsoleStreamSnapshot(current, {
           connection: "unavailable",
@@ -255,14 +260,14 @@ export function useRelayConsoleStream(
       return
     }
 
-    let cancelled = false
-    const lifecycle = new AbortController()
-    let activeIterator: ReturnType<typeof openRelayConsoleStream> | null = null
+    let disposed = false
+    let activeTransport: ConsoleStreamSnapshot["transport"] = null
     let flushTimer: number | null = null
     const pending: Array<RelayConsoleLine> = []
     const seen = new Set(
       consoleDataRef.current?.lines.map((line) => line.id) ?? []
     )
+    loadTiming?.markCache(Boolean(consoleDataRef.current))
     setSnapshot((current) =>
       updateConsoleStreamSnapshot(current, {
         connection: hasEverBeenLiveRef.current ? "reconnecting" : "opening",
@@ -272,13 +277,13 @@ export function useRelayConsoleStream(
     )
 
     function commitSnapshot(patch: Partial<ConsoleStreamSnapshot>) {
-      if (cancelled) return
+      if (disposed) return
       setSnapshot((current) => updateConsoleStreamSnapshot(current, patch))
     }
 
     function flush() {
       flushTimer = null
-      if (cancelled || pending.length === 0) return
+      if (disposed || pending.length === 0) return
       const fresh = pending.splice(0).filter((line) => {
         if (seen.has(line.id)) return false
         seen.add(line.id)
@@ -369,25 +374,20 @@ export function useRelayConsoleStream(
     const connectFiber = Effect.runFork(
       Effect.gen(function* () {
         let retryDelay = 400
-        while (!cancelled) {
-          const failure = yield* Effect.tryPromise({
-            try: async () => {
-              const stream = openRelayConsoleStream(
-                relayId,
-                instanceId,
-                lifecycle.signal
-              )
-              activeIterator = stream
-              // Cancellation changes from the effect cleanup while next() awaits.
-              // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-              while (!cancelled) {
-                const result = await activeIterator.next()
-                // Cleanup can run while the iterator awaits its next event.
-                // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-                if (cancelled) break
-                if (result.done) throw new Error("Console stream closed")
-                const event = result.value
+        while (!disposed) {
+          const failure = yield* openRelayConsoleStream(
+            relayId,
+            instanceId,
+            browserOrigin,
+            consoleTransport,
+            loadTiming
+          ).pipe(
+            Stream.runForEach((event) =>
+              Effect.sync(() => {
+                if (disposed) return
                 if (event.type === "transport") {
+                  activeTransport = event.transport
+                  loadTiming?.markTransport(event.transport)
                   commitSnapshot({
                     error: null,
                     transport: event.transport,
@@ -443,6 +443,10 @@ export function useRelayConsoleStream(
                     error: null,
                     loading: false,
                   })
+                  loadTiming?.markReady(
+                    activeTransport,
+                    nextConsole.lines.length
+                  )
                   retryDelay = 400
                 } else if (event.type === "reset") {
                   if (
@@ -450,7 +454,7 @@ export function useRelayConsoleStream(
                     lifecycleEventTime(event.lifecycle, "started") ===
                       consoleLifecycleTime(consoleDataRef.current)
                   ) {
-                    continue
+                    return
                   }
                   replaceSession(event.lifecycle, event.lines, event.truncated)
                 } else if (event.type === "history") {
@@ -459,16 +463,16 @@ export function useRelayConsoleStream(
                     lifecycleEventTime(event.lifecycle, "started") !==
                       consoleLifecycleTime(consoleDataRef.current)
                   ) {
-                    continue
+                    return
                   }
                   const fresh = event.lines.filter((line) => {
                     if (seen.has(line.id)) return false
                     seen.add(line.id)
                     return true
                   })
-                  if (fresh.length === 0) continue
+                  if (fresh.length === 0) return
                   const current = consoleDataRef.current
-                  if (!current) continue
+                  if (!current) return
                   const nextConsole = {
                     ...current,
                     lines: prependConsoleHistory(current.lines, fresh),
@@ -490,7 +494,7 @@ export function useRelayConsoleStream(
                       !startedAt ||
                       startedAt === consoleLifecycleTime(consoleDataRef.current)
                     ) {
-                      continue
+                      return
                     }
                     replaceSession(
                       [{ state: "started", time: startedAt }],
@@ -501,18 +505,18 @@ export function useRelayConsoleStream(
                     append(event.line)
                   }
                 }
-              }
-            },
-            catch: (cause) => cause,
-          }).pipe(
+              })
+            ),
+            Effect.andThen(Effect.fail(new Error("Console stream closed"))),
             Effect.match({
               onFailure: (cause) => cause,
               onSuccess: () => null,
             })
           )
           // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-          if (cancelled) break
+          if (disposed) break
           if (failure === null) continue
+          loadTiming?.markRetryableFailure(failure)
           commitSnapshot({
             connection: hasEverBeenLiveRef.current
               ? "reconnecting"
@@ -529,12 +533,18 @@ export function useRelayConsoleStream(
     return () => {
       if (flushTimer !== null) window.clearTimeout(flushTimer)
       flush()
-      cancelled = true
-      lifecycle.abort()
-      if (activeIterator) void activeIterator.return(undefined)
+      disposed = true
       connectFiber.interruptUnsafe()
     }
-  }, [instanceId, queryClient, relayConnected, relayId])
+  }, [
+    browserOrigin,
+    consoleTransport,
+    instanceId,
+    loadTiming,
+    queryClient,
+    relayConnected,
+    relayId,
+  ])
 
   return snapshot
 }

@@ -40,7 +40,10 @@ import { runAppEffect } from "@/effect/runtime"
 import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import { betterAuthSecrets, kilnPublicUrl } from "@/lib/environment"
-import { syncInstanceRegistry } from "@/lib/instance-registry"
+import {
+  backfillInstanceSourceNames,
+  syncInstanceRegistry,
+} from "@/lib/instance-registry"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 
 import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
@@ -81,6 +84,20 @@ export interface RelayCredentials {
   clientPrivateKeyPem: string
   clientPublicKeyPem: string
   relayPublicKeyPem: string
+}
+
+interface EncryptedRelayCredentials {
+  caCertificatePem: string | null
+  clientId: string
+  clientPrivateKeyCiphertext: string
+  clientPublicKeyPem: string
+  relayId: string
+  relayPublicKeyPem: string
+}
+
+export interface RelayIssuanceMaterial {
+  encryptedCredentials: EncryptedRelayCredentials
+  relay: PersistedRelay
 }
 
 export interface RelayClientAdministration {
@@ -238,6 +255,42 @@ export const listPersistedRelaysEffect = Effect.fn("relays.list")(function* () {
       ORDER BY name ASC, created_at ASC`
   )
   return rows.map(toPersistedRelay)
+})
+
+export const loadEnabledRelayForIssuanceEffect = Effect.fn(
+  "relays.issuance.load"
+)(function* (id: string) {
+  const database = yield* Database
+  const rows = yield* database.queryRows<RelayRow>(
+    "relay_issuance",
+    `SELECT id, name, hostname, port, use_tls, browser_origin,
+            client_id, client_role, client_actions, enabled,
+            last_connected_at, last_error, managed_ember_count,
+            node_arch, node_platform, node_version,
+            relay_public_key, relay_ca_certificate,
+            client_public_key, client_private_key_ciphertext, created_by, created_at
+       FROM ${databaseTable("relay")}
+      WHERE id = ? AND enabled = TRUE
+      LIMIT 1`,
+    [id]
+  )
+  const row = rows[0]
+  if (!row) {
+    return yield* ResourceNotFoundError.make({
+      resource: "relay",
+      message: "Relay is not available",
+    })
+  }
+  return {
+    encryptedCredentials: encryptedRelayCredentials(row),
+    relay: toPersistedRelay(row),
+  } satisfies RelayIssuanceMaterial
+})
+
+export const decryptRelayIssuanceCredentialsEffect = Effect.fn(
+  "relays.issuance.decryptCredentials"
+)(function* (material: RelayIssuanceMaterial) {
+  return yield* decryptRelayCredentialsEffect(material.encryptedCredentials)
 })
 
 export async function pairPersistedRelay(
@@ -521,10 +574,37 @@ export async function maintainPersistedRelayConnections(): Promise<void> {
   const { relayRpc } = await import("@/lib/relay-connection")
   await Promise.allSettled(
     relays.map(async (relay) => {
-      const snapshot = relaySnapshotSchema.parse(
-        await relayRpc(relay, "relay.snapshot", {}, 5_000)
+      const freshSnapshot = await Effect.runPromise(
+        Effect.result(
+          Effect.tryPromise({
+            try: async () =>
+              relaySnapshotSchema.parse(
+                await relayRpc(relay, "relay.snapshot", {}, 5_000)
+              ),
+            catch: (cause) => cause,
+          })
+        )
       )
-      await syncInstanceRegistry(relay.id, snapshot.instances)
+      if (Result.isSuccess(freshSnapshot)) {
+        await syncInstanceRegistry(relay.id, freshSnapshot.success.instances)
+        return
+      }
+      const fallback = await cachedRelaySnapshotFallback(relay.id)
+      if (fallback) {
+        await backfillInstanceSourceNames(relay.id, fallback.instances)
+      }
+    })
+  )
+}
+
+async function cachedRelaySnapshotFallback(relayId: string) {
+  const { cachedRelayFallbackJsonEffect, relayCachePolicy } =
+    await import("@/lib/relay-client")
+  return runAppEffect(
+    "relay.snapshotFallback",
+    cachedRelayFallbackJsonEffect({
+      decode: relaySnapshotSchema.parse,
+      policy: relayCachePolicy.snapshot(relayId),
     })
   )
 }
@@ -1063,8 +1143,15 @@ export const loadRelayCredentialsEffect = Effect.fn("relays.credentials")(
         })
       )
     }
+    return yield* decryptRelayCredentialsEffect(encryptedRelayCredentials(row))
+  }
+)
+
+const decryptRelayCredentialsEffect = Effect.fn("relays.credentials.decrypt")(
+  function* (credentials: EncryptedRelayCredentials) {
+    const database = yield* Database
     const decrypted = yield* Effect.try({
-      try: () => decryptPrivateKey(row.client_private_key_ciphertext),
+      try: () => decryptPrivateKey(credentials.clientPrivateKeyCiphertext),
       catch: (cause) =>
         CredentialError.make({ operation: "decrypt_relay_private_key", cause }),
     })
@@ -1080,20 +1167,31 @@ export const loadRelayCredentialsEffect = Effect.fn("relays.credentials")(
       yield* database.execute(
         "rotate_relay_private_key",
         `UPDATE ${databaseTable("relay")}
-            SET client_private_key_ciphertext = ?
-          WHERE id = ? AND client_private_key_ciphertext = ?`,
-        [rotated, id, row.client_private_key_ciphertext]
+          SET client_private_key_ciphertext = ?
+        WHERE id = ? AND client_private_key_ciphertext = ?`,
+        [rotated, credentials.relayId, credentials.clientPrivateKeyCiphertext]
       )
     }
     return {
-      caCertificatePem: row.relay_ca_certificate,
-      clientId: row.client_id,
+      caCertificatePem: credentials.caCertificatePem,
+      clientId: credentials.clientId,
       clientPrivateKeyPem: decrypted.plaintext,
-      clientPublicKeyPem: row.client_public_key,
-      relayPublicKeyPem: row.relay_public_key,
+      clientPublicKeyPem: credentials.clientPublicKeyPem,
+      relayPublicKeyPem: credentials.relayPublicKeyPem,
     } satisfies RelayCredentials
   }
 )
+
+function encryptedRelayCredentials(row: RelayRow): EncryptedRelayCredentials {
+  return {
+    caCertificatePem: row.relay_ca_certificate,
+    clientId: row.client_id,
+    clientPrivateKeyCiphertext: row.client_private_key_ciphertext,
+    clientPublicKeyPem: row.client_public_key,
+    relayId: row.id,
+    relayPublicKeyPem: row.relay_public_key,
+  }
+}
 
 function decodePairingUri(value: string) {
   const url = new URL(value.trim())

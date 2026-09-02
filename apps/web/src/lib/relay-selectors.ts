@@ -37,7 +37,6 @@ export type RouteInstance = SidebarInstance & {
 export type ServerListInstance = Pick<
   RelayInstance,
   | "brickId"
-  | "brickSource"
   | "connectAddress"
   | "game"
   | "id"
@@ -157,7 +156,6 @@ export function selectServerListInstances(
 ): Array<ServerListInstance> {
   return snapshot.instances.map((instance) => ({
     brickId: instance.brickId,
-    brickSource: instance.brickSource,
     connectAddress: instance.connectAddress,
     game: instance.game,
     id: instance.id,
@@ -209,6 +207,26 @@ export function selectRelayConnected(relayId: string) {
       (relay) => relay.id === relayId && relay.status === "connected"
     ) ||
       (connection.relays.length === 0 && connection.relay?.id === relayId))
+}
+
+export function selectRelayBrowserOrigin(relayId: string) {
+  return (connection: RelayConnection): string | null => {
+    if (connection.status === "unconfigured") return null
+    return (
+      connection.relays.find((relay) => relay.id === relayId)?.browserOrigin ??
+      null
+    )
+  }
+}
+
+export function selectRelayConsoleTransport(relayId: string) {
+  return (connection: RelayConnection): "direct" | "hearth" | null => {
+    if (connection.status === "unconfigured") return null
+    return (
+      connection.relays.find((relay) => relay.id === relayId)
+        ?.consoleTransport ?? null
+    )
+  }
 }
 
 export function selectInstanceWorkspaceInstance(identifier: string) {

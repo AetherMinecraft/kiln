@@ -650,6 +650,19 @@ export const relayProxySettingsSchema = z
   })
   .strict()
 
+export const relayProxyReadInputSchema = z
+  .object({
+    includeDiagnostics: z.boolean().optional().default(true),
+  })
+  .strict()
+
+export const relayProxyBrowserMetadataSchema = z
+  .object({
+    browserOrigin: z.url(),
+    mode: relayProxyModeSchema,
+  })
+  .strict()
+
 const webRouteHostnameSchema = z
   .string()
   .trim()
@@ -1084,23 +1097,25 @@ export const relaySftpSnapshotSchema = z.object({
   publication: relaySftpPublicationStatusSchema.default("unknown"),
 })
 
+const relaySnapshotRelaySchema = z.object({
+  browserOrigin: relayProxyBrowserMetadataSchema.shape.browserOrigin.optional(),
+  id: relayIdSchema,
+  name: z.string().min(1).max(120),
+  proxyMode: relayProxyModeSchema.optional(),
+  sftp: relaySftpSnapshotSchema,
+  tls: z
+    .object({
+      expiresAt: z.number().int().positive(),
+      fingerprint: z.string().min(1),
+      mode: z.enum(["external", "managed"]),
+    })
+    .nullable(),
+})
+
 export const relaySnapshotSchema = z.object({
   node: relayNodeSchema,
   instances: z.array(relayInstanceSchema),
-  relay: z
-    .object({
-      id: relayIdSchema,
-      name: z.string().min(1).max(120),
-      sftp: relaySftpSnapshotSchema,
-      tls: z
-        .object({
-          expiresAt: z.number().int().positive(),
-          fingerprint: z.string().min(1),
-          mode: z.enum(["external", "managed"]),
-        })
-        .nullable(),
-    })
-    .optional(),
+  relay: relaySnapshotRelaySchema.optional(),
 })
 
 /**
@@ -1113,6 +1128,7 @@ export const relaySnapshotDeltaSchema = z.object({
   deletedInstanceIds: z.array(relayInstanceSchema.shape.id),
   instances: z.array(relayInstanceSchema),
   node: relayNodeSchema.optional(),
+  relay: relaySnapshotRelaySchema.optional(),
 })
 
 export const relayFileTreeSchema = z.object({
@@ -1546,6 +1562,9 @@ export type RelayTailscaleStackDns = z.infer<
 >
 export type RelayTailscaleStatus = z.infer<typeof relayTailscaleStatusSchema>
 export type RelayProxyMode = z.infer<typeof relayProxyModeSchema>
+export type RelayProxyBrowserMetadata = z.infer<
+  typeof relayProxyBrowserMetadataSchema
+>
 export type RelayProxySettings = z.infer<typeof relayProxySettingsSchema>
 export type RelayProxyDiagnostics = z.infer<typeof relayProxyDiagnosticsSchema>
 export type RelayInstanceWebRoute = z.infer<typeof relayInstanceWebRouteSchema>
@@ -1626,14 +1645,23 @@ export function createRelaySnapshotDelta(
   )
     ? undefined
     : next.node
+  const relay = jsonValueEqual(previous.relay, next.relay)
+    ? undefined
+    : next.relay
 
-  if (instances.length === 0 && deletedInstanceIds.length === 0 && !node) {
+  if (
+    instances.length === 0 &&
+    deletedInstanceIds.length === 0 &&
+    !node &&
+    !relay
+  ) {
     return null
   }
   return {
     deletedInstanceIds,
     instances,
     ...(node ? { node } : {}),
+    ...(relay ? { relay } : {}),
   }
 }
 
@@ -1655,6 +1683,7 @@ export function applyRelaySnapshotDelta(
     ...snapshot,
     instances: [...retained, ...upserts.values()],
     node: delta.node ?? snapshot.node,
+    relay: delta.relay ?? snapshot.relay,
   }
 }
 

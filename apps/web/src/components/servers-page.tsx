@@ -1,28 +1,26 @@
 import * as React from "react"
 import { eq, not } from "@tanstack/db"
 import { useDbClient, useLiveQuery } from "@tanstack/react-db"
-import {
-  useQuery,
-  useQueryClient,
-  useSuspenseQuery,
-} from "@tanstack/react-query"
+import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import { ensuringPromise, forkPromise } from "@/effect/promise"
 import {
+  EllipsisVertical,
   Folder,
   ListTodo,
-  Network,
   Plus,
   RefreshCw,
-  Search,
   Server,
   TerminalSquare,
   Trash2,
-  X,
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
-import { Input } from "@workspace/ui/components/input"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@workspace/ui/components/dropdown-menu"
 import {
   Tooltip,
   TooltipContent,
@@ -35,42 +33,73 @@ import {
   createAddServerDialogStore,
 } from "@/components/add-server-dialog"
 import type { AddServerDialogStore } from "@/components/add-server-dialog"
+import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
+import {
+  DataTableActionGroup,
+  DataTableEmptyState,
+  DataTableTextCell,
+} from "@/components/data-table"
 import {
   ServerDeleteDialog,
   type ServerDeleteTarget,
 } from "@/components/server-delete-dialog"
 import {
-  BrickIcon,
-  brickIconPresentation,
-  type BrickIconDefinition,
-  type BrickIconPresentation,
-} from "@/components/brick-icon"
-import {
-  WorkspaceDataTable,
-  WorkspaceTableCell,
-  WorkspaceTableHead,
-  WorkspaceTableHeading,
-  createWorkspaceTableSearchStore,
-  useWorkspaceTableSearchInput,
-} from "@/components/workspace-data-table"
-import type { WorkspaceTableSearchStore } from "@/components/workspace-data-table"
+  DataTableToolbar,
+  DataTableWorkspace,
+} from "@/components/data-table-workspace"
+import { DataTable } from "@/components/data-table-view"
+import { InstanceName } from "@/components/instance-name"
 import {
   accessCapabilitiesQueryOptions,
   brickCatalogQueryOptions,
-  brickIconPresentationsQueryOptions,
   relayConnectionQueryOptions,
 } from "@/lib/query-options"
 import {
   getRelayInstancesCollection,
   relayInstancesCollectionOptions,
 } from "@/lib/collections/relay-instances"
+import {
+  createDataTableColumnHelper,
+  dataTableColumnMeta,
+  defineDataTable,
+} from "@/lib/data-table"
+import {
+  replaceDataTableUrlSearch,
+  type DataTableSearchStore,
+} from "@/lib/data-table-search"
+import {
+  replaceDataTableRows,
+  useLiveDataTableSource,
+  type DataTableSource,
+} from "@/lib/data-table-source"
 import { roleHasPermission } from "@/lib/permissions"
 import { selectRelayConfigured } from "@/lib/relay-selectors"
 import type { ServerListInstance } from "@/lib/relay-selectors"
 
-const emptyServers: Array<ServerListInstance> = []
-const emptyBrickIcons: Array<BrickIconDefinition> = []
 const minimumManualSyncFeedbackMs = 500
+const serverInventoryError = new Error("Could not load servers")
+const serverTableItemCache = new WeakMap<ServerListInstance, ServerTableItem>()
+
+interface ServerTableItem {
+  routeIdentifier: string
+  server: ServerListInstance
+}
+
+const serverTableColumnHelper = createDataTableColumnHelper<ServerTableItem>()
+const serverTableSearchFields = [
+  ({ server }: ServerTableItem) => server.name,
+  ({ server }: ServerTableItem) => server.id,
+  ({ server }: ServerTableItem) => server.shortId,
+  ({ server }: ServerTableItem) => server.routeId,
+  ({ server }: ServerTableItem) => server.game,
+  ({ server }: ServerTableItem) => server.implementation,
+  ({ server }: ServerTableItem) => server.version,
+  ({ server }: ServerTableItem) => server.connectAddress,
+  ({ server }: ServerTableItem) => server.relayId,
+  ({ server }: ServerTableItem) => server.relayName,
+  ({ server }: ServerTableItem) => server.relayStatus,
+  ({ server }: ServerTableItem) => server.observedState,
+] as const
 
 interface ServerDeleteAccess {
   all: boolean
@@ -78,13 +107,7 @@ interface ServerDeleteAccess {
   relays: ReadonlySet<string>
 }
 
-export type ServerSearchStore = WorkspaceTableSearchStore
-
-export function createServerSearchStore(
-  initialValue: string
-): ServerSearchStore {
-  return createWorkspaceTableSearchStore(initialValue)
-}
+export type ServerSearchStore = DataTableSearchStore
 
 export const ServersPage = React.memo(function ServersPage({
   canProvision,
@@ -137,17 +160,31 @@ export const ServersPage = React.memo(function ServersPage({
   }, [canProvision, queryClient])
 
   return (
-    <div className="mx-auto w-full max-w-[90rem] px-3 pb-10 sm:px-5">
-      <section
-        data-slot="servers-workspace"
-        className="overflow-hidden rounded-xl border bg-card/45 [contain:paint]"
+    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-3 pb-3 sm:px-5 sm:pb-5">
+      <DataTableWorkspace
+        toolbar={
+          <DataTableToolbar
+            actions={
+              <>
+                <ActivityButton />
+                <AddServerButton
+                  canProvision={canProvision}
+                  dialogStore={dialogStore}
+                />
+              </>
+            }
+            leading={<ServerSyncButton disabled={!relayConfigured} />}
+            search={{
+              ariaLabel: "Search servers",
+              closeMobileWhenEmpty: true,
+              id: "server-search",
+              onValueChange: replaceDataTableUrlSearch,
+              placeholder: "Search servers",
+              store: searchStore,
+            }}
+          />
+        }
       >
-        <ServerToolbar
-          canProvision={canProvision}
-          dialogStore={dialogStore}
-          relayConfigured={relayConfigured}
-          searchStore={searchStore}
-        />
         <FilteredServerTableBoundary
           canProvision={canProvision}
           deleteAccess={deleteAccess}
@@ -156,7 +193,7 @@ export const ServersPage = React.memo(function ServersPage({
           relayConfigured={relayConfigured}
           searchStore={searchStore}
         />
-      </section>
+      </DataTableWorkspace>
       {canProvision ? <AddServerDialogHost store={dialogStore} /> : null}
       {deleteTarget ? (
         <ServerDeleteDialog
@@ -169,85 +206,6 @@ export const ServersPage = React.memo(function ServersPage({
           }}
         />
       ) : null}
-    </div>
-  )
-})
-
-const ServerToolbar = React.memo(function ServerToolbar({
-  canProvision,
-  dialogStore,
-  relayConfigured,
-  searchStore,
-}: {
-  canProvision: boolean
-  dialogStore: AddServerDialogStore
-  relayConfigured: boolean
-  searchStore: ServerSearchStore
-}) {
-  const [mobileSearchOpen, setMobileSearchOpen] = React.useState(
-    () => searchStore.getSnapshot().length > 0
-  )
-  const searchInputRef = React.useRef<HTMLInputElement>(null)
-  const handleSearchEmpty = React.useCallback((value: string) => {
-    if (value.length === 0) setMobileSearchOpen(false)
-  }, [])
-
-  React.useEffect(() => {
-    if (mobileSearchOpen) searchInputRef.current?.focus()
-  }, [mobileSearchOpen])
-
-  return (
-    <div className="flex min-w-0 items-center gap-2 border-b bg-background/25 p-3">
-      <ServerSyncButton disabled={!relayConfigured} />
-
-      {!mobileSearchOpen ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              size="icon"
-              variant="outline"
-              aria-label="Search servers"
-              aria-controls="server-search"
-              aria-expanded={false}
-              className="sm:hidden"
-              onClick={() => setMobileSearchOpen(true)}
-            >
-              <Search />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={6}>
-            Search servers
-          </TooltipContent>
-        </Tooltip>
-      ) : null}
-
-      <div
-        className={`${mobileSearchOpen ? "block" : "hidden"} min-w-0 flex-1 sm:block sm:max-w-md`}
-      >
-        <ServerSearchInput
-          inputRef={searchInputRef}
-          store={searchStore}
-          onSearchEmpty={handleSearchEmpty}
-        />
-      </div>
-
-      {mobileSearchOpen ? (
-        <ClearMobileSearchButton
-          searchStore={searchStore}
-          onClose={() => setMobileSearchOpen(false)}
-        />
-      ) : null}
-
-      <div
-        className={`${mobileSearchOpen ? "hidden sm:flex" : "flex"} ml-auto shrink-0 items-center gap-2`}
-      >
-        <ActivityButton />
-        <AddServerButton
-          canProvision={canProvision}
-          dialogStore={dialogStore}
-        />
-      </div>
     </div>
   )
 })
@@ -320,64 +278,6 @@ const ServerSyncButton = React.memo(function ServerSyncButton({
   )
 })
 
-function ClearMobileSearchButton({
-  searchStore,
-  onClose,
-}: {
-  searchStore: ServerSearchStore
-  onClose: () => void
-}) {
-  return (
-    <Button
-      type="button"
-      size="icon"
-      variant="ghost"
-      aria-label="Close server search"
-      className="sm:hidden"
-      onClick={() => {
-        onClose()
-        searchStore.set("")
-        replaceServerSearch("")
-      }}
-    >
-      <X />
-    </Button>
-  )
-}
-
-const ServerSearchInput = React.memo(function ServerSearchInput({
-  inputRef,
-  store,
-  onSearchEmpty,
-}: {
-  inputRef: React.RefObject<HTMLInputElement | null>
-  store: ServerSearchStore
-  onSearchEmpty: (value: string) => void
-}) {
-  useWorkspaceTableSearchInput(inputRef, store)
-
-  return (
-    <div className="relative min-w-0 flex-1">
-      <Search className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted-foreground" />
-      <Input
-        ref={inputRef}
-        id="server-search"
-        type="search"
-        defaultValue={store.getServerSnapshot()}
-        onChange={(event) => {
-          const value = event.currentTarget.value
-          store.set(value)
-          onSearchEmpty(value)
-          replaceServerSearch(value)
-        }}
-        placeholder="Search servers"
-        aria-label="Search servers"
-        className="pl-9 text-base md:text-sm"
-      />
-    </div>
-  )
-})
-
 const ActivityButton = React.memo(function ActivityButton() {
   return (
     <Tooltip>
@@ -424,80 +324,6 @@ const AddServerButton = React.memo(function AddServerButton({
   )
 })
 
-const ServerTableSearchBoundary = React.memo(
-  function ServerTableSearchBoundary({
-    bricks,
-    canProvision,
-    deleteAccess,
-    dialogStore,
-    onDelete,
-    searchStore,
-    servers,
-  }: {
-    bricks: Array<BrickIconDefinition>
-    canProvision: boolean
-    deleteAccess: ServerDeleteAccess
-    dialogStore: AddServerDialogStore
-    onDelete: (target: ServerDeleteTarget) => void
-    searchStore: ServerSearchStore
-    servers: Array<ServerListInstance>
-  }) {
-    const shortIdCounts = React.useMemo(() => {
-      const counts = new Map<string, number>()
-      for (const server of servers) {
-        counts.set(server.shortId, (counts.get(server.shortId) ?? 0) + 1)
-      }
-      return counts
-    }, [servers])
-    const renderRow = React.useCallback(
-      (server: ServerListInstance) => {
-        const icon = brickIconPresentation(bricks, {
-          brickId: server.brickId,
-          brickSource: server.brickSource,
-          implementation: server.implementation,
-        })
-        return (
-          <ServerTableRow
-            canonical={shortIdCounts.get(server.shortId) === 1}
-            canDelete={canDeleteServer(deleteAccess, server)}
-            icon={icon}
-            onDelete={onDelete}
-            routeIdentifier={
-              shortIdCounts.get(server.shortId) === 1
-                ? server.shortId
-                : server.routeId
-            }
-            server={server}
-          />
-        )
-      },
-      [bricks, deleteAccess, onDelete, shortIdCounts]
-    )
-    const renderEmpty = React.useCallback(
-      (searchActive: boolean) => (
-        <EmptyServerTable
-          canProvision={canProvision}
-          dialogStore={dialogStore}
-          searchActive={searchActive}
-        />
-      ),
-      [canProvision, dialogStore]
-    )
-
-    return (
-      <WorkspaceDataTable
-        getRowKey={serverRowKey}
-        getSearchText={serverSearchText}
-        head={<ServerTableHead />}
-        items={servers}
-        renderEmpty={renderEmpty}
-        renderRow={renderRow}
-        searchStore={searchStore}
-      />
-    )
-  }
-)
-
 const FilteredServerTableBoundary = React.memo(
   function FilteredServerTableBoundary({
     canProvision,
@@ -514,7 +340,8 @@ const FilteredServerTableBoundary = React.memo(
     relayConfigured: boolean
     searchStore: ServerSearchStore
   }) {
-    const { data: servers = emptyServers } = useLiveQuery({
+    const dbClient = useDbClient()
+    const result = useLiveQuery({
       query: (query) => {
         if (!relayConfigured) return undefined
         return query
@@ -524,7 +351,6 @@ const FilteredServerTableBoundary = React.memo(
           )
           .select(({ instance }) => ({
             brickId: instance.brickId,
-            brickSource: instance.brickSource,
             connectAddress: instance.connectAddress,
             game: instance.game,
             id: instance.id,
@@ -541,153 +367,205 @@ const FilteredServerTableBoundary = React.memo(
           }))
       },
     })
-    const { data: bricks = emptyBrickIcons } = useQuery({
-      ...brickIconPresentationsQueryOptions(),
-      notifyOnChangeProps: ["data"],
+    const retry = React.useCallback(() => {
+      forkPromise(() =>
+        getRelayInstancesCollection(dbClient).utils.refetch({
+          throwOnError: true,
+        })
+      )
+    }, [dbClient])
+    const liveSource = useLiveDataTableSource<ServerListInstance>({
+      data: result.data,
+      error: serverInventoryError,
+      isError: result.isError,
+      isLoading: result.isLoading,
+      retry,
     })
+    const items = React.useMemo(
+      () => createServerTableItems(liveSource.rows),
+      [liveSource.rows]
+    )
+    const source = React.useMemo(
+      () => replaceDataTableRows(liveSource, items),
+      [items, liveSource]
+    )
+
     return (
-      <ServerTableSearchBoundary
-        bricks={bricks}
+      <ServerDataTable
         canProvision={canProvision}
         deleteAccess={deleteAccess}
         dialogStore={dialogStore}
         onDelete={onDelete}
         searchStore={searchStore}
-        servers={servers}
+        source={source}
       />
     )
   }
 )
 
-const ServerTableHead = React.memo(function ServerTableHead() {
-  return (
-    <WorkspaceTableHead>
-      <WorkspaceTableHeading className="w-10 px-2 sm:w-24 sm:px-3">
-        <span className="sr-only sm:not-sr-only">Status</span>
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-auto sm:w-[25%]">
-        Server
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[12%] lg:table-cell">
-        ID
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[18%] lg:table-cell">
-        Relay
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[24%] xl:table-cell">
-        Address
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="hidden w-[16%] md:table-cell">
-        Version
-      </WorkspaceTableHeading>
-      <WorkspaceTableHeading className="w-36 px-1 text-right sm:w-40 sm:px-3">
-        Actions
-      </WorkspaceTableHeading>
-    </WorkspaceTableHead>
-  )
-})
-
-const ServerTableRow = React.memo(function ServerTableRow({
-  canonical,
-  canDelete,
-  icon,
+const ServerDataTable = React.memo(function ServerDataTable({
+  canProvision,
+  deleteAccess,
+  dialogStore,
   onDelete,
-  routeIdentifier,
-  server,
+  searchStore,
+  source,
 }: {
-  canonical: boolean
-  canDelete: boolean
-  icon: BrickIconPresentation
+  canProvision: boolean
+  deleteAccess: ServerDeleteAccess
+  dialogStore: AddServerDialogStore
   onDelete: (target: ServerDeleteTarget) => void
-  routeIdentifier: string
-  server: ServerListInstance
+  searchStore: ServerSearchStore
+  source: DataTableSource<ServerTableItem>
 }) {
-  return (
-    <tr className="group transition-colors hover:bg-accent/25">
-      <WorkspaceTableCell className="px-2 sm:px-3">
-        <ServerStatus server={server} />
-      </WorkspaceTableCell>
-      <WorkspaceTableCell>
-        <div className="flex min-w-0 items-center gap-2.5">
-          <span className="flex size-[32px] shrink-0 items-center justify-center rounded-md border border-border/70 bg-background/35 text-muted-foreground">
-            <BrickIcon
-              id={icon.id}
-              color={icon.color}
-              iconSvg={icon.iconSvg}
-              className="size-[24px]"
-              aria-hidden="true"
-            />
-          </span>
-          <div className="min-w-0">
+  const [initialTableState] = React.useState(() => ({
+    sorting: [{ desc: false, id: "server" }],
+  }))
+  const definition = React.useMemo(() => {
+    const columns = serverTableColumnHelper.columns([
+      serverTableColumnHelper.accessor(
+        ({ server }) => serverStatus(server).label,
+        {
+          id: "status",
+          header: () => <span className="sr-only sm:not-sr-only">Status</span>,
+          sortFn: "text",
+          cell: ({ row }) => <ServerStatus server={row.original.server} />,
+          meta: dataTableColumnMeta(
+            { width: { base: "2.5rem", sm: "6.5rem" } },
+            {
+              cellClassName: "px-2 sm:px-3",
+              headerClassName: "px-2 sm:px-3",
+              headerLabelClassName: "shrink-0 overflow-visible text-clip",
+            }
+          ),
+        }
+      ),
+      serverTableColumnHelper.accessor(({ server }) => server.name, {
+        id: "server",
+        header: "Server",
+        sortFn: "text",
+        cell: ({ row }) => {
+          const { routeIdentifier, server } = row.original
+          return (
             <Link
               to="/server/$serverId/console"
               params={{ serverId: routeIdentifier }}
               preload="intent"
-              className="block truncate text-xs font-semibold text-foreground hover:text-primary"
+              className="group/server-link flex min-h-14 w-full min-w-0 items-center px-3 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
             >
-              {server.name}
+              <InstanceName
+                instance={{
+                  brickId: server.brickId,
+                  id: server.id,
+                  implementation: server.implementation,
+                  kind: "server",
+                  observedState: server.observedState,
+                  relayId: server.relayId,
+                  relayStatus: server.relayStatus,
+                }}
+                live={false}
+                name={server.name}
+                nameClassName="transition-colors group-hover/server-link:text-primary"
+                meta={`${server.game} · ${server.implementation}`}
+                metaClassName="font-mono"
+              />
             </Link>
-            <p className="type-meta truncate font-mono text-muted-foreground">
-              {server.game} · {server.implementation}
-            </p>
-          </div>
-        </div>
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden lg:table-cell">
-        <span
-          className={`type-meta font-mono ${canonical ? "text-foreground" : "text-amber-300"}`}
-          title={
-            canonical
-              ? server.id
-              : `${server.shortId} is shared by more than one accessible server; this row uses its Relay-qualified route`
+          )
+        },
+        meta: dataTableColumnMeta(
+          {
+            width: {
+              base: "minmax(0,1fr)",
+              md: "minmax(0,1.2fr)",
+            },
+          },
+          { cellClassName: "px-0" }
+        ),
+      }),
+      serverTableColumnHelper.accessor(({ server }) => server.relayName, {
+        id: "relay",
+        header: "Relay",
+        sortFn: "text",
+        cell: ({ row }) => (
+          <DataTableTextCell value={row.original.server.relayName} />
+        ),
+        meta: dataTableColumnMeta({
+          hideBelow: "md",
+          width: "minmax(0,0.8fr)",
+        }),
+      }),
+      serverTableColumnHelper.accessor(({ server }) => server.connectAddress, {
+        id: "address",
+        header: "Host / IP",
+        sortFn: "text",
+        cell: ({ row }) => {
+          const address = row.original.server.connectAddress
+          return (
+            <DataTableTextCell
+              className={
+                address.startsWith("Error:")
+                  ? "font-semibold text-destructive"
+                  : undefined
+              }
+              monospace
+              title={address}
+              value={address.startsWith("Error:") ? "ERROR" : address}
+            />
+          )
+        },
+        meta: dataTableColumnMeta({
+          hideBelow: "xl",
+          width: "minmax(12rem,1fr)",
+        }),
+      }),
+      serverTableColumnHelper.display({
+        id: "actions",
+        header: () => <span className="sr-only">Actions</span>,
+        enableSorting: false,
+        cell: ({ row }) => {
+          const { routeIdentifier, server } = row.original
+          return (
+            <ServerActions
+              canDelete={canDeleteServer(deleteAccess, server)}
+              onDelete={onDelete}
+              routeIdentifier={routeIdentifier}
+              server={server}
+            />
+          )
+        },
+        meta: dataTableColumnMeta(
+          { width: { base: "8.5rem", sm: "9.5rem" } },
+          {
+            cellClassName: "px-1 sm:px-3",
+            headerClassName: "px-1 sm:px-3",
           }
-        >
-          {server.shortId}
-        </span>
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden lg:table-cell">
-        <div className="min-w-0">
-          <p className="type-meta truncate text-foreground">
-            {server.relayName}
-          </p>
-          <p className="type-meta truncate font-mono text-muted-foreground">
-            {server.relayStatus}
-          </p>
-        </div>
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden xl:table-cell">
-        <span
-          className={`type-meta block truncate font-mono ${
-            server.connectAddress.startsWith("Error:")
-              ? "font-semibold text-destructive"
-              : "text-foreground"
-          }`}
-          title={server.connectAddress}
-        >
-          {server.connectAddress.startsWith("Error:")
-            ? "ERROR"
-            : server.connectAddress}
-        </span>
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="hidden md:table-cell">
-        <div className="min-w-0">
-          <p className="type-meta truncate font-mono text-foreground">
-            {server.version}
-          </p>
-          <p className="type-meta truncate text-muted-foreground">
-            {server.implementation}
-          </p>
-        </div>
-      </WorkspaceTableCell>
-      <WorkspaceTableCell className="px-1 sm:px-3">
-        <ServerActions
-          canDelete={canDelete}
-          routeIdentifier={routeIdentifier}
-          server={server}
-          onDelete={onDelete}
+        ),
+      }),
+    ])
+    return defineDataTable({
+      ariaLabel: "Servers",
+      columns,
+      getRowId: serverTableItemKey,
+      model: {
+        initialState: initialTableState,
+      },
+      search: { fields: serverTableSearchFields },
+      virtualization: true,
+    })
+  }, [deleteAccess, initialTableState, onDelete])
+  return (
+    <DataTable
+      definition={definition}
+      emptyState={({ searchActive }) => (
+        <EmptyServerTable
+          canProvision={canProvision}
+          dialogStore={dialogStore}
+          searchActive={searchActive}
         />
-      </WorkspaceTableCell>
-    </tr>
+      )}
+      searchStore={searchStore}
+      source={source}
+    />
   )
 })
 
@@ -704,7 +582,7 @@ const ServerActions = React.memo(function ServerActions({
 }) {
   const deleteEnabled = server.relayStatus === "connected"
   return (
-    <div className="flex items-center justify-end gap-1">
+    <DataTableActionGroup>
       <ServerActionLink
         icon={TerminalSquare}
         label={`Open ${server.name} console`}
@@ -719,13 +597,6 @@ const ServerActions = React.memo(function ServerActions({
         tab="files"
         tooltip="Files"
       />
-      <ServerActionLink
-        icon={Network}
-        label={`Open ${server.name} network`}
-        routeIdentifier={routeIdentifier}
-        tab="network"
-        tooltip="Network"
-      />
       {canDelete ? (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -734,7 +605,7 @@ const ServerActions = React.memo(function ServerActions({
               size="icon-sm"
               variant="ghost"
               aria-label={`Delete ${server.name}`}
-              className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
               disabled={!deleteEnabled}
               onClick={() =>
                 onDelete({
@@ -753,7 +624,23 @@ const ServerActions = React.memo(function ServerActions({
           </TooltipContent>
         </Tooltip>
       ) : null}
-    </div>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`More actions for ${server.name}`}
+          >
+            <EllipsisVertical />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="min-w-44">
+          <CopyIdentifierMenuItem label="Server ID" value={server.id} />
+          <CopyIdentifierMenuItem label="Relay ID" value={server.relayId} />
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </DataTableActionGroup>
   )
 })
 
@@ -767,7 +654,7 @@ const ServerActionLink = React.memo(function ServerActionLink({
   icon: typeof TerminalSquare
   label: string
   routeIdentifier: string
-  tab: "console" | "files" | "network"
+  tab: "console" | "files"
   tooltip: string
 }) {
   const link =
@@ -823,14 +710,7 @@ function canDeleteServer(
 }
 
 function ServerStatus({ server }: { server: ServerListInstance }) {
-  const status =
-    server.relayStatus === "unreachable"
-      ? {
-          dot: "bg-destructive",
-          label: "Relay unavailable",
-          text: "text-destructive",
-        }
-      : serverStatusTone(server.observedState)
+  const status = serverStatus(server)
   return (
     <span
       aria-label={status.label}
@@ -840,6 +720,16 @@ function ServerStatus({ server }: { server: ServerListInstance }) {
       <span className="hidden sm:inline">{status.label}</span>
     </span>
   )
+}
+
+function serverStatus(server: ServerListInstance) {
+  return server.relayStatus === "unreachable"
+    ? {
+        dot: "bg-destructive",
+        label: "Relay unavailable",
+        text: "text-destructive",
+      }
+    : serverStatusTone(server.observedState)
 }
 
 function EmptyServerTable({
@@ -852,29 +742,28 @@ function EmptyServerTable({
   searchActive: boolean
 }) {
   return (
-    <div className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center">
-      <Server className="size-6 text-muted-foreground/45" />
-      <p className="mt-3 text-sm font-semibold">
-        {searchActive ? "No servers match your search" : "No managed servers"}
-      </p>
-      <p className="type-support mt-1 max-w-sm text-muted-foreground">
-        {searchActive
-          ? "Try a server name, short ID, Relay, address, game, implementation, or version."
-          : canProvision
-            ? "Provision the first game server managed by Hearth."
-            : "No server instances have been assigned to your account yet."}
-      </p>
-      {!searchActive && canProvision ? (
-        <Button
-          type="button"
-          size="sm"
-          className="mt-4"
-          onClick={dialogStore.open}
-        >
-          <Plus /> Add Server
-        </Button>
-      ) : null}
-    </div>
+    <DataTableEmptyState
+      action={
+        !searchActive && canProvision ? (
+          <Button type="button" size="sm" onClick={dialogStore.open}>
+            <Plus /> Add Server
+          </Button>
+        ) : null
+      }
+      description={
+        <span className="block max-w-sm">
+          {searchActive
+            ? "Try a server name, short ID, Relay, address, game, implementation, or version."
+            : canProvision
+              ? "Provision the first game server managed by Hearth."
+              : "No server instances have been assigned to your account yet."}
+        </span>
+      }
+      icon={<Server className="size-6 text-muted-foreground/45" />}
+      title={
+        searchActive ? "No servers match your search" : "No managed servers"
+      }
+    />
   )
 }
 
@@ -882,40 +771,31 @@ function serverRowKey(server: ServerListInstance): string {
   return `${server.relayId}:${server.id}`
 }
 
-function serverSearchText(server: ServerListInstance): string {
-  return [
-    server.name,
-    server.id,
-    server.shortId,
-    server.routeId,
-    server.game,
-    server.implementation,
-    server.version,
-    server.connectAddress,
-    server.relayId,
-    server.relayName,
-    server.relayStatus,
-    server.observedState,
-  ]
-    .join(" ")
-    .toLowerCase()
+function serverTableItemKey(item: ServerTableItem): string {
+  return serverRowKey(item.server)
 }
 
-function replaceServerSearch(search: string) {
-  const url = new URL(window.location.href)
-  if (search.length > 0) url.searchParams.set("search", search)
-  else url.searchParams.delete("search")
+function createServerTableItems(
+  servers: Array<ServerListInstance>
+): Array<ServerTableItem> {
+  const shortIdCounts = new Map<string, number>()
+  for (const server of servers) {
+    shortIdCounts.set(
+      server.shortId,
+      (shortIdCounts.get(server.shortId) ?? 0) + 1
+    )
+  }
 
-  // TanStack patches the history instance methods so router consumers update
-  // after navigation. Search typing is intentionally local to this workspace;
-  // use the browser prototype method to update the current entry without
-  // repainting the router's SafeFragment and CatchBoundary tree.
-  History.prototype.replaceState.call(
-    window.history,
-    window.history.state,
-    "",
-    `${url.pathname}${url.search}${url.hash}`
-  )
+  return servers.map((server) => {
+    const routeIdentifier =
+      shortIdCounts.get(server.shortId) === 1 ? server.shortId : server.routeId
+    const cached = serverTableItemCache.get(server)
+    if (cached?.routeIdentifier === routeIdentifier) return cached
+
+    const item = { routeIdentifier, server }
+    serverTableItemCache.set(server, item)
+    return item
+  })
 }
 
 function serverStatusTone(state: ServerListInstance["observedState"]) {

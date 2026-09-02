@@ -1,10 +1,19 @@
-import type { QueryClient, QueryKey } from "@tanstack/react-query"
+import type { InfiniteData, QueryClient, QueryKey } from "@tanstack/react-query"
 
 import type {
   HearthRealtimeScope,
   HearthRealtimeTopic,
 } from "@/lib/hearth-realtime-topics"
 import { queryKeys } from "@/lib/query-options"
+import {
+  backupRunsInputFromQueryKey,
+  type BackupRunsPage,
+} from "@/lib/backup-runs"
+import {
+  patchBackupRunsData,
+  resetBackupRunsToFirstPage,
+} from "@/lib/backup-runs-cache"
+import { getBackupRunForQuery } from "@/server/backups"
 
 interface HearthRealtimeQueryScope {
   exact: boolean
@@ -30,7 +39,7 @@ const hearthRealtimeQueryScopes = {
   activity: [prefix(["activity"])],
   "backup-settings": [prefix(["backups", "policy"])],
   "backup-storage": [exact(queryKeys.backups.storage)],
-  backups: [exact(queryKeys.backups.all)],
+  backups: [],
   "database-credentials": [prefix(["databases"])],
   "database-directory": [
     exact(queryKeys.databases.directory),
@@ -46,7 +55,6 @@ const hearthRealtimeQueryScopes = {
   "relay-proxy": [prefix(["relays", "proxy"])],
   relays: [
     exact(queryKeys.relays),
-    exact(queryKeys.backups.all),
     exact(queryKeys.databases.list),
     exact(queryKeys.databases.directory),
     exact(queryKeys.domains.settings),
@@ -119,6 +127,11 @@ export async function refreshHearthRealtimeTopics(
   topics: ReadonlyArray<HearthRealtimeTopic>,
   scope?: HearthRealtimeScope
 ): Promise<void> {
+  if (topics.includes("backups") || topics.includes("relays")) {
+    await refreshBackupRuns(queryClient, scope?.backupId)
+  } else if (topics.includes("database-directory")) {
+    await invalidateNameDependentBackupRuns(queryClient)
+  }
   const scopeHashes = new Set<string>()
   const requestedScopes: Array<HearthRealtimeQueryScope> = []
   for (const topic of topics) {
@@ -147,5 +160,62 @@ export async function refreshHearthRealtimeTopics(
     scopesToRefresh.map(({ exact, queryKey }) =>
       queryClient.invalidateQueries({ exact, queryKey }, { throwOnError: true })
     )
+  )
+}
+
+export function invalidateNameDependentBackupRuns(
+  queryClient: QueryClient
+): Promise<void> {
+  return queryClient.invalidateQueries({
+    predicate: (query) => {
+      const input = backupRunsInputFromQueryKey(query.queryKey)
+      return Boolean(input && (input.search.trim() || input.sort === "target"))
+    },
+  })
+}
+
+async function refreshBackupRuns(
+  queryClient: QueryClient,
+  backupId: string | undefined
+): Promise<void> {
+  const queries = queryClient.getQueryCache().findAll({
+    queryKey: ["backups", "runs"],
+  })
+  await Promise.all(
+    queries.map(async (query) => {
+      const input = backupRunsInputFromQueryKey(query.queryKey)
+      if (!input) return
+      if (query.getObserversCount() === 0) {
+        await queryClient.invalidateQueries({
+          exact: true,
+          queryKey: query.queryKey,
+          refetchType: "none",
+        })
+        return
+      }
+      if (!backupId) {
+        await resetBackupRunsToFirstPage(queryClient, input)
+        return
+      }
+      const replacement = await getBackupRunForQuery({
+        data: { ...input, backupId },
+      })
+      const current = queryClient.getQueryData<
+        InfiniteData<BackupRunsPage, string | null>
+      >(query.queryKey)
+      const patch = patchBackupRunsData(
+        current,
+        backupId,
+        replacement,
+        input.sort
+      )
+      if (patch.kind === "reset") {
+        await resetBackupRunsToFirstPage(queryClient, input)
+        return
+      }
+      if (patch.kind === "update") {
+        queryClient.setQueryData(query.queryKey, patch.data)
+      }
+    })
   )
 }

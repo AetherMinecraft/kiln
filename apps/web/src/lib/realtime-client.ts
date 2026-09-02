@@ -1,8 +1,12 @@
 import type { QueryClient } from "@tanstack/react-query"
 import { Result } from "effect"
+import type { RelayInstance } from "@workspace/contracts"
 
 import type { RelayInstancesCollection } from "@/lib/collections/relay-instances"
-import { refreshHearthRealtimeTopics } from "@/lib/hearth-realtime"
+import {
+  invalidateNameDependentBackupRuns,
+  refreshHearthRealtimeTopics,
+} from "@/lib/hearth-realtime"
 import type {
   HearthRealtimeScope,
   hearthRealtimeTopics,
@@ -34,6 +38,9 @@ export function applyRealtimeEvent(input: ApplyRealtimeEventInput): void {
     )
     return
   }
+  const instanceIdentityChanged =
+    event.type === "instances.delta" &&
+    realtimeInstanceIdentityChanged(queryClient, event)
   queryClient.setQueryData<RelayFleetSnapshot>(
     queryKeys.relay.snapshot,
     (snapshot) => applyRealtimeSnapshotEvent(snapshot, event)
@@ -73,6 +80,9 @@ export function applyRealtimeEvent(input: ApplyRealtimeEventInput): void {
             event
           )
       )
+      if (instanceIdentityChanged) {
+        void invalidateNameDependentBackupRuns(queryClient)
+      }
       return
     }
     instances.utils.writeBatch(() => {
@@ -94,6 +104,9 @@ export function applyRealtimeEvent(input: ApplyRealtimeEventInput): void {
       ].filter((key) => instances.has(key))
       if (deletedKeys.length > 0) instances.utils.writeDelete(deletedKeys)
     })
+    if (instanceIdentityChanged) {
+      void invalidateNameDependentBackupRuns(queryClient)
+    }
     return
   }
   if (event.type === "relay.status") {
@@ -234,6 +247,34 @@ export function applyProvisioningInstance(
   )
 }
 
+export function applyUpdatedInstance(
+  queryClient: QueryClient,
+  updated: RelayInstance & { relayId: string }
+): void {
+  const current = queryClient
+    .getQueryData<RelayFleetSnapshot>(queryKeys.relay.snapshot)
+    ?.instances.find(
+      (instance) =>
+        instance.id === updated.id && instance.relayId === updated.relayId
+    )
+  queryClient.setQueryData<RelayFleetSnapshot>(
+    queryKeys.relay.snapshot,
+    (snapshot) => replaceRelaySnapshotInstance(snapshot, updated)
+  )
+  queryClient.setQueryData<Array<FleetInstance>>(
+    queryKeys.relay.instances,
+    (instances) =>
+      instances?.map((instance) =>
+        instance.id === updated.id && instance.relayId === updated.relayId
+          ? mergeRealtimeInstance(instance, { ...instance, ...updated })
+          : instance
+      )
+  )
+  if (!current || current.name !== updated.name) {
+    void invalidateNameDependentBackupRuns(queryClient)
+  }
+}
+
 export function applyDeletedInstance(
   queryClient: QueryClient,
   deleted: { instanceId: string; relayId: string }
@@ -325,11 +366,9 @@ function connectionWithRelayStatuses(
     { status: "connected" } | { status: "unreachable" }
   >,
   snapshot: RelayFleetSnapshot | undefined,
-  relays: Array<{
-    id: string
-    name: string
-    status: "connected" | "unreachable"
-  }>
+  relays: Array<
+    Extract<RelayConnection, { status: "connected" }>["relays"][number]
+  >
 ): RelayConnection {
   const connectedCount = relays.filter(
     (relay) => relay.status === "connected"
@@ -383,6 +422,28 @@ function upsertRelaySnapshotInstance(
     return replaceRelaySnapshotInstance(snapshot, updated)
   }
   return { ...snapshot, instances: [updated, ...snapshot.instances] }
+}
+
+function realtimeInstanceIdentityChanged(
+  queryClient: QueryClient,
+  event: Extract<RealtimeClientEvent, { type: "instances.delta" }>
+): boolean {
+  if (event.deleted.length > 0) return true
+  const current =
+    queryClient.getQueryData<RelayFleetSnapshot>(queryKeys.relay.snapshot)
+      ?.instances ??
+    queryClient.getQueryData<Array<FleetInstance>>(queryKeys.relay.instances) ??
+    []
+  const currentNames = new Map(
+    current.map((instance) => [
+      `${instance.relayId}:${instance.id}`,
+      instance.name,
+    ])
+  )
+  return event.upserted.some(
+    (instance) =>
+      currentNames.get(`${instance.relayId}:${instance.id}`) !== instance.name
+  )
 }
 
 export function mergeRealtimeInstance(

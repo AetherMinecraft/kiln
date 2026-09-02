@@ -78,6 +78,7 @@ import {
   relayFetchEffect,
   relayJsonEffect,
 } from "@/lib/relay-client"
+import { relayConsoleTransport } from "@/lib/relay-console-route"
 import type { RelayEndpoint } from "@/lib/relay-client"
 import {
   relayFleetInstance,
@@ -89,6 +90,7 @@ import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { resolveMclogsApiUrl } from "@/lib/mclogs"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
+import { updateInstanceSourceName } from "@/lib/instance-registry"
 
 const instanceInputSchema = z.object({
   instanceId: z.string().min(1),
@@ -305,6 +307,7 @@ export const updateInstanceName = createServerFn({ method: "POST" })
         user.id
       )
     )
+    await updateInstanceSourceName(relay.id, renamed)
     await runAppEffect(
       "relay.snapshot.invalidate",
       invalidateRelayCache(relayCachePolicy.snapshot(relay.id))
@@ -1334,9 +1337,14 @@ function publicPausedFleetRelay(relays: Array<PersistedRelay>) {
 
 function publicRelayState<TStatus extends RelayReachability | "paused">(entry: {
   relay: PersistedRelay
+  snapshot?: Awaited<ReturnType<typeof authorizeRelaySnapshot>> | null
   status: TStatus
 }) {
+  const proxyMode = entry.snapshot?.relay?.proxyMode
   return {
+    browserOrigin:
+      entry.snapshot?.relay?.browserOrigin ?? entry.relay.browserOrigin,
+    consoleTransport: relayConsoleTransport(proxyMode),
     id: entry.relay.id,
     name: entry.relay.name,
     status: entry.status,

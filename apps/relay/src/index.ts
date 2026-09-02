@@ -31,6 +31,7 @@ import {
   relayInstancePortInputsSchema,
   relayInstanceWebRouteInputsSchema,
   relayNetworkingSchema,
+  relayProxyReadInputSchema,
   relayProxySettingsSchema,
   relayDirectoryPageInputSchema,
   relayDirectorySizesInputSchema,
@@ -106,6 +107,7 @@ import type {
 import { loadRelayTls } from "./effect/tls.js"
 import { applyStoredInstanceNames } from "./instance-names.js"
 import { normalizedRoute } from "./route-label.js"
+import { readRelayProxy } from "./proxy-read.js"
 import { uploadConsoleLogToMclogs } from "./mclogs.js"
 import { closeRelayServer } from "./shutdown.js"
 import { attachSftpServer } from "./sftp-server.js"
@@ -973,8 +975,10 @@ async function relaySnapshot() {
       retainedInstances
     ),
     relay: {
+      browserOrigin: config.browserOrigin,
       id: relayIdentity.fingerprint,
       name: relayIdentity.name,
+      proxyMode: config.proxyMode,
       sftp: {
         developmentAuthentication: config.sftpDevAuthentication,
         host: config.advertisedHost,
@@ -1101,10 +1105,13 @@ async function executeControlRequest(
     }
     case "relay.proxy.read": {
       const settings = await lifecycle.proxySettings()
-      return {
-        diagnostics: await lifecycle.proxyDiagnostics(settings),
+      const input = relayProxyReadInputSchema.parse(request.payload)
+      return readRelayProxy({
+        browserOrigin: config.browserOrigin,
+        includeDiagnostics: input.includeDiagnostics,
+        loadDiagnostics: () => lifecycle.proxyDiagnostics(settings),
         settings,
-      }
+      })
     }
     case "relay.proxy.write": {
       const settings = relayProxySettingsSchema.parse(request.payload)
@@ -1112,7 +1119,9 @@ async function executeControlRequest(
         "relay.proxy.routes",
         startup.state.listWebRoutes()
       )
-      return lifecycle.configureProxy(settings, routes)
+      const proxy = await lifecycle.configureProxy(settings, routes)
+      await snapshotHub.refresh()
+      return proxy
     }
     case "relay.audit.list":
       return runRelayEffect(

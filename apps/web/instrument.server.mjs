@@ -1,5 +1,10 @@
 import * as Sentry from "@sentry/tanstackstart-react"
 
+import {
+  isExpectedAppError,
+  parseSampleRate,
+} from "./src/observability/sentry-policy.ts"
+
 const dsn = process.env.SENTRY_DSN?.trim()
 
 if (dsn && !Sentry.isInitialized()) {
@@ -18,10 +23,10 @@ if (dsn && !Sentry.isInitialized()) {
       userInfo: false,
       httpBodies: [],
     },
-    tracesSampleRate: parseSampleRate(
-      process.env.SENTRY_TRACES_SAMPLE_RATE,
-      process.env.NODE_ENV === "production" ? 0.05 : 1
-    ),
+    tracesSampleRate:
+      process.env.NODE_ENV === "production"
+        ? parseSampleRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 0.05)
+        : 0,
     beforeSend(event, hint) {
       return isExpectedAppError(hint.originalException) ? null : event
     },
@@ -29,26 +34,4 @@ if (dsn && !Sentry.isInitialized()) {
       tags: { "kiln.service": "hearth-server" },
     },
   })
-}
-
-function parseSampleRate(value, fallback) {
-  if (!value?.trim()) return fallback
-  const parsed = Number(value)
-  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1
-    ? parsed
-    : fallback
-}
-
-function isExpectedAppError(value) {
-  if (!value || typeof value !== "object") return false
-  if (
-    [
-      "AuthenticationError",
-      "PermissionDeniedError",
-      "ResourceNotFoundError",
-    ].includes(value._tag)
-  ) {
-    return true
-  }
-  return value._tag === "RelayResponseError" && value.status < 500
 }

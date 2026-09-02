@@ -84,7 +84,6 @@ import { relayRpc } from "@/lib/relay-connection"
 import {
   dispatchBackupTask,
   reconcileRelayBackups,
-  scheduleBackupReconciliation,
 } from "@/lib/backup-reconciliation"
 import { deleteInstanceWithFinalBackup } from "@/lib/final-instance-deletion"
 import { kilnInstallationId } from "@/lib/environment"
@@ -428,7 +427,7 @@ export const createCliBackupEffect = Effect.fn("cli.api.backups.create")(
             }),
       "Hearth could not reserve the backup."
     )
-    yield* Effect.sync(() => publishBackupChange(relay.id))
+    yield* Effect.sync(() => publishBackupChange(relay.id, backupId))
     const relayAccepted = yield* enqueueCliBackupEffect(
       principal,
       relay,
@@ -541,15 +540,15 @@ export const restoreCliBackupEffect = Effect.fn("cli.api.backups.restore")(
       }),
       "Hearth could not reserve the restore."
     )
-    yield* Effect.sync(() => publishBackupChange(relay.id))
+    yield* Effect.sync(() => publishBackupChange(relay.id, backup.id))
+    if (safety) {
+      yield* Effect.sync(() => publishBackupChange(relay.id, safety.backupId))
+    }
     const relayAccepted = yield* enqueueCliBackupEffect(
       principal,
       relay,
       safety ?? restore
     )
-    if (safety && relayAccepted) {
-      scheduleBackupReconciliation(relay, cliRelaySubject(principal))
-    }
     return cliRestoreBackupResponseSchema.parse({
       relayAccepted,
       restoreTaskId: restore.taskId,
@@ -581,7 +580,7 @@ export const deleteCliBackupEffect = Effect.fn("cli.api.backups.delete")(
       }),
       "Hearth could not reserve backup deletion."
     )
-    yield* Effect.sync(() => publishBackupChange(relay.id))
+    yield* Effect.sync(() => publishBackupChange(relay.id, backup.id))
     const relayAccepted = yield* enqueueCliBackupEffect(
       principal,
       relay,
@@ -628,7 +627,7 @@ export const getCliBackupDownloadEffect = Effect.fn("cli.api.backups.download")(
       )
       if (reserved.kind === "dispatch") {
         const relay = yield* requiredRelay(backup.relayId)
-        yield* Effect.sync(() => publishBackupChange(relay.id))
+        yield* Effect.sync(() => publishBackupChange(relay.id, backup.id))
         yield* enqueueCliBackupEffect(principal, relay, reserved.dispatch)
         return cliBackupDownloadResponseSchema.parse({
           status: "preparing",
