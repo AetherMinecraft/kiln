@@ -744,7 +744,8 @@ export class FilesystemDriver {
   upload(
     instance: RelayInstanceConfig,
     requestedPath: string,
-    source: AsyncIterable<Uint8Array>
+    source: AsyncIterable<Uint8Array>,
+    authorizeCommit: () => boolean = () => true
   ) {
     return Effect.gen({ self: this }, function* () {
       yield* requireLinuxDescriptorAnchoring()
@@ -764,7 +765,14 @@ export class FilesystemDriver {
       return yield* Effect.scoped(
         openUploadParent(root, segments.slice(0, -1)).pipe(
           Effect.flatMap((parentHandle) =>
-            uploadIntoParent(root, parentHandle, name, requestedPath, source)
+            uploadIntoParent(
+              root,
+              parentHandle,
+              name,
+              requestedPath,
+              source,
+              authorizeCommit
+            )
           )
         )
       )
@@ -1407,7 +1415,8 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
   parentHandle: FileHandle,
   name: string,
   requestedPath: string,
-  source: AsyncIterable<Uint8Array>
+  source: AsyncIterable<Uint8Array>,
+  authorizeCommit: () => boolean
 ) {
   const anchoredParent = fileDescriptorPath(parentHandle)
   const resolvedParent = yield* filesystemOperation(
@@ -1466,6 +1475,13 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
           () => realpath(anchoredParent)
         )
         yield* ensureContained(root, currentParent)
+        if (!authorizeCommit()) {
+          return yield* filesystemFailure(
+            "io_error",
+            "upload.authorizeCommit",
+            "Upload authorization changed before commit"
+          )
+        }
         yield* filesystemOperation("upload.replace", () =>
           rename(temporary, target)
         ).pipe(Effect.uninterruptible)

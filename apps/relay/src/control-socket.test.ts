@@ -8,9 +8,12 @@ import { describe, expect, it } from "vite-plus/test"
 import {
   relayAuthChallengeTranscript,
   relayAuthResponseTranscript,
+  relayBrowserCapabilityV2Feature,
+  relayBrowserLeaseRenewalV1Feature,
   relayControlDeadlineMs,
   relayControlRequestTimeoutMs,
   relayControlProtocol,
+  relayFileRequestReplayV1Feature,
   relaySnapshotDeltaFeature,
 } from "@workspace/contracts"
 import type {
@@ -270,6 +273,11 @@ describe("Relay control socket", () => {
     let releaseClientLookup: (() => void) | undefined
     const audits: Array<RelayAuditInput> = []
     const state = RelayStateStore.of({
+      browserAuthority: () =>
+        Effect.succeed({ issuerGeneration: 0, minimumRevision: 0 }),
+      reviseBrowserAuthorization: (_issuer, items) =>
+        Effect.succeed({ issuerGeneration: 0, items }),
+      reserveBrowserFileReplay: () => Effect.succeed("reserved"),
       appendAudit: (input) =>
         Effect.sync(() => {
           audits.push(input)
@@ -409,7 +417,16 @@ describe("Relay control socket", () => {
           v: 1,
         })
       )
-      expect((await inbox.next()).type).toBe("auth.ready")
+      const ready = await inbox.next()
+      expect(ready.type).toBe("auth.ready")
+      if (ready.type === "auth.ready") {
+        expect(ready.browserIssuerGeneration).toBe(0)
+        expect(ready.features).toEqual([
+          relayBrowserCapabilityV2Feature,
+          relayBrowserLeaseRenewalV1Feature,
+          relayFileRequestReplayV1Feature,
+        ])
+      }
       expect((await inbox.next()).type).toBe("event")
 
       const consoleRequestId = randomBytes(12).toString("hex")
@@ -714,6 +731,11 @@ describe("Relay control socket", () => {
       }
     })
     const state = RelayStateStore.of({
+      browserAuthority: () =>
+        Effect.succeed({ issuerGeneration: 0, minimumRevision: 0 }),
+      reviseBrowserAuthorization: (_issuer, items) =>
+        Effect.succeed({ issuerGeneration: 0, items }),
+      reserveBrowserFileReplay: () => Effect.succeed("reserved"),
       appendAudit: () => Effect.void,
       cancelBackupTask: () => Effect.succeed(false),
       createInvitation: () => Effect.void,
@@ -873,6 +895,11 @@ describe("Relay control socket", () => {
       sourceCidrs: [],
     }
     const state = RelayStateStore.of({
+      browserAuthority: () =>
+        Effect.succeed({ issuerGeneration: 0, minimumRevision: 0 }),
+      reviseBrowserAuthorization: (_issuer, items) =>
+        Effect.succeed({ issuerGeneration: 0, items }),
+      reserveBrowserFileReplay: () => Effect.succeed("reserved"),
       appendAudit: () => Effect.void,
       cancelBackupTask: () => Effect.succeed(false),
       createInvitation: () => Effect.void,
