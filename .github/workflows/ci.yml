@@ -30,6 +30,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      mariadb:
+        image: ${{ matrix.name == 'MariaDB migration' && 'mariadb:10.11' || '' }}
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: kiln_migration_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mariadb-admin ping -h 127.0.0.1 -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +56,12 @@ jobs:
               ACCESS_MIGRATION_TEST=1 DB_HOST=127.0.0.1 DB_PORT=3306 \
                 DB_NAME=kiln_migration_test DB_USERNAME=root DB_PASSWORD=root \
                 vp run test
+          - name: MariaDB migration
+            command: |
+              cd apps/web
+              ACCESS_MIGRATION_TEST=1 DB_HOST=127.0.0.1 DB_PORT=3306 \
+                DB_NAME=kiln_migration_test DB_USERNAME=root DB_PASSWORD=root \
+                vp test run scripts/migrate-access.test.mjs --maxWorkers 1 --no-file-parallelism
           - name: Build
             command: |
               vp run -r build

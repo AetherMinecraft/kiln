@@ -1,4 +1,4 @@
-// The MySQL fixture in this file is opt-in: run with ACCESS_MIGRATION_TEST=1.
+// The SQL fixture in this file is opt-in: run with ACCESS_MIGRATION_TEST=1.
 import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import { test } from "vite-plus/test"
@@ -49,7 +49,7 @@ test("legacy permissions are frozen explicit selections and preserve split opera
 })
 
 test.skipIf(process.env.ACCESS_MIGRATION_TEST !== "1")(
-  "MySQL migration preserves identities, evidence, timed status and reruns without restoring grants",
+  "SQL migration preserves identities, evidence, timed status and reruns without restoring grants",
   async () => {
     const { default: mysql } = await import("mysql2/promise")
     // Caller must provision an isolated database and explicitly opt into this fixture.
@@ -142,6 +142,19 @@ test.skipIf(process.env.ACCESS_MIGRATION_TEST !== "1")(
       await ensureAccessModelSchema(db)
       const first = await backfillAccessModel(db)
       assert.equal(first.alreadyApplied, false)
+      const [audit] = await db.query(
+        `SELECT metadata FROM ${databaseTable("auth_audit")} WHERE event = 'access.migration.anomaly' ORDER BY id`
+      )
+      assert.deepEqual(
+        audit.map(({ metadata }) =>
+          typeof metadata === "string" ? JSON.parse(metadata) : metadata
+        ),
+        [
+          { resource: "instance", total: 0, sampled: 0, identifiers: [] },
+          { resource: "relay", total: 1, sampled: 1, identifiers: ["relay"] },
+          { resource: "database", total: 0, sampled: 0, identifiers: [] },
+        ]
+      )
       const [users] = await db.query(
         `SELECT * FROM ${databaseTable("user")} ORDER BY id`
       )
@@ -178,6 +191,10 @@ test.skipIf(process.env.ACCESS_MIGRATION_TEST !== "1")(
       )
       await ensureAccessModelSchema(db)
       assert.deepEqual(await backfillAccessModel(db), { alreadyApplied: true })
+      const [auditCount] = await db.query(
+        `SELECT COUNT(*) AS count FROM ${databaseTable("auth_audit")} WHERE event = 'access.migration.anomaly'`
+      )
+      assert.equal(Number(auditCount[0].count), 3)
       const [selections] = await db.query(
         `SELECT * FROM ${databaseTable("access_selection")} WHERE access_id='grant'`
       )
@@ -194,7 +211,7 @@ test.skipIf(process.env.ACCESS_MIGRATION_TEST !== "1")(
         db.execute(
           `INSERT INTO ${databaseTable("access_preset")} (id, access_id) VALUES ('invalid', 'grant')`
         ),
-        /check constraint/iu
+        /constraint.*access_preset_reference_chk.*(?:violated|failed)/iu
       )
       const [engineSelections] = await db.query(
         `SELECT access_id FROM ${databaseTable("access_selection")} WHERE selection_key='database.dump.export' ORDER BY access_id`
