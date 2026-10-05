@@ -371,7 +371,7 @@ export async function backfillAccessModel(database) {
         identifiers,
       })
       await database.execute(
-        `INSERT INTO ${databaseTable("auth_audit")} (event, metadata) VALUES ('access.migration.anomaly', CAST(? AS JSON))`,
+        `INSERT INTO ${databaseTable("auth_audit")} (event, metadata) VALUES ('access.migration.anomaly', ?)`,
         [
           JSON.stringify({
             resource: check.resource,
