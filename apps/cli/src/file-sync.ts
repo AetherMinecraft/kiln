@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs"
 import { lstat, readFile, readdir } from "node:fs/promises"
 import { basename, isAbsolute, relative, resolve } from "node:path"
 
-import { Effect, Result } from "effect"
+import { Cause, Effect, Exit, Result, Semaphore } from "effect"
 import type { FileEntryWithStats, SFTPWrapper, Stats } from "ssh2"
 
 import { CliCommandError, commandError } from "./errors.js"
@@ -728,24 +728,16 @@ async function readRemoteInventory(
   return { entries }
 }
 
-/**
- * Runs at most `concurrency` operations at once, across every caller that
- * shares the returned function.
- */
 function limit(concurrency: number) {
-  let active = 0
-  const waiting: Array<() => void> = []
+  const semaphore = Semaphore.makeUnsafe(concurrency)
   return async <TResult>(run: () => Promise<TResult>): Promise<TResult> => {
-    if (active >= concurrency) {
-      await new Promise<void>((release) => waiting.push(release))
-    }
-    active += 1
-    try {
-      return await run()
-    } finally {
-      active -= 1
-      waiting.shift()?.()
-    }
+    const exit = await Effect.runPromiseExit(
+      semaphore.withPermit(
+        Effect.tryPromise({ try: run, catch: (cause) => cause })
+      )
+    )
+    if (Exit.isFailure(exit)) throw Cause.squash(exit.cause)
+    return exit.value
   }
 }
 

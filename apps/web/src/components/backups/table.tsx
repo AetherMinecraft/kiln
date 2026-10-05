@@ -92,6 +92,7 @@ export const BackupTable = React.memo(function BackupTable({
   availableRelayIds,
   availableTargetKeys,
   canCreate,
+  canDownload,
   currentUserId,
   destinations,
   dialogStore,
@@ -109,6 +110,7 @@ export const BackupTable = React.memo(function BackupTable({
   availableRelayIds: ReadonlySet<string>
   availableTargetKeys: ReadonlySet<string>
   canCreate: (backup: Backup) => boolean
+  canDownload: (backup: Backup) => boolean
   currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
@@ -135,6 +137,7 @@ export const BackupTable = React.memo(function BackupTable({
         key={backup.id}
         backup={backup}
         canCreate={canCreate(backup)}
+        canDownload={canDownload(backup)}
         currentUserId={currentUserId}
         destinations={destinations}
         dialogStore={dialogStore}
@@ -160,6 +163,7 @@ export const BackupTable = React.memo(function BackupTable({
     ),
     [
       canCreate,
+      canDownload,
       currentUserId,
       destinations,
       dialogStore,
@@ -209,6 +213,7 @@ export const BackupTable = React.memo(function BackupTable({
           availableRelayIds={availableRelayIds}
           availableTargetKeys={availableTargetKeys}
           canCreate={canCreate}
+          canDownload={canDownload}
           currentUserId={currentUserId}
           destinations={destinations}
           dialogStore={dialogStore}
@@ -233,6 +238,7 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
   availableRelayIds,
   availableTargetKeys,
   canCreate,
+  canDownload,
   currentUserId,
   destinations,
   dialogStore,
@@ -251,6 +257,7 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
   availableRelayIds: ReadonlySet<string>
   availableTargetKeys: ReadonlySet<string>
   canCreate: (backup: Backup) => boolean
+  canDownload: (backup: Backup) => boolean
   currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
@@ -320,7 +327,7 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
                 />
                 <BackupAvailabilityTags
                   backup={backup}
-                  canCopy={canCreateBackup}
+                  canCopy={canDownload(backup)}
                   currentUserId={currentUserId}
                   destinations={destinations}
                 />
@@ -464,6 +471,7 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
       model: {
         enableRowRangeSelection: true,
         enableRowSelection: (row) => backupCanBeRemoved(row.original),
+        enableSortingRemoval: false,
         enableSubRowSelection: false,
         initialState: initialTableState,
         manualSorting: true,
@@ -472,6 +480,7 @@ const BackupDesktopTable = React.memo(function BackupDesktopTable({
     })
   }, [
     canCreate,
+    canDownload,
     currentUserId,
     destinations,
     dialogStore,
@@ -536,23 +545,29 @@ const BackupDesktopTableStateSync = React.memo(
         onSortChange(next.id as BackupRunSort, next.desc ? "desc" : "asc")
       }
     )
+    // The v9 adapter rebuilds the `table` wrapper every render; the atoms and
+    // API methods underneath are stable, so key the subscriptions on those to
+    // avoid unsubscribing and resubscribing on each render.
+    const { rowSelection: rowSelectionAtom, sorting: sortingAtom } = table.atoms
+    const { setRowSelection } = table
+
     React.useLayoutEffect(() => {
-      const subscription = table.atoms.sorting.subscribe(handleSortingChange)
+      const subscription = sortingAtom.subscribe(handleSortingChange)
       return () => subscription.unsubscribe()
-    }, [table])
+    }, [sortingAtom])
 
     React.useLayoutEffect(() => {
-      const current = table.atoms.rowSelection.get()
+      const current = rowSelectionAtom.get()
       if (backupSelectionMatchesState(selectedBackupIds, current)) return
-      table.setRowSelection(backupRowSelectionState(selectedBackupIds))
-    }, [selectedBackupIds, table])
+      setRowSelection(backupRowSelectionState(selectedBackupIds))
+    }, [rowSelectionAtom, selectedBackupIds, setRowSelection])
 
     React.useLayoutEffect(() => {
-      const subscription = table.atoms.rowSelection.subscribe((selection) => {
+      const subscription = rowSelectionAtom.subscribe((selection) => {
         selectionStore.replace(Object.keys(selection))
       })
       return () => subscription.unsubscribe()
-    }, [selectionStore, table])
+    }, [rowSelectionAtom, selectionStore])
 
     return null
   }
@@ -717,6 +732,7 @@ function backupTableRowClassName() {
 const BackupMobileRow = React.memo(function BackupMobileRow({
   backup,
   canCreate,
+  canDownload,
   currentUserId,
   destinations,
   dialogStore,
@@ -729,6 +745,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
 }: {
   backup: Backup
   canCreate: boolean
+  canDownload: boolean
   currentUserId: string
   destinations: ReadonlyArray<BackupAvailabilityDestination>
   dialogStore: BackupDialogStore
@@ -782,7 +799,7 @@ const BackupMobileRow = React.memo(function BackupMobileRow({
       )}
       <BackupAvailabilityTags
         backup={backup}
-        canCopy={canCreate}
+        canCopy={canDownload}
         currentUserId={currentUserId}
         destinations={destinations}
       />

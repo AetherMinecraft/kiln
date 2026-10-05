@@ -36,7 +36,11 @@ import type {
   RelaySnapshot,
 } from "@workspace/contracts"
 
-import { actionsForRole, isActionAllowed } from "./permissions.js"
+import {
+  actionsForRole,
+  fileMutationAction,
+  isActionAllowed,
+} from "./permissions.js"
 import { relayBuildLabel } from "./build-info.js"
 import { isSourceAllowed } from "./source-policy.js"
 import { createRelaySnapshotDelta } from "./snapshot-delta.js"
@@ -813,9 +817,7 @@ export function auditDetailsForRequest(
     details.createdDirectories = directories.length
     details.deletedFiles = deletions.length
     details.permission =
-      deletions.length === 0
-        ? "instance.files.write"
-        : "instance.files.delete-managed"
+      deletions.length === 0 ? "instance.files.write" : "instance.files.delete"
     if (typeof payload.deploymentId === "string") {
       details.deploymentId = payload.deploymentId
     }
@@ -1017,15 +1019,20 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "instance.files.read":
       return "instance.files.read"
     case "instance.files.write":
+      return "instance.files.write"
     case "instance.files.mutate":
     case "instance.files.mutate.result":
-      return "instance.files.write"
+      return fileMutationAction(objectString(request.payload, "operation"))
     case "instance.files.upload-url":
       return "instance.files.upload-url"
     case "instance.files.sync.prepare":
     case "instance.files.sync.activate":
     case "instance.files.sync.cleanup":
       return "instance.files.sync"
+    case "instance.files.database.read":
+      return "instance.files.read"
+    case "instance.files.database.write":
+      return "instance.files.write"
     case "instance.console.history":
       return "instance.console.read"
     case "instance.console.write":
@@ -1042,6 +1049,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "instance.network.write"
     case "instance.network.routes.read":
       return "instance.network.read"
+    case "instance.network.databases.remove":
     case "instance.network.routes.write":
       return "instance.network.write"
     case "hearth.tailscale.instance.detach":
@@ -1066,7 +1074,7 @@ const decodeControlClientMessage = (
   text: string
 ): Option.Option<typeof RelayControlClientMessageSchema.Type> =>
   Option.flatMap(
-    Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(text),
+    Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))(text),
     Schema.decodeUnknownOption(RelayControlClientMessageSchema)
   )
 

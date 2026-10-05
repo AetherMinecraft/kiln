@@ -26,6 +26,7 @@ import {
   relayInstanceActionSchema,
   relayInstanceNameSchema,
   relayInstanceSchema,
+  relayRemoveDatabaseConnectionSchema,
   relayInstancePortLeaseReleaseSchema,
   relayInstancePortLeaseRequestSchema,
   relayInstancePortInputsSchema,
@@ -41,6 +42,8 @@ import {
   relayFileSyncPrepareSchema,
   relayFileSearchPageInputSchema,
   relayFileStatInputSchema,
+  relayFileDatabaseReadInputSchema,
+  relayFileDatabaseWriteInputSchema,
   relayRemoteFileUploadResultSchema,
   relayRemoteFileUploadSchema,
   relaySaveFileInputSchema,
@@ -62,6 +65,7 @@ import type {
   RelayInstance,
 } from "@workspace/contracts"
 
+import { DatabaseConnections } from "./database-connections.js"
 import { BrickCatalog } from "./bricks.js"
 import { BackupDownloadServer } from "./backup-download.js"
 import { BackupManager } from "./backups.js"
@@ -73,6 +77,7 @@ import {
 } from "./config.js"
 import { attachControlSocket } from "./control-socket.js"
 import { DockerDriver } from "./docker.js"
+import { DatabaseBrowser } from "./database-browser.js"
 import { DatabaseDriver } from "./databases.js"
 import {
   inspectEncryptedPlatformBackup,
@@ -175,13 +180,15 @@ await runRelayEffect(
   "relay.startup.runtimeRecovery",
   runtimeRecovery.initialize()
 )
+const databaseConnections = new DatabaseConnections(config, startupCore.state)
 const docker = new DockerDriver(
   config,
   runtimeRecovery,
   bricks,
-  startupCore.state
+  startupCore.state,
+  databaseConnections
 )
-const databases = new DatabaseDriver(config, docker)
+const databases = new DatabaseDriver(config, docker, databaseConnections)
 const systemUpdates = new SystemUpdateManager(config)
 const filesystem = new FilesystemDriver(config)
 const deploymentFileSync = new DeploymentFileSyncDriver(config)
@@ -189,7 +196,32 @@ await runRelayEffect(
   "relay.startup.fileSyncRecovery",
   deploymentFileSync.recover()
 )
-const lifecycle = new LifecycleDriver(config, docker, bricks)
+const databaseBrowser = new DatabaseBrowser(filesystem)
+const lifecycle = new LifecycleDriver(
+  config,
+  docker,
+  bricks,
+  databaseConnections
+)
+const databaseConnectionSnapshots = await docker.databaseConnectionSnapshots()
+await databaseConnections.initialize(databaseConnectionSnapshots)
+for (const snapshot of databaseConnectionSnapshots) {
+  await runRelayEffect(
+    "relay.startup.databaseConnections",
+    Effect.tryPromise(() =>
+      databaseConnections.reconcile(snapshot.instanceId, snapshot.service)
+    ).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          console.warn(
+            `Could not restore database connections for ${snapshot.service}:`,
+            error
+          )
+        })
+      )
+    )
+  )
+}
 const startupProxySettings = await lifecycle.proxySettings()
 lifecycle.hydrateProxySettings(startupProxySettings)
 let activeTls = await runRelayEffect("relay.startup.tls", loadRelayTls(config))
@@ -1298,10 +1330,20 @@ async function executeControlRequest(
       return databases.rotateCredentials(
         relayRotateDatabaseCredentialsSchema.parse(request.payload)
       )
-    case "database.network.write":
-      return databases.updateNetwork(
-        relayDatabaseNetworkSchema.parse(request.payload)
+    case "database.network.write": {
+      const input = relayDatabaseNetworkSchema.parse(request.payload)
+      return serializeInstanceMutation(input.instanceId, () =>
+        Effect.runPromise(
+          relayOperation(() => databases.updateNetwork(input)).pipe(
+            Effect.ensuring(
+              cleanupOperation("database connection snapshot", () =>
+                snapshotHub.refresh()
+              )
+            )
+          )
+        )
       )
+    }
     case "database.dump.export":
       return databases.exportDump(
         relayDatabaseExportSchema.parse(request.payload)
@@ -1733,6 +1775,20 @@ async function executeControlRequest(
         )
       )
     }
+    case "instance.files.database.read": {
+      const input = relayFileDatabaseReadInputSchema.parse(payload)
+      return runRelayEffect(
+        "relay.files.database.read",
+        databaseBrowser.read(await requiredInstance(input), input)
+      )
+    }
+    case "instance.files.database.write": {
+      const input = relayFileDatabaseWriteInputSchema.parse(payload)
+      return runRelayEffect(
+        "relay.files.database.write",
+        databaseBrowser.write(await requiredInstance(input), input)
+      )
+    }
     case "instance.console.history":
       return docker.console(
         await requiredInstance(payload),
@@ -1834,6 +1890,23 @@ async function executeControlRequest(
         startup.state.listInstanceRoutes(instance.id)
       )
       return lifecycle.webRouteState(instance.id, routes)
+    }
+    case "instance.network.databases.remove": {
+      const input = relayRemoveDatabaseConnectionSchema.parse(payload)
+      return serializeInstanceMutation(input.instanceId, async () => {
+        const instance = await requiredInstance(payload)
+        await databaseConnections.set(
+          instance.id,
+          input.databaseId,
+          false,
+          input.databaseRelayId
+        )
+        await databaseConnections.reconcile(instance.id, instance.service)
+        const snapshot = await snapshotHub.refresh()
+        return snapshot.instances.find(
+          (candidate) => candidate.id === instance.id
+        )
+      })
     }
     case "instance.network.routes.write": {
       return serializeWebRouteMutation(async () => {

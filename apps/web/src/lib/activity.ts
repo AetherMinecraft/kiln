@@ -32,6 +32,7 @@ export function isActivityType(value: string): value is ActivityType {
 export const activityInstantSchema = z.iso.datetime()
 
 export interface ActivityScope {
+  relayAudit: boolean
   allInstances: boolean
   instanceIds: ReadonlySet<string>
 }
@@ -60,9 +61,12 @@ export function scopeAllowsAudit(
   scope: ActivityScope,
   audit: RelayAuditRecord
 ): boolean {
-  if (scope.allInstances) return true
+  if (scope.relayAudit) return true
   const instanceId = auditInstanceId(audit)
-  return instanceId !== null && scope.instanceIds.has(instanceId)
+  return (
+    instanceId !== null &&
+    (scope.allInstances || scope.instanceIds.has(instanceId))
+  )
 }
 
 export function activityLocalRangeToUtc(
@@ -90,6 +94,7 @@ export function activityTypeForAudit(audit: RelayAuditRecord): ActivityType {
   if (
     audit.event.startsWith("browser.file.") ||
     operation === "instance.files.write" ||
+    operation === "instance.files.database.write" ||
     operation === "instance.files.upload-url" ||
     operation === "instance.files.sync.activate"
   ) {
@@ -166,6 +171,9 @@ export function activityLabelForAudit(audit: RelayAuditRecord): string {
       : "Updated server startup settings"
   }
   if (operation === "instance.files.write") return "Saved a server file"
+  if (operation === "instance.files.database.write") {
+    return "Edited a server database"
+  }
   if (operation === "instance.files.upload-url") {
     return "Downloaded a URL to a server"
   }
@@ -176,6 +184,8 @@ export function activityLabelForAudit(audit: RelayAuditRecord): string {
   if (operation === "instance.network.ports.write") {
     return "Updated server port allocations"
   }
+  if (operation === "instance.network.databases.remove")
+    return "Removed a saved database connection"
   if (operation === "instance.network.routes.write") {
     return "Updated server network routes"
   }
@@ -256,7 +266,10 @@ export function activityPermissionForAudit(
   if (operation === "instance.files.sync.activate") {
     return audit.details.deletedFiles === 0
       ? "instance.files.write"
-      : "instance.files.delete-managed"
+      : "instance.files.delete"
+  }
+  if (operation === "instance.files.database.write") {
+    return "instance.files.write"
   }
   if (
     operation === "relay.pairing.create" ||
@@ -270,10 +283,12 @@ export function activityPermissionForAudit(
     operation === "instance.files.upload-url" ||
     operation === "instance.console.write" ||
     operation === "instance.network.ports.write" ||
-    operation === "instance.network.routes.write"
+    operation === "instance.network.routes.write" ||
+    operation === "instance.network.databases.remove"
   ) {
     return operation === "instance.network.ports.write" ||
-      operation === "instance.network.routes.write"
+      operation === "instance.network.routes.write" ||
+      operation === "instance.network.databases.remove"
       ? "instance.network.write"
       : operation
   }

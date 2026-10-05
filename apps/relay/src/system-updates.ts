@@ -17,8 +17,8 @@ import {
   isKilnGitRepositorySource,
   isKilnNightlyVersion,
   isKilnReleaseVersion,
-  kilnGitHubContainerRegistry,
   kilnReleaseVersionCore,
+  kilnImageRepository,
 } from "@workspace/contracts"
 import { Effect, Semaphore } from "effect"
 
@@ -167,7 +167,7 @@ export class SystemUpdateManager {
         ) {
           return yield* systemUpdateFailure(
             "start.validate",
-            "The update helper must be a Relay digest from the configured Kiln repository"
+            "The update helper must be a Relay digest from this distribution"
           )
         }
         if (input.targets.length === 0) {
@@ -307,14 +307,12 @@ export class SystemUpdateManager {
                       abortReason(signal)
                     )
                   : Effect.succeed(
-                      operations.map(
-                        (operation): UpdateOperation => ({
-                          ...operation,
-                          error: cause.message,
-                          finishedAt: new Date().toISOString(),
-                          status: "failed",
-                        })
-                      )
+                      operations.map((operation): UpdateOperation => ({
+                        ...operation,
+                        error: cause.message,
+                        finishedAt: new Date().toISOString(),
+                        status: "failed",
+                      }))
                     )
               )
             )
@@ -435,7 +433,7 @@ const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
   if (targetComponent === null || eligibility.component !== targetComponent) {
     return yield* systemUpdateFailure(
       "start.validate",
-      "The selected container is not an official Kiln component"
+      "The selected container is not a component of this distribution"
     )
   }
   if (!eligibility.eligible) {
@@ -761,7 +759,7 @@ function updateEligibility(
       : !component
         ? "The container is not a Hearth or Relay image."
         : !official
-          ? "Only images from the configured public Kiln repository can be updated."
+          ? "Only public images from this distribution can be updated."
           : !eligibleTag
             ? "This container is pinned. Change it to :latest or :latest-nightly to enable one-click updates."
             : null,
@@ -886,17 +884,15 @@ function pullAndVerifyImageEffect(
 
 function releaseImageComponent(
   image: string,
-  gitRepository: string
+  repository: string
 ): KilnComponent | null {
-  const registry = kilnGitHubContainerRegistry(gitRepository)
   for (const component of ["hearth", "relay"] as const) {
-    const prefix = `${registry}/${component}@sha256:`
+    const prefix = `${kilnImageRepository(component, repository)}@`
     if (
       image.startsWith(prefix) &&
-      /^[a-f0-9]{64}$/u.test(image.slice(prefix.length))
-    ) {
+      /^sha256:[a-f0-9]{64}$/u.test(image.slice(prefix.length))
+    )
       return component
-    }
   }
   return null
 }

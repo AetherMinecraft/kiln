@@ -28,7 +28,7 @@ kiln update
 
 The updater reuses pnpm or Bun when it can identify that package manager as the
 owner of the installed CLI. Otherwise, and whenever that update fails, it uses
-`npm install --global kiln-cli@latest`. This updates only the local Kiln CLI,
+`npm install --global <distribution-package>@latest` (`kiln-cli` for official builds). This updates only the local Kiln CLI,
 not Hearth or any Relay.
 
 ## Install the agent skill
@@ -57,13 +57,13 @@ the JavaScript runtime entitlements required by Bun.
 
 ## Distribute a fork through GitHub Releases
 
-Publishing a `v0.x.y` GitHub Release runs the `Publish CLI tarball` workflow.
+Publishing a `vx.y.z` GitHub Release runs the `Publish CLI tarball` workflow.
 It builds the CLI's bundled Node package from that tag and attaches
-`kiln-cli-0.x.y.tgz` plus its SHA-256 checksum to the release. The workflow can
+`kiln-cli-x.y.z.tgz` plus its SHA-256 checksum to the release. The workflow can
 also be dispatched manually with an existing release tag to retry an upload.
-Every Kiln nightly release also builds and attaches the matching
-`kiln-cli-0.x.y-nightly.YYYYMMDD.HHMMSS.tgz` package and checksum directly in
-the nightly release job.
+Nightly and stable releases call that workflow after publishing the app release,
+so the matching package and checksum are also attached to automated releases.
+The package uses the fork's CLI identity while keeping the asset filename stable.
 
 Another repository can download and install the package without using the npm
 registry:
@@ -83,7 +83,8 @@ For a private Kiln fork, authenticate `gh` with a fine-grained token or GitHub
 App token that can read the fork's repository contents. A `GITHUB_TOKEN` issued
 to a different private repository does not automatically have that access.
 Fork installations should be updated by downloading a newer release tarball;
-`kiln update` targets the public npm package.
+`kiln update` targets the build's npm package and requires that package to be
+published to npm.
 
 ## Authenticate
 
@@ -92,7 +93,7 @@ kiln login
 kiln login https://hearth.example.com --name workstation --no-open
 ```
 
-The first form targets `https://kiln.site`. The command opens a browser and
+Login honors `KILN_URL` and the selected saved profile before the build's default URL. Official builds default to `https://kiln.site`; fork builds can set their own default. The command opens a browser and
 waits while you approve the sign-in. Self-hosted Hearth installations are
 selected with the positional URL or `--url`. Named profiles are available
 through `--profile`.
@@ -197,9 +198,11 @@ missing regular files explicitly named by the manifest are eligible.
 `--max-delete` defaults to zero and refuses a plan over its limit. Excludes,
 undeclared files, directories, worlds, logs, backups, crash reports, and Kiln's
 staging data remain preserved. Managed deletion requires the separate
-`instance.files.delete-managed` permission.
+`instance.files.delete` permission.
 
 Without `--atomic`, sync retains the Phase 1 direct-upload behavior and never
 deletes files.
 
 Run `kiln help` for the complete command reference.
+
+Fork maintainers: see [distribution publishing](../../docs/forking.md).

@@ -235,7 +235,7 @@ describe("Relay control audit details", () => {
       deploymentId,
       instanceId,
       operation: "instance.files.sync.activate",
-      permission: "instance.files.delete-managed",
+      permission: "instance.files.delete",
       source: "cli",
       subject: "user-123",
     })
@@ -273,6 +273,11 @@ describe("Relay control socket", () => {
     let releaseClientLookup: (() => void) | undefined
     const audits: Array<RelayAuditInput> = []
     const state = RelayStateStore.of({
+      listInstanceDatabaseConnections: () => Effect.succeed([]),
+      setDatabaseConnection: () => Effect.void,
+      recoverDatabaseConnections: () => Effect.void,
+      deleteInstanceDatabaseConnections: () => Effect.void,
+      deleteDatabaseConnections: () => Effect.void,
       browserAuthority: () =>
         Effect.succeed({ issuerGeneration: 0, minimumRevision: 0 }),
       reviseBrowserAuthorization: (_issuer, items) =>
@@ -731,6 +736,11 @@ describe("Relay control socket", () => {
       }
     })
     const state = RelayStateStore.of({
+      listInstanceDatabaseConnections: () => Effect.succeed([]),
+      setDatabaseConnection: () => Effect.void,
+      recoverDatabaseConnections: () => Effect.void,
+      deleteInstanceDatabaseConnections: () => Effect.void,
+      deleteDatabaseConnections: () => Effect.void,
       browserAuthority: () =>
         Effect.succeed({ issuerGeneration: 0, minimumRevision: 0 }),
       reviseBrowserAuthorization: (_issuer, items) =>
@@ -895,6 +905,11 @@ describe("Relay control socket", () => {
       sourceCidrs: [],
     }
     const state = RelayStateStore.of({
+      listInstanceDatabaseConnections: () => Effect.succeed([]),
+      setDatabaseConnection: () => Effect.void,
+      recoverDatabaseConnections: () => Effect.void,
+      deleteInstanceDatabaseConnections: () => Effect.void,
+      deleteDatabaseConnections: () => Effect.void,
       browserAuthority: () =>
         Effect.succeed({ issuerGeneration: 0, minimumRevision: 0 }),
       reviseBrowserAuthorization: (_issuer, items) =>

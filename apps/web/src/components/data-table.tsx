@@ -14,10 +14,12 @@ import { Skeleton } from "@workspace/ui/components/skeleton"
 import { cn } from "@workspace/ui/lib/utils"
 import {
   dataTableFeatures,
+  dataTableSelectAllState,
   defaultDataTableVirtualization,
   type DataTableBreakpoint,
   type DataTableDefinition,
   type DataTableInstance,
+  type DataTableSelectableRow,
   type DataTableVirtualizationOptions,
 } from "@/lib/data-table"
 import {
@@ -160,16 +162,28 @@ export function DataTableCompactList<TItem>({
 }
 
 interface DataTableProps<TData extends RowData> {
+  leadingBody?: React.ReactNode
   definition: DataTableDefinition<TData>
   emptyState: React.ReactNode
   source: DataTableSource<TData>
   table: DataTableInstance<TData>
 }
 
+/**
+ * Rendered rows for the current row model. Row data lives in table options, so
+ * `table.store` never notifies when rows load, append, or disappear. Context
+ * lets the select-all checkbox track those changes without re-rendering the
+ * memoized head, body, or row cells around it.
+ */
+const DataTableRowsContext = React.createContext<
+  ReadonlyArray<DataTableSelectableRow>
+>([])
+
 const dataTableScrollAreaClassName =
   "block min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-y-contain border-b border-border/70"
 
 export function DataTableRenderer<TData extends RowData>({
+  leadingBody,
   definition,
   emptyState,
   source,
@@ -179,6 +193,7 @@ export function DataTableRenderer<TData extends RowData>({
     <Subscribe source={table.atoms.sorting} selector={dataTableSortingResetKey}>
       {(sortingResetKey) => (
         <DataTableRowModel
+          leadingBody={leadingBody}
           definition={definition}
           emptyState={emptyState}
           source={source}
@@ -197,6 +212,7 @@ interface DataTableRowModelProps<
 }
 
 function DataTableRowModel<TData extends RowData>({
+  leadingBody,
   definition,
   emptyState,
   source,
@@ -213,8 +229,8 @@ function DataTableRowModel<TData extends RowData>({
   )
   const bodyState = dataTableBodyState(source.body, emptyState, rows.length)
   const gridStyle = React.useMemo(
-    () => dataTableGridStyle(table),
-    [table, definition.columns]
+    () => dataTableGridStyle(definition.columns),
+    [definition.columns]
   )
 
   React.useLayoutEffect(() => {
@@ -228,73 +244,80 @@ function DataTableRowModel<TData extends RowData>({
   }, [source.resetKey, sortingResetKey])
 
   return (
-    <div
-      aria-busy={
-        source.body.kind === "loading" ||
-        source.refreshing ||
-        source.loadMore?.state.kind === "loading" ||
-        undefined
-      }
-      className="relative flex h-full min-h-0 w-full min-w-0 flex-1 flex-col"
-    >
-      {source.refreshing ? (
-        <span
-          aria-live="polite"
-          className="pointer-events-none absolute top-3 right-3 z-30 inline-flex items-center gap-1.5 text-xs text-muted-foreground"
-          role="status"
-        >
-          <LoaderCircle aria-hidden className="size-3.5 animate-spin" />
-          Updating
-        </span>
-      ) : null}
-      {!source.refreshing && source.notice ? (
-        <DataTableSourceNotice floating notice={source.notice} />
-      ) : null}
-      {!source.refreshing && source.loadMore?.state.kind === "loading" ? (
-        <span aria-live="polite" className="sr-only" role="status">
-          Loading more rows
-        </span>
-      ) : null}
-      <table
-        aria-colcount={columnCount}
-        aria-label={definition.ariaLabel}
-        aria-rowcount={hasBodyState ? 2 : rows.length + 1}
-        className="flex h-full min-h-0 w-full min-w-0 border-collapse flex-col overflow-hidden pb-px text-left"
-        style={gridStyle}
+    <DataTableRowsContext.Provider value={rows}>
+      <div
+        aria-busy={
+          source.body.kind === "loading" ||
+          source.refreshing ||
+          source.loadMore?.state.kind === "loading" ||
+          undefined
+        }
+        className="relative flex h-full min-h-0 w-full min-w-0 flex-1 flex-col"
       >
-        <MemoizedDataTableHead
-          columns={definition.columns}
-          scrollbarWidth={scrollbarWidth}
-          table={table}
-        />
-        {hasBodyState ? (
-          <DataTableStateBody
-            centered={source.body.kind !== "loading"}
-            colSpan={columnCount}
-            scrollElementRef={scrollElementRef}
+        {source.refreshing ? (
+          <span
+            aria-live="polite"
+            className="pointer-events-none absolute top-3 right-3 z-30 inline-flex items-center gap-1.5 text-xs text-muted-foreground"
+            role="status"
           >
-            {bodyState}
-          </DataTableStateBody>
-        ) : definition.virtualization ? (
-          <VirtualDataTableBody
+            <LoaderCircle aria-hidden className="size-3.5 animate-spin" />
+            Updating
+          </span>
+        ) : null}
+        {!source.refreshing && source.notice ? (
+          <DataTableSourceNotice floating notice={source.notice} />
+        ) : null}
+        {!source.refreshing && source.loadMore?.state.kind === "loading" ? (
+          <span aria-live="polite" className="sr-only" role="status">
+            Loading more rows
+          </span>
+        ) : null}
+        <table
+          aria-colcount={columnCount}
+          aria-label={definition.ariaLabel}
+          aria-rowcount={
+            leadingBody ? undefined : hasBodyState ? 2 : rows.length + 1
+          }
+          className="flex h-full min-h-0 w-full min-w-0 border-collapse flex-col overflow-hidden pb-px text-left"
+          role="table"
+          style={gridStyle}
+        >
+          <MemoizedDataTableHead
             columns={definition.columns}
-            getRowClassName={definition.getRowClassName}
-            loadMoreSource={source.loadMore}
-            rows={rows}
-            scrollElementRef={scrollElementRef}
-            virtualization={definition.virtualization}
+            scrollbarWidth={scrollbarWidth}
+            table={table}
           />
-        ) : (
-          <DataTableBody
-            columns={definition.columns}
-            getRowClassName={definition.getRowClassName}
-            loadMoreSource={source.loadMore}
-            rows={rows}
-            scrollElementRef={scrollElementRef}
-          />
-        )}
-      </table>
-    </div>
+          {leadingBody}
+          {hasBodyState ? (
+            <DataTableStateBody
+              empty={source.body.kind === "ready" && rows.length === 0}
+              centered={source.body.kind !== "loading"}
+              colSpan={columnCount}
+              scrollElementRef={scrollElementRef}
+            >
+              {bodyState}
+            </DataTableStateBody>
+          ) : definition.virtualization ? (
+            <VirtualDataTableBody
+              columns={definition.columns}
+              getRowClassName={definition.getRowClassName}
+              loadMoreSource={source.loadMore}
+              rows={rows}
+              scrollElementRef={scrollElementRef}
+              virtualization={definition.virtualization}
+            />
+          ) : (
+            <DataTableBody
+              columns={definition.columns}
+              getRowClassName={definition.getRowClassName}
+              loadMoreSource={source.loadMore}
+              rows={rows}
+              scrollElementRef={scrollElementRef}
+            />
+          )}
+        </table>
+      </div>
+    </DataTableRowsContext.Provider>
   )
 }
 
@@ -361,23 +384,25 @@ const dataTableBreakpoints: ReadonlyArray<DataTableBreakpoint> = [
 type DataTableGridStyle = React.CSSProperties &
   Record<`--data-table-grid-${DataTableBreakpoint}`, string>
 
+/**
+ * Built from the column definitions rather than `table.getAllLeafColumns()`:
+ * the v9 adapter hands back a new `table` identity every render, while the
+ * column defs are memoized by consumers. This table has no column groups or
+ * visibility feature, so leaf order matches definition order.
+ */
 function dataTableGridStyle<TData extends RowData>(
-  table: DataTableInstance<TData>
+  columns: DataTableDefinition<TData>["columns"]
 ): DataTableGridStyle {
-  const columns = table.getAllLeafColumns()
   const grids = Object.fromEntries(
     dataTableBreakpoints.map((breakpoint) => [
       `--data-table-grid-${breakpoint}`,
       columns
         .filter(
           (column) =>
-            !dataTableColumnIsHidden(
-              column.columnDef.meta?.layout?.hideBelow,
-              breakpoint
-            )
+            !dataTableColumnIsHidden(column.meta?.layout?.hideBelow, breakpoint)
         )
         .map((column) =>
-          dataTableColumnWidth(column.columnDef.meta?.layout?.width, breakpoint)
+          dataTableColumnWidth(column.meta?.layout?.width, breakpoint)
         )
         .join(" "),
     ])
@@ -438,20 +463,32 @@ const dataTableVisibilityClasses = {
 } as const
 
 function DataTableStateBody({
+  empty,
   centered,
   children,
   colSpan,
   scrollElementRef,
 }: {
+  empty: boolean
   centered: boolean
   children: React.ReactNode
   colSpan: number
   scrollElementRef: React.RefObject<HTMLTableSectionElement | null>
 }) {
   return (
-    <tbody ref={scrollElementRef} className={dataTableScrollAreaClassName}>
-      <tr className={cn("block", centered && "h-full")}>
-        <td className={cn("block p-0", centered && "h-full")} colSpan={colSpan}>
+    <tbody
+      data-slot="data-table-state-body"
+      data-empty={empty || undefined}
+      ref={scrollElementRef}
+      className={dataTableScrollAreaClassName}
+      role="rowgroup"
+    >
+      <tr className={cn("block", centered && "h-full")} role="row">
+        <td
+          className={cn("block p-0", centered && "h-full")}
+          colSpan={colSpan}
+          role="cell"
+        >
           {centered ? (
             <DataTableCenteredState>{children}</DataTableCenteredState>
           ) : (
@@ -601,6 +638,7 @@ function DataTableHead<TData extends RowData>({
   return (
     <thead
       className="z-20 block shrink-0 bg-background/95 shadow-[0_1px_0_var(--border)] backdrop-blur"
+      role="rowgroup"
       style={{ paddingInlineEnd: scrollbarWidth }}
     >
       {table.getHeaderGroups().map((headerGroup) => (
@@ -608,6 +646,7 @@ function DataTableHead<TData extends RowData>({
           key={headerGroup.id}
           aria-rowindex={1}
           className="type-technical-label grid grid-cols-[var(--data-table-grid-base)] bg-muted/20 text-muted-foreground sm:grid-cols-[var(--data-table-grid-sm)] md:grid-cols-[var(--data-table-grid-md)] lg:grid-cols-[var(--data-table-grid-lg)] xl:grid-cols-[var(--data-table-grid-xl)]"
+          role="row"
         >
           {headerGroup.headers.map((header) => (
             <MemoizedDataTableHeaderCell
@@ -716,6 +755,7 @@ function DataTableHeaderCellContent<TData extends RowData>({
         dataTableColumnVisibilityClass(meta?.layout?.hideBelow, "header"),
         meta?.headerClassName
       )}
+      role="columnheader"
       scope="col"
     >
       {header.isPlaceholder ? null : canSort ? (
@@ -726,7 +766,10 @@ function DataTableHeaderCellContent<TData extends RowData>({
           onClick={header.column.getToggleSortingHandler()}
         >
           <span
-            className={cn("truncate uppercase", meta?.headerLabelClassName)}
+            className={cn(
+              "min-w-0 truncate uppercase",
+              meta?.headerLabelClassName
+            )}
           >
             <FlexRender header={header} />
           </span>
@@ -776,7 +819,11 @@ function DataTableBody<TData extends RowData>({
   const showLoadMoreRow = shouldRenderDataTableLoadMore(loadMoreSource)
 
   return (
-    <tbody ref={scrollElementRef} className={dataTableScrollAreaClassName}>
+    <tbody
+      ref={scrollElementRef}
+      className={dataTableScrollAreaClassName}
+      role="rowgroup"
+    >
       {rows.map((row) => (
         <DataTableRowSelectionBoundary
           key={row.id}
@@ -829,13 +876,15 @@ function VirtualDataTableBody<TData extends RowData>({
     <tbody
       ref={scrollElementRef}
       className={cn("relative", dataTableScrollAreaClassName)}
+      role="rowgroup"
     >
       <tr
         aria-hidden="true"
         className="pointer-events-none block w-full"
+        role="presentation"
         style={{ height: rowVirtualizer.getTotalSize() }}
       >
-        <td className="block p-0" />
+        <td className="block p-0" role="presentation" />
       </tr>
       {rowVirtualizer.getVirtualItems().map((virtualRow) => {
         if (
@@ -900,6 +949,7 @@ function DataTableLoadMoreRow({
       aria-hidden={loadMoreSource.state.kind !== "error"}
       className="grid h-12 place-items-center"
       data-index={dataIndex}
+      role="row"
       style={
         virtualStart === undefined
           ? undefined
@@ -912,7 +962,12 @@ function DataTableLoadMoreRow({
             }
       }
     >
-      <td ref={triggerRef} className="col-span-full" colSpan={colSpan}>
+      <td
+        ref={triggerRef}
+        className="col-span-full"
+        colSpan={colSpan}
+        role="cell"
+      >
         <DataTableLoadMoreContent source={loadMoreSource} />
       </td>
     </tr>
@@ -992,6 +1047,7 @@ function DataTableRow<TData extends RowData>({
       )}
       data-index={dataIndex}
       data-state={isSelected ? "selected" : undefined}
+      role="row"
       style={
         virtualStart === undefined
           ? undefined
@@ -1015,6 +1071,7 @@ function DataTableRow<TData extends RowData>({
             ),
             cell.column.columnDef.meta?.cellClassName
           )}
+          role="cell"
         >
           <FlexRender cell={cell} />
         </td>
@@ -1082,12 +1139,6 @@ export function DataTableCheckbox({
   )
 }
 
-type DataTableSelectAllState =
-  | "checked"
-  | "disabled"
-  | "indeterminate"
-  | "unchecked"
-
 export function DataTableSelectAllCheckbox<TData extends RowData>({
   ariaLabel,
   className = "grid size-7 place-items-center",
@@ -1099,10 +1150,12 @@ export function DataTableSelectAllCheckbox<TData extends RowData>({
   id?: string
   table: DataTableInstance<TData>
 }) {
+  const rows = React.useContext(DataTableRowsContext)
+
   return (
     <Subscribe
-      source={table.store}
-      selector={() => getDataTableSelectAllState(table)}
+      source={table.atoms.rowSelection}
+      selector={(selection) => dataTableSelectAllState(rows, selection)}
     >
       {(state) => (
         <span className={className}>
@@ -1120,23 +1173,6 @@ export function DataTableSelectAllCheckbox<TData extends RowData>({
   )
 }
 
-function getDataTableSelectAllState<TData extends RowData>(
-  table: DataTableInstance<TData>
-): DataTableSelectAllState {
-  const selectableRows = table
-    .getRowModel()
-    .rows.filter((row) => row.getCanSelect())
-  if (selectableRows.length === 0) return "disabled"
-
-  const selectedCount = selectableRows.reduce(
-    (count, row) => count + Number(row.getIsSelected()),
-    0
-  )
-  if (selectedCount === 0) return "unchecked"
-  if (selectedCount === selectableRows.length) return "checked"
-  return "indeterminate"
-}
-
 export function DataTableRowCheckbox<TData extends RowData>({
   ariaLabel,
   className = "grid size-7 shrink-0 place-items-center",
@@ -1149,6 +1185,16 @@ export function DataTableRowCheckbox<TData extends RowData>({
   row: Row<typeof dataTableFeatures, TData>
 }) {
   const disabled = !row.getCanSelect()
+  const toggleSelected: React.ChangeEventHandler<HTMLInputElement> = (
+    event
+  ) => {
+    // Memoized rows keep the `Row` object from the data array they rendered
+    // with, and shift-range selection compares that object against the rows of
+    // the current row model. Resolve the live row so ranges keep working after
+    // a refetch replaces the data array.
+    const liveRow = row.table.getCoreRowModel().rowsById[row.id] ?? row
+    liveRow.getToggleSelectedHandler()(event)
+  }
 
   return (
     <span className={className} title={disabled ? disabledTitle : undefined}>
@@ -1161,7 +1207,7 @@ export function DataTableRowCheckbox<TData extends RowData>({
             ariaLabel={ariaLabel}
             checked={selected}
             disabled={disabled}
-            onChange={row.getToggleSelectedHandler()}
+            onChange={toggleSelected}
           />
         )}
       </Subscribe>

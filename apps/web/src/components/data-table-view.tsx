@@ -22,6 +22,7 @@ interface DataTableViewContext {
 
 interface DataTableViewProps<TData extends RowData & object> {
   children?: (table: DataTableInstance<TData>) => React.ReactNode
+  leadingBody?: React.ReactNode
   definition: DataTableDefinition<TData>
   emptyState:
     | React.ReactNode
@@ -88,6 +89,7 @@ function SearchableDataTableView<TData extends RowData & object>({
 
 function DataTableModel<TData extends RowData & object>({
   children,
+  leadingBody,
   definition,
   emptyState,
   searchActive,
@@ -106,8 +108,14 @@ function DataTableModel<TData extends RowData & object>({
 
   return (
     <>
+      {/*
+        The v9 adapter returns a new `table` identity on every render, so
+        children that subscribe in effects should depend on `table.store` or
+        `table.atoms.*` (stable) rather than on `table` itself.
+      */}
       {children?.(table)}
       <DataTableRenderer
+        leadingBody={leadingBody}
         definition={definition}
         emptyState={resolvedEmptyState}
         source={source}

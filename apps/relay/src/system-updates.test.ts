@@ -23,7 +23,6 @@ import type { CommandOptions, CommandResult } from "./command.js"
 
 const targetImage = `ghcr.io/kiln-site/relay@sha256:${"a".repeat(64)}`
 const hearthImage = `ghcr.io/kiln-site/hearth@sha256:${"b".repeat(64)}`
-const forkTargetImage = `ghcr.io/aetherminecraft/relay@sha256:${"d".repeat(64)}`
 
 const relayContainer = {
   Config: {
@@ -55,11 +54,11 @@ const hearthContainer = {
 
 class FakeCommand {
   readonly calls: Array<Array<string>> = []
-  containerImageSource = KILN_IMAGE_SOURCE
   currentVersion = "0.1.0-nightly.1"
+  currentImagePrefix = "ghcr.io/kiln-site"
+  currentImageSource = KILN_IMAGE_SOURCE
   imageSource = KILN_IMAGE_SOURCE
   imageVersion = "0.1.0-nightly.18"
-  relayImage = relayContainer.Config.Image
   helperRunning = true
   holdPull = false
   pullStarted: Promise<void>
@@ -83,7 +82,7 @@ class FakeCommand {
       return emptyResult()
     }
     if (arguments_[0] === "image" && arguments_[1] === "inspect") {
-      const component = arguments_[2]?.includes("/hearth@") ? "hearth" : "relay"
+      const component = arguments_[2] === hearthImage ? "hearth" : "relay"
       return jsonResult([
         {
           Config: {
@@ -111,10 +110,10 @@ class FakeCommand {
             ...relayContainer,
             Config: {
               ...relayContainer.Config,
-              Image: this.relayImage,
+              Image: `${this.currentImagePrefix}/relay:latest`,
               Labels: {
                 ...relayContainer.Config.Labels,
-                "org.opencontainers.image.source": this.containerImageSource,
+                "org.opencontainers.image.source": this.currentImageSource,
                 "org.opencontainers.image.version": this.currentVersion,
               },
             },
@@ -181,56 +180,26 @@ describe("release image versions", () => {
     withTemporaryDataDirectory((dataDirectory) =>
       Effect.gen(function* () {
         const docker = new FakeCommand()
-        const gitRepository = "https://github.com/aetherminecraft/kiln"
-        const imageSource = "https://github.com/AetherMinecraft/kiln"
-        docker.containerImageSource = imageSource
-        docker.imageSource = imageSource
-        docker.relayImage = "ghcr.io/aetherminecraft/relay:latest"
+        docker.imageSource = "https://github.com/example/kiln-fork"
+        docker.currentImageSource = docker.imageSource
+        docker.currentImagePrefix = "ghcr.io/example/kiln-fork"
         const manager = new SystemUpdateManager(
-          { dataDirectory, gitRepository },
+          { dataDirectory, gitRepository: docker.imageSource },
           docker.run
         )
 
+        const forkImage = targetImage.replace(
+          "ghcr.io/kiln-site",
+          docker.currentImagePrefix
+        )
         const operation = yield* manager.start({
-          helperImage: forkTargetImage,
+          helperImage: forkImage,
           targetContainer: "kiln-relay",
-          targetImage: forkTargetImage,
+          targetImage: forkImage,
           version: "0.1.0",
         })
 
         expect(operation.status).toBe("running")
-        expect(operation.targetReference).toBe(
-          "ghcr.io/aetherminecraft/relay:latest"
-        )
-      })
-    )
-  )
-
-  effectIt.effect("rejects helper images from another repository owner", () =>
-    withTemporaryDataDirectory((dataDirectory) =>
-      Effect.gen(function* () {
-        const docker = new FakeCommand()
-        const manager = new SystemUpdateManager(
-          {
-            dataDirectory,
-            gitRepository: "https://github.com/example/kiln-fork",
-          },
-          docker.run
-        )
-
-        const failure = yield* manager
-          .start({
-            helperImage: targetImage,
-            targetContainer: "kiln-relay",
-            targetImage: forkTargetImage,
-            version: "0.1.0",
-          })
-          .pipe(Effect.flip)
-
-        expect(failure.message).toContain("configured Kiln repository")
-        expect(
-          docker.calls.some((arguments_) => arguments_[0] === "pull")
-        ).toBe(false)
       })
     )
   )

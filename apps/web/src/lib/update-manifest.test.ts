@@ -7,7 +7,6 @@ import {
   validateUpdateManifest,
 } from "@/lib/update-manifest"
 
-const gitRepository = "https://github.com/kiln-site/kiln"
 const manifest: KilnReleaseManifest = {
   channel: "nightly",
   commit: "a".repeat(40),
@@ -53,48 +52,8 @@ describe("update manifest validation", () => {
 
   it("accepts the current Relay protocol", () => {
     expect(() =>
-      validateUpdateManifest(
-        manifest,
-        "0.1.0-nightly.2",
-        "relay",
-        gitRepository
-      )
+      validateUpdateManifest(manifest, "0.1.0-nightly.2", "relay")
     ).not.toThrow()
-  })
-
-  it("accepts images published by the configured fork owner", () => {
-    const forkRepository = "https://github.com/Example/Kiln-Fork"
-    expect(() =>
-      validateUpdateManifest(
-        {
-          ...manifest,
-          components: {
-            hearth: {
-              ...manifest.components.hearth,
-              image: "ghcr.io/example/hearth",
-            },
-            relay: {
-              ...manifest.components.relay,
-              image: "ghcr.io/example/relay",
-            },
-          },
-        },
-        "0.1.0-nightly.2",
-        "relay",
-        forkRepository
-      )
-    ).not.toThrow()
-  })
-
-  it("rejects images from another repository owner", () => {
-    expect(() =>
-      validateUpdateManifest(
-        manifest,
-        "0.1.0-nightly.2",
-        "relay",
-        "https://github.com/example/kiln-fork"
-      )
-    ).toThrow("unexpected image")
   })
 
   it("accepts a legacy baked image version on the same release line", () => {
@@ -106,8 +65,7 @@ describe("update manifest validation", () => {
           version: "0.1.0-nightly.20260725.162524",
         },
         "0.1.0-nightly.20260725.162524",
-        "relay",
-        gitRepository
+        "relay"
       )
     ).not.toThrow()
   })
@@ -121,8 +79,7 @@ describe("update manifest validation", () => {
           version: "0.1.0-nightly.20260725.162524",
         },
         "0.1.0-nightly.20260725.162524",
-        "relay",
-        gitRepository
+        "relay"
       )
     ).toThrow("image version is invalid")
   })
@@ -137,8 +94,7 @@ describe("update manifest validation", () => {
           },
         },
         "0.1.0-nightly.2",
-        "relay",
-        gitRepository
+        "relay"
       )
     ).toThrow(`requires Relay protocol ${relayControlProtocolVersion - 1}`)
   })
@@ -153,9 +109,41 @@ describe("update manifest validation", () => {
           },
         },
         "0.1.0-nightly.2",
-        "hearth",
-        gitRepository
+        "hearth"
       )
     ).not.toThrow()
+  })
+})
+
+describe("fork update boundaries", () => {
+  it("accepts the fork and rejects a release from another distribution", () => {
+    const repository = "https://github.com/example/fork"
+    const fork = {
+      ...manifest,
+      components: {
+        hearth: {
+          ...manifest.components.hearth,
+          image: "ghcr.io/example/fork/hearth",
+        },
+        relay: {
+          ...manifest.components.relay,
+          image: "ghcr.io/example/fork/relay",
+        },
+      },
+    }
+    expect(() =>
+      validateUpdateManifest(fork, fork.version, "relay", repository)
+    ).not.toThrow()
+    expect(() =>
+      validateUpdateManifest(manifest, manifest.version, "relay", repository)
+    ).toThrow("unexpected image")
+    expect(() =>
+      validateUpdateManifest(
+        fork,
+        fork.version,
+        "relay",
+        "https://github.com/other/fork"
+      )
+    ).toThrow("unexpected image")
   })
 })

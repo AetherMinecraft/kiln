@@ -21,24 +21,19 @@
     "dev": "vp run -r --parallel dev",
     "e2e:docker": "node scripts/e2e-docker.mjs",
     "lint": "vp lint",
-    "prepare": "node scripts/prepare-effect.mjs",
-    "test": "vp run -r test && node --test scripts/dev-docker-helpers.test.mjs scripts/effect-boundaries.test.mjs scripts/image-source-compatibility.test.mjs scripts/relay-runtime-manifest.test.mjs scripts/migrate-app.test.mjs",
+    "test": "vp run -r test && node --test scripts/dev-docker-helpers.test.mjs scripts/effect-boundaries.test.mjs scripts/image-source-compatibility.test.mjs scripts/release.test.mjs scripts/relay-runtime-manifest.test.mjs scripts/migrate-app.test.mjs apps/web/scripts/migrate-access.test.mjs",
     "format": "vp fmt",
     "typecheck": "vp run -r typecheck",
     "doctor": "npx react-doctor@latest"
   },
   "devDependencies": {
+    "effect": "4.0.0-rc.118",
     "typescript": "^6",
     "vite": "catalog:",
     "vite-plus": "catalog:"
   },
   "packageManager": "pnpm@10.33.4",
   "engines": {
-    "node": ">=20"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "bun"
-    ]
+    "node": "^22.18.0 || ^24.11.0 || >=26.0.0"
   }
 }

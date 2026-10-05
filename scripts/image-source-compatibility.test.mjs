@@ -1,58 +1,24 @@
 import assert from "node:assert/strict"
-import { readFile } from "node:fs/promises"
 import test from "node:test"
 
-const legacySource = "https://github.com/kiln-site/hearth"
+import {
+  DEFAULT_KILN_GIT_REPO,
+  LEGACY_KILN_GIT_REPO,
+  isKilnGitRepositorySource,
+  kilnImageSource,
+} from "../packages/contracts/src/git-repository.ts"
 
-test("workflows publish images for the repository running them", async () => {
-  const [
-    reusableImage,
-    images,
-    embers,
-    nightlyRelease,
-    hearthDockerfile,
-    relayDockerfile,
-  ] = await Promise.all([
-    readFile(".github/workflows/reusable-image.yml", "utf8"),
-    readFile(".github/workflows/images.yml", "utf8"),
-    readFile(".github/workflows/embers.yml", "utf8"),
-    readFile(".github/workflows/nightly-release.yml", "utf8"),
-    readFile("apps/web/Dockerfile", "utf8"),
-    readFile("apps/relay/Dockerfile", "utf8"),
-  ])
-
-  assert.match(
-    reusableImage,
-    /labels: \|\r?\n\s+\$\{\{ inputs\.source_label && format\('org\.opencontainers\.image\.source=\{0\}', inputs\.source_label\) \|\| '' \}\}/u
+test("official releases retain the source label required by older Relays", () => {
+  assert.equal(kilnImageSource(DEFAULT_KILN_GIT_REPO), LEGACY_KILN_GIT_REPO)
+  assert.ok(
+    isKilnGitRepositorySource(LEGACY_KILN_GIT_REPO, DEFAULT_KILN_GIT_REPO)
   )
-  assert.match(reusableImage, /image=\$\{INPUT_IMAGE,,\}/u)
-  assert.match(reusableImage, /ghcr\.io\/\$\{INPUT_OWNER,,\}/u)
-  assert.equal(
-    nightlyRelease.split(
-      'IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"'
-    ).length - 1,
-    3
-  )
-  assert.equal(countDynamicSourceLabels(images), 1)
-  assert.equal(countDynamicSourceLabels(embers), 2)
-  assert.equal(countDynamicSourceLabels(nightlyRelease), 3)
-  assert.doesNotMatch(
-    [reusableImage, images, embers, nightlyRelease].join("\n"),
-    /ghcr\.io\/kiln-site/u
-  )
-  assert.match(hearthDockerfile, dockerfileSourceLabel())
-  assert.match(relayDockerfile, dockerfileSourceLabel())
 })
 
-function countDynamicSourceLabels(workflow) {
-  return workflow.split(
-    "source_label: ${{ github.server_url }}/${{ github.repository }}"
-  ).length - 1
-}
-
-function dockerfileSourceLabel() {
-  return new RegExp(
-    `LABEL org\\.opencontainers\\.image\\.source="${legacySource}"`,
-    "u"
-  )
-}
+test("a fork accepts its own provenance but never upstream's legacy label", () => {
+  const fork = "https://github.com/example/fork"
+  assert.equal(kilnImageSource(fork), fork)
+  assert.ok(isKilnGitRepositorySource(fork, fork))
+  assert.equal(isKilnGitRepositorySource(LEGACY_KILN_GIT_REPO, fork), false)
+  assert.equal(isKilnGitRepositorySource(DEFAULT_KILN_GIT_REPO, fork), false)
+})

@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start"
 import { Effect } from "effect"
 import {
+  projectRelayInstanceOverview,
   relayFileActivitySchema,
   relayFileContentSchema,
   relayDirectoryPageInputSchema,
@@ -29,20 +30,36 @@ import {
   relayMclogsUploadResultSchema,
   relayIdSchema,
   relayInstanceSchema,
+  relayRemoveDatabaseConnectionSchema,
   relayControlDeadlineMs,
   relaySaveFileInputSchema,
+  databaseMutateInputSchema,
+  databaseMutateResultSchema,
+  databaseOverviewSchema,
+  databaseQueryInputSchema,
+  databaseQueryResultSchema,
+  databaseRowsInputSchema,
+  databaseRowsSchema,
+  type DatabaseReadRequest,
+  type DatabaseWriteRequest,
   relaySnapshotSchema,
 } from "@workspace/contracts"
 import { z } from "zod"
 
 import {
-  allowedInstanceIds,
+  allowedInstanceIdsForUser,
+  canReadRelayNode,
   hasPlatformPermission,
   isPlatformAdmin,
   listUserGrants,
   requireRelayPermission,
   visibleRelaysForUser,
+  type AccessGrant,
 } from "@/lib/access-control"
+import {
+  instanceScope,
+  resolveScopeAuthorization,
+} from "@/lib/scope-authorization.server"
 import {
   listFileActivity,
   recordFileEdited,
@@ -54,7 +71,7 @@ import {
   type AccessPermission,
 } from "@/lib/permissions"
 import type { AuthenticatedUser } from "@/lib/auth-session"
-import { requireAuthenticatedUser } from "@/server/auth"
+import { requireEligibleResourceUser } from "@/server/auth"
 import {
   AuthenticationError,
   ExternalServiceError,
@@ -147,6 +164,19 @@ const filePathSchema = z
 
 const fileInputSchema = instanceInputSchema.extend({ path: filePathSchema })
 
+const databaseRowsRequestSchema = fileInputSchema.extend({
+  request: databaseRowsInputSchema,
+})
+
+const databaseQueryRequestSchema = fileInputSchema.extend({
+  request: databaseQueryInputSchema,
+  write: z.boolean(),
+})
+
+const databaseMutateRequestSchema = fileInputSchema.extend({
+  request: databaseMutateInputSchema,
+})
+
 const filePinInputSchema = fileInputSchema.extend({ pinned: z.boolean() })
 
 const saveFileInputSchema = fileInputSchema.extend(
@@ -214,7 +244,7 @@ const relayWarningAt = new Map<string, number>()
 
 export const getRelaySnapshot = createServerFn({ method: "POST" }).handler(
   async () => {
-    const user = await requireAuthenticatedUser()
+    const user = await requireEligibleResourceUser()
     return authorizedFleetSnapshot(user, true)
   }
 )
@@ -222,7 +252,7 @@ export const getRelaySnapshot = createServerFn({ method: "POST" }).handler(
 export const getFreshRelayConnectionState = createServerFn({
   method: "POST",
 }).handler(async () => {
-  const user = await requireAuthenticatedUser()
+  const user = await requireEligibleResourceUser()
   return authorizedRelayConnectionState(user, {
     fallbackOnError: true,
     fresh: true,
@@ -253,7 +283,7 @@ export const getFreshRelayInstance = createServerFn({ method: "POST" })
 
 export const getRelayInstances = createServerFn({ method: "POST" }).handler(
   async () => {
-    const user = await requireAuthenticatedUser()
+    const user = await requireEligibleResourceUser()
     return (await authorizedFleetSnapshot(user, true)).instances
   }
 )
@@ -261,7 +291,7 @@ export const getRelayInstances = createServerFn({ method: "POST" }).handler(
 export const getRelayConnectionState = createServerFn({
   method: "GET",
 }).handler(async () => {
-  const user = await requireAuthenticatedUser()
+  const user = await requireEligibleResourceUser()
   return authorizedRelayConnectionState(user, {
     fallbackOnError: true,
     fresh: false,
@@ -284,7 +314,7 @@ export const updateInstanceName = createServerFn({ method: "POST" })
     await requireRelayPermission({
       user,
       relayId: relay.id,
-      permission: "instance.settings",
+      permission: "instance.configuration.write",
       instanceId: data.instanceId,
     })
     const snapshot = relaySnapshotSchema.parse(
@@ -317,19 +347,19 @@ export const updateInstanceName = createServerFn({ method: "POST" })
       relayId: relay.id,
       type: "instance.upsert",
     })
-    return { ...renamed, relayId: relay.id }
+    return { ...projectRelayInstanceOverview(renamed), relayId: relay.id }
   })
 
 export const deleteInstance = createServerFn({ method: "POST" })
   .validator(deleteInstanceInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    // Deletion weighs delete and backup authority; resolve the grants once.
+    const authorization = await resolveScopeAuthorization({
+      scope: instanceScope(relay.id, data.instanceId),
       user,
-      relayId: relay.id,
-      permission: "instance.delete",
-      instanceId: data.instanceId,
     })
+    authorization.require("instance.delete")
     if (data.confirmation !== data.instanceId) {
       throw AuthenticationError.make({
         message: "The server ID confirmation did not match.",
@@ -339,10 +369,12 @@ export const deleteInstance = createServerFn({ method: "POST" })
     await requireAccountPassword(user, data.password)
 
     if (data.createBackup) {
+      authorization.require("backup.create")
       await deleteInstanceWithFinalBackup({
         instanceId: data.instanceId,
         relay,
         requestedBy: user.id,
+        user,
         ...(data.storageId === undefined ? {} : { storageId: data.storageId }),
       })
     } else {
@@ -400,6 +432,36 @@ export const completeRelayConsoleCommand = createServerFn({ method: "POST" })
     return relayConsoleCompletionSchema.parse(value)
   })
 
+export const removeInstanceDatabaseConnection = createServerFn({
+  method: "POST",
+})
+  .validator(
+    relayRemoveDatabaseConnectionSchema.extend({ relayId: relayIdSchema })
+  )
+  .handler(async ({ data }) => {
+    const value = await relayRequest(
+      `/v1/instances/${encodeURIComponent(data.instanceId)}/database-connections`,
+      {
+        body: JSON.stringify({
+          databaseId: data.databaseId,
+          databaseRelayId: data.databaseRelayId,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "DELETE",
+      },
+      "instance.network.write",
+      data.instanceId,
+      data.relayId
+    )
+    publishRealtimeChange({
+      type: "hearth.invalidate",
+      audience: { kind: "relays", relayIds: [data.relayId] },
+      scope: { relayId: data.relayId },
+      topics: ["databases"],
+    })
+    return { ...relayInstanceSchema.parse(value), relayId: data.relayId }
+  })
+
 export const getInstanceWebRoutes = createServerFn({ method: "GET" })
   .validator(instanceInputSchema)
   .handler(async ({ data }) => {
@@ -423,7 +485,11 @@ export const getRelayInstanceResources = createServerFn({ method: "GET" })
       data.instanceId,
       data.relayId
     )
-    return relayInstanceResourceSnapshotSchema.parse(value)
+    const snapshot = relayInstanceResourceSnapshotSchema.parse(value)
+    return {
+      ...snapshot,
+      instance: projectRelayInstanceOverview(snapshot.instance),
+    }
   })
 
 export const updateInstanceWebRoutes = createServerFn({ method: "POST" })
@@ -482,7 +548,7 @@ export const updateInstancePorts = createServerFn({ method: "POST" })
       relayId: data.relayId,
       type: "instance.upsert",
     })
-    return { ...instance, relayId: data.relayId }
+    return { ...projectRelayInstanceOverview(instance), relayId: data.relayId }
   })
 
 export const reserveInstancePort = createServerFn({ method: "POST" })
@@ -716,6 +782,73 @@ export const saveRelayFile = createServerFn({ method: "POST" })
     return file
   })
 
+async function relayDatabaseRequest(
+  data: z.infer<typeof fileInputSchema>,
+  request: DatabaseReadRequest | DatabaseWriteRequest,
+  write: boolean
+) {
+  const { relay, user } = await instanceRelayAccess(data.relayId)
+  await requireRelayPermission({
+    user,
+    relayId: relay.id,
+    permission: write ? "instance.files.write" : "instance.files.read",
+    instanceId: data.instanceId,
+  })
+  const response = await relayFetch(
+    relay,
+    `/v1/instances/${encodeURIComponent(data.instanceId)}/file-database${write ? "?mode=write" : ""}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ path: data.path, request }),
+    },
+    // The Relay stops database work after 20s; leave room for its reply.
+    25_000,
+    write ? user.id : undefined
+  )
+  const result: unknown = await response.json()
+  if (write) {
+    await recordFileActivityBestEffort(
+      "edit",
+      recordFileEdited(relay.id, data.instanceId, data.path),
+      relay.id,
+      data.instanceId
+    )
+  }
+  return result
+}
+
+export const getRelayDatabaseOverview = createServerFn({ method: "GET" })
+  .validator(fileInputSchema)
+  .handler(async ({ data }) =>
+    databaseOverviewSchema.parse(
+      await relayDatabaseRequest(data, { action: "overview" }, false)
+    )
+  )
+
+export const getRelayDatabaseRows = createServerFn({ method: "POST" })
+  .validator(databaseRowsRequestSchema)
+  .handler(async ({ data }) =>
+    databaseRowsSchema.parse(
+      await relayDatabaseRequest(data, data.request, false)
+    )
+  )
+
+export const runRelayDatabaseQuery = createServerFn({ method: "POST" })
+  .validator(databaseQueryRequestSchema)
+  .handler(async ({ data }) =>
+    databaseQueryResultSchema.parse(
+      await relayDatabaseRequest(data, data.request, data.write)
+    )
+  )
+
+export const mutateRelayDatabase = createServerFn({ method: "POST" })
+  .validator(databaseMutateRequestSchema)
+  .handler(async ({ data }) =>
+    databaseMutateResultSchema.parse(
+      await relayDatabaseRequest(data, data.request, true)
+    )
+  )
+
 export const mutateRelayFiles = createServerFn({ method: "POST" })
   .validator(fileMutationInputSchema)
   .handler(async ({ data }) => {
@@ -723,7 +856,10 @@ export const mutateRelayFiles = createServerFn({ method: "POST" })
     await requireRelayPermission({
       user,
       relayId: relay.id,
-      permission: "instance.files.write",
+      permission:
+        data.operation === "delete"
+          ? "instance.files.delete"
+          : "instance.files.write",
       instanceId: data.instanceId,
     })
     const input = relayFileMutationInputSchema.parse(data)
@@ -829,7 +965,7 @@ export const performRelayAction = createServerFn({ method: "POST" })
     await requireRelayPermission({
       user,
       relayId: relay.id,
-      permission: "instance.power",
+      permission: `instance.power.${action}`,
       instanceId,
     })
     const response = await relayFetch(
@@ -852,7 +988,7 @@ export const performRelayAction = createServerFn({ method: "POST" })
       relayId: relay.id,
       type: "instance.upsert",
     })
-    return { ...instance, relayId: relay.id }
+    return { ...projectRelayInstanceOverview(instance), relayId: relay.id }
   })
 
 export const uploadToMclogs = createServerFn({ method: "POST" })
@@ -1068,19 +1204,24 @@ async function relayFallbackSnapshot(relay: RelayEndpoint) {
   )
 }
 
-async function authorizeRelaySnapshot(
+function authorizeRelaySnapshot(
   snapshot: Awaited<ReturnType<typeof relaySnapshot>>,
   relay: RelayEndpoint,
-  user: AuthenticatedUser
+  user: AuthenticatedUser,
+  grants: ReadonlyArray<AccessGrant>
 ) {
-  const allowed = await allowedInstanceIds(
+  const allowed = allowedInstanceIdsForUser(
     user,
     relay.id,
-    snapshot.instances.map((instance) => instance.id)
+    snapshot.instances.map((instance) => instance.id),
+    grants
   )
-  const instances = snapshot.instances.filter((item) => allowed.has(item.id))
+  const instances = snapshot.instances.flatMap((item) =>
+    allowed.has(item.id) ? [projectRelayInstanceOverview(item)] : []
+  )
   return {
     ...snapshot,
+    node: canReadRelayNode(user, relay.id, grants) ? snapshot.node : null,
     instances,
   }
 }
@@ -1088,6 +1229,7 @@ async function authorizeRelaySnapshot(
 async function authorizedRelayEntry(
   relay: PersistedRelay,
   user: AuthenticatedUser,
+  grants: ReadonlyArray<AccessGrant>,
   options: {
     fallbackOnError: boolean
     fresh?: boolean
@@ -1120,18 +1262,13 @@ async function authorizedRelayEntry(
           }))
         )
       }),
-      Effect.flatMap(({ snapshot, status }) =>
-        Effect.tryPromise({
-          try: async () => ({
-            relay,
-            snapshot: snapshot
-              ? await authorizeRelaySnapshot(snapshot, relay, user)
-              : null,
-            status,
-          }),
-          catch: (cause) => cause,
-        })
-      )
+      Effect.map(({ snapshot, status }) => ({
+        relay,
+        snapshot: snapshot
+          ? authorizeRelaySnapshot(snapshot, relay, user, grants)
+          : null,
+        status,
+      }))
     )
   )
 }
@@ -1166,7 +1303,7 @@ async function authorize(
 async function instanceRelayAccess(relayId: string) {
   const user = await Effect.runPromise(
     Effect.tryPromise({
-      try: requireAuthenticatedUser,
+      try: requireEligibleResourceUser,
       catch: (cause) =>
         AuthenticationError.make({
           message: "Authentication required",
@@ -1191,12 +1328,14 @@ async function authorizedFleetSnapshot(
   fallbackOnError: boolean,
   fresh = false
 ): Promise<RelayFleetSnapshot> {
-  const relays = (
-    await authorizedRelays(user, await listPersistedRelays())
-  ).filter((relay) => relay.enabled)
+  const { grants, relays: visibleRelays } = await authorizedRelays(
+    user,
+    await listPersistedRelays()
+  )
+  const relays = visibleRelays.filter((relay) => relay.enabled)
   const entries = await Promise.all(
     relays.map((relay) =>
-      authorizedRelayEntry(relay, user, {
+      authorizedRelayEntry(relay, user, grants, {
         fallbackOnError,
         fresh,
         warnOnUnavailable: false,
@@ -1214,7 +1353,7 @@ async function authorizedRelayConnectionState(
     warnOnUnavailable: boolean
   }
 ) {
-  const configuredRelays = await authorizedRelays(
+  const { grants, relays: configuredRelays } = await authorizedRelays(
     user,
     await listPersistedRelays()
   )
@@ -1239,7 +1378,7 @@ async function authorizedRelayConnectionState(
   }
 
   const entries = await Promise.all(
-    relays.map((relay) => authorizedRelayEntry(relay, user, options))
+    relays.map((relay) => authorizedRelayEntry(relay, user, grants, options))
   )
   const connectedCount = entries.filter(
     (entry) => entry.status === "connected"
@@ -1266,12 +1405,16 @@ async function authorizedRelayConnectionState(
   }
 }
 
+/**
+ * One grant load covers the whole fleet: relay visibility, per-relay instance
+ * filtering, and node readability all read the same resolved set.
+ */
 async function authorizedRelays(
   user: AuthenticatedUser,
   relays: Array<PersistedRelay>
-): Promise<Array<PersistedRelay>> {
+): Promise<{ grants: Array<AccessGrant>; relays: Array<PersistedRelay> }> {
   const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
-  return visibleRelaysForUser(user, relays, grants)
+  return { grants, relays: visibleRelaysForUser(user, relays, grants) }
 }
 
 async function mergeRelaySnapshots(
@@ -1299,7 +1442,7 @@ async function mergeRelaySnapshots(
   )
   return {
     nodes: entries.flatMap(({ relay, snapshot, status }) =>
-      snapshot
+      snapshot?.node
         ? [
             {
               ...snapshot.node,

@@ -1,6 +1,11 @@
 name: Publish CLI tarball
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
   release:
     types: [published]
   workflow_dispatch:
@@ -36,7 +41,7 @@ jobs:
           fi
           version="${tag#v}"
           printf '%s\n' "$version" \
-            | grep -Eq '^0\.[0-9]+\.[0-9]+(-nightly\.[0-9]{8}\.[0-9]{6})?$'
+            | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-nightly\.[0-9]{8}\.[0-9]{6})?$'
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -64,6 +69,8 @@ jobs:
       - name: Build npm package
         env:
           KILN_GIT_REPO: https://github.com/${{ github.repository }}
+          KILN_CLI_PACKAGE: ${{ vars.NPM_PACKAGE }}
+          KILN_CLI_DEFAULT_URL: ${{ vars.CLI_DEFAULT_URL }}
           KILN_VERSION: ${{ steps.release.outputs.version }}
         run: vp run -F kiln-cli build:npm
 
@@ -79,7 +86,12 @@ jobs:
           filename="$(npm pack ./apps/cli/dist/npm \
             --pack-destination artifacts \
             --json | jq -er '.[0].filename')"
-          test "$filename" = "kiln-cli-${VERSION}.tgz"
+          test "$(node -p 'require("./apps/cli/dist/npm/package.json").version')" = "$VERSION"
+          asset="kiln-cli-${VERSION}.tgz"
+          if [ "$filename" != "$asset" ]; then
+            mv "artifacts/$filename" "artifacts/$asset"
+          fi
+          filename="$asset"
           (cd artifacts && sha256sum "$filename" > "$filename.sha256")
           echo "filename=$filename" >> "$GITHUB_OUTPUT"
 
