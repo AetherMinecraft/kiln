@@ -72,6 +72,7 @@ describe("activity", () => {
 
   it("never exposes unknown or other-server scope to an instance-only user", () => {
     const scope = {
+      relayAudit: false,
       allInstances: false,
       instanceIds: new Set(["server-a"]),
     }
@@ -134,9 +135,7 @@ describe("activity", () => {
     expect(activityLabelForAudit(record)).toBe(
       "Activated a server file deployment"
     )
-    expect(activityPermissionForAudit(record)).toBe(
-      "instance.files.delete-managed"
-    )
+    expect(activityPermissionForAudit(record)).toBe("instance.files.delete")
   })
 
   it("uses the recorded permission when the audit provides one", () => {

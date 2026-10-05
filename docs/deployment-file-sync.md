@@ -80,7 +80,7 @@ Only missing regular files named in `managed` become deletion candidates.
 Directories, excluded paths, undeclared plugin data, `.kiln`, logs, backups,
 crash reports, standard world roots, and directories detected as worlds by a
 `level.dat` file are preserved. Hearth requires `instance.files.write` for
-staging and activation and the separate `instance.files.delete-managed`
+staging and activation and the separate `instance.files.delete`
 permission whenever managed deletion is requested. Relay also requires its
 dedicated `instance.files.sync` action at the control boundary.
 

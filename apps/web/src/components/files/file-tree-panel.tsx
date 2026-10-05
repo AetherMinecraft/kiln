@@ -6,7 +6,6 @@ import {
   FilePlus,
   FolderPlus,
   FolderTree,
-  GripVertical,
   House,
   LoaderCircle,
   Network,
@@ -34,6 +33,7 @@ import type { InstanceWorkspaceInstance } from "@/lib/relay-selectors"
 import { EditorTooltip } from "@/components/files/editor-tooltip"
 import { FileActionsMenu } from "@/components/files/file-actions-menu"
 import { selectedUploadFiles } from "@/components/files/file-upload-selection"
+import { PanelResizeHandle } from "@/components/panel-resize-handle"
 import {
   directoryPath,
   fileTreeParentDirectoryPaths,
@@ -447,6 +447,8 @@ export function FileTreePanel({
     onPathChange,
   })
   const searchTimer = React.useRef<number | null>(null)
+  const searchValue = React.useRef("")
+  const rowClickActive = React.useRef(false)
   const loadingPlaceholderPaths = React.useRef(new Set<string>())
   const { model } = useFileTree({
     preparedInput,
@@ -465,6 +467,20 @@ export function FileTreePanel({
       }
       handlers.onPathChange(selected)
       handlers.onFileSelected()
+    },
+    // Trees closes search on every row click; keep it open so results persist.
+    onSearchChange: (value) => {
+      if (value !== null) {
+        searchValue.current = value
+        return
+      }
+      if (!rowClickActive.current || !searchValue.current) {
+        searchValue.current = ""
+        return
+      }
+      const focusedPath = model.getFocusedPath()
+      model.setSearch(searchValue.current)
+      if (focusedPath) model.focusPath(focusedPath)
     },
     search: false,
     flattenEmptyDirectories: true,
@@ -1180,6 +1196,12 @@ export function FileTreePanel({
           model={model}
           aria-label={`${instance.name} files`}
           className="block size-full min-h-[210px]"
+          onClickCapture={() => {
+            rowClickActive.current = true
+            window.setTimeout(() => {
+              rowClickActive.current = false
+            })
+          }}
           onPointerDownCapture={(event) => {
             const directory = resolveTreeEventDirectory(event.nativeEvent)
             if (directory !== null) void fileIndex.ensureDirectory(directory)
@@ -1250,16 +1272,13 @@ export function FileTreePanel({
         className="pointer-events-none absolute inset-y-0 right-0 z-30 hidden w-px bg-border/80 md:block"
       />
 
-      <div
+      <PanelResizeHandle
         ref={resizeHandleRef}
-        role="separator"
-        tabIndex={0}
         aria-label="Resize file tree"
-        aria-orientation="vertical"
         aria-valuemin={fileTreeMinWidth}
         aria-valuemax={fileTreeMaxWidth}
         aria-valuenow={currentWidth.current}
-        className={`${collapsed ? "md:hidden" : "md:flex"} group absolute inset-y-0 -right-1 z-40 hidden w-2.5 cursor-col-resize touch-none items-center justify-center outline-none`}
+        className={`${collapsed ? "md:hidden" : "md:flex"} hidden`}
         onPointerDown={handleResizePointerDown}
         onPointerMove={handleResizePointerMove}
         onPointerUp={handleResizePointerEnd}
@@ -1272,12 +1291,7 @@ export function FileTreePanel({
           persistFileTreeWidth(applyFileTreeWidth(defaultFileTreeWidth()))
         }}
         onKeyDown={handleResizeKeyDown}
-      >
-        <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border/80 transition-colors group-hover:bg-primary/55 group-focus-visible:bg-primary/75 group-data-[resizing=true]:bg-primary" />
-        <span className="relative grid h-9 w-2.5 place-items-center overflow-hidden border border-primary/35 bg-background text-primary opacity-0 shadow-[0_0_14px_color-mix(in_oklch,var(--primary),transparent_70%)] transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 group-data-[resizing=true]:opacity-100">
-          <GripVertical className="size-2" />
-        </span>
-      </div>
+      />
     </aside>
   )
 }

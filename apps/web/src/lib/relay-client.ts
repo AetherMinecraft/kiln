@@ -265,7 +265,7 @@ function relayControlRequest(path: string, init?: RequestInit) {
     return { operation: "instance.provision.prepare" as const, payload: body }
   }
   const match = url.pathname.match(
-    /^\/v1\/instances\/([^/]+)(?:\/(tree|directory|directory-sizes|file-search|file-stat|file|file-mutations|actions|resources|console|console-completions|console-share|latest-log|ports|web-routes|startup|provision))?$/u
+    /^\/v1\/instances\/([^/]+)(?:\/(tree|directory|directory-sizes|file-search|file-stat|file|file-mutations|file-database|actions|resources|console|console-completions|console-share|latest-log|ports|web-routes|database-connections|startup|provision))?$/u
   )
   if (!match) throw new Error("Unsupported Relay request")
   const instanceId = decodeURIComponent(match[1])
@@ -362,6 +362,12 @@ function relayControlRequest(path: string, init?: RequestInit) {
       ? { operation: "instance.files.write" as const, payload }
       : { operation: "instance.files.read" as const, payload }
   }
+  if (resource === "file-database" && method === "POST") {
+    const payload = { ...body, instanceId }
+    return url.searchParams.get("mode") === "write"
+      ? { operation: "instance.files.database.write" as const, payload }
+      : { operation: "instance.files.database.read" as const, payload }
+  }
   if (resource === "file-mutations" && method === "POST") {
     return {
       operation: "instance.files.mutate.result" as const,
@@ -422,6 +428,12 @@ function relayControlRequest(path: string, init?: RequestInit) {
   if (resource === "ports" && method === "DELETE") {
     return {
       operation: "instance.network.ports.release" as const,
+      payload: { ...body, instanceId },
+    }
+  }
+  if (resource === "database-connections" && method === "DELETE") {
+    return {
+      operation: "instance.network.databases.remove" as const,
       payload: { ...body, instanceId },
     }
   }

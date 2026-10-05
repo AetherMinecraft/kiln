@@ -1,6 +1,7 @@
 import {
-  kilnGitHubContainerRegistry,
   LEGACY_KILN_GIT_REPO,
+  DEFAULT_KILN_GIT_REPO,
+  kilnImageRepository,
 } from "@workspace/contracts"
 
 // Official images retain the pre-rename source label until older Relays that
@@ -59,11 +60,10 @@ export function kilnComponent(value: string | undefined): KilnComponent | null {
 export function managedImageChannel(
   image: string,
   component: KilnComponent,
-  gitRepository?: string
+  repository = DEFAULT_KILN_GIT_REPO
 ): string | null {
-  const imageRepository = `${kilnGitHubContainerRegistry(gitRepository)}/${component}`
-  const stable = `${imageRepository}:latest`
-  const nightly = `${imageRepository}:latest-nightly`
+  const stable = `${kilnImageRepository(component, repository)}:latest`
+  const nightly = `${kilnImageRepository(component, repository)}:latest-nightly`
   return image === stable || image === nightly ? image : null
 }
 

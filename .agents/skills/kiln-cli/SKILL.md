@@ -55,8 +55,9 @@ kiln login
 kiln login https://hearth.example.com --profile staging --name workstation
 ```
 
-`kiln login` targets `https://kiln.site` by default and normally opens a
-browser. Add `--no-open` when the environment cannot launch one. Do not start a
+`kiln login` uses an explicit URL, `KILN_URL`, the selected saved profile, then
+the distribution's default URL, and normally opens a browser. Official builds
+default to `https://kiln.site`; forks without a default require a panel URL. Add `--no-open` when the environment cannot launch one. Do not start a
 new login when an authenticated profile already targets the requested Hearth.
 `kiln logout` revokes the credential before removing both the saved profile and
 its system credential. If native credential deletion fails, the CLI reports a
@@ -66,6 +67,27 @@ Use `--profile <name>` on any command to select a saved profile. `KILN_URL`,
 `KILN_TOKEN`, and `KILN_CONFIG` support isolated automation, but prefer the
 user's existing authenticated profile for interactive work.
 
+## Account and resource permissions
+
+CLI credentials retain the account's current resource permissions, including
+linked presets and inherited Relay assignments. New invitations grant nothing
+until accepted. A user must be verified and enabled to run resource commands.
+Disabling an account pauses authority without deleting the saved CLI credential;
+re-enabling resumes it if the credential is still valid. Explicit logout,
+revocation, and expiration still invalidate credentials.
+
+Power commands check the specific action. File writes, deletion, and chmod use
+separate permissions; write includes read. Changing only disk limits requires
+`instance.limits.write`; it does not require configuration-write permission.
+Use `--no-start` on a stopped server when no power permission is granted;
+reconfiguring a running server requires the corresponding stop/restart permission.
+Changing a Brick or non-resource startup variables requires
+`instance.configuration.write`. Resource variables and disk limits require
+`instance.limits.write`; changes affecting both require both permissions.
+Creating a backup (including a restore safety backup) in a user-owned destination
+also requires `backup.download`, because it exports the backup contents. A read-only CLI credential never gains write
+access from a more permissive preset.
+
 ## Update the CLI
 
 Update the locally installed CLI with:
@@ -74,7 +96,8 @@ Update the locally installed CLI with:
 kiln update
 ```
 
-This reinstalls `kiln-cli@latest` globally through pnpm or Bun when the CLI can
+This reinstalls the distribution's embedded npm package at `latest` (`kiln-cli`
+for official builds) globally through pnpm or Bun when the CLI can
 identify that installer, with npm as the default and fallback. It updates only
 the CLI executable; it does not update Hearth, Relays, or managed servers, and
 it does not require authentication.
@@ -167,7 +190,8 @@ kiln servers create <relay-id> https://example.com/custom-brick.yml \
 
 Server creation requires a full-access CLI credential. Platform administrators
 can create on any Relay; Bring Your Own Relays users can create only on Relays
-they paired. Disk quotas must be at least `0.1GiB`, matching the Relay
+they paired. Omitting `--disk` provisions `5GiB` of storage. Disk quotas must
+be at least `0.1GiB`, matching the Relay
 allocation minimum. New and renamed server names are limited to 32 characters;
 read commands still accept legacy stored names up to 120 characters.
 `--no-start` leaves the new server stopped.
@@ -382,7 +406,7 @@ Managed deletion additionally requires `--delete-managed`, a version 1 JSON
 `--max-delete` ceiling (default zero). Protected worlds, logs, backups, crash
 reports, undeclared paths, directories, excluded paths, and `.kiln` data are
 never deletion candidates. Hearth requires `instance.files.write` and, for
-deletion, `instance.files.delete-managed`; Relay requires
+deletion, `instance.files.delete`; Relay requires
 `instance.files.sync`. Omitting `--atomic` retains direct, non-deleting sync.
 
 Ask the Relay to download a file directly from an HTTPS URL:

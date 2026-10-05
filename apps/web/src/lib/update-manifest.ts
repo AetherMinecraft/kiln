@@ -1,9 +1,11 @@
 import {
   isKilnReleaseVersion,
-  kilnGitHubContainerRegistry,
+  kilnImageRepository,
   kilnReleaseVersionCore,
   relayControlProtocolVersion,
 } from "@workspace/contracts"
+
+import { kilnGitRepository } from "@/lib/environment"
 
 import type { KilnReleaseManifest } from "@/effect/github-releases"
 
@@ -17,7 +19,7 @@ export function validateUpdateManifest(
   manifest: KilnReleaseManifest,
   version: string,
   component: "hearth" | "relay",
-  gitRepository: string
+  repository = kilnGitRepository()
 ): void {
   if (manifest.version !== version) {
     throw new Error("The release manifest version does not match its tag")
@@ -38,9 +40,8 @@ export function validateUpdateManifest(
       `This release requires Relay protocol ${manifest.compatibility.relayProtocol}; Hearth supports protocol ${relayControlProtocolVersion}`
     )
   }
-  const imageRegistry = kilnGitHubContainerRegistry(gitRepository)
   for (const [name, component] of Object.entries(manifest.components)) {
-    if (component.image !== `${imageRegistry}/${name}`) {
+    if (component.image !== kilnImageRepository(name, repository)) {
       throw new Error("The release manifest contains an unexpected image")
     }
     if (!/^sha256:[a-f0-9]{64}$/u.test(component.digest)) {

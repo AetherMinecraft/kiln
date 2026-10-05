@@ -2,6 +2,12 @@ import { defineConfig } from "vite-plus"
 
 export default defineConfig({
   pack: {
+    deps: {
+      // tsdown <0.23 compatibility: resolve external dependency subpaths.
+      // Remove to preserve subpath imports as written (the new default).
+      // https://tsdown.dev/options/dependencies#deps-resolvedepsubpath
+      resolveDepSubpath: true,
+    },
     dts: true,
     entry: ["src/index.ts"],
     format: "esm",
@@ -12,6 +18,7 @@ export default defineConfig({
   run: {
     tasks: {
       build: "vp pack",
+      test: "vp test run",
       typecheck: "tsc --noEmit",
     },
   },

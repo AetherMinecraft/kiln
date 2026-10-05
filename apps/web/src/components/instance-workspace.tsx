@@ -60,7 +60,7 @@ import type {
   InstanceWorkspacePermissions,
 } from "@/components/instance-workspace-context"
 import { WorkspaceFrame } from "@/components/workspace-frame"
-import { roleHasPermission } from "@/lib/permissions"
+import { canAccessInstancePermission } from "@/lib/navigation-destinations"
 import { provisioningFailureDiagnostics } from "@/lib/provisioning-diagnostics"
 import {
   beginPendingPowerAction,
@@ -618,24 +618,27 @@ const InstancePowerControlsBoundary = React.memo(
     const { data: capabilities } = useSuspenseQuery(
       accessCapabilitiesQueryOptions()
     )
-    const canControlPower = React.useMemo(() => {
-      if (!instance) return false
-      return (
-        capabilities.isPlatformAdmin ||
-        capabilities.grants.some(
-          (grant) =>
-            roleHasPermission(grant.role, "instance.power") &&
-            grant.relayId === instance.relayId &&
-            (grant.resourceType === "relay"
-              ? grant.resourceId === instance.relayId
-              : grant.resourceId === instance.id)
+    const powerPermissions = React.useMemo(() => {
+      const can = (action: ServerAction) =>
+        Boolean(
+          instance &&
+          canAccessInstancePermission(
+            capabilities,
+            instance,
+            `instance.power.${action}`
+          )
         )
-      )
-    }, [capabilities.grants, capabilities.isPlatformAdmin, instance])
+      return {
+        start: can("start"),
+        stop: can("stop"),
+        restart: can("restart"),
+        kill: can("kill"),
+      }
+    }, [capabilities, instance])
 
     return instance ? (
       <InstancePowerControls
-        canControlPower={canControlPower}
+        powerPermissions={powerPermissions}
         instance={instance}
         onError={onError}
       />
@@ -807,13 +810,13 @@ function InstanceRouteTitle() {
 
 function ServerPowerControls({
   action,
-  canControlPower,
+  powerPermissions,
   instance,
   onAction,
   relayConnected,
 }: {
   action: ServerAction | null
-  canControlPower: boolean
+  powerPermissions: Record<ServerAction, boolean>
   instance: Pick<InstanceWorkspaceInstance, "id" | "name" | "provisioning"> &
     Pick<InstanceRuntime, "observedState">
   onAction: (action: ServerAction) => Promise<void>
@@ -821,7 +824,7 @@ function ServerPowerControls({
 }) {
   const [serverActionsOpen, setServerActionsOpen] = React.useState(false)
   const [confirmKill, setConfirmKill] = React.useState(false)
-  if (!canControlPower) return null
+  if (!Object.values(powerPermissions).some(Boolean)) return null
 
   const isRunning = instance.observedState === "running"
   const isStarting = instance.observedState === "starting"
@@ -839,10 +842,13 @@ function ServerPowerControls({
     isProvisioning
   const controlsUnavailable =
     !relayConnected || action !== null || isProvisioning
-  const startUnavailable = controlsUnavailable || powerIsOn || isStopping
-  const stopUnavailable = controlsUnavailable || !powerIsOn || isStopping
+  const startUnavailable =
+    !powerPermissions.start || controlsUnavailable || powerIsOn || isStopping
+  const stopUnavailable =
+    !powerPermissions.stop || controlsUnavailable || !powerIsOn || isStopping
 
   function runAction(nextAction: ServerAction) {
+    if (!powerPermissions[nextAction]) return
     setServerActionsOpen(false)
     setConfirmKill(false)
     void onAction(nextAction)
@@ -858,7 +864,7 @@ function ServerPowerControls({
             ? "hidden h-9 w-[6.5rem] justify-center gap-1.5 !border-red-500/65 !bg-red-600 px-3 text-xs !text-white shadow-none hover:!border-red-400 hover:!bg-red-500 disabled:!border-red-500/35 disabled:!bg-red-600/45 disabled:!text-white/70 md:inline-flex"
             : "hidden h-9 w-[6.5rem] justify-center gap-1.5 !border-blue-500/65 !bg-blue-600 px-3 text-xs !text-white shadow-none hover:!border-blue-400 hover:!bg-blue-500 md:inline-flex"
         }
-        disabled={controlsUnavailable || isStopping}
+        disabled={powerIsOn ? stopUnavailable : startUnavailable}
         onClick={() => runAction(powerIsOn ? "stop" : "start")}
       >
         {powerIsTransitioning ? (
@@ -933,7 +939,7 @@ function ServerPowerControls({
                   variant="outline"
                   size="sm"
                   className="!border-red-500/65 !bg-red-600 !text-white hover:!border-red-400 hover:!bg-red-500"
-                  disabled={controlsUnavailable}
+                  disabled={!powerPermissions.kill || controlsUnavailable}
                   onClick={() => runAction("kill")}
                 >
                   <OctagonX />
@@ -964,14 +970,21 @@ function ServerPowerControls({
               />
               <PowerActionButton
                 description="Gracefully stop and start"
-                disabled={controlsUnavailable || !isRunning}
+                disabled={
+                  !powerPermissions.restart || controlsUnavailable || !isRunning
+                }
                 icon={<RotateCw className="size-3.5" />}
                 label="Restart"
                 onClick={() => runAction("restart")}
               />
               <PowerActionButton
                 description="Terminate immediately"
-                disabled={controlsUnavailable || !powerIsOn || isStopping}
+                disabled={
+                  !powerPermissions.kill ||
+                  controlsUnavailable ||
+                  !powerIsOn ||
+                  isStopping
+                }
                 icon={<OctagonX className="size-3.5" />}
                 label="Kill"
                 tone="kill"
@@ -986,11 +999,11 @@ function ServerPowerControls({
 }
 
 function InstancePowerControls({
-  canControlPower,
+  powerPermissions,
   instance,
   onError,
 }: {
-  canControlPower: boolean
+  powerPermissions: Record<ServerAction, boolean>
   instance: InstanceWorkspaceInstance
   onError: (error: string | null) => void
 }) {
@@ -1030,6 +1043,7 @@ function InstancePowerControls({
   const handleAction = React.useCallback(
     async (nextAction: ServerAction) => {
       if (
+        !powerPermissions[nextAction] ||
         !relayConnected ||
         !observedState ||
         instance.provisioning ||
@@ -1105,6 +1119,7 @@ function InstancePowerControls({
       instance.provisioning,
       instance.relayId,
       mutateRelayAction,
+      powerPermissions,
       onError,
       observedState,
       queryClient,
@@ -1113,7 +1128,7 @@ function InstancePowerControls({
   )
 
   if (!observedState) {
-    if (!canControlPower) return null
+    if (!Object.values(powerPermissions).some(Boolean)) return null
     return (
       <div
         className="col-start-2 row-start-1 flex items-center justify-end gap-1.5 xl:col-start-3"
@@ -1127,7 +1142,7 @@ function InstancePowerControls({
   return (
     <ServerPowerControls
       action={action}
-      canControlPower={canControlPower}
+      powerPermissions={powerPermissions}
       instance={{
         id: instance.id,
         name: instance.name,
@@ -1689,16 +1704,8 @@ function ResourceHistoryPopover({
   historyStore: ResourceHistoryStore
   children: React.ReactElement
 }) {
-  const [replayToken, setReplayToken] = React.useState(0)
-
   return (
-    <HoverCard
-      openDelay={160}
-      closeDelay={100}
-      onOpenChange={(open) => {
-        if (open) setReplayToken((current) => current + 1)
-      }}
-    >
+    <HoverCard openDelay={160} closeDelay={100}>
       <HoverCardTrigger asChild>{children}</HoverCardTrigger>
       <HoverCardContent
         align="center"
@@ -1707,11 +1714,7 @@ function ResourceHistoryPopover({
         collisionPadding={12}
         className="w-[min(20rem,calc(100vw-1.5rem))] border-border/90 bg-popover p-0 shadow-2xl"
       >
-        <ResourceHistoryCard
-          resource={resource}
-          historyStore={historyStore}
-          replayToken={replayToken}
-        />
+        <ResourceHistoryCard resource={resource} historyStore={historyStore} />
       </HoverCardContent>
     </HoverCard>
   )
@@ -1720,22 +1723,19 @@ function ResourceHistoryPopover({
 function ResourceHistoryCard({
   resource,
   historyStore,
-  replayToken,
 }: {
   resource: ResourceItem
   historyStore: ResourceHistoryStore
-  replayToken: number
 }) {
   const history = React.useSyncExternalStore(
     historyStore.subscribe,
     historyStore.getSnapshot,
     historyStore.getSnapshot
   )
-  const now = Date.now()
-  const domainStart = now - RESOURCE_HISTORY_WINDOW_MS
-  const visibleHistory = history.filter(
-    (sample) => sample.timestamp >= domainStart
-  )
+  const visibleHistory = React.useMemo(() => {
+    const domainStart = Date.now() - RESOURCE_HISTORY_WINDOW_MS
+    return history.filter((sample) => sample.timestamp >= domainStart)
+  }, [history])
   const values = visibleHistory
     .map((sample) => sample[resource.id])
     .filter((value): value is number => value !== null)
@@ -1744,13 +1744,17 @@ function ResourceHistoryCard({
     : null
   const peak = values.length ? Math.max(...values) : null
   const latest = visibleHistory.at(-1)
-  const chartData = visibleHistory.map((sample) => ({
-    timestamp: sample.timestamp,
-    value: sample[resource.id],
-    secondary: sample.storageNode,
-    received: sample.networkReceived,
-    sent: sample.networkSent,
-  }))
+  const chartData = React.useMemo(
+    () =>
+      visibleHistory.map((sample) => ({
+        timestamp: sample.timestamp,
+        value: sample[resource.id],
+        secondary: sample.storageNode,
+        received: sample.networkReceived,
+        sent: sample.networkSent,
+      })),
+    [resource.id, visibleHistory]
+  )
 
   return (
     <div className="overflow-hidden rounded-[inherit]">
@@ -1775,10 +1779,7 @@ function ResourceHistoryCard({
             resourceId={resource.id}
             label={resource.label}
             color={resource.chartColor}
-            domainStart={domainStart}
-            domainEnd={now}
             maxValue={resource.chartMax}
-            replayToken={replayToken}
             formatValue={(value) => formatHistoryValue(resource.id, value)}
           />
         </React.Suspense>
