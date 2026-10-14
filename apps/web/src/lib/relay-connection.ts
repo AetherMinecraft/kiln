@@ -18,14 +18,17 @@ import {
   relayControlMaxFrameBytes,
   relayControlRequestTimeoutMs,
   relayControlProtocol,
+  relaySnapshotControlDelta,
   relaySnapshotDeltaFeature,
   relaySnapshotDeltaSchema,
+  relaySnapshotNodeResourcesFeature,
   relaySnapshotSchema,
 } from "@workspace/contracts"
 import type {
   RelayAuthChallenge,
   RelayControlOperation,
   RelayControlRequest,
+  RelayNode,
   RelayProxyBrowserMetadata,
   RelaySnapshot,
   RelaySnapshotDelta,
@@ -338,6 +341,15 @@ export function relayConnectionState(relayId: string): RelayConnectionState {
   )
 }
 
+/**
+ * The Relay node last pushed over this Hearth process's own control socket.
+ * Each process keeps its own connections, so this is null until this process
+ * has authenticated with the Relay. Callers must authorize the reader first.
+ */
+export function relayConnectionNode(relayId: string): RelayNode | null {
+  return connections.get(relayId)?.pushedNode ?? null
+}
+
 export function relayConnectionBrowserMetadata(
   relayId: string
 ): RelayProxyBrowserMetadata | null {
@@ -404,6 +416,13 @@ class RelayConnection {
 
   get state(): RelayConnectionState {
     return this.#state
+  }
+
+  /** The node from the pushed snapshot, without consuming it for RPC reads. */
+  get pushedNode(): RelayNode | null {
+    return this.#state.status === "authenticated"
+      ? (this.#pushedSnapshot?.node ?? null)
+      : null
   }
 
   get browserMetadata(): RelayProxyBrowserMetadata | null {
@@ -909,15 +928,23 @@ class RelayConnection {
               delta.data
             )
             this.#hasPushedSnapshot = true
-            publishRealtimeChange({
-              delta: delta.data,
-              directoryChanged: snapshotDeltaChangesDirectory(
-                previousSnapshot,
-                delta.data
-              ),
-              relayId: this.#relay.id,
-              type: "relay.snapshot.delta",
-            })
+            // Resource-only node samples refresh the cached snapshot without
+            // waking browsers on the fleet-wide realtime channel.
+            const controlDelta = relaySnapshotControlDelta(
+              previousSnapshot,
+              delta.data
+            )
+            if (controlDelta) {
+              publishRealtimeChange({
+                delta: controlDelta,
+                directoryChanged: snapshotDeltaChangesDirectory(
+                  previousSnapshot,
+                  controlDelta
+                ),
+                relayId: this.#relay.id,
+                type: "relay.snapshot.delta",
+              })
+            }
           }
           return
         }
@@ -984,6 +1011,7 @@ class RelayConnection {
         clientId: credentials.clientId,
         features: [
           relaySnapshotDeltaFeature,
+          relaySnapshotNodeResourcesFeature,
           relayBrowserCapabilityV2Feature,
           relayBrowserLeaseRenewalV1Feature,
           relayFileRequestReplayV1Feature,

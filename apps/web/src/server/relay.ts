@@ -107,7 +107,7 @@ import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { resolveMclogsApiUrl } from "@/lib/mclogs"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
-import { isRelayUpdating } from "@/lib/relay-connection"
+import { isRelayUpdating, relayConnectionNode } from "@/lib/relay-connection"
 import { updateInstanceSourceName } from "@/lib/instance-registry"
 
 const instanceInputSchema = z.object({
@@ -249,6 +249,31 @@ export const getRelaySnapshot = createServerFn({ method: "POST" }).handler(
     return authorizedFleetSnapshot(user, true)
   }
 )
+
+/**
+ * Live Relay memory for the Relays table. After authorization it reads the node
+ * this process's control socket last received (kept current by node resource
+ * deltas): no Relay round trip, cache read, or snapshot validation. A Relay is
+ * omitted while this process has no authenticated connection to it, and its
+ * cell shows no reading; another Hearth process's sockets are not consulted.
+ * `relayMemory` is null for Relays that predate memory reporting.
+ */
+export const getRelayMemoryReadings = createServerFn({
+  method: "GET",
+}).handler(async () => {
+  const user = await requireEligibleResourceUser()
+  const { grants, relays } = await authorizedRelays(
+    user,
+    await listPersistedRelays()
+  )
+  return relays.flatMap((relay) => {
+    if (!relay.enabled || !canReadRelayNode(user, relay.id, grants)) return []
+    const node = relayConnectionNode(relay.id)
+    return node
+      ? [{ relayId: relay.id, relayMemory: node.relayMemory ?? null }]
+      : []
+  })
+})
 
 export const getFreshRelayConnectionState = createServerFn({
   method: "POST",
