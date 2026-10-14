@@ -126,6 +126,8 @@ import { applyStoredInstanceNames } from "./instance-names.js"
 import { normalizedRoute } from "./route-label.js"
 import { uploadConsoleLogToMclogs } from "./mclogs.js"
 import { closeRelayServer } from "./shutdown.js"
+import { handleHealthRequest, listenRelayHealthServerEffect } from "./health.js"
+import { rejectMalformedUpgrades, requestUrl } from "./request-url.js"
 import { attachSftpServer } from "./sftp-server.js"
 import { actionsForRole, relayActions } from "./permissions.js"
 import type { RelayAction } from "./permissions.js"
@@ -600,9 +602,18 @@ const requestHandler = (
   request: IncomingMessage,
   response: ServerResponse
 ): void => {
+  // Route handlers below parse the target with `new URL()`; reject what it
+  // cannot parse (e.g. `//%`) before they run.
+  if (!requestUrl(request)) {
+    json(response, 400, {
+      error: "Invalid request target",
+      code: "invalid_request",
+    })
+    return
+  }
   Effect.runFork(
     relayOperation(async () => {
-      if (healthCheck(request, response)) return
+      if (handleHealthRequest(request, response)) return
       if (trustProbe(request, response)) return
       if (bootstrapDiscovery(request, response)) return
       if (await pairingRequest(request, response)) return
@@ -620,7 +631,7 @@ const requestHandler = (
             return
           }
           Sentry.captureException(cause, {
-            tags: { "kiln.operation": normalizedRequestOperation(request.url) },
+            tags: { "kiln.operation": normalizedRequestOperation(request) },
           })
           console.error(cause)
           json(response, 500, {
@@ -650,6 +661,7 @@ const controlSocket = attachControlSocket({
   subscribeSnapshots: (listener) =>
     snapshotHub.subscribe(({ snapshot }) => listener(snapshot), false),
 })
+rejectMalformedUpgrades(server)
 const browserSocket = attachBrowserSocket({
   config,
   consoleSources: consoleSources(docker, databases),
@@ -663,6 +675,7 @@ const browserSocket = attachBrowserSocket({
 })
 let startingSftpServer: Awaited<ReturnType<typeof attachSftpServer>> | null =
   null
+let healthServer: HttpServer | null = null
 const sftpServer = await Effect.runPromise(
   relayOperation(() =>
     attachSftpServer({
@@ -687,6 +700,17 @@ const sftpServer = await Effect.runPromise(
       relayOperation(() => lifecycle.assertPrivateProxyListener())
     ),
     Effect.tap(() => listenRelayServerEffect(server, config.port, config.host)),
+    // Start the Docker healthcheck listener only once the main listener is up,
+    // so "healthy" keeps meaning the Relay is serving.
+    Effect.tap(() =>
+      listenRelayHealthServerEffect(config.healthPort).pipe(
+        Effect.tap((listening) =>
+          Effect.sync(() => {
+            healthServer = listening
+          })
+        )
+      )
+    ),
     Effect.onError(() =>
       Effect.sync(() => {
         tailscaleFirewallFiber.interruptUnsafe()
@@ -913,6 +937,8 @@ function shutdownRelay(signal: NodeJS.Signals): Promise<void> {
     Effect.gen(function* () {
       yield* Effect.sync(() => {
         console.log(`Received ${signal}; shutting down relay`)
+        healthServer?.close()
+        healthServer?.closeAllConnections()
         tailscaleFirewallFiber.interruptUnsafe()
         tlsRefreshFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
@@ -2272,20 +2298,8 @@ function serializeWebRouteMutation<T>(mutate: () => Promise<T>): Promise<T> {
   return Effect.runPromise(webRouteMutation.withPermit(relayOperation(mutate)))
 }
 
-function normalizedRequestOperation(url: string | undefined): string {
-  return normalizedRoute(new URL(url ?? "/", "http://relay").pathname)
-}
-
-function healthCheck(
-  request: IncomingMessage,
-  response: ServerResponse
-): boolean {
-  const method = request.method ?? "GET"
-  if (method !== "GET" && method !== "HEAD") return false
-  const url = new URL(request.url ?? "/", "http://relay")
-  if (url.pathname !== "/health") return false
-  response.writeHead(204, { "Cache-Control": "no-store" }).end()
-  return true
+function normalizedRequestOperation(request: IncomingMessage): string {
+  return normalizedRoute(requestUrl(request)?.pathname ?? "/")
 }
 
 function listenRelayServerEffect(
