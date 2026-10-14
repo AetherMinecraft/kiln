@@ -11,6 +11,7 @@ const HEARTH_FILE_FALLBACK_LIMIT = 2 * 1024 * 1024
 class DirectRelayTransferError extends Error {}
 
 interface FileTransferInput {
+  signal?: AbortSignal
   instanceId: string
   path: string
   relayId: string
@@ -191,6 +192,7 @@ function submitNativeDownload(
 export async function uploadRelayFile(
   input: FileTransferInput & {
     file: File
+    onProgress?: (uploadedBytes: number) => void
   }
 ): Promise<{
   modifiedAt: string
@@ -200,7 +202,12 @@ export async function uploadRelayFile(
 }> {
   const result = await runTransfer(
     transferOperation(async () => {
-      const response = await relayFileRequest(input, "PUT", input.file)
+      const response = await relayFileRequest(
+        input,
+        "PUT",
+        input.file,
+        input.onProgress
+      )
       if (!response.ok) throw await transferError(response, "upload")
       return (await response.json()) as unknown
     }).pipe(
@@ -209,6 +216,7 @@ export async function uploadRelayFile(
           return Effect.fail(directTransferUnavailable("upload", cause))
         }
         return transferOperation(async () => {
+          input.onProgress?.(0)
           const bytes = new Uint8Array(await input.file.arrayBuffer())
           const content = new TextDecoder("utf-8", { fatal: true }).decode(
             bytes
@@ -252,6 +260,7 @@ export async function uploadRelayFile(
     typeof value.size !== "number"
   )
     throw new Error("Relay returned an invalid upload response")
+  input.onProgress?.(input.file.size)
   return {
     modifiedAt: value.modifiedAt,
     path: value.path,
@@ -263,17 +272,21 @@ export async function uploadRelayFile(
 async function relayFileRequest(
   input: FileTransferInput,
   method: "HEAD" | "PUT",
-  body?: BodyInit
+  body?: File,
+  onProgress?: (uploadedBytes: number) => void
 ): Promise<Response> {
   const authorization = await relayFileAuthorization(input, method)
   return runTransfer(
     transferOperation(() =>
-      fetch(authorization.url, {
-        ...(body === undefined ? {} : { body }),
-        headers: authorization.headers,
-        method,
-        mode: "cors",
-      })
+      body && onProgress
+        ? uploadRelayRequest(authorization, body, onProgress)
+        : fetch(authorization.url, {
+            ...(body === undefined ? {} : { body }),
+            headers: authorization.headers,
+            method,
+            mode: "cors",
+            signal: input.signal,
+          })
     ).pipe(
       Effect.mapError(
         (cause) =>
@@ -284,6 +297,33 @@ async function relayFileRequest(
       )
     )
   )
+}
+
+function uploadRelayRequest(
+  authorization: RelayFileAuthorization,
+  file: File,
+  onProgress: (uploadedBytes: number) => void
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    request.upload.onprogress = (event) =>
+      onProgress(Math.min(event.loaded, file.size))
+    request.onload = () =>
+      resolve(
+        new Response(request.responseText || null, {
+          status: request.status,
+          statusText: request.statusText,
+        })
+      )
+    request.onerror = () =>
+      reject(new TypeError("Relay upload connection failed"))
+    request.onabort = () => reject(new Error("Relay upload was aborted"))
+    request.open("PUT", authorization.url)
+    for (const [name, value] of Object.entries(authorization.headers)) {
+      request.setRequestHeader(name, value)
+    }
+    request.send(file)
+  })
 }
 
 async function relayFileAuthorization(

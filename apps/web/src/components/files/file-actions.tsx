@@ -14,12 +14,19 @@ import {
   DialogTitle,
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+} from "@workspace/ui/components/input-group"
 import { dismissToast, showToast } from "@workspace/ui/components/sonner"
 
 import {
   directoryPath,
   isUnarchiveSupportedPath,
   joinFilePath,
+  movedFilePath,
+  normalizeDirectoryPath,
   unarchiveDestinationPath,
   type FileActionsController,
   type FileWorkspaceAction,
@@ -35,11 +42,26 @@ import { mutateRelayFiles } from "@/server/relay"
 type FileActionDialogState =
   | { kind: "archive"; paths: ReadonlyArray<string> }
   | { kind: "delete"; paths: ReadonlyArray<string> }
+  | { kind: "move"; path: string; destination: string }
+  | { kind: "move-to"; path: string }
   | { kind: "rename"; path: string }
   | null
 
 function formatName(path: string) {
   return path.split("/").filter(Boolean).at(-1) ?? path
+}
+
+// The input sits after a fixed `/data/`, so drop that prefix from pasted paths.
+function withoutDataPrefix(value: string) {
+  return value.replace(/^\/+(?:data(?:\/+|$))?/u, "")
+}
+
+function moveTargetDirectory(value: string): string | null {
+  const directory = normalizeDirectoryPath(
+    withoutDataPrefix(value.trim().replace(/[\\/]+/gu, "/"))
+  )
+  const segments = directory.split("/")
+  return segments.includes(".") || segments.includes("..") ? null : directory
 }
 
 export function useFileActions({
@@ -57,7 +79,7 @@ export function useFileActions({
 }) {
   const [dialog, setDialog] = React.useState<FileActionDialogState>(null)
   const [downloadPath, setDownloadPath] = React.useState<string | null>(null)
-  const [downloadPending, setDownloadPending] = React.useState(false)
+  const settleMove = React.useRef<((moved: boolean) => void) | null>(null)
   const mutation = useMutation({
     mutationFn: (input: RelayFileMutationInput) =>
       mutateRelayFiles({
@@ -126,49 +148,66 @@ export function useFileActions({
     [runMutation]
   )
 
-  const downloadArchive = React.useCallback(
-    async (paths: ReadonlyArray<string>, requestedName: string) => {
-      const toastId = showToast({
+  // Resolves once the move is confirmed and applied, or false when cancelled.
+  const move = React.useCallback(
+    (path: string, destination: string) => {
+      if (!canWrite) return Promise.resolve(false)
+      settleMove.current?.(false)
+      return new Promise<boolean>((resolve) => {
+        settleMove.current = resolve
+        setDialog({ kind: "move", path, destination })
+      })
+    },
+    [canWrite]
+  )
+
+  const closeDialog = React.useCallback(() => {
+    settleMove.current?.(false)
+    settleMove.current = null
+    setDialog(null)
+  }, [])
+
+  const archiveMutation = useMutation({
+    mutationFn: ({
+      paths,
+      requestedName,
+    }: {
+      paths: ReadonlyArray<string>
+      requestedName: string
+    }) =>
+      downloadRelayArchive({
+        instanceId: instance.id,
+        name: requestedName.endsWith(".zip")
+          ? requestedName
+          : `${requestedName}.zip`,
+        paths,
+        relayId: instance.relayId,
+      }),
+    onMutate: () =>
+      showToast({
         type: "loading",
         message: "Preparing download",
         duration: Number.POSITIVE_INFINITY,
-      })
-      setDownloadPending(true)
-      await Effect.runPromise(
-        Effect.tryPromise({
-          try: () =>
-            downloadRelayArchive({
-              instanceId: instance.id,
-              name: requestedName.endsWith(".zip")
-                ? requestedName
-                : `${requestedName}.zip`,
-              paths,
-              relayId: instance.relayId,
-            }),
-          catch: (cause) => cause,
-        }).pipe(
-          Effect.match({
-            onFailure: (cause) => {
-              dismissToast(toastId)
-              showToast({
-                type: "error",
-                message: "Download failed",
-                description:
-                  cause instanceof Error
-                    ? cause.message
-                    : "The Relay could not prepare this download.",
-              })
-            },
-            onSuccess: () => {
-              dismissToast(toastId)
-              showToast({ type: "success", message: "Download started" })
-            },
-          }),
-          Effect.ensuring(Effect.sync(() => setDownloadPending(false)))
-        )
-      )
+      }),
+    onSuccess: () =>
+      showToast({ type: "success", message: "Download started" }),
+    onError: (cause) =>
+      showToast({
+        type: "error",
+        message: "Download failed",
+        description:
+          cause instanceof Error
+            ? cause.message
+            : "The Relay could not prepare this download.",
+      }),
+    onSettled: (_, __, ___, toastId) => {
+      if (toastId !== undefined) dismissToast(toastId)
     },
-    [instance.id, instance.relayId]
+  })
+  const downloadArchive = React.useCallback(
+    (paths: ReadonlyArray<string>, requestedName: string) =>
+      archiveMutation.mutate({ paths, requestedName }),
+    [archiveMutation.mutate]
   )
 
   const request = React.useCallback(
@@ -186,8 +225,11 @@ export function useFileActions({
         return
       }
       if (!canWrite) return
-      if (action === "rename" && paths.length === 1) {
-        setDialog({ kind: "rename", path: paths[0] ?? "" })
+      if ((action === "rename" || action === "move") && paths.length === 1) {
+        setDialog({
+          kind: action === "move" ? "move-to" : "rename",
+          path: paths[0] ?? "",
+        })
         return
       }
       if (action === "archive") {
@@ -228,6 +270,66 @@ export function useFileActions({
 
   async function submitDialog(value?: string) {
     if (!dialog) return
+    if (dialog.kind === "move") {
+      const settle = settleMove.current
+      settleMove.current = null
+      const moved = await runMutation(
+        {
+          operation: "rename",
+          path: dialog.path,
+          destination: dialog.destination,
+        },
+        "Item moved"
+      )
+      if (moved) {
+        const selectedPath = movedFilePath(
+          selectionStore.getSnapshot(),
+          dialog.path,
+          dialog.destination
+        )
+        if (selectedPath !== null) onPathChange(selectedPath)
+      }
+      setDialog(null)
+      settle?.(Boolean(moved))
+      return
+    }
+    if (dialog.kind === "move-to") {
+      const directory = moveTargetDirectory(value ?? "")
+      if (directory === null) {
+        showToast({
+          type: "error",
+          message: "Enter a valid folder path",
+          description: "Folder paths cannot contain . or .. segments.",
+        })
+        return
+      }
+      const destination = `${directory}${dialog.path.slice(directoryPath(dialog.path).length)}`
+      if (destination === dialog.path) {
+        setDialog(null)
+        return
+      }
+      if (dialog.path.endsWith("/") && destination.startsWith(dialog.path)) {
+        showToast({
+          type: "error",
+          message: "Cannot move a folder into itself",
+        })
+        return
+      }
+      const result = await runMutation(
+        { operation: "rename", path: dialog.path, destination },
+        "Item moved"
+      )
+      if (result) {
+        const selectedPath = movedFilePath(
+          selectionStore.getSnapshot(),
+          dialog.path,
+          destination
+        )
+        if (selectedPath !== null) onPathChange(selectedPath)
+        setDialog(null)
+      }
+      return
+    }
     if (dialog.kind === "delete") {
       const result = await runMutation(
         { operation: "delete", paths: [...dialog.paths] },
@@ -271,10 +373,12 @@ export function useFileActions({
 
   return {
     controller: {
-      busy: mutation.isPending || downloadPending,
+      busy: mutation.isPending || archiveMutation.isPending,
       canWrite,
       request,
+      move,
     } satisfies FileActionsController,
+    closeDialog,
     dialog,
     downloadPath,
     setDialog,
@@ -297,19 +401,60 @@ export function FileActionDialogHost({
   const initialValue =
     dialog?.kind === "rename"
       ? formatName(dialog.path)
-      : dialog?.kind === "archive"
-        ? dialog.paths.length === 1
-          ? `${formatName(dialog.paths[0] ?? "archive")}.zip`
-          : "selected-files.zip"
-        : ""
+      : dialog?.kind === "move-to"
+        ? directoryPath(dialog.path)
+        : dialog?.kind === "archive"
+          ? dialog.paths.length === 1
+            ? `${formatName(dialog.paths[0] ?? "archive")}.zip`
+            : "selected-files.zip"
+          : ""
   const [value, setValue] = React.useState(initialValue)
   if (!dialog) return null
+  // An empty move destination is the /data root.
+  const missingValue =
+    (dialog.kind === "rename" || dialog.kind === "archive") && !value.trim()
+  if (dialog.kind === "move") {
+    return (
+      <Dialog open onOpenChange={onOpenChange}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              Move {dialog.path.endsWith("/") ? "folder" : "file"}?
+            </DialogTitle>
+          </DialogHeader>
+          <dl className="type-code grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5">
+            <dt className="text-muted-foreground">From</dt>
+            <dd className="truncate">/data/{dialog.path}</dd>
+            <dt className="text-muted-foreground">To</dt>
+            <dd className="truncate text-primary">
+              /data/{dialog.destination}
+            </dd>
+          </dl>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => onOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            <Button autoFocus disabled={busy} onClick={() => void onSubmit()}>
+              {busy ? <LoaderCircle className="animate-spin" /> : null}
+              Move
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    )
+  }
   const title =
     dialog.kind === "rename"
       ? "Rename item"
-      : dialog.kind === "archive"
-        ? "Create archive"
-        : `Delete ${dialog.paths.length === 1 ? "item" : `${dialog.paths.length} items`}?`
+      : dialog.kind === "move-to"
+        ? `Move ${formatName(dialog.path)}`
+        : dialog.kind === "archive"
+          ? "Create archive"
+          : `Delete ${dialog.paths.length === 1 ? "item" : `${dialog.paths.length} items`}?`
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
@@ -321,10 +466,36 @@ export function FileActionDialogHost({
               ? "This permanently removes the selected files from the server."
               : dialog.kind === "archive"
                 ? "The ZIP archive will be created in the current directory."
-                : `Choose a new name for ${formatName(dialog.path)}.`}
+                : dialog.kind === "move-to"
+                  ? "Enter the folder to move this item into."
+                  : `Choose a new name for ${formatName(dialog.path)}.`}
           </DialogDescription>
         </DialogHeader>
-        {dialog.kind !== "delete" ? (
+        {dialog.kind === "move-to" ? (
+          <InputGroup>
+            <InputGroupAddon className="font-mono text-xs">
+              /data/
+            </InputGroupAddon>
+            <InputGroupInput
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono text-sm"
+              value={value}
+              aria-label="Destination folder in /data"
+              onFocus={(event) => event.currentTarget.select()}
+              onChange={(event) =>
+                setValue(withoutDataPrefix(event.target.value))
+              }
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault()
+                  void onSubmit(value)
+                }
+              }}
+            />
+          </InputGroup>
+        ) : dialog.kind !== "delete" ? (
           <Input
             autoFocus
             value={value}
@@ -348,7 +519,7 @@ export function FileActionDialogHost({
           </Button>
           <Button
             variant={dialog.kind === "delete" ? "destructive" : "default"}
-            disabled={busy || (dialog.kind !== "delete" && !value.trim())}
+            disabled={busy || missingValue}
             onClick={() => void onSubmit(value)}
           >
             {busy ? <LoaderCircle className="animate-spin" /> : null}
@@ -356,7 +527,9 @@ export function FileActionDialogHost({
               ? "Delete"
               : dialog.kind === "archive"
                 ? "Create archive"
-                : "Rename"}
+                : dialog.kind === "move-to"
+                  ? "Move"
+                  : "Rename"}
           </Button>
         </DialogFooter>
       </DialogContent>

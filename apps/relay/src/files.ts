@@ -41,8 +41,8 @@ import { Effect, Result, Stream } from "effect"
 import { openPromise, type Entry, type ZipFile } from "yauzl"
 import {
   extract as createTarExtractor,
-  type Entry as TarEntry,
-  type Headers as TarHeaders,
+  type ExtractEvents,
+  type Header as TarHeaders,
 } from "tar-stream"
 import ZipStream from "zip-stream"
 
@@ -763,7 +763,7 @@ export class FilesystemDriver {
         )
       }
       return yield* Effect.scoped(
-        openUploadParent(root, segments.slice(0, -1)).pipe(
+        openParentPath(root, segments.slice(0, -1), "upload").pipe(
           Effect.flatMap((parentHandle) =>
             uploadIntoParent(
               root,
@@ -789,11 +789,48 @@ export class FilesystemDriver {
       const root = yield* this.#instanceRoot(instance)
 
       if (input.operation === "rename") {
+        yield* requireLinuxDescriptorAnchoring()
         const source = yield* existingMutationEntry(root, input.path)
-        const destination = yield* mutationDestination(root, input.destination)
-        yield* requireMissingDestination(destination)
-        yield* filesystemOperation("mutation.rename", () =>
-          rename(source.absolute, destination)
+        const requestedDestination = input.destination.replace(/\/+$/u, "")
+        yield* validateRelativePath(requestedDestination)
+        const segments = requestedDestination
+          .split("/")
+          .filter((segment) => segment && segment !== ".")
+        const name = segments.at(-1)
+        if (!name) {
+          return yield* filesystemFailure(
+            "invalid_path",
+            "mutation",
+            "Invalid relative path"
+          )
+        }
+        if (
+          source.kind === "directory" &&
+          segments.join("/").startsWith(`${relative(root, source.absolute)}/`)
+        ) {
+          return yield* filesystemFailure(
+            "invalid_path",
+            "mutation",
+            "A folder cannot be moved into itself"
+          )
+        }
+        // Moves may target folders that do not exist yet; create them in place.
+        yield* Effect.scoped(
+          openParentPath(root, segments.slice(0, -1), "mutation").pipe(
+            Effect.flatMap((parentHandle) => {
+              const destination = resolve(
+                fileDescriptorPath(parentHandle),
+                name
+              )
+              return requireMissingDestination(destination).pipe(
+                Effect.andThen(
+                  filesystemOperation("mutation.rename", () =>
+                    rename(source.absolute, destination)
+                  )
+                )
+              )
+            })
+          )
         )
       }
 
@@ -1355,25 +1392,27 @@ function fileDescriptorPath(file: FileHandle): string {
   return `/proc/self/fd/${file.fd}`
 }
 
-const openUploadParent = Effect.fn("relay.files.openUploadParent")(function* (
+// Opens (creating as needed) each parent directory without following symlinks.
+const openParentPath = Effect.fn("relay.files.openParentPath")(function* (
   root: string,
-  segments: ReadonlyArray<string>
+  segments: ReadonlyArray<string>,
+  operation: "mutation" | "upload"
 ) {
   let parentHandle = yield* Effect.acquireRelease(
-    filesystemOperation("upload.openRoot", () =>
+    filesystemOperation(`${operation}.openRoot`, () =>
       open(
         root,
         fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW
       )
     ),
-    (handle) => closeHandleEffect(handle, "upload.closeRoot")
+    (handle) => closeHandleEffect(handle, `${operation}.closeRoot`)
   )
 
   for (const segment of segments) {
     const child = resolve(fileDescriptorPath(parentHandle), segment)
     const existing = yield* optionalFileMetadata(child)
     if (!existing) {
-      yield* filesystemOperation("upload.createParent", () =>
+      yield* filesystemOperation(`${operation}.createParent`, () =>
         mkdir(child, { mode: 0o755 })
       ).pipe(
         Effect.catchIf(
@@ -1382,18 +1421,18 @@ const openUploadParent = Effect.fn("relay.files.openUploadParent")(function* (
         )
       )
     }
-    const metadata = yield* filesystemOperation("upload.statParent", () =>
+    const metadata = yield* filesystemOperation(`${operation}.statParent`, () =>
       lstat(child)
     )
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
       return yield* filesystemFailure(
         "not_a_directory",
-        "upload",
-        "An upload parent path is not a directory"
+        operation,
+        "A parent path is not a directory"
       )
     }
     const childHandle = yield* Effect.acquireRelease(
-      filesystemOperation("upload.openParent", () =>
+      filesystemOperation(`${operation}.openParent`, () =>
         open(
           child,
           fsConstants.O_RDONLY |
@@ -1401,10 +1440,10 @@ const openUploadParent = Effect.fn("relay.files.openUploadParent")(function* (
             fsConstants.O_NOFOLLOW
         )
       ),
-      (handle) => closeHandleEffect(handle, "upload.closeParent")
+      (handle) => closeHandleEffect(handle, `${operation}.closeParent`)
     )
     const resolvedChild = yield* filesystemOperation(
-      "upload.resolveParentDescriptor",
+      `${operation}.resolveParentDescriptor`,
       () => realpath(fileDescriptorPath(childHandle))
     )
     yield* ensureContained(root, resolvedChild)
@@ -1942,6 +1981,8 @@ async function extractZipArchive(
   )
 }
 
+type TarEntry = ExtractEvents["entry"][1]
+
 interface TarArchiveEntry {
   kind: "directory" | "file"
   mode: number
@@ -2171,6 +2212,12 @@ async function writeTarEntryToFile(
   let position = 0
   for await (const chunk of entry) {
     if (signal.aborted) throw archiveExtractionCancelled()
+    if (!(chunk instanceof Uint8Array)) {
+      throw archiveExtractionError(
+        "invalid_archive_entry",
+        "The archive entry contains non-binary data"
+      )
+    }
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     let offset = 0
     while (offset < buffer.length) {

@@ -21,6 +21,7 @@ import {
   relayControlMaxFrameBytes,
   relayControlRequestTimeoutMs,
   relayControlProtocol,
+  relayConsoleResourcesV1Feature,
   relayFileRequestReplayV1Feature,
   relaySnapshotDeltaFeature,
   isAuditedRelayControlOperation,
@@ -522,7 +523,7 @@ function authenticateSocket(
                 )
             )
           )
-          if (isAuditedOperation(request.operation)) {
+          if (isAuditedRelayControlOperation(request.operation)) {
             Effect.runFork(
               promiseOperation(() =>
                 options.runEffect(
@@ -641,6 +642,7 @@ function authenticateSocket(
           relayBrowserCapabilityV2Feature,
           relayBrowserLeaseRenewalV1Feature,
           relayFileRequestReplayV1Feature,
+          relayConsoleResourcesV1Feature,
         ],
         protocol: relayControlProtocol,
         relayBuild: relayBuildLabel(),
@@ -769,11 +771,7 @@ function reverseRequestCancellationGraceMs(
   return 1_000
 }
 
-export function isAuditedOperation(operation: RelayControlOperation): boolean {
-  return isAuditedRelayControlOperation(operation)
-}
-
-export function auditDetailsForRequest(
+function auditDetailsForRequest(
   request: RelayControlRequest,
   result: unknown
 ): Readonly<Record<string, unknown>> {
@@ -880,7 +878,7 @@ function closeClientSockets(
   }
 }
 
-export function authenticationVerifier(options: {
+function authenticationVerifier(options: {
   readonly challenge: Omit<RelayAuthChallenge, "signature">
   readonly client: RelayClientGrant
   readonly signature: string
@@ -968,6 +966,19 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "database.dump.export":
       return "database.dump.export"
     case "database.dump.import":
+      return "database.dump.import"
+    // Reading or editing rows is reading or writing the data a dump carries.
+    case "database.data.read":
+      return "database.dump.export"
+    case "database.data.write":
+      return "database.dump.import"
+    // A signed-in client can read and change everything a dump carries.
+    case "database.terminal.attach":
+    case "database.terminal.heartbeat":
+    case "database.terminal.detach":
+    case "database.terminal.write":
+    case "database.terminal.claim":
+    case "database.terminal.restart":
       return "database.dump.import"
     case "backup.task.enqueue": {
       const kind = objectString(request.payload, "kind")
@@ -1136,7 +1147,7 @@ function sendError(
   send(socket, error)
 }
 
-export function relayControlErrorMessage(cause: unknown): string {
+function relayControlErrorMessage(cause: unknown): string {
   if (!cause || typeof cause !== "object" || !("message" in cause)) {
     return "Relay operation failed"
   }
@@ -1152,7 +1163,7 @@ export function relayControlErrorMessage(cause: unknown): string {
   return detail && detail.length <= 240 ? detail : "Relay operation failed"
 }
 
-export function relayControlFailureTags(
+function relayControlFailureTags(
   request: Pick<RelayControlRequest, "id" | "operation">
 ) {
   return {

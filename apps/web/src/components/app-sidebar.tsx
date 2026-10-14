@@ -4,17 +4,13 @@ import {
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query"
-import { useVirtualizer } from "@tanstack/react-virtual"
 import {
-  ArrowRight,
   CalendarClock,
-  Check,
   ChevronsUpDown,
   Database,
   ListTodo,
   LoaderCircle,
   LogOut,
-  Search,
   Server as ServerIcon,
   Settings,
   UserRoundCog,
@@ -23,16 +19,10 @@ import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
 import { forkPromise } from "@/effect/promise"
 
 import {
-  Avatar,
-  AvatarFallback,
-  AvatarImage,
-} from "@workspace/ui/components/avatar"
-import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@workspace/ui/components/popover"
-import { Input } from "@workspace/ui/components/input"
 import {
   Sidebar,
   SidebarContent,
@@ -53,25 +43,45 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@workspace/ui/components/tooltip"
+import { AccountAvatar } from "@/components/account-avatar"
 import { HearthMark } from "@/components/hearth-mark"
+import {
+  CollapsedNotificationsAnchor,
+  NotificationsBell,
+  NotificationsMenuItem,
+  UnreadNotificationsIndicator,
+} from "@/components/notifications"
 import { BackupIcon } from "@/components/backup-icon"
 import {
   RouteCommandMenuProvider,
   RouteCommandMenuTrigger,
 } from "@/components/route-command-menu"
 import { InstanceName } from "@/components/instance-name"
+import {
+  InstancePickerContent,
+  type InstancePickerItem,
+} from "@/components/instance-picker"
 import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { clearAppearanceCache } from "@/lib/appearance"
-import { minecraftHeadUrl } from "@/lib/minecraft-profile"
 import {
   accessCapabilitiesQueryOptions,
   managedDatabaseDirectoryQueryOptions,
-  minecraftProfileQueryOptions,
   relayConnectionQueryOptions,
   relaySnapshotQueryOptions,
 } from "@/lib/query-options"
+import { kilnReleaseLabel } from "@/lib/release-version"
 import { disableDevelopmentBypass } from "@/server/auth"
+import { engineLabel } from "@/components/database/database-presentation"
+import {
+  databaseRouteIdFromSelection,
+  databaseRouteIdentifier,
+  databaseSelectionRouteId,
+  resolveDatabaseRoute,
+  type ManagedDatabaseDirectoryEntry,
+} from "@/lib/database-route"
+import type { getManagedDatabaseDirectory } from "@/server/databases"
+import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import {
   findFirstCanonicalRelayInstance,
   relayInstanceRouteIdentifier,
@@ -84,12 +94,14 @@ import type { SidebarInstance } from "@/lib/relay-selectors"
 import { globalSectionFromRouteId } from "@/lib/route-sections"
 import type { GlobalSection } from "@/lib/route-sections"
 import {
+  accessibleDestinationsForDatabase,
   accessibleDestinationsForServer,
   accessibleInfrastructureDestinations,
   canAccessActivity,
   canAccessAutomations,
   canAccessBackups,
   serverDestinations,
+  type DatabaseDestinationId,
   type NavigationAccessCapabilities,
   type ServerDestination,
   type ServerDestinationId,
@@ -161,6 +173,7 @@ const AppSidebarView = React.memo(function AppSidebarView({
                   KILN
                 </span>
               </SidebarMenuButton>
+              <HeaderNotificationsBell />
             </SidebarMenuItem>
           </SidebarMenu>
           <RouteCommandMenuTrigger />
@@ -186,6 +199,19 @@ const AppSidebarView = React.memo(function AppSidebarView({
     </RouteCommandMenuProvider>
   )
 })
+
+// Collapsed, notifications live in the account menu instead. Only one popover
+// may be mounted at a time, since both share one open state.
+function HeaderNotificationsBell() {
+  const { isMobile, state } = useSidebar()
+  if (state === "collapsed" && !isMobile) return null
+  return (
+    <NotificationsBell
+      className="absolute top-1/2 right-1 -translate-y-1/2"
+      tooltipHidden={isMobile}
+    />
+  )
+}
 
 function InfrastructureNavigation({
   capabilities,
@@ -311,7 +337,166 @@ function SidebarInstanceNavigation({
   initialSelectedInstanceRouteId: string | null
   relayConfigured: boolean
 }) {
-  const { data: instances = emptyInstances } = useQuery({
+  // "server", a database selection ("db:<id>"), or null off instance routes.
+  const routeSelection = useRouterState({
+    select: (state) => {
+      const params = state.matches.at(-1)?.params as
+        | { databaseId?: string; serverId?: string }
+        | undefined
+      if (params?.databaseId) return databaseSelectionRouteId(params.databaseId)
+      return params?.serverId ? "server" : null
+    },
+  })
+  const databaseRouteId =
+    routeSelection === "server"
+      ? null
+      : databaseRouteIdFromSelection(
+          routeSelection ??
+            readSelectedInstanceRouteId() ??
+            initialSelectedInstanceRouteId
+        )
+  const showDatabases =
+    relayConfigured &&
+    accessibleInfrastructureDestinations(capabilities).some(
+      (destination) => destination.to === "/infra/databases"
+    )
+  const serverNavigation = (
+    <SidebarServerNavigation
+      capabilities={capabilities}
+      emptyFallback={
+        showDatabases ? (
+          <SidebarDatabaseNavigation
+            capabilities={capabilities}
+            databaseRouteId={null}
+            fallback={null}
+          />
+        ) : null
+      }
+      initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
+      relayConfigured={relayConfigured}
+    />
+  )
+
+  return databaseRouteId ? (
+    <SidebarDatabaseNavigation
+      capabilities={capabilities}
+      databaseRouteId={databaseRouteId}
+      fallback={serverNavigation}
+    />
+  ) : (
+    serverNavigation
+  )
+}
+
+function SidebarDatabaseNavigation({
+  capabilities,
+  databaseRouteId,
+  fallback,
+}: {
+  capabilities: NavigationAccessCapabilities
+  // null selects the first database, for users without servers.
+  databaseRouteId: string | null
+  fallback: React.ReactNode
+}) {
+  const select = React.useMemo(
+    () => (databases: Array<ManagedDatabaseDirectoryEntry>) => {
+      const resolution = resolveDatabaseRoute(databases, databaseRouteId)
+      const database =
+        resolution.status === "found"
+          ? resolution.database
+          : databaseRouteId === null
+            ? databases[0]
+            : undefined
+      return database
+        ? { database, routeId: databaseRouteIdentifier(databases, database) }
+        : null
+    },
+    [databaseRouteId]
+  )
+  const query = useQuery({ ...managedDatabaseDirectoryQueryOptions(), select })
+  if (!query.data) return query.isPending ? null : fallback
+  const { database, routeId } = query.data
+
+  return (
+    <>
+      <RememberSelectedInstance
+        instanceRouteId={databaseSelectionRouteId(routeId)}
+      />
+      <SidebarSeparator />
+      <SidebarGroup>
+        <SidebarGroupLabel className="type-technical-label">
+          Database
+        </SidebarGroupLabel>
+        <SidebarGroupContent>
+          <SidebarMenu>
+            <InstanceSelector
+              capabilities={capabilities}
+              selection={{ kind: "database", database }}
+            />
+            <DatabaseTabNavigation
+              capabilities={capabilities}
+              database={database}
+              routeId={routeId}
+            />
+          </SidebarMenu>
+        </SidebarGroupContent>
+      </SidebarGroup>
+    </>
+  )
+}
+
+const DatabaseTabNavigation = React.memo(function DatabaseTabNavigation({
+  capabilities,
+  database,
+  routeId,
+}: {
+  capabilities: NavigationAccessCapabilities
+  database: ManagedDatabaseDirectoryEntry
+  routeId: string
+}) {
+  return accessibleDestinationsForDatabase(database, capabilities).map(
+    (item) => (
+      <SidebarMenuItem key={item.id}>
+        <SidebarMenuButton asChild tooltip={item.label}>
+          <Link
+            to={
+              item.id === "terminal"
+                ? "/db/$databaseId/terminal"
+                : item.id === "logs"
+                  ? "/db/$databaseId/logs"
+                  : item.id === "viewer"
+                    ? "/db/$databaseId/viewer"
+                    : item.id === "network"
+                      ? "/db/$databaseId/network"
+                      : "/db/$databaseId/info"
+            }
+            params={{ databaseId: routeId }}
+            activeOptions={{ exact: true }}
+            activeProps={{ "data-active": true }}
+            preload="intent"
+          >
+            <item.icon />
+            <span>{item.label}</span>
+          </Link>
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+    )
+  )
+})
+
+function SidebarServerNavigation({
+  capabilities,
+  emptyFallback,
+  initialSelectedInstanceRouteId,
+  relayConfigured,
+}: {
+  capabilities: NavigationAccessCapabilities
+  // Shown once the fleet loads without servers.
+  emptyFallback: React.ReactNode
+  initialSelectedInstanceRouteId: string | null
+  relayConfigured: boolean
+}) {
+  const { data: instances = emptyInstances, isPending } = useQuery({
     ...relaySnapshotQueryOptions(),
     enabled: relayConfigured,
     select: selectSidebarInstances,
@@ -341,7 +526,7 @@ function SidebarInstanceNavigation({
   const instanceRouteId = instance
     ? (relayInstanceRouteIdentifier(instances, instance) ?? null)
     : null
-  if (instances.length === 0) return null
+  if (instances.length === 0) return isPending ? null : emptyFallback
 
   return (
     <>
@@ -438,10 +623,14 @@ const InstanceNavigation = React.memo(function InstanceNavigation({
       </SidebarGroupLabel>
       <SidebarGroupContent>
         <SidebarMenu>
-          <ServerSelector
-            instance={instance}
-            instances={instances}
+          <InstanceSelector
+            capabilities={capabilities}
             navigateToTab={navigateToTab}
+            selection={
+              instance
+                ? { kind: "server", instance }
+                : { kind: "none", serverCount: instances.length }
+            }
           />
           <InstanceTabNavigation
             capabilities={capabilities}
@@ -459,14 +648,20 @@ function ambiguousServerHref(shortId: string) {
   return `/infra/servers?search=${encodeURIComponent(shortId)}`
 }
 
-const ServerSelector = React.memo(function ServerSelector({
-  instance,
-  instances,
+type InstanceSelection =
+  | { kind: "server"; instance: SidebarInstance }
+  | { kind: "database"; database: ManagedDatabaseDirectoryEntry }
+  | { kind: "none"; serverCount: number }
+
+const InstanceSelector = React.memo(function InstanceSelector({
+  capabilities,
   navigateToTab,
+  selection,
 }: {
-  instance: SidebarInstance | null
-  instances: Array<SidebarInstance>
-  navigateToTab: (tab: InstanceTab, serverId: string) => void
+  capabilities: NavigationAccessCapabilities
+  // Server tab navigation; database routes navigate here directly.
+  navigateToTab?: (tab: InstanceTab, serverId: string) => void
+  selection: InstanceSelection
 }) {
   const { isMobile } = useSidebar()
   const navigate = useNavigate()
@@ -475,38 +670,103 @@ const ServerSelector = React.memo(function ServerSelector({
   const handleOpenChange = React.useCallback((nextOpen: boolean) => {
     setOpen(nextOpen)
   }, [])
+  const closePicker = React.useCallback(() => setOpen(false), [])
   const selectInstance = React.useCallback(
-    (routeId: string) => {
+    (item: InstancePickerItem) => {
       handleOpenChange(false)
+      if (item.identity.kind === "database") {
+        const databases = queryClient.getQueryData(
+          managedDatabaseDirectoryQueryOptions().queryKey
+        )
+        const routeId = databases
+          ? databaseRouteIdentifier(databases, item.identity)
+          : item.identity.id
+        const tab = databaseTabFromPathname(window.location.pathname)
+        void navigate(
+          tab === "terminal"
+            ? {
+                to: "/db/$databaseId/terminal",
+                params: { databaseId: routeId },
+              }
+            : tab === "logs"
+              ? {
+                  to: "/db/$databaseId/logs",
+                  params: { databaseId: routeId },
+                }
+              : tab === "viewer"
+                ? {
+                    to: "/db/$databaseId/viewer",
+                    params: { databaseId: routeId },
+                  }
+                : tab === "network"
+                  ? {
+                      to: "/db/$databaseId/network",
+                      params: { databaseId: routeId },
+                    }
+                  : tab === "info"
+                    ? {
+                        to: "/db/$databaseId/info",
+                        params: { databaseId: routeId },
+                      }
+                    : { to: "/db/$databaseId", params: { databaseId: routeId } }
+        )
+        return
+      }
+      if (item.identity.kind === "relay") {
+        void navigate({
+          to: "/infra/relays",
+          search: { search: item.identity.relayId },
+        })
+        return
+      }
       const snapshot = queryClient.getQueryData(
         relaySnapshotQueryOptions().queryKey
       )
       if (!snapshot) return
       const instances = selectSidebarInstances(snapshot)
-      const resolution = resolveCanonicalRelayInstance(instances, routeId)
-      if (resolution.status === "ambiguous") {
-        void navigate({ href: ambiguousServerHref(routeId) })
-        return
-      }
-      if (resolution.status === "not-found") return
-      const routeIdentifier = relayInstanceRouteIdentifier(
-        instances,
-        resolution.instance
+      const selected = instances.find(
+        (candidate) =>
+          candidate.id === item.identity.id &&
+          candidate.relayId === item.identity.relayId
       )
+      if (!selected) return
+      const routeIdentifier = relayInstanceRouteIdentifier(instances, selected)
       if (!routeIdentifier) {
-        void navigate({
-          href: ambiguousServerHref(resolution.instance.shortId),
-        })
+        void navigate({ href: ambiguousServerHref(selected.shortId) })
         return
       }
 
-      navigateToTab(
-        instanceTabFromPathname(window.location.pathname) ?? "console",
-        routeIdentifier
-      )
+      const tab = instanceTabFromPathname(window.location.pathname) ?? "console"
+      if (navigateToTab) {
+        navigateToTab(tab, routeIdentifier)
+        return
+      }
+      void navigate({
+        to: "/server/$serverId/console",
+        params: { serverId: routeIdentifier },
+      })
     },
     [handleOpenChange, navigate, navigateToTab, queryClient]
   )
+  const selectedKey =
+    selection.kind === "server"
+      ? sidebarPickerKey(
+          "server",
+          selection.instance.relayId,
+          selection.instance.id
+        )
+      : selection.kind === "database"
+        ? sidebarPickerKey(
+            "database",
+            selection.database.relayId,
+            selection.database.id
+          )
+        : null
+  const selectedKeys = React.useMemo(
+    () => new Set(selectedKey ? [selectedKey] : []),
+    [selectedKey]
+  )
+  const instance = selection.kind === "server" ? selection.instance : null
 
   return (
     <SidebarMenuItem>
@@ -514,8 +774,14 @@ const ServerSelector = React.memo(function ServerSelector({
         <PopoverTrigger asChild>
           <SidebarMenuButton
             size="lg"
-            tooltip="Switch server"
-            aria-label={instance ? undefined : "Choose a server"}
+            tooltip={
+              selection.kind === "database"
+                ? "Switch database"
+                : "Switch server"
+            }
+            aria-label={
+              selection.kind === "none" ? "Choose a server" : undefined
+            }
             className="mb-1.5 h-auto border border-sidebar-border/75 bg-background/35 px-2 py-2 group-data-[collapsible=icon]:h-[32px]! group-data-[collapsible=icon]:overflow-visible group-data-[collapsible=icon]:bg-black/10 hover:border-sidebar-border hover:bg-sidebar-accent group-data-[collapsible=icon]:hover:bg-black/15 data-[state=open]:border-sidebar-border data-[state=open]:bg-sidebar-accent dark:group-data-[collapsible=icon]:bg-black/25 dark:group-data-[collapsible=icon]:hover:bg-black/35"
           >
             {instance ? (
@@ -523,7 +789,7 @@ const ServerSelector = React.memo(function ServerSelector({
                 <span className="sr-only">Switch server. </span>
                 <InstanceName
                   className="min-w-0 flex-1 gap-2 group-data-[collapsible=icon]:gap-0"
-                  iconClassName="border-sidebar-border/70 bg-background/25 text-sidebar-foreground/85 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:m-auto group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent"
+                  iconClassName="border-sidebar-border/70 bg-background/25 text-sidebar-foreground/85 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent"
                   iconSizeClassName="group-data-[collapsible=icon]:size-5!"
                   instance={{
                     brickId: instance.brickId,
@@ -538,13 +804,35 @@ const ServerSelector = React.memo(function ServerSelector({
                   metaClassName="text-sidebar-muted-foreground"
                   name={instance.name}
                   nameClassName="type-control-sm text-sidebar-foreground"
+                  showFavorite={false}
+                  statusClassName="ring-popover"
+                  textClassName="group-data-[collapsible=icon]:sr-only"
+                />
+              </>
+            ) : selection.kind === "database" ? (
+              <>
+                <span className="sr-only">Switch database. </span>
+                <InstanceName
+                  className="min-w-0 flex-1 gap-2 group-data-[collapsible=icon]:gap-0"
+                  iconClassName="border-sidebar-border/70 bg-background/25 text-sidebar-foreground/85 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent"
+                  iconSizeClassName="group-data-[collapsible=icon]:size-5!"
+                  instance={{
+                    id: selection.database.id,
+                    kind: "database",
+                    relayId: selection.database.relayId,
+                  }}
+                  meta={`${engineLabel(selection.database.engine)} · ${selection.database.relayName}`}
+                  metaClassName="text-sidebar-muted-foreground"
+                  name={selection.database.name}
+                  nameClassName="type-control-sm text-sidebar-foreground"
+                  showFavorite={false}
                   statusClassName="ring-popover"
                   textClassName="group-data-[collapsible=icon]:sr-only"
                 />
               </>
             ) : (
               <>
-                <span className="relative grid size-8 shrink-0 place-items-center rounded-md border border-sidebar-border/70 bg-background/25 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:m-auto group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent">
+                <span className="relative grid size-8 shrink-0 place-items-center rounded-md border border-sidebar-border/70 bg-background/25 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent">
                   <ServerIcon
                     className="size-4 text-sidebar-foreground/85"
                     aria-hidden="true"
@@ -555,7 +843,7 @@ const ServerSelector = React.memo(function ServerSelector({
                     Choose a server
                   </span>
                   <span className="type-meta w-full truncate text-sidebar-muted-foreground">
-                    {instances.length === 0
+                    {selection.kind === "none" && selection.serverCount === 0
                       ? "No managed servers"
                       : "Selection required"}
                   </span>
@@ -566,308 +854,141 @@ const ServerSelector = React.memo(function ServerSelector({
           </SidebarMenuButton>
         </PopoverTrigger>
         <PopoverContent
-          aria-label="Managed servers"
+          aria-label="Instances"
           side={isMobile ? "bottom" : "right"}
           align="start"
           sideOffset={6}
           className="w-72 max-w-[calc(100vw-1rem)] overflow-hidden p-0"
         >
-          <ServerSelectorSearch
-            activeInstanceId={instance?.id}
-            activeRelayId={instance?.relayId}
-            instances={instances}
+          <SidebarInstancePicker
+            capabilities={capabilities}
+            selectedKeys={selectedKeys}
+            onNavigate={closePicker}
             onSelect={selectInstance}
           />
-          <div className="border-t border-border/70 p-1.5">
-            <Link
-              to="/infra/servers"
-              onClick={() => handleOpenChange(false)}
-              className="type-control-sm group flex h-9 w-full items-center gap-2 rounded-md bg-muted/45 px-2.5 text-foreground transition-colors outline-none hover:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring/40"
-            >
-              <ServerIcon
-                className="size-3.5 text-muted-foreground"
-                aria-hidden="true"
-              />
-              <span>View all servers</span>
-              <ArrowRight
-                className="ml-auto size-3.5 text-muted-foreground transition-transform duration-150 group-hover:translate-x-0.5 group-focus-visible:translate-x-0.5"
-                aria-hidden="true"
-              />
-            </Link>
-          </div>
         </PopoverContent>
       </Popover>
     </SidebarMenuItem>
   )
 })
 
-const ServerSelectorSearch = React.memo(function ServerSelectorSearch({
-  activeInstanceId,
-  activeRelayId,
-  instances,
+const SidebarInstancePicker = React.memo(function SidebarInstancePicker({
+  capabilities,
+  onNavigate,
   onSelect,
+  selectedKeys,
 }: {
-  activeInstanceId: string | undefined
-  activeRelayId: string | undefined
-  instances: Array<SidebarInstance>
-  onSelect: (routeId: string) => void
+  capabilities: NavigationAccessCapabilities
+  onNavigate: () => void
+  onSelect: (item: InstancePickerItem) => void
+  selectedKeys: ReadonlySet<string>
 }) {
-  const [search, setSearch] = React.useState("")
+  const destinations = accessibleInfrastructureDestinations(capabilities)
+  const showDatabases = destinations.some(
+    (destination) => destination.to === "/infra/databases"
+  )
+  const showRelays = destinations.some(
+    (destination) => destination.to === "/infra/relays"
+  )
+  const { data: serverItems = emptyPickerItems } = useQuery({
+    ...relaySnapshotQueryOptions(),
+    select: selectSidebarServerPickerItems,
+  })
+  const { data: relayItems = emptyPickerItems } = useQuery({
+    ...relaySnapshotQueryOptions(),
+    enabled: showRelays,
+    select: selectSidebarRelayPickerItems,
+  })
+  const { data: databaseItems = emptyPickerItems } = useQuery({
+    ...managedDatabaseDirectoryQueryOptions(),
+    enabled: showDatabases,
+    select: selectSidebarDatabasePickerItems,
+  })
+  const items = React.useMemo(
+    () =>
+      databaseItems.length === 0 && relayItems.length === 0
+        ? serverItems
+        : [
+            ...serverItems,
+            ...(showDatabases ? databaseItems : emptyPickerItems),
+            ...(showRelays ? relayItems : emptyPickerItems),
+          ],
+    [databaseItems, relayItems, serverItems, showDatabases, showRelays]
+  )
 
   return (
-    <>
-      <ServerSelectorSearchField value={search} onValueChange={setSearch} />
-      <ServerSelectorResults
-        activeInstanceId={activeInstanceId}
-        activeRelayId={activeRelayId}
-        instances={instances}
-        onSelect={onSelect}
-        search={search}
-      />
-    </>
-  )
-})
-
-const ServerSelectorSearchField = React.memo(
-  function ServerSelectorSearchField({
-    value,
-    onValueChange,
-  }: {
-    value: string
-    onValueChange: (value: string) => void
-  }) {
-    return (
-      <div className="border-b border-border/70 p-2">
-        <div className="relative">
-          <Search
-            className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
-            aria-hidden="true"
-          />
-          <Input
-            autoFocus
-            type="search"
-            value={value}
-            onChange={(event) => onValueChange(event.currentTarget.value)}
-            placeholder="Search servers"
-            aria-label="Search servers"
-            className="h-8 bg-input/14 pr-2 pl-8 text-sm"
-          />
-        </div>
-      </div>
-    )
-  }
-)
-
-interface ServerSelectorResultsProps {
-  activeInstanceId: string | undefined
-  activeRelayId: string | undefined
-  instances: Array<SidebarInstance>
-  onSelect: (routeId: string) => void
-  search: string
-}
-
-const ServerSelectorResults = React.memo(function ServerSelectorResults({
-  activeInstanceId,
-  activeRelayId,
-  instances,
-  onSelect,
-  search,
-}: ServerSelectorResultsProps) {
-  const query = normalizeServerSearch(search)
-  const filteredInstances = React.useMemo(() => {
-    if (!query) return instances
-    return instances.filter((item) =>
-      matchesNormalizedServerSearch(item, query)
-    )
-  }, [instances, query])
-
-  return filteredInstances.length > 0 ? (
-    <VirtualizedServerSelectorResults
-      key={query}
-      activeInstanceId={activeInstanceId}
-      activeRelayId={activeRelayId}
-      instances={filteredInstances}
+    <InstancePickerContent
+      ariaLabel="Instances"
+      emptyMessage="No managed instances"
+      items={items}
+      selectedKeys={selectedKeys}
+      viewAll
+      onNavigate={onNavigate}
       onSelect={onSelect}
     />
-  ) : (
-    <div className="px-4 py-6 text-center">
-      <p className="type-control-sm">
-        {instances.length === 0
-          ? "No managed servers"
-          : "No servers match your search"}
-      </p>
-      <p className="type-meta mt-1 text-muted-foreground">
-        {instances.length === 0
-          ? "Servers will appear here once they are provisioned."
-          : "Try a name, version, ID, or status."}
-      </p>
-    </div>
-  )
-}, serverSelectorResultsAreEqual)
-
-const VirtualizedServerSelectorResults = React.memo(
-  function VirtualizedServerSelectorResults({
-    activeInstanceId,
-    activeRelayId,
-    instances,
-    onSelect,
-  }: {
-    activeInstanceId: string | undefined
-    activeRelayId: string | undefined
-    instances: Array<SidebarInstance>
-    onSelect: (routeId: string) => void
-  }) {
-    const scrollElementRef = React.useRef<HTMLDivElement>(null)
-    const getScrollElement = React.useCallback(
-      () => scrollElementRef.current,
-      []
-    )
-    const getItemKey = React.useCallback(
-      (index: number) => {
-        const item = instances[index]
-        return item ? `${item.relayId}:${item.id}` : index
-      },
-      [instances]
-    )
-    const rowVirtualizer = useVirtualizer({
-      count: instances.length,
-      estimateSize: estimateServerSelectorRowSize,
-      gap: serverSelectorRowGap,
-      getItemKey,
-      getScrollElement,
-      overscan: 3,
-    })
-
-    return (
-      <div
-        ref={scrollElementRef}
-        className="max-h-64 overflow-y-auto overscroll-contain p-1.5"
-      >
-        <div
-          className="relative w-full"
-          style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
-        >
-          {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-            const item = instances[virtualRow.index]
-            if (!item) return null
-            return (
-              <div
-                key={virtualRow.key}
-                ref={rowVirtualizer.measureElement}
-                className={`absolute top-0 left-0 w-full pb-0.5 ${virtualRow.index < instances.length - 1 ? "border-b border-border/50" : ""}`}
-                data-index={virtualRow.index}
-                style={{ top: virtualRow.start }}
-              >
-                <ServerSelectorItem
-                  active={
-                    item.id === activeInstanceId &&
-                    item.relayId === activeRelayId
-                  }
-                  item={item}
-                  onSelect={onSelect}
-                />
-              </div>
-            )
-          })}
-        </div>
-      </div>
-    )
-  }
-)
-
-const serverSelectorRowGap = 3
-
-function estimateServerSelectorRowSize(): number {
-  return 46
-}
-
-function serverSelectorResultsAreEqual(
-  previous: ServerSelectorResultsProps,
-  next: ServerSelectorResultsProps
-): boolean {
-  if (
-    previous.activeInstanceId !== next.activeInstanceId ||
-    previous.activeRelayId !== next.activeRelayId ||
-    previous.instances !== next.instances ||
-    previous.onSelect !== next.onSelect
-  ) {
-    return false
-  }
-  if (previous.search === next.search) return true
-
-  const previousQuery = normalizeServerSearch(previous.search)
-  const nextQuery = normalizeServerSearch(next.search)
-  return previous.instances.every(
-    (item) =>
-      matchesNormalizedServerSearch(item, previousQuery) ===
-      matchesNormalizedServerSearch(item, nextQuery)
-  )
-}
-
-function normalizeServerSearch(search: string): string {
-  return search.trim().toLocaleLowerCase()
-}
-
-function matchesNormalizedServerSearch(
-  item: SidebarInstance,
-  query: string
-): boolean {
-  if (!query) return true
-
-  return [
-    item.name,
-    item.implementation,
-    item.version,
-    item.shortId,
-    item.routeId,
-    item.relayName,
-    item.observedState,
-  ]
-    .join(" ")
-    .toLocaleLowerCase()
-    .includes(query)
-}
-
-const ServerSelectorItem = React.memo(function ServerSelectorItem({
-  active,
-  item,
-  onSelect,
-}: {
-  active: boolean
-  item: SidebarInstance
-  onSelect: (routeId: string) => void
-}) {
-  return (
-    <button
-      type="button"
-      aria-pressed={active}
-      className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-[color,background-color,box-shadow] duration-100 outline-none hover:bg-popover-accent hover:text-popover-accent-foreground focus-visible:bg-popover-accent focus-visible:text-popover-accent-foreground focus-visible:ring-2 focus-visible:ring-ring/35 ${active ? "bg-primary/8 shadow-[inset_0_0_0_1px_color-mix(in_oklab,var(--primary)_14%,transparent)]" : ""}`}
-      onClick={() => onSelect(item.routeId)}
-    >
-      <InstanceName
-        className="min-w-0 flex-1 gap-2"
-        iconClassName="border-0 bg-muted/55"
-        instance={{
-          brickId: item.brickId,
-          brickSource: item.brickSource,
-          id: item.id,
-          implementation: item.implementation,
-          kind: "server",
-          observedState: item.observedState,
-          relayId: item.relayId,
-        }}
-        meta={`${item.implementation} ${item.version} · ${item.shortId}`}
-        metaClassName="font-mono"
-        name={item.name}
-        nameClassName="type-control-sm"
-        statusClassName="ring-popover"
-      />
-      {active ? (
-        <Check className="size-4 shrink-0 text-primary" aria-hidden="true" />
-      ) : null}
-    </button>
   )
 })
+
+const emptyPickerItems: Array<InstancePickerItem> = []
+
+function sidebarPickerKey(
+  kind: InstancePickerItem["identity"]["kind"],
+  relayId: string,
+  id: string
+) {
+  return `${kind}:${relayId}:${id}`
+}
+
+function selectSidebarServerPickerItems(
+  snapshot: RelayFleetSnapshot
+): Array<InstancePickerItem> {
+  return selectSidebarInstances(snapshot).map((instance) => ({
+    identity: {
+      brickId: instance.brickId,
+      brickSource: instance.brickSource,
+      id: instance.id,
+      implementation: instance.implementation,
+      kind: "server",
+      observedState: instance.observedState,
+      relayId: instance.relayId,
+    },
+    key: sidebarPickerKey("server", instance.relayId, instance.id),
+    meta: `${instance.implementation} ${instance.version} · ${instance.shortId}`,
+    name: instance.name,
+    searchText: `${instance.routeId} ${instance.relayName} ${instance.observedState}`,
+  }))
+}
+
+function selectSidebarRelayPickerItems(
+  snapshot: RelayFleetSnapshot
+): Array<InstancePickerItem> {
+  return snapshot.nodes.map((node) => ({
+    identity: {
+      id: node.relayId,
+      kind: "relay",
+      relayId: node.relayId,
+      relayStatus: node.relayStatus,
+      source: "fleet",
+      updating: node.relayUpdating,
+    },
+    key: sidebarPickerKey("relay", node.relayId, node.relayId),
+    meta: `${node.arch} · ${kilnReleaseLabel(node.version)}`,
+    name: node.relayName,
+    searchText: `${node.relayId} ${node.version}`,
+  }))
+}
+
+function selectSidebarDatabasePickerItems(
+  databases: Awaited<ReturnType<typeof getManagedDatabaseDirectory>>
+): Array<InstancePickerItem> {
+  return databases.map((database) => ({
+    identity: { id: database.id, kind: "database", relayId: database.relayId },
+    key: sidebarPickerKey("database", database.relayId, database.id),
+    meta: `${engineLabel(database.engine)} · ${database.shortId}`,
+    name: database.name,
+    searchText: `${database.id} ${database.relayName}`,
+  }))
+}
 
 const InstanceTabNavigation = React.memo(function InstanceTabNavigation({
   capabilities,
@@ -1075,85 +1196,67 @@ function AccountNavigation({
   )
 }
 
-const AccountAvatar = React.memo(function AccountAvatar({
-  name,
-}: {
-  name: string
-}) {
-  const { data: profile } = useQuery(minecraftProfileQueryOptions(name))
-
-  return (
-    <Avatar size="sm" className="rounded-none">
-      {profile ? (
-        <AvatarImage
-          src={minecraftHeadUrl(profile.id)}
-          alt=""
-          referrerPolicy="no-referrer"
-        />
-      ) : null}
-      <AvatarFallback className="type-label rounded-none bg-primary/12 font-bold text-primary">
-        {initials(name)}
-      </AvatarFallback>
-    </Avatar>
-  )
-})
-
 function CollapsedAccountMenu({ user }: { user: AuthenticatedUser }) {
   const [open, setOpen] = React.useState(false)
   const [signingOut, setSigningOut] = React.useState(false)
+  const closeMenu = React.useCallback(() => setOpen(false), [])
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className="grid size-[32px] place-items-center transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none data-[state=open]:bg-sidebar-accent"
-          aria-label={`Open account menu for ${user.name}`}
+    <CollapsedNotificationsAnchor>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="relative grid size-[32px] place-items-center transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none data-[state=open]:bg-sidebar-accent"
+            aria-label={`Open account menu for ${user.name}`}
+          >
+            <AccountAvatar name={user.name} />
+            <UnreadNotificationsIndicator />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          aria-label="Account menu"
+          side="right"
+          align="end"
+          className="w-48 p-1"
         >
-          <AccountAvatar name={user.name} />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        aria-label="Account menu"
-        side="right"
-        align="end"
-        className="w-48 p-1"
-      >
-        <p className="truncate px-2 py-2 text-xs text-muted-foreground">
-          {user.name}
-        </p>
-        <div className="-mx-1 mb-1 h-px bg-border" />
-        <Link
-          to="/settings/account"
-          preload="intent"
-          className="flex h-9 w-full items-center gap-2 px-2 text-sm transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring/45 focus-visible:outline-none"
-          onClick={() => setOpen(false)}
-        >
-          <Settings className="size-4" />
-          <span>Settings</span>
-        </Link>
-        <button
-          type="button"
-          className="flex h-9 w-full items-center gap-2 px-2 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45"
-          aria-label={signingOut ? "Signing out" : "Logout"}
-          disabled={signingOut}
-          onClick={() => {
-            setSigningOut(true)
-            forkPromise(
-              () => signOut(user.isDevelopmentBypass),
-              () => setSigningOut(false)
-            )
-          }}
-        >
-          {signingOut ? (
-            <LoaderCircle className="size-4 animate-spin" />
-          ) : (
-            <LogOut className="size-4" />
-          )}
-          <span>{signingOut ? "Signing out" : "Logout"}</span>
-        </button>
-      </PopoverContent>
-    </Popover>
+          <p className="truncate px-2 py-2 text-xs text-muted-foreground">
+            {user.name}
+          </p>
+          <div className="-mx-1 mb-1 h-px bg-border" />
+          <NotificationsMenuItem onSelect={closeMenu} />
+          <Link
+            to="/settings/account"
+            preload="intent"
+            className="flex h-9 w-full items-center gap-2 px-2 text-sm transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring/45 focus-visible:outline-none"
+            onClick={() => setOpen(false)}
+          >
+            <Settings className="size-4" />
+            <span>Settings</span>
+          </Link>
+          <button
+            type="button"
+            className="flex h-9 w-full items-center gap-2 px-2 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45"
+            aria-label={signingOut ? "Signing out" : "Logout"}
+            disabled={signingOut}
+            onClick={() => {
+              setSigningOut(true)
+              forkPromise(
+                () => signOut(user.isDevelopmentBypass),
+                () => setSigningOut(false)
+              )
+            }}
+          >
+            {signingOut ? (
+              <LoaderCircle className="size-4 animate-spin" />
+            ) : (
+              <LogOut className="size-4" />
+            )}
+            <span>{signingOut ? "Signing out" : "Logout"}</span>
+          </button>
+        </PopoverContent>
+      </Popover>
+    </CollapsedNotificationsAnchor>
   )
 }
 
@@ -1270,15 +1373,6 @@ async function signOut(isDevelopmentBypass: boolean) {
   window.location.assign("/")
 }
 
-function initials(name: string): string {
-  return name
-    .split(/\s+/u)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0].toUpperCase())
-    .join("")
-}
-
 function globalSectionFromPathname(pathname: string): GlobalSection {
   if (pathname === "/infra" || pathname.startsWith("/infra/")) return "infra"
   if (pathname === "/automations" || pathname.startsWith("/automations/")) {
@@ -1288,6 +1382,7 @@ function globalSectionFromPathname(pathname: string): GlobalSection {
     return "backups"
   }
   if (pathname === "/access") return "access"
+  if (pathname === "/notifications") return "notifications"
   if (pathname === "/settings" || pathname.startsWith("/settings/")) {
     return "settings"
   }
@@ -1302,4 +1397,13 @@ function instanceTabFromPathname(pathname: string): InstanceTab | null {
   if (/^\/server\/[^/]+\/info\/?$/.test(pathname)) return "info"
   if (/^\/server\/[^/]+\/console\/?$/.test(pathname)) return "console"
   return null
+}
+
+function databaseTabFromPathname(
+  pathname: string
+): DatabaseDestinationId | null {
+  const match = /^\/db\/[^/]+\/(info|logs|network|terminal|viewer)\/?$/.exec(
+    pathname
+  )
+  return match ? (match[1] as DatabaseDestinationId) : null
 }

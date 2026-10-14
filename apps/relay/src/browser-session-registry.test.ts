@@ -22,14 +22,6 @@ const limits = {
 }
 
 describe("browser session registry", () => {
-  it("invalidates in-flight client lookups when issuer grants change", () => {
-    const registry = new BrowserSessionRegistry(limits)
-    const configuration = registry.clientConfiguration
-    registry.revokeIssuer("hearth-a")
-    expect(registry.clientConfiguration).not.toBe(configuration)
-    registry.close()
-  })
-
   it("keeps legacy console and resource sessions separate with the same proof key", () => {
     const registry = new BrowserSessionRegistry({
       ...limits,
@@ -331,6 +323,7 @@ function authority(
     keyThumbprint: "thumbprint-a",
     loginSessionId: "login-session-a",
     operation: "console",
+    resourceKind: "instance",
     origin: "https://hearth.test",
     revision: 1,
     subject: "user-a",

@@ -17,10 +17,10 @@ Under **Settings → Secrets and variables → Actions → Variables**, configur
 | ---------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------- |
 | `PUBLISH_IMAGES`       | Set to `true` to publish releases and images. Unset means checks/builds only.                            | `true`                             |
 | `INITIAL_RELEASE_LINE` | Optional starting version before the first stable promotion; defaults to `0.1.0`.                        | Leave unset                        |
-| `NPM_PACKAGE`          | npm package you own. Enables npm publishing; CLI release downloads are always attached.                 | `kiln-cli`                         |
+| `NPM_PACKAGE`          | npm package you own. Enables npm publishing; CLI release downloads are always attached.                  | `kiln-cli`                         |
 | `CLI_DEFAULT_URL`      | Optional default panel URL embedded in the CLI. Fork builds without this require a URL or saved profile. | `https://kiln.site`                |
-| `BUILD_RUNNER_AMD64`   | Optional runner label for push-triggered image builds.                                                   | `blacksmith-4vcpu-ubuntu-2404`     |
-| `BUILD_RUNNER_ARM64`   | Optional ARM64 runner label for push-triggered image builds.                                             | `blacksmith-4vcpu-ubuntu-2404-arm` |
+| `BUILD_RUNNER_AMD64`   | Optional Linux x64 runner label for push-triggered image builds and all native CLI checks/builds.        | `blacksmith-4vcpu-ubuntu-2404`     |
+| `BUILD_RUNNER_ARM64`   | Optional Linux ARM64 runner label for push-triggered image builds and all native CLI checks/builds.      | `blacksmith-4vcpu-ubuntu-2404-arm` |
 | `SENTRY_DSN`           | Optional server telemetry DSN baked into published images.                                               | Your server DSN                    |
 | `VITE_SENTRY_DSN`      | Optional browser telemetry DSN baked into Hearth.                                                        | Your browser DSN                   |
 | `SENTRY_ORG`           | Optional source-map upload organization.                                                                 | `quartzdev`                        |
@@ -34,8 +34,10 @@ Compose's `SENTRY_DSN` defaults to empty, so set it in `.env` to enable server
 telemetry. Browser telemetry requires an image rebuild to change.
 
 Normal GitHub `ubuntu-24.04` / `ubuntu-24.04-arm` runners are the default.
-PRs, manual runs, and scheduled builds retain GitHub runners even when custom
-push runners are configured. npm publishing always uses a GitHub-hosted runner.
+Image PRs, manual image runs, and scheduled image builds retain GitHub runners.
+Linux native CLI checks and release builds use the configured runners for every
+trigger, including PRs and manual retries. macOS and Windows CLI jobs retain their
+platform-specific GitHub runners. npm publishing uses a GitHub-hosted runner.
 
 Workflows request `contents: write`, `packages: write`, and, for npm, `id-token:
 write` where needed. Organization policies must permit those permissions.
@@ -97,22 +99,28 @@ catalog. Existing server image selections are not automatically rewritten.
 
 Choose an available npm name, such as `@your-npm-org/my-panel-cli`. Your npm scope
 can differ from your GitHub owner. The generated package records the fork's
-repository and embeds its package name and optional default panel URL. The binary
-is still named `kiln`, so install one distribution globally at a time.
+repository and optional default panel URL. Native binaries embed this repository
+as their update source. The command is still named `kiln`, so install one
+distribution globally at a time.
 
-Bootstrap the new npm package once using your own npm login:
+Bootstrap the launcher and five platform package names once using your own npm
+login. Platform package names append `-linux-x64`, `-linux-arm64`, `-darwin-x64`,
+`-darwin-arm64`, and `-windows-x64` to your chosen package name. On each supported
+platform, build and publish its package (or publish the matching platform tarball
+from a GitHub release):
 
 ```sh
 KILN_GIT_REPO=https://github.com/example/my-panel \
 KILN_CLI_PACKAGE=@your-npm-org/my-panel-cli \
 KILN_VERSION=1.0.0-test.20260930.000000 \
-  vp run -F kiln-cli build:npm
-npm pack --dry-run ./apps/cli/dist/npm
+  vp run -F kiln-cli build
+npm publish ./apps/cli/dist/npm-platform --access public --tag test
+# After all five platform packages exist at that version:
 npm publish ./apps/cli/dist/npm --access public --tag test
 ```
 
-On npm, configure GitHub trusted publishers for your owner/repository and these
-workflow filenames, allowing `npm publish`:
+On npm, configure GitHub trusted publishers on **all six packages** for your
+owner/repository and these workflow filenames, allowing `npm publish`:
 
 - `nightly-release.yml` for continuous releases;
 - `stable-release.yml` for stable promotions;
@@ -122,8 +130,12 @@ npm validates the **calling** workflow when using a reusable workflow. Keep the
 existing `publish-cli.yml` publisher on Kiln and add the other two; no npm token is
 needed in GitHub. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
 
-Install with `npm install --global @your-npm-org/my-panel-cli`. `kiln update`
-reinstalls that same package, never `kiln-cli`. Login uses an explicit URL,
+Install with `npm install --global @your-npm-org/my-panel-cli`, with optional
+dependencies enabled. `kiln update` downloads the matching native executable from
+your fork's GitHub releases, preserving the stable/nightly channel; it never
+invokes a package manager. `npm install --global @your-npm-org/my-panel-cli@latest`
+continues to install from npm. Set `KILN_GIT_REPO` for local builds; release workflows
+set it to their own repository automatically. Login uses an explicit URL,
 `KILN_URL`, the selected saved profile, then the build's default URL. Forks with
 no default get an instruction to supply their panel URL. Credentials remain
 scoped to the existing URL/profile system.

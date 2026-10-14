@@ -16,6 +16,14 @@ import {
   relayCreateDatabaseSchema,
   relayDatabaseActionSchema,
   relayDatabaseDumpSchema,
+  relayDatabaseDataReadSchema,
+  relayDatabaseDataWriteSchema,
+  relayDatabaseTerminalAttachSchema,
+  relayDatabaseTerminalDetachSchema,
+  relayDatabaseTerminalHeartbeatSchema,
+  relayDatabaseTerminalClaimSchema,
+  relayDatabaseTerminalRestartSchema,
+  relayDatabaseTerminalWriteSchema,
   relayDatabaseExportSchema,
   relayDatabaseNetworkSchema,
   relayDeleteDatabaseSchema,
@@ -32,6 +40,7 @@ import {
   relayInstancePortInputsSchema,
   relayInstanceWebRouteInputsSchema,
   relayNetworkingSchema,
+  relayProxyBrowserMetadataSchema,
   relayProxyReadInputSchema,
   relayProxySettingsSchema,
   relayDirectoryPageInputSchema,
@@ -79,6 +88,10 @@ import { attachControlSocket } from "./control-socket.js"
 import { DockerDriver } from "./docker.js"
 import { DatabaseBrowser } from "./database-browser.js"
 import { DatabaseDriver } from "./databases.js"
+import { browseManagedDatabase } from "./database-sql-browser.js"
+import { consoleSources } from "./console-sources.js"
+import { DatabaseTerminals } from "./database-terminal.js"
+import { forkPromise } from "./effect/promise.js"
 import {
   inspectEncryptedPlatformBackup,
   restoreEncryptedPlatformBackup,
@@ -114,7 +127,6 @@ import type {
 import { loadRelayTls } from "./effect/tls.js"
 import { applyStoredInstanceNames } from "./instance-names.js"
 import { normalizedRoute } from "./route-label.js"
-import { readRelayProxy } from "./proxy-read.js"
 import { uploadConsoleLogToMclogs } from "./mclogs.js"
 import { closeRelayServer } from "./shutdown.js"
 import { attachSftpServer } from "./sftp-server.js"
@@ -189,6 +201,8 @@ const docker = new DockerDriver(
   databaseConnections
 )
 const databases = new DatabaseDriver(config, docker, databaseConnections)
+const databaseTerminals = new DatabaseTerminals(config)
+forkPromise(async () => databaseTerminals.sweep(await databases.list()))
 const systemUpdates = new SystemUpdateManager(config)
 const filesystem = new FilesystemDriver(config)
 const deploymentFileSync = new DeploymentFileSyncDriver(config)
@@ -642,6 +656,7 @@ const controlSocket = attachControlSocket({
 })
 const browserSocket = attachBrowserSocket({
   config,
+  consoleSources: consoleSources(docker, databases),
   docker,
   filesystem,
   identity: relayIdentity,
@@ -919,9 +934,7 @@ function shutdownRelay(signal: NodeJS.Signals): Promise<void> {
         ],
         { concurrency: 3, discard: true }
       )
-      const result = yield* relayOperation(() =>
-        closeRelayServer(server, new Set())
-      ).pipe(
+      const result = yield* relayOperation(() => closeRelayServer(server)).pipe(
         Effect.catch((cause) =>
           Effect.sync(() => {
             console.error("Relay server shutdown failed", cause)
@@ -1030,6 +1043,15 @@ async function relaySnapshot() {
         : null,
     },
   }
+}
+
+// A terminal belongs to the paired client and the person it acted for, so
+// one Hearth user can't read or type into another's session.
+function terminalOwner(
+  client: RelayClientGrant,
+  request: RelayControlRequest
+): string {
+  return `${client.id}:${request.subject ?? ""}`
 }
 
 async function executeControlRequest(
@@ -1141,12 +1163,16 @@ async function executeControlRequest(
     case "relay.proxy.read": {
       const settings = await lifecycle.proxySettings()
       const input = relayProxyReadInputSchema.parse(request.payload)
-      return readRelayProxy({
-        browserOrigin: config.browserOrigin,
-        includeDiagnostics: input.includeDiagnostics,
-        loadDiagnostics: () => lifecycle.proxyDiagnostics(settings),
+      if (!input.includeDiagnostics) {
+        return relayProxyBrowserMetadataSchema.parse({
+          browserOrigin: config.browserOrigin,
+          mode: settings.mode,
+        })
+      }
+      return {
+        diagnostics: await lifecycle.proxyDiagnostics(settings),
         settings,
-      })
+      }
     }
     case "relay.proxy.write": {
       const settings = relayProxySettingsSchema.parse(request.payload)
@@ -1352,6 +1378,82 @@ async function executeControlRequest(
       return databases.importDump(
         relayDatabaseDumpSchema.parse(request.payload)
       )
+    case "database.data.read": {
+      const input = relayDatabaseDataReadSchema.parse(request.payload)
+      return runRelayEffect(
+        "relay.databases.data.read",
+        browseManagedDatabase(
+          await databases.target(input.databaseId),
+          input,
+          input.request,
+          { canWrite: false, readOnly: true }
+        )
+      )
+    }
+    case "database.terminal.attach": {
+      const input = relayDatabaseTerminalAttachSchema.parse(request.payload)
+      return databaseTerminals.attach(
+        terminalOwner(client, request),
+        await databases.target(input.databaseId),
+        input,
+        // Output goes back to the Hearth connection that attached.
+        (output, timeoutMs) =>
+          requestHearth("hearth.database.terminal.output", output, timeoutMs)
+      )
+    }
+    case "database.terminal.heartbeat": {
+      const input = relayDatabaseTerminalHeartbeatSchema.parse(request.payload)
+      return databaseTerminals.heartbeat(
+        terminalOwner(client, request),
+        input.attachmentIds
+      )
+    }
+    case "database.terminal.restart": {
+      const input = relayDatabaseTerminalRestartSchema.parse(request.payload)
+      return databaseTerminals.restart(
+        terminalOwner(client, request),
+        input.databaseId
+      )
+    }
+    case "database.terminal.detach": {
+      const input = relayDatabaseTerminalDetachSchema.parse(request.payload)
+      return databaseTerminals.detach(
+        terminalOwner(client, request),
+        input.attachmentId
+      )
+    }
+    case "database.terminal.write": {
+      const input = relayDatabaseTerminalWriteSchema.parse(request.payload)
+      return databaseTerminals.write(
+        terminalOwner(client, request),
+        input.databaseId,
+        input.sessionId,
+        input.data
+      )
+    }
+    case "database.terminal.claim": {
+      const input = relayDatabaseTerminalClaimSchema.parse(request.payload)
+      return databaseTerminals.claim(
+        terminalOwner(client, request),
+        input.databaseId,
+        input.sessionId,
+        input.attachmentId,
+        input.rows,
+        input.cols
+      )
+    }
+    case "database.data.write": {
+      const input = relayDatabaseDataWriteSchema.parse(request.payload)
+      return runRelayEffect(
+        "relay.databases.data.write",
+        browseManagedDatabase(
+          await databases.target(input.databaseId),
+          input,
+          input.request,
+          { canWrite: true, readOnly: input.readOnly === true }
+        )
+      )
+    }
     case "backup.task.enqueue":
       return runRelayEffect(
         "relay.backups.enqueue",

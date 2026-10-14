@@ -30,10 +30,6 @@ export type SidebarInstance = Pick<
   routeId: string
 }
 
-export type RouteInstance = SidebarInstance & {
-  relayStatus: "connected" | "unreachable"
-}
-
 export type ServerListInstance = Pick<
   RelayInstance,
   | "brickId"
@@ -50,6 +46,7 @@ export type ServerListInstance = Pick<
   relayId: string
   relayName: string
   relayStatus: "connected" | "unreachable"
+  relayUpdating?: boolean
   routeId: string
 }
 
@@ -140,36 +137,6 @@ export function selectSidebarInstanceCount(
     if (isServerInstance(instance)) count += 1
   }
   return count
-}
-
-export function selectRouteInstances(
-  snapshot: RelayFleetSnapshot
-): Array<RouteInstance> {
-  return snapshot.instances.map((instance) => ({
-    ...sidebarInstance(instance),
-    relayStatus: instance.relayStatus,
-  }))
-}
-
-export function selectServerListInstances(
-  snapshot: RelayFleetSnapshot
-): Array<ServerListInstance> {
-  return snapshot.instances.map((instance) => ({
-    brickId: instance.brickId,
-    connectAddress: instance.connectAddress,
-    game: instance.game,
-    id: instance.id,
-    implementation: instance.implementation,
-    name: instance.name,
-    observedState: instance.observedState,
-    provisioning: instance.provisioning,
-    relayId: instance.relayId,
-    relayName: instance.relayName,
-    relayStatus: instance.relayStatus,
-    routeId: instance.routeId,
-    shortId: instance.shortId,
-    version: instance.version,
-  }))
 }
 
 function sidebarInstance(
@@ -270,24 +237,6 @@ export function selectInstanceRelayConnected(
           instance.id === identifier ||
           instance.name === identifier)
     )?.relayStatus === "connected"
-}
-
-export function selectInstanceRuntime(instanceId: string, relayId?: string) {
-  return (snapshot: RelayFleetSnapshot): InstanceRuntime | null => {
-    const instance = snapshot.instances.find(
-      (item) => item.id === instanceId && (!relayId || item.relayId === relayId)
-    )
-    return instance
-      ? {
-          id: instance.id,
-          lifecycle: instance.lifecycle,
-          observedState: instance.observedState,
-          recovery: instance.recovery,
-          relayId: instance.relayId,
-          resources: instance.resources,
-        }
-      : null
-  }
 }
 
 export type ConsoleInstanceRuntime = Omit<InstanceRuntime, "resources">

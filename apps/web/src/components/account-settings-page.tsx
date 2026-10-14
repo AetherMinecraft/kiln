@@ -6,10 +6,14 @@ import {
   Check,
   Clipboard,
   Fingerprint,
+  KeyRound,
   Laptop,
   LoaderCircle,
   LockKeyhole,
   LogOut,
+  MonitorSmartphone,
+  Pencil,
+  Plus,
   Smartphone,
   Terminal,
   Trash2,
@@ -31,7 +35,15 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@workspace/ui/components/tooltip"
+import { cn } from "@workspace/ui/lib/utils"
 
+import { AccountAvatar } from "@/components/account-avatar"
+import {
+  SettingsEmptyState,
+  SettingsPage,
+  SettingsPanel,
+  SettingsRow,
+} from "@/components/settings-panel"
 import { ensuringPromise, recoverPromise } from "@/effect/promise"
 import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
@@ -44,11 +56,17 @@ import type { AccountSessionSummary } from "@/effect/account-sessions"
 
 const accountDateFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
-  timeStyle: "short",
+})
+const relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, {
+  numeric: "auto",
 })
 const activeSessionsQueryKey = ["account", "active-sessions"] as const
 const linkedCliQueryKey = ["account", "linked-clis"] as const
 const redactedTextAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+const redactedDigitAlphabet = "0123456789"
+const redactedSeparators = new Set(["@", ".", "-", "_", ":"])
+// The CLI names credentials `${hostname} (${platform}/${arch})` by default.
+const defaultCliNamePattern = /^(.+) (\([^()\s]+\/[^()\s]+\))$/
 
 type ActiveSession = AccountSessionSummary
 
@@ -84,41 +102,85 @@ function twoFactorFormReducer(
 }
 
 export function AccountSettingsPage({ user }: { user: AuthenticatedUser }) {
+  const enabled = !user.isDevelopmentBypass
   return (
-    <div className="w-full max-w-2xl px-5 pb-12">
+    <SettingsPage>
       <fieldset
-        disabled={user.isDevelopmentBypass}
-        className={`min-w-0 border-0 p-0 ${user.isDevelopmentBypass ? "opacity-45" : ""}`}
+        disabled={!enabled}
+        className={cn(
+          "grid min-w-0 gap-4 border-0 p-0",
+          !enabled && "opacity-45"
+        )}
       >
-        <div className="border-b">
-          <DisplayNameCard initialDisplayName={user.name} />
-          <EmailAddressCard initialEmail={user.email} />
-          <PasswordCard />
-          <TwoFactorCard />
-          {user.isDevelopmentBypass ? (
-            <DisabledPasskeysCard />
-          ) : (
-            <PasskeysCard />
-          )}
-          <CliCredentialsCard enabled={!user.isDevelopmentBypass} />
-          <SessionsCard enabled={!user.isDevelopmentBypass} />
+        <ProfileCard user={user} />
+        <div className="grid items-stretch gap-4 lg:grid-cols-2">
+          <SettingsPanel icon={<KeyRound />} title="Sign-in">
+            <PasswordRow />
+            <TwoFactorRow />
+          </SettingsPanel>
+          {enabled ? <PasskeysPanel /> : <DisabledPasskeysPanel />}
+        </div>
+        <div className="grid items-stretch gap-4 lg:grid-cols-2">
+          <SessionsPanel enabled={enabled} />
+          <CliCredentialsPanel enabled={enabled} />
         </div>
       </fieldset>
-    </div>
+    </SettingsPage>
   )
 }
 
-function DisplayNameCard({
-  initialDisplayName,
+function ProfileCard({ user }: { user: AuthenticatedUser }) {
+  const session = authClient.useSession()
+  const [displayName, setDisplayName] = React.useState(user.name)
+  const email = session.data?.user.email ?? user.email
+
+  return (
+    <section
+      aria-label="Profile"
+      className="min-w-0 overflow-hidden rounded-xl border bg-card/45"
+    >
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-4 p-4 sm:p-5">
+        <div className="flex min-w-0 flex-1 basis-72 items-center gap-4">
+          <AccountAvatar
+            name={displayName}
+            size="lg"
+            className="data-[size=lg]:size-14"
+            fallbackClassName="text-base"
+          />
+          <div className="min-w-0">
+            <h2 className="type-section-title break-words">{displayName}</h2>
+            <div className="mt-1.5 min-w-0">
+              <RedactedText
+                label="email address"
+                value={email}
+                className="font-mono text-xs text-muted-foreground"
+              />
+            </div>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <DisplayNameAction
+            currentDisplayName={displayName}
+            onSaved={setDisplayName}
+          />
+          <EmailAddressAction currentEmail={email} />
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function DisplayNameAction({
+  currentDisplayName,
+  onSaved,
 }: {
-  initialDisplayName: string
+  currentDisplayName: string
+  onSaved: (displayName: string) => void
 }) {
   const queryClient = useQueryClient()
   const session = authClient.useSession()
   const [open, setOpen] = React.useState(false)
-  const [currentDisplayName, setCurrentDisplayName] =
-    React.useState(initialDisplayName)
-  const [displayName, setDisplayName] = React.useState(initialDisplayName)
+  const [displayName, setDisplayName] = React.useState(currentDisplayName)
   const [pending, setPending] = React.useState(false)
 
   async function updateDisplayName(event: React.FormEvent<HTMLFormElement>) {
@@ -164,7 +226,7 @@ function DisplayNameCard({
       return
     }
 
-    setCurrentDisplayName(nextDisplayName)
+    onSaved(nextDisplayName)
     setDisplayName(nextDisplayName)
     setOpen(false)
     showToast({ message: "Display name updated.", type: "success" })
@@ -184,21 +246,15 @@ function DisplayNameCard({
   }
 
   return (
-    <AccountSection title="Display Name">
-      <div className="flex min-w-0 items-center justify-between gap-3">
-        <p className="truncate text-xs text-muted-foreground">
-          {currentDisplayName}
-        </p>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          onClick={() => setOpen(true)}
-        >
-          Change
-        </Button>
-      </div>
+    <>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => setOpen(true)}
+      >
+        <Pencil /> Edit name
+      </Button>
 
       <Dialog open={open} onOpenChange={changeOpen}>
         <DialogContent>
@@ -239,14 +295,14 @@ function DisplayNameCard({
           </form>
         </DialogContent>
       </Dialog>
-    </AccountSection>
+    </>
   )
 }
 
-function EmailAddressCard({ initialEmail }: { initialEmail: string }) {
+function EmailAddressAction({ currentEmail }: { currentEmail: string }) {
   const session = authClient.useSession()
   const [open, setOpen] = React.useState(false)
-  const [email, setEmail] = React.useState(initialEmail)
+  const [email, setEmail] = React.useState(currentEmail)
   const [code, setCode] = React.useState("")
   const [requestedEmail, setRequestedEmail] = React.useState<string | null>(
     null
@@ -254,7 +310,6 @@ function EmailAddressCard({ initialEmail }: { initialEmail: string }) {
   const [pending, setPending] = React.useState<"request" | "verify" | null>(
     null
   )
-  const currentEmail = session.data?.user.email ?? initialEmail
 
   React.useEffect(() => setEmail(currentEmail), [currentEmail])
 
@@ -335,19 +390,15 @@ function EmailAddressCard({ initialEmail }: { initialEmail: string }) {
   }
 
   return (
-    <AccountSection title="Email address">
-      <div className="flex min-w-0 items-center justify-between gap-3">
-        <RedactedEmail value={currentEmail} />
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          onClick={() => setOpen(true)}
-        >
-          Change
-        </Button>
-      </div>
+    <>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => setOpen(true)}
+      >
+        Change email
+      </Button>
 
       <Dialog open={open} onOpenChange={changeOpen}>
         <DialogContent>
@@ -431,11 +482,19 @@ function EmailAddressCard({ initialEmail }: { initialEmail: string }) {
           )}
         </DialogContent>
       </Dialog>
-    </AccountSection>
+    </>
   )
 }
 
-function RedactedEmail({ value }: { value: string }) {
+function RedactedText({
+  className,
+  label,
+  value,
+}: {
+  className?: string
+  label: string
+  value: string
+}) {
   const [revealed, setRevealed] = React.useState(false)
   const redacted = React.useMemo(() => redactedPlaceholder(value), [value])
 
@@ -444,10 +503,12 @@ function RedactedEmail({ value }: { value: string }) {
       <TooltipTrigger asChild>
         <button
           type="button"
-          className={`min-w-0 cursor-pointer truncate rounded-sm font-mono text-[11px] leading-none transition hover:text-foreground ${revealed ? "text-muted-foreground" : "text-muted-foreground blur-[2px] select-none"}`}
-          aria-label={
-            revealed ? `${value}. Hide email address` : "Reveal email address"
-          }
+          className={cn(
+            "min-w-0 cursor-pointer rounded-sm text-left break-all transition hover:text-foreground",
+            !revealed && "blur-[3px] select-none",
+            className
+          )}
+          aria-label={revealed ? `${value}. Hide ${label}` : `Reveal ${label}`}
           aria-pressed={revealed}
           onClick={() => setRevealed((current) => !current)}
         >
@@ -455,7 +516,7 @@ function RedactedEmail({ value }: { value: string }) {
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" sideOffset={6}>
-        {revealed ? "Click to hide email" : "Click to reveal email"}
+        {revealed ? `Click to hide ${label}` : `Click to reveal ${label}`}
       </TooltipContent>
     </Tooltip>
   )
@@ -468,21 +529,21 @@ function redactedPlaceholder(value: string): string {
     state = Math.imul(state, 0x01000193)
   }
 
-  const nextCharacter = () => {
+  const nextCharacter = (alphabet: string) => {
     state = Math.imul(state ^ (state >>> 13), 0x85ebca6b)
     state = Math.imul(state ^ (state >>> 16), 0xc2b2ae35)
-    return (
-      redactedTextAlphabet[Math.abs(state) % redactedTextAlphabet.length] ?? "x"
-    )
+    return alphabet[Math.abs(state) % alphabet.length] ?? "x"
   }
 
   return Array.from(value, (character) => {
-    if (["@", ".", "-", "_"].includes(character)) return character
-    return nextCharacter()
+    if (redactedSeparators.has(character)) return character
+    return nextCharacter(
+      /\d/.test(character) ? redactedDigitAlphabet : redactedTextAlphabet
+    )
   }).join("")
 }
 
-function PasswordCard() {
+function PasswordRow() {
   const queryClient = useQueryClient()
   const [open, setOpen] = React.useState(false)
   const [currentPassword, setCurrentPassword] = React.useState("")
@@ -542,17 +603,15 @@ function PasswordCard() {
   }
 
   return (
-    <AccountSection title="Password">
-      <div className="flex justify-end">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => setOpen(true)}
-        >
-          Change password
-        </Button>
-      </div>
+    <SettingsRow label="Password">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => setOpen(true)}
+      >
+        Change password
+      </Button>
 
       <Dialog open={open} onOpenChange={changeOpen}>
         <DialogContent>
@@ -618,11 +677,11 @@ function PasswordCard() {
           </form>
         </DialogContent>
       </Dialog>
-    </AccountSection>
+    </SettingsRow>
   )
 }
 
-function TwoFactorCard() {
+function TwoFactorRow() {
   const session = authClient.useSession()
   const queryClient = useQueryClient()
   const [form, dispatchForm] = React.useReducer(
@@ -639,7 +698,7 @@ function TwoFactorCard() {
     event.preventDefault()
     setPending("enable")
     const result = await recoverPromise(
-      () => authClient.twoFactor.enable({ password }),
+      () => authClient.twoFactor.enable({ password, method: "totp" }),
       (cause) => failedAuthResult(cause, "Could not begin 2FA setup")
     )
     setPending(null)
@@ -650,7 +709,7 @@ function TwoFactorCard() {
       })
       return
     }
-    if (!result.data) {
+    if (!result.data || result.data.method !== "totp") {
       showToast({ message: "Could not begin 2FA setup", type: "error" })
       return
     }
@@ -731,20 +790,18 @@ function TwoFactorCard() {
   }
 
   return (
-    <AccountSection title="Authenticator app">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-xs text-muted-foreground">
-          {twoFactorEnabled ? "Enabled" : "Not set up"}
-        </p>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => changeOpen(true)}
-        >
-          {twoFactorEnabled ? "Manage" : "Set up"}
-        </Button>
-      </div>
+    <SettingsRow label="Authenticator app">
+      <span className="text-xs text-muted-foreground">
+        {twoFactorEnabled ? "Enabled" : "Not set up"}
+      </span>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => changeOpen(true)}
+      >
+        {twoFactorEnabled ? "Manage" : "Set up"}
+      </Button>
 
       <Dialog open={open} onOpenChange={changeOpen}>
         <DialogContent className={setup ? "sm:max-w-xl" : undefined}>
@@ -883,11 +940,11 @@ function TwoFactorCard() {
           )}
         </DialogContent>
       </Dialog>
-    </AccountSection>
+    </SettingsRow>
   )
 }
 
-function PasskeysCard() {
+function PasskeysPanel() {
   const passkeys = authClient.useListPasskeys()
   const session = authClient.useSession()
   const queryClient = useQueryClient()
@@ -987,59 +1044,43 @@ function PasskeysCard() {
   }
 
   return (
-    <AccountSection title="Passkeys">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-xs text-muted-foreground">
-          {passkeys.data?.length
-            ? `${passkeys.data.length} registered`
-            : "None registered"}
-        </p>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => setOpen(true)}
-        >
-          Add passkey
-        </Button>
-      </div>
+    <SettingsPanel
+      icon={<Fingerprint />}
+      title="Passkeys"
+      action={<AddPasskeyButton onClick={() => setOpen(true)} />}
+    >
       {passkeys.data?.length ? (
-        <div className="mt-3 divide-y border bg-background/45">
+        <ul className="divide-y">
           {passkeys.data.map((passkey) => (
-            <div
+            <AccountListItem
               key={passkey.id}
-              className="flex items-center gap-3 px-3 py-2.5"
-            >
-              <span className="grid size-8 shrink-0 place-items-center border bg-card text-primary">
-                <Fingerprint className="size-3.5" />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-xs font-medium">
-                  {passkey.name || "Unnamed passkey"}
-                </span>
-                <span className="type-technical-label mt-0.5 block text-muted-foreground">
-                  {passkey.deviceType || "Authenticator"} · Added{" "}
-                  {formatDate(passkey.createdAt)}
-                </span>
-              </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label={`Remove ${passkey.name || "passkey"}`}
-                disabled={pending !== null}
-                onClick={() => void deletePasskey(passkey.id)}
-              >
-                {pending === passkey.id ? (
-                  <LoaderCircle className="animate-spin" />
-                ) : (
-                  <Trash2 />
-                )}
-              </Button>
-            </div>
+              icon={<Fingerprint />}
+              title={passkey.name || "Unnamed passkey"}
+              meta={`Added ${formatRelative(passkey.createdAt)}`}
+              action={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-destructive"
+                  aria-label={`Remove ${passkey.name || "passkey"}`}
+                  disabled={pending !== null}
+                  onClick={() => void deletePasskey(passkey.id)}
+                >
+                  {pending === passkey.id ? (
+                    <LoaderCircle className="animate-spin" />
+                  ) : (
+                    <Trash2 />
+                  )}
+                  Remove
+                </Button>
+              }
+            />
           ))}
-        </div>
-      ) : null}
+        </ul>
+      ) : (
+        <PasskeysEmptyState />
+      )}
 
       <Dialog open={open} onOpenChange={changeOpen}>
         <DialogContent>
@@ -1094,24 +1135,39 @@ function PasskeysCard() {
           </form>
         </DialogContent>
       </Dialog>
-    </AccountSection>
+    </SettingsPanel>
   )
 }
 
-function DisabledPasskeysCard() {
+function DisabledPasskeysPanel() {
   return (
-    <AccountSection title="Passkeys">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-xs text-muted-foreground">None registered</p>
-        <Button type="button" variant="outline" size="sm">
-          Add passkey
-        </Button>
-      </div>
-    </AccountSection>
+    <SettingsPanel
+      icon={<Fingerprint />}
+      title="Passkeys"
+      action={<AddPasskeyButton />}
+    >
+      <PasskeysEmptyState />
+    </SettingsPanel>
   )
 }
 
-function CliCredentialsCard({ enabled }: { enabled: boolean }) {
+function AddPasskeyButton({ onClick }: { onClick?: () => void }) {
+  return (
+    <Button type="button" variant="outline" size="sm" onClick={onClick}>
+      <Plus /> Add passkey
+    </Button>
+  )
+}
+
+function PasskeysEmptyState() {
+  return (
+    <SettingsEmptyState icon={<Fingerprint />}>
+      <p>No passkeys</p>
+    </SettingsEmptyState>
+  )
+}
+
+function CliCredentialsPanel({ enabled }: { enabled: boolean }) {
   const queryClient = useQueryClient()
   const [pendingId, setPendingId] = React.useState<string | null>(null)
   const linked = useQuery({
@@ -1144,77 +1200,33 @@ function CliCredentialsCard({ enabled }: { enabled: boolean }) {
   }
 
   return (
-    <AccountSection title="Linked CLIs">
-      <p className="mb-3 text-xs text-muted-foreground">
-        {enabled
-          ? `${active.length} active · full access expires after ${linked.data?.defaultAccessDays ?? 30} days by default`
-          : "No persisted CLIs for the development identity"}
-      </p>
-      <div className="divide-y border bg-background/45">
-        {!enabled ? (
-          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
-            Sign in with an account to link a CLI
-          </p>
-        ) : linked.isPending ? (
-          <div className="flex items-center justify-center gap-2 px-3 py-8 text-xs text-muted-foreground">
-            <LoaderCircle className="size-4 animate-spin" /> Loading CLIs
-          </div>
-        ) : linked.isError ? (
-          <div className="px-3 py-6 text-center">
-            <p className="text-xs text-destructive">
-              {authErrorMessage(linked.error, "Could not load linked CLIs")}
-            </p>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="mt-2"
-              onClick={() => void linked.refetch()}
-            >
-              Try again
-            </Button>
-          </div>
-        ) : linked.data?.credentials.length ? (
-          linked.data.credentials.map((credential) => {
-            return (
-              <div
-                key={credential.id}
-                className="grid gap-3 px-3 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(10rem,0.55fr)_auto] sm:items-center"
-              >
-                <div className="flex min-w-0 items-center gap-3">
-                  <span className="grid size-9 shrink-0 place-items-center border bg-card text-primary">
-                    <Terminal className="size-4" />
-                  </span>
-                  <span className="min-w-0">
-                    <span className="block truncate text-xs font-medium">
-                      {credential.name}
-                    </span>
-                    <span className="type-technical-label mt-0.5 block text-muted-foreground">
-                      {credential.mode === "read_only"
-                        ? "Read-only"
-                        : "Full access"}
-                      {!credential.active
-                        ? ` · ${credential.revokedAt ? "Unlinked" : "Expired"}`
-                        : " · Active"}
-                    </span>
-                  </span>
-                </div>
-                <div className="type-meta text-muted-foreground sm:text-right">
-                  <span className="block">
-                    Last used {formatDate(credential.lastUsedAt)}
-                  </span>
-                  <span className="block">
-                    {credential.expiresAt
-                      ? `Expires ${formatDate(credential.expiresAt)}`
-                      : "No expiration"}
-                  </span>
-                </div>
+    <SettingsPanel icon={<Terminal />} title="Linked CLIs">
+      {!enabled ? (
+        <SettingsEmptyState icon={<Terminal />}>
+          <p>No CLIs linked</p>
+        </SettingsEmptyState>
+      ) : linked.isPending ? (
+        <PanelLoading label="Loading CLIs" />
+      ) : linked.isError ? (
+        <PanelError
+          message={authErrorMessage(linked.error, "Could not load linked CLIs")}
+          onRetry={() => void linked.refetch()}
+        />
+      ) : active.length ? (
+        <ul className="divide-y">
+          {active.map((credential) => (
+            <AccountListItem
+              key={credential.id}
+              icon={<Terminal />}
+              title={<CliCredentialName name={credential.name} />}
+              meta={`${credential.mode === "read_only" ? "Read-only" : "Full access"} · ${credential.lastUsedAt ? `Used ${formatRelative(credential.lastUsedAt)}` : "Never used"}`}
+              action={
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="justify-self-start text-muted-foreground hover:text-destructive sm:justify-self-end"
-                  disabled={!credential.active || pendingId !== null}
+                  className="text-muted-foreground hover:text-destructive"
+                  disabled={pendingId !== null}
                   onClick={() => void unlink(credential.id)}
                 >
                   {pendingId === credential.id ? (
@@ -1224,20 +1236,24 @@ function CliCredentialsCard({ enabled }: { enabled: boolean }) {
                   )}
                   Unlink
                 </Button>
-              </div>
-            )
-          })
-        ) : (
-          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
-            No CLIs linked yet. Run <code>kiln login</code> to connect one.
+              }
+            />
+          ))}
+        </ul>
+      ) : (
+        <SettingsEmptyState icon={<Terminal />}>
+          <p>
+            No CLIs linked. Run{" "}
+            <code className="font-mono text-foreground">kiln login</code> to
+            connect one.
           </p>
-        )}
-      </div>
-    </AccountSection>
+        </SettingsEmptyState>
+      )}
+    </SettingsPanel>
   )
 }
 
-function SessionsCard({ enabled }: { enabled: boolean }) {
+function SessionsPanel({ enabled }: { enabled: boolean }) {
   const session = authClient.useSession()
   const queryClient = useQueryClient()
   const [pendingSessionId, setPendingSessionId] = React.useState<string | null>(
@@ -1317,11 +1333,10 @@ function SessionsCard({ enabled }: { enabled: boolean }) {
   }
 
   return (
-    <AccountSection title="Active sessions">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <p className="text-xs text-muted-foreground">
-          {sessions.data?.length ?? 0} active
-        </p>
+    <SettingsPanel
+      icon={<MonitorSmartphone />}
+      title="Active sessions"
+      action={
         <Button
           type="button"
           variant="destructive"
@@ -1331,36 +1346,25 @@ function SessionsCard({ enabled }: { enabled: boolean }) {
         >
           <LogOut /> Log out everywhere
         </Button>
-      </div>
-      <div className="divide-y border bg-background/45">
-        {!enabled ? (
-          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
-            No persisted sessions for the development identity
-          </p>
-        ) : sessions.isPending ? (
-          <div className="flex items-center justify-center gap-2 px-3 py-8 text-xs text-muted-foreground">
-            <LoaderCircle className="size-4 animate-spin" /> Loading sessions
-          </div>
-        ) : sessions.isError ? (
-          <div className="px-3 py-6 text-center">
-            <p className="text-xs text-destructive">
-              {authErrorMessage(
-                sessions.error,
-                "Could not load active sessions"
-              )}
-            </p>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="mt-2"
-              onClick={() => void sessions.refetch()}
-            >
-              Try again
-            </Button>
-          </div>
-        ) : sessions.data?.length ? (
-          sessions.data.map((activeSession) => (
+      }
+    >
+      {!enabled ? (
+        <SettingsEmptyState icon={<MonitorSmartphone />}>
+          <p>No active sessions</p>
+        </SettingsEmptyState>
+      ) : sessions.isPending ? (
+        <PanelLoading label="Loading sessions" />
+      ) : sessions.isError ? (
+        <PanelError
+          message={authErrorMessage(
+            sessions.error,
+            "Could not load active sessions"
+          )}
+          onRetry={() => void sessions.refetch()}
+        />
+      ) : sessions.data?.length ? (
+        <ul className="divide-y">
+          {sessions.data.map((activeSession) => (
             <SessionRow
               key={activeSession.id}
               activeSession={activeSession}
@@ -1369,13 +1373,13 @@ function SessionsCard({ enabled }: { enabled: boolean }) {
               disabled={pendingSessionId !== null || loggingOut}
               onRevoke={revokeSession}
             />
-          ))
-        ) : (
-          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
-            No active sessions found
-          </p>
-        )}
-      </div>
+          ))}
+        </ul>
+      ) : (
+        <SettingsEmptyState icon={<MonitorSmartphone />}>
+          <p>No active sessions</p>
+        </SettingsEmptyState>
+      )}
 
       <Dialog open={logoutDialogOpen} onOpenChange={setLogoutDialogOpen}>
         <DialogContent>
@@ -1411,7 +1415,7 @@ function SessionsCard({ enabled }: { enabled: boolean }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </AccountSection>
+    </SettingsPanel>
   )
 }
 
@@ -1432,75 +1436,144 @@ const SessionRow = React.memo(function SessionRow({
   const DeviceIcon = device.mobile ? Smartphone : Laptop
 
   return (
-    <div className="grid gap-3 px-3 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,0.55fr)_auto] sm:items-center">
-      <div className="flex min-w-0 items-center gap-3">
-        <span className="grid size-9 shrink-0 place-items-center border bg-card text-primary">
-          <DeviceIcon className="size-4" />
-        </span>
-        <span className="min-w-0">
-          <span className="flex items-center gap-2">
-            <span className="truncate text-xs font-medium">
-              {device.browser} on {device.platform}
-            </span>
-            {current ? (
-              <span className="type-technical-label shrink-0 border border-emerald-500/25 bg-emerald-500/8 px-1.5 py-0.5 text-emerald-500">
-                Current
-              </span>
-            ) : null}
+    <AccountListItem
+      icon={<DeviceIcon />}
+      title={`${device.browser} on ${device.platform}`}
+      accessory={
+        current ? <StatusPill tone="success">Current</StatusPill> : null
+      }
+      meta={
+        <>
+          {activeSession.ipAddress ? (
+            <RedactedText label="IP address" value={activeSession.ipAddress} />
+          ) : (
+            "Unknown IP"
+          )}
+          {` · Signed in ${formatRelative(activeSession.createdAt)}`}
+        </>
+      }
+      action={
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="text-muted-foreground hover:text-destructive"
+          aria-label={current ? "Sign out this session" : "Revoke this session"}
+          disabled={disabled}
+          onClick={() => onRevoke(activeSession)}
+        >
+          {pending ? (
+            <LoaderCircle className="animate-spin" />
+          ) : current ? (
+            <LogOut />
+          ) : (
+            <Trash2 />
+          )}
+          {current ? "Sign out" : "Revoke"}
+        </Button>
+      }
+    />
+  )
+})
+
+function CliCredentialName({ name }: { name: string }) {
+  const match = defaultCliNamePattern.exec(name)
+  if (!match) return name
+  return (
+    <>
+      <RedactedText label="hostname" value={match[1] ?? ""} /> {match[2]}
+    </>
+  )
+}
+
+function AccountListItem({
+  accessory,
+  action,
+  icon,
+  meta,
+  title,
+}: {
+  accessory?: React.ReactNode
+  action: React.ReactNode
+  icon: React.ReactNode
+  meta: React.ReactNode
+  title: React.ReactNode
+}) {
+  return (
+    <li className="flex items-center gap-3 px-4 py-3">
+      <span className="shrink-0 text-muted-foreground [&_svg]:size-4">
+        {icon}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="min-w-0 text-sm font-medium break-words">
+            {title}
           </span>
-          <span className="type-technical-label mt-0.5 block truncate text-muted-foreground">
-            {activeSession.ipAddress || "IP unavailable"}
-          </span>
-        </span>
+          {accessory}
+        </div>
+        <p className="type-meta mt-0.5 break-words text-muted-foreground">
+          {meta}
+        </p>
       </div>
-      <div className="type-meta text-muted-foreground sm:text-right">
-        <span className="block">
-          Started {formatDate(activeSession.createdAt)}
-        </span>
-        <span className="block">
-          Expires {formatDate(activeSession.expiresAt)}
-        </span>
-      </div>
+      <div className="shrink-0">{action}</div>
+    </li>
+  )
+}
+
+function PanelLoading({ label }: { label: string }) {
+  return (
+    <div className="flex flex-1 items-center justify-center gap-2 px-4 py-8 text-xs text-muted-foreground">
+      <LoaderCircle className="size-4 animate-spin" /> {label}
+    </div>
+  )
+}
+
+function PanelError({
+  message,
+  onRetry,
+}: {
+  message: string
+  onRetry: () => void
+}) {
+  return (
+    <div className="flex-1 px-4 py-6 text-center">
+      <p className="text-xs text-destructive">{message}</p>
       <Button
         type="button"
         variant="ghost"
         size="sm"
-        className="justify-self-start text-muted-foreground hover:text-destructive sm:justify-self-end"
-        aria-label={current ? "Sign out this session" : "Revoke this session"}
-        disabled={disabled}
-        onClick={() => onRevoke(activeSession)}
+        className="mt-2"
+        onClick={onRetry}
       >
-        {pending ? (
-          <LoaderCircle className="animate-spin" />
-        ) : current ? (
-          <LogOut />
-        ) : (
-          <Trash2 />
-        )}
-        {current ? "Sign out" : "Revoke"}
+        Try again
       </Button>
     </div>
   )
-})
+}
 
-function AccountSection({
-  title,
+type StatusTone = "muted" | "success"
+
+const statusPillClass: Record<StatusTone, string> = {
+  muted: "border-border bg-background/50 text-muted-foreground",
+  success: "border-emerald-500/25 bg-emerald-500/8 text-emerald-500",
+}
+
+function StatusPill({
   children,
+  tone,
 }: {
-  title: string
   children: React.ReactNode
+  tone: StatusTone
 }) {
-  const headingId = React.useId()
   return (
-    <section
-      aria-labelledby={headingId}
-      className="grid gap-3 border-b py-5 last:border-b-0 sm:grid-cols-[9rem_minmax(0,1fr)] sm:items-start"
+    <span
+      className={cn(
+        "type-technical-label inline-flex shrink-0 items-center border px-1.5 py-0.5 text-[0.6875rem]",
+        statusPillClass[tone]
+      )}
     >
-      <h2 id={headingId} className="text-xs font-medium text-foreground">
-        {title}
-      </h2>
-      <div className="min-w-0">{children}</div>
-    </section>
+      {children}
+    </span>
   )
 }
 
@@ -1573,9 +1646,16 @@ function recoverUrl(value: string): URL | null {
   return new URL(value)
 }
 
-function formatDate(value?: Date | string | null): string {
-  if (!value) return "recently"
-  return accountDateFormatter.format(new Date(value))
+function formatRelative(value: Date | string | number): string {
+  const elapsed = Date.now() - new Date(value).getTime()
+  const minutes = Math.round(elapsed / 60_000)
+  if (minutes < 1) return "just now"
+  if (minutes < 60) return relativeTimeFormatter.format(-minutes, "minute")
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return relativeTimeFormatter.format(-hours, "hour")
+  const days = Math.round(hours / 24)
+  if (days < 30) return relativeTimeFormatter.format(-days, "day")
+  return `on ${accountDateFormatter.format(new Date(value))}`
 }
 
 function describeUserAgent(userAgent?: string | null): {

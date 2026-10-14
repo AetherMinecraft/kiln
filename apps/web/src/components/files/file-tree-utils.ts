@@ -24,6 +24,19 @@ export function joinFilePath(directory: string, name: string): string {
   return `${normalizeDirectoryPath(directory)}${name}`
 }
 
+/** Rebases `path` when it is `from` or lives inside the moved `from/` directory. */
+export function movedFilePath(
+  path: string,
+  from: string,
+  to: string
+): string | null {
+  if (path === from) return to
+  if (from.endsWith("/") && path.startsWith(from)) {
+    return `${to}${path.slice(from.length)}`
+  }
+  return null
+}
+
 export function isUnarchiveSupportedPath(path: string): boolean {
   return !path.endsWith("/") && relayFileUnarchiveSuffix(path) !== null
 }
@@ -60,6 +73,7 @@ export type FileWorkspaceAction =
   | "delete"
   | "download"
   | "duplicate"
+  | "move"
   | "rename"
   | "unarchive"
 
@@ -67,6 +81,7 @@ export interface FileActionsController {
   busy: boolean
   canWrite: boolean
   request: (action: FileWorkspaceAction, paths: ReadonlyArray<string>) => void
+  move: (path: string, destination: string) => Promise<boolean>
 }
 
 export async function uploadDroppedFiles(

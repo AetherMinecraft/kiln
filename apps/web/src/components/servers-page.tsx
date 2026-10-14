@@ -24,6 +24,7 @@ import { Button } from "@workspace/ui/components/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import {
@@ -40,6 +41,14 @@ import {
 import type { AddServerDialogStore } from "@/components/add-server-dialog"
 import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
 import {
+  FavoritesOnlyButton,
+  FavoritesOnlyEmptyState,
+  InstanceFavoriteMenuItem,
+  InstanceFavoriteToggle,
+  useFavoritesOnly,
+  useFavoritesOnlySource,
+} from "@/components/instance-favorite"
+import {
   DataTableActionGroup,
   DataTableEmptyState,
   DataTableTextCell,
@@ -54,6 +63,11 @@ import {
 } from "@/components/data-table-workspace"
 import { DataTable } from "@/components/data-table-view"
 import { InstanceName } from "@/components/instance-name"
+import {
+  instanceStatusPresentation,
+  statusColumnWidth,
+} from "@/components/instance-name-presentation"
+import { StatusIndicator } from "@/components/status-indicator"
 import {
   accessCapabilitiesQueryOptions,
   brickCatalogQueryOptions,
@@ -77,6 +91,7 @@ import {
   useLiveDataTableSource,
   type DataTableSource,
 } from "@/lib/data-table-source"
+import type { InstanceFavorite } from "@/lib/instance-favorites"
 import { grantHasPermission } from "@/lib/permissions"
 import { selectRelayConfigured } from "@/lib/relay-selectors"
 import type { ServerListInstance } from "@/lib/relay-selectors"
@@ -102,8 +117,7 @@ const serverTableSearchFields = [
   ({ server }: ServerTableItem) => server.connectAddress,
   ({ server }: ServerTableItem) => server.relayId,
   ({ server }: ServerTableItem) => server.relayName,
-  ({ server }: ServerTableItem) => server.relayStatus,
-  ({ server }: ServerTableItem) => server.observedState,
+  ({ server }: ServerTableItem) => serverStatus(server).label,
 ] as const
 
 interface ServerDeleteAccess {
@@ -183,6 +197,7 @@ export const ServersPage = React.memo(function ServersPage({
                 />
               </>
             }
+            controls={<FavoritesOnlyButton table="servers" />}
             leading={<ServerSyncButton disabled={!relayConfigured} />}
             search={{
               ariaLabel: "Search servers",
@@ -358,6 +373,7 @@ const FilteredServerTableBoundary = React.memo(
             relayId: instance.relayId,
             relayName: instance.relayName,
             relayStatus: instance.relayStatus,
+            relayUpdating: instance.relayUpdating,
             routeId: instance.routeId,
             shortId: instance.shortId,
             version: instance.version,
@@ -415,14 +431,21 @@ const ServerDataTable = React.memo(function ServerDataTable({
   searchStore: ServerSearchStore
   source: DataTableSource<ServerTableItem>
 }) {
+  const [favoritesOnly] = useFavoritesOnly("servers")
+  const visibleSource = useFavoritesOnlySource(
+    source,
+    favoritesOnly,
+    serverTableItemFavorite
+  )
+  const favoritesFiltered = favoritesOnly && source.rows.length > 0
   const visibleResourceKeys = React.useMemo(
     () =>
       new Set(
-        source.rows.map(({ server }) =>
+        visibleSource.rows.map(({ server }) =>
           resourceInvitationScopeKey(server.relayId, server.id)
         )
       ),
-    [source.rows]
+    [visibleSource.rows]
   )
   const [initialTableState] = React.useState(() => ({
     sorting: [{ desc: false, id: "server" }],
@@ -435,9 +458,11 @@ const ServerDataTable = React.memo(function ServerDataTable({
           id: "status",
           header: () => <span className="sr-only sm:not-sr-only">Status</span>,
           sortFn: "text",
-          cell: ({ row }) => <ServerStatus server={row.original.server} />,
+          cell: ({ row }) => (
+            <StatusIndicator status={serverStatus(row.original.server)} />
+          ),
           meta: dataTableColumnMeta(
-            { width: { base: "2.5rem", sm: "6.5rem" } },
+            { width: { base: "2.5rem", sm: statusColumnWidth } },
             {
               cellClassName: "px-2 sm:px-3",
               headerClassName: "px-2 sm:px-3",
@@ -446,6 +471,23 @@ const ServerDataTable = React.memo(function ServerDataTable({
           ),
         }
       ),
+      serverTableColumnHelper.display({
+        id: "favorite",
+        header: () => <span className="sr-only">Favorite</span>,
+        enableSorting: false,
+        cell: ({ row }) => (
+          <InstanceFavoriteToggle
+            id={row.original.server.id}
+            kind="server"
+            name={row.original.server.name}
+            relayId={row.original.server.relayId}
+          />
+        ),
+        meta: dataTableColumnMeta(
+          { width: { base: "1.75rem" } },
+          { cellClassName: "px-0", headerClassName: "px-0" }
+        ),
+      }),
       serverTableColumnHelper.accessor(({ server }) => server.name, {
         id: "server",
         header: "Server",
@@ -469,12 +511,14 @@ const ServerDataTable = React.memo(function ServerDataTable({
                     observedState: server.observedState,
                     relayId: server.relayId,
                     relayStatus: server.relayStatus,
+                    relayUpdating: server.relayUpdating,
                   }}
                   live={false}
                   name={server.name}
                   nameClassName="transition-colors group-hover/server-link:text-primary"
                   meta={`${server.game} · ${server.implementation}`}
                   metaClassName="font-mono"
+                  showFavorite={false}
                 />
               </Link>
               <PendingResourceInvitationBadge
@@ -576,15 +620,23 @@ const ServerDataTable = React.memo(function ServerDataTable({
         />
       }
       definition={definition}
-      emptyState={({ searchActive }) => (
-        <EmptyServerTable
-          canProvision={canProvision}
-          dialogStore={dialogStore}
-          searchActive={searchActive}
-        />
-      )}
+      emptyState={({ searchActive }) =>
+        favoritesFiltered ? (
+          <FavoritesOnlyEmptyState
+            icon={<Server className="size-6 text-muted-foreground/45" />}
+            searchActive={searchActive}
+            table="servers"
+          />
+        ) : (
+          <EmptyServerTable
+            canProvision={canProvision}
+            dialogStore={dialogStore}
+            searchActive={searchActive}
+          />
+        )
+      }
       searchStore={searchStore}
-      source={source}
+      source={visibleSource}
     />
   )
 })
@@ -656,6 +708,14 @@ const ServerActions = React.memo(function ServerActions({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-44">
+          <InstanceFavoriteMenuItem
+            favorite={{
+              id: server.id,
+              kind: "server",
+              relayId: server.relayId,
+            }}
+          />
+          <DropdownMenuSeparator />
           <CopyIdentifierMenuItem label="Server ID" value={server.id} />
           <CopyIdentifierMenuItem label="Relay ID" value={server.relayId} />
         </DropdownMenuContent>
@@ -729,27 +789,15 @@ function canDeleteServer(
   )
 }
 
-function ServerStatus({ server }: { server: ServerListInstance }) {
-  const status = serverStatus(server)
-  return (
-    <span
-      aria-label={status.label}
-      className={`type-label inline-flex items-center gap-1.5 ${status.text}`}
-    >
-      <span className={`size-1.5 shrink-0 rounded-full ${status.dot}`} />
-      <span className="hidden sm:inline">{status.label}</span>
-    </span>
-  )
-}
-
 function serverStatus(server: ServerListInstance) {
-  return server.relayStatus === "unreachable"
-    ? {
-        dot: "bg-destructive",
-        label: "Relay unavailable",
-        text: "text-destructive",
-      }
-    : serverStatusTone(server.observedState)
+  return instanceStatusPresentation({
+    id: server.id,
+    kind: "server",
+    observedState: server.observedState,
+    relayId: server.relayId,
+    relayStatus: server.relayStatus,
+    relayUpdating: server.relayUpdating,
+  })
 }
 
 function EmptyServerTable({
@@ -795,6 +843,12 @@ function serverTableItemKey(item: ServerTableItem): string {
   return serverRowKey(item.server)
 }
 
+function serverTableItemFavorite({
+  server,
+}: ServerTableItem): InstanceFavorite {
+  return { id: server.id, kind: "server", relayId: server.relayId }
+}
+
 function createServerTableItems(
   servers: Array<ServerListInstance>
 ): Array<ServerTableItem> {
@@ -816,40 +870,4 @@ function createServerTableItems(
     serverTableItemCache.set(server, item)
     return item
   })
-}
-
-function serverStatusTone(state: ServerListInstance["observedState"]) {
-  if (state === "running") {
-    return {
-      dot: "bg-emerald-400",
-      label: "Running",
-      text: "text-emerald-300",
-    }
-  }
-  if (state === "failed") {
-    return {
-      dot: "bg-destructive",
-      label: "Failed",
-      text: "text-destructive",
-    }
-  }
-  if (state === "starting" || state === "provisioning") {
-    return {
-      dot: "bg-amber-400",
-      label: state === "starting" ? "Starting" : "Provisioning",
-      text: "text-amber-300",
-    }
-  }
-  if (state === "stopping") {
-    return {
-      dot: "bg-amber-400/70",
-      label: "Stopping",
-      text: "text-amber-300",
-    }
-  }
-  return {
-    dot: "bg-muted-foreground/50",
-    label: "Stopped",
-    text: "text-muted-foreground",
-  }
 }

@@ -7,6 +7,7 @@ export interface FleetRelayInstance extends RelayInstance {
   relayId: string
   relayName: string
   relayStatus: RelayReachability
+  relayUpdating?: boolean
   routeId: string
 }
 
@@ -14,6 +15,7 @@ export interface FleetRelayNode extends RelayNode {
   relayId: string
   relayName: string
   relayStatus: RelayReachability
+  relayUpdating?: boolean
 }
 
 export interface RelayFleetSnapshot {
@@ -36,24 +38,5 @@ export function relayFleetInstance(
     relayName: relay.name,
     relayStatus,
     routeId: relayInstanceRouteId(relay.id, instance.shortId),
-  }
-}
-
-export function addRelayInstanceToSnapshot(
-  snapshot: RelayFleetSnapshot | undefined,
-  instance: RelayInstance,
-  relay: { id: string; name: string }
-): RelayFleetSnapshot | undefined {
-  if (!snapshot) return snapshot
-
-  const relayInstance = relayFleetInstance(instance, relay)
-  const existingIndex = snapshot.instances.findIndex(
-    (item) => item.id === instance.id && item.relayId === relay.id
-  )
-  if (existingIndex !== -1) return snapshot
-
-  return {
-    ...snapshot,
-    instances: [relayInstance, ...snapshot.instances],
   }
 }

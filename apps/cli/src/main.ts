@@ -82,9 +82,7 @@ import {
 } from "./sftp.js"
 import { runCliProgram } from "./runtime.js"
 import { updateCliEffect } from "./update.js"
-import release from "../../../release.json" with { type: "json" }
-
-const VERSION = process.env.KILN_VERSION?.trim() || release.releaseLine
+import { cliVersion as VERSION } from "./distribution.js"
 
 const whoamiSchema = z.object({
   credential: z.object({
@@ -148,8 +146,12 @@ const runCommandEffect = Effect.fn("cli.command")(function* (
   }
   if (group === "update") {
     if (action !== undefined) return yield* invalidUsage("Usage: kiln update")
-    yield* updateCliEffect()
-    writeLine("Kiln CLI updated to the latest version.")
+    const result = yield* updateCliEffect()
+    writeLine(
+      result.updated
+        ? `Kiln CLI updated to ${result.version}.`
+        : `Kiln CLI ${result.version} is already up to date.`
+    )
     return
   }
 

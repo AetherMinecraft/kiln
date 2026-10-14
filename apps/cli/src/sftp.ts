@@ -172,8 +172,6 @@ export function resolveRemotePath(root: string, remotePath: string): string {
   const segments = remotePath.replace(/^\/+|\/+$/gu, "").split("/")
   if (
     !remotePath.trim() ||
-    remotePath.startsWith("/") ||
-    remotePath.includes("\\") ||
     segments.some(
       (segment) =>
         !segment ||

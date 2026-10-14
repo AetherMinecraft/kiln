@@ -1,6 +1,14 @@
-import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query"
+import {
+  infiniteQueryOptions,
+  mutationOptions,
+  queryOptions,
+} from "@tanstack/react-query"
 import type { QueryClient } from "@tanstack/react-query"
-import type { BackupTarget, RelayInstance } from "@workspace/contracts"
+import type {
+  BackupTarget,
+  RelayConsoleResource,
+  RelayInstance,
+} from "@workspace/contracts"
 
 import { getAccessCapabilities, getInvitationPreview } from "@/server/access"
 import { getActivity } from "@/server/activity"
@@ -23,8 +31,19 @@ import {
   getManagedDatabaseDirectory,
   getManagedDatabases,
 } from "@/server/databases"
-import { isMinecraftUsername } from "@/lib/minecraft-profile"
+import {
+  isMinecraftUsername,
+  minecraftUsernameKey,
+} from "@/lib/minecraft-profile"
 import { getUiPreferences } from "@/server/preferences"
+import {
+  getInstanceFavorites,
+  setInstanceFavorite,
+} from "@/server/instance-favorites"
+import {
+  instanceFavoriteKey,
+  type InstanceFavorite,
+} from "@/lib/instance-favorites"
 import { getMinecraftProfile } from "@/server/minecraft"
 import { reconcilePendingPowerSnapshot } from "@/lib/instance-power-state"
 import { systemUpdateOverviewRefetchPolicy } from "@/lib/system-update-presence"
@@ -37,12 +56,18 @@ import {
   getRelaySnapshot,
   getRelayTree,
 } from "@/server/relay"
-import { getRelays, getRelayTailscale } from "@/server/relays"
+import {
+  getRelays,
+  getRelayOwnerMinecraftProfiles,
+  getRelayTailscale,
+} from "@/server/relays"
 import { getTailscaleStacks } from "@/server/tailscale"
 import { getAuthState } from "@/server/auth"
-import { getUpdateOverview } from "@/server/updates"
+import type { ReleaseHistoryCursor } from "@/effect/kiln-release-feed"
+import { getReleaseHistory, getUpdateOverview } from "@/server/updates"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
+import { withDatabaseRelayStatus } from "@/lib/database-relay-status"
 import {
   backupRunScopesEqual,
   backupRunsInputFromQueryKey,
@@ -68,6 +93,8 @@ export const queryKeys = {
   minecraft: {
     profile: (displayName: string) =>
       ["minecraft", "profile", displayName] as const,
+    relayOwners: (ownerNames: string) =>
+      ["minecraft", "relay-owner-profiles", ownerNames] as const,
   },
   access: {
     capabilities: ["access", "capabilities"] as const,
@@ -105,8 +132,8 @@ export const queryKeys = {
   relay: {
     all: ["relay"] as const,
     connection: ["relay", "connection"] as const,
-    console: (relayId: string, instanceId: string) =>
-      ["relay", relayId, "instances", instanceId, "console"] as const,
+    console: (relayId: string, resource: RelayConsoleResource) =>
+      ["relay", relayId, `${resource.kind}s`, resource.id, "console"] as const,
     file: (relayId: string, instanceId: string, path: string) =>
       [
         "relay",
@@ -134,6 +161,9 @@ export const queryKeys = {
   tailscale: (relayId: string) => ["tailscale", "relays", relayId] as const,
   tailscaleStacks: ["tailscale", "stacks"] as const,
   updates: ["updates", "overview"] as const,
+  releaseHistory: ["updates", "release-history"] as const,
+  instanceFavorites: ["instance-favorites"] as const,
+  notifications: ["notifications"] as const,
   uiPreferences: ["ui", "preferences"] as const,
 }
 
@@ -198,10 +228,25 @@ export function authStateQueryOptions() {
 }
 
 export function minecraftProfileQueryOptions(displayName: string) {
+  const username = minecraftUsernameKey(displayName)
   return queryOptions({
-    queryKey: queryKeys.minecraft.profile(displayName),
-    queryFn: () => getMinecraftProfile(),
+    queryKey: queryKeys.minecraft.profile(username),
+    queryFn: ({ signal }) => getMinecraftProfile({ signal }),
     enabled: isMinecraftUsername(displayName),
+    gcTime: 60 * 60_000,
+    retry: false,
+    staleTime: 60 * 60_000,
+  })
+}
+
+/** Keyed by the visible owners so pairing or sharing a Relay refetches. */
+export function relayOwnerMinecraftProfilesQueryOptions(ownerNames: string) {
+  return queryOptions({
+    queryKey: queryKeys.minecraft.relayOwners(ownerNames),
+    queryFn: ({ signal }) => getRelayOwnerMinecraftProfiles({ signal }),
+    enabled: ownerNames.length > 0,
+    gcTime: 60 * 60_000,
+    retry: false,
     staleTime: 60 * 60_000,
   })
 }
@@ -303,7 +348,7 @@ export async function fetchRelaySnapshot(
   )
 }
 
-export function snapshotWithCanonicalState(
+function snapshotWithCanonicalState(
   queryClient: QueryClient,
   fetched: RelayFleetSnapshot
 ): RelayFleetSnapshot {
@@ -326,7 +371,7 @@ export function snapshotWithCanonicalState(
   return snapshot
 }
 
-export function connectionWithCanonicalSnapshot(
+function connectionWithCanonicalSnapshot(
   queryClient: QueryClient,
   connection: Extract<RelayConnection, { status: "connected" | "unreachable" }>
 ): Extract<RelayConnection, { status: "connected" | "unreachable" }> {
@@ -347,10 +392,36 @@ export function managedDatabaseDirectoryQueryOptions() {
 export function managedDatabasesQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.databases.list,
-    queryFn: () => getManagedDatabases(),
+    queryFn: ({ client }) => fetchManagedDatabases(client),
     refetchOnWindowFocus: "always",
     staleTime: 5_000,
   })
+}
+
+/**
+ * Inventory responses can resolve after newer Relay status events, so the
+ * live Relay status from the connection cache is reapplied to every result.
+ */
+export async function fetchManagedDatabases(queryClient: QueryClient) {
+  const overview = await getManagedDatabases()
+  const connection = queryClient.getQueryData<RelayConnection>(
+    queryKeys.relay.connection
+  )
+  if (
+    connection?.status !== "connected" &&
+    connection?.status !== "unreachable"
+  ) {
+    return overview
+  }
+  return withDatabaseRelayStatus(
+    overview,
+    new Map(
+      connection.relays.map((relay) => [
+        relay.id,
+        { status: relay.status, updating: relay.updating === true },
+      ])
+    )
+  )
 }
 
 export function managedDatabaseCredentialQueryOptions(
@@ -395,6 +466,69 @@ export function invitationPreviewQueryOptions(token: string) {
   })
 }
 
+export function instanceFavoritesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.instanceFavorites,
+    queryFn: () => getInstanceFavorites(),
+    staleTime: Infinity,
+  })
+}
+
+const setInstanceFavoriteMutationKey = ["instance-favorites", "set"] as const
+
+function withInstanceFavorite(
+  favorites: ReadonlyArray<InstanceFavorite>,
+  favorite: InstanceFavorite,
+  starred: boolean
+): Array<InstanceFavorite> {
+  const key = instanceFavoriteKey(favorite)
+  const rest = favorites.filter(
+    (candidate) => instanceFavoriteKey(candidate) !== key
+  )
+  return starred ? [...rest, favorite] : rest
+}
+
+export function setInstanceFavoriteMutationOptions(
+  queryClient: QueryClient,
+  onFailure: (error: Error) => void
+) {
+  const { queryKey } = instanceFavoritesQueryOptions()
+  return mutationOptions({
+    mutationKey: setInstanceFavoriteMutationKey,
+    mutationFn: (input: { favorite: InstanceFavorite; starred: boolean }) =>
+      setInstanceFavorite({ data: input }),
+    onMutate: async ({ favorite, starred }) => {
+      await queryClient.cancelQueries({ queryKey })
+      const key = instanceFavoriteKey(favorite)
+      const wasStarred =
+        queryClient
+          .getQueryData(queryKey)
+          ?.some((candidate) => instanceFavoriteKey(candidate) === key) ?? false
+      queryClient.setQueryData(queryKey, (current = []) =>
+        withInstanceFavorite(current, favorite, starred)
+      )
+      return { wasStarred }
+    },
+    onError: (error, { favorite }, context) => {
+      // Undo only this favorite; other toggles may have landed meanwhile.
+      if (context) {
+        queryClient.setQueryData(queryKey, (current = []) =>
+          withInstanceFavorite(current, favorite, context.wasStarred)
+        )
+      }
+      onFailure(error)
+    },
+    onSettled: async () => {
+      // Reconcile once the last overlapping toggle settles, so an earlier
+      // refetch can't overwrite a later optimistic change.
+      const pending = queryClient.isMutating({
+        mutationKey: setInstanceFavoriteMutationKey,
+      })
+      if (pending === 1) await queryClient.invalidateQueries({ queryKey })
+    },
+  })
+}
+
 export function uiPreferencesQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.uiPreferences,
@@ -435,6 +569,22 @@ export function updateOverviewQueryOptions() {
     queryKey: queryKeys.updates,
     queryFn: () => getUpdateOverview(),
     staleTime: 30_000,
+  })
+}
+
+export function releaseHistoryInfiniteQueryOptions() {
+  return infiniteQueryOptions({
+    queryKey: queryKeys.releaseHistory,
+    initialPageParam: null as ReleaseHistoryCursor | null,
+    queryFn: ({ pageParam, signal }) =>
+      getReleaseHistory({ data: { cursor: pageParam }, signal }),
+    getNextPageParam: (page) => page.nextCursor,
+    // Releases rarely change once published; new ones arrive with the
+    // overview, which refreshes this list. Pages stay cached between visits,
+    // so reopening the changelog shows them at once while they refresh.
+    gcTime: 30 * 60_000,
+    refetchOnWindowFocus: false,
+    staleTime: 5 * 60_000,
   })
 }
 
@@ -524,24 +674,38 @@ export function relayTreeQueryOptions(relayId: string, instanceId: string) {
   })
 }
 
-export function relayRootDirectoryQueryOptions(
+export function relayDirectoryQueryOptions(
   relayId: string,
-  instanceId: string
+  instanceId: string,
+  directory = ""
 ) {
-  return queryOptions({
+  const path = directory.replace(/^\/+|\/+$/gu, "")
+  return infiniteQueryOptions({
     queryKey: [
       ...queryKeys.relay.tree(relayId, instanceId),
       "directory",
-      "root",
+      path ? `${path}/` : "",
     ] as const,
-    queryFn: () =>
-      getRelayDirectoryPage({ data: { instanceId, path: "", relayId } }),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam, signal }) =>
+      getRelayDirectoryPage({
+        data: { instanceId, path, relayId, cursor: pageParam },
+        signal,
+      }),
+    getNextPageParam: (page) => page.cursor ?? undefined,
     retry: 3,
     retryDelay: (attempt) => Math.min(500 * 2 ** attempt, 2_000),
     refetchOnReconnect: false,
     refetchOnWindowFocus: false,
     staleTime: 15_000,
   })
+}
+
+export function relayRootDirectoryQueryOptions(
+  relayId: string,
+  instanceId: string
+) {
+  return relayDirectoryQueryOptions(relayId, instanceId)
 }
 
 export function relayFileQueryOptions(
@@ -551,7 +715,8 @@ export function relayFileQueryOptions(
 ) {
   return queryOptions({
     queryKey: queryKeys.relay.file(relayId, instanceId, path),
-    queryFn: () => getRelayFile({ data: { instanceId, path, relayId } }),
+    queryFn: ({ signal }) =>
+      getRelayFile({ data: { instanceId, path, relayId }, signal }),
     staleTime: 15_000,
   })
 }
@@ -563,7 +728,8 @@ export function relayFileEntryQueryOptions(
 ) {
   return queryOptions({
     queryKey: [...queryKeys.relay.file(relayId, instanceId, path), "stat"],
-    queryFn: () => getRelayFileEntry({ data: { instanceId, path, relayId } }),
+    queryFn: ({ signal }) =>
+      getRelayFileEntry({ data: { instanceId, path, relayId }, signal }),
     retry: false,
     staleTime: 15_000,
   })
@@ -575,7 +741,8 @@ export function relayFileActivityQueryOptions(
 ) {
   return queryOptions({
     queryKey: queryKeys.fileActivity(relayId, instanceId),
-    queryFn: () => getRelayFileActivity({ data: { instanceId, relayId } }),
+    queryFn: ({ signal }) =>
+      getRelayFileActivity({ data: { instanceId, relayId }, signal }),
     staleTime: 15_000,
   })
 }

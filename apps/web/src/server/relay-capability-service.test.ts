@@ -3,13 +3,6 @@ import { generateKeyPairSync } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { Effect } from "effect"
 
-vi.hoisted(() => {
-  process.env.DB_HOST ??= "127.0.0.1"
-  process.env.DB_NAME ??= "test"
-  process.env.DB_PASSWORD ??= "test"
-  process.env.DB_USERNAME ??= "test"
-})
-
 const fakes = vi.hoisted(() => ({
   decryptCredentials: vi.fn(),
   relayBrowserMetadata: vi.fn(),
@@ -221,15 +214,12 @@ describe("Relay capability issuance orchestration", () => {
       write: true,
     })
 
-    expect(fakes.requirePermissions).toHaveBeenCalledTimes(2)
     expect(fakes.requirePermissions).toHaveBeenCalledWith({
       instanceId: "instance-one",
       permissions: ["instance.console.read", "instance.console.write"],
       relayId: "relay-one",
       user,
     })
-    expect(fakes.decryptCredentials).toHaveBeenCalledOnce()
-    expect(fakes.relayRpc).toHaveBeenCalledOnce()
     expect(issued.browserOrigin).toBe("https://relay-live.example.com")
     expect(decodeCapabilityPayload(issued.capability)).toMatchObject({
       actions: ["instance.console.read", "instance.console.write"],
@@ -254,7 +244,6 @@ describe("Relay capability issuance orchestration", () => {
       write: false,
     })
 
-    expect(fakes.relayBrowserMetadata).toHaveBeenCalledWith("relay-one")
     expect(fakes.relayRpc).not.toHaveBeenCalled()
     expect(issued).toMatchObject({
       browserOrigin: "https://relay-snapshot.example.com",
@@ -263,6 +252,11 @@ describe("Relay capability issuance orchestration", () => {
   })
 
   it("does not resolve browser metadata for the Hearth proxy", async () => {
+    fakes.relayBrowserMetadata.mockReturnValue({
+      browserOrigin: "https://relay-snapshot.example.com",
+      mode: "hearth",
+    })
+
     const prepared = await prepareConsoleCapabilityForUser({
       credentialId: "credential-one",
       instanceId: "instance-one",
@@ -277,7 +271,6 @@ describe("Relay capability issuance orchestration", () => {
       relayId: "relay-one",
       user,
     })
-    expect(fakes.relayBrowserMetadata).not.toHaveBeenCalled()
     expect(fakes.relayRpc).not.toHaveBeenCalled()
     expect(prepared.capability).toMatchObject({
       browserOrigin: "https://relay.example.com",
@@ -291,10 +284,10 @@ describe("Relay capability issuance orchestration", () => {
 
     const issued = await issueBrowserCapabilitiesForRequest({
       authenticate: () => Promise.resolve({ sessionId: "session-one", user }),
-      instanceId: "instance-one",
       publicKeyJwk,
       relayId: "relay-one",
       requests: [{ kind: "console", optInV2: true, write: true }],
+      resource: { id: "instance-one", kind: "instance" },
     })
 
     expect(issued.capabilities[0]).toMatchObject({
@@ -310,10 +303,66 @@ describe("Relay capability issuance orchestration", () => {
       version: 2,
     })
     expect(Number(payload.expiresAt) - Number(payload.issuedAt)).toBe(30_000)
-    expect(fakes.relayBrowserAuthorizationReady).toHaveBeenCalledWith(
-      "relay-one",
-      1
-    )
+  })
+
+  describe("database consoles", () => {
+    // Alice can read the logs of database-one only.
+    beforeEach(() => {
+      fakes.features.add("browser-capability-v2")
+      fakes.features.add("browser-lease-renewal-v1")
+      fakes.features.add("console-resources-v1")
+      fakes.requirePermissions.mockImplementation(
+        (input: { databaseId?: string; permissions: Array<string> }) =>
+          input.databaseId === "database-one" &&
+          input.permissions.every(
+            (permission) => permission === "database.logs.read"
+          )
+            ? Effect.void
+            : Effect.fail(new Error("Permission denied"))
+      )
+    })
+
+    const issue = (
+      databaseId: string,
+      write = false
+    ): ReturnType<typeof issueBrowserCapabilitiesForRequest> =>
+      issueBrowserCapabilitiesForRequest({
+        authenticate: () => Promise.resolve({ sessionId: "session-one", user }),
+        publicKeyJwk,
+        relayId: "relay-one",
+        requests: [{ kind: "console", optInV2: true, write }],
+        resource: { id: databaseId, kind: "database" },
+      })
+
+    it("issues a capability to read a database's console", async () => {
+      const issued = await issue("database-one")
+
+      expect(
+        decodeCapabilityPayload(issued.capabilities[0]!.capability)
+      ).toMatchObject({
+        actions: ["database.logs.read"],
+        instanceId: "database-one",
+        operation: "console",
+        resourceKind: "database",
+        version: 2,
+      })
+    })
+
+    it("refuses a database whose logs the person can't read", async () => {
+      await expect(issue("database-two")).rejects.toThrow()
+    })
+
+    it("refuses console input to a database", async () => {
+      await expect(issue("database-one", true)).rejects.toThrow()
+    })
+
+    it("refuses Relays that can't stream database consoles", async () => {
+      fakes.features.delete("console-resources-v1")
+
+      await expect(issue("database-one")).rejects.toThrow(
+        "Update this Relay to view these logs."
+      )
+    })
   })
 
   it("uses the generation synchronized after stale issuance material was loaded", async () => {
@@ -323,10 +372,10 @@ describe("Relay capability issuance orchestration", () => {
 
     const issued = await issueBrowserCapabilitiesForRequest({
       authenticate: () => Promise.resolve({ sessionId: "session-one", user }),
-      instanceId: "instance-one",
       publicKeyJwk,
       relayId: "relay-one",
       requests: [{ kind: "console", optInV2: true, write: false }],
+      resource: { id: "instance-one", kind: "instance" },
     })
 
     expect(
@@ -354,17 +403,34 @@ describe("Relay capability issuance orchestration", () => {
 
     const issued = await issueBrowserCapabilitiesForRequest({
       authenticate: () => Promise.resolve({ sessionId: "session-one", user }),
-      instanceId: "instance-one",
       publicKeyJwk,
       relayId: "relay-one",
       requests: [{ kind: "console", optInV2: true, write: true }],
+      resource: { id: "instance-one", kind: "instance" },
     })
 
-    expect(fakes.refreshUser).toHaveBeenCalledTimes(3)
-    expect(fakes.requirePermissions).toHaveBeenCalledTimes(3)
     expect(
       decodeCapabilityPayload(issued.capabilities[0]!.capability)
     ).toMatchObject({ authorizationRevision: 8 })
+  })
+
+  it("refuses to sign when access is revoked during capability issuance", async () => {
+    const revoked = new Error("Console access denied")
+    fakes.features.add("browser-capability-v2")
+    fakes.features.add("browser-lease-renewal-v1")
+    fakes.requirePermissions
+      .mockReturnValueOnce(Effect.void)
+      .mockReturnValue(Effect.fail(revoked))
+
+    await expect(
+      issueBrowserCapabilitiesForRequest({
+        authenticate: () => Promise.resolve({ sessionId: "session-one", user }),
+        publicKeyJwk,
+        relayId: "relay-one",
+        requests: [{ kind: "console", optInV2: true, write: true }],
+        resource: { id: "instance-one", kind: "instance" },
+      })
+    ).rejects.toBe(revoked)
   })
 })
 

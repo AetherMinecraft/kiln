@@ -8,24 +8,25 @@
   },
   "scripts": {
     "build": "bun scripts/build.mjs",
-    "build:npm": "bun scripts/build.mjs --npm-only",
+    "build:npm": "node scripts/package.mjs",
     "dev": "bun src/main.ts",
     "format": "vp fmt \"src/**/*.ts\"",
     "lint": "vp lint src",
     "test": "vp test run",
+    "test:native": "bun scripts/native-e2e.mjs",
     "test:credential-store": "pnpm build && node scripts/credential-store-e2e.mjs"
   },
   "dependencies": {
     "@workspace/contracts": "workspace:*",
     "effect": "4.0.1",
     "ssh2": "1.17.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@effect/vitest": "4.0.1",
-    "@types/node": "^22",
-    "@types/ssh2": "1.15.5",
-    "bun": "1.2.18",
+    "@types/node": "^22.20.5",
+    "@types/ssh2": "1.15.6",
+    "bun": "1.4.2",
     "typescript": "^6",
     "vite-plus": "catalog:",
     "vitest": "catalog:"

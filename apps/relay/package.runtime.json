@@ -2,32 +2,36 @@
   "name": "@kiln/relay-runtime",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.33.4",
+  "packageManager": "pnpm@10.34.6",
   "dependencies": {
     "@effect/sql-sqlite-node": "4.0.1",
-    "@opentelemetry/api": "1.9.0",
-    "@opentelemetry/core": "2.9.0",
-    "@peculiar/x509": "2.0.0",
-    "@sentry/node": "10.66.0",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/core": "2.11.0",
+    "@peculiar/x509": "2.1.0",
+    "@sentry/node": "10.76.0",
+    "@xterm/addon-serialize": "0.14.0",
+    "@xterm/headless": "6.0.0",
     "effect": "4.0.1",
-    "minimatch": "10.2.5",
+    "minimatch": "10.2.6",
+    "mysql2": "3.24.5",
+    "pg": "8.23.1",
     "reflect-metadata": "0.2.2",
     "ssh2": "1.17.0",
-    "tar-stream": "3.2.0",
-    "ws": "8.21.1",
-    "yaml": "2.8.1",
+    "tar-stream": "3.2.2",
+    "ws": "8.22.0",
+    "yaml": "2.9.1",
     "yauzl": "3.4.0",
     "zip-stream": "7.0.5",
-    "zod": "4.4.3"
+    "zod": "4.6.5"
   },
   "pnpm": {
     "overrides": {
-      "@apm-js-collab/code-transformer": "0.18.0",
-      "@opentelemetry/core": "2.9.0",
-      "@opentelemetry/resources": "2.9.0",
-      "@opentelemetry/sdk-trace": "2.9.0",
-      "@opentelemetry/sdk-trace-base": "2.9.0",
-      "import-in-the-middle": "3.3.1"
+      "@apm-js-collab/code-transformer": "0.18.1",
+      "@opentelemetry/core": "2.11.0",
+      "@opentelemetry/resources": "2.11.0",
+      "@opentelemetry/sdk-trace": "2.11.0",
+      "@opentelemetry/sdk-trace-base": "2.11.0",
+      "import-in-the-middle": "3.5.2"
     }
   }
 }

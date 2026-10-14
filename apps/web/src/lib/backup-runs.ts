@@ -8,11 +8,17 @@ export type BackupRunSort = (typeof backupRunSorts)[number]
 export type BackupRunSortDirection = "asc" | "desc"
 export type BackupRunStatus = "active" | "available" | "failed"
 
-export const backupRunScopeSchema = z.strictObject({
-  kind: z.enum(["database", "instance", "platform"]),
-  relayId: z.string().min(1).max(43),
-  targetId: z.string().min(1).max(120),
-})
+const backupRunTargetKindSchema = z.enum(["database", "instance", "platform"])
+
+/** One backup target, or every target of a kind, including future ones. */
+export const backupRunScopeSchema = z.union([
+  z.strictObject({
+    kind: backupRunTargetKindSchema,
+    relayId: z.string().min(1).max(43),
+    targetId: z.string().min(1).max(120),
+  }),
+  z.strictObject({ kind: backupRunTargetKindSchema }),
+])
 
 export const backupRunsQuerySchema = z.strictObject({
   cursor: z.string().min(1).max(2_048).nullable().optional(),
@@ -139,35 +145,9 @@ export function backupRunScopesEqual(
   if (!left || !right) return left == null && right == null
   return (
     left.kind === right.kind &&
-    left.relayId === right.relayId &&
-    left.targetId === right.targetId
+    ("relayId" in left ? left.relayId : null) ===
+      ("relayId" in right ? right.relayId : null) &&
+    ("targetId" in left ? left.targetId : null) ===
+      ("targetId" in right ? right.targetId : null)
   )
-}
-
-export function compareBackupRunOrderKeys(
-  left: BackupRunOrderKey,
-  right: BackupRunOrderKey,
-  direction: BackupRunSortDirection
-): number {
-  if (left.value === null && right.value !== null) return 1
-  if (left.value !== null && right.value === null) return -1
-  const valueComparison = compareNullableOrderValues(left.value, right.value)
-  if (valueComparison !== 0) {
-    return direction === "asc" ? valueComparison : -valueComparison
-  }
-  return direction === "asc"
-    ? left.id.localeCompare(right.id)
-    : right.id.localeCompare(left.id)
-}
-
-function compareNullableOrderValues(
-  left: BackupRunOrderKey["value"],
-  right: BackupRunOrderKey["value"]
-): number {
-  if (left === null) return right === null ? 0 : 1
-  if (right === null) return -1
-  if (typeof left === "number" && typeof right === "number") {
-    return left - right
-  }
-  return String(left).localeCompare(String(right))
 }

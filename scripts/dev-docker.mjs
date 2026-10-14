@@ -3,11 +3,6 @@ import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs"
 import { basename, dirname, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 
-import {
-  developmentRelayName,
-  ensureDockerVolume,
-} from "./dev-docker-helpers.mjs"
-
 const command = process.argv[2] ?? "start"
 const initialDirectory = process.cwd()
 const worktreeRoot = captureAt(initialDirectory, "git", [
@@ -129,6 +124,23 @@ switch (command) {
     // and SFTP client need them as much as the browser does.
     console.log(hostsEntry())
     break
+  case "test":
+    // Web tests, including the real-MySQL suites, against this stack's MySQL.
+    run(
+      "pnpm",
+      ["exec", "vp", "test", "run", ...process.argv.slice(3)],
+      {
+        ...process.env,
+        KILN_TEST_MYSQL: "1",
+        DB_HOST: orbstack ? `mysql.${stack}.orb.local` : "127.0.0.1",
+        DB_PORT: "3306",
+        DB_NAME: process.env.KILN_TEST_DB_NAME ?? "kiln_test",
+        DB_USERNAME: "root",
+        DB_PASSWORD: "kiln-root",
+      },
+      resolve(worktreeRoot, "apps/web")
+    )
+    break
   case "list":
     run("docker", ["compose", "ls"], process.env)
     break
@@ -196,21 +208,25 @@ function destroyNamespacedNetworks() {
 }
 
 function ensureSharedStore() {
-  try {
-    ensureDockerVolume("kiln-dev-pnpm-store", (arguments_) =>
-      spawnSync("docker", arguments_, {
-        cwd: worktreeRoot,
-        encoding: "utf8",
-        env: process.env,
-      })
-    )
-  } catch (cause) {
-    fail(
-      cause instanceof Error
-        ? cause.message
-        : "Could not create the shared pnpm Docker volume."
-    )
-  }
+  const volume = "kiln-dev-pnpm-store"
+  const docker = (arguments_) =>
+    spawnSync("docker", arguments_, {
+      cwd: worktreeRoot,
+      encoding: "utf8",
+      env: process.env,
+    })
+  const inspect = () => docker(["volume", "inspect", volume])
+  if (inspect().status === 0) return
+
+  // Another worktree can create the shared volume at the same time.
+  const created = docker(["volume", "create", volume])
+  if (created.status === 0 || inspect().status === 0) return
+  const detail = created.stderr?.trim()
+  fail(
+    detail
+      ? `Could not create Docker volume ${volume}: ${detail}`
+      : `Could not create Docker volume ${volume}.`
+  )
 }
 
 function refresh() {
@@ -417,9 +433,9 @@ function captureAt(
   return result.stdout.trim()
 }
 
-function run(executable, arguments_, environment) {
+function run(executable, arguments_, environment, cwd = worktreeRoot) {
   const result = spawnSync(executable, arguments_, {
-    cwd: worktreeRoot,
+    cwd,
     env: environment,
     stdio: "inherit",
   })

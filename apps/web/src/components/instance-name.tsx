@@ -15,6 +15,8 @@ import {
   type InstanceNameInstance,
   type InstanceStatusPresentation,
 } from "@/components/instance-name-presentation"
+import { IdentityName } from "@/components/identity-name"
+import { InstanceFavoriteStar } from "@/components/instance-favorite"
 import { managedDatabasesCollectionOptions } from "@/lib/collections/managed-databases"
 import { relayInstancesCollectionOptions } from "@/lib/collections/relay-instances"
 import { relayNodesCollectionOptions } from "@/lib/collections/relay-nodes"
@@ -34,6 +36,8 @@ interface InstanceNameProps {
   name: string
   nameAccessory?: React.ReactNode
   nameClassName?: string
+  /** Shows a star after the name when the user favorited this instance. */
+  showFavorite?: boolean
   showStatus?: boolean
   statusClassName?: string
   textClassName?: string
@@ -103,6 +107,7 @@ function LiveServerIdentity(
           name: server.name,
           observedState: server.observedState,
           relayStatus: server.relayStatus,
+          relayUpdating: server.relayUpdating,
         })),
   })
   const live = data?.[0]
@@ -120,6 +125,7 @@ function LiveServerIdentity(
               ...instance,
               observedState: live?.observedState ?? instance.observedState,
               relayStatus: live?.relayStatus ?? instance.relayStatus,
+              relayUpdating: live ? live.relayUpdating : instance.relayUpdating,
             })
       }
     />
@@ -144,6 +150,8 @@ function LiveDatabaseIdentity(
           inventoryStatus: database.inventoryStatus,
           name: database.name,
           observedState: database.observedState,
+          relayStatus: database.relayStatus,
+          relayUpdating: database.relayUpdating,
         })),
   })
   const live = data?.[0]
@@ -159,6 +167,8 @@ function LiveDatabaseIdentity(
               inventoryStatus:
                 live?.inventoryStatus ?? instance.inventoryStatus,
               observedState: live?.observedState ?? instance.observedState,
+              relayStatus: live ? live.relayStatus : instance.relayStatus,
+              relayUpdating: live ? live.relayUpdating : instance.relayUpdating,
             })
       }
     />
@@ -214,6 +224,7 @@ function LiveFleetRelayIdentity(
         .select(({ relay }) => ({
           name: relay.relayName,
           relayStatus: relay.relayStatus,
+          relayUpdating: relay.relayUpdating,
         })),
   })
   const live = data?.[0]
@@ -227,6 +238,7 @@ function LiveFleetRelayIdentity(
           : instanceStatusPresentation({
               ...instance,
               relayStatus: live?.relayStatus ?? instance.relayStatus,
+              updating: live ? live.relayUpdating : instance.updating,
             })
       }
     />
@@ -247,6 +259,7 @@ const InstanceNameView = React.memo(function InstanceNameView({
   name,
   nameAccessory,
   nameClassName,
+  showFavorite,
   status,
   statusClassName,
   textClassName,
@@ -258,13 +271,9 @@ const InstanceNameView = React.memo(function InstanceNameView({
   status?: InstanceStatusPresentation
 }) {
   return (
-    <span className={cn("flex min-w-0 items-center gap-2.5", className)}>
-      <span
-        className={cn(
-          "relative grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-background/35 text-muted-foreground",
-          iconClassName
-        )}
-      >
+    <IdentityName
+      className={className}
+      icon={
         <InstanceIcon
           brickId={brickId}
           brickSource={brickSource}
@@ -272,84 +281,30 @@ const InstanceNameView = React.memo(function InstanceNameView({
           implementation={implementation}
           instance={instance}
         />
-        {status ? (
-          <InstanceStatus
-            className={statusClassName}
-            label={status.label}
-            tone={status.tone}
-          />
-        ) : null}
-      </span>
-      <InstanceText
-        meta={meta}
-        metaClassName={metaClassName}
-        name={liveName ?? name}
-        nameAccessory={nameAccessory}
-        nameClassName={nameClassName}
-        textClassName={textClassName}
-      />
-    </span>
-  )
-})
-
-const InstanceText = React.memo(function InstanceText({
-  meta,
-  metaClassName,
-  name,
-  nameAccessory,
-  nameClassName,
-  textClassName,
-}: Pick<
-  InstanceNameProps,
-  | "meta"
-  | "metaClassName"
-  | "name"
-  | "nameAccessory"
-  | "nameClassName"
-  | "textClassName"
->) {
-  return (
-    <span className={cn("min-w-0 flex-1", textClassName)}>
-      <span
-        className={cn(
-          "flex min-w-0 items-center gap-1.5 text-xs font-semibold text-foreground",
-          nameClassName
-        )}
-      >
-        <span className="truncate">{name}</span>
-        {nameAccessory}
-      </span>
-      {meta ? (
-        <span
-          className={cn(
-            "type-meta block truncate text-muted-foreground",
-            metaClassName
-          )}
-        >
-          {meta}
-        </span>
-      ) : null}
-    </span>
-  )
-})
-
-const InstanceStatus = React.memo(function InstanceStatus({
-  className,
-  label,
-  tone,
-}: InstanceStatusPresentation & { className?: string }) {
-  return (
-    <>
-      <span
-        className={cn(
-          "absolute -right-0.5 -bottom-0.5 size-1.5 rounded-full ring-2 ring-background",
-          statusToneClassName[tone],
-          className
-        )}
-        aria-hidden="true"
-      />
-      <span className="sr-only">Status: {label}</span>
-    </>
+      }
+      iconClassName={iconClassName}
+      meta={meta}
+      metaClassName={metaClassName}
+      name={liveName ?? name}
+      nameAccessory={
+        showFavorite === false ? (
+          nameAccessory
+        ) : (
+          <>
+            <InstanceFavoriteStar
+              id={instance.id}
+              kind={instance.kind}
+              relayId={instance.relayId}
+            />
+            {nameAccessory}
+          </>
+        )
+      }
+      nameClassName={nameClassName}
+      status={status}
+      statusClassName={statusClassName}
+      textClassName={textClassName}
+    />
   )
 })
 
@@ -437,6 +392,7 @@ function instanceNamePropsEqual(
     previous.name === next.name &&
     previous.nameAccessory === next.nameAccessory &&
     previous.nameClassName === next.nameClassName &&
+    previous.showFavorite === next.showFavorite &&
     previous.showStatus === next.showStatus &&
     previous.statusClassName === next.statusClassName &&
     previous.textClassName === next.textClassName &&
@@ -467,14 +423,17 @@ function instancePresentationEqual(
         (previous.connected === next.connected &&
           previous.enabled === next.enabled &&
           previous.lastError === next.lastError &&
-          previous.relayStatus === next.relayStatus))
+          previous.relayStatus === next.relayStatus &&
+          previous.updating === next.updating))
     )
   }
   if (previous.kind === "database" && next.kind === "database") {
     return (
       live ||
       (previous.inventoryStatus === next.inventoryStatus &&
-        previous.observedState === next.observedState)
+        previous.observedState === next.observedState &&
+        previous.relayStatus === next.relayStatus &&
+        previous.relayUpdating === next.relayUpdating)
     )
   }
   if (previous.kind !== "server" || next.kind !== "server") return false
@@ -484,15 +443,7 @@ function instancePresentationEqual(
     previous.implementation === next.implementation &&
     (live ||
       (previous.observedState === next.observedState &&
-        previous.relayStatus === next.relayStatus))
+        previous.relayStatus === next.relayStatus &&
+        previous.relayUpdating === next.relayUpdating))
   )
 }
-
-const statusToneClassName: Record<InstanceStatusPresentation["tone"], string> =
-  {
-    danger: "bg-destructive",
-    info: "bg-sky-400",
-    neutral: "bg-muted-foreground/45",
-    success: "bg-emerald-400",
-    warning: "bg-amber-400",
-  }

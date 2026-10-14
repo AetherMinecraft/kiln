@@ -7,20 +7,17 @@ import * as React from "react"
 import { useDbClient, useLiveQuery } from "@tanstack/react-db"
 import {
   useMutation,
-  useQuery,
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query"
+import { Link } from "@tanstack/react-router"
 import type { DatabaseEngine } from "@workspace/contracts"
 import {
-  CircleAlert,
-  Copy,
   Database,
   Download,
   EllipsisVertical,
   KeyRound,
   LoaderCircle,
-  Network,
   Play,
   Plus,
   RefreshCw,
@@ -49,11 +46,6 @@ import {
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@workspace/ui/components/popover"
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -73,19 +65,41 @@ import {
   DataTableTextCell,
 } from "@/components/data-table"
 import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
+import {
+  CredentialsDialog,
+  DeleteDatabaseDialog,
+  ImportDatabaseDialog,
+  useDatabaseExport,
+} from "@/components/database/database-dialogs"
+import { DatabaseNetworkPicker } from "@/components/database/database-network"
+import {
+  databaseRelayAvailable,
+  databaseStatusPresentation,
+  engineBadgeClasses,
+  engineLabel,
+  engineOptions,
+  showDatabaseOperationError,
+  type ManagedDatabase,
+  type ManagedDatabaseOverview,
+} from "@/components/database/database-presentation"
+import {
+  FavoritesOnlyButton,
+  FavoritesOnlyEmptyState,
+  InstanceFavoriteMenuItem,
+  InstanceFavoriteToggle,
+  useFavoritesOnly,
+  useFavoritesOnlySource,
+} from "@/components/instance-favorite"
 import { DataTable } from "@/components/data-table-view"
 import {
   DataTableToolbar,
   DataTableWorkspace,
 } from "@/components/data-table-workspace"
 import { InstanceName } from "@/components/instance-name"
-import { instanceStatusPresentation } from "@/components/instance-name-presentation"
+import { statusColumnWidth } from "@/components/instance-name-presentation"
+import { StatusIndicator } from "@/components/status-indicator"
 import { getManagedDatabasesCollection } from "@/lib/collections/managed-databases"
-import {
-  ServerPickerList,
-  serverPickerOptionKey,
-} from "@/components/server-picker-list"
-import { grantHasPermission } from "@/lib/permissions"
+import type { InstanceFavorite } from "@/lib/instance-favorites"
 import type { AccessPermission } from "@/lib/permissions"
 import {
   createDataTableColumnHelper,
@@ -97,27 +111,13 @@ import {
   type DataTableSearchStore,
 } from "@/lib/data-table-search"
 import { useLiveDataTableSource } from "@/lib/data-table-source"
-import {
-  accessCapabilitiesQueryOptions,
-  managedDatabaseCredentialQueryOptions,
-  managedDatabasesQueryOptions,
-  queryKeys,
-  relaySnapshotQueryOptions,
-} from "@/lib/query-options"
+import { managedDatabasesQueryOptions, queryKeys } from "@/lib/query-options"
 import { ensuringPromise, forkPromise } from "@/effect/promise"
 import {
   createManagedDatabase,
-  deleteManagedDatabase,
-  exportManagedDatabase,
-  importManagedDatabase,
-  rotateManagedDatabasePassword,
   runManagedDatabaseAction,
-  updateManagedDatabaseNetwork,
 } from "@/server/databases"
-import type { getManagedDatabases } from "@/server/databases"
 
-type ManagedDatabaseOverview = Awaited<ReturnType<typeof getManagedDatabases>>
-type ManagedDatabase = ManagedDatabaseOverview["databases"][number]
 type ManagedRelay = ManagedDatabaseOverview["relays"][number]
 type DatabaseDialog =
   | { kind: "credentials"; database: ManagedDatabase }
@@ -125,30 +125,6 @@ type DatabaseDialog =
   | { kind: "import"; database: ManagedDatabase }
   | null
 
-const engineOptions: ReadonlyArray<{
-  description: string
-  label: string
-  value: DatabaseEngine
-}> = [
-  { value: "mysql", label: "MySQL", description: "8.4 LTS" },
-  { value: "mariadb", label: "MariaDB", description: "11.8 LTS" },
-  { value: "postgres", label: "Postgres", description: "17" },
-  { value: "redis", label: "Redis", description: "8" },
-  { value: "valkey", label: "Valkey", description: "8" },
-]
-
-const engineBadgeClasses: Record<DatabaseEngine, string> = {
-  mariadb:
-    "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300",
-  mysql: "border-sky-500/35 bg-sky-500/10 text-sky-700 dark:text-sky-300",
-  postgres:
-    "border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-  redis: "border-red-500/35 bg-red-500/10 text-red-700 dark:text-red-300",
-  valkey:
-    "border-violet-500/35 bg-violet-500/10 text-violet-700 dark:text-violet-300",
-}
-
-const dumpLimitBytes = 700_000
 const databaseInventoryError = new Error("Could not load databases")
 const minimumManualSyncFeedbackMs = 500
 const databaseTableColumnHelper = createDataTableColumnHelper<ManagedDatabase>()
@@ -280,6 +256,7 @@ const DatabaseToolbar = React.memo(function DatabaseToolbar({
           </Button>
         ) : null
       }
+      controls={<FavoritesOnlyButton table="databases" />}
       leading={<DatabaseSyncButton relayErrors={relayErrors} />}
       search={{
         ariaLabel: "Search databases",
@@ -388,14 +365,21 @@ const DatabaseTable = React.memo(function DatabaseTable({
     isLoading: result.isLoading,
     retry,
   })
+  const [favoritesOnly] = useFavoritesOnly("databases")
+  const visibleSource = useFavoritesOnlySource(
+    source,
+    favoritesOnly,
+    databaseFavorite
+  )
+  const favoritesFiltered = favoritesOnly && source.rows.length > 0
   const visibleResourceKeys = React.useMemo(
     () =>
       new Set(
-        source.rows.map((database) =>
+        visibleSource.rows.map((database) =>
           resourceInvitationScopeKey(database.relayId, database.id)
         )
       ),
-    [source.rows]
+    [visibleSource.rows]
   )
   const [initialTableState] = React.useState(() => ({
     sorting: [{ desc: false, id: "database" }],
@@ -403,25 +387,18 @@ const DatabaseTable = React.memo(function DatabaseTable({
   const definition = React.useMemo(() => {
     const columns = databaseTableColumnHelper.columns([
       databaseTableColumnHelper.accessor(
-        (database) =>
-          databaseStatusPresentation(
-            database.inventoryStatus,
-            database.observedState
-          ).label,
+        (database) => databaseStatusPresentation(database).label,
         {
           id: "status",
           header: () => <span className="sr-only sm:not-sr-only">Status</span>,
           sortFn: "text",
           cell: ({ row }) => (
-            <DatabaseStatus
-              status={databaseStatusPresentation(
-                row.original.inventoryStatus,
-                row.original.observedState
-              )}
+            <StatusIndicator
+              status={databaseStatusPresentation(row.original)}
             />
           ),
           meta: dataTableColumnMeta(
-            { width: { base: "2.5rem", sm: "7.5rem" } },
+            { width: { base: "2.5rem", sm: statusColumnWidth } },
             {
               cellClassName: "px-2 sm:px-3",
               headerClassName: "px-2 sm:px-3",
@@ -430,6 +407,23 @@ const DatabaseTable = React.memo(function DatabaseTable({
           ),
         }
       ),
+      databaseTableColumnHelper.display({
+        id: "favorite",
+        header: () => <span className="sr-only">Favorite</span>,
+        enableSorting: false,
+        cell: ({ row }) => (
+          <InstanceFavoriteToggle
+            id={row.original.id}
+            kind="database"
+            name={row.original.name}
+            relayId={row.original.relayId}
+          />
+        ),
+        meta: dataTableColumnMeta(
+          { width: { base: "1.75rem" } },
+          { cellClassName: "px-0", headerClassName: "px-0" }
+        ),
+      }),
       databaseTableColumnHelper.accessor((database) => database.name, {
         id: "database",
         header: "Database",
@@ -438,20 +432,33 @@ const DatabaseTable = React.memo(function DatabaseTable({
           const database = row.original
           return (
             <div className="flex w-full min-w-0 items-center gap-1">
-              <InstanceName
-                className="min-w-0 flex-1"
-                instance={{
-                  id: database.id,
-                  inventoryStatus: database.inventoryStatus,
-                  kind: "database",
-                  observedState: database.observedState,
-                  relayId: database.relayId,
-                }}
-                live={false}
-                name={database.name}
-                meta={database.shortId}
-                metaClassName="font-mono"
-              />
+              <Link
+                to="/db/$databaseId"
+                // The full ID always resolves; the route shortens it when
+                // no other database shares its short ID.
+                params={{ databaseId: database.id }}
+                preload="intent"
+                className="group/database-link flex min-h-14 min-w-0 flex-1 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+              >
+                <InstanceName
+                  className="min-w-0 flex-1"
+                  instance={{
+                    id: database.id,
+                    inventoryStatus: database.inventoryStatus,
+                    kind: "database",
+                    observedState: database.observedState,
+                    relayId: database.relayId,
+                    relayStatus: database.relayStatus,
+                    relayUpdating: database.relayUpdating,
+                  }}
+                  live={false}
+                  name={database.name}
+                  nameClassName="transition-colors group-hover/database-link:text-primary"
+                  meta={database.shortId}
+                  metaClassName="font-mono"
+                  showFavorite={false}
+                />
+              </Link>
               <PendingResourceInvitationBadge
                 resourceType="database"
                 relayId={database.relayId}
@@ -529,15 +536,23 @@ const DatabaseTable = React.memo(function DatabaseTable({
         />
       }
       definition={definition}
-      emptyState={({ searchActive }) => (
-        <EmptyDatabaseTable
-          canCreate={canCreate}
-          searchActive={searchActive}
-          onCreate={onCreate}
-        />
-      )}
+      emptyState={({ searchActive }) =>
+        favoritesFiltered ? (
+          <FavoritesOnlyEmptyState
+            icon={<Database className="size-6 text-muted-foreground/45" />}
+            searchActive={searchActive}
+            table="databases"
+          />
+        ) : (
+          <EmptyDatabaseTable
+            canCreate={canCreate}
+            searchActive={searchActive}
+            onCreate={onCreate}
+          />
+        )
+      }
       searchStore={searchStore}
-      source={source}
+      source={visibleSource}
     />
   )
 })
@@ -564,25 +579,16 @@ const DatabaseActions = React.memo(function DatabaseActions({
         queryKey: queryKeys.databases.list,
       })
     },
-    onError: (error) => showOperationError("Database action failed", error),
+    onError: (error) =>
+      showDatabaseOperationError("Database action failed", error),
   })
-  const exportDump = useMutation({
-    mutationFn: () =>
-      exportManagedDatabase({
-        data: { databaseId: database.id, relayId: database.relayId },
-      }),
-    onSuccess: (result) => {
-      downloadTextFile(result.fileName, result.content)
-      showToast({ message: `Exported ${database.name}`, type: "success" })
-    },
-    onError: (error) => showOperationError("Export failed", error),
-  })
+  const exportDump = useDatabaseExport(database)
   const can = React.useCallback(
     (permission: AccessPermission) => database.permissions.includes(permission),
     [database.permissions]
   )
   const running = database.observedState === "running"
-  const available = database.inventoryStatus === "available"
+  const available = databaseRelayAvailable(database)
   const busy = action.isPending || exportDump.isPending
   const canExport =
     available &&
@@ -652,6 +658,14 @@ const DatabaseActions = React.memo(function DatabaseActions({
           <TooltipContent side="bottom">More actions</TooltipContent>
         </Tooltip>
         <DropdownMenuContent align="end" className="min-w-44">
+          <InstanceFavoriteMenuItem
+            favorite={{
+              id: database.id,
+              kind: "database",
+              relayId: database.relayId,
+            }}
+          />
+          <DropdownMenuSeparator />
           {canPower ? (
             <>
               <DropdownMenuItem
@@ -845,515 +859,6 @@ function CreateDatabaseDialog({
   )
 }
 
-function CredentialsDialog({
-  database,
-  open,
-  onOpenChange,
-}: {
-  database: ManagedDatabase
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}) {
-  const queryClient = useQueryClient()
-  const credential = useQuery(
-    managedDatabaseCredentialQueryOptions(database.relayId, database.id)
-  )
-  const close = React.useCallback(() => {
-    queryClient.removeQueries({
-      exact: true,
-      queryKey: queryKeys.databases.credential(database.relayId, database.id),
-    })
-    onOpenChange(false)
-  }, [database.id, database.relayId, onOpenChange, queryClient])
-  const rotate = useMutation({
-    mutationFn: () =>
-      rotateManagedDatabasePassword({
-        data: { databaseId: database.id, relayId: database.relayId },
-      }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: queryKeys.databases.credential(database.relayId, database.id),
-      })
-      showToast({ message: "Database password rotated", type: "success" })
-    },
-  })
-
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen) close()
-      }}
-    >
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Credentials</DialogTitle>
-          <DialogDescription>
-            Use these values from a server connected to {database.name}'s
-            private network.
-          </DialogDescription>
-        </DialogHeader>
-        {credential.isPending ? (
-          <div className="flex min-h-40 items-center justify-center">
-            <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
-          </div>
-        ) : credential.error ? (
-          <p className="text-xs text-destructive">{credential.error.message}</p>
-        ) : credential.data ? (
-          <div className="space-y-3">
-            {database.inventoryStatus === "available" ? (
-              <>
-                <CredentialField label="Host" value={database.hostname} />
-                <div className="grid grid-cols-2 gap-3">
-                  <CredentialField
-                    label="Port"
-                    value={String(database.internalPort)}
-                  />
-                  <CredentialField
-                    label="Database"
-                    value={credential.data.databaseName}
-                  />
-                </div>
-              </>
-            ) : (
-              <CredentialField
-                label="Database"
-                value={credential.data.databaseName}
-              />
-            )}
-            <CredentialField
-              label="Username"
-              value={credential.data.username}
-            />
-            <CredentialField
-              label="Password"
-              value={credential.data.password}
-              secret
-            />
-          </div>
-        ) : null}
-        {rotate.error ? (
-          <p className="text-xs text-destructive">{rotate.error.message}</p>
-        ) : null}
-        <DialogFooter className="sm:justify-between">
-          {database.inventoryStatus === "available" &&
-          database.permissions.includes("database.credentials.rotate") ? (
-            <Button
-              disabled={rotate.isPending}
-              type="button"
-              variant="outline"
-              onClick={() => rotate.mutate()}
-            >
-              {rotate.isPending ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <RotateCw />
-              )}
-              Rotate password
-            </Button>
-          ) : (
-            <span />
-          )}
-          <Button type="button" onClick={close}>
-            Done
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function CredentialField({
-  label,
-  secret = false,
-  value,
-}: {
-  label: string
-  secret?: boolean
-  value: string
-}) {
-  const [revealed, setRevealed] = React.useState(!secret)
-  return (
-    <label className="block">
-      <span className="type-technical-label mb-1.5 block text-muted-foreground">
-        {label}
-      </span>
-      <div className="flex gap-1.5">
-        <Input
-          className="font-mono text-xs"
-          readOnly
-          type={revealed ? "text" : "password"}
-          value={value}
-          onFocus={(event) => event.currentTarget.select()}
-        />
-        {secret ? (
-          <Button
-            aria-label={revealed ? "Hide password" : "Reveal password"}
-            type="button"
-            variant="outline"
-            onClick={() => setRevealed((current) => !current)}
-          >
-            {revealed ? "Hide" : "Show"}
-          </Button>
-        ) : null}
-        <Button
-          aria-label={`Copy ${label.toLowerCase()}`}
-          size="icon"
-          type="button"
-          variant="outline"
-          onClick={() => {
-            void navigator.clipboard.writeText(value)
-            showToast({ message: `${label} copied`, type: "success" })
-          }}
-        >
-          <Copy />
-        </Button>
-      </div>
-    </label>
-  )
-}
-
-const DatabaseNetworkPicker = React.memo(function DatabaseNetworkPicker({
-  database,
-}: {
-  database: ManagedDatabase
-}) {
-  const [open, setOpen] = React.useState(false)
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <PopoverTrigger asChild>
-            <Button
-              aria-label={`Connect servers to ${database.name}`}
-              aria-expanded={open}
-              className="text-muted-foreground hover:text-primary"
-              size="icon-sm"
-              type="button"
-              variant="ghost"
-            >
-              <Network />
-            </Button>
-          </PopoverTrigger>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">Connect servers</TooltipContent>
-      </Tooltip>
-      <PopoverContent
-        align="end"
-        className="w-[min(32rem,calc(100vw-2rem))] p-1.5"
-      >
-        {open ? <DatabaseNetworkPickerContent database={database} /> : null}
-      </PopoverContent>
-    </Popover>
-  )
-})
-
-function DatabaseNetworkPickerContent({
-  database,
-}: {
-  database: ManagedDatabase
-}) {
-  const queryClient = useQueryClient()
-  const { data: capabilities } = useSuspenseQuery(
-    accessCapabilitiesQueryOptions()
-  )
-  const { data: snapshot } = useQuery(relaySnapshotQueryOptions())
-  const servers = React.useMemo(
-    () =>
-      (snapshot?.instances ?? [])
-        .flatMap((instance) => {
-          if (instance.relayId !== database.relayId) return []
-          const canWrite =
-            capabilities.isPlatformAdmin ||
-            capabilities.grants.some(
-              (grant) =>
-                grant.relayId === database.relayId &&
-                grantHasPermission(grant, "instance.network.write") &&
-                (grant.resourceType === "relay" ||
-                  (grant.resourceType === "instance" &&
-                    grant.resourceId === instance.id))
-            )
-          return canWrite
-            ? [
-                {
-                  id: instance.id,
-                  name: instance.name,
-                  relayId: instance.relayId,
-                  relayName: instance.relayName,
-                },
-              ]
-            : []
-        })
-        .sort((left, right) => left.name.localeCompare(right.name)),
-    [capabilities, database.relayId, snapshot?.instances]
-  )
-  const selectedKeys = React.useMemo(
-    () =>
-      new Set(
-        database.connectedInstanceIds.map(
-          (instanceId) => `${database.relayId}:${instanceId}`
-        )
-      ),
-    [database.connectedInstanceIds, database.relayId]
-  )
-  const update = useMutation({
-    mutationFn: (input: { connected: boolean; instanceId: string }) =>
-      updateManagedDatabaseNetwork({
-        data: {
-          ...input,
-          databaseId: database.id,
-          relayId: database.relayId,
-        },
-      }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: queryKeys.databases.list,
-      })
-    },
-    onError: (error) => showOperationError("Network update failed", error),
-  })
-  const pendingKey = update.isPending
-    ? serverPickerOptionKey({
-        id: update.variables.instanceId,
-        name: "",
-        relayId: database.relayId,
-        relayName: "",
-      })
-    : undefined
-
-  return (
-    <ServerPickerList
-      ariaLabel={`Servers available to ${database.name}`}
-      emptyMessage={`No connectable servers are hosted on ${database.relayName}.`}
-      pendingKey={pendingKey}
-      selectedKeys={selectedKeys}
-      servers={servers}
-      onSelect={(server) =>
-        update.mutate({
-          connected: !selectedKeys.has(serverPickerOptionKey(server)),
-          instanceId: server.id,
-        })
-      }
-    />
-  )
-}
-
-function ImportDatabaseDialog({
-  database,
-  open,
-  onOpenChange,
-}: {
-  database: ManagedDatabase
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}) {
-  const [file, setFile] = React.useState<File | null>(null)
-  const [localError, setLocalError] = React.useState<string | null>(null)
-  const upload = useMutation({
-    mutationFn: async () => {
-      if (!file) throw new Error("Choose a SQL dump first")
-      if (file.size > dumpLimitBytes) {
-        throw new Error("SQL dumps are currently limited to 700 KB")
-      }
-      return importManagedDatabase({
-        data: {
-          content: await file.text(),
-          databaseId: database.id,
-          relayId: database.relayId,
-        },
-      })
-    },
-    onSuccess: () => {
-      showToast({
-        message: `Imported ${file?.name ?? "SQL dump"}`,
-        type: "success",
-      })
-      onOpenChange(false)
-    },
-  })
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Import SQL dump</DialogTitle>
-          <DialogDescription>
-            Statements run against {database.databaseName}. Existing data is not
-            cleared first. Current upload limit: 700 KB.
-          </DialogDescription>
-        </DialogHeader>
-        <label className="block rounded-lg border border-dashed border-border p-4 text-center">
-          <Upload className="mx-auto size-5 text-muted-foreground" />
-          <span className="mt-2 block text-xs font-medium">
-            {file?.name ?? "Choose a .sql file"}
-          </span>
-          <span className="type-meta mt-1 block text-muted-foreground">
-            MySQL, MariaDB, and PostgreSQL text dumps
-          </span>
-          <input
-            accept=".sql,application/sql,text/plain"
-            className="sr-only"
-            type="file"
-            onChange={(event) => {
-              const next = event.currentTarget.files?.[0] ?? null
-              setFile(next)
-              setLocalError(
-                next && next.size > dumpLimitBytes
-                  ? "SQL dumps are currently limited to 700 KB"
-                  : null
-              )
-            }}
-          />
-        </label>
-        {localError || upload.error ? (
-          <p className="text-xs text-destructive">
-            {localError ?? upload.error?.message}
-          </p>
-        ) : null}
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="ghost"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            disabled={!file || Boolean(localError) || upload.isPending}
-            type="button"
-            onClick={() => upload.mutate()}
-          >
-            {upload.isPending ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <Upload />
-            )}
-            Import
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function DeleteDatabaseDialog({
-  database,
-  open,
-  onOpenChange,
-}: {
-  database: ManagedDatabase
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}) {
-  const queryClient = useQueryClient()
-  const remove = useMutation({
-    mutationFn: () =>
-      deleteManagedDatabase({
-        data: { databaseId: database.id, relayId: database.relayId },
-      }),
-    onSuccess: async () => {
-      queryClient.removeQueries({
-        queryKey: queryKeys.databases.credential(database.relayId, database.id),
-      })
-      await queryClient.invalidateQueries({
-        queryKey: queryKeys.databases.all,
-      })
-      showToast({ message: `${database.name} deleted`, type: "success" })
-      onOpenChange(false)
-    },
-  })
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Delete {database.name}?</DialogTitle>
-          <DialogDescription>
-            The container, isolated network, persistent data volume,
-            credentials, and access grants will be permanently removed.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs">
-          <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
-          This action cannot be undone. Export a SQL dump first if you need a
-          recovery copy.
-        </div>
-        {remove.error ? (
-          <p className="text-xs text-destructive">{remove.error.message}</p>
-        ) : null}
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="ghost"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            disabled={remove.isPending}
-            type="button"
-            variant="destructive"
-            onClick={() => remove.mutate()}
-          >
-            {remove.isPending ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <Trash2 />
-            )}
-            Delete database
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function databaseStatusPresentation(
-  inventoryStatus: ManagedDatabase["inventoryStatus"],
-  state: ManagedDatabase["observedState"]
-) {
-  const status = instanceStatusPresentation({
-    id: "status-presentation",
-    inventoryStatus,
-    kind: "database",
-    observedState: state,
-    relayId: "status-presentation",
-  })
-  return {
-    dot: databaseStatusToneClasses[status.tone].dot,
-    label: status.label,
-    text: databaseStatusToneClasses[status.tone].text,
-  }
-}
-
-const databaseStatusToneClasses = {
-  danger: { dot: "bg-destructive", text: "text-destructive" },
-  info: { dot: "bg-sky-400", text: "text-sky-300" },
-  neutral: {
-    dot: "bg-muted-foreground",
-    text: "text-muted-foreground",
-  },
-  success: { dot: "bg-emerald-400", text: "text-emerald-300" },
-  warning: { dot: "bg-amber-300", text: "text-amber-200" },
-} as const
-
-function DatabaseStatus({
-  status,
-}: {
-  status: ReturnType<typeof databaseStatusPresentation>
-}) {
-  return (
-    <span
-      aria-label={status.label}
-      className={`type-label inline-flex items-center gap-1.5 ${status.text}`}
-    >
-      <span className={`size-1.5 rounded-full ${status.dot}`} />
-      <span className="hidden sm:inline">{status.label}</span>
-    </span>
-  )
-}
-
 function EmptyDatabaseTable({
   canCreate,
   onCreate,
@@ -1393,26 +898,6 @@ function databaseRowKey(database: ManagedDatabase): string {
   return `${database.relayId}:${database.id}`
 }
 
-function engineLabel(engine: DatabaseEngine): string {
-  return (
-    engineOptions.find((option) => option.value === engine)?.label ?? engine
-  )
-}
-
-function downloadTextFile(fileName: string, content: string) {
-  const url = URL.createObjectURL(
-    new Blob([content], { type: "application/sql" })
-  )
-  const link = document.createElement("a")
-  link.href = url
-  link.download = fileName
-  link.click()
-  URL.revokeObjectURL(url)
-}
-
-function showOperationError(message: string, error: Error) {
-  showToast({
-    message: `${message}: ${error.message}`,
-    type: "error",
-  })
+function databaseFavorite(database: ManagedDatabase): InstanceFavorite {
+  return { id: database.id, kind: "database", relayId: database.relayId }
 }

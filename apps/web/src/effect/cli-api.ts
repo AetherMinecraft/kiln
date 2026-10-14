@@ -989,7 +989,7 @@ export function cliActivityResponse(
   return cliActivityResponseSchema.parse({ entries: safeEntries })
 }
 
-export function relayRemoteUploadInput(
+function relayRemoteUploadInput(
   input: z.infer<typeof cliRemoteFileUploadRequestSchema>
 ) {
   return relayRemoteFileUploadSchema.parse({
@@ -1277,7 +1277,7 @@ export const getCliSftpConnectionEffect = Effect.fn("cli.api.sftp")(function* (
   )
 })
 
-export function cliSftpUnavailableMessage(
+function cliSftpUnavailableMessage(
   connection: RelaySftpConnection
 ): string | null {
   if (connection.publication === "not_published") {
@@ -1365,7 +1365,7 @@ const authorizeCliBackupCreateTarget = Effect.fn(
   return relay
 })
 
-export function cliDatabaseSupportsLogicalBackups(database: {
+function cliDatabaseSupportsLogicalBackups(database: {
   engine: Parameters<typeof databaseEngineSupportsLogicalBackups>[0]
 }): boolean {
   return databaseEngineSupportsLogicalBackups(database.engine)
@@ -1806,7 +1806,7 @@ function relayUnavailableFailure(cause: unknown): CliAccessError {
   })
 }
 
-export function cliConsoleRelayFailure(cause: unknown): CliAccessError {
+function cliConsoleRelayFailure(cause: unknown): CliAccessError {
   if (!(cause instanceof RelayUnavailableError) || !cause.code) {
     return relayUnavailableFailure(cause)
   }

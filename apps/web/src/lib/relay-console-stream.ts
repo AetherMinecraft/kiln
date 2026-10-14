@@ -2,9 +2,13 @@ import {
   relayBrowserConsoleProtocols,
   relayConsoleStreamEventSchema,
 } from "@workspace/contracts"
-import type { RelayConsoleStreamEvent } from "@workspace/contracts"
+import type {
+  RelayConsoleResource,
+  RelayConsoleStreamEvent,
+} from "@workspace/contracts"
 import { Effect, Exit, Fiber, Result, Scope, Stream } from "effect"
 
+import { consoleCopy } from "@/lib/console-copy"
 import {
   startConsoleTimingSpan,
   withConsoleTimingSpan,
@@ -13,7 +17,6 @@ import type { ConsoleLoadTiming } from "@/lib/console-performance"
 import {
   authenticateRelayBrowserSocket,
   isTerminalRelayBrowserFailure,
-  createRelayBrowserSocketInbox,
   maintainRelayBrowserLease,
   openRelayBrowserSocket,
   relayBrowserEndpoint,
@@ -51,25 +54,28 @@ export class RelayConsoleConnectionError extends Error {
   }
 }
 
+// Follows a resource's console, directly from its Relay where it can and
+// through Hearth otherwise. Only servers take input (`write`).
 export function openRelayConsoleStream(
   relayId: string,
-  instanceId: string,
+  resource: RelayConsoleResource,
   browserOrigin: string | null,
   consoleTransport: RelayConsoleTransport | null = null,
   timing?: ConsoleLoadTiming,
   write = false
 ): Stream.Stream<KilnConsoleStreamEvent, Error> {
+  const { stream } = consoleCopy[resource.kind]
   if (!navigator.onLine) {
     return Stream.fail(
       new RelayConsoleConnectionError(
         "browser_offline",
-        "You're offline. Reconnect to the internet to resume the console."
+        `You're offline. Reconnect to the internet to resume the ${stream}.`
       )
     )
   }
 
   const openHearth = (fallbackMessage: string | null) =>
-    openHearthConsoleStream(relayId, instanceId, fallbackMessage, timing).pipe(
+    openHearthConsoleStream(relayId, resource, fallbackMessage, timing).pipe(
       Stream.catch((cause) =>
         isTerminalRelayBrowserFailure(cause)
           ? Stream.fail(cause)
@@ -77,8 +83,8 @@ export function openRelayConsoleStream(
               new RelayConsoleConnectionError(
                 "hearth_proxy_failed",
                 fallbackMessage === null
-                  ? "Hearth can reach this Relay, but its secure console stream could not be opened."
-                  : "Hearth can reach this Relay, but neither the secure direct stream nor the Hearth fallback could read the console.",
+                  ? `Hearth can reach this Relay, but its secure ${stream} could not be opened.`
+                  : `Hearth can reach this Relay, but neither the secure direct stream nor the Hearth fallback could read the ${stream}.`,
                 { cause }
               )
             )
@@ -89,7 +95,7 @@ export function openRelayConsoleStream(
 
   return openDirectRelayConsoleStream(
     relayId,
-    instanceId,
+    resource,
     browserOrigin,
     timing,
     write
@@ -102,8 +108,7 @@ export function openRelayConsoleStream(
             Stream.prepend<KilnConsoleStreamEvent>([
               {
                 type: "reconnecting",
-                message:
-                  "The direct console stream failed. Trying to reconnect through Hearth.",
+                message: `The direct ${stream} failed. Trying to reconnect through Hearth.`,
               },
             ])
           )
@@ -113,7 +118,7 @@ export function openRelayConsoleStream(
 
 function openDirectRelayConsoleStream(
   relayId: string,
-  instanceId: string,
+  resource: RelayConsoleResource,
   browserOrigin: string | null,
   timing?: ConsoleLoadTiming,
   write = false
@@ -124,7 +129,9 @@ function openDirectRelayConsoleStream(
         ? yield* forkRelayConsoleSocket(browserOrigin, relayId, timing)
         : null
       const credentialLease = yield* Effect.acquireRelease(
-        Effect.sync(() => acquireRelayBrowserCredentials(relayId, instanceId)),
+        Effect.sync(() =>
+          acquireRelayBrowserCredentials(relayId, resource.id, resource.kind)
+        ),
         (lease) => Effect.sync(lease.release)
       )
       const { keys, publicKeyJwk } = yield* Effect.tryPromise({
@@ -194,7 +201,7 @@ function openDirectRelayConsoleStream(
           capability: capability.capability,
           channel: "console",
           credentials: { keys, publicKeyJwk },
-          instanceId,
+          instanceId: resource.id,
           relayId,
         })
       )
@@ -231,19 +238,26 @@ function openDirectRelayConsoleStream(
       }
       yield* Effect.sync(() => {
         socket.send(
-          JSON.stringify({ instanceId, type: "console.subscribe", v: 1 })
+          JSON.stringify({
+            instanceId: resource.id,
+            type: "console.subscribe",
+            v: 1,
+          })
         )
       })
 
-      yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          registerRelayConsoleOperationClient(relayId, instanceId, {
-            request: (operation, payload) =>
-              inbox.request(socket, instanceId, operation, payload),
-          })
-        ),
-        (unregister) => Effect.sync(unregister)
-      )
+      // Commands and completions go to servers only.
+      if (resource.kind === "instance") {
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            registerRelayConsoleOperationClient(relayId, resource.id, {
+              request: (operation, payload) =>
+                inbox.request(socket, resource.id, operation, payload),
+            })
+          ),
+          (unregister) => Effect.sync(unregister)
+        )
+      }
 
       const events = inbox.stream.pipe(
         Stream.mapEffect((message) =>
@@ -304,6 +318,15 @@ function openRelayConsoleSocket(
   )
 }
 
+function hearthConsoleStreamUrl(
+  relayId: string,
+  resource: RelayConsoleResource
+): string {
+  const search = new URLSearchParams({ relayId })
+  if (resource.kind !== "instance") search.set("kind", resource.kind)
+  return `/api/console/${encodeURIComponent(resource.id)}?${search}`
+}
+
 function sameRelayBrowserEndpoint(left: string, right: string): boolean {
   const endpoints = Result.try(() => [
     relayBrowserEndpoint(left).href,
@@ -325,7 +348,7 @@ function canReuseRelayConsoleSocket(
 
 function openHearthConsoleStream(
   relayId: string,
-  instanceId: string,
+  resource: RelayConsoleResource,
   fallbackMessage: string | null,
   timing?: ConsoleLoadTiming
 ): Stream.Stream<KilnConsoleStreamEvent, Error> {
@@ -337,10 +360,10 @@ function openHearthConsoleStream(
         "http.console.fallback",
         Effect.tryPromise({
           try: (signal) =>
-            fetch(
-              `/api/console/${encodeURIComponent(instanceId)}?relayId=${encodeURIComponent(relayId)}`,
-              { cache: "no-store", signal }
-            ),
+            fetch(hearthConsoleStreamUrl(relayId, resource), {
+              cache: "no-store",
+              signal,
+            }),
           catch: asError,
         })
       )
@@ -357,7 +380,7 @@ function openHearthConsoleStream(
               "error" in problem &&
               typeof problem.error === "string"
               ? problem.error
-              : `Hearth console proxy returned HTTP ${response.status}`
+              : `The stream through Hearth returned HTTP ${response.status}`
           )
         )
       }
@@ -404,7 +427,7 @@ function parseHearthConsoleEvent(
         const message =
           "message" in value && typeof value.message === "string"
             ? value.message
-            : "Hearth console proxy was interrupted"
+            : "The stream through Hearth was interrupted"
         throw new Error(message)
       }
       return relayConsoleStreamEventSchema.parse(value)
@@ -459,10 +482,6 @@ function directFallbackMessage(cause: Error): string {
     cause.code === "direct_secure_channel_failed"
     ? "Secure direct connection unavailable. Streaming through Hearth."
     : "Direct Relay stream interrupted. Streaming through Hearth."
-}
-
-export function createSocketInbox(socket: WebSocket) {
-  return createRelayBrowserSocketInbox(socket, "console")
 }
 
 function asError(cause: unknown): Error {

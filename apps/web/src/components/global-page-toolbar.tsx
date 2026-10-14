@@ -8,6 +8,8 @@ import {
   TooltipTrigger,
 } from "@workspace/ui/components/tooltip"
 
+import { InfraToolbarActions } from "@/components/infra-layout"
+import { NotificationsToolbarActions } from "@/components/notifications-page"
 import { sectionDestinationLabel } from "@/lib/navigation-destinations"
 import type { GlobalSection } from "@/lib/route-sections"
 
@@ -27,6 +29,8 @@ export const GlobalPageToolbar = React.memo(function GlobalPageToolbar({
         <ToolbarSidebarTrigger />
         <span className="h-8 w-px shrink-0 bg-border/80" aria-hidden="true" />
         <PageTitle section={section} title={title} />
+        {section === "notifications" ? <NotificationsToolbarActions /> : null}
+        {section === "infra" ? <InfraToolbarActions /> : null}
       </div>
     </header>
   )
@@ -57,6 +61,7 @@ const sectionTitles: Record<PageSection, string> = {
   automations: "Automations",
   backups: "Backups",
   infra: "Infrastructure",
+  notifications: "Notifications",
   settings: "Settings",
 }
 
