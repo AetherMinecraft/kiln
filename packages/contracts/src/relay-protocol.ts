@@ -22,6 +22,8 @@ export const relayFileRequestReplayV1Feature = "file-request-replay-v1"
 // The Relay streams console output for more kinds of resource than servers;
 // see `relayBrowserResourceKinds`.
 export const relayConsoleResourcesV1Feature = "console-resources-v1"
+// The Relay deploys apps: Docker images, Dockerfiles, and Compose projects.
+export const relayAppsV1Feature = "apps-v1"
 export const relayBrowserAuthorizationReviseMaxItems = 256
 
 export const relayControlOperations = [
@@ -67,6 +69,20 @@ export const relayControlOperations = [
   "database.terminal.write",
   "database.terminal.claim",
   "database.terminal.restart",
+  "app.list",
+  "app.create",
+  "app.delete",
+  "app.deploy",
+  "app.action",
+  "app.network.write",
+  "app.network.routes.read",
+  "app.network.routes.write",
+  "app.terminal.attach",
+  "app.terminal.heartbeat",
+  "app.terminal.detach",
+  "app.terminal.write",
+  "app.terminal.claim",
+  "app.terminal.restart",
   "backup.task.enqueue",
   "backup.task.cancel",
   "backup.task.get",
@@ -158,6 +174,14 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "database.data.write",
   "database.terminal.attach",
   "database.terminal.restart",
+  "app.create",
+  "app.delete",
+  "app.deploy",
+  "app.action",
+  "app.network.write",
+  "app.network.routes.write",
+  "app.terminal.attach",
+  "app.terminal.restart",
   "backup.task.enqueue",
   "backup.task.cancel",
   "schedule.apply",
@@ -182,6 +206,8 @@ export function relayControlDeadlineMs(
   if (operation === "instance.delete") return 360_000
   if (operation === "database.create") return 360_000
   if (operation === "database.delete") return 180_000
+  if (operation === "app.delete") return 180_000
+  if (operation === "app.action") return 180_000
   if (operation === "database.credentials.rotate") return 180_000
   if (operation === "database.dump.export") return 120_000
   if (operation === "database.dump.import") return 120_000
@@ -203,7 +229,8 @@ export function relayControlDeadlineMs(
     return 360_000
   }
   return operation === "instance.network.ports.write" ||
-    operation === "instance.network.routes.write"
+    operation === "instance.network.routes.write" ||
+    operation === "app.network.routes.write"
     ? 240_000
     : 30_000
 }
@@ -213,6 +240,11 @@ export const RelayControlOperationSchema = Schema.Literals(
 )
 
 export const relaySnapshotDeltaFeature = "relay.snapshot.delta.v1"
+// Hearth keeps node resource samples (CPU, memory, Relay memory) current, so
+// snapshot deltas carry the node whenever those samples change. Older Hearths
+// would forward every such delta to browsers, so they never receive them.
+export const relaySnapshotNodeResourcesFeature =
+  "relay.snapshot.node-resources.v1"
 
 export const RelayAuthChallengeSchema = Schema.Struct({
   expiresAt: Schema.Number,
@@ -254,7 +286,11 @@ export const RelayBrowserOperationKindSchema = Schema.Literals([
 
 // The kinds of resource a browser capability can be for. Its `instanceId` is
 // the resource's ID; capabilities without `resourceKind` are for servers.
-export const relayBrowserResourceKinds = ["instance", "database"] as const
+export const relayBrowserResourceKinds = [
+  "instance",
+  "database",
+  "app",
+] as const
 
 export const RelayBrowserResourceKindSchema = Schema.Literals(
   relayBrowserResourceKinds
@@ -266,11 +302,15 @@ export type RelayBrowserResourceKind =
 export interface RelayConsoleResource {
   readonly id: string
   readonly kind: RelayBrowserResourceKind
+  // Which of the resource's outputs to follow, for kinds with more than one:
+  // an app's deployment log or one of its services.
+  readonly stream?: string
 }
 
 // The action that reads each kind of resource's console output. Only servers
 // take console input.
 export const relayConsoleReadActions = {
+  app: "app.logs.read",
   database: "database.logs.read",
   instance: "instance.console.read",
 } as const satisfies Record<RelayBrowserResourceKind, string>

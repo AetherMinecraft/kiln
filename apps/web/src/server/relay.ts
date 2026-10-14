@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start"
 import { Effect } from "effect"
 import {
+  appIdFromFileRoot,
   projectRelayInstanceOverview,
   relayFileActivitySchema,
   relayFileContentSchema,
@@ -107,7 +108,7 @@ import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { resolveMclogsApiUrl } from "@/lib/mclogs"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
-import { isRelayUpdating } from "@/lib/relay-connection"
+import { isRelayUpdating, relayConnectionNode } from "@/lib/relay-connection"
 import { updateInstanceSourceName } from "@/lib/instance-registry"
 
 const instanceInputSchema = z.object({
@@ -249,6 +250,31 @@ export const getRelaySnapshot = createServerFn({ method: "POST" }).handler(
     return authorizedFleetSnapshot(user, true)
   }
 )
+
+/**
+ * Live Relay memory for the Relays table. After authorization it reads the node
+ * this process's control socket last received (kept current by node resource
+ * deltas): no Relay round trip, cache read, or snapshot validation. A Relay is
+ * omitted while this process has no authenticated connection to it, and its
+ * cell shows no reading; another Hearth process's sockets are not consulted.
+ * `relayMemory` is null for Relays that predate memory reporting.
+ */
+export const getRelayMemoryReadings = createServerFn({
+  method: "GET",
+}).handler(async () => {
+  const user = await requireEligibleResourceUser()
+  const { grants, relays } = await authorizedRelays(
+    user,
+    await listPersistedRelays()
+  )
+  return relays.flatMap((relay) => {
+    if (!relay.enabled || !canReadRelayNode(user, relay.id, grants)) return []
+    const node = relayConnectionNode(relay.id)
+    return node
+      ? [{ relayId: relay.id, relayMemory: node.relayMemory ?? null }]
+      : []
+  })
+})
 
 export const getFreshRelayConnectionState = createServerFn({
   method: "POST",
@@ -610,12 +636,12 @@ export const getRelayTree = createServerFn({ method: "GET" })
   .validator(treeInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.read",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.read"
+    )
     return runAppEffect(
       "relay.tree",
       cachedRelayJsonEffect({
@@ -633,12 +659,12 @@ export const getRelayDirectoryPage = createServerFn({ method: "GET" })
   .validator(directoryPageInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.read",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.read"
+    )
     const search = new URLSearchParams({ path: data.path })
     if (data.cursor) search.set("cursor", data.cursor)
     return runAppEffect(
@@ -655,12 +681,12 @@ export const getRelayDirectorySizes = createServerFn({ method: "POST" })
   .validator(directorySizesInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.read",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.read"
+    )
     const input = relayDirectorySizesInputSchema.parse({
       instanceId: data.instanceId,
       paths: data.paths,
@@ -680,12 +706,12 @@ export const getRelayFileEntry = createServerFn({ method: "GET" })
   .validator(fileStatInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.read",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.read"
+    )
     const search = new URLSearchParams({ path: data.path })
     return runAppEffect(
       "relay.fileStat",
@@ -701,12 +727,12 @@ export const searchRelayFiles = createServerFn({ method: "GET" })
   .validator(fileSearchPageInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.read",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.read"
+    )
     const search = new URLSearchParams({ query: data.query })
     if (data.cursor) search.set("cursor", data.cursor)
     return runAppEffect(
@@ -723,12 +749,12 @@ export const getRelayFile = createServerFn({ method: "GET" })
   .validator(fileInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.read",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.read"
+    )
     const response = await relayFetch(
       relay,
       `/v1/instances/${encodeURIComponent(data.instanceId)}/file?path=${encodeURIComponent(data.path)}`
@@ -740,12 +766,12 @@ export const recordRelayFileView = createServerFn({ method: "POST" })
   .validator(fileInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.read",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.read"
+    )
     await recordFileActivityBestEffort(
       "view",
       recordFileViewed(relay.id, data.instanceId, data.path),
@@ -760,12 +786,12 @@ export const saveRelayFile = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const { instanceId, path, relayId, ...input } = data
     const { relay, user } = await instanceRelayAccess(relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.write",
+      relay.id,
       instanceId,
-    })
+      "instance.files.write"
+    )
     const response = await relayFetch(
       relay,
       `/v1/instances/${encodeURIComponent(instanceId)}/file?path=${encodeURIComponent(path)}`,
@@ -789,12 +815,12 @@ async function relayDatabaseRequest(
   write: boolean
 ) {
   const { relay, user } = await instanceRelayAccess(data.relayId)
-  await requireRelayPermission({
+  await requireFilePermission(
     user,
-    relayId: relay.id,
-    permission: write ? "instance.files.write" : "instance.files.read",
-    instanceId: data.instanceId,
-  })
+    relay.id,
+    data.instanceId,
+    write ? "instance.files.write" : "instance.files.read"
+  )
   const response = await relayFetch(
     relay,
     `/v1/instances/${encodeURIComponent(data.instanceId)}/file-database${write ? "?mode=write" : ""}`,
@@ -854,15 +880,14 @@ export const mutateRelayFiles = createServerFn({ method: "POST" })
   .validator(fileMutationInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission:
-        data.operation === "delete"
-          ? "instance.files.delete"
-          : "instance.files.write",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      data.operation === "delete"
+        ? "instance.files.delete"
+        : "instance.files.write"
+    )
     const input = relayFileMutationInputSchema.parse(data)
     const response = await relayFetch(
       relay,
@@ -886,12 +911,12 @@ export const getRelayFileActivity = createServerFn({ method: "GET" })
   .validator(instanceInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.read",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.read"
+    )
     return relayFileActivitySchema.parse(
       await listFileActivity(relay.id, data.instanceId)
     )
@@ -901,12 +926,12 @@ export const updateRelayFilePin = createServerFn({ method: "POST" })
   .validator(filePinInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await instanceRelayAccess(data.relayId)
-    await requireRelayPermission({
+    await requireFilePermission(
       user,
-      relayId: relay.id,
-      permission: "instance.files.write",
-      instanceId: data.instanceId,
-    })
+      relay.id,
+      data.instanceId,
+      "instance.files.write"
+    )
     const search = new URLSearchParams({ path: data.path })
     const entry = await runAppEffect(
       "relay.fileStat.pinValidation",
@@ -1299,6 +1324,31 @@ async function authorize(
     permission,
     instanceId,
   })
+}
+
+// App data directories (`app:<appId>`) are served like a server's files and
+// checked against the app permissions granted on their Relay.
+async function requireFilePermission(
+  user: AuthenticatedUser,
+  relayId: string,
+  instanceId: string,
+  permission:
+    | "instance.files.delete"
+    | "instance.files.read"
+    | "instance.files.write"
+) {
+  if (appIdFromFileRoot(instanceId)) {
+    await requireRelayPermission({
+      permission:
+        permission === "instance.files.read"
+          ? "app.files.read"
+          : "app.files.write",
+      relayId,
+      user,
+    })
+    return
+  }
+  await requireRelayPermission({ instanceId, permission, relayId, user })
 }
 
 async function instanceRelayAccess(relayId: string) {

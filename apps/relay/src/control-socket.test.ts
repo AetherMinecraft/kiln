@@ -2,8 +2,10 @@ import { generateKeyPairSync, randomBytes, sign, verify } from "node:crypto"
 import { once } from "node:events"
 import { mkdtempSync, rmSync } from "node:fs"
 import { createServer } from "node:http"
+import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { Duplex } from "node:stream"
 import { ManagedRuntime } from "effect"
 import type { Effect } from "effect"
 import { WebSocket } from "ws"
@@ -15,6 +17,7 @@ import {
   relayControlMaxFrameBytes,
   relayControlProtocol,
   relaySnapshotDeltaFeature,
+  relaySnapshotNodeResourcesFeature,
 } from "@workspace/contracts"
 import type {
   RelayAuthChallenge,
@@ -29,6 +32,7 @@ import { fingerprint } from "./effect/identity.js"
 import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
 import type { RelayClientRole } from "./effect/state.js"
 import type { RelayAction } from "./permissions.js"
+import { sendRawRequest } from "./test/raw-http.js"
 
 describe("Relay control socket", () => {
   it("authenticates a paired Hearth with signed challenges and serves its requests", async () => {
@@ -66,6 +70,22 @@ describe("Relay control socket", () => {
     })
   })
 
+  it("ignores upgrade targets that URL parsing rejects instead of crashing", async () => {
+    const relay = await startRelay()
+    const address = relay.server.address() as AddressInfo
+    const upgraded = once(relay.server, "upgrade")
+
+    const malformed = sendRawRequest(address.port, "//%", { upgrade: true })
+    // Listeners run in registration order; the control socket's has returned.
+    const [, upgradedSocket] = (await upgraded) as [unknown, Duplex]
+    // Production answers these with 400 from index.ts; this harness has no
+    // such listener, so release the parked socket.
+    upgradedSocket.destroy()
+    malformed.destroy()
+    const { inbox } = await relay.open()
+    expect((await inbox.next()).type).toBe("auth.challenge")
+  })
+
   it("rejects an identity proof signed by a different key", async () => {
     const relay = await startRelay()
     const hearth = await relay.pair()
@@ -101,6 +121,61 @@ describe("Relay control socket", () => {
     expect(await inbox.next()).toMatchObject({
       code: "forbidden",
       replyTo: syncId,
+      type: "error",
+    })
+  })
+
+  it("keeps an app's files behind app file actions, apart from servers'", async () => {
+    const relay = await startRelay()
+    const appFiles = `app:${"a".repeat(40)}`
+    const serverId = "b".repeat(40)
+    const serverReader = await relay.pair({
+      actions: ["instance.files.list", "instance.files.read"],
+      role: "custom",
+    })
+    const appReader = await relay.pair({
+      actions: ["app.files.read"],
+      role: "custom",
+    })
+
+    const asServerReader = await relay.connect(serverReader)
+    const forApp = sendRequest(asServerReader.socket, "instance.files.read", {
+      instanceId: appFiles,
+      path: "config.yml",
+    })
+    expect(await asServerReader.inbox.next()).toMatchObject({
+      code: "forbidden",
+      replyTo: forApp,
+      type: "error",
+    })
+
+    const asAppReader = await relay.connect(appReader)
+    const ownFiles = sendRequest(asAppReader.socket, "instance.files.read", {
+      instanceId: appFiles,
+      path: "config.yml",
+    })
+    expect(await asAppReader.inbox.next()).toMatchObject({
+      payload: { ok: true },
+      replyTo: ownFiles,
+      type: "response",
+    })
+    const write = sendRequest(asAppReader.socket, "instance.files.write", {
+      content: "",
+      instanceId: appFiles,
+      path: "config.yml",
+    })
+    expect(await asAppReader.inbox.next()).toMatchObject({
+      code: "forbidden",
+      replyTo: write,
+      type: "error",
+    })
+    const forServer = sendRequest(asAppReader.socket, "instance.files.read", {
+      instanceId: serverId,
+      path: "server.properties",
+    })
+    expect(await asAppReader.inbox.next()).toMatchObject({
+      code: "forbidden",
+      replyTo: forServer,
       type: "error",
     })
   })
@@ -508,6 +583,42 @@ describe("Relay control socket", () => {
       type: "event",
     })
   })
+
+  it("sends node resource samples only to Hearths that advertise support", async () => {
+    const relay = await startRelay()
+    const resourceClient = await relay.connect(await relay.pair(), {
+      features: [relaySnapshotDeltaFeature, relaySnapshotNodeResourcesFeature],
+    })
+    // Older Hearths forward every node delta to browsers.
+    const controlClient = await relay.connect(await relay.pair(), {
+      features: [relaySnapshotDeltaFeature],
+    })
+
+    const sampled = {
+      instances: [],
+      node: { relayMemory: { container: null, process: { rssBytes: 1 } } },
+    }
+    relay.pushSnapshot(sampled)
+    relay.pushSnapshot({ ...sampled, instances: [{ id: "added" }] })
+
+    expect(await resourceClient.inbox.next()).toMatchObject({
+      event: "relay.snapshot.delta",
+      payload: { instances: [], node: sampled.node },
+      seq: 2,
+    })
+    expect(await resourceClient.inbox.next()).toMatchObject({
+      event: "relay.snapshot.delta",
+      payload: { instances: [{ id: "added" }] },
+      seq: 3,
+    })
+    const controlDelta = await controlClient.inbox.next()
+    expect(controlDelta).toMatchObject({
+      event: "relay.snapshot.delta",
+      payload: { instances: [{ id: "added" }] },
+      seq: 2,
+    })
+    expect(controlDelta).not.toHaveProperty("payload.node")
+  })
 })
 
 const initialSnapshot = { instances: [], node: {} }
@@ -592,6 +703,7 @@ async function startRelay(
     },
     control,
     open,
+    server,
     pair: async (
       grant: {
         readonly actions?: ReadonlyArray<RelayAction>

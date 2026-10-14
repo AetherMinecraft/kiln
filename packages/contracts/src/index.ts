@@ -12,6 +12,7 @@ import {
   databaseReadRequestSchema,
   databaseWriteRequestSchema,
 } from "./database-browser.js"
+import { fileRootIdSchema, tailscaleMemberIdSchema } from "./app-keys.js"
 import {
   relayTailscaleDomainSchema,
   relayTailscaleHostnameSchema,
@@ -34,6 +35,7 @@ export * from "./tailscale.js"
 export * from "./schedules.js"
 export * from "./snbt.js"
 export * from "./database-browser.js"
+export * from "./app-keys.js"
 
 export const relayIdSchema = z.string().regex(/^[A-Za-z\d_-]{43}$/u)
 
@@ -327,6 +329,178 @@ export const hearthDatabaseTerminalOutputSchema = z.object({
   seq: z.number().int().nonnegative(),
   sessionId: databaseTerminalIdSchema,
 })
+
+// Apps run any container workload: a Docker image, a Dockerfile, or a
+// Compose project. Hearth keeps each app's configuration; the Relay deploys
+// it and reports the containers it finds by their labels.
+export const appIdSchema = z.string().regex(/^[a-f0-9]{40}$/u)
+
+export const appNameSchema = relayDatabaseNameSchema
+
+// A Compose service's name; image and Dockerfile apps have one service, `app`.
+export const appServiceNameSchema = z
+  .string()
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$/u)
+
+export const appSourceTypeSchema = z.enum(["image", "dockerfile", "compose"])
+
+export const appPortSchema = z
+  .object({
+    containerPort: z.number().int().min(1).max(65_535),
+    hostPort: z.number().int().min(1).max(65_535),
+    protocol: z.enum(["tcp", "udp"]),
+  })
+  .strict()
+
+// Every source is kept, so switching between them loses nothing; only
+// `sourceType` deploys.
+export const appConfigSchema = z
+  .object({
+    // Replaces the image's command, for images and Dockerfiles.
+    command: z.string().max(4_000),
+    compose: z.string().max(400_000),
+    // Where the app's data directory is mounted, for images and Dockerfiles.
+    // Compose files mount it themselves through `${KILN_DATA}`.
+    dataMount: z
+      .string()
+      .max(512)
+      .regex(/^\/[^\0:]*$/u, "Use an absolute path inside the container"),
+    databaseIds: z.array(databaseIdSchema).max(32),
+    dockerfile: z.string().max(200_000),
+    // KEY=VALUE lines, as in an env file.
+    environment: z.string().max(65_536),
+    image: z.string().trim().max(512),
+    ports: z.array(appPortSchema).max(32),
+    sourceType: appSourceTypeSchema,
+  })
+  .strict()
+
+export const defaultAppConfig: z.infer<typeof appConfigSchema> = {
+  command: "",
+  compose: "",
+  dataMount: "/data",
+  databaseIds: [],
+  dockerfile: "",
+  environment: "",
+  image: "",
+  ports: [],
+  sourceType: "image",
+}
+
+export const appDeploymentStateSchema = z.enum([
+  "running",
+  "succeeded",
+  "failed",
+])
+
+// Not strict: a newer Relay may report more about its containers.
+export const relayAppContainerSchema = z.object({
+  createdAt: z.string().datetime().nullable(),
+  exitCode: z.number().int().nullable(),
+  id: z.string().min(1),
+  image: z.string(),
+  labels: z.record(z.string(), z.string()),
+  name: z.string().min(1),
+  networks: z.array(z.string()),
+  ports: z.array(appPortSchema),
+  running: z.boolean(),
+  service: appServiceNameSchema,
+  startedAt: z.string().datetime().nullable(),
+  state: z.string(),
+  status: z.string(),
+})
+
+export const relayAppDeploymentSchema = z.object({
+  error: z.string().max(2_000).nullable(),
+  finishedAt: z.string().datetime().nullable(),
+  id: z.string().min(1).max(64),
+  sourceType: appSourceTypeSchema,
+  startedAt: z.string().datetime(),
+  state: appDeploymentStateSchema,
+})
+
+export const relayAppSchema = z.object({
+  connectedDatabaseIds: z.array(databaseIdSchema),
+  containers: z.array(relayAppContainerSchema),
+  // The app's data directory on the Relay's host.
+  dataDirectory: z.string(),
+  deployment: relayAppDeploymentSchema.nullable(),
+  // The name its containers answer to on the app's network.
+  hostname: z.string(),
+  id: appIdSchema,
+  network: z.string(),
+  observedState: z.enum(["starting", "running", "stopped", "failed"]),
+  shortId: z.string().regex(/^[a-f0-9]{8}$/u),
+  status: z.string().min(1).max(280),
+})
+
+export const relayCreateAppSchema = z
+  .object({ id: appIdSchema, name: appNameSchema })
+  .strict()
+
+export const relayDeployAppSchema = z
+  .object({ appId: appIdSchema, config: appConfigSchema, name: appNameSchema })
+  .strict()
+
+export const relayAppActionSchema = z
+  .object({
+    action: z.enum(["start", "stop", "restart"]),
+    appId: appIdSchema,
+  })
+  .strict()
+
+export const relayDeleteAppSchema = z
+  .object({ appId: appIdSchema, deleteData: z.boolean().default(true) })
+  .strict()
+
+// Connects the app's running containers to exactly these databases.
+export const relayAppNetworkSchema = z
+  .object({
+    appId: appIdSchema,
+    databaseIds: z.array(databaseIdSchema).max(32),
+  })
+  .strict()
+
+// App terminals are full shells in one of the app's services, sessions kept
+// like a database's: one per person per service.
+const appTerminalTargetShape = {
+  appId: appIdSchema,
+  service: appServiceNameSchema,
+}
+
+export const relayAppTerminalAttachSchema = z
+  .object({
+    ...appTerminalTargetShape,
+    ...databaseTerminalSizeShape,
+    attachmentId: databaseTerminalIdSchema,
+    idleTimeoutMs: z
+      .number()
+      .int()
+      .min(60_000)
+      .max(24 * 60 * 60_000),
+  })
+  .strict()
+
+export const relayAppTerminalRestartSchema = z
+  .object(appTerminalTargetShape)
+  .strict()
+
+export const relayAppTerminalWriteSchema = z
+  .object({
+    ...appTerminalTargetShape,
+    data: z.string().min(1).max(DATABASE_TERMINAL_WRITE_MAX_CHARACTERS),
+    sessionId: databaseTerminalIdSchema,
+  })
+  .strict()
+
+export const relayAppTerminalClaimSchema = z
+  .object({
+    ...appTerminalTargetShape,
+    ...databaseTerminalSizeShape,
+    attachmentId: databaseTerminalIdSchema,
+    sessionId: databaseTerminalIdSchema,
+  })
+  .strict()
 
 export const relayDatabaseDataWriteSchema = relayDatabaseExportSchema.extend({
   // Runs a query in a read-only transaction, guarding against accidental
@@ -660,7 +834,8 @@ export const relayTailscaleStackBindingInputSchema = z
   .object({
     enabled: z.boolean().default(true),
     hostname: relayTailscaleSubdomainSchema,
-    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    // A server, or an app's service (see `appTailscaleMemberId`).
+    instanceId: tailscaleMemberIdSchema,
   })
   .strict()
 
@@ -895,6 +1070,26 @@ export const relayInstanceWebRouteStateSchema = z
     requiresRestart: z.boolean(),
     routes: relayInstanceWebRoutesSchema,
     status: z.enum(["blocked", "pending_restart", "ready"]),
+  })
+  .strict()
+
+// App web routes are server routes aimed at one of the app's services.
+export const relayAppWebRouteInputSchema =
+  relayInstanceWebRouteInputSchema.extend({ service: appServiceNameSchema })
+
+export const relayAppWebRouteSchema = relayInstanceWebRouteSchema.extend({
+  service: appServiceNameSchema,
+})
+
+export const relayAppWebRouteStateSchema =
+  relayInstanceWebRouteStateSchema.extend({
+    routes: relayInstanceWebRouteArraySchema(relayAppWebRouteSchema),
+  })
+
+export const relayAppWebRoutesWriteSchema = z
+  .object({
+    appId: appIdSchema,
+    routes: relayInstanceWebRouteArraySchema(relayAppWebRouteInputSchema),
   })
   .strict()
 
@@ -1208,6 +1403,40 @@ export const relayNodeCapabilitySchema = z.enum([
   "tailscale-staged-removal",
 ])
 
+const relayMemoryBytesSchema = z.number().int().nonnegative()
+
+/**
+ * Memory used by the Relay itself, separate from the host totals in
+ * `RelayNode.memory`. `process` is the Relay's Node.js process. `container` is
+ * the Relay container's cgroup v2 accounting, which also counts page cache the
+ * kernel charged to the Relay (for example from walking server directories or
+ * reading files for backups); that cache is reclaimable, so it is reported as
+ * `fileBytes` rather than folded into the process numbers. `container` is null
+ * when the Relay is not in a cgroup v2 container or the files are unreadable.
+ */
+export const relayProcessMemorySchema = z.object({
+  process: z.object({
+    rssBytes: relayMemoryBytesSchema,
+    heapUsedBytes: relayMemoryBytesSchema,
+    heapTotalBytes: relayMemoryBytesSchema,
+    externalBytes: relayMemoryBytesSchema,
+    arrayBuffersBytes: relayMemoryBytesSchema,
+  }),
+  container: z
+    .object({
+      /** `memory.current`: everything charged to the cgroup. */
+      usedBytes: relayMemoryBytesSchema,
+      /** `memory.max`, or null when the cgroup is unlimited. */
+      limitBytes: relayMemoryBytesSchema.nullable(),
+      anonBytes: relayMemoryBytesSchema.nullable(),
+      fileBytes: relayMemoryBytesSchema.nullable(),
+      activeFileBytes: relayMemoryBytesSchema.nullable(),
+      inactiveFileBytes: relayMemoryBytesSchema.nullable(),
+      kernelBytes: relayMemoryBytesSchema.nullable(),
+    })
+    .nullable(),
+})
+
 export const relayNodeSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -1235,6 +1464,8 @@ export const relayNodeSchema = z.object({
     version: z.string().nullable(),
   }),
   connectedAt: z.string().datetime(),
+  /** Absent from Relays that predate memory reporting. */
+  relayMemory: relayProcessMemorySchema.optional(),
 })
 
 export const relaySftpPublicationStatusSchema = z.enum([
@@ -1309,14 +1540,14 @@ const relayFileCursorSchema = z.string().uuid().nullable()
 export const relayDirectoryPageInputSchema = z
   .object({
     cursor: z.string().uuid().optional(),
-    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    instanceId: fileRootIdSchema,
     path: z.string().max(8_192),
   })
   .strict()
 
 export const relayDirectorySizesInputSchema = z
   .object({
-    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    instanceId: fileRootIdSchema,
     paths: z.array(z.string().min(1).max(8_192)).min(1).max(128),
   })
   .strict()
@@ -1331,7 +1562,7 @@ export const relayDirectorySizesSchema = z
 
 export const relayFileStatInputSchema = z
   .object({
-    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    instanceId: fileRootIdSchema,
     path: z.string().min(1).max(8_192),
   })
   .strict()
@@ -1348,7 +1579,7 @@ export const relayDirectoryPageSchema = z
 export const relayFileSearchPageInputSchema = z
   .object({
     cursor: z.string().uuid().optional(),
-    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    instanceId: fileRootIdSchema,
     query: z.string().trim().min(1).max(256),
   })
   .strict()
@@ -1393,7 +1624,7 @@ const relayFileMutationPathSchema = z
 
 export const relayRemoteFileUploadSchema = z
   .object({
-    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    instanceId: fileRootIdSchema,
     path: relayFileMutationPathSchema,
     url: z
       .url()
@@ -1699,6 +1930,24 @@ export type HearthDatabaseTerminalOutput = z.infer<
 export type RelayDatabaseDataWrite = z.infer<
   typeof relayDatabaseDataWriteSchema
 >
+export type AppConfig = z.infer<typeof appConfigSchema>
+export type AppSourceType = z.infer<typeof appSourceTypeSchema>
+export type AppPort = z.infer<typeof appPortSchema>
+export type AppDeploymentState = z.infer<typeof appDeploymentStateSchema>
+export type RelayApp = z.infer<typeof relayAppSchema>
+export type RelayAppContainer = z.infer<typeof relayAppContainerSchema>
+export type RelayAppDeployment = z.infer<typeof relayAppDeploymentSchema>
+export type RelayCreateApp = z.infer<typeof relayCreateAppSchema>
+export type RelayDeployApp = z.infer<typeof relayDeployAppSchema>
+export type RelayAppAction = z.infer<typeof relayAppActionSchema>
+export type RelayDeleteApp = z.infer<typeof relayDeleteAppSchema>
+export type RelayAppNetwork = z.infer<typeof relayAppNetworkSchema>
+export type RelayAppWebRoute = z.infer<typeof relayAppWebRouteSchema>
+export type RelayAppWebRouteInput = z.infer<typeof relayAppWebRouteInputSchema>
+export type RelayAppWebRouteState = z.infer<typeof relayAppWebRouteStateSchema>
+export type RelayAppTerminalAttach = z.infer<
+  typeof relayAppTerminalAttachSchema
+>
 export type BrickId = z.infer<typeof brickIdSchema>
 export type BrickVariableValue = z.infer<typeof brickVariableValueSchema>
 export type BrickVariable = z.infer<typeof brickVariableSchema>
@@ -1793,15 +2042,23 @@ export type RelayInstance = z.infer<typeof relayInstanceSchema>
 export type RelaySnapshotDelta = z.infer<typeof relaySnapshotDeltaSchema>
 export type RelayNode = z.infer<typeof relayNodeSchema>
 export type RelaySnapshot = z.infer<typeof relaySnapshotSchema>
+export type RelayProcessMemory = z.infer<typeof relayProcessMemorySchema>
 
 /**
  * Builds the control-plane portion of a Relay snapshot update. High-frequency
  * resource samples use their dedicated stream and must not wake every Hearth
  * client through the fleet-wide realtime channel.
+ *
+ * `nodeResources` also sends the node whenever its resource samples (CPU,
+ * memory, storage, uptime, Relay memory) change, for Hearths that advertise
+ * `relaySnapshotNodeResourcesFeature`. Those Hearths keep their cached node
+ * current and strip resource-only node changes with
+ * `relaySnapshotControlDelta` before notifying browsers.
  */
 export function createRelaySnapshotDelta(
   previous: RelaySnapshot,
-  next: RelaySnapshot
+  next: RelaySnapshot,
+  options: { readonly nodeResources?: boolean } = {}
 ): RelaySnapshotDelta | null {
   const previousInstances = new Map(
     previous.instances.map((instance) => [instance.id, instance])
@@ -1822,8 +2079,10 @@ export function createRelaySnapshotDelta(
     nextIds.has(instance.id) ? [] : [instance.id]
   )
   const node = jsonValueEqual(
-    relayNodeControlState(previous.node),
-    relayNodeControlState(next.node)
+    options.nodeResources
+      ? previous.node
+      : relayNodeControlState(previous.node),
+    options.nodeResources ? next.node : relayNodeControlState(next.node)
   )
     ? undefined
     : next.node
@@ -1851,6 +2110,14 @@ export function applyRelaySnapshotDelta(
   snapshot: RelaySnapshot,
   delta: RelaySnapshotDelta
 ): RelaySnapshot {
+  // Node resource samples arrive every few seconds; keep the instances array.
+  if (delta.instances.length === 0 && delta.deletedInstanceIds.length === 0) {
+    return {
+      ...snapshot,
+      node: delta.node ?? snapshot.node,
+      relay: delta.relay ?? snapshot.relay,
+    }
+  }
   const deleted = new Set(delta.deletedInstanceIds)
   const upserts = new Map(
     delta.instances.map((instance) => [instance.id, instance])
@@ -1869,6 +2136,32 @@ export function applyRelaySnapshotDelta(
   }
 }
 
+/**
+ * Drops a node that only carries new resource samples, so a delta received
+ * with `relaySnapshotNodeResourcesFeature` wakes browsers exactly as often as
+ * a control-only delta. Returns null when nothing control-relevant changed.
+ */
+export function relaySnapshotControlDelta(
+  previous: RelaySnapshot,
+  delta: RelaySnapshotDelta
+): RelaySnapshotDelta | null {
+  if (
+    !delta.node ||
+    !jsonValueEqual(
+      relayNodeControlState(previous.node),
+      relayNodeControlState(delta.node)
+    )
+  ) {
+    return delta
+  }
+  const { node: _node, ...control } = delta
+  return control.instances.length === 0 &&
+    control.deletedInstanceIds.length === 0 &&
+    !control.relay
+    ? null
+    : control
+}
+
 function relayInstanceControlState(instance: RelayInstance) {
   const { resources: _resources, ...control } = instance
   return control
@@ -1878,6 +2171,7 @@ function relayNodeControlState(node: RelayNode) {
   const {
     cpu: _cpu,
     memory: _memory,
+    relayMemory: _relayMemory,
     storage: _storage,
     uptimeSeconds: _uptimeSeconds,
     ...control

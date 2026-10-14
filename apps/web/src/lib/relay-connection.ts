@@ -18,14 +18,17 @@ import {
   relayControlMaxFrameBytes,
   relayControlRequestTimeoutMs,
   relayControlProtocol,
+  relaySnapshotControlDelta,
   relaySnapshotDeltaFeature,
   relaySnapshotDeltaSchema,
+  relaySnapshotNodeResourcesFeature,
   relaySnapshotSchema,
 } from "@workspace/contracts"
 import type {
   RelayAuthChallenge,
   RelayControlOperation,
   RelayControlRequest,
+  RelayNode,
   RelayProxyBrowserMetadata,
   RelaySnapshot,
   RelaySnapshotDelta,
@@ -33,6 +36,7 @@ import type {
 import {
   hearthDatabaseTerminalOutputSchema,
   relayTailscaleStackIdSchema,
+  tailscaleMemberIdSchema,
 } from "@workspace/contracts"
 import { z } from "zod"
 
@@ -60,7 +64,8 @@ export type { RelayEndpoint }
 
 const MAX_BACKOFF_MS = 30_000
 const tailscaleInstanceDetachSchema = z.strictObject({
-  instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+  // A server, or an app's service being deleted.
+  instanceId: tailscaleMemberIdSchema,
   mode: z.enum(["prepare", "rollback"]),
   stackIds: z.array(relayTailscaleStackIdSchema).min(1).max(4_096),
 })
@@ -338,6 +343,15 @@ export function relayConnectionState(relayId: string): RelayConnectionState {
   )
 }
 
+/**
+ * The Relay node last pushed over this Hearth process's own control socket.
+ * Each process keeps its own connections, so this is null until this process
+ * has authenticated with the Relay. Callers must authorize the reader first.
+ */
+export function relayConnectionNode(relayId: string): RelayNode | null {
+  return connections.get(relayId)?.pushedNode ?? null
+}
+
 export function relayConnectionBrowserMetadata(
   relayId: string
 ): RelayProxyBrowserMetadata | null {
@@ -404,6 +418,13 @@ class RelayConnection {
 
   get state(): RelayConnectionState {
     return this.#state
+  }
+
+  /** The node from the pushed snapshot, without consuming it for RPC reads. */
+  get pushedNode(): RelayNode | null {
+    return this.#state.status === "authenticated"
+      ? (this.#pushedSnapshot?.node ?? null)
+      : null
   }
 
   get browserMetadata(): RelayProxyBrowserMetadata | null {
@@ -909,15 +930,23 @@ class RelayConnection {
               delta.data
             )
             this.#hasPushedSnapshot = true
-            publishRealtimeChange({
-              delta: delta.data,
-              directoryChanged: snapshotDeltaChangesDirectory(
-                previousSnapshot,
-                delta.data
-              ),
-              relayId: this.#relay.id,
-              type: "relay.snapshot.delta",
-            })
+            // Resource-only node samples refresh the cached snapshot without
+            // waking browsers on the fleet-wide realtime channel.
+            const controlDelta = relaySnapshotControlDelta(
+              previousSnapshot,
+              delta.data
+            )
+            if (controlDelta) {
+              publishRealtimeChange({
+                delta: controlDelta,
+                directoryChanged: snapshotDeltaChangesDirectory(
+                  previousSnapshot,
+                  controlDelta
+                ),
+                relayId: this.#relay.id,
+                type: "relay.snapshot.delta",
+              })
+            }
           }
           return
         }
@@ -984,6 +1013,7 @@ class RelayConnection {
         clientId: credentials.clientId,
         features: [
           relaySnapshotDeltaFeature,
+          relaySnapshotNodeResourcesFeature,
           relayBrowserCapabilityV2Feature,
           relayBrowserLeaseRenewalV1Feature,
           relayFileRequestReplayV1Feature,

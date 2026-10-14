@@ -4,12 +4,17 @@ import type {
   RelayInstanceWebRoute,
   RelayProxySettings,
 } from "@workspace/contracts"
+import { Effect } from "effect"
 
-import { command } from "./command.js"
 import type { RelayConfig } from "./config.js"
+import { containerName, type DockerEngine } from "./docker-engine.js"
 import { recoverPromise } from "./effect/promise.js"
 import type { RelayStoredWebRoute } from "./effect/state.js"
-import { relayResourceNames } from "./relay-resources.js"
+import {
+  APP_SERVICE,
+  appIdFromRouteOwner,
+  relayResourceNames,
+} from "./relay-resources.js"
 import {
   WEB_ROUTE_LABEL_PREFIX,
   WEB_ROUTE_REVISION_LABEL,
@@ -170,6 +175,17 @@ accessLog: {}
 `
 }
 
+// A server's container, or the network alias of an app's service.
+function routeUpstreamHost(
+  resources: ReturnType<typeof relayResourceNames>,
+  route: RelayStoredWebRoute
+): string {
+  const appId = appIdFromRouteOwner(route.instanceId)
+  return appId
+    ? resources.appAlias(appId, route.service ?? APP_SERVICE)
+    : resources.instanceContainer(route.instanceId)
+}
+
 export function traefikDynamicConfiguration(
   config: RelayConfig,
   routes: ReadonlyArray<RelayStoredWebRoute>,
@@ -235,7 +251,7 @@ export function traefikDynamicConfiguration(
       `    ${name}:`,
       "      loadBalancer:",
       "        servers:",
-      `          - url: ${JSON.stringify(`http://${resources.instanceContainer(route.instanceId)}:${route.targetPort}`)}`
+      `          - url: ${JSON.stringify(`http://${routeUpstreamHost(resources, route)}:${route.targetPort}`)}`
     )
   }
 
@@ -275,66 +291,55 @@ function isTraefikHostname(value: string): boolean {
 }
 
 export async function discoverExternalTraefikContainer(input: {
+  docker: DockerEngine
   edgeNetwork: string
   resourceNamespace: string | null
   settings: RelayProxySettings
 }): Promise<string | null> {
+  const { docker } = input
   if (input.settings.mode === "coolify") {
-    return firstTraefikContainer(["coolify-proxy"])
+    return firstTraefikContainer(docker, ["coolify-proxy"])
   }
   if (input.resourceNamespace) {
     const attached = await recoverPromise(
-      () =>
-        command("docker", [
-          "network",
-          "inspect",
-          "--format",
-          "{{range .Containers}}{{println .Name}}{{end}}",
-          input.edgeNetwork,
-        ]),
-      () => ({ stderr: "", stdout: "" })
+      async () =>
+        Object.values(
+          (await Effect.runPromise(docker.inspectNetwork(input.edgeNetwork)))
+            .Containers ?? {}
+        ).map((container) => container.Name),
+      () => []
     )
-    return firstTraefikContainer(containerNames(attached.stdout))
+    return firstTraefikContainer(docker, attached)
   }
 
   const candidates = ["coolify-proxy"]
   const ports = await Promise.all(
     [80, 443].map((port) =>
       recoverPromise(
-        () =>
-          command("docker", [
-            "ps",
-            "--filter",
-            `publish=${port}`,
-            "--format",
-            "{{.Names}}",
-          ]),
-        () => ({ stderr: "", stdout: "" })
+        async () =>
+          (
+            await Effect.runPromise(
+              docker.listContainers({ filters: { publish: [String(port)] } })
+            )
+          ).map(containerName),
+        () => []
       )
     )
   )
-  for (const result of ports) {
-    candidates.push(...containerNames(result.stdout))
-  }
-  return firstTraefikContainer(Array.from(new Set(candidates)))
+  for (const names of ports) candidates.push(...names)
+  return firstTraefikContainer(docker, Array.from(new Set(candidates)))
 }
 
 async function firstTraefikContainer(
+  docker: DockerEngine,
   names: ReadonlyArray<string>
 ): Promise<string | null> {
   for (const name of names) {
     const inspected = await recoverPromise(
-      async () =>
-        (
-          await command("docker", [
-            "inspect",
-            "--format",
-            "{{.State.Running}} {{.Config.Image}}",
-            name,
-          ])
-        ).stdout
-          .trim()
-          .toLowerCase(),
+      async () => {
+        const container = await Effect.runPromise(docker.inspectContainer(name))
+        return `${container.State.Running} ${container.Config.Image}`.toLowerCase()
+      },
       () => ""
     )
     if (
@@ -345,11 +350,4 @@ async function firstTraefikContainer(
     }
   }
   return null
-}
-
-function containerNames(output: string): Array<string> {
-  return output
-    .split("\n")
-    .map((value) => value.trim())
-    .filter(Boolean)
 }
