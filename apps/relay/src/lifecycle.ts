@@ -44,6 +44,7 @@ import type {
   RelayUpdateInstanceStartup,
 } from "@workspace/contracts"
 import {
+  appTailscaleMember,
   builtinTailscaleBrickId,
   builtinTailscaleBrickSource,
   relayDiskAllocationAvailableBytes,
@@ -75,6 +76,8 @@ import {
 } from "./port-allocations.js"
 import { INSTANCE_STOP_TIMEOUT_SECONDS } from "./power-state.js"
 import {
+  APP_SERVICE,
+  appIdFromRouteOwner,
   relayOwnerLabel,
   relayOwnsLabels,
   relayResourceNames,
@@ -634,6 +637,13 @@ export class LifecycleDriver {
     const existing = await this.#readTailscaleStackConfig(input.id)
     const instances = await this.#docker.inspectInstances()
     for (const binding of input.bindings) {
+      const app = appTailscaleMember(binding.instanceId)
+      if (app) {
+        // Throws for an app that isn't on this Relay. One not deployed yet
+        // joins when it deploys.
+        await this.#appServiceContainer?.(app.appId, app.service)
+        continue
+      }
       const instance = instances.find(
         (candidate) => candidate.id === binding.instanceId
       )
@@ -1272,6 +1282,160 @@ export class LifecycleDriver {
       await this.#serializeEdgeMutation(() =>
         this.#disableExternalEdge(settings)
       )
+      if (settings.mode === "traefik") {
+        await this.#connectTraefikToApps(routes)
+      }
+    }
+  }
+
+  // Bundled Traefik reaches routed apps on their own networks.
+  async #connectTraefikToApps(routes: ReadonlyArray<RelayStoredWebRoute>) {
+    const appIds = new Set(
+      routes.flatMap((route) => {
+        const appId = appIdFromRouteOwner(route.instanceId)
+        return appId ? [appId] : []
+      })
+    )
+    for (const appId of appIds) {
+      await recoverPromise(
+        () =>
+          connectNetwork(
+            this.#engine,
+            this.#resources.traefikContainer,
+            this.#resources.appNetwork(appId)
+          ),
+        () => undefined
+      )
+    }
+  }
+
+  // The Traefik labels each of an app's services needs for its routes, and
+  // the edge network Traefik reaches them on. Only an external Traefik reads
+  // labels; bundled Traefik routes from its file configuration.
+  async appRoutePlan(
+    routes: ReadonlyArray<RelayInstanceWebRoute & { readonly service?: string }>
+  ): Promise<{
+    labels: (service: string) => Record<string, string>
+    network: string | null
+  }> {
+    const settings = await this.proxySettings()
+    if (
+      routes.length === 0 ||
+      (settings.mode !== "none" && settings.mode !== "coolify")
+    ) {
+      return { labels: () => ({}), network: null }
+    }
+    await this.#serializeEdgeMutation(() => this.#ensureEdgeNetwork())
+    const profile = this.#externalTraefikProfile(settings)
+    return {
+      labels: (service) => {
+        const own = routes.filter(
+          (route) => (route.service ?? APP_SERVICE) === service
+        )
+        return own.length > 0
+          ? traefikRouteLabels(own, profile, this.#resources.edgeNetwork)
+          : {}
+      },
+      network: this.#resources.edgeNetwork,
+    }
+  }
+
+  // Whether an app's routes are live: bundled Traefik applies them as soon
+  // as they're saved; an external one once a deploy puts their labels on
+  // the app's containers.
+  async appWebRouteState(
+    routes: ReadonlyArray<
+      RelayInstanceWebRoute & { readonly service?: string }
+    >,
+    containers: ReadonlyArray<{
+      readonly labels: Readonly<Record<string, string>>
+      readonly networks: ReadonlyArray<string>
+      readonly service: string
+    }>
+  ): Promise<Omit<RelayInstanceWebRouteState, "routes">> {
+    const settings = await this.proxySettings()
+    if (settings.mode === "traefik") {
+      return {
+        edgeConnected: false,
+        message:
+          "Bundled Traefik routes to this app as soon as routes are saved.",
+        proxyConnected: true,
+        requiresRestart: false,
+        status: "ready",
+      }
+    }
+    if (settings.mode === "hearth") {
+      return {
+        edgeConnected: false,
+        message:
+          "Hearth proxy mode does not publish websites. Choose an existing or bundled Traefik edge.",
+        proxyConnected: false,
+        requiresRestart: false,
+        status: routes.length > 0 ? "blocked" : "ready",
+      }
+    }
+    const profile = this.#externalTraefikProfile(settings)
+    const edge = this.#resources.edgeNetwork
+    const routesFor = (service: string) =>
+      routes.filter((route) => (route.service ?? APP_SERVICE) === service)
+    const requiresDeploy = containers.some((container) => {
+      const own = routesFor(container.service)
+      return routeLabelsRequireRestart(
+        container.labels,
+        own,
+        own.length > 0 ? traefikRouteLabels(own, profile, edge) : {}
+      )
+    })
+    const edgeConnected = containers
+      .filter((container) => routesFor(container.service).length > 0)
+      .every((container) => container.networks.includes(edge))
+    const proxy = await this.#externalTraefikContainer(settings)
+    const proxyConnected = Boolean(
+      proxy && (await containerUsesNetwork(this.#engine, proxy, edge))
+    )
+    if (routes.length > 0 && containers.length === 0) {
+      return {
+        edgeConnected,
+        message: "Deploy this app to publish its routes.",
+        proxyConnected,
+        requiresRestart: true,
+        status: "pending_restart",
+      }
+    }
+    if (requiresDeploy) {
+      return {
+        edgeConnected,
+        message:
+          routes.length > 0
+            ? "Deploy this app to apply its pending Traefik labels."
+            : "Deploy once to remove this app's stale Traefik labels.",
+        proxyConnected,
+        requiresRestart: true,
+        status: "pending_restart",
+      }
+    }
+    if (routes.length > 0 && (!edgeConnected || !proxyConnected)) {
+      return {
+        edgeConnected,
+        message: proxy
+          ? `Relay found ${proxy}, but the ${edge} attachment is not ready yet.`
+          : settings.mode === "coolify"
+            ? "Relay could not find Coolify's running coolify-proxy container."
+            : `Attach your Traefik container to ${edge} to activate these routes.`,
+        proxyConnected,
+        requiresRestart: false,
+        status: "blocked",
+      }
+    }
+    return {
+      edgeConnected,
+      message:
+        routes.length > 0
+          ? "Traefik labels and edge network membership are applied."
+          : "This app is not exposed to the edge network.",
+      proxyConnected,
+      requiresRestart: false,
+      status: "ready",
     }
   }
 
@@ -1498,6 +1662,7 @@ export class LifecycleDriver {
               action,
               portConfiguration
             )
+            await this.reattachTailscaleMember(instance.id)
             if (pendingExternalPort) {
               const networking = await this.networking()
               if (networking?.enabled) {
@@ -1719,6 +1884,7 @@ export class LifecycleDriver {
             },
           }
         )
+        await this.reattachTailscaleMember(instance.id)
         const networking = await this.networking()
         if (networking?.enabled) {
           await this.#refreshCoreDnsConfiguration(networking)
@@ -2062,8 +2228,8 @@ export class LifecycleDriver {
     )
 
     return runLifecycle(
-      lifecycleOperation(() =>
-        this.#provisionManagedInstance({
+      lifecycleOperation(async () => {
+        const reconfigured = await this.#provisionManagedInstance({
           diskLimitBytes,
           grandfatheredDiskLimitBytes: existing.limits.diskBytes,
           id: existing.id,
@@ -2076,7 +2242,11 @@ export class LifecycleDriver {
           tailscale,
           variables,
         })
-      ).pipe(
+        // The new container joins its Tailscale networks where the old one
+        // was.
+        await this.reattachTailscaleMember(existing.id)
+        return reconfigured
+      }).pipe(
         Effect.mapError(
           (error) =>
             new Error(
@@ -2810,7 +2980,9 @@ export class LifecycleDriver {
             stackIds: affectedStackIds,
           })
         }
-        detachedStacks = await this.#detachInstanceFromTailscaleStacks(instance)
+        detachedStacks = await this.#detachMemberFromTailscaleStacks(
+          instance.id
+        )
         await runLifecycle(
           this.#engine
             .stopContainer(instance.service, {
@@ -3048,6 +3220,8 @@ export class LifecycleDriver {
           this.#resources.traefikContainer,
           this.#resources.gameNetwork
         )
+        // A new Traefik container joins routed apps' networks too.
+        await this.#connectTraefikToApps(routes)
       }).pipe(
         Effect.mapError((cause) =>
           isPortBindingFailure(cause)
@@ -3201,7 +3375,26 @@ export class LifecycleDriver {
   async #disableExternalEdge(settings: RelayProxySettings): Promise<void> {
     const instances = await this.#docker.inspectInstances()
     const proxy = await this.#externalTraefikContainer(settings)
+    // Apps join the edge network for their routes too.
+    const apps = await recoverPromise(
+      async () =>
+        (
+          await runLifecycle(
+            this.#engine.listContainers({
+              all: true,
+              filters: {
+                label: ["kiln.resource.kind=app"],
+                network: [this.#resources.edgeNetwork],
+              },
+            })
+          )
+        ).map(containerName),
+      () => []
+    )
     await Promise.all([
+      ...apps.map((app) =>
+        disconnectNetwork(this.#engine, app, this.#resources.edgeNetwork)
+      ),
       ...instances
         .filter((instance) => instance.managedByRelay)
         .map((instance) =>
@@ -3488,35 +3681,22 @@ export class LifecycleDriver {
     for (const binding of previousById.values()) {
       const replacement = desiredById.get(binding.instanceId)
       if (replacement?.address === binding.address) continue
-      const instance = await this.#docker.findInstance(binding.instanceId)
-      if (!instance) continue
+      const container = await this.#tailscaleMemberContainer(binding.instanceId)
+      if (!container) continue
       await runLifecycle(
         this.#engine
-          .disconnectNetwork(network, instance.service, { force: true })
+          .disconnectNetwork(network, container, { force: true })
           .pipe(Effect.ignore)
       )
     }
     for (const binding of desiredById.values()) {
-      const prior = previousById.get(binding.instanceId)
-      const instance = await this.#docker.findInstance(binding.instanceId)
-      if (!instance) continue
-      if (
-        prior?.address === binding.address &&
-        (await containerUsesNetwork(this.#engine, instance.service, network))
-      ) {
-        continue
-      }
-      if (await containerUsesNetwork(this.#engine, instance.service, network)) {
-        await runLifecycle(
-          this.#engine.disconnectNetwork(network, instance.service, {
-            force: true,
-          })
-        )
-      }
-      await runLifecycle(
-        this.#engine.connectNetwork(network, instance.service, {
-          ipv4Address: binding.address,
-        })
+      const container = await this.#tailscaleMemberContainer(binding.instanceId)
+      if (!container) continue
+      await attachTailscaleMember(
+        this.#engine,
+        container,
+        network,
+        binding.address
       )
     }
   }
@@ -3946,9 +4126,7 @@ export class LifecycleDriver {
     )
   }
 
-  async #detachInstanceFromTailscaleStacks(
-    instance: RelayInstanceConfig
-  ): Promise<
+  async #detachMemberFromTailscaleStacks(memberId: string): Promise<
     Array<{
       next: RelayTailscaleStackConfig
       previous: RelayTailscaleStackConfig
@@ -3956,7 +4134,7 @@ export class LifecycleDriver {
     }>
   > {
     const configs = (await this.#tailscaleStackConfigs()).filter((config) =>
-      config.bindings.some((binding) => binding.instanceId === instance.id)
+      config.bindings.some((binding) => binding.instanceId === memberId)
     )
     const completed: Array<{
       next: RelayTailscaleStackConfig
@@ -3968,14 +4146,14 @@ export class LifecycleDriver {
         for (const previous of configs) {
           if (await this.#tailscaleStackRemovalPending(previous.id)) {
             throw new Error(
-              `Finish removing ${previous.name} from Tailscale before deleting this server`
+              `Finish removing ${previous.name} from Tailscale before deleting this`
             )
           }
           const records = await this.#readTailscaleStackDnsRecords(previous)
           const detached = tailscaleStackWithoutInstance(
             previous,
             records,
-            instance.id
+            memberId
           )
           const next = detached.config
           completed.push({ next, previous, records })
@@ -3995,7 +4173,7 @@ export class LifecycleDriver {
             const rollbackFailures =
               await this.#restoreInstanceTailscaleStacks(completed)
             throw new Error(
-              `Could not remove the server from its Tailscale networks: ${
+              `Could not remove it from its Tailscale networks: ${
                 cause instanceof Error ? cause.message : "unknown error"
               }${
                 rollbackFailures.length > 0
@@ -4253,6 +4431,110 @@ export class LifecycleDriver {
     await runLifecycle(this.#engine.removeNetwork(name))
   }
 
+  // An app service's current container, for its Tailscale memberships. Set
+  // once the app driver exists, since that driver needs this one.
+  #appServiceContainer:
+    | ((appId: string, service: string) => Promise<string | null>)
+    | null = null
+
+  useAppServiceContainers(
+    resolve: (appId: string, service: string) => Promise<string | null>
+  ) {
+    this.#appServiceContainer = resolve
+  }
+
+  // The container a Tailscale member runs in: a server's, or an app
+  // service's newest. Null when it has none yet.
+  async #tailscaleMemberContainer(memberId: string): Promise<string | null> {
+    const app = appTailscaleMember(memberId)
+    if (app) {
+      return this.#appServiceContainer
+        ? this.#appServiceContainer(app.appId, app.service)
+        : null
+    }
+    return (await this.#docker.findInstance(memberId))?.service ?? null
+  }
+
+  // Every enabled membership whose member matches, with the network and the
+  // address it holds there.
+  async tailscaleMemberships(
+    matches: (memberId: string) => boolean
+  ): Promise<Array<{ address: string; memberId: string; network: string }>> {
+    return (await this.#tailscaleStackConfigs()).flatMap((config) =>
+      activeTailscaleStackBindings(config.bindings)
+        .filter((binding) => matches(binding.instanceId))
+        .map((binding) => ({
+          address: binding.address,
+          memberId: binding.instanceId,
+          network: this.#resources.tailscaleStackNetwork(config.id),
+        }))
+    )
+  }
+
+  // Puts a member's container back at its address on each of its Tailscale
+  // networks, after the container was recreated.
+  async reattachTailscaleMember(memberId: string): Promise<void> {
+    const container = await this.#tailscaleMemberContainer(memberId)
+    if (!container) return
+    for (const membership of await this.tailscaleMemberships(
+      (candidate) => candidate === memberId
+    )) {
+      await attachTailscaleMember(
+        this.#engine,
+        container,
+        membership.network,
+        membership.address
+      )
+    }
+  }
+
+  // Takes an app's services off their Tailscale networks before the app is
+  // deleted. Hearth drops their DNS records from every node first, and puts
+  // them back if the detach fails.
+  async detachAppFromTailscale(
+    appId: string,
+    synchronize: (input: {
+      memberId: string
+      mode: "prepare" | "rollback"
+      stackIds: ReadonlyArray<string>
+    }) => Promise<void>
+  ): Promise<void> {
+    const configs = await this.#tailscaleStackConfigs()
+    const memberIds = [
+      ...new Set(
+        configs.flatMap((config) =>
+          config.bindings
+            .map((binding) => binding.instanceId)
+            .filter((memberId) => appTailscaleMember(memberId)?.appId === appId)
+        )
+      ),
+    ]
+    for (const memberId of memberIds) {
+      const stackIds = configs
+        .filter((config) =>
+          config.bindings.some((binding) => binding.instanceId === memberId)
+        )
+        .map((config) => config.id)
+      await synchronize({ memberId, mode: "prepare", stackIds })
+      await runLifecycle(
+        lifecycleOperation(() =>
+          this.#detachMemberFromTailscaleStacks(memberId)
+        ).pipe(
+          Effect.tapError(() =>
+            lifecycleOperation(() =>
+              synchronize({ memberId, mode: "rollback", stackIds })
+            ).pipe(Effect.ignore)
+          )
+        )
+      )
+    }
+  }
+
+  // The Relay's data directory as the Docker host sees it, for bind mounts.
+  hostDataDirectory(): Promise<string> {
+    return this.#hostDataDirectory()
+  }
+
   async #hostDataDirectory(): Promise<string> {
     this.#hostDataDirectoryPromise ??= this.#resolveHostDataDirectory()
     return this.#hostDataDirectoryPromise
@@ -4292,10 +4574,50 @@ async function ensureProtectedFile(path: string): Promise<void> {
   await chmod(path, 0o600)
 }
 
+// Puts a container on a Tailscale network at its member address, moving it
+// there if it holds another.
+async function attachTailscaleMember(
+  docker: DockerEngine,
+  container: string,
+  network: string,
+  address: string
+): Promise<void> {
+  const endpoint = (await containerNetworks(docker, container))[network]
+  if (endpoint && endpointAddress(endpoint) === address) return
+  if (endpoint) {
+    await runLifecycle(
+      docker.disconnectNetwork(network, container, { force: true })
+    )
+  }
+  await runLifecycle(
+    docker.connectNetwork(network, container, { ipv4Address: address })
+  )
+}
+
+// The address a container holds on a network, or is configured to take when
+// it starts.
+function endpointAddress(endpoint: {
+  readonly IPAMConfig?: { readonly IPv4Address?: string } | null
+  readonly IPAddress?: string
+}): string | null {
+  return endpoint.IPAMConfig?.IPv4Address || endpoint.IPAddress || null
+}
+
 async function containerNetworks(
   docker: DockerEngine,
   name: string
-): Promise<Readonly<Record<string, { readonly Aliases?: unknown }>>> {
+): Promise<
+  Readonly<
+    Record<
+      string,
+      {
+        readonly Aliases?: unknown
+        readonly IPAMConfig?: { readonly IPv4Address?: string } | null
+        readonly IPAddress?: string
+      }
+    >
+  >
+> {
   return recoverPromise(
     async () =>
       (await Effect.runPromise(docker.inspectContainer(name))).NetworkSettings

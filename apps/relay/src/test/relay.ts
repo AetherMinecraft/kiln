@@ -14,6 +14,7 @@ import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 
 import {
+  appTailscaleMember,
   brickRecipeSchema,
   relayCreateInstanceSchema,
   type BrickRecipe,
@@ -22,6 +23,7 @@ import {
 import { Effect, ManagedRuntime } from "effect"
 import { onTestFinished } from "vite-plus/test"
 
+import { AppDriver } from "../apps.js"
 import { BrickCatalog } from "../bricks.js"
 import { loadConfig, type RelayConfig } from "../config.js"
 import { DatabaseConnections } from "../database-connections.js"
@@ -29,13 +31,14 @@ import { DatabaseDriver } from "../databases.js"
 import { DockerDriver } from "../docker.js"
 import { makeRelayStateLayer, RelayStateStore } from "../effect/state.js"
 import { LifecycleDriver } from "../lifecycle.js"
-import { relayResourceNames } from "../relay-resources.js"
+import { appRouteOwner, relayResourceNames } from "../relay-resources.js"
 import { RuntimeRecoveryManager } from "../runtime-recovery.js"
 import { type ContainerSeed, type FakeContainer, fakeDocker } from "./docker.js"
 
 export const TEST_NAMESPACE = "kiln-test"
 
 export interface RelayDrivers {
+  readonly apps: AppDriver
   readonly bricks: BrickCatalog
   readonly databaseConnections: DatabaseConnections
   readonly databases: DatabaseDriver
@@ -115,7 +118,29 @@ export async function relayHarness(
       databaseConnections
     )
     lifecycles.push(lifecycle)
+    const apps = new AppDriver(config, () => lifecycle.hostDataDirectory(), {
+      routes: async (appId) =>
+        lifecycle.appRoutePlan(
+          await Effect.runPromise(
+            state.listInstanceRoutes(appRouteOwner(appId))
+          )
+        ),
+      tailscale: async (appId) =>
+        (
+          await lifecycle.tailscaleMemberships(
+            (memberId) => appTailscaleMember(memberId)?.appId === appId
+          )
+        ).map((membership) => ({
+          ...membership,
+          service: appTailscaleMember(membership.memberId)!.service,
+        })),
+    })
+    lifecycle.useAppServiceContainers(async (appId, service) => {
+      await apps.get(appId)
+      return (await apps.serviceContainer(appId, service))?.name ?? null
+    })
     return {
+      apps,
       bricks,
       databaseConnections,
       databases: new DatabaseDriver(config, docker, databaseConnections),
@@ -146,7 +171,12 @@ export async function relayHarness(
     state,
     restart: drivers,
     publishRecipe,
-    createServer: async ({ id, recipe = serverRecipe(), start = false, variables = {} }) =>
+    createServer: async ({
+      id,
+      recipe = serverRecipe(),
+      start = false,
+      variables = {},
+    }) =>
       initial.lifecycle.createInstanceWithId(
         id,
         relayCreateInstanceSchema.parse({

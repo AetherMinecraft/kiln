@@ -216,6 +216,11 @@ export class FakeDocker {
   readonly images = new Map<string, Record<string, string>>()
   /** Images whose registry cannot be reached; pulling them fails. */
   readonly unreachableImages = new Set<string>()
+  /**
+   * Images whose process exits as soon as it starts. Under a restart policy
+   * Docker keeps restarting them, reporting them running and restarting.
+   */
+  readonly crashingImages = new Set<string>()
   /** The Tailscale control plane, keyed by machine (container) name. */
   readonly tailscale = {
     controlPlaneReachable: true,
@@ -272,6 +277,7 @@ export class FakeDocker {
     this.volumes.clear()
     this.images.clear()
     this.unreachableImages.clear()
+    this.crashingImages.clear()
     this.tailscale.controlPlaneReachable = true
     this.tailscale.machines.clear()
     this.#faults.length = 0
@@ -455,9 +461,16 @@ export class FakeDocker {
    * not enough.
    */
   idle(): Promise<void> {
+    // Quiet is counted from no earlier than the call, so a request still on
+    // its way from work Relay started just before (a forked restart) has
+    // time to arrive, however long ago the last one was.
+    const called = Date.now()
     return new Promise((resolve) => {
       const check = () => {
-        if (this.#inFlight === 0 && Date.now() - this.#lastActivity >= 25) {
+        if (
+          this.#inFlight === 0 &&
+          Date.now() - Math.max(this.#lastActivity, called) >= 25
+        ) {
           // Let callers observe the result before waiters resume.
           setImmediate(resolve)
         } else {
@@ -672,11 +685,13 @@ export class FakeDocker {
         Restarting: container.state.restarting,
         Running: container.state.running,
         StartedAt: container.state.startedAt,
-        Status: container.state.running
-          ? "running"
-          : container.state.startedAt === NEVER
-            ? "created"
-            : "exited",
+        Status: container.state.restarting
+          ? "restarting"
+          : container.state.running
+            ? "running"
+            : container.state.startedAt === NEVER
+              ? "created"
+              : "exited",
       },
     }
   }
@@ -856,9 +871,10 @@ export class FakeDocker {
   }
 
   #start(container: FakeContainer): void {
+    const crashing = this.crashingImages.has(container.image)
     container.state.running = true
-    container.state.restarting = false
-    container.state.exitCode = 0
+    container.state.restarting = crashing && container.restartPolicy !== "no"
+    container.state.exitCode = crashing ? 1 : 0
     container.state.oomKilled = false
     container.state.startedAt = this.#timestamp()
     container.state.health = container.healthCheck ? "healthy" : undefined
@@ -1037,17 +1053,26 @@ export class FakeDocker {
 
   #networkList(filters: Array<string>): Array<FakeNetwork> {
     return [...this.networks.values()].filter((network) =>
-      filters.every((filter) => {
-        const [key, value = ""] = splitOnce(filter, "=")
-        if (key !== "label") {
-          return this.#unsupported(`docker network ls --filter ${filter}`)
-        }
-        const [label, expected] = splitOnce(value, "=")
-        return expected === undefined
-          ? Object.hasOwn(network.labels, label)
-          : network.labels[label] === expected
-      })
+      this.#labelled(network.labels, filters, "network ls")
     )
+  }
+
+  /** Label filters, the only ones Relay sends for networks, volumes, images. */
+  #labelled(
+    labels: Record<string, string>,
+    filters: Array<string>,
+    listing: string
+  ): boolean {
+    return filters.every((filter) => {
+      const [key, value = ""] = splitOnce(filter, "=")
+      if (key !== "label") {
+        return this.#unsupported(`docker ${listing} --filter ${filter}`)
+      }
+      const [label, expected] = splitOnce(value, "=")
+      return expected === undefined
+        ? Object.hasOwn(labels, label)
+        : labels[label] === expected
+    })
   }
 
   #requiredNetwork(reference: string): FakeNetwork {
@@ -1390,6 +1415,20 @@ export class FakeDocker {
       await this.#networkRemove(parameters[0] ?? "")
       return json(204)
     }
+    if (method === "GET" && path === "/volumes") {
+      const filters = apiFilters(url)
+      return json(200, {
+        Volumes: [...this.volumes.values()]
+          .filter((volume) =>
+            this.#labelled(volume.labels, filters, "volume ls")
+          )
+          .map((volume) => ({
+            Driver: "local",
+            Labels: volume.labels,
+            Name: volume.name,
+          })),
+      })
+    }
     if (method === "GET" && (parameters = route(/^\/volumes\/([^/]+)$/u))) {
       const volume = this.volumes.get(parameters[0] ?? "")
       if (!volume) {
@@ -1404,6 +1443,33 @@ export class FakeDocker {
     if (method === "DELETE" && (parameters = route(/^\/volumes\/([^/]+)$/u))) {
       await this.#volumeRemove(parameters[0] ?? "")
       return json(204)
+    }
+    if (method === "GET" && path === "/images/json") {
+      const filters = apiFilters(url)
+      return json(
+        200,
+        [...this.images]
+          .filter(([, labels]) => this.#labelled(labels, filters, "image ls"))
+          .map(([image, labels]) => ({
+            Id: `sha256:${image}`,
+            Labels: labels,
+            RepoTags: [image],
+          }))
+      )
+    }
+    if (
+      method === "DELETE" &&
+      (parameters = route(/^\/images\/(.+)$/u)) &&
+      !path.endsWith("/json")
+    ) {
+      const [reference = ""] = parameters
+      const image = [...this.images.keys()].find(
+        (candidate) =>
+          candidate === reference || `sha256:${candidate}` === reference
+      )
+      if (!image) throw new DockerFailure(`No such image: ${reference}`, 404)
+      this.images.delete(image)
+      return json(200, [{ Deleted: `sha256:${image}` }])
     }
     if (method === "GET" && (parameters = route(/^\/images\/(.+)\/json$/u))) {
       const [image = ""] = parameters
