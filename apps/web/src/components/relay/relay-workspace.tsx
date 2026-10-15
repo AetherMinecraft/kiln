@@ -2,8 +2,9 @@ import * as React from "react"
 import { useQuery } from "@tanstack/react-query"
 import { RadioTower } from "lucide-react"
 
-import { RelayPauseButton } from "@/components/relay/relay-actions"
+import { RelayPowerControls } from "@/components/relay/relay-power-controls"
 import { useRelayLiveStatus } from "@/components/relay/relay-presentation"
+import { RelayResourceMeters } from "@/components/relay/relay-resource-meters"
 import {
   RelayWorkspaceContext,
   type RelayWorkspaceRelay,
@@ -104,10 +105,7 @@ const RelayWorkspaceHeader = React.memo(function RelayWorkspaceHeader({
             />
           }
         >
-          <span className="hidden shrink-0 items-center gap-1.5 @[30rem]:inline-flex">
-            <RelayStatusLabel relay={relay} />
-            <WorkspaceMetaSeparator />
-          </span>
+          <RelayStatusLabel relay={relay} />
           <span className="hidden shrink-0 items-center gap-1.5 @[40rem]:inline-flex">
             <WorkspaceIdCopyButton
               id={relay.id}
@@ -122,24 +120,43 @@ const RelayWorkspaceHeader = React.memo(function RelayWorkspaceHeader({
           />
         </WorkspaceIdentity>
       }
+      center={<RelayResourceMeters relay={relay} />}
       actions={<RelayHeaderActions relay={relay} />}
     />
   )
 })
 
+// Only when the Relay isn't simply online: its meters and actions can't say
+// why they're idle.
 function RelayStatusLabel({ relay }: { relay: RelayDirectoryEntry }) {
-  const { presentation } = useRelayLiveStatus(relay)
-  return <span>{presentation.label}</span>
+  const { presentation, relayStatus, updating } = useRelayLiveStatus(relay)
+  if (!updating && (relayStatus === "connected" || relayStatus === "checking"))
+    return null
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1.5">
+      <span>{presentation.label}</span>
+      <WorkspaceMetaSeparator />
+    </span>
+  )
 }
 
 function RelayHeaderActions({ relay }: { relay: RelayDirectoryEntry }) {
-  const { data: canPause = false } = useQuery({
+  const { data: permissions } = useQuery({
     ...accessCapabilitiesQueryOptions(),
-    select: (capabilities) =>
-      canAccessRelayPermission(capabilities, relay.id, "relay.pause"),
+    select: (capabilities) => ({
+      pause: canAccessRelayPermission(capabilities, relay.id, "relay.pause"),
+      restartHost: canAccessRelayPermission(
+        capabilities,
+        relay.id,
+        "relay.terminal"
+      ),
+      restartRelay: canAccessRelayPermission(
+        capabilities,
+        relay.id,
+        "relay.update"
+      ),
+    }),
   })
-  if (!canPause) return null
-  return (
-<RelayPauseButton relay={relay} />
-  )
+  if (!permissions) return null
+  return <RelayPowerControls permissions={permissions} relay={relay} />
 }

@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto"
 import { existsSync, readdirSync } from "node:fs"
-import { statfs } from "node:fs/promises"
+import { lstat, readdir, statfs } from "node:fs/promises"
 import { request } from "node:http"
 import { Socket } from "node:net"
-import { hostname } from "node:os"
-import { basename, relative, resolve } from "node:path"
+import { cpus, hostname, totalmem } from "node:os"
+import { basename, join, relative, resolve } from "node:path"
 import { Effect, Option, Queue, Result, Semaphore, Stream } from "effect"
 
 import {
@@ -20,7 +20,7 @@ import {
 } from "./docker-engine.js"
 import type { BrickCatalog } from "./bricks.js"
 import { directoryApparentSizeEffect } from "./disk-usage.js"
-import { ensuringPromise } from "./effect/promise.js"
+import { ensuringPromise, recoverPromise } from "./effect/promise.js"
 import type {
   RelayStateStore,
   RelayStoredLifecycleSession,
@@ -387,6 +387,8 @@ interface ResourceCacheEntry {
 }
 
 interface DiskUsageCacheEntry {
+  // The folder measured, for the Relay's own total to reuse.
+  directory?: string
   lastAttempt: number
   pending: boolean
   usedBytes: number | null
@@ -408,6 +410,9 @@ export const MAX_CONSOLE_HISTORY_CHARACTERS = 16 * 1024 * 1024
 const STARTUP_READINESS_LOG_LINES = 1_000
 const RESOURCE_HISTORY_WINDOW_MS = 6 * 60_000
 const DISK_USAGE_REFRESH_MS = 60_000
+// The data directory holds every server, so it is totalled less often than
+// one server's folder is walked.
+const RELAY_DISK_USAGE_REFRESH_MS = 5 * 60_000
 const DISCOVERY_TIMEOUT_MS = 30_000
 
 function diskQuotaExceeded(
@@ -446,6 +451,14 @@ export class DockerDriver {
   #relaySftpPublication: Promise<RelaySftpPublication> | undefined
   readonly #resourceCache = new Map<string, ResourceCacheEntry>()
   readonly #resourceHistory = new Map<string, Array<RelayInstanceResources>>()
+  readonly #relayResourceCache: ResourceCacheEntry = {
+    lastAttempt: 0,
+    pending: false,
+    value: null,
+  }
+  readonly #relayDiskUsage = initialDiskUsageCacheEntry()
+  #relayProcessCpu: { at: number; usage: NodeJS.CpuUsage } | null = null
+  #relayResourceHistory: Array<RelayInstanceResources> = []
   readonly #state: RelayStateStore["Service"]
 
   constructor(
@@ -751,6 +764,48 @@ export class DockerDriver {
     const history = this.#resourceHistory.get(instanceId) ?? []
     const cutoff = Date.now() - RESOURCE_HISTORY_WINDOW_MS
     return history.filter((sample) => Date.parse(sample.sampledAt) >= cutoff)
+  }
+
+  // The Relay's own usage, sampled like a server's: its container's CPU and
+  // memory, and everything Kiln keeps in the data directory against the
+  // node's disk. Null until the first sample lands, or outside Docker.
+  relayResources(): RelayInstanceResources | null {
+    const cached = this.#relayResourceCache
+    if (!cached.pending && Date.now() - cached.lastAttempt >= 1_500) {
+      cached.lastAttempt = Date.now()
+      cached.pending = true
+      Effect.runFork(
+        promiseEffect(() => this.#sampleRelayResources()).pipe(
+          Effect.tap((resources) =>
+            Effect.sync(() => {
+              cached.value = resources
+              const cutoff =
+                Date.parse(resources.sampledAt) - RESOURCE_HISTORY_WINDOW_MS
+              this.#relayResourceHistory = [
+                ...this.#relayResourceHistory,
+                resources,
+              ].filter((sample) => Date.parse(sample.sampledAt) >= cutoff)
+            })
+          ),
+          // Observational, like server sampling: keep the last good value.
+          Effect.ignore,
+          Effect.ensuring(
+            Effect.sync(() => {
+              cached.lastAttempt = Date.now()
+              cached.pending = false
+            })
+          )
+        )
+      )
+    }
+    return cached.value
+  }
+
+  relayResourceHistory(): Array<RelayInstanceResources> {
+    const cutoff = Date.now() - RESOURCE_HISTORY_WINDOW_MS
+    return this.#relayResourceHistory.filter(
+      (sample) => Date.parse(sample.sampledAt) >= cutoff
+    )
   }
 
   async recordProvisionedState(
@@ -1940,32 +1995,9 @@ export class DockerDriver {
       statfs(directory),
     ])
     const instanceStorageUsed = this.#directoryUsageFor(instance)
-    const cpuCurrent = stats.cpu_stats?.cpu_usage?.total_usage ?? 0
-    const cpuPrevious = stats.precpu_stats?.cpu_usage?.total_usage ?? 0
-    const systemCurrent = stats.cpu_stats?.system_cpu_usage ?? 0
-    const systemPrevious = stats.precpu_stats?.system_cpu_usage ?? 0
-    const cpuDelta = cpuCurrent - cpuPrevious
-    const systemDelta = systemCurrent - systemPrevious
-    const onlineCpus = Math.max(stats.cpu_stats?.online_cpus ?? 1, 1)
-    const cpuCapacityPercent = onlineCpus * 100
-    const cpuPercent =
-      cpuDelta > 0 && systemDelta > 0
-        ? (cpuDelta / systemDelta) * onlineCpus * 100
-        : 0
-
-    const memoryTotal = Math.max(
-      instance.config.limits.memoryBytes || stats.memory_stats?.limit || 0,
-      0
-    )
-    const memoryCache = Math.max(
-      stats.memory_stats?.stats?.total_inactive_file ??
-        stats.memory_stats?.stats?.inactive_file ??
-        0,
-      0
-    )
-    const memoryUsed = Math.max(
-      Math.min((stats.memory_stats?.usage ?? 0) - memoryCache, memoryTotal),
-      0
+    const { cpu, memory } = containerCpuAndMemory(
+      stats,
+      instance.config.limits.memoryBytes
     )
     const nodeStorageTotal = filesystem.blocks * filesystem.bsize
     const nodeStorageAvailable = filesystem.bavail * filesystem.bsize
@@ -2003,15 +2035,8 @@ export class DockerDriver {
 
     return {
       sampledAt: new Date(sampledAt).toISOString(),
-      cpu: {
-        capacityPercent: cpuCapacityPercent,
-        percent: roundPercent(cpuPercent),
-      },
-      memory: {
-        totalBytes: memoryTotal,
-        usedBytes: memoryUsed,
-        percent: roundPercent(percentOf(memoryUsed, memoryTotal)),
-      },
+      cpu,
+      memory,
       storage: {
         totalBytes: storageLimit,
         usedBytes: instanceStorageUsed,
@@ -2031,6 +2056,144 @@ export class DockerDriver {
     }
   }
 
+  async #sampleRelayResources(): Promise<RelayInstanceResources> {
+    const [stats, filesystem] = await Promise.all([
+      // Docker can't find the Relay when it isn't a container or has been
+      // given another hostname. The process's own usage stands in then, so
+      // the disk figures still arrive.
+      recoverPromise(
+        () => this.#dockerStats(hostname()),
+        () => null
+      ),
+      statfs(this.#config.dataDirectory),
+    ])
+    const nodeStorageTotal = filesystem.blocks * filesystem.bsize
+    const nodeStorageUsed = Math.max(
+      nodeStorageTotal - filesystem.bavail * filesystem.bsize,
+      0
+    )
+    const dataUsed = this.#relayDataUsage()
+    return {
+      sampledAt: new Date().toISOString(),
+      ...(stats ? containerCpuAndMemory(stats, 0) : this.#relayProcessUsage()),
+      storage: {
+        totalBytes: nodeStorageTotal,
+        usedBytes: dataUsed,
+        percent:
+          dataUsed === null
+            ? null
+            : roundPercent(percentOf(dataUsed, nodeStorageTotal)),
+        nodeTotalBytes: nodeStorageTotal,
+        nodeUsedBytes: nodeStorageUsed,
+        nodePercent: roundPercent(percentOf(nodeStorageUsed, nodeStorageTotal)),
+      },
+    }
+  }
+
+  #relayProcessUsage(): Pick<RelayInstanceResources, "cpu" | "memory"> {
+    const now = performance.now()
+    const usage = process.cpuUsage()
+    const previous = this.#relayProcessCpu
+    this.#relayProcessCpu = { at: now, usage }
+    const cores = Math.max(cpus().length, 1)
+    const elapsedMicros = previous ? (now - previous.at) * 1_000 : 0
+    const usedMicros = previous
+      ? usage.user -
+        previous.usage.user +
+        (usage.system - previous.usage.system)
+      : 0
+    const memoryTotal = totalmem()
+    const memoryUsed = Math.min(process.memoryUsage.rss(), memoryTotal)
+    return {
+      cpu: {
+        capacityPercent: cores * 100,
+        percent:
+          elapsedMicros > 0
+            ? roundPercent((usedMicros / elapsedMicros) * 100)
+            : 0,
+      },
+      memory: {
+        totalBytes: memoryTotal,
+        usedBytes: memoryUsed,
+        percent: roundPercent(percentOf(memoryUsed, memoryTotal)),
+      },
+    }
+  }
+
+  #relayDataUsage(): number | null {
+    const cached = this.#relayDiskUsage
+    if (
+      !cached.pending &&
+      Date.now() - cached.lastAttempt >= RELAY_DISK_USAGE_REFRESH_MS
+    ) {
+      cached.lastAttempt = Date.now()
+      cached.pending = true
+      Effect.runFork(
+        this.#kilnDataUsage().pipe(
+          Effect.tap((usedBytes) =>
+            Effect.sync(() => {
+              cached.usedBytes = usedBytes
+            })
+          ),
+          // Keep the last value; scans race with servers writing.
+          Effect.catch(() => Effect.void),
+          Effect.ensuring(
+            Effect.sync(() => {
+              cached.lastAttempt = Date.now()
+              cached.pending = false
+            })
+          )
+        )
+      )
+    }
+    return cached.usedBytes
+  }
+
+  // Everything in the data directory. Server folders measured for their own
+  // meters count with that figure instead of being walked again, and every
+  // other folder takes the disk usage permit on its own, so a server's
+  // measurement never waits behind the whole tree.
+  #kilnDataUsage(): Effect.Effect<number, unknown> {
+    const measured = new Map<string, number>()
+    for (const entry of this.#diskUsageCache.values()) {
+      if (entry.directory && entry.usedBytes !== null) {
+        measured.set(entry.directory, entry.usedBytes)
+      }
+    }
+    const semaphore = this.#diskUsageSemaphore
+    const dataDirectory = resolve(this.#config.dataDirectory)
+    const rootDirectory = resolve(this.#config.rootDirectory)
+    const sizeOfEntries = Effect.fnUntraced(function* (
+      directory: string,
+      device: number
+    ): Effect.fn.Return<number, unknown> {
+      const entries = yield* promiseEffect(() =>
+        readdir(directory, { withFileTypes: true })
+      )
+      let total = 0
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) continue
+        const path = join(directory, entry.name)
+        const metadata = yield* Effect.option(promiseEffect(() => lstat(path)))
+        if (Option.isNone(metadata) || metadata.value.dev !== device) continue
+        if (entry.isFile()) {
+          total += metadata.value.size
+        } else if (path === rootDirectory) {
+          total += yield* sizeOfEntries(path, device)
+        } else if (entry.isDirectory()) {
+          total +=
+            measured.get(path) ??
+            (yield* semaphore.withPermits(1)(directoryApparentSizeEffect(path)))
+        }
+      }
+      return total
+    })
+    return promiseEffect(() => lstat(dataDirectory)).pipe(
+      Effect.flatMap((metadata) => sizeOfEntries(dataDirectory, metadata.dev)),
+      Effect.withSpan("Relay.dataUsage")
+    )
+  }
+
   #directoryUsageFor(instance: DiscoveredInstance): number | null {
     const now = Date.now()
     const cached =
@@ -2044,6 +2207,7 @@ export class DockerDriver {
         this.#config.rootDirectory,
         instance.config.directory
       )
+      cached.directory = directory
       const findCurrent = () => this.#findDiscovered(instance.config.id)
       const engine = this.#engine
       const refresh = Effect.gen(function* () {
@@ -2594,6 +2758,52 @@ function parseBrickReadinessLabel(value: string | undefined) {
   return Result.try(() => brickReadinessSchema.parse(JSON.parse(value))).pipe(
     Result.getOrUndefined
   )
+}
+
+// A container's CPU over Docker's sampling interval, and its memory less
+// reclaimable page cache, against `memoryLimitBytes` or else the container's
+// own limit (the host's memory when it has none).
+function containerCpuAndMemory(
+  stats: DockerStats,
+  memoryLimitBytes: number
+): Pick<RelayInstanceResources, "cpu" | "memory"> {
+  const cpuCurrent = stats.cpu_stats?.cpu_usage?.total_usage ?? 0
+  const cpuPrevious = stats.precpu_stats?.cpu_usage?.total_usage ?? 0
+  const systemCurrent = stats.cpu_stats?.system_cpu_usage ?? 0
+  const systemPrevious = stats.precpu_stats?.system_cpu_usage ?? 0
+  const cpuDelta = cpuCurrent - cpuPrevious
+  const systemDelta = systemCurrent - systemPrevious
+  const onlineCpus = Math.max(stats.cpu_stats?.online_cpus ?? 1, 1)
+  const cpuPercent =
+    cpuDelta > 0 && systemDelta > 0
+      ? (cpuDelta / systemDelta) * onlineCpus * 100
+      : 0
+
+  const memoryTotal = Math.max(
+    memoryLimitBytes || stats.memory_stats?.limit || 0,
+    0
+  )
+  const memoryCache = Math.max(
+    stats.memory_stats?.stats?.total_inactive_file ??
+      stats.memory_stats?.stats?.inactive_file ??
+      0,
+    0
+  )
+  const memoryUsed = Math.max(
+    Math.min((stats.memory_stats?.usage ?? 0) - memoryCache, memoryTotal),
+    0
+  )
+  return {
+    cpu: {
+      capacityPercent: onlineCpus * 100,
+      percent: roundPercent(cpuPercent),
+    },
+    memory: {
+      totalBytes: memoryTotal,
+      usedBytes: memoryUsed,
+      percent: roundPercent(percentOf(memoryUsed, memoryTotal)),
+    },
+  }
 }
 
 function percentOf(used: number, total: number): number {
