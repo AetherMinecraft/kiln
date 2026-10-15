@@ -135,7 +135,7 @@ export function ResourceUsersCard({
   noun: string
   relayId: string
   resourceId: string
-  resourceType: "database" | "instance"
+  resourceType: "database" | "instance" | "relay"
 }) {
   const { data: access } = useQuery({
     ...accessCapabilitiesQueryOptions(),
@@ -231,7 +231,7 @@ export function MetaRow({
   className?: string
   icon: LucideIcon
   label: string
-  value: string
+  value: React.ReactNode
   mono?: boolean
   wrap?: boolean
 }) {
@@ -249,7 +249,7 @@ export function MetaRow({
         </span>
         <span
           className={`mt-0.5 block text-xs ${mono ? "font-mono" : "font-medium"} ${wrap ? "break-all" : "truncate"}`}
-          title={value}
+          title={typeof value === "string" ? value : undefined}
         >
           {value}
         </span>
