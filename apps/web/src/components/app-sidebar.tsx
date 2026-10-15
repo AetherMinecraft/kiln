@@ -183,24 +183,27 @@ const AppSidebarView = React.memo(function AppSidebarView({
       relayConfigured={relayConfigured}
     >
       <Sidebar collapsible="icon" className="border-sidebar-border/80">
-        <SidebarHeader className="gap-1.5 px-2 py-2">
-          <SidebarMenu className="h-16 justify-center">
-            <SidebarMenuItem>
+        <SidebarHeader className="h-20 shrink-0 justify-center px-2 py-2">
+          <SidebarMenu>
+            <SidebarMenuItem className="flex items-center gap-1">
               <SidebarMenuButton
                 size="lg"
-                className="h-11 hover:bg-transparent active:bg-transparent data-[state=open]:bg-transparent"
+                className="h-11 min-w-0 flex-1 hover:bg-transparent active:bg-transparent data-[state=open]:bg-transparent"
                 tooltip="Kiln"
               >
                 <HearthMark className="group-data-[collapsible=icon]:size-[32px]!" />
-                <span className="min-w-0 flex-1 truncate font-heading text-lg font-semibold tracking-[0.04em]">
+                <span className="min-w-0 flex-1 truncate font-heading text-2xl font-semibold tracking-[0.04em]">
                   KILN
                 </span>
               </SidebarMenuButton>
               <HeaderNotificationsBell />
             </SidebarMenuItem>
           </SidebarMenu>
-          <RouteCommandMenuTrigger />
         </SidebarHeader>
+
+        <div className="shrink-0 p-2 group-data-[collapsible=icon]:px-0">
+          <RouteCommandMenuTrigger />
+        </div>
 
         <SidebarSeparator />
 
@@ -230,7 +233,7 @@ function HeaderNotificationsBell() {
   if (state === "collapsed" && !isMobile) return null
   return (
     <NotificationsBell
-      className="absolute top-1/2 right-1 -translate-y-1/2"
+      className="mr-1"
       tooltipHidden={isMobile}
     />
   )
