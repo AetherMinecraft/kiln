@@ -30,6 +30,7 @@ import {
   relayAppTerminalWriteSchema,
   relayCreateAppSchema,
   appIdFromFileRoot,
+  isRelayFileRoot,
   appIdSchema,
   appTailscaleMember,
   relayAppWebRouteStateSchema,
@@ -132,6 +133,7 @@ import {
   restoreEncryptedPlatformBackup,
 } from "./platform-backups.js"
 import { FilesystemDriver, type FileRoot } from "./files.js"
+import { HostFiles } from "./host-files.js"
 import { LifecycleDriver } from "./lifecycle.js"
 import { nodeSnapshot } from "./node.js"
 import { reportRelayMemoryMetrics } from "./relay-memory.js"
@@ -277,6 +279,19 @@ const appFilesystem = new FilesystemDriver({
   ...config,
   rootDirectory: apps.rootDirectory,
 })
+// Saves overwrite host files in place, as editors do, so hard links and
+// containers that bind-mount a file see the change.
+const hostFilesystem = new FilesystemDriver(
+  { ...config, rootDirectory: config.hostRootDirectory },
+  { saveInPlace: true }
+)
+const hostFiles = new HostFiles(config)
+const hostDatabaseBrowser = new DatabaseBrowser(hostFilesystem)
+async function hostFileRoot(id: string): Promise<FileRoot> {
+  if (!config.hostAccess) throw new HostAccessDisabledError()
+  if (id !== relayIdentity.fingerprint) throw new Error("Relay not found")
+  return { id, directory: "." }
+}
 const appDatabaseBrowser = new DatabaseBrowser(appFilesystem)
 // A helper left from when host access was on goes; one still in use has its
 // sessions swept with the rest.
@@ -754,6 +769,7 @@ const controlSocket = attachControlSocket({
 rejectMalformedUpgrades(server)
 const browserSocket = attachBrowserSocket({
   config,
+  hostFiles: { filesystem: hostFilesystem, root: hostFileRoot },
   appFiles: {
     filesystem: appFilesystem,
     root: (appId) => apps.fileRoot(appId),
@@ -1265,7 +1281,13 @@ async function executeControlRequest(
       return { mode, removed: mode === "commit" }
     }
     case "relay.host.read":
-      return { terminal: hostShell.enabled }
+      return {
+        terminal: hostShell.enabled,
+        files: await hostFiles.status(),
+      }
+    case "relay.host.files.mount":
+      await hostFiles.mount()
+      return { started: true }
     case "relay.terminal.attach": {
       const input = relayHostTerminalAttachSchema.parse(request.payload)
       return terminals.attach(
@@ -2129,6 +2151,10 @@ async function executeControlRequest(
     }
     case "instance.files.directory.sizes": {
       const input = relayDirectorySizesInputSchema.parse(payload)
+      if (isRelayFileRoot(input.instanceId)) {
+        await hostFileRoot(input.instanceId)
+        return { sizes: {}, pending: [] }
+      }
       return withFileTarget(input, (target) =>
         runRelayEffect(
           "relay.files.directorySizes",
@@ -2569,7 +2595,14 @@ async function withFileTarget<T>(
     root: FileRoot
   }) => Promise<T>
 ): Promise<T> {
-  const appId = appIdFromFileRoot(requiredString(payload, "instanceId"))
+  const id = requiredString(payload, "instanceId")
+  if (isRelayFileRoot(id))
+    return run({
+      databaseBrowser: hostDatabaseBrowser,
+      filesystem: hostFilesystem,
+      root: await hostFileRoot(id),
+    })
+  const appId = appIdFromFileRoot(id)
   return run(
     appId
       ? {

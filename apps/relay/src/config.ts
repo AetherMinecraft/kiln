@@ -81,10 +81,12 @@ export interface RelayConfig {
   discoveredPublicIp: string | null
   dockerSocket: string
   dataDirectory: string
-  // Whether Hearth may open shells on the host the Relay runs on. Docker
-  // access already amounts to root there; this lets an operator keep it out
-  // of the panel.
+  // Whether Hearth may open shells on, and browse the files of, the host the
+  // Relay runs on. Docker access already amounts to root there; this lets an
+  // operator keep it out of the panel.
   hostAccess: boolean
+  // Where the host's filesystem is mounted; Files are off when it isn't.
+  hostRootDirectory: string
   gameHost: string
   gamePortRange: {
     end: number
@@ -231,6 +233,7 @@ export function loadConfig(
     dockerSocket: "/var/run/docker.sock",
     dataDirectory,
     hostAccess: booleanEnvironment(environment.KILN_RELAY_HOST_ACCESS, true),
+    hostRootDirectory: environment.KILN_RELAY_HOST_ROOT?.trim() || "/host",
     gameHost,
     gamePortRange: relayGamePortRange(environment),
     gameHostSource,

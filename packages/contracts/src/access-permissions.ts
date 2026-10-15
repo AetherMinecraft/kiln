@@ -80,6 +80,9 @@ export const accessPermissions = [
   "relay.audit.read",
   "relay.logs.read",
   "relay.terminal",
+  "relay.files.read",
+  "relay.files.write",
+  "relay.files.mount",
   "database.data.read",
   "database.data.write",
   "database.terminal",
@@ -176,6 +179,7 @@ const implicationEdges: Partial<
   "schedule.execute": ["schedule.read"],
   "schedule.delete": ["schedule.read"],
   "relay.connections.manage": ["relay.connections.read"],
+  "relay.files.write": ["relay.files.read"],
 }
 
 /** Explicit editor block and family for every permission; no naming heuristics. */
@@ -193,6 +197,9 @@ const permissionPlacement: Record<
   "relay.audit.read": ["relay.activity", "relay"],
   "relay.logs.read": ["relay.logs", "relay"],
   "relay.terminal": ["relay.terminal", "relay"],
+  "relay.files.read": ["relay.files", "relay"],
+  "relay.files.write": ["relay.files", "relay"],
+  "relay.files.mount": ["relay.files", "relay"],
   "instance.create": ["resource.creation", "relay"],
   "database.create": ["resource.creation", "relay"],
   "access.read": ["access", "shared"],
@@ -580,6 +587,21 @@ const permissionCopy: Record<
     label: "View Relay activity",
     description: "Read the Relay’s activity history.",
   },
+  "relay.files.read": {
+    label: "View host files",
+    description:
+      "Browse and download files anywhere on the Relay’s host, including system configuration and secrets.",
+  },
+  "relay.files.write": {
+    label: "Edit host files",
+    description:
+      "Create, upload, edit, move, and delete files anywhere on the Relay’s host. Equivalent to root on the host.",
+  },
+  "relay.files.mount": {
+    label: "Mount host files",
+    description:
+      "Restart the Relay with its host’s filesystem mounted, so host files can be browsed.",
+  },
   "relay.terminal": {
     label: "Open host terminal",
     description: "Run a root shell on the Relay’s host node.",
@@ -665,6 +687,7 @@ const blockLabels: Record<string, string> = {
   "relay.activity": "Relay activity",
   "relay.logs": "Relay logs",
   "relay.terminal": "Host terminal",
+  "relay.files": "Host files",
 }
 export const permissionBlocks = Object.freeze(
   [...new Set(permissionCatalog.map((entry) => entry.block))].map((key) =>
@@ -998,6 +1021,12 @@ export function permissionsForRelayClientPolicy(
         case "instance.files.list":
         case "instance.files.download":
           permissions = ["instance.files.read"]
+          break
+        case "relay.files.download":
+          permissions = ["relay.files.read"]
+          break
+        case "relay.files.upload":
+          permissions = ["relay.files.write"]
           break
         case "app.files.download":
           permissions = ["app.files.read"]

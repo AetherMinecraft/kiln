@@ -24,7 +24,9 @@ import {
   relayAppsV1Feature,
   relayLogsV1Feature,
   relayProxyConfigurationV1Feature,
+  relayHostFilesV1Feature,
   appIdFromFileRoot,
+  isRelayFileRoot,
   relayFileRequestReplayV1Feature,
   relaySnapshotDeltaFeature,
   relaySnapshotNodeResourcesFeature,
@@ -651,6 +653,7 @@ function authenticateSocket(
           relayAppsV1Feature,
           relayLogsV1Feature,
           relayProxyConfigurationV1Feature,
+          relayHostFilesV1Feature,
         ],
         protocol: relayControlProtocol,
         relayBuild: relayBuildLabel(),
@@ -911,6 +914,15 @@ function appFileAction(operation: RelayControlOperation): RelayAction {
 }
 
 function actionForRequest(request: RelayControlRequest): RelayAction | null {
+  if (
+    request.operation.startsWith("instance.files.") &&
+    isRelayFileRoot(objectString(request.payload, "instanceId") ?? "")
+  ) {
+    const action = appFileAction(request.operation)
+    return action === "app.files.read"
+      ? "relay.files.read"
+      : "relay.files.write"
+  }
   // An app's data directory is served by the same file operations.
   if (
     request.operation.startsWith("instance.files.") &&
@@ -955,6 +967,8 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "relay.host.read":
     case "relay.proxy.read":
       return "relay.read"
+    case "relay.host.files.mount":
+      return "relay.files.mount"
     case "relay.proxy.config.read":
       return "instance.network.read"
     case "relay.proxy.write":

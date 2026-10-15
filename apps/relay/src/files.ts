@@ -1,5 +1,6 @@
 import {
   chmod,
+  chown,
   cp,
   lstat,
   mkdir,
@@ -106,10 +107,18 @@ export class FilesystemDriver {
   readonly #activeDirectorySizeScans = new Map<string, DirectorySizeScan>()
   readonly #directorySizeRescans = new Map<string, DirectorySizeScan>()
   readonly #searchScans = new Map<string, SearchScan>()
+  readonly #saveInPlace: boolean
   #openingDirectoryScans = 0
 
-  constructor(config: RelayConfig) {
+  constructor(
+    config: RelayConfig,
+    options: {
+      // Overwrite saved files rather than replace them with a new copy.
+      saveInPlace?: boolean
+    } = {}
+  ) {
     this.#config = config
+    this.#saveInPlace = options.saveInPlace ?? false
   }
 
   tree(instance: FileRoot) {
@@ -585,11 +594,42 @@ export class FilesystemDriver {
         input.force ?? false
       )
 
+      if (this.#saveInPlace) {
+        // The file itself changes, as nano and VS Code save, so its hard
+        // links and containers that bind-mount it see the new content, and
+        // it keeps its owner and mode.
+        yield* Effect.acquireUseRelease(
+          filesystemOperation("write.open", () =>
+            open(
+              path,
+              fsConstants.O_WRONLY |
+                fsConstants.O_TRUNC |
+                fsConstants.O_NOFOLLOW
+            )
+          ),
+          (file) =>
+            filesystemOperation("write.inPlace", async () => {
+              await file.writeFile(encoded)
+              await file.sync()
+            }),
+          (file) => closeHandleEffect(file, "write.close")
+        ).pipe(Effect.uninterruptible)
+        return yield* this.read(instance, requestedPath)
+      }
+      // A copy replaces the file at once, so a crash never leaves it half
+      // written.
       const temporary = `${path}.hearth-${process.pid}-${randomUUID()}`
       return yield* Effect.acquireUseRelease(
-        filesystemOperation("write.temporary", () =>
-          writeFile(temporary, encoded, { mode: metadata.mode })
-        ),
+        filesystemOperation("write.temporary", async () => {
+          await writeFile(temporary, encoded)
+          // The copy replacing the file keeps its owner and mode. The Relay
+          // usually runs as root, so it would otherwise hand host and server
+          // files to root, and the umask would narrow their mode.
+          if (process.getuid?.() === 0) {
+            await chown(temporary, metadata.uid, metadata.gid)
+          }
+          await chmod(temporary, metadata.mode)
+        }),
         () =>
           filesystemOperation("write.replace", () =>
             rename(temporary, path)
@@ -1584,13 +1624,31 @@ function filesystemOperation<TResult>(
     catch: (cause) =>
       cause instanceof RelayFilesystemError
         ? cause
-        : makeFilesystemError(
-            "io_error",
-            operation,
-            errorMessage(cause),
-            cause
-          ),
+        : systemFilesystemError(operation, cause),
   })
+}
+
+// The system's errors name the Relay's own paths; the ones people can act on
+// get a plain explanation instead.
+function systemFilesystemError(operation: string, cause: unknown) {
+  const code = (cause as NodeJS.ErrnoException | null)?.code
+  if (code === "EACCES" || code === "EPERM") {
+    return makeFilesystemError(
+      "permission_denied",
+      operation,
+      "The Relay doesn't have permission to do this",
+      cause
+    )
+  }
+  if (code === "EROFS") {
+    return makeFilesystemError(
+      "read_only",
+      operation,
+      "This file system is read-only",
+      cause
+    )
+  }
+  return makeFilesystemError("io_error", operation, errorMessage(cause), cause)
 }
 
 interface MutationEntry {
@@ -2644,6 +2702,8 @@ function ensureContained(root: string, candidate: string) {
     : filesystemFailure(
         "path_outside_instance",
         "path",
-        "Path resolves outside the instance directory"
+        // Includes absolute links in host files: they resolve inside the
+        // Relay's container, not on the host.
+        "This path or a link in it leads outside these files"
       )
 }

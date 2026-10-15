@@ -52,6 +52,20 @@ access. Its small shell helper is created on first use and removed when host
 access is disabled. Each person's session survives page and Hearth reconnects
 and closes after the configured terminal idle timeout.
 
+The Files page browses and edits the host's files with the same browser and
+editor as server and app files, protected by `relay.files.read` and
+`relay.files.write`. It needs the host's filesystem mounted at `/host`. Someone
+with `relay.files.mount` (Relay owners and platform admins by default) can turn
+that on from the Files page, which restarts the Relay with the mount and puts it
+back as it was if that fails. To set it up yourself instead, start the stack
+below with `docker compose -f compose.yaml -f compose.host-files.yaml up -d`.
+Recreating the Relay from a Compose file without it removes the mount. Saving a
+host file overwrites it in place, as editors do, so its hard links and
+containers that bind-mount it see the change. Where Docker is rootless, remaps
+users, or SELinux confines the Relay, the Files page says which files it can't
+reach. Links with absolute targets resolve inside the Relay's container, so the
+Files page refuses to open them.
+
 Then:
 
 ```sh

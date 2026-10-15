@@ -63,6 +63,7 @@ services:
         condition: service_completed_successfully
     volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
+      - /:/host:rw,rslave
       - relay-data:/data
       - .:/workspace
       - relay-dev-node-modules:/workspace/node_modules

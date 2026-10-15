@@ -25,6 +25,12 @@ export interface ContainerInspect {
   }
   Id: string
   Image: string
+  Mounts?: Array<{
+    Destination: string
+    Name?: string
+    RW?: boolean
+    Type?: string
+  }>
   Name: string
   NetworkSettings?: {
     Networks?: Record<string, { Aliases?: Array<string> | null }>
@@ -307,14 +313,14 @@ function updateFailure(phase: string, reason: string) {
   )
 }
 
-function isDockerGeneratedHostname(
+export function isDockerGeneratedHostname(
   hostname: string | undefined,
   containerId: string
 ): boolean {
   return hostname === containerId.slice(0, 12) || hostname === containerId
 }
 
-function networkAliases(
+export function networkAliases(
   aliases: Array<string> | null | undefined,
   targetContainer: string
 ): Array<string> {
