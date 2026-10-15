@@ -216,6 +216,8 @@ export class FakeDocker {
   readonly images = new Map<string, Record<string, string>>()
   /** Images whose registry cannot be reached; pulling them fails. */
   readonly unreachableImages = new Set<string>()
+  /** What pulling an image prints before its final status, by image. */
+  readonly pullOutput = new Map<string, string>()
   /**
    * Images whose process exits as soon as it starts. Under a restart policy
    * Docker keeps restarting them, reporting them running and restarting.
@@ -277,6 +279,7 @@ export class FakeDocker {
     this.volumes.clear()
     this.images.clear()
     this.unreachableImages.clear()
+    this.pullOutput.clear()
     this.crashingImages.clear()
     this.tailscale.controlPlaneReachable = true
     this.tailscale.machines.clear()
@@ -414,6 +417,32 @@ export class FakeDocker {
     container.state.oomKilled = exit.oomKilled ?? false
     container.state.finishedAt = this.#timestamp()
     this.#endExecs(container)
+  }
+
+  /** How many requests are following containers' logs. */
+  followerCount(): number {
+    return this.#followers.size
+  }
+
+  /**
+   * Simulates the container's process writing `lines`, all at once, to its
+   * log and to anyone following it.
+   */
+  writeLogs(
+    containerName: string,
+    lines: ReadonlyArray<{ text: string; time: string }>
+  ): void {
+    const container = this.#requiredContainer(containerName)
+    container.logs.push(...lines)
+    const output = Buffer.concat(
+      lines.map(({ text, time }) => {
+        const line = Buffer.from(`${time} ${text}\n`)
+        return container.tty ? line : frame(1, line)
+      })
+    )
+    for (const follower of this.#followers) {
+      if (follower.containerId === container.id) follower.response.write(output)
+    }
   }
 
   /** Simulates Docker or the host restarting the container's process. */
@@ -1022,7 +1051,7 @@ export class FakeDocker {
       )
     }
     this.images.set(image, this.images.get(image) ?? {})
-    return `Status: Downloaded newer image for ${image}\n`
+    return `${this.pullOutput.get(image) ?? ""}Status: Downloaded newer image for ${image}\n`
   }
 
   // ------------------------------------------------------ networks, volumes
