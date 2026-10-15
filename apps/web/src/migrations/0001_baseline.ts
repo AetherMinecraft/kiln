@@ -32,6 +32,14 @@ function columnDefinitions(create: string) {
   return columns
 }
 
+// MariaDB still reports integer display widths (`int(11)`) and stores `json`
+// as `longtext`, where the MySQL 8 baseline has `int` and `json`.
+function comparableType(type: string) {
+  return type
+    .replace(/^(tinyint|smallint|mediumint|int|bigint)\(\d+\)/, "$1")
+    .replace(/^longtext$/, "json")
+}
+
 // Creates the schema on a fresh database. An install upgrading from the last
 // release that used the legacy migration scripts already has these tables,
 // so it is only checked against the baseline and recorded.
@@ -78,7 +86,8 @@ export const baseline: Migration = {
         return (
           definition === undefined ||
           column === undefined ||
-          column.columnType !== definition.type ||
+          comparableType(column.columnType) !==
+            comparableType(definition.type) ||
           (column.nullable === "YES") !== definition.nullable ||
           (definition.collation !== undefined &&
             column.collation !== definition.collation)

@@ -59,7 +59,7 @@ jobs:
           - name: MariaDB migration
             command: |
               cd apps/web
-              MYSQL_MIGRATION_TEST=1 DB_HOST=127.0.0.1 DB_PORT=3306 \
+              KILN_TEST_MYSQL=1 DB_HOST=127.0.0.1 DB_PORT=3306 \
                 DB_NAME=kiln_migration_test DB_USERNAME=root DB_PASSWORD=root \
                 vp test run src/effect/migrations.test.ts --maxWorkers 1 --no-file-parallelism
           - name: Build
