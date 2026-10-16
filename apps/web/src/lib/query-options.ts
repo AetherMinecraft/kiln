@@ -54,21 +54,25 @@ import {
   getRelayFileEntry,
   getRelayFile,
   getRelayFileActivity,
-  getRelayMemoryReadings,
+  getRelayNodeReadings,
   getRelaySnapshot,
   getRelayTree,
 } from "@/server/relay"
 import {
   getRelayOwnerMinecraftProfiles,
   getRelayProxy,
-  getRelayProxyConfiguration,
+  getRelayHostFiles,
   getRelayTailscale,
   getRelays,
 } from "@/server/relays"
 import { getTailscaleStacks } from "@/server/tailscale"
 import { getAuthState } from "@/server/auth"
 import type { ReleaseHistoryCursor } from "@/effect/kiln-release-feed"
-import { getReleaseHistory, getUpdateOverview } from "@/server/updates"
+import {
+  getRelayRelease,
+  getReleaseHistory,
+  getUpdateOverview,
+} from "@/server/updates"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import { withInventoryRelayStatus } from "@/lib/inventory-relay-status"
@@ -174,7 +178,7 @@ export const queryKeys = {
       ["relay", relayId, "instances", instanceId, "recipe"] as const,
     snapshot: ["relay", "snapshot"] as const,
     instances: ["relay", "instances"] as const,
-    memory: ["relay", "memory"] as const,
+    nodeReadings: ["relay", "node-readings"] as const,
     resources: (relayId: string) => ["relay", "resources", relayId] as const,
     webRoutes: (relayId: string, instanceId: string) =>
       ["web-routes", relayId, instanceId] as const,
@@ -187,12 +191,14 @@ export const queryKeys = {
   },
   relays: ["relays"] as const,
   relayProxy: (relayId: string) => ["relays", "proxy", relayId] as const,
-  relayProxyConfiguration: (relayId: string) =>
-    ["relays", "proxy", relayId, "configuration"] as const,
+  relayHostFiles: (relayId: string) =>
+    ["relays", "host-files", relayId] as const,
   tailscale: (relayId: string) => ["tailscale", "relays", relayId] as const,
   tailscaleStacks: ["tailscale", "stacks"] as const,
   updates: ["updates", "overview"] as const,
   releaseHistory: ["updates", "release-history"] as const,
+  relayRelease: (relayId: string, version: string) =>
+    ["updates", "relay", relayId, version] as const,
   instanceFavorites: ["instance-favorites"] as const,
   notifications: ["notifications"] as const,
   uiPreferences: ["ui", "preferences"] as const,
@@ -362,10 +368,14 @@ export function relayConnectionQueryOptions(queryClient: QueryClient) {
 }
 
 /** Polled only while a Relay memory cell is mounted and the tab is visible. */
-export function relayMemoryReadingsQueryOptions() {
+export type RelayNodeReading = Awaited<
+  ReturnType<typeof getRelayNodeReadings>
+>[number]
+
+export function relayNodeReadingsQueryOptions() {
   return queryOptions({
-    queryKey: queryKeys.relay.memory,
-    queryFn: ({ signal }) => getRelayMemoryReadings({ signal }),
+    queryKey: queryKeys.relay.nodeReadings,
+    queryFn: ({ signal }) => getRelayNodeReadings({ signal }),
     refetchInterval: connectedRelayPollDelayMs,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
@@ -662,12 +672,18 @@ export function relayProxyQueryOptions(relayId: string) {
   })
 }
 
-export function relayProxyConfigurationQueryOptions(relayId: string) {
+// The paths only move if the Relay's data or proxy mode does, so they're read
+// rarely; a proxy change refreshes them, and keying by the Relay's version
+// reads them again after it updates.
+export function relayHostFilesQueryOptions(
+  relayId: string,
+  version: string | null
+) {
   return queryOptions({
-    queryFn: () => getRelayProxyConfiguration({ data: { id: relayId } }),
-    queryKey: queryKeys.relayProxyConfiguration(relayId),
+    queryFn: () => getRelayHostFiles({ data: { id: relayId } }),
+    queryKey: [...queryKeys.relayHostFiles(relayId), version] as const,
     retry: false,
-    staleTime: 10_000,
+    staleTime: 5 * 60_000,
   })
 }
 
@@ -695,6 +711,17 @@ export function updateOverviewQueryOptions() {
     queryKey: queryKeys.updates,
     queryFn: () => getUpdateOverview(),
     staleTime: 30_000,
+  })
+}
+
+// Keyed by the version the Relay runs, so an update refreshes it.
+export function relayReleaseQueryOptions(relayId: string, version: string) {
+  return queryOptions({
+    queryKey: queryKeys.relayRelease(relayId, version),
+    queryFn: ({ signal }) => getRelayRelease({ data: { relayId }, signal }),
+    refetchOnWindowFocus: false,
+    retry: false,
+    staleTime: 10 * 60_000,
   })
 }
 

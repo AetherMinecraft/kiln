@@ -339,6 +339,12 @@ export type RelayHostFiles = z.infer<typeof relayHostFilesSchema>
 export const relayHostAccessSchema = z.object({
   terminal: z.boolean(),
   files: relayHostFilesSchema,
+  /**
+   * The Relay's data folder on its host, where its database and the bundled
+   * Traefik's files are, for opening them in its host files. Absent from
+   * older Relays.
+   */
+  dataDirectory: z.string().min(1).optional(),
 })
 
 // Relay to Hearth: output for one attachment, in order. `ended` arrives with
@@ -1506,9 +1512,19 @@ export const relayNodeSchema = z.object({
   arch: z.string().min(1),
   uptimeSeconds: z.number().nonnegative().nullable().default(null),
   startedAt: z.string().datetime().nullable().default(null),
+  /**
+   * When the node itself booted, to the minute. Absent from Relays that
+   * predate it. `startedAt` and `uptimeSeconds` are the Relay's own.
+   */
+  bootedAt: z.string().datetime().optional(),
   cpu: z.object({
     cores: z.number().int().positive(),
     loadPercent: z.number().min(0),
+    /**
+     * Like "AMD EPYC 7763 64-Core Processor". Absent when the CPU doesn't
+     * say, and from Relays that predate it.
+     */
+    model: z.string().min(1).max(200).optional(),
   }),
   memory: z.object({
     totalBytes: z.number().nonnegative(),
@@ -1522,6 +1538,11 @@ export const relayNodeSchema = z.object({
     available: z.boolean(),
     version: z.string().nullable(),
   }),
+  /**
+   * The host's operating system as Docker reports it, like "Ubuntu 24.04.1
+   * LTS". Absent when Docker can't say, and from Relays that predate it.
+   */
+  operatingSystem: z.string().min(1).max(200).optional(),
   connectedAt: z.string().datetime(),
   /** Absent from Relays that predate memory reporting. */
   relayMemory: relayProcessMemorySchema.optional(),

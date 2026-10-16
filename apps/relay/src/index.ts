@@ -1358,6 +1358,7 @@ async function executeControlRequest(
       return {
         terminal: hostShell.enabled,
         files: await hostFiles.status(),
+        dataDirectory: await lifecycle.hostDataDirectory(),
       }
     case "relay.host.files.mount":
       await hostFiles.mount()

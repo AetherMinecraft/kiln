@@ -115,7 +115,13 @@ export const InstanceFavoriteMenuItem = React.memo(
 )
 
 export const InstanceFavoriteButton = React.memo(
-  function InstanceFavoriteButton(favorite: InstanceFavorite) {
+  function InstanceFavoriteButton({ id, kind, relayId }: InstanceFavorite) {
+    // Built from its fields: other props, like the dev tools' source tags,
+    // must not reach the favorites schema.
+    const favorite = React.useMemo(
+      () => ({ id, kind, relayId }),
+      [id, kind, relayId]
+    )
     const starred = useIsInstanceFavorite(favorite)
     const toggle = useToggleInstanceFavorite()
 

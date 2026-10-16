@@ -491,13 +491,7 @@ export function appDestinationHref(
   return destination.to.replace("$appId", encodeURIComponent(routeId))
 }
 
-export type RelayDestinationId =
-  | "info"
-  | "terminal"
-  | "logs"
-  | "proxy"
-  | "files"
-  | "database"
+export type RelayDestinationId = "info" | "terminal" | "logs" | "files"
 
 export interface RelayDestination extends NavigationDestination {
   id: RelayDestinationId
@@ -508,7 +502,16 @@ export const relayDestinations = [
   {
     icon: SlidersHorizontal,
     id: "info",
-    keywords: ["settings", "details", "node", "version"],
+    keywords: [
+      "settings",
+      "details",
+      "node",
+      "version",
+      "proxy",
+      "traefik",
+      "database",
+      "sqlite",
+    ],
     label: "Info",
     permission: "relay.read",
     to: "/relay/$relayId/info",
@@ -522,28 +525,12 @@ export const relayDestinations = [
     to: "/relay/$relayId/terminal",
   },
   {
-    icon: Database,
-    id: "database",
-    keywords: ["sqlite", "state", "tables", "query"],
-    label: "Database",
-    permission: "relay.database.read",
-    to: "/relay/$relayId/database",
-  },
-  {
     icon: ScrollText,
     id: "logs",
     keywords: ["output", "container", "errors"],
     label: "Logs",
     permission: "relay.logs.read",
     to: "/relay/$relayId/logs",
-  },
-  {
-    icon: Waypoints,
-    id: "proxy",
-    keywords: ["traefik", "routes", "domains", "certificates", "https"],
-    label: "Proxy",
-    permission: "instance.network.read",
-    to: "/relay/$relayId/proxy",
   },
   {
     icon: Folder,

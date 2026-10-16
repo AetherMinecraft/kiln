@@ -1,4 +1,5 @@
 import { createServerFn, createServerOnlyFn } from "@tanstack/react-start"
+import { relayIdSchema } from "@workspace/contracts"
 import { Effect } from "effect"
 import { z } from "zod"
 
@@ -13,6 +14,7 @@ import { platformAdminIdsEffect } from "@/effect/notifications"
 import { attachRelayOwnersEffect } from "@/effect/relay-owners"
 import { runAppEffect } from "@/effect/runtime"
 import {
+  grantsAllowPermission,
   isPlatformAdmin,
   listUserGrants,
   requireRelayPermission,
@@ -21,10 +23,15 @@ import { grantHasPermission } from "@/lib/permissions"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import {
+  compareLatestReleaseVersion,
+  findKilnRelease,
+} from "@/lib/release-version"
+import {
   updateTargetVersion,
   validateUpdateManifest,
 } from "@/lib/update-manifest"
 import { requireEligibleResourceUser } from "@/server/auth"
+import { authorizedRelay } from "@/server/relay-access"
 
 const componentSchema = z.enum(["hearth", "relay"])
 const startUpdateTargetSchema = z.object({
@@ -244,6 +251,35 @@ export const getUpdateOverview = createServerFn({ method: "GET" }).handler(
     }
   }
 )
+
+// The release this Relay runs, by name, and for those who can update it the
+// newest release when it's newer, by the Updates dialog's rule. Either is
+// null when unknown, as for development builds.
+export const getRelayRelease = createServerFn({ method: "GET" })
+  .validator(z.object({ relayId: relayIdSchema }))
+  .handler(async ({ data }) => {
+    const { relay, user } = await authorizedRelay(data.relayId, "relay.read")
+    const [{ relayConnectionNode }, grants, releases] = await Promise.all([
+      import("@/lib/relay-connection"),
+      isPlatformAdmin(user) ? null : listUserGrants(user.id, relay.id),
+      runAppEffect("updates.relay-release", listKilnReleasesEffect()),
+    ])
+    const version = relayConnectionNode(relay.id)?.version ?? relay.nodeVersion
+    const current = findKilnRelease(releases, version)
+    const latest = releases[0]
+    const canUpdate =
+      grants === null ||
+      grantsAllowPermission(grants, "relay.update", { relayId: relay.id })
+    return {
+      current: current ? { name: current.name, url: current.url } : null,
+      update:
+        canUpdate &&
+        latest &&
+        compareLatestReleaseVersion(version, releases) === 1
+          ? { name: latest.name, url: latest.url, version: latest.version }
+          : null,
+    }
+  })
 
 export const getReleaseHistory = createServerFn({ method: "GET" })
   .validator(releaseHistorySchema)

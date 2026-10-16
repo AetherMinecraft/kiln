@@ -111,19 +111,17 @@ function queryScopes(
     return [exact(queryKeys.fileActivity(scope.relayId, scope.instanceId))]
   }
   if (topic === "apps" && scope) {
-    return [
-      ...hearthRealtimeQueryScopes.apps,
-      exact(queryKeys.relayProxyConfiguration(scope.relayId)),
-    ]
+    return hearthRealtimeQueryScopes.apps
   }
   if (topic === "instance-web-routes" && scope?.instanceId) {
-    return [
-      exact(queryKeys.relay.webRoutes(scope.relayId, scope.instanceId)),
-      exact(queryKeys.relayProxyConfiguration(scope.relayId)),
-    ]
+    return [exact(queryKeys.relay.webRoutes(scope.relayId, scope.instanceId))]
   }
   if (topic === "relay-proxy" && scope) {
-    return [prefix(queryKeys.relayProxy(scope.relayId))]
+    return [
+      prefix(queryKeys.relayProxy(scope.relayId)),
+      // The Traefik config only exists in Bundled mode.
+      prefix(queryKeys.relayHostFiles(scope.relayId)),
+    ]
   }
   if (topic === "relays" && scope) {
     return [

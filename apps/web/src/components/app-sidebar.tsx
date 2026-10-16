@@ -714,8 +714,6 @@ const RelayTabNavigation = React.memo(function RelayTabNavigation({
 
 function relayTabRoute(tab: RelayDestinationId) {
   switch (tab) {
-    case "database":
-      return "/relay/$relayId/database" as const
     case "files":
       return "/relay/$relayId/files" as const
     case "info":
@@ -724,8 +722,6 @@ function relayTabRoute(tab: RelayDestinationId) {
       return "/relay/$relayId/terminal"
     case "logs":
       return "/relay/$relayId/logs" as const
-    case "proxy":
-      return "/relay/$relayId/proxy" as const
   }
 }
 

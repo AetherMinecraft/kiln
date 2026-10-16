@@ -1291,10 +1291,6 @@ export function EditRelayDialog({
     mutationFn: updateRelayProxy,
     onSuccess: (result) => {
       queryClient.setQueryData(queryKeys.relayProxy(relay.id), result)
-      void queryClient.invalidateQueries({
-        exact: true,
-        queryKey: queryKeys.relayProxyConfiguration(relay.id),
-      })
     },
   })
 
@@ -1332,7 +1328,7 @@ export function EditRelayDialog({
     const parsedProxy =
       relay.enabled && proxy
         ? relayProxySettingsSchema.safeParse({
-            acmeEmail: proxy.settings.acmeEmail,
+            acmeEmail: String(form.get("acmeEmail") ?? "").trim() || null,
             mode: relayProxyMode(form.get("mode")),
             traefikImage: form.get("traefikImage"),
           })
@@ -1531,6 +1527,21 @@ const RelayProxyFields = React.memo(function RelayProxyFields({
             required={relayEnabled}
           />
         </Field>
+        <div className="sm:col-span-2">
+          <Field
+            label="Certificate email"
+            htmlFor={`relay-acme-email-${relayId}`}
+          >
+            <Input
+              id={`relay-acme-email-${relayId}`}
+              name="acmeEmail"
+              type="email"
+              defaultValue={proxy.data?.settings.acmeEmail ?? ""}
+              placeholder="Optional"
+              disabled={!relayEnabled}
+            />
+          </Field>
+        </div>
       </div>
       {!relayEnabled ? (
         <p className="type-meta mt-2 text-sky-300">
