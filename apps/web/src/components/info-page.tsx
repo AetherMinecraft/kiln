@@ -1,5 +1,6 @@
 import * as React from "react"
-import { Check, Copy, Info } from "lucide-react"
+import { createLink } from "@tanstack/react-router"
+import { Check, ChevronRight, Copy, Info } from "lucide-react"
 
 import {
   Popover,
@@ -28,11 +29,13 @@ export function InfoPage({
 }) {
   return (
     <section className="min-h-0 flex-1 overflow-y-auto bg-card">
-      <div className="grid min-h-full lg:grid-cols-[minmax(0,1fr)_19rem]">
+      <div className="grid min-h-full lg:grid-cols-[minmax(0,1fr)_21rem]">
         <div className="flex min-w-0 flex-col gap-4 px-5 py-6 sm:px-7">
           {children}
         </div>
-        <aside className="min-w-0 border-t bg-background/30 px-5 py-6 sm:px-6 lg:border-t-0 lg:border-l [&_dt]:w-24">
+        {/* Rail labels are short, so they take only their width and leave the
+            rest to values. */}
+        <aside className="min-w-0 border-t bg-background/30 px-4 py-6 lg:border-t-0 lg:border-l [&_dt]:min-w-0">
           {rail}
         </aside>
       </div>
@@ -44,11 +47,13 @@ export function InfoPage({
 export function InfoSection({
   action,
   children,
+  icon,
   status,
   title,
 }: {
   action?: React.ReactNode
   children: React.ReactNode
+  icon?: React.ReactNode
   // Beside the title, such as a status indicator.
   status?: React.ReactNode
   title: string
@@ -56,7 +61,10 @@ export function InfoSection({
   return (
     <section className="min-w-0 border bg-background/45">
       <header className="flex min-h-12 items-center gap-3 border-b px-4 py-2">
-        <h3 className="min-w-0 truncate text-sm font-semibold">{title}</h3>
+        <h3 className="flex min-w-0 items-center gap-2 text-sm font-semibold [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground">
+          {icon}
+          <span className="truncate">{title}</span>
+        </h3>
         {status}
         {action ? (
           <div className="ml-auto flex shrink-0 items-center gap-1.5">
@@ -78,7 +86,9 @@ export function InfoFact({
 }) {
   return (
     <div className="flex min-h-10 items-center gap-3 border-b border-border/60 py-1.5 text-[0.8125rem] last:border-b-0">
-      <dt className="w-28 shrink-0 text-muted-foreground">{label}</dt>
+      <dt className="min-w-28 shrink-0 whitespace-nowrap text-muted-foreground">
+        {label}
+      </dt>
       <dd className="flex min-w-0 flex-1 items-center justify-end gap-1.5 text-right">
         {children}
       </dd>
@@ -165,10 +175,14 @@ export function InfoDetailRow({
 }
 
 export function InfoCopyValue({
+  display,
   label,
   mono = true,
   value,
 }: {
+  // Shown in place of a value too long to read in the row, such as "Copy
+  // path"; the value is still what's copied, and shows on hover.
+  display?: string
   // Lowercase noun, for example "Relay address".
   label: string
   // Identifiers and addresses are monospaced; names aren't.
@@ -190,7 +204,7 @@ export function InfoCopyValue({
           onClick={() => void copy()}
         >
           <span className="truncate" title={value}>
-            {value}
+            {display ?? value}
           </span>
           {copied ? (
             <Check className="size-3 shrink-0" />
@@ -213,17 +227,135 @@ export function InfoRailGroup({
   title,
 }: {
   children: React.ReactNode
-  title: string
+  // Left out when the rows say what they are, such as a list of links.
+  title?: string
 }) {
   return (
     <section className="mt-6 first:mt-0">
-      <h3 className="type-technical-label mb-1 text-muted-foreground/80">
-        {title}
-      </h3>
+      {title ? (
+        <h3 className="type-technical-label mb-1 text-muted-foreground/80">
+          {title}
+        </h3>
+      ) : null}
       {children}
     </section>
   )
 }
+
+const infoRailRowClassName =
+  "group -mx-2 flex min-w-0 items-center gap-2.5 px-2 py-1.5 text-[0.8125rem]"
+const infoRailLinkClassName =
+  "transition-colors outline-none hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset"
+
+// A row in a rail group: what leads it, such as a count, then its label, a
+// detail, and an action on the right.
+function InfoRailRowContent({
+  action,
+  children,
+  detail,
+  leading,
+}: {
+  action?: React.ReactNode
+  children: React.ReactNode
+  detail?: React.ReactNode
+  leading: React.ReactNode
+}) {
+  return (
+    <>
+      <span className="flex w-6 shrink-0 items-center font-semibold tabular-nums [&_svg]:size-3.5 [&_svg]:text-muted-foreground">
+        {leading}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-muted-foreground transition-colors group-hover:text-foreground">
+        {children}
+      </span>
+      {/* Inset as far as an action's padding, so details and actions in a
+          group end in line. */}
+      {detail ? (
+        <span className="shrink-0 pr-2 text-xs text-muted-foreground/80">
+          {detail}
+        </span>
+      ) : null}
+      {/* Above a row's link, so it takes its own clicks, and the row's full
+          height so it's easy to hit. */}
+      {action ? (
+        <span className="relative z-10 -my-1.5 flex shrink-0 self-stretch">
+          {action}
+        </span>
+      ) : null}
+    </>
+  )
+}
+
+// A rail row that doesn't open anything, such as one the viewer can't open.
+export function InfoRailRow(props: {
+  action?: React.ReactNode
+  children: React.ReactNode
+  detail?: React.ReactNode
+  leading: React.ReactNode
+}) {
+  return (
+    <div className={infoRailRowClassName}>
+      <InfoRailRowContent {...props} />
+    </div>
+  )
+}
+
+// A rail row that opens a page. With an action, the link spans the row under
+// its content, since a button can't sit inside a link.
+const InfoRailLinkAnchor = React.forwardRef<
+  HTMLAnchorElement,
+  React.ComponentPropsWithoutRef<"a"> & {
+    action?: React.ReactNode
+    detail?: React.ReactNode
+    leading: React.ReactNode
+  }
+>(function InfoRailLinkAnchor(
+  { action, children, className, detail, leading, ...props },
+  ref
+) {
+  const chevron = (
+    <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/70 transition-transform group-hover:translate-x-0.5" />
+  )
+  if (action) {
+    return (
+      <div
+        className={cn(
+          infoRailRowClassName,
+          "relative transition-colors hover:bg-muted/60 has-[a:focus-visible]:bg-muted/60",
+          className
+        )}
+      >
+        <a
+          ref={ref}
+          {...props}
+          aria-label={
+            props["aria-label"] ??
+            (typeof children === "string" ? children : undefined)
+          }
+          className="absolute inset-0 outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset"
+        />
+        <InfoRailRowContent action={action} detail={detail} leading={leading}>
+          {children}
+        </InfoRailRowContent>
+        {chevron}
+      </div>
+    )
+  }
+  return (
+    <a
+      ref={ref}
+      {...props}
+      className={cn(infoRailRowClassName, infoRailLinkClassName, className)}
+    >
+      <InfoRailRowContent detail={detail} leading={leading}>
+        {children}
+      </InfoRailRowContent>
+      {chevron}
+    </a>
+  )
+})
+
+export const InfoRailLink = createLink(InfoRailLinkAnchor)
 
 export function InfoRailCard({
   children,

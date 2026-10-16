@@ -12,7 +12,11 @@ import type {
 
 import { getAccessCapabilities, getInvitationPreview } from "@/server/access"
 import { getActivity } from "@/server/activity"
-import { getBackupPolicy, getBackupRunsPage } from "@/server/backups"
+import {
+  getBackupPolicy,
+  getBackupRunsPage,
+  getBackupUsage,
+} from "@/server/backups"
 import { getBackupStorage } from "@/server/backup-storage"
 import {
   getBrickCatalog,
@@ -73,6 +77,7 @@ import {
   getReleaseHistory,
   getUpdateOverview,
 } from "@/server/updates"
+import { getResourceUserCount } from "@/server/resource-access"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import { withInventoryRelayStatus } from "@/lib/inventory-relay-status"
@@ -120,6 +125,8 @@ export const queryKeys = {
     policy: (relayId: string, target: BackupTarget) =>
       ["backups", "policy", relayId, target.kind, target.id] as const,
     storage: ["backups", "storage"] as const,
+    usage: (relayId: string, target: BackupTarget) =>
+      ["backups", "usage", relayId, target.kind, target.id] as const,
   },
   bricks: ["bricks", "catalog"] as const,
   brickIcons: ["bricks", "icons"] as const,
@@ -319,6 +326,38 @@ export function backupStorageQueryOptions() {
     queryKey: queryKeys.backups.storage,
     queryFn: () => getBackupStorage(),
     staleTime: 30_000,
+  })
+}
+
+// How many people the Access page lists for a resource, with its owner.
+// Keyed under the Access page's own queries, so access changes refresh it.
+export function resourceUserCountQueryOptions(scope: {
+  relayId: string
+  resourceId: string
+  resourceType: "database" | "instance" | "relay"
+}) {
+  return queryOptions({
+    queryKey: [
+      "resource-access",
+      scope.relayId,
+      scope.resourceType,
+      scope.resourceId,
+      "count",
+    ] as const,
+    queryFn: () => getResourceUserCount({ data: scope }),
+    retry: false,
+    staleTime: Infinity,
+  })
+}
+
+// How many backups a target keeps, against its quantity limit. Backup and
+// limit changes refresh it.
+export function backupUsageQueryOptions(relayId: string, target: BackupTarget) {
+  return queryOptions({
+    queryKey: queryKeys.backups.usage(relayId, target),
+    queryFn: () => getBackupUsage({ data: { relayId, target } }),
+    retry: false,
+    staleTime: Infinity,
   })
 }
 

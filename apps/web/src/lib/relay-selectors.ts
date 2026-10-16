@@ -101,10 +101,13 @@ export type InstanceSettingsInstance = Pick<
   | "containerId"
   | "directory"
   | "game"
+  | "hostDirectory"
   | "id"
   | "implementation"
   | "javaVersion"
+  | "limits"
   | "name"
+  | "ports"
   | "provisioning"
   | "publicHost"
   | "publicPort"
@@ -303,10 +306,13 @@ export function selectInstanceSettings(instanceId: string, relayId?: string) {
         containerId: instance.containerId,
         directory: instance.directory,
         game: instance.game,
+        hostDirectory: instance.hostDirectory,
         id: instance.id,
         implementation: instance.implementation,
         javaVersion: instance.javaVersion,
+        limits: instance.limits,
         name: instance.name,
+        ports: instance.ports,
         provisioning: instance.provisioning,
         publicHost: instance.publicHost,
         publicPort: instance.publicPort,
