@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto"
 import { existsSync, readdirSync } from "node:fs"
-import { statfs } from "node:fs/promises"
+import { lstat, readdir, statfs } from "node:fs/promises"
 import { request } from "node:http"
 import { Socket } from "node:net"
-import { hostname } from "node:os"
-import { basename, relative, resolve } from "node:path"
+import { cpus, hostname, totalmem } from "node:os"
+import { basename, join, relative, resolve } from "node:path"
 import { Effect, Option, Queue, Result, Semaphore, Stream } from "effect"
 
 import {
@@ -12,7 +12,6 @@ import {
   type DatabaseConnections,
   type DatabaseConnectionSnapshot,
 } from "./database-connections.js"
-import { command } from "./command.js"
 import {
   DockerEngine,
   DockerEngineError,
@@ -20,7 +19,7 @@ import {
 } from "./docker-engine.js"
 import type { BrickCatalog } from "./bricks.js"
 import { directoryApparentSizeEffect } from "./disk-usage.js"
-import { ensuringPromise } from "./effect/promise.js"
+import { ensuringPromise, recoverPromise } from "./effect/promise.js"
 import type {
   RelayStateStore,
   RelayStoredLifecycleSession,
@@ -387,6 +386,8 @@ interface ResourceCacheEntry {
 }
 
 interface DiskUsageCacheEntry {
+  // The folder measured, for the Relay's own total to reuse.
+  directory?: string
   lastAttempt: number
   pending: boolean
   usedBytes: number | null
@@ -401,12 +402,16 @@ const CONSOLE_TTY_COLUMNS = 120
 const CONSOLE_TTY_ROWS = 40
 const MAX_SHARED_CONSOLE_BYTES = 10 * 1024 * 1024
 export const MAX_CONSOLE_HISTORY_LINES = 5_000
-// Console history kept from one read, in characters; the newest output is
-// kept and the history says it was truncated.
-const MAX_CONSOLE_HISTORY_CHARACTERS = 16 * 1024 * 1024
+// Console history kept from one read, and by each console browsers follow,
+// in characters; the newest output is kept and the history says it was
+// truncated.
+export const MAX_CONSOLE_HISTORY_CHARACTERS = 16 * 1024 * 1024
 const STARTUP_READINESS_LOG_LINES = 1_000
 const RESOURCE_HISTORY_WINDOW_MS = 6 * 60_000
 const DISK_USAGE_REFRESH_MS = 60_000
+// The data directory holds every server, so it is totalled less often than
+// one server's folder is walked.
+const RELAY_DISK_USAGE_REFRESH_MS = 5 * 60_000
 const DISCOVERY_TIMEOUT_MS = 30_000
 
 function diskQuotaExceeded(
@@ -431,6 +436,9 @@ export class DockerDriver {
   readonly #config: RelayConfig
   readonly #resources: RelayResourceNames
   #cachedDockerVersion: string | null | undefined
+  #hostOperatingSystem: string | null = null
+  #hostOperatingSystemLookup = false
+  #hostOperatingSystemRetryAt = 0
   readonly #consoleLocks = new Map<string, Promise<void>>()
   readonly #consoleSizeStarts = new Map<string, string>()
   readonly #consoleSizePending = new Map<string, Promise<void>>()
@@ -445,6 +453,14 @@ export class DockerDriver {
   #relaySftpPublication: Promise<RelaySftpPublication> | undefined
   readonly #resourceCache = new Map<string, ResourceCacheEntry>()
   readonly #resourceHistory = new Map<string, Array<RelayInstanceResources>>()
+  readonly #relayResourceCache: ResourceCacheEntry = {
+    lastAttempt: 0,
+    pending: false,
+    value: null,
+  }
+  readonly #relayDiskUsage = initialDiskUsageCacheEntry()
+  #relayProcessCpu: { at: number; usage: NodeJS.CpuUsage } | null = null
+  #relayResourceHistory: Array<RelayInstanceResources> = []
   readonly #state: RelayStateStore["Service"]
 
   constructor(
@@ -752,6 +768,48 @@ export class DockerDriver {
     return history.filter((sample) => Date.parse(sample.sampledAt) >= cutoff)
   }
 
+  // The Relay's own usage, sampled like a server's: its container's CPU and
+  // memory, and everything Kiln keeps in the data directory against the
+  // node's disk. Null until the first sample lands, or outside Docker.
+  relayResources(): RelayInstanceResources | null {
+    const cached = this.#relayResourceCache
+    if (!cached.pending && Date.now() - cached.lastAttempt >= 1_500) {
+      cached.lastAttempt = Date.now()
+      cached.pending = true
+      Effect.runFork(
+        promiseEffect(() => this.#sampleRelayResources()).pipe(
+          Effect.tap((resources) =>
+            Effect.sync(() => {
+              cached.value = resources
+              const cutoff =
+                Date.parse(resources.sampledAt) - RESOURCE_HISTORY_WINDOW_MS
+              this.#relayResourceHistory = [
+                ...this.#relayResourceHistory,
+                resources,
+              ].filter((sample) => Date.parse(sample.sampledAt) >= cutoff)
+            })
+          ),
+          // Observational, like server sampling: keep the last good value.
+          Effect.ignore,
+          Effect.ensuring(
+            Effect.sync(() => {
+              cached.lastAttempt = Date.now()
+              cached.pending = false
+            })
+          )
+        )
+      )
+    }
+    return cached.value
+  }
+
+  relayResourceHistory(): Array<RelayInstanceResources> {
+    const cutoff = Date.now() - RESOURCE_HISTORY_WINDOW_MS
+    return this.#relayResourceHistory.filter(
+      (sample) => Date.parse(sample.sampledAt) >= cutoff
+    )
+  }
+
   async recordProvisionedState(
     instanceId: string,
     desiredState: RelayDesiredState
@@ -836,43 +894,30 @@ export class DockerDriver {
             : action === "restart"
               ? (INSTANCE_STOP_TIMEOUT_SECONDS + 60) * 1_000
               : (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000
-        if (instance.managedByRelay) {
-          const engine = this.#engine
-          await runEffect(
-            Effect.gen(function* () {
-              yield* engine.setRestartPolicy(instance.service, "no")
-              const options = {
-                seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
-                timeout,
-              }
-              yield* action === "start"
-                ? engine.startContainer(instance.service, { timeout })
-                : action === "stop"
-                  ? engine.stopContainer(instance.service, options)
-                  : action === "restart"
-                    ? engine.restartContainer(instance.service, options)
-                    : engine.killContainer(instance.service, { timeout })
-            })
-          )
-        } else {
-          const common = this.#composeArguments()
-          const actionArguments =
-            action === "start"
-              ? ["up", "--detach", "--no-deps", instance.service]
-              : action === "stop" || action === "restart"
-                ? [
-                    action,
-                    "--timeout",
-                    String(INSTANCE_STOP_TIMEOUT_SECONDS),
-                    instance.service,
-                  ]
-                : [action, instance.service]
-
-          await command("docker", [...common, ...actionArguments], {
-            cwd: this.#config.projectDirectory,
-            timeout,
+        const engine = this.#engine
+        // Instances Relay doesn't own keep their restart policy, and are
+        // addressed by the container discovery found for them.
+        const container = instance.managedByRelay
+          ? instance.service
+          : discovered.container.Id
+        await runEffect(
+          Effect.gen(function* () {
+            if (instance.managedByRelay) {
+              yield* engine.setRestartPolicy(container, "no")
+            }
+            const options = {
+              seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
+              timeout,
+            }
+            yield* action === "start"
+              ? engine.startContainer(container, { timeout })
+              : action === "stop"
+                ? engine.stopContainer(container, options)
+                : action === "restart"
+                  ? engine.restartContainer(container, options)
+                  : engine.killContainer(container, { timeout })
           })
-        }
+        )
       }).pipe(
         Effect.onError(() =>
           Effect.all(
@@ -1259,10 +1304,7 @@ export class DockerDriver {
       instanceId: resourceId,
       lifecycle: startedAt ? [{ state: "started", time: startedAt }] : [],
       lines: rawLines.map((line) => {
-        const hash = createHash("sha1")
-          .update(`${line.timestamp ?? ""}\u0000${line.text}`)
-          .digest("hex")
-          .slice(0, 14)
+        const hash = consoleLineHash(line)
         const occurrence = occurrences.get(hash) ?? 0
         occurrences.set(hash, occurrence + 1)
         return { ...line, id: `${hash}-${occurrence}` }
@@ -1337,7 +1379,7 @@ export class DockerDriver {
             Math.max(limit, 100),
             MAX_CONSOLE_HISTORY_LINES
           )
-          const occurrences = new Map<string, number>()
+          const lineId = followedConsoleLineIds()
 
           const queueLine = (
             value: string,
@@ -1346,15 +1388,9 @@ export class DockerDriver {
             const parsed = parseConsoleLine(value)
             if (!parsed) return
             const prefixed = prefixConsoleLine(parsed, component)
-            const hash = createHash("sha1")
-              .update(`${prefixed.timestamp ?? ""}\u0000${prefixed.text}`)
-              .digest("hex")
-              .slice(0, 14)
-            const occurrence = occurrences.get(hash) ?? 0
-            occurrences.set(hash, occurrence + 1)
             Queue.offerUnsafe(queue, {
               ...prefixed,
-              id: `${hash}-${occurrence}`,
+              id: lineId(prefixed),
             })
           }
           // Aborting ends the stream; closing it interrupts the requests.
@@ -1462,13 +1498,9 @@ export class DockerDriver {
     return this.#withConsoleLock(instance.id, async () => {
       const discovered = await this.#findDiscovered(instance.id)
       const { Config: containerConfig, State: state } = discovered.container
-      if (
-        !state.Running ||
-        !containerConfig.Tty ||
-        !containerConfig.OpenStdin ||
-        !containerConfig.AttachStdin ||
-        !containerConfig.AttachStdout
-      ) {
+      // The probe attaches to the console's TTY, which needs only a running
+      // container that keeps stdin open.
+      if (!state.Running || !containerConfig.Tty || !containerConfig.OpenStdin) {
         return emptyResult
       }
 
@@ -1495,6 +1527,42 @@ export class DockerDriver {
       ? result.value.Version.trim() || null
       : null
     return this.#cachedDockerVersion
+  }
+
+  // The host's operating system, which Docker reads from the host rather
+  // than this container. Looked up in the background with a short timeout,
+  // and again a minute after a failure, so a slow Docker never holds up a
+  // snapshot; snapshots leave it out until it's known.
+  hostOperatingSystem(): string | null {
+    if (
+      this.#hostOperatingSystem === null &&
+      !this.#hostOperatingSystemLookup &&
+      Date.now() >= this.#hostOperatingSystemRetryAt
+    ) {
+      this.#hostOperatingSystemLookup = true
+      Effect.runFork(
+        this.#engine.info({ timeout: 2_500 }).pipe(
+          Effect.option,
+          Effect.map((result) =>
+            Option.isSome(result)
+              ? result.value.OperatingSystem?.trim().slice(0, 200) || null
+              : null
+          ),
+          Effect.tap((operatingSystem) =>
+            Effect.sync(() => {
+              if (operatingSystem) this.#hostOperatingSystem = operatingSystem
+              else this.#hostOperatingSystemRetryAt = Date.now() + 60_000
+            })
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              this.#hostOperatingSystemLookup = false
+            })
+          )
+        )
+      )
+    }
+    return this.#hostOperatingSystem
   }
 
   relayStartedAt(): Promise<string | null> {
@@ -1948,32 +2016,9 @@ export class DockerDriver {
       statfs(directory),
     ])
     const instanceStorageUsed = this.#directoryUsageFor(instance)
-    const cpuCurrent = stats.cpu_stats?.cpu_usage?.total_usage ?? 0
-    const cpuPrevious = stats.precpu_stats?.cpu_usage?.total_usage ?? 0
-    const systemCurrent = stats.cpu_stats?.system_cpu_usage ?? 0
-    const systemPrevious = stats.precpu_stats?.system_cpu_usage ?? 0
-    const cpuDelta = cpuCurrent - cpuPrevious
-    const systemDelta = systemCurrent - systemPrevious
-    const onlineCpus = Math.max(stats.cpu_stats?.online_cpus ?? 1, 1)
-    const cpuCapacityPercent = onlineCpus * 100
-    const cpuPercent =
-      cpuDelta > 0 && systemDelta > 0
-        ? (cpuDelta / systemDelta) * onlineCpus * 100
-        : 0
-
-    const memoryTotal = Math.max(
-      instance.config.limits.memoryBytes || stats.memory_stats?.limit || 0,
-      0
-    )
-    const memoryCache = Math.max(
-      stats.memory_stats?.stats?.total_inactive_file ??
-        stats.memory_stats?.stats?.inactive_file ??
-        0,
-      0
-    )
-    const memoryUsed = Math.max(
-      Math.min((stats.memory_stats?.usage ?? 0) - memoryCache, memoryTotal),
-      0
+    const { cpu, memory } = containerCpuAndMemory(
+      stats,
+      instance.config.limits.memoryBytes
     )
     const nodeStorageTotal = filesystem.blocks * filesystem.bsize
     const nodeStorageAvailable = filesystem.bavail * filesystem.bsize
@@ -2011,15 +2056,8 @@ export class DockerDriver {
 
     return {
       sampledAt: new Date(sampledAt).toISOString(),
-      cpu: {
-        capacityPercent: cpuCapacityPercent,
-        percent: roundPercent(cpuPercent),
-      },
-      memory: {
-        totalBytes: memoryTotal,
-        usedBytes: memoryUsed,
-        percent: roundPercent(percentOf(memoryUsed, memoryTotal)),
-      },
+      cpu,
+      memory,
       storage: {
         totalBytes: storageLimit,
         usedBytes: instanceStorageUsed,
@@ -2039,6 +2077,144 @@ export class DockerDriver {
     }
   }
 
+  async #sampleRelayResources(): Promise<RelayInstanceResources> {
+    const [stats, filesystem] = await Promise.all([
+      // Docker can't find the Relay when it isn't a container or has been
+      // given another hostname. The process's own usage stands in then, so
+      // the disk figures still arrive.
+      recoverPromise(
+        () => this.#dockerStats(hostname()),
+        () => null
+      ),
+      statfs(this.#config.dataDirectory),
+    ])
+    const nodeStorageTotal = filesystem.blocks * filesystem.bsize
+    const nodeStorageUsed = Math.max(
+      nodeStorageTotal - filesystem.bavail * filesystem.bsize,
+      0
+    )
+    const dataUsed = this.#relayDataUsage()
+    return {
+      sampledAt: new Date().toISOString(),
+      ...(stats ? containerCpuAndMemory(stats, 0) : this.#relayProcessUsage()),
+      storage: {
+        totalBytes: nodeStorageTotal,
+        usedBytes: dataUsed,
+        percent:
+          dataUsed === null
+            ? null
+            : roundPercent(percentOf(dataUsed, nodeStorageTotal)),
+        nodeTotalBytes: nodeStorageTotal,
+        nodeUsedBytes: nodeStorageUsed,
+        nodePercent: roundPercent(percentOf(nodeStorageUsed, nodeStorageTotal)),
+      },
+    }
+  }
+
+  #relayProcessUsage(): Pick<RelayInstanceResources, "cpu" | "memory"> {
+    const now = performance.now()
+    const usage = process.cpuUsage()
+    const previous = this.#relayProcessCpu
+    this.#relayProcessCpu = { at: now, usage }
+    const cores = Math.max(cpus().length, 1)
+    const elapsedMicros = previous ? (now - previous.at) * 1_000 : 0
+    const usedMicros = previous
+      ? usage.user -
+        previous.usage.user +
+        (usage.system - previous.usage.system)
+      : 0
+    const memoryTotal = totalmem()
+    const memoryUsed = Math.min(process.memoryUsage.rss(), memoryTotal)
+    return {
+      cpu: {
+        capacityPercent: cores * 100,
+        percent:
+          elapsedMicros > 0
+            ? roundPercent((usedMicros / elapsedMicros) * 100)
+            : 0,
+      },
+      memory: {
+        totalBytes: memoryTotal,
+        usedBytes: memoryUsed,
+        percent: roundPercent(percentOf(memoryUsed, memoryTotal)),
+      },
+    }
+  }
+
+  #relayDataUsage(): number | null {
+    const cached = this.#relayDiskUsage
+    if (
+      !cached.pending &&
+      Date.now() - cached.lastAttempt >= RELAY_DISK_USAGE_REFRESH_MS
+    ) {
+      cached.lastAttempt = Date.now()
+      cached.pending = true
+      Effect.runFork(
+        this.#kilnDataUsage().pipe(
+          Effect.tap((usedBytes) =>
+            Effect.sync(() => {
+              cached.usedBytes = usedBytes
+            })
+          ),
+          // Keep the last value; scans race with servers writing.
+          Effect.catch(() => Effect.void),
+          Effect.ensuring(
+            Effect.sync(() => {
+              cached.lastAttempt = Date.now()
+              cached.pending = false
+            })
+          )
+        )
+      )
+    }
+    return cached.usedBytes
+  }
+
+  // Everything in the data directory. Server folders measured for their own
+  // meters count with that figure instead of being walked again, and every
+  // other folder takes the disk usage permit on its own, so a server's
+  // measurement never waits behind the whole tree.
+  #kilnDataUsage(): Effect.Effect<number, unknown> {
+    const measured = new Map<string, number>()
+    for (const entry of this.#diskUsageCache.values()) {
+      if (entry.directory && entry.usedBytes !== null) {
+        measured.set(entry.directory, entry.usedBytes)
+      }
+    }
+    const semaphore = this.#diskUsageSemaphore
+    const dataDirectory = resolve(this.#config.dataDirectory)
+    const rootDirectory = resolve(this.#config.rootDirectory)
+    const sizeOfEntries = Effect.fnUntraced(function* (
+      directory: string,
+      device: number
+    ): Effect.fn.Return<number, unknown> {
+      const entries = yield* promiseEffect(() =>
+        readdir(directory, { withFileTypes: true })
+      )
+      let total = 0
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) continue
+        const path = join(directory, entry.name)
+        const metadata = yield* Effect.option(promiseEffect(() => lstat(path)))
+        if (Option.isNone(metadata) || metadata.value.dev !== device) continue
+        if (entry.isFile()) {
+          total += metadata.value.size
+        } else if (path === rootDirectory) {
+          total += yield* sizeOfEntries(path, device)
+        } else if (entry.isDirectory()) {
+          total +=
+            measured.get(path) ??
+            (yield* semaphore.withPermits(1)(directoryApparentSizeEffect(path)))
+        }
+      }
+      return total
+    })
+    return promiseEffect(() => lstat(dataDirectory)).pipe(
+      Effect.flatMap((metadata) => sizeOfEntries(dataDirectory, metadata.dev)),
+      Effect.withSpan("Relay.dataUsage")
+    )
+  }
+
   #directoryUsageFor(instance: DiscoveredInstance): number | null {
     const now = Date.now()
     const cached =
@@ -2052,6 +2228,7 @@ export class DockerDriver {
         this.#config.rootDirectory,
         instance.config.directory
       )
+      cached.directory = directory
       const findCurrent = () => this.#findDiscovered(instance.config.id)
       const engine = this.#engine
       const refresh = Effect.gen(function* () {
@@ -2362,6 +2539,7 @@ export class DockerDriver {
           : undefined,
       }),
       directory: relativeDirectory,
+      hostDirectory: serverMount.Source,
       game:
         labels["kiln.instance.game"] ??
         (validBrickId === "palworld" ? "Palworld" : "Minecraft"),
@@ -2388,17 +2566,6 @@ export class DockerDriver {
     }
   }
 
-  #composeArguments(): Array<string> {
-    return [
-      "compose",
-      "--file",
-      this.#config.composeFile,
-      "--project-directory",
-      this.#config.projectDirectory,
-      "--project-name",
-      this.#config.projectName,
-    ]
-  }
 }
 
 function normalizedBrickNetworkMode(
@@ -2602,6 +2769,52 @@ function parseBrickReadinessLabel(value: string | undefined) {
   return Result.try(() => brickReadinessSchema.parse(JSON.parse(value))).pipe(
     Result.getOrUndefined
   )
+}
+
+// A container's CPU over Docker's sampling interval, and its memory less
+// reclaimable page cache, against `memoryLimitBytes` or else the container's
+// own limit (the host's memory when it has none).
+function containerCpuAndMemory(
+  stats: DockerStats,
+  memoryLimitBytes: number
+): Pick<RelayInstanceResources, "cpu" | "memory"> {
+  const cpuCurrent = stats.cpu_stats?.cpu_usage?.total_usage ?? 0
+  const cpuPrevious = stats.precpu_stats?.cpu_usage?.total_usage ?? 0
+  const systemCurrent = stats.cpu_stats?.system_cpu_usage ?? 0
+  const systemPrevious = stats.precpu_stats?.system_cpu_usage ?? 0
+  const cpuDelta = cpuCurrent - cpuPrevious
+  const systemDelta = systemCurrent - systemPrevious
+  const onlineCpus = Math.max(stats.cpu_stats?.online_cpus ?? 1, 1)
+  const cpuPercent =
+    cpuDelta > 0 && systemDelta > 0
+      ? (cpuDelta / systemDelta) * onlineCpus * 100
+      : 0
+
+  const memoryTotal = Math.max(
+    memoryLimitBytes || stats.memory_stats?.limit || 0,
+    0
+  )
+  const memoryCache = Math.max(
+    stats.memory_stats?.stats?.total_inactive_file ??
+      stats.memory_stats?.stats?.inactive_file ??
+      0,
+    0
+  )
+  const memoryUsed = Math.max(
+    Math.min((stats.memory_stats?.usage ?? 0) - memoryCache, memoryTotal),
+    0
+  )
+  return {
+    cpu: {
+      capacityPercent: onlineCpus * 100,
+      percent: roundPercent(cpuPercent),
+    },
+    memory: {
+      totalBytes: memoryTotal,
+      usedBytes: memoryUsed,
+      percent: roundPercent(percentOf(memoryUsed, memoryTotal)),
+    },
+  }
 }
 
 function percentOf(used: number, total: number): number {
@@ -2829,6 +3042,39 @@ function prefixConsoleLine(
     segments: undefined,
     service: component,
     text: `[${component}] ${line.text}`,
+  }
+}
+
+// A console line's ID is this, numbered among the lines with the same
+// timestamp and text. History reads and followed logs number lines alike, so
+// hubs and pages recognize the lines they already have.
+function consoleLineHash(line: ParsedConsoleLine): string {
+  return createHash("sha1")
+    .update(`${line.timestamp ?? ""}\u0000${line.text}`)
+    .digest("hex")
+    .slice(0, 14)
+}
+
+// How many lines back a followed log still numbers a repeat after the line
+// it repeats. Past this, nothing recognizes the earlier line's ID any more:
+// hubs keep 5,000 lines, and pages about 10,000 IDs.
+const FOLLOWED_LINE_REPEAT_HORIZON = 3 * MAX_CONSOLE_HISTORY_LINES
+
+// IDs for a followed log's lines, numbered as a history read numbers them,
+// without counting every line a long-lived log has written: a line's count
+// is kept while it was last seen within the horizon.
+function followedConsoleLineIds(): (line: ParsedConsoleLine) => string {
+  // Least recently seen first.
+  const counts = new Map<string, number>()
+  return (line) => {
+    const hash = consoleLineHash(line)
+    const count = counts.get(hash) ?? 0
+    counts.delete(hash)
+    counts.set(hash, count + 1)
+    if (counts.size > FOLLOWED_LINE_REPEAT_HORIZON) {
+      counts.delete(counts.keys().next().value!)
+    }
+    return `${hash}-${count}`
   }
 }
 

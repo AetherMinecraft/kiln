@@ -8,7 +8,6 @@ import {
 import { Deferred, Effect, Fiber, Option, Schema } from "effect"
 import type { Effect as EffectType } from "effect"
 import { WebSocket, WebSocketServer } from "ws"
-import * as Sentry from "@sentry/node"
 
 import {
   RelayControlClientMessageSchema,
@@ -23,7 +22,13 @@ import {
   relayControlProtocol,
   relayConsoleResourcesV1Feature,
   relayAppsV1Feature,
+  relayLogsV1Feature,
+  relayProxyConfigurationV1Feature,
+  relayHostFilesV1Feature,
+  relayRestartV1Feature,
+  relayResourcesV1Feature,
   appIdFromFileRoot,
+  isRelayFileRoot,
   relayFileRequestReplayV1Feature,
   relaySnapshotDeltaFeature,
   relaySnapshotNodeResourcesFeature,
@@ -40,6 +45,8 @@ import type {
   RelaySnapshot,
 } from "@workspace/contracts"
 
+import { RelayNotFoundError } from "./effect/errors.js"
+import { reportRelayError } from "./effect/runtime.js"
 import {
   actionsForRole,
   fileMutationAction,
@@ -546,10 +553,8 @@ function authenticateSocket(
               ).pipe(
                 Effect.catch((cause) =>
                   Effect.sync(() => {
-                    Sentry.captureException(cause, {
-                      tags: {
-                        "kiln.operation": "relay.control.audit",
-                      },
+                    reportRelayError(cause, {
+                      operation: "relay.control.audit",
                     })
                   })
                 )
@@ -582,20 +587,25 @@ function authenticateSocket(
     return operation.pipe(
       Effect.catch((cause) =>
         Effect.sync(() => {
-          if (!controller.signal.aborted) {
-            Sentry.captureException(cause, {
-              tags: relayControlFailureTags(request),
-            })
+          if (controller.signal.aborted) {
+            sendError(
+              socket,
+              request.id,
+              "request_cancelled",
+              "Relay request was cancelled"
+            )
+            return
           }
+          if (cause instanceof RelayNotFoundError) {
+            sendError(socket, request.id, "not_found", cause.message)
+            return
+          }
+          reportRelayError(cause, relayControlErrorContext(request))
           sendError(
             socket,
             request.id,
-            controller.signal.aborted
-              ? "request_cancelled"
-              : "operation_failed",
-            controller.signal.aborted
-              ? "Relay request was cancelled"
-              : relayControlErrorMessage(cause)
+            "operation_failed",
+            relayControlErrorMessage(cause)
           )
         })
       ),
@@ -651,6 +661,11 @@ function authenticateSocket(
           relayFileRequestReplayV1Feature,
           relayConsoleResourcesV1Feature,
           relayAppsV1Feature,
+          relayLogsV1Feature,
+          relayProxyConfigurationV1Feature,
+          relayHostFilesV1Feature,
+          relayRestartV1Feature,
+          relayResourcesV1Feature,
         ],
         protocol: relayControlProtocol,
         relayBuild: relayBuildLabel(),
@@ -935,6 +950,15 @@ function appFileAction(operation: RelayControlOperation): RelayAction {
 }
 
 function actionForRequest(request: RelayControlRequest): RelayAction | null {
+  if (
+    request.operation.startsWith("instance.files.") &&
+    isRelayFileRoot(objectString(request.payload, "instanceId") ?? "")
+  ) {
+    const action = appFileAction(request.operation)
+    return action === "app.files.read"
+      ? "relay.files.read"
+      : "relay.files.write"
+  }
   // An app's data directory is served by the same file operations.
   if (
     request.operation.startsWith("instance.files.") &&
@@ -946,8 +970,12 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "relay.snapshot":
     case "relay.system.inspect":
     case "relay.update.status":
+    case "relay.resources.read":
       return "relay.read"
     case "relay.update.apply":
+      return "relay.update"
+    // Updating already restarts the Relay.
+    case "relay.restart":
       return "relay.update"
     case "relay.rename":
       return "relay.rename"
@@ -969,8 +997,25 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "instance.network.write"
     case "relay.tailscale.stack.remove":
       return "instance.delete"
+    case "relay.terminal.attach":
+    case "relay.terminal.heartbeat":
+    case "relay.terminal.detach":
+    case "relay.terminal.write":
+    case "relay.terminal.claim":
+    case "relay.terminal.restart":
+      return "relay.terminal"
+    // A root shell on the host could reboot it anyway.
+    case "relay.host.restart":
+      return "relay.terminal"
+    case "relay.database.read":
+      return "relay.database.read"
+    case "relay.host.read":
     case "relay.proxy.read":
       return "relay.read"
+    case "relay.host.files.mount":
+      return "relay.files.mount"
+    case "relay.proxy.config.read":
+      return "instance.network.read"
     case "relay.proxy.write":
       return "relay.configure"
     case "relay.pairing.create":
@@ -991,10 +1036,13 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "brick.recipe":
       return "brick.read"
     case "database.list":
+    case "database.inspect":
       return "database.read"
     case "database.create":
       return "database.create"
+    // Wiping deletes all of a database's data, so it takes deletion.
     case "database.delete":
+    case "database.wipe":
       return "database.delete"
     case "database.action":
       return "database.power"
@@ -1221,12 +1269,14 @@ function relayControlErrorMessage(cause: unknown): string {
   return detail && detail.length <= 240 ? detail : "Relay operation failed"
 }
 
-function relayControlFailureTags(
+function relayControlErrorContext(
   request: Pick<RelayControlRequest, "id" | "operation">
 ) {
   return {
-    "kiln.operation": request.operation,
-    "kiln.request_id": request.id,
-    "kiln.transport": "control-socket",
+    operation: request.operation,
+    attributes: {
+      "kiln.request_id": request.id,
+      "kiln.transport": "control-socket",
+    },
   }
 }

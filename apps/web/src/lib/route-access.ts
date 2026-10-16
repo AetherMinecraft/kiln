@@ -4,6 +4,7 @@ import type { QueryClient } from "@tanstack/react-query"
 import {
   accessibleDestinationsForApp,
   accessibleDestinationsForDatabase,
+  accessibleDestinationsForRelay,
   accessibleDestinationsForServer,
   accessibleInfrastructureDestinations,
   canAccessActivity,
@@ -14,10 +15,12 @@ import {
   databaseDestinationHref,
   firstAccessibleAppHref,
   infrastructureDestinations,
+  relayDestinationHref,
   serverDestinationHref,
   type AppDestinationId,
   type DatabaseDestinationId,
   type NavigationAccessCapabilities,
+  type RelayDestinationId,
   type ServerDestinationId,
 } from "@/lib/navigation-destinations"
 import { accessCapabilitiesQueryOptions } from "@/lib/query-options"
@@ -123,77 +126,105 @@ export async function redirectToFirstAccessibleServerDestination(
   throw redirect({ href: firstAccessibleAppHref(capabilities), replace: true })
 }
 
+// Allows a workspace destination the person can open. Otherwise, or when no
+// destination is asked for, redirects to the first one they can open, or out
+// of the workspace.
+async function requireResourceDestination<D extends { id: string }>(
+  queryClient: QueryClient,
+  destinations: (
+    capabilities: NavigationAccessCapabilities
+  ) => ReadonlyArray<D>,
+  href: (destination: D) => string,
+  destinationId?: D["id"]
+): Promise<void> {
+  const capabilities = await routeAccessCapabilities(queryClient)
+  const accessible = destinations(capabilities)
+  if (accessible.some((destination) => destination.id === destinationId)) {
+    return
+  }
+  const fallback = accessible[0]
+  throw redirect({
+    href: fallback ? href(fallback) : firstAccessibleAppHref(capabilities),
+    replace: true,
+  })
+}
+
 type RouteDatabase = Parameters<typeof accessibleDestinationsForDatabase>[0]
 
-export async function requireDatabaseDestinationAccess(
+export function requireDatabaseDestinationAccess(
   queryClient: QueryClient,
   database: RouteDatabase,
   destinationId: DatabaseDestinationId,
   routeId: string
 ): Promise<void> {
-  const capabilities = await routeAccessCapabilities(queryClient)
-  const destinations = accessibleDestinationsForDatabase(database, capabilities)
-  if (destinations.some((destination) => destination.id === destinationId)) {
-    return
-  }
-  const fallback = destinations[0]
-  throw redirect({
-    href: fallback
-      ? databaseDestinationHref(fallback, routeId)
-      : firstAccessibleAppHref(capabilities),
-    replace: true,
-  })
+  return requireResourceDestination(
+    queryClient,
+    (capabilities) => accessibleDestinationsForDatabase(database, capabilities),
+    (destination) => databaseDestinationHref(destination, routeId),
+    destinationId
+  )
 }
 
-export async function redirectToFirstAccessibleDatabaseDestination(
+export function redirectToFirstAccessibleDatabaseDestination(
   queryClient: QueryClient,
   database: RouteDatabase,
   routeId: string
-): Promise<never> {
-  const capabilities = await routeAccessCapabilities(queryClient)
-  const destination = accessibleDestinationsForDatabase(
-    database,
-    capabilities
-  )[0]
-  throw redirect({
-    href: destination
-      ? databaseDestinationHref(destination, routeId)
-      : firstAccessibleAppHref(capabilities),
-    replace: true,
-  })
+): Promise<void> {
+  return requireResourceDestination(
+    queryClient,
+    (capabilities) => accessibleDestinationsForDatabase(database, capabilities),
+    (destination) => databaseDestinationHref(destination, routeId)
+  )
 }
 
-export async function requireAppDestinationAccess(
+export function requireAppDestinationAccess(
   queryClient: QueryClient,
   app: { relayId: string },
   destinationId: AppDestinationId,
   routeId: string
 ): Promise<void> {
-  const capabilities = await routeAccessCapabilities(queryClient)
-  const destinations = accessibleDestinationsForApp(app, capabilities)
-  if (destinations.some((destination) => destination.id === destinationId)) {
-    return
-  }
-  const fallback = destinations[0]
-  throw redirect({
-    href: fallback
-      ? appDestinationHref(fallback, routeId)
-      : firstAccessibleAppHref(capabilities),
-    replace: true,
-  })
+  return requireResourceDestination(
+    queryClient,
+    (capabilities) => accessibleDestinationsForApp(app, capabilities),
+    (destination) => appDestinationHref(destination, routeId),
+    destinationId
+  )
 }
 
-export async function redirectToFirstAccessibleAppDestination(
+export function redirectToFirstAccessibleAppDestination(
   queryClient: QueryClient,
   app: { relayId: string },
   routeId: string
-): Promise<never> {
-  const capabilities = await routeAccessCapabilities(queryClient)
-  const destination = accessibleDestinationsForApp(app, capabilities)[0]
-  throw redirect({
-    href: destination
-      ? appDestinationHref(destination, routeId)
-      : firstAccessibleAppHref(capabilities),
-    replace: true,
-  })
+): Promise<void> {
+  return requireResourceDestination(
+    queryClient,
+    (capabilities) => accessibleDestinationsForApp(app, capabilities),
+    (destination) => appDestinationHref(destination, routeId)
+  )
+}
+
+export function requireRelayDestinationAccess(
+  queryClient: QueryClient,
+  relay: { id: string },
+  destinationId: RelayDestinationId,
+  routeId: string
+): Promise<void> {
+  return requireResourceDestination(
+    queryClient,
+    (capabilities) => accessibleDestinationsForRelay(relay, capabilities),
+    (destination) => relayDestinationHref(destination, routeId),
+    destinationId
+  )
+}
+
+export function redirectToFirstAccessibleRelayDestination(
+  queryClient: QueryClient,
+  relay: { id: string },
+  routeId: string
+): Promise<void> {
+  return requireResourceDestination(
+    queryClient,
+    (capabilities) => accessibleDestinationsForRelay(relay, capabilities),
+    (destination) => relayDestinationHref(destination, routeId)
+  )
 }

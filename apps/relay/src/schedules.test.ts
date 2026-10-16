@@ -1,9 +1,12 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { symlinkSync } from "node:fs"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { DatabaseSync } from "node:sqlite"
+import { randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { setImmediate as yieldToEventLoop } from "node:timers/promises"
 
-import { Effect } from "effect"
+import { Effect, Fiber, ManagedRuntime } from "effect"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 import type {
@@ -11,11 +14,17 @@ import type {
   RelayBackupTask,
   RelayScheduleProjection,
 } from "@workspace/contracts"
-import { nextScheduleOccurrence } from "@workspace/contracts"
+import { nextScheduleOccurrence, scheduleStableId } from "@workspace/contracts"
 
-import { ScheduleManager } from "./schedules.js"
+import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
+
+import { ScheduleManager, type ScheduleManagerOptions } from "./schedules.js"
 
 const directories: Array<string> = []
+const managers: Array<ScheduleManager> = []
+const runtimes: Array<
+  ReturnType<typeof ManagedRuntime.make<RelayStateStore, unknown>>
+> = []
 const minuteMs = 60_000
 const hourMs = 60 * minuteMs
 
@@ -27,9 +36,9 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
+  for (const manager of managers.splice(0)) manager.close()
   vi.useRealTimers()
-  // A finished run is visible before its final atomic write lands, so retry
-  // cleanup if that write races the removal.
+  await Promise.all(runtimes.splice(0).map((runtime) => runtime.dispose()))
   await Promise.all(
     directories
       .splice(0)
@@ -43,11 +52,11 @@ afterEach(async () => {
  * Advances virtual time in `stepMs` increments until `assertion` passes,
  * giving real file I/O a chance to finish between steps.
  */
-async function advanceUntil(assertion: () => void, stepMs = 0) {
+async function advanceUntil(assertion: () => void | Promise<void>, stepMs = 0) {
   const startedAt = performance.now()
   while (true) {
     try {
-      assertion()
+      await assertion()
       return
     } catch (error) {
       if (performance.now() - startedAt > 3_000) throw error
@@ -59,6 +68,9 @@ async function advanceUntil(assertion: () => void, stepMs = 0) {
 
 async function manager(
   overrides: Partial<{
+    directory: string
+    legacy: unknown
+    beforeMake: (filename: string) => void
     enqueueBackup: (input: BackupTaskInput) => Promise<RelayBackupTask>
     findInstance: (instanceId: string) => Promise<object | null>
     getBackup: (taskId: string) => Promise<RelayBackupTask | null>
@@ -66,9 +78,10 @@ async function manager(
     sendConsoleCommand: (instanceId: string, command: string) => Promise<void>
   }> = {}
 ) {
-  const directory = await mkdtemp(join(tmpdir(), "kiln-schedules-"))
+  const directory =
+    overrides.directory ?? (await mkdtemp(join(tmpdir(), "kiln-schedules-")))
   directories.push(directory)
-  const schedules = await ScheduleManager.make({
+  const options: Omit<ScheduleManagerOptions, "state"> = {
     enqueueBackup:
       overrides.enqueueBackup ??
       (async () => {
@@ -84,8 +97,27 @@ async function manager(
     runInstancePower: async () => undefined,
     sendConsoleCommand: overrides.sendConsoleCommand ?? (async () => undefined),
     stateDirectory: directory,
-  })
-  return { directory, schedules }
+  }
+  const filename = join(directory, "relay.sqlite")
+  if (overrides.legacy)
+    await writeFile(
+      join(directory, "schedules.json"),
+      JSON.stringify(overrides.legacy)
+    )
+  const start = async () => {
+    const runtime = ManagedRuntime.make(makeRelayStateLayer(filename))
+    runtimes.push(runtime)
+    const store = await runtime.runPromise(RelayStateStore)
+    overrides.beforeMake?.(filename)
+    const schedules = await ScheduleManager.make({
+      ...options,
+      state: store.schedules,
+    })
+    managers.push(schedules)
+    return schedules
+  }
+  const schedules = await start()
+  return { directory, filename, restart: start, schedules }
 }
 
 const projection: RelayScheduleProjection = {
@@ -127,8 +159,8 @@ const afterWaitCommand = {
   type: "console_command" as const,
 }
 
-function latestRun(schedules: ScheduleManager) {
-  return schedules.overview([projection.id]).runs[0]
+async function latestRun(schedules: ScheduleManager) {
+  return (await schedules.overview([projection.id])).runs[0]
 }
 
 function runNow(schedules: ScheduleManager) {
@@ -139,31 +171,812 @@ function runNow(schedules: ScheduleManager) {
 }
 
 describe("Relay schedule persistence", () => {
-  it("keeps running due schedules after a failed tick", async () => {
+  it("keeps manual and due occurrences distinct at the same wall-clock time", async () => {
+    const { schedules } = await manager({ findInstance: async () => ({}) })
+    const applied = await schedules.apply({ ...projection, cron: "hourly" })
+    vi.setSystemTime(applied.nextRunAt!)
+    const manual = await runNow(schedules)
+    await advanceUntil(async () =>
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
+    )
+    const worker = Effect.runFork(schedules.run())
+    try {
+      await advanceUntil(async () => {
+        const { runs } = await schedules.overview()
+        expect(runs).toHaveLength(2)
+        expect(runs.every((run) => run.status === "succeeded")).toBe(true)
+        expect(
+          runs.map((run) => run.scheduledAt).sort((left, right) => left - right)
+        ).toEqual(
+          [applied.nextRunAt!, manual.scheduledAt].sort(
+            (left, right) => left - right
+          )
+        )
+        expect(manual.scheduledAt).not.toBe(applied.nextRunAt)
+      })
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(worker))
+    }
+  })
+
+  it.each(["same Relay", "legacy Relay"])(
+    "preserves existing %s history at a due timestamp and advances the queue",
+    async (origin) => {
+      const dueAt = Date.now() + minuteMs
+      const healthyId = randomUUID()
+      const existing = {
+        id:
+          origin === "same Relay"
+            ? scheduleStableId(projection.id, dueAt, "relay-a")
+            : "legacy-manual-run",
+        scheduleId: projection.id,
+        revision: 1,
+        scheduledAt: dueAt,
+        startedAt: dueAt,
+        finishedAt: dueAt,
+        status: "succeeded",
+        targetRuns: [],
+      }
+      const { schedules } = await manager({
+        legacy: {
+          version: 1,
+          lastHeartbeatAt: Date.now(),
+          tombstones: {},
+          runs: [existing],
+          schedules: [
+            { ...projection, nextRunAt: dueAt },
+            { ...projection, id: healthyId, nextRunAt: dueAt },
+          ],
+        },
+      })
+      vi.setSystemTime(dueAt)
+      const worker = Effect.runFork(schedules.run())
+      try {
+        await advanceUntil(async () => {
+          const overview = await schedules.overview()
+          expect(overview.deployments.every((d) => d.nextRunAt! > dueAt)).toBe(
+            true
+          )
+          expect(overview.runs.find((r) => r.id === existing.id)).toMatchObject(
+            existing
+          )
+          expect(
+            overview.runs.find((r) => r.scheduleId === healthyId)?.status
+          ).toBe("failed")
+          expect(overview.runs).toHaveLength(2)
+        })
+      } finally {
+        await Effect.runPromise(Fiber.interrupt(worker))
+      }
+    }
+  )
+
+  it.each(["live", "restart"])(
+    "drops an unreadable definition for redeployment without blocking healthy schedules during %s claims",
+    async (mode) => {
+      const { filename, schedules, restart } = await manager()
+      const ids = Array.from({ length: 34 }, () => randomUUID()).sort()
+      const applied = await Promise.all(
+        ids.map((id, index) =>
+          schedules.apply({
+            ...projection,
+            id,
+            cron: "hourly",
+            targets: [{ ...projection.targets[0]!, id: `server-${index}` }],
+          })
+        )
+      )
+      const database = new DatabaseSync(filename)
+      database
+        .prepare(
+          "UPDATE relay_schedules SET definition_json = '{' WHERE schedule_id = ?"
+        )
+        .run(ids[0]!)
+      database.close()
+      vi.setSystemTime(applied[0]!.nextRunAt!)
+      let recovered = schedules
+      if (mode === "restart") {
+        schedules.close()
+        recovered = await restart()
+      }
+      const worker = Effect.runFork(recovered.run())
+      try {
+        await advanceUntil(async () => {
+          const overview = await recovered.overview()
+          expect(overview.runs).toHaveLength(ids.length - 1)
+          expect(
+            overview.runs.every(
+              (r) => r.status === (mode === "restart" ? "missed" : "failed")
+            )
+          ).toBe(true)
+          // Hearth redeploys a schedule whose revision the Relay no longer reports.
+          expect(overview.deployments.map((d) => d.scheduleId)).not.toContain(
+            ids[0]
+          )
+        }, 1_000)
+        const repaired = await recovered.apply({
+          ...projection,
+          id: ids[0]!,
+          cron: "hourly",
+          revision: 1,
+        })
+        expect(repaired.nextRunAt).toBeGreaterThan(Date.now())
+      } finally {
+        await Effect.runPromise(Fiber.interrupt(worker))
+      }
+    }
+  )
+
+  it("records overdue occurrences as missed after a restart even when storage fails first", async () => {
     const commands: Array<string> = []
-    const reportError = vi.fn()
-    const { directory, schedules } = await manager({
+    const { filename, schedules, restart } = await manager({
       findInstance: async () => ({}),
-      reportError,
+      sendConsoleCommand: async (_id, command) => {
+        commands.push(command)
+      },
+    })
+    const ids = Array.from({ length: 34 }, () => randomUUID()).sort()
+    const applied = await Promise.all(
+      ids.map((id) => schedules.apply({ ...projection, id, cron: "hourly" }))
+    )
+    const database = new DatabaseSync(filename)
+    database.exec(`CREATE TRIGGER fail_recovery BEFORE UPDATE ON relay_schedules
+      WHEN OLD.schedule_id = '${ids[1]}' BEGIN SELECT RAISE(FAIL, 'storage unavailable'); END`)
+    vi.setSystemTime(applied[0]!.nextRunAt!)
+    schedules.close()
+    const recovered = await restart()
+    const worker = Effect.runFork(recovered.run())
+    try {
+      await advanceUntil(async () => {
+        const { runs } = await recovered.overview(ids)
+        expect(runs).toHaveLength(ids.length - 1)
+      }, 1_000)
+      database.exec("DROP TRIGGER fail_recovery")
+      await advanceUntil(async () => {
+        const { runs } = await recovered.overview(ids)
+        expect(runs).toHaveLength(ids.length)
+        expect(runs.every((run) => run.status === "missed")).toBe(true)
+      }, 1_000)
+      expect(commands).toEqual([])
+    } finally {
+      database.close()
+      await Effect.runPromise(Fiber.interrupt(worker))
+    }
+  })
+
+  it("executes durable claims around a failing row and retries that row after storage recovers", async () => {
+    const commands: Array<string> = []
+    const failures: Array<unknown> = []
+    const { filename, schedules } = await manager({
+      findInstance: async () => ({}),
+      reportError: (_message, cause) => failures.push(cause),
+      sendConsoleCommand: async (_id, command) => {
+        commands.push(command)
+      },
+    })
+    const ids = Array.from({ length: 3 }, () => randomUUID()).sort()
+    const applied = await Promise.all(
+      ids.map((id, index) =>
+        schedules.apply({
+          ...projection,
+          id,
+          cron: "hourly",
+          targets: [{ ...projection.targets[0]!, id: `server-${index}` }],
+          actions: [
+            {
+              ...projection.actions[0]!,
+              type: "console_command",
+              command: `say ${index}`,
+            },
+          ],
+        })
+      )
+    )
+    const database = new DatabaseSync(filename)
+    database.exec(`CREATE TRIGGER fail_one_claim BEFORE UPDATE ON relay_schedules
+      WHEN OLD.schedule_id = '${ids[1]}' BEGIN SELECT RAISE(FAIL, 'storage unavailable'); END`)
+    vi.setSystemTime(applied[0]!.nextRunAt!)
+    const worker = Effect.runFork(schedules.run())
+    try {
+      await advanceUntil(async () => {
+        expect([...commands].sort()).toEqual(["say 0", "say 2"])
+        const overview = await schedules.overview()
+        expect(overview.runs).toHaveLength(2)
+        expect(overview.runs.every((r) => r.status === "succeeded")).toBe(true)
+      })
+      expect(failures).toHaveLength(1)
+      database.exec("DROP TRIGGER fail_one_claim")
+      await advanceUntil(async () => {
+        expect([...commands].sort()).toEqual(["say 0", "say 1", "say 2"])
+        expect(
+          (await schedules.overview()).runs.every(
+            (r) => r.status === "succeeded"
+          )
+        ).toBe(true)
+      }, 1000)
+    } finally {
+      database.close()
+      await Effect.runPromise(Fiber.interrupt(worker))
+    }
+  })
+
+  it("still executes claimed occurrences when a later write in the batch fails", async () => {
+    const commands: Array<string> = []
+    const errors: Array<string> = []
+    const { filename, schedules } = await manager({
+      findInstance: async () => ({}),
+      reportError: (message) => errors.push(message),
+      sendConsoleCommand: async (_id, command) => {
+        commands.push(command)
+      },
+    })
+    const [healthyId, unreadableId] = [randomUUID(), randomUUID()].sort()
+    const applied = await schedules.apply({
+      ...projection,
+      id: healthyId!,
+      cron: "hourly",
+    })
+    await schedules.apply({ ...projection, id: unreadableId!, cron: "hourly" })
+    const database = new DatabaseSync(filename)
+    database
+      .prepare(
+        "UPDATE relay_schedules SET definition_json = '{' WHERE schedule_id = ?"
+      )
+      .run(unreadableId!)
+    database.exec(`CREATE TRIGGER fail_drop BEFORE DELETE ON relay_schedules
+      BEGIN SELECT RAISE(FAIL, 'storage unavailable'); END`)
+    vi.setSystemTime(applied.nextRunAt!)
+    const worker = Effect.runFork(schedules.run())
+    try {
+      await advanceUntil(async () => {
+        expect(commands).toEqual(["say hello"])
+        expect((await schedules.overview()).runs[0]?.status).toBe("succeeded")
+      })
+      expect(errors).toEqual(["Relay schedule claim failed"])
+      database.exec("DROP TRIGGER fail_drop")
+      await advanceUntil(async () => {
+        const { deployments } = await schedules.overview()
+        expect(deployments.map((d) => d.scheduleId)).toEqual([healthyId])
+      }, 1_000)
+      expect(commands).toEqual(["say hello"])
+    } finally {
+      database.close()
+      await Effect.runPromise(Fiber.interrupt(worker))
+    }
+  })
+
+  it("reports a long run and keeps its result after newer runs fill the history", async () => {
+    const { filename, schedules } = await manager({
+      findInstance: async () => ({}),
+    })
+    await schedules.apply({
+      ...projection,
+      enabled: false,
+      actions: [waitAction(30, "minutes"), projection.actions[0]!],
+    })
+    const long = await runNow(schedules)
+    const database = new DatabaseSync(filename)
+    const insert = database.prepare(`INSERT INTO relay_schedule_runs
+      (run_id, schedule_id, revision, scheduled_at, started_at, finished_at,
+       status, sequence_attempts_json, target_runs_json)
+      VALUES (?, ?, 1, ?, ?, ?, 'succeeded', '[]', '[]')`)
+    for (let index = 0; index < 1_000; index++) {
+      const at = Date.now() + 1 + index
+      insert.run(randomUUID(), projection.id, at, at, at)
+    }
+    database.close()
+    expect(
+      (await schedules.overview()).runs.find((run) => run.id === long.id)
+        ?.status
+    ).toBe("running")
+    await advanceUntil(async () => {
+      const { runs } = await schedules.overview()
+      expect(runs).toHaveLength(1_000)
+      expect(runs[0]).toMatchObject({ id: long.id, status: "succeeded" })
+    }, minuteMs)
+  })
+
+  it("drains due work in batches without losing occurrences behind executing runs", async () => {
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const commands: Array<string> = []
+    const { schedules } = await manager({
+      findInstance: async () => ({}),
+      sendConsoleCommand: async (_instanceId, command) => {
+        commands.push(command)
+        await blocked
+      },
+    })
+    const definitions = Array.from({ length: 50 }, (_, index) => ({
+      ...projection,
+      id: randomUUID(),
+      cron: "hourly",
+      targets: [{ ...projection.targets[0]!, id: `server-${index}` }],
+      actions: [
+        {
+          ...projection.actions[0]!,
+          type: "console_command" as const,
+          command: `say ${index}`,
+        },
+      ],
+    }))
+    const deployments = await Promise.all(
+      definitions.map((definition) => schedules.apply(definition))
+    )
+    vi.setSystemTime(deployments[0]!.nextRunAt!)
+    const fiber = Effect.runFork(schedules.run())
+    try {
+      await advanceUntil(() => expect(commands.length).toBeGreaterThan(0))
+      await vi.advanceTimersByTimeAsync(1_000)
+      release()
+      await advanceUntil(async () => {
+        const overview = await schedules.overview()
+        expect([...commands].sort()).toEqual(
+          definitions.map((_, index) => `say ${index}`).sort()
+        )
+        expect(overview.runs).toHaveLength(definitions.length)
+        expect(overview.runs.every((run) => run.status === "succeeded")).toBe(
+          true
+        )
+      }, 1_000)
+    } finally {
+      release()
+      await Effect.runPromise(Fiber.interrupt(fiber))
+      schedules.close()
+    }
+  })
+
+  it("marks unfinished runs interrupted after a restart", async () => {
+    const { schedules, restart } = await manager({
+      findInstance: async () => ({}),
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [waitAction(30, "minutes")],
+    })
+    await runNow(schedules)
+    expect((await latestRun(schedules))?.status).toBe("running")
+    schedules.close()
+    const recovered = await restart()
+    expect((await latestRun(recovered))?.status).toBe("interrupted")
+  })
+
+  it("imports legacy state and merges files an older Relay writes after a downgrade by revision", async () => {
+    const removedId = "32483f84-1709-4546-85b7-7eebc19a6b1f"
+    const otherId = "6f0d9a55-4be1-4a3e-9d4f-0f6c1f2b8a11"
+    const legacy = {
+      version: 1,
+      lastHeartbeatAt: Date.now(),
+      schedules: [
+        { ...projection, nextRunAt: Date.now() + hourMs },
+        { ...projection, id: otherId, nextRunAt: Date.now() + hourMs },
+      ],
+      tombstones: { [removedId]: 3 },
+      runs: [
+        {
+          id: "legacy-run",
+          scheduleId: projection.id,
+          revision: 1,
+          scheduledAt: Date.now() - minuteMs,
+          startedAt: Date.now() - minuteMs,
+          finishedAt: Date.now(),
+          status: "succeeded",
+          targetRuns: [],
+        },
+      ],
+    }
+    const { directory, schedules, restart } = await manager({ legacy })
+    expect((await latestRun(schedules))?.id).toBe("legacy-run")
+    expect(
+      await schedules.apply({ ...projection, id: removedId, revision: 2 })
+    ).toMatchObject({ acknowledgedRevision: 3, nextRunAt: null })
+    await schedules.apply({ ...projection, revision: 2 })
+    schedules.close()
+
+    // A stale copy of the original file never moves a revision backward.
+    await writeFile(join(directory, "schedules.json"), JSON.stringify(legacy))
+    const stale = await restart()
+    expect(
+      (await stale.overview([projection.id])).deployments[0]
+    ).toMatchObject({ acknowledgedRevision: 2 })
+    stale.close()
+
+    // After a downgrade the older Relay deletes one schedule and redeploys
+    // the other at the same revision, as Hearth does to refresh credentials.
+    // Its file is newer, so both changes survive the re-upgrade.
+    const redeployedNextRunAt = Date.now() + 2 * hourMs
+    await writeFile(
+      join(directory, "schedules.json"),
+      JSON.stringify({
+        ...legacy,
+        schedules: [
+          {
+            ...projection,
+            id: otherId,
+            nextRunAt: redeployedNextRunAt,
+          },
+        ],
+        tombstones: { [projection.id]: 3 },
+        runs: [],
+      })
+    )
+    const recovered = await restart()
+    const { deployments } = await recovered.overview()
+    expect(deployments).toEqual([
+      {
+        scheduleId: otherId,
+        acknowledgedRevision: 1,
+        nextRunAt: redeployedNextRunAt,
+      },
+    ])
+    expect(
+      await recovered.apply({ ...projection, revision: 2 })
+    ).toMatchObject({ acknowledgedRevision: 3, nextRunAt: null })
+    expect((await latestRun(recovered))?.id).toBe("legacy-run")
+    await expect(
+      readFile(join(directory, "schedules.json"), "utf8")
+    ).rejects.toMatchObject({ code: "ENOENT" })
+    expect(
+      JSON.parse(
+        await readFile(join(directory, "schedules.json.migrated"), "utf8")
+      )
+    ).toEqual(legacy)
+  })
+
+  it("rolls back a failed legacy import and retries it without losing the source", async () => {
+    let filename = ""
+    const legacy = {
+      version: 1,
+      lastHeartbeatAt: Date.now(),
+      tombstones: {},
+      schedules: [{ ...projection, nextRunAt: Date.now() + hourMs }],
+      runs: [
+        {
+          id: "legacy-run",
+          scheduleId: projection.id,
+          revision: 1,
+          scheduledAt: Date.now(),
+          startedAt: Date.now(),
+          finishedAt: Date.now(),
+          status: "succeeded",
+          targetRuns: [],
+        },
+      ],
+    }
+    await expect(
+      manager({
+        legacy,
+        beforeMake: (path) => {
+          filename = path
+          const database = new DatabaseSync(path)
+          database.exec(`CREATE TRIGGER fail_import BEFORE INSERT ON relay_schedule_runs
+        BEGIN SELECT RAISE(FAIL, 'storage unavailable'); END`)
+          database.close()
+        },
+      })
+    ).rejects.toBeDefined()
+    const database = new DatabaseSync(filename)
+    expect(
+      database.prepare("SELECT schedule_id FROM relay_schedules").all()
+    ).toEqual([])
+    expect(
+      JSON.parse(
+        await readFile(join(dirname(filename), "schedules.json"), "utf8")
+      )
+    ).toEqual(legacy)
+    database.exec("DROP TRIGGER fail_import")
+    database.close()
+    const recovered = await manager({ directory: dirname(filename) })
+    expect((await latestRun(recovered.schedules))?.status).toBe("succeeded")
+    expect((await recovered.schedules.overview()).deployments).toHaveLength(1)
+  })
+
+  it("refuses to start while an imported legacy file cannot be retired", async () => {
+    let archive = ""
+    const legacy = {
+      version: 1,
+      lastHeartbeatAt: Date.now(),
+      tombstones: {},
+      schedules: [{ ...projection, nextRunAt: Date.now() + hourMs }],
+      runs: [],
+    }
+    await expect(
+      manager({
+        legacy,
+        beforeMake: (filename) => {
+          archive = join(dirname(filename), "schedules.json.migrated")
+          symlinkSync(archive, archive)
+        },
+      })
+    ).rejects.toMatchObject({ code: "ELOOP" })
+    const directory = dirname(archive)
+    expect(
+      JSON.parse(await readFile(join(directory, "schedules.json"), "utf8"))
+    ).toEqual(legacy)
+    await rm(archive)
+    const recovered = await manager({ directory })
+    expect((await recovered.schedules.overview()).deployments).toHaveLength(1)
+    await expect(
+      readFile(join(directory, "schedules.json"), "utf8")
+    ).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("accepts a same-revision redeploy with refreshed backup credentials", async () => {
+    const credentials = (key: string) => ({
+      accessKeyId: key,
+      allowPrivateNetwork: false,
+      secretAccessKey: `secret-${key}`,
+      bucket: "backups",
+      region: "us-east-1",
+      endpoint: "https://s3.example.com",
+      forcePathStyle: true,
+      kind: "s3" as const,
+      objectKeyPrefix: "scheduled",
+    })
+    const definition: RelayScheduleProjection = {
+      ...projection,
+      cron: "hourly",
+      targets: [
+        projection.targets[0]!,
+        { ...projection.targets[0]!, id: "server-b", name: "Server B" },
+      ],
+      actions: [
+        {
+          type: "backup",
+          id: projection.actions[0]!.id,
+          destination: { kind: "storage", storageId: randomUUID() },
+          mode: "full",
+          name: "Backups",
+          executions: ["server-a", "server-b"].map((id) => ({
+            targetId: id,
+            targetKind: "instance",
+            mode: "full",
+            destination: credentials("old"),
+          })),
+        },
+      ],
+    }
+    const { schedules } = await manager()
+    const applied = await schedules.apply(definition)
+    await vi.advanceTimersByTimeAsync(5_000)
+    const refreshed: RelayScheduleProjection = {
+      ...definition,
+      targets: [...definition.targets].reverse(),
+      actions: definition.actions.map((action) =>
+        action.type !== "backup"
+          ? action
+          : {
+              ...action,
+              executions: [...action.executions].reverse().map((execution) => ({
+                ...execution,
+                destination: credentials("rotated"),
+              })),
+            }
+      ),
+    }
+    expect(await schedules.apply(refreshed)).toEqual(applied)
+    // Assert the caller-visible execution gets the new credential, not just an ACK.
+    let usedKey: string | undefined
+    const running = await manager({
+      enqueueBackup: async (input) => {
+        if (input.kind !== "create") throw new Error("unexpected backup")
+        if (
+          input.destination.kind === "s3" &&
+          "accessKeyId" in input.destination
+        )
+          usedKey = input.destination.accessKeyId
+        throw new Error("test boundary")
+      },
+      findInstance: async () => ({}),
+    })
+    await running.schedules.apply(definition)
+    await running.schedules.apply(refreshed)
+    await runNow(running.schedules)
+    await advanceUntil(() => expect(usedKey).toBe("rotated"))
+  })
+
+  it("keeps valid history and definitions available when one history row is unreadable", async () => {
+    const { filename, schedules } = await manager({
+      findInstance: async () => ({}),
+    })
+    await schedules.apply(projection)
+    const first = await runNow(schedules)
+    await advanceUntil(async () =>
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
+    )
+    const second = await runNow(schedules)
+    await advanceUntil(async () =>
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
+    )
+    const database = new DatabaseSync(filename)
+    database
+      .prepare(
+        "UPDATE relay_schedule_runs SET target_runs_json = '{' WHERE run_id = ?"
+      )
+      .run(first.id)
+    database.close()
+    const overview = await schedules.overview()
+    expect(overview.deployments[0]?.acknowledgedRevision).toBe(1)
+    expect(overview.runs.map((run) => run.id)).toEqual([second.id])
+  })
+
+  it("ignores a stale apply or removal that arrives after a newer revision", async () => {
+    const { schedules, restart } = await manager()
+    const applied = await schedules.apply({ ...projection, revision: 3 })
+    expect(await schedules.apply({ ...projection, revision: 2 })).toEqual(
+      applied
+    )
+    expect(
+      await schedules.remove({ scheduleId: projection.id, revision: 2 })
+    ).toEqual(applied)
+    schedules.close()
+    const recovered = await restart()
+    expect((await recovered.overview()).deployments).toEqual([applied])
+    expect(
+      await recovered.remove({ scheduleId: projection.id, revision: 3 })
+    ).toEqual({ ...applied, nextRunAt: null })
+    expect((await recovered.overview()).deployments).toEqual([])
+  })
+
+  it("retries a failed completion without re-executing actions and retains it after restart", async () => {
+    const errors: Array<string> = []
+    const commands: Array<string> = []
+    const { filename, restart, schedules } = await manager({
+      findInstance: async () => ({}),
+      reportError: (message) => errors.push(message),
+      sendConsoleCommand: async (_instanceId, command) => {
+        commands.push(command)
+        const database = new DatabaseSync(filename)
+        database.exec(`CREATE TRIGGER fail_completion BEFORE INSERT ON relay_schedule_runs
+          WHEN NEW.status <> 'running' BEGIN SELECT RAISE(FAIL, 'storage unavailable'); END`)
+        database.close()
+      },
+    })
+    await schedules.apply({ ...projection, enabled: false })
+    await runNow(schedules)
+    await advanceUntil(async () =>
+      expect(errors).toContain("Relay schedule completion write failed")
+    )
+    await vi.advanceTimersByTimeAsync(2 * minuteMs)
+    const database = new DatabaseSync(filename)
+    database.exec("DROP TRIGGER fail_completion")
+    database.close()
+    await advanceUntil(
+      async () =>
+        expect((await latestRun(schedules))?.status).toBe("succeeded"),
+      1_000
+    )
+    schedules.close()
+    const recovered = await restart()
+    expect((await latestRun(recovered))?.status).toBe("succeeded")
+    expect(commands).toEqual(["say hello"])
+    expect(errors).toEqual(["Relay schedule completion write failed"])
+    recovered.close()
+  })
+
+  it("bounds pending completions during a storage outage and releases capacity when storage recovers", async () => {
+    const { filename, schedules } = await manager({
+      findInstance: async () => ({}),
+    })
+    await schedules.apply({ ...projection, enabled: false })
+    const database = new DatabaseSync(filename)
+    database.exec(
+      "CREATE TRIGGER pending_completions BEFORE INSERT ON relay_schedule_runs WHEN NEW.status <> 'running' BEGIN SELECT RAISE(FAIL, 'storage unavailable'); END"
+    )
+    try {
+      const runs = await Promise.all(
+        Array.from({ length: 32 }, () => runNow(schedules))
+      )
+      await expect(runNow(schedules)).rejects.toThrow("capacity")
+      await vi.advanceTimersByTimeAsync(5 * minuteMs)
+      await expect(runNow(schedules)).rejects.toThrow("capacity")
+      database.exec("DROP TRIGGER pending_completions")
+      await advanceUntil(async () => {
+        const overview = await schedules.overview()
+        expect(overview.runs).toHaveLength(runs.length)
+        expect(overview.runs.every((run) => run.status !== "running")).toBe(
+          true
+        )
+      }, 1_000)
+      await expect(runNow(schedules)).resolves.toMatchObject({
+        status: "running",
+      })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("persists due runs before execution and preserves completed history on restart", async () => {
+    const commands: Array<string> = []
+    const { restart, schedules } = await manager({
+      findInstance: async () => ({}),
+      sendConsoleCommand: async (_instanceId, command) => {
+        expect((await latestRun(schedules))?.status).toBe("running")
+        commands.push(command)
+      },
+    })
+    const applied = await schedules.apply({ ...projection, cron: "* * * * *" })
+    vi.setSystemTime(applied.nextRunAt!)
+    const fiber = Effect.runFork(schedules.run())
+    try {
+      await advanceUntil(async () => {
+        expect(commands).toEqual(["say hello"])
+        expect((await latestRun(schedules))?.status).toBe("succeeded")
+      })
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(fiber))
+      schedules.close()
+    }
+
+    const recovered = await restart()
+    expect(await latestRun(recovered)).toMatchObject({
+      scheduledAt: applied.nextRunAt,
+      status: "succeeded",
+    })
+    expect((await recovered.overview()).deployments).toEqual(
+      (await schedules.overview()).deployments
+    )
+    recovered.close()
+  })
+
+  it("records an occurrence that fell due while the Relay was down as missed", async () => {
+    const commands: Array<string> = []
+    const { restart, schedules } = await manager({
+      findInstance: async () => ({}),
       sendConsoleCommand: async (_instanceId, command) => {
         commands.push(command)
       },
     })
-    await schedules.apply({ ...projection, cron: "* * * * *" })
-    const statePath = join(directory, "schedules.json")
-    await rm(statePath, { force: true })
-    await mkdir(statePath)
+    const applied = await schedules.apply({ ...projection, cron: "* * * * *" })
+    schedules.close()
+    vi.advanceTimersByTime(2 * minuteMs)
 
-    const fiber = Effect.runFork(schedules.run())
+    const recovered = await restart()
+    const worker = Effect.runFork(recovered.run())
     try {
-      await advanceUntil(() => expect(reportError).toHaveBeenCalled(), 1_000)
+      await advanceUntil(async () =>
+        expect(await latestRun(recovered)).toMatchObject({
+          scheduledAt: applied.nextRunAt,
+          status: "missed",
+        })
+      )
+      expect(
+        (await recovered.overview()).deployments[0]?.nextRunAt
+      ).toBeGreaterThan(Date.now())
       expect(commands).toEqual([])
-
-      await rm(statePath, { force: true, recursive: true })
-      await advanceUntil(() => expect(commands).toEqual(["say hello"]), 1_000)
     } finally {
-      fiber.interruptUnsafe()
-      schedules.close()
+      await Effect.runPromise(Fiber.interrupt(worker))
+    }
+  })
+
+  it("backs off an ongoing claim failure and resumes after recovery", async () => {
+    const errors: Array<string> = []
+    const { filename, schedules } = await manager({
+      reportError: (message) => errors.push(message),
+    })
+    const applied = await schedules.apply({ ...projection, cron: "* * * * *" })
+    const database = new DatabaseSync(filename)
+    database.exec(
+      "CREATE TRIGGER persistent_claim_failure BEFORE UPDATE ON relay_schedules BEGIN SELECT RAISE(FAIL, 'busy'); END"
+    )
+    vi.setSystemTime(applied.nextRunAt!)
+    const worker = Effect.runFork(schedules.run())
+    try {
+      await advanceUntil(() =>
+        expect(errors).toEqual(["Relay schedule claim failed"])
+      )
+      await vi.advanceTimersByTimeAsync(5 * minuteMs)
+      expect(errors).toEqual(["Relay schedule claim failed"])
+      database.exec("DROP TRIGGER persistent_claim_failure")
+      await advanceUntil(
+        async () => expect((await latestRun(schedules))?.status).toBe("failed"),
+        1_000
+      )
+    } finally {
+      database.close()
+      await Effect.runPromise(Fiber.interrupt(worker))
     }
   })
 
@@ -173,7 +986,9 @@ describe("Relay schedule persistence", () => {
 
     expect(applied.acknowledgedRevision).toBe(1)
     expect(applied.nextRunAt).toBeTypeOf("number")
-    expect(schedules.overview([projection.id]).deployments).toEqual([applied])
+    expect((await schedules.overview([projection.id])).deployments).toEqual([
+      applied,
+    ])
   })
 
   it("evaluates cron in the Relay timezone", async () => {
@@ -212,7 +1027,7 @@ describe("Relay schedule persistence", () => {
       nextRunAt: null,
       scheduleId: projection.id,
     })
-    expect(schedules.overview([projection.id]).deployments).toEqual([])
+    expect((await schedules.overview([projection.id])).deployments).toEqual([])
   })
 
   it("starts a deployed schedule immediately without changing its next run", async () => {
@@ -228,12 +1043,12 @@ describe("Relay schedule persistence", () => {
     const started = await runNow(schedules)
 
     expect(started.status).toBe("running")
-    expect(schedules.overview([projection.id]).deployments[0]?.nextRunAt).toBe(
-      applied.nextRunAt
-    )
-    await advanceUntil(() => {
+    expect(
+      (await schedules.overview([projection.id])).deployments[0]?.nextRunAt
+    ).toBe(applied.nextRunAt)
+    await advanceUntil(async () => {
       expect(commands).toEqual(["say hello"])
-      expect(latestRun(schedules)?.status).toBe("succeeded")
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
     })
   })
 
@@ -261,9 +1076,9 @@ describe("Relay schedule persistence", () => {
 
     await runNow(schedules)
 
-    await advanceUntil(() => {
+    await advanceUntil(async () => {
       expect(commands).toEqual(["server-a:say hello"])
-      expect(latestRun(schedules)).toMatchObject({
+      expect(await latestRun(schedules)).toMatchObject({
         status: "partial",
         targetRuns: [
           { status: "succeeded", target: { id: "server-a" } },
@@ -292,11 +1107,11 @@ describe("Relay schedule persistence", () => {
 
     await runNow(schedules)
 
-    await advanceUntil(() => expect(commands).toHaveLength(1))
-    expect(latestRun(schedules)?.status).toBe("running")
+    await advanceUntil(async () => expect(commands).toHaveLength(1))
+    expect((await latestRun(schedules))?.status).toBe("running")
 
-    await advanceUntil(() => {
-      expect(latestRun(schedules)?.status).toBe("succeeded")
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
     }, minuteMs)
     expect(commands.map(({ command }) => command)).toEqual([
       "say hello",
@@ -305,7 +1120,7 @@ describe("Relay schedule persistence", () => {
     expect(
       (commands[1]?.sentAt ?? 0) - (commands[0]?.sentAt ?? 0)
     ).toBeGreaterThanOrEqual(5 * minuteMs)
-    expect(latestRun(schedules)?.sequenceAttempts).toMatchObject([
+    expect((await latestRun(schedules))?.sequenceAttempts).toMatchObject([
       { actionType: "wait", status: "succeeded" },
     ])
   })
@@ -337,14 +1152,14 @@ describe("Relay schedule persistence", () => {
 
     await runNow(schedules)
 
-    await advanceUntil(() => {
-      expect(latestRun(schedules)?.status).toBe("succeeded")
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
     }, minuteMs)
     expect(commands).toEqual([
       ...Array(9).fill("say hello"),
       ...Array(9).fill("say after wait"),
     ])
-    expect(latestRun(schedules)?.targetRuns).toHaveLength(9)
+    expect((await latestRun(schedules))?.targetRuns).toHaveLength(9)
   })
 
   it("skips a wait when every target overlaps another occurrence", async () => {
@@ -366,22 +1181,24 @@ describe("Relay schedule persistence", () => {
     })
 
     const first = await runNow(schedules)
-    await advanceUntil(() => expect(commandStarted).toBe(true))
+    await advanceUntil(async () => expect(commandStarted).toBe(true))
     const overlapping = await runNow(schedules)
-    const findRun = (id: string) =>
-      schedules.overview([projection.id]).runs.find((run) => run.id === id)
+    const findRun = async (id: string) =>
+      (await schedules.overview([projection.id])).runs.find(
+        (run) => run.id === id
+      )
 
-    await advanceUntil(() =>
-      expect(findRun(overlapping.id)?.status).toBe("noop")
+    await advanceUntil(async () =>
+      expect((await findRun(overlapping.id))?.status).toBe("noop")
     )
-    expect(findRun(overlapping.id)).toMatchObject({
+    expect(await findRun(overlapping.id)).toMatchObject({
       sequenceAttempts: [{ actionType: "wait", status: "not_run" }],
       targetRuns: [{ status: "skipped_overlap" }],
     })
 
     releaseCommand()
     await advanceUntil(
-      () => expect(findRun(first.id)?.status).toBe("succeeded"),
+      async () => expect((await findRun(first.id))?.status).toBe("succeeded"),
       1_000
     )
   })
@@ -400,12 +1217,53 @@ describe("Relay schedule persistence", () => {
 
     await runNow(schedules)
 
-    await advanceUntil(() =>
-      expect(latestRun(schedules)?.status).toBe("failed")
+    await advanceUntil(async () =>
+      expect((await latestRun(schedules))?.status).toBe("failed")
     )
-    expect(latestRun(schedules)).toMatchObject({
+    expect(await latestRun(schedules)).toMatchObject({
       sequenceAttempts: [{ actionType: "wait", status: "not_run" }],
       targetRuns: [{ status: "failed" }],
+    })
+  })
+
+  it("runs later actions after a failure when the schedule continues on failure", async () => {
+    const commands: Array<string> = []
+    const { schedules } = await manager({
+      findInstance: async () => ({}),
+      sendConsoleCommand: async (_instanceId, command) => {
+        commands.push(command)
+        if (command === "say hello") throw new Error("Command failed")
+      },
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        projection.actions[0],
+        waitAction(20, "milliseconds"),
+        afterWaitCommand,
+      ],
+      continueOnFailure: true,
+    })
+
+    await runNow(schedules)
+
+    await advanceUntil(
+      async () => expect((await latestRun(schedules))?.status).toBe("failed"),
+      20
+    )
+    expect(commands).toEqual(["say hello", "say after wait"])
+    expect(await latestRun(schedules)).toMatchObject({
+      sequenceAttempts: [{ actionType: "wait", status: "succeeded" }],
+      targetRuns: [
+        {
+          attempts: [
+            { error: "Command failed", status: "failed" },
+            { error: null, status: "succeeded" },
+          ],
+          error: "Command failed",
+          status: "failed",
+        },
+      ],
     })
   })
 
@@ -419,10 +1277,10 @@ describe("Relay schedule persistence", () => {
     await runNow(schedules)
 
     await advanceUntil(
-      () => expect(latestRun(schedules)?.status).toBe("noop"),
+      async () => expect((await latestRun(schedules))?.status).toBe("noop"),
       1_000
     )
-    expect(latestRun(schedules)).toMatchObject({
+    expect(await latestRun(schedules)).toMatchObject({
       sequenceAttempts: [{ actionType: "wait", status: "succeeded" }],
       targetRuns: [{ status: "noop" }],
     })
@@ -450,13 +1308,13 @@ describe("Relay schedule persistence", () => {
 
     await runNow(schedules)
 
-    await advanceUntil(() => {
-      expect(latestRun(schedules)?.status).toBe("noop")
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).toBe("noop")
     })
     expect(commands).toEqual([])
-    expect(latestRun(schedules)?.targetRuns[0]?.attempts[0]?.status).toBe(
-      "skipped_policy"
-    )
+    expect(
+      (await latestRun(schedules))?.targetRuns[0]?.attempts[0]?.status
+    ).toBe("skipped_policy")
   })
 
   it("runs a deployed incremental backup with its prepared destination", async () => {
@@ -501,8 +1359,8 @@ describe("Relay schedule persistence", () => {
 
     await runNow(schedules)
 
-    await advanceUntil(() => {
-      expect(latestRun(schedules)?.status).toBe("succeeded")
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
     })
     expect(inputs).toHaveLength(1)
     expect(inputs[0]).toMatchObject({
@@ -570,8 +1428,8 @@ describe("Relay schedule persistence", () => {
 
     await runNow(schedules)
 
-    await advanceUntil(() => {
-      expect(latestRun(schedules)?.status).toBe("succeeded")
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
     })
     expect(inputs).toHaveLength(1)
     expect(inputs[0]).toMatchObject({
@@ -624,11 +1482,11 @@ describe("Relay schedule persistence", () => {
 
     await runNow(schedules)
 
-    await advanceUntil(() => {
-      expect(latestRun(schedules)?.status).toBe("failed")
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).toBe("failed")
     }, hourMs)
-    expect(latestRun(schedules)?.targetRuns[0]?.attempts[0]?.status).toBe(
-      "failed"
-    )
+    expect(
+      (await latestRun(schedules))?.targetRuns[0]?.attempts[0]?.status
+    ).toBe("failed")
   })
 })

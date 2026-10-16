@@ -61,6 +61,8 @@ import { relayInstanceRouteId } from "@/lib/relay-fleet"
 import type { ActivityData, ActivityEntry } from "@/server/activity"
 
 export interface ActivityFilters {
+  // A database's ID, from its Info page; there's no picker for it.
+  database?: string
   from?: string
   q?: string
   relay?: string
@@ -285,7 +287,7 @@ const typeDetails: Record<
   ActivityType,
   { icon: React.ComponentType<{ className?: string }>; label: string }
 > = {
-  server: { icon: Server, label: "Server" },
+  server: { icon: Server, label: "Game Server" },
   power: { icon: CircleGauge, label: "Power" },
   console: { icon: TerminalSquare, label: "Console" },
   files: { icon: FolderClock, label: "Files" },
@@ -656,6 +658,7 @@ const ActivityClearFilters = React.memo(function ActivityClearFilters({
       variant="ghost"
       onClick={() =>
         onFiltersChange({
+          database: undefined,
           from: undefined,
           q: undefined,
           relay: undefined,
@@ -930,7 +933,7 @@ const ActivitySearch = React.memo(function ActivitySearch({
         type="search"
         value={value}
         onChange={(event) => update(event.currentTarget.value)}
-        placeholder="Search actions, people, servers…"
+        placeholder="Search actions, people, game servers…"
         aria-label="Search activity"
         className="pr-8 pl-9 text-base md:text-sm"
       />
@@ -1710,7 +1713,7 @@ function ActivityWhereLink({
         search={{ search: entry.relay.name }}
         preload="intent"
         className="min-w-0 truncate text-muted-foreground hover:text-primary"
-        aria-label={`View servers on ${entry.relay.name}`}
+        aria-label={`View game servers on ${entry.relay.name}`}
       >
         {entry.relay.name}
       </Link>
@@ -1780,6 +1783,7 @@ function activityActors(data: ActivityData): Array<ActivityEntry["actor"]> {
 
 function activityFilterCount(filters: ActivityFilters): number {
   return [
+    filters.database,
     filters.q,
     filters.type,
     filters.user,
@@ -1980,6 +1984,7 @@ function filterActivity(
     if (filters.user && entry.actor.id !== filters.user) return false
     if (filters.relay && entry.relay.id !== filters.relay) return false
     if (filters.server && entry.server?.id !== filters.server) return false
+    if (filters.database && entry.databaseId !== filters.database) return false
     if (filters.source && entry.source !== filters.source) return false
     if (!normalized) return true
     return [

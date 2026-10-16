@@ -5,18 +5,33 @@
  * requests; Relay's snapshot loop alone made two of them every two seconds.
  * Talking to the socket directly answers the same questions without a process.
  *
- * Paths are unversioned, so the daemon answers in its own API version: what
- * the bundled CLI negotiates with any daemon that is not newer than it.
+ * Paths are unversioned and the client doesn't negotiate a version, so the
+ * daemon answers every request in its own current API version.
  *
- * Creating containers, networks, and volumes, pulling images, Compose, and
- * execs that read stdin stay on the CLI (see `./command.js`): their flags and
- * credential handling are what other Kiln versions depend on.
+ * Execs that stream stdio (database clients, backups, terminals) run over
+ * connections Docker upgrades, as `docker exec` does.
+ *
+ * Pulls read registry credentials from the Docker config file (see
+ * `./registry-auth.js`).
+ *
+ * Containers Relay creates are described in its own terms (see
+ * `./docker-container-spec.js`).
+ *
+ * Dockerfile builds and Compose projects run the standalone `docker-buildx`
+ * and `docker-compose` binaries instead (see `./apps.js`).
  */
 import { Agent, request } from "node:http"
+import { type Duplex, PassThrough, Writable } from "node:stream"
 import { StringDecoder } from "node:string_decoder"
 import { Effect, Predicate, Result } from "effect"
 
+import {
+  normalizedReference,
+  parseImageReference,
+  repositoryName,
+} from "./docker-reference.js"
 import { DockerEngineError } from "./effect/errors.js"
+import { registryAuthHeader } from "./registry-auth.js"
 
 export { DockerEngineError }
 
@@ -24,6 +39,8 @@ export { DockerEngineError }
 const DEFAULT_TIMEOUT_MS = 30_000
 const DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 const MAX_ERROR_BYTES = 64 * 1024
+// How long an exec that has closed its output may take to report its code.
+const EXIT_CODE_WAIT_MS = 10_000
 // Longer lines are cut, so one line without an end can't grow without limit.
 const MAX_LINE_CHARACTERS = 1024 * 1024
 
@@ -109,7 +126,15 @@ export interface DockerNetwork {
 
 export interface DockerVolume {
   readonly Labels: Readonly<Record<string, string>> | null
+  // The volume's folder on the host, as the daemon sees it.
+  readonly Mountpoint?: string
   readonly Name: string
+}
+
+export interface DockerVolumeUsage {
+  readonly Name: string
+  // Size is -1 when Docker can't measure the volume.
+  readonly UsageData?: { readonly Size: number } | null
 }
 
 export interface DockerImage {
@@ -137,6 +162,7 @@ interface Exchange {
   readonly method: "DELETE" | "GET" | "POST"
   readonly path: string
   readonly body?: unknown
+  readonly headers?: Readonly<Record<string, string>>
   /** For the whole exchange; `null` waits as long as the answer lasts. */
   readonly timeout?: number | null
   readonly maxBytes?: number
@@ -153,6 +179,20 @@ export class DockerEngine {
 
   version(): Effect.Effect<{ readonly Version: string }, DockerEngineError> {
     return this.#json({ method: "GET", path: "/version" })
+  }
+
+  info(options: { readonly timeout?: number } = {}): Effect.Effect<
+    {
+      readonly OperatingSystem?: string
+      readonly SecurityOptions?: ReadonlyArray<string> | null
+    },
+    DockerEngineError
+  > {
+    return this.#json({
+      method: "GET",
+      path: "/info",
+      timeout: options.timeout,
+    })
   }
 
   // ------------------------------------------------------------- containers
@@ -203,9 +243,54 @@ export class DockerEngine {
     return this.#json({
       body,
       method: "POST",
-      path: `/containers/create${query({ name })}`,
+      path: `/containers/create${query({ name: name || undefined })}`,
       timeout: 60_000,
     })
+  }
+
+  /**
+   * Waits for a container to reach `condition` and returns its exit code, as
+   * `docker wait`. The request holds until then, so start it before the
+   * container can exit.
+   */
+  waitContainer(
+    reference: string,
+    condition: "next-exit" | "not-running" | "removed"
+  ): Effect.Effect<number, DockerEngineError> {
+    return this.#json<{
+      readonly Error?: { readonly Message?: string } | null
+      readonly StatusCode: number
+    }>({
+      method: "POST",
+      path: `/containers/${segment(reference)}/wait${query({ condition })}`,
+      timeout: null,
+    }).pipe(
+      Effect.flatMap((answer) =>
+        answer.Error?.Message
+          ? Effect.fail(
+              new DockerEngineError({
+                operation: "POST /containers/{id}/wait",
+                reason: answer.Error.Message,
+              })
+            )
+          : Effect.succeed(answer.StatusCode)
+      )
+    )
+  }
+
+  /**
+   * Attaches to a container's stdio, as `docker attach` (or `docker run`
+   * before it starts the container), and returns the raw connection.
+   */
+  attachContainer(reference: string): Effect.Effect<Duplex, DockerEngineError> {
+    return this.hijack(
+      `/containers/${segment(reference)}/attach${query({
+        stderr: true,
+        stdin: true,
+        stdout: true,
+        stream: true,
+      })}`
+    )
   }
 
   /** Succeeds when the container is already running, as `docker start`. */
@@ -438,6 +523,165 @@ export class DockerEngine {
     })
   }
 
+  /**
+   * Starts a process in a running container and streams its stdio, as
+   * `docker exec [-i]`: stdout and stderr arrive as they are written, and
+   * ending `stdin` closes the process's input. Closing the connection with
+   * `kill()` is what stopping the CLI did; the process sees its input and
+   * output close.
+   */
+  execProcess(
+    reference: string,
+    command: ReadonlyArray<string>,
+    options: {
+      readonly env?: ReadonlyArray<string>
+      /** Attaches stdin, as `-i`. */
+      readonly stdin?: boolean
+      readonly user?: string
+    } = {}
+  ): Effect.Effect<DockerExecProcess, DockerEngineError> {
+    return Effect.gen({ self: this }, function* () {
+      const created = yield* this.createExec(reference, {
+        AttachStderr: true,
+        AttachStdin: options.stdin ?? false,
+        AttachStdout: true,
+        Cmd: command,
+        ...(options.env?.length && { Env: options.env }),
+        Tty: false,
+        ...(options.user && { User: options.user }),
+      })
+      const socket = yield* this.hijack(`/exec/${segment(created.Id)}/start`, {
+        Detach: false,
+        Tty: false,
+      })
+      return new DockerExecProcess(
+        socket,
+        options.stdin ?? false,
+        this.#execExitCode(created.Id),
+        command[0] ?? "exec"
+      )
+    })
+  }
+
+  /**
+   * Runs a process with `input` on its stdin and returns its output, failing
+   * with its stderr when it exits with a non-zero code, as
+   * `docker exec -i … <<< input`.
+   */
+  execWithInput(
+    reference: string,
+    command: ReadonlyArray<string>,
+    options: {
+      readonly env?: ReadonlyArray<string>
+      readonly input?: string | Uint8Array
+      readonly maxOutputBytes: number
+      /** Why output past `maxOutputBytes` failed. */
+      readonly overflow: string
+      readonly timeout: number
+      readonly user?: string
+    }
+  ): Effect.Effect<DockerOutput, DockerEngineError> {
+    const program = command[0] ?? "exec"
+    const operation = `exec ${program} in ${reference}`
+    const run = Effect.acquireUseRelease(
+      this.execProcess(reference, command, {
+        env: options.env,
+        stdin: true,
+        user: options.user,
+      }),
+      (process) =>
+        completeWithInput(process, {
+          input: options.input,
+          maxOutputBytes: options.maxOutputBytes,
+          operation,
+          overflow: options.overflow,
+        }),
+      (process) => Effect.sync(() => process.kill())
+    )
+    return withTimeout(run, options.timeout, operation)
+  }
+
+  /**
+   * Sends `POST path` asking Docker to upgrade the connection, as attach and
+   * exec start do, and returns the raw connection once it has.
+   */
+  hijack(
+    path: string,
+    body?: unknown,
+    options: { readonly timeout?: number } = {}
+  ): Effect.Effect<Duplex, DockerEngineError> {
+    const operation = `POST ${path.split("?")[0] ?? path}`
+    const socketPath = this.socketPath
+    return Effect.callback<Duplex, DockerEngineError>((resume) => {
+      const encoded =
+        body === undefined ? undefined : Buffer.from(JSON.stringify(body))
+      const call = request({
+        headers: {
+          Connection: "Upgrade",
+          Upgrade: "tcp",
+          ...(encoded && {
+            "Content-Length": String(encoded.byteLength),
+            "Content-Type": "application/json",
+          }),
+        },
+        method: "POST",
+        path,
+        socketPath,
+      })
+      let settled = false
+      const fail = (
+        reason: string,
+        details: { cause?: unknown; status?: number } = {}
+      ) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        call.destroy()
+        resume(
+          Effect.fail(new DockerEngineError({ operation, reason, ...details }))
+        )
+      }
+      const timeout = options.timeout ?? 10_000
+      const timer = setTimeout(
+        () => fail(`Docker did not start ${operation} within ${timeout} ms`),
+        timeout
+      )
+      call.on("upgrade", (_response, socket, head) => {
+        if (settled) {
+          socket.destroy()
+          return
+        }
+        settled = true
+        clearTimeout(timer)
+        // Output that came in the same packet as the upgrade response.
+        if (head.length > 0) socket.unshift(head)
+        resume(Effect.succeed(socket))
+      })
+      call.on("response", (response) => {
+        const status = response.statusCode ?? 500
+        const chunks: Array<Buffer> = []
+        response.on("data", (chunk: Buffer) => chunks.push(chunk))
+        response.on("end", () =>
+          fail(
+            status >= 400
+              ? `Error response from daemon: ${daemonMessage(Buffer.concat(chunks), status)}`
+              : `Docker answered ${operation} without upgrading the connection`,
+            { status }
+          )
+        )
+      })
+      call.on("error", (cause) =>
+        fail(transportFailure(cause, socketPath, operation), { cause })
+      )
+      call.end(encoded)
+      return Effect.sync(() => {
+        settled = true
+        clearTimeout(timer)
+        call.destroy()
+      })
+    })
+  }
+
   resizeExec(
     id: string,
     size: { readonly columns: number; readonly rows: number }
@@ -449,17 +693,26 @@ export class DockerEngine {
     })
   }
 
-  // The output ends as the process exits; its code can be recorded just after.
+  // The output ends as the process exits; Docker records its code just
+  // after, which can take a while on a busy host.
   #execExitCode(id: string): Effect.Effect<number, DockerEngineError> {
     const inspect = this.#json<{
       readonly ExitCode: number | null
       readonly Running: boolean
     }>({ method: "GET", path: `/exec/${segment(id)}/json` })
     return Effect.gen(function* () {
-      for (let attempt = 0; ; attempt += 1) {
+      let waited = 0
+      for (let delay = 25; ; delay = Math.min(delay * 2, 500)) {
         const exec = yield* inspect
-        if (!exec.Running || attempt >= 20) return exec.ExitCode ?? -1
-        yield* Effect.sleep(25)
+        if (!exec.Running && exec.ExitCode !== null) return exec.ExitCode
+        if (waited >= EXIT_CODE_WAIT_MS) {
+          return yield* new DockerEngineError({
+            operation: "GET /exec/{id}/json",
+            reason: `Docker didn't report the exit code of exec ${id.slice(0, 12)} within ${EXIT_CODE_WAIT_MS} ms`,
+          })
+        }
+        yield* Effect.sleep(delay)
+        waited += delay
       }
     })
   }
@@ -522,6 +775,25 @@ export class DockerEngine {
     })
   }
 
+  /** A bridge network. */
+  createNetwork(options: {
+    readonly name: string
+    readonly internal?: boolean
+    readonly labels?: Readonly<Record<string, string>>
+    readonly subnet?: string
+  }): Effect.Effect<{ readonly Id: string }, DockerEngineError> {
+    return this.#json({
+      body: {
+        Internal: options.internal ?? false,
+        Labels: { ...options.labels },
+        Name: options.name,
+        ...(options.subnet && { IPAM: { Config: [{ Subnet: options.subnet }] } }),
+      },
+      method: "POST",
+      path: "/networks/create",
+    })
+  }
+
   removeNetwork(reference: string): Effect.Effect<void, DockerEngineError> {
     return this.#empty({
       method: "DELETE",
@@ -544,6 +816,40 @@ export class DockerEngine {
     }).pipe(Effect.map((answer) => answer.Volumes ?? []))
   }
 
+  /**
+   * A local volume. Docker answers with the existing volume when one has the
+   * name.
+   */
+  createVolume(options: {
+    readonly name: string
+    readonly labels?: Readonly<Record<string, string>>
+  }): Effect.Effect<DockerVolume, DockerEngineError> {
+    return this.#json({
+      body: {
+        Labels: { ...options.labels },
+        Name: options.name,
+      },
+      method: "POST",
+      path: "/volumes/create",
+    })
+  }
+
+  /**
+   * How much each volume holds, as `docker system df -v`. Docker walks every
+   * volume to answer, so ask only when someone wants the figure.
+   */
+  volumeUsage(
+    options: { readonly timeout?: number } = {}
+  ): Effect.Effect<ReadonlyArray<DockerVolumeUsage>, DockerEngineError> {
+    return this.#json<{
+      readonly Volumes?: ReadonlyArray<DockerVolumeUsage> | null
+    }>({
+      method: "GET",
+      path: `/system/df${query({ type: "volume" })}`,
+      timeout: options.timeout,
+    }).pipe(Effect.map((answer) => answer.Volumes ?? []))
+  }
+
   inspectVolume(name: string): Effect.Effect<DockerVolume, DockerEngineError> {
     return this.#json({ method: "GET", path: `/volumes/${segment(name)}` })
   }
@@ -563,6 +869,52 @@ export class DockerEngine {
     })
   }
 
+  /**
+   * Pulls an image, as `docker pull`, with credentials for its registry from
+   * the Docker config file (see `./registry-auth.js`). Each progress
+   * message goes to `onLine` the way the CLI printed it without a terminal,
+   * ending with the image's full reference.
+   */
+  pullImage(
+    image: string,
+    options: {
+      readonly onLine?: (line: string) => void
+      readonly timeout?: number
+    } = {}
+  ): Effect.Effect<void, DockerEngineError> {
+    return Effect.gen({ self: this }, function* () {
+      const reference = yield* Effect.try({
+        try: () => parseImageReference(image),
+        catch: (cause) =>
+          new DockerEngineError({
+            cause,
+            operation: "POST /images/create",
+            reason: cause instanceof Error ? cause.message : String(cause),
+          }),
+      })
+      const auth = yield* registryAuthHeader(reference)
+      const progress = progressReader(options.onLine)
+      yield* this.#exchange({
+        ...(auth && { headers: { "X-Registry-Auth": auth } }),
+        method: "POST",
+        onData: progress.read,
+        path: `/images/create${query({
+          fromImage: repositoryName(reference),
+          tag: reference.digest ?? reference.tag ?? "latest",
+        })}`,
+        timeout: options.timeout ?? 300_000,
+      })
+      const problem = progress.end()
+      if (problem !== undefined) {
+        return yield* new DockerEngineError({
+          operation: "POST /images/create",
+          reason: problem,
+        })
+      }
+      options.onLine?.(normalizedReference(reference))
+    })
+  }
+
   /** `docker image rm --force`. */
   removeImage(reference: string): Effect.Effect<void, DockerEngineError> {
     return this.#empty({
@@ -572,11 +924,51 @@ export class DockerEngine {
     })
   }
 
-  inspectImage(image: string): Effect.Effect<DockerImage, DockerEngineError> {
+  /** `A` is how the caller reads Docker's answer; nothing checks it. */
+  inspectImage<A = DockerImage>(
+    image: string
+  ): Effect.Effect<A, DockerEngineError> {
     return this.#json({
       method: "GET",
       path: `/images/${imageSegment(image)}/json`,
     })
+  }
+
+  /**
+   * `docker image tag <source> <reference>`: points `reference`, a name
+   * with an optional tag, at the image `source` names.
+   */
+  tagImage(
+    source: string,
+    reference: string
+  ): Effect.Effect<void, DockerEngineError> {
+    const operation = "POST /images/{name}/tag"
+    return Effect.try({
+      try: () => parseImageReference(reference),
+      catch: (cause) =>
+        new DockerEngineError({
+          cause,
+          operation,
+          reason: cause instanceof Error ? cause.message : String(cause),
+        }),
+    }).pipe(
+      Effect.flatMap((target) =>
+        target.digest === undefined
+          ? this.#empty({
+              method: "POST",
+              path: `/images/${imageSegment(source)}/tag${query({
+                repo: repositoryName(target),
+                tag: target.tag ?? "latest",
+              })}`,
+            })
+          : Effect.fail(
+              new DockerEngineError({
+                operation,
+                reason: `refusing to create a tag with a digest reference: ${reference}`,
+              })
+            )
+      )
+    )
   }
 
   // ---------------------------------------------------------------- transport
@@ -612,12 +1004,13 @@ export class DockerEngine {
           : Buffer.from(JSON.stringify(exchange.body))
       const call = request({
         agent,
-        headers: body
-          ? {
-              "Content-Length": String(body.byteLength),
-              "Content-Type": "application/json",
-            }
-          : undefined,
+        headers: {
+          ...exchange.headers,
+          ...(body && {
+            "Content-Length": String(body.byteLength),
+            "Content-Type": "application/json",
+          }),
+        },
         method: exchange.method,
         path: exchange.path,
         socketPath,
@@ -701,6 +1094,244 @@ export class DockerEngine {
   }
 }
 
+/**
+ * A process started with `execProcess`, or a container attached to before
+ * it starts: its stdio over the upgraded connection, multiplexed as Docker
+ * sends it without a TTY.
+ */
+export class DockerExecProcess {
+  readonly stdin: Writable
+  readonly stdout = new PassThrough()
+  readonly stderr = new PassThrough()
+  readonly #socket: Duplex
+  readonly #ended: Promise<Error | null>
+  readonly #exitCode: Effect.Effect<number, DockerEngineError>
+  /** What runs, for messages. */
+  readonly program: string
+  #killed = false
+
+  constructor(
+    socket: Duplex,
+    attachStdin: boolean,
+    exitCode: Effect.Effect<number, DockerEngineError>,
+    program: string
+  ) {
+    this.#socket = socket
+    this.#exitCode = exitCode
+    this.program = program
+    this.stdin = new Writable({
+      // Input the process can no longer read (it exited, or its connection
+      // closed) is dropped: what happened to the process is reported by its
+      // output and exit code, not as a write error.
+      write: (chunk: Buffer, _encoding, callback) => {
+        if (!attachStdin || socket.destroyed || !socket.writable) callback()
+        else socket.write(chunk, () => callback())
+      },
+      // Half-closes the connection: Docker closes the process's stdin and
+      // keeps sending its output.
+      final: (callback) => {
+        if (!socket.destroyed) socket.end()
+        callback()
+      },
+    })
+    // How the process failed reaches callers through `exitCode`, and through
+    // the streams to those that pipe or write them; a stream nobody listens
+    // to failing must not become an uncaught error that stops the Relay.
+    for (const stream of [this.stdin, this.stdout, this.stderr]) {
+      stream.on("error", ignoreStreamError)
+    }
+    // Reading waits for whichever reader is behind.
+    const behind = new Set<PassThrough>()
+    const demultiplex = demultiplexer(false, (stream, payload) => {
+      const target = stream === "stderr" ? this.stderr : this.stdout
+      if (target.write(payload) || behind.has(target)) return
+      behind.add(target)
+      socket.pause()
+      target.once("drain", () => {
+        behind.delete(target)
+        if (behind.size === 0) socket.resume()
+      })
+    })
+    this.#ended = new Promise((resolve) => {
+      let failure: Error | null = null
+      socket.on("data", (chunk: Buffer) => {
+        const problem = demultiplex(chunk)
+        if (problem !== undefined) {
+          failure = new Error(problem)
+          socket.destroy()
+        }
+      })
+      socket.on("error", (cause: Error) => {
+        failure ??= cause
+      })
+      socket.once("close", () => {
+        // A process that stops before reading all of its input stops its
+        // writer too, instead of having the rest read for nothing.
+        if (attachStdin && !this.stdin.writableFinished) {
+          this.stdin.destroy(
+            new Error(`${program} stopped before reading all of its input`)
+          )
+        }
+        const error = this.#killed ? null : failure
+        if (error) {
+          this.stdout.destroy(error)
+          this.stderr.destroy(error)
+        } else {
+          this.stdout.end()
+          this.stderr.end()
+        }
+        resolve(error)
+      })
+    })
+  }
+
+  /**
+   * The process's exit code, once its output has ended; -1 after `kill()`,
+   * which leaves the process to notice its closed stdio.
+   */
+  get exitCode(): Effect.Effect<number, DockerEngineError> {
+    const operation = `exec ${this.program}`
+    return Effect.promise(() => this.#ended).pipe(
+      Effect.flatMap((failure) =>
+        this.#killed
+          ? Effect.succeed(-1)
+          : failure
+            ? Effect.fail(
+                new DockerEngineError({
+                  cause: failure,
+                  operation,
+                  reason: `Docker closed ${operation} early: ${failure.message}`,
+                })
+              )
+            : this.#exitCode
+      )
+    )
+  }
+
+  /**
+   * Waits for `exitCode`, for stream-based callers, killing the process when
+   * it takes longer than `timeout` or `signal` aborts (failing with its
+   * reason).
+   */
+  async waitFor(options: {
+    readonly signal?: AbortSignal
+    readonly timeout: number
+    readonly timedOut: string
+  }): Promise<number> {
+    const { signal } = options
+    const exited = this.exitCode.pipe(
+      Effect.mapError((cause): unknown => cause),
+      Effect.timeoutOrElse({
+        duration: options.timeout,
+        orElse: () => Effect.fail<unknown>(new Error(options.timedOut)),
+      })
+    )
+    const outcome = await Effect.runPromise(
+      Effect.result(
+        (signal ? Effect.raceFirst(exited, aborted(signal)) : exited).pipe(
+          Effect.tapError(() => Effect.sync(() => this.kill()))
+        )
+      )
+    )
+    if (Result.isFailure(outcome)) throw outcome.failure
+    return outcome.success
+  }
+
+  /**
+   * Closes the connection, as stopping a `docker exec` client did. Returns
+   * whether that stopped the process, rather than it having ended already.
+   */
+  kill(): boolean {
+    if (this.#socket.destroyed) return false
+    this.#killed = true
+    this.#socket.destroy()
+    return true
+  }
+}
+
+/**
+ * Streams input into a process (`input` pipes into its stdin) and waits for
+ * it to exit (`exited`). A process that fails on its own, such as a database
+ * client rejecting the input, reports its error rather than the input's
+ * stream; input that fails first stops the process and reports its own.
+ */
+export async function streamIntoProcess(
+  process: DockerExecProcess,
+  input: () => Promise<void>,
+  exited: () => Promise<void>
+): Promise<void> {
+  const settle = (run: () => Promise<void>) =>
+    Effect.runPromise(
+      Effect.result(Effect.tryPromise({ try: run, catch: (cause) => cause }))
+    )
+  const finished = settle(exited)
+  const piped = await settle(input)
+  const stopped = Result.isFailure(piped) && process.kill()
+  const outcome = await finished
+  if (Result.isFailure(piped) && stopped) throw piped.failure
+  if (Result.isFailure(outcome)) throw outcome.failure
+  if (Result.isFailure(piped)) throw piped.failure
+}
+
+/**
+ * Writes `input` to a process's stdin, closes it, and returns the process's
+ * output once it exits, failing with its stderr when it exits with a
+ * non-zero code, as a CLI client run with `-i` reported it.
+ */
+export function completeWithInput(
+  process: DockerExecProcess,
+  options: {
+    readonly input?: string | Uint8Array
+    readonly maxOutputBytes: number
+    readonly operation: string
+    /** Why output past `maxOutputBytes` failed. */
+    readonly overflow: string
+  }
+): Effect.Effect<DockerOutput, DockerEngineError> {
+  const { operation } = options
+  return Effect.gen(function* () {
+    const output = outputCollector(options.maxOutputBytes, options.overflow)
+    let overflow: string | undefined
+    const collect = (stream: "stderr" | "stdout") => (chunk: Buffer) => {
+      if (overflow !== undefined) return
+      overflow = output.add(stream, chunk)
+      if (overflow !== undefined) process.kill()
+    }
+    process.stdout.on("data", collect("stdout"))
+    process.stderr.on("data", collect("stderr"))
+    // A process that exits without reading its input isn't an error.
+    process.stdin.on("error", () => undefined)
+    process.stdin.end(options.input ?? "")
+    const exitCode = yield* process.exitCode
+    if (overflow !== undefined) {
+      return yield* new DockerEngineError({ operation, reason: overflow })
+    }
+    const result = output.read()
+    if (exitCode !== 0) {
+      return yield* new DockerEngineError({
+        operation,
+        reason:
+          result.stderr.trim() ||
+          `${process.program} exited with code ${exitCode}`,
+      })
+    }
+    return result
+  })
+}
+
+// Fails with the signal's reason once it aborts.
+function aborted(signal: AbortSignal): Effect.Effect<never, unknown> {
+  return Effect.callback<never, unknown>((resume) => {
+    const abort = () => resume(Effect.fail(signal.reason))
+    if (signal.aborted) {
+      abort()
+      return
+    }
+    signal.addEventListener("abort", abort, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", abort))
+  })
+}
+
 export function isDockerNotFound(cause: unknown): boolean {
   return cause instanceof DockerEngineError && cause.status === 404
 }
@@ -732,6 +1363,62 @@ export function dockerTimestamp(value: string): string {
   }
   const remainder = ((milliseconds % 1_000) + 1_000) % 1_000
   return `${Math.floor(milliseconds / 1_000)}.${String(remainder * 1_000_000).padStart(9, "0")}`
+}
+
+/**
+ * Reads Docker's JSON progress stream (pulls, builds, pushes) a line at a
+ * time, handing each message to `onLine` as the CLI printed it without a
+ * terminal. Repeated progress updates for one layer are printed once. An
+ * error Docker reports within the stream ends it with its message.
+ */
+function progressReader(onLine: ((line: string) => void) | undefined) {
+  let problem: string | undefined
+  const printed = new Set<string>()
+  const lines = lineReader((line) => {
+    if (problem !== undefined || !line.trim()) return
+    const parsed = Result.getOrUndefined(
+      Result.try((): unknown => JSON.parse(line))
+    )
+    if (!Predicate.isObject(parsed)) return
+    const message = parsed as Record<string, unknown>
+    const text = (value: unknown) =>
+      Predicate.isString(value) ? value : undefined
+    const detail = Predicate.isObject(message.errorDetail)
+      ? (message.errorDetail as Record<string, unknown>)
+      : undefined
+    const error = text(detail?.message) ?? text(message.error)
+    if (error !== undefined) {
+      problem = error
+      return
+    }
+    const stream = text(message.stream)
+    if (stream !== undefined) {
+      for (const part of stream.split("\n")) {
+        if (part.trim()) onLine?.(part.replace(/\r$/u, ""))
+      }
+      return
+    }
+    const status = text(message.status)
+    if (status === undefined) return
+    const id = text(message.id)
+    const progress = message.progressDetail
+    if (Predicate.isObject(progress) && Object.keys(progress).length > 0) {
+      const key = `${id ?? ""}\u0000${status}`
+      if (printed.has(key)) return
+      printed.add(key)
+    }
+    onLine?.(id ? `${id}: ${status}` : status)
+  })
+  return {
+    end: (): string | undefined => {
+      lines.flush()
+      return problem
+    },
+    read: (chunk: Buffer): string | undefined => {
+      lines.read(chunk)
+      return problem
+    },
+  }
 }
 
 function logsPath(
@@ -768,6 +1455,8 @@ function withTimeout<A>(
     })
   )
 }
+
+function ignoreStreamError() {}
 
 /**
  * Splits a non-TTY stream into stdout and stderr: each frame is a stream byte,
@@ -904,4 +1593,15 @@ function query(
   }
   const encoded = search.toString()
   return encoded ? `?${encoded}` : ""
+}
+
+// Pulls an image Docker doesn't have yet.
+export function ensureImage(
+  engine: DockerEngine,
+  image: string
+): Effect.Effect<void, DockerEngineError> {
+  return engine.inspectImage(image).pipe(
+    Effect.catch(() => engine.pullImage(image, { timeout: 300_000 })),
+    Effect.asVoid
+  )
 }

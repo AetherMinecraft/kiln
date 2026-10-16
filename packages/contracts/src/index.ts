@@ -191,9 +191,14 @@ export const relayDatabaseNetworkSchema = z
   })
   .strict()
 
+// A text SQL dump, or a PostgreSQL custom-format dump (pg_dump -Fc) in
+// base64. Either holds at most 700 KB of dump; base64 makes that ~933 KB.
+export const relayDatabaseDumpFormatSchema = z.enum(["sql", "postgres-custom"])
+
 export const relayDatabaseDumpSchema = z
   .object({
-    content: z.string().max(700_000),
+    content: z.string().max(940_000),
+    format: relayDatabaseDumpFormatSchema.optional(),
     databaseId: databaseIdSchema,
     password: z.string().min(24).max(256),
     username: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/u),
@@ -202,7 +207,29 @@ export const relayDatabaseDumpSchema = z
 
 export const relayDatabaseExportSchema = relayDatabaseDumpSchema.omit({
   content: true,
+  format: true,
 })
+
+export const relayDatabaseInspectRequestSchema = z
+  .object({ databaseId: databaseIdSchema })
+  .strict()
+
+// The database's container as Docker has it: its name, its data volume's
+// folder on the host, and how much that volume holds, or null when Docker
+// can't say.
+export const relayDatabaseContainerSchema = z
+  .object({
+    containerName: z.string().min(1).max(256),
+    dataDirectory: z.string().min(1).max(4096).nullable(),
+    volumeBytes: z.number().int().nonnegative().nullable(),
+  })
+  .strict()
+
+export const relayDatabaseWipeSchema = relayDatabaseExportSchema
+
+export const relayStateDatabaseReadSchema = z
+  .object({ request: databaseReadRequestSchema })
+  .strict()
 
 export const relayDatabaseDataReadSchema = relayDatabaseExportSchema.extend({
   request: databaseReadRequestSchema,
@@ -310,6 +337,39 @@ export const relayDatabaseTerminalClaimSchema = z
     attachmentId: databaseTerminalIdSchema,
   })
   .strict()
+
+// Host shells use the same session protocol as database and app terminals.
+export const relayHostTerminalAttachSchema =
+  relayDatabaseTerminalAttachSchema.omit({
+    databaseId: true,
+    password: true,
+    username: true,
+  })
+export const relayHostTerminalWriteSchema =
+  relayDatabaseTerminalWriteSchema.omit({ databaseId: true })
+export const relayHostTerminalClaimSchema =
+  relayDatabaseTerminalClaimSchema.omit({ databaseId: true })
+export const relayHostFilesSchema = z.object({
+  // `mounting` while the Relay restarts itself with the host's filesystem.
+  status: z.enum(["disabled", "unmounted", "mounting", "ready"]),
+  // Why the Relay can't read or change some host files, when it can tell.
+  limitation: z
+    .enum(["rootless", "user-namespace", "non-root", "selinux", "read-only"])
+    .nullable(),
+  // Why the last attempt to mount the host's filesystem failed.
+  mountError: z.string().nullable(),
+})
+export type RelayHostFiles = z.infer<typeof relayHostFilesSchema>
+export const relayHostAccessSchema = z.object({
+  terminal: z.boolean(),
+  files: relayHostFilesSchema,
+  /**
+   * The Relay's data folder on its host, where its database and the bundled
+   * Traefik's files are, for opening them in its host files. Absent from
+   * older Relays.
+   */
+  dataDirectory: z.string().min(1).optional(),
+})
 
 // Relay to Hearth: output for one attachment, in order. `ended` arrives with
 // the session's last output. Not strict: a Relay newer than its Hearth may
@@ -1111,6 +1171,35 @@ export const relayProxyDiagnosticsSchema = z
   })
   .strict()
 
+// What the Relay's proxy serves: the Traefik configuration it generates (the
+// static file only for its bundled Traefik), and each web route with the
+// server or app it reaches.
+export const relayProxyConfigurationSchema = z.object({
+  // Both files only exist for the bundled Traefik.
+  dynamicConfiguration: z.string().nullable(),
+  routes: z.array(
+    z.object({
+      hostname: z.string(),
+      id: z.string(),
+      name: z.string(),
+      owner: z.object({
+        id: z.string(),
+        kind: z.enum(["app", "server"]),
+        service: z.string().nullable(),
+      }),
+      path: z.string().nullable(),
+      stripPrefix: z.boolean(),
+      targetPort: z.number().int(),
+      upstream: z.string(),
+    })
+  ),
+  staticConfiguration: z.string().nullable(),
+})
+
+export type RelayProxyConfiguration = z.infer<
+  typeof relayProxyConfigurationSchema
+>
+
 export const relayInstanceResourcesSchema = z.object({
   sampledAt: z.string().datetime(),
   cpu: z.object({
@@ -1315,6 +1404,8 @@ export const relayInstanceSchema = z.object({
   connectAddress: z.string().min(1),
   service: z.string().min(1),
   directory: z.string().min(1),
+  // The server's folder on the Relay's host. Absent from older Relays.
+  hostDirectory: z.string().min(1).optional(),
   desiredState: relayDesiredStateSchema,
   observedState: relayObservedStateSchema,
   stateReason: relayInstanceStateReasonSchema.nullable().default(null),
@@ -1399,6 +1490,7 @@ export const relayTailscaleStackSchema = z
 export const relayTailscaleStacksSchema = z.array(relayTailscaleStackSchema)
 
 export const relayNodeCapabilitySchema = z.enum([
+  "schedule-continue-on-failure",
   "tailscale-stacks",
   "tailscale-staged-removal",
 ])
@@ -1437,6 +1529,24 @@ export const relayProcessMemorySchema = z.object({
     .nullable(),
 })
 
+/**
+ * A Hearth or Relay update a Relay ran, from its own records. Its result
+ * outlives the Hearth that asked for it, so a Hearth replaced mid-update
+ * learns how it went from the Relay instead of the lost reply.
+ */
+export const relaySystemUpdateSchema = z.object({
+  id: z.uuid(),
+  component: z.enum(["hearth", "relay"]),
+  error: z.string().max(2_000).nullable(),
+  finishedAt: z.string().datetime().nullable(),
+  phase: z.string().max(100).optional(),
+  /** The Hearth request that started it, when Hearth named one. */
+  requestId: z.uuid().optional(),
+  startedAt: z.string().datetime(),
+  status: z.enum(["failed", "running", "succeeded"]),
+  version: z.string().min(1).max(100),
+})
+
 export const relayNodeSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -1447,9 +1557,19 @@ export const relayNodeSchema = z.object({
   arch: z.string().min(1),
   uptimeSeconds: z.number().nonnegative().nullable().default(null),
   startedAt: z.string().datetime().nullable().default(null),
+  /**
+   * When the node itself booted, to the minute. Absent from Relays that
+   * predate it. `startedAt` and `uptimeSeconds` are the Relay's own.
+   */
+  bootedAt: z.string().datetime().optional(),
   cpu: z.object({
     cores: z.number().int().positive(),
     loadPercent: z.number().min(0),
+    /**
+     * Like "AMD EPYC 7763 64-Core Processor". Absent when the CPU doesn't
+     * say, and from Relays that predate it.
+     */
+    model: z.string().min(1).max(200).optional(),
   }),
   memory: z.object({
     totalBytes: z.number().nonnegative(),
@@ -1463,9 +1583,27 @@ export const relayNodeSchema = z.object({
     available: z.boolean(),
     version: z.string().nullable(),
   }),
+  /**
+   * The host's operating system as Docker reports it, like "Ubuntu 24.04.1
+   * LTS". Absent when Docker can't say, and from Relays that predate it.
+   */
+  operatingSystem: z.string().min(1).max(200).optional(),
   connectedAt: z.string().datetime(),
   /** Absent from Relays that predate memory reporting. */
   relayMemory: relayProcessMemorySchema.optional(),
+  /**
+   * The Relay's own usage, sampled like a server's: its container's CPU and
+   * memory, and everything Kiln keeps in the Relay's data directory measured
+   * against the node's disk. Absent until the first sample, and from Relays
+   * that predate it.
+   */
+  relayResources: relayInstanceResourcesSchema.optional(),
+  /**
+   * The latest update of each container this Relay updates (itself, and
+   * Hearth when it shares the Docker host), running or finished. Absent from
+   * Relays that predate it.
+   */
+  updates: z.array(relaySystemUpdateSchema).max(8).optional(),
 })
 
 export const relaySftpPublicationStatusSchema = z.enum([
@@ -1909,7 +2047,14 @@ export type RelayRotateDatabaseCredentials = z.infer<
 >
 export type RelayDatabaseNetwork = z.infer<typeof relayDatabaseNetworkSchema>
 export type RelayDatabaseDump = z.infer<typeof relayDatabaseDumpSchema>
+export type RelayDatabaseDumpFormat = z.infer<
+  typeof relayDatabaseDumpFormatSchema
+>
 export type RelayDatabaseExport = z.infer<typeof relayDatabaseExportSchema>
+export type RelayDatabaseContainer = z.infer<
+  typeof relayDatabaseContainerSchema
+>
+export type RelayDatabaseWipe = z.infer<typeof relayDatabaseWipeSchema>
 export type RelayDatabaseDataRead = z.infer<typeof relayDatabaseDataReadSchema>
 export type DatabaseTerminalControl = z.infer<
   typeof databaseTerminalControlSchema
@@ -2041,6 +2186,7 @@ export type RelayInstanceCustomRouteLabel = z.infer<
 export type RelayInstance = z.infer<typeof relayInstanceSchema>
 export type RelaySnapshotDelta = z.infer<typeof relaySnapshotDeltaSchema>
 export type RelayNode = z.infer<typeof relayNodeSchema>
+export type RelaySystemUpdate = z.infer<typeof relaySystemUpdateSchema>
 export type RelaySnapshot = z.infer<typeof relaySnapshotSchema>
 export type RelayProcessMemory = z.infer<typeof relayProcessMemorySchema>
 
@@ -2172,6 +2318,7 @@ function relayNodeControlState(node: RelayNode) {
     cpu: _cpu,
     memory: _memory,
     relayMemory: _relayMemory,
+    relayResources: _relayResources,
     storage: _storage,
     uptimeSeconds: _uptimeSeconds,
     ...control

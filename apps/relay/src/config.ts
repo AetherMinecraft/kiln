@@ -27,6 +27,8 @@ export interface RelayInstanceConfig {
   brickSnapshotSha256?: string
   connectAddress: string
   directory: string
+  // The server's folder on the Relay's host, its /server bind mount's source.
+  hostDirectory?: string
   game: string
   id: string
   shortId: string
@@ -73,7 +75,6 @@ export interface RelayConfig {
   }
   canProvisionInstances: boolean
   coolifyPublicOrigin: string | null
-  composeFile: string
   connectDomain: string
   connectPort: number
   directBrowserOrigin: string
@@ -81,6 +82,12 @@ export interface RelayConfig {
   discoveredPublicIp: string | null
   dockerSocket: string
   dataDirectory: string
+  // Whether Hearth may open shells on, and browse the files of, the host the
+  // Relay runs on. Docker access already amounts to root there; this lets an
+  // operator keep it out of the panel.
+  hostAccess: boolean
+  // Where the host's filesystem is mounted; Files are off when it isn't.
+  hostRootDirectory: string
   gameHost: string
   gamePortRange: {
     end: number
@@ -99,8 +106,6 @@ export interface RelayConfig {
   port: number
   platformBackupKey: string | null
   publicPort: number
-  projectDirectory: string
-  projectName: string
   proxyMode: RelayProxyMode
   resourceNamespace: string | null
   rootDirectory: string
@@ -218,7 +223,6 @@ export function loadConfig(
       true
     ),
     coolifyPublicOrigin,
-    composeFile: `${dataDirectory}/instances/compose.yaml`,
     connectDomain: "test",
     connectPort: 25_565,
     directBrowserOrigin,
@@ -226,6 +230,8 @@ export function loadConfig(
     discoveredPublicIp: null,
     dockerSocket: "/var/run/docker.sock",
     dataDirectory,
+    hostAccess: booleanEnvironment(environment.KILN_RELAY_HOST_ACCESS, true),
+    hostRootDirectory: environment.KILN_RELAY_HOST_ROOT?.trim() || "/host",
     gameHost,
     gamePortRange: relayGamePortRange(environment),
     gameHostSource,
@@ -241,10 +247,6 @@ export function loadConfig(
     port,
     platformBackupKey: optionalPlatformBackupKey(environment),
     publicPort,
-    projectDirectory: `${dataDirectory}/instances`,
-    projectName: resourceNamespace
-      ? `${resourceNamespace}-mc-servers`
-      : "mc-servers",
     proxyMode,
     resourceNamespace,
     rootDirectory: `${dataDirectory}/instances`,
@@ -709,4 +711,10 @@ function highEntropySecret(
 
 function formatUrlHost(value: string): string {
   return value.includes(":") && !value.startsWith("[") ? `[${value}]` : value
+}
+
+export function relayStateDatabasePath(
+  config: Pick<RelayConfig, "dataDirectory">
+): string {
+  return `${config.dataDirectory}/network/relay.sqlite`
 }

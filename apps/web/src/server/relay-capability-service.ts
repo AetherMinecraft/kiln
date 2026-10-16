@@ -1,13 +1,15 @@
 import { createHash, randomUUID, sign } from "node:crypto"
 
-import * as Sentry from "@sentry/tanstackstart-react"
 import {
   relayBrowserCapabilityV2Feature,
   relayBrowserLeaseRenewalV1Feature,
   relayConsoleReadActions,
   relayConsoleResourcesV1Feature,
   relayAppsV1Feature,
+  relayLogsV1Feature,
   appIdFromFileRoot,
+  isRelayFileRoot,
+  relayHostFilesV1Feature,
   relayFileRequestReplayV1Feature,
   relayProxyBrowserMetadataSchema,
   relayProxyDiagnosticsSchema,
@@ -42,7 +44,7 @@ import {
 import type { PersistedRelay, RelayCredentials } from "@/lib/relay-registry"
 import { CredentialError } from "@/effect/errors"
 import { recoverPromise } from "@/effect/promise"
-import { runAppEffect } from "@/effect/runtime"
+import { runAppEffect, traceAppPromise } from "@/effect/runtime"
 import type { AccessPermission } from "@/lib/permissions"
 
 type BrowserPublicKey = {
@@ -62,6 +64,9 @@ type BrowserAction =
   | "instance.files.download"
   | "instance.files.upload"
   | "instance.read"
+  | "relay.logs.read"
+  | "relay.files.download"
+  | "relay.files.upload"
 
 interface IssuedBrowserCapability {
   browserOrigin: string
@@ -312,22 +317,30 @@ export function issueFileCapabilityForRequest(input: {
 }): Promise<IssuedBrowserCapability> {
   // An app's data directory (`app:<appId>`) is transferred with the app's
   // own file actions.
+  const host = isRelayFileRoot(input.instanceId)
   const app = appIdFromFileRoot(input.instanceId) !== null
   return runAppEffect(
     "file.capability.issue",
     prepareBrowserCapabilityEffect({
       actions: [
-        app
+        host
           ? input.action === "instance.files.upload"
-            ? "app.files.upload"
-            : "app.files.download"
-          : input.action,
+            ? "relay.files.upload"
+            : "relay.files.download"
+          : app
+            ? input.action === "instance.files.upload"
+              ? "app.files.upload"
+              : "app.files.download"
+            : input.action,
       ],
       path: input.path,
       publicKeyJwk: input.publicKeyJwk,
       relayId: input.relayId,
       resolveBrowserMetadata: true,
-      resource: { id: input.instanceId, kind: app ? "app" : "instance" },
+      resource: {
+        id: input.instanceId,
+        kind: host ? "relay" : app ? "app" : "instance",
+      },
       identity: authenticatedIdentityEffect(input.authenticate),
       optInV2: input.optInV2,
     }).pipe(Effect.map((prepared) => prepared.capability))
@@ -376,7 +389,9 @@ const prepareBrowserCapabilityEffect = Effect.fn("relay.capability.prepare")(
 
     const operation: RelayBrowserOperationKind = input.actions.some(
       (action) =>
-        action.startsWith("instance.files.") || action.startsWith("app.files.")
+        action.startsWith("instance.files.") ||
+        action.startsWith("app.files.") ||
+        action.startsWith("relay.files.")
     )
       ? "file"
       : input.actions.includes("instance.read")
@@ -389,7 +404,8 @@ const prepareBrowserCapabilityEffect = Effect.fn("relay.capability.prepare")(
     const version = resourceVersion(
       input.resource,
       negotiatedVersion(operation, input.optInV2 ?? false, features),
-      features
+      features,
+      operation
     )
     if (version === 2 && identity.sessionId.length === 0) {
       return yield* Effect.fail(
@@ -468,6 +484,10 @@ const authorizeBrowserCapabilityEffect = Effect.fn(
   relayId: string
   resource: RelayConsoleResource
 }) {
+  // A Relay's own output is only ever the Relay the capability is for.
+  if (input.resource.kind === "relay" && input.resource.id !== input.relayId) {
+    return yield* Effect.fail(new Error("Relay not found"))
+  }
   for (
     let attempt = 0;
     attempt < MAX_AUTHORIZATION_STABILITY_ATTEMPTS;
@@ -497,67 +517,50 @@ const resolveRelayBrowserMetadataEffect = Effect.fn(
   "relay.capability.resolveBrowserMetadata"
 )(function* (relay: PersistedRelay) {
   return yield* Effect.promise(() =>
-    Sentry.startSpan(
-      {
-        name: "Resolve Relay browser metadata",
-        op: "rpc.relay.browser-metadata",
-      },
-      (span) =>
-        recoverPromise(
-          async () => {
-            const { relayConnectionBrowserMetadata, relayRpc } =
-              await import("@/lib/relay-connection")
-            const synchronized = relayConnectionBrowserMetadata(relay.id)
-            if (synchronized) {
-              span.setAttribute(
-                "kiln.console.metadata_shape",
-                "connection_snapshot"
-              )
-              return synchronized
-            }
-            const value = await relayRpc(
-              relay,
-              "relay.proxy.read",
-              { includeDiagnostics: false },
-              5_000
-            )
-            if (!value || typeof value !== "object") {
-              span.setAttribute(
-                "kiln.console.metadata_shape",
-                "registry_fallback"
-              )
-              return null
-            }
-            const response = Object.fromEntries(Object.entries(value))
-            const metadata = relayProxyBrowserMetadataSchema.safeParse(response)
-            if (metadata.success) {
-              span.setAttribute("kiln.console.metadata_shape", "lightweight")
-              return metadata.data
-            }
-            // Relays predating the lightweight metadata hint ignore its payload
-            // and return full diagnostics. Keep rolling upgrades compatible
-            // without adding a second RPC.
-            const diagnostics = relayProxyDiagnosticsSchema.parse(
-              response.diagnostics
-            )
-            const settings = relayProxySettingsSchema.parse(response.settings)
-            span.setAttribute(
-              "kiln.console.metadata_shape",
-              "legacy_diagnostics"
-            )
-            return {
-              browserOrigin: diagnostics.browserOrigin,
-              mode: settings.mode,
-            } satisfies RelayProxyBrowserMetadata
-          },
-          () => {
-            span.setAttribute(
-              "kiln.console.metadata_shape",
-              "registry_fallback"
-            )
+    traceAppPromise("relay.capability.browserMetadata.read", (span) =>
+      recoverPromise(
+        async () => {
+          const { relayConnectionBrowserMetadata, relayRpc } =
+            await import("@/lib/relay-connection")
+          const synchronized = relayConnectionBrowserMetadata(relay.id)
+          if (synchronized) {
+            span.attribute("kiln.console.metadata_shape", "connection_snapshot")
+            return synchronized
+          }
+          const value = await relayRpc(
+            relay,
+            "relay.proxy.read",
+            { includeDiagnostics: false },
+            5_000
+          )
+          if (!value || typeof value !== "object") {
+            span.attribute("kiln.console.metadata_shape", "registry_fallback")
             return null
           }
-        )
+          const response = Object.fromEntries(Object.entries(value))
+          const metadata = relayProxyBrowserMetadataSchema.safeParse(response)
+          if (metadata.success) {
+            span.attribute("kiln.console.metadata_shape", "lightweight")
+            return metadata.data
+          }
+          // Relays predating the lightweight metadata hint ignore its payload
+          // and return full diagnostics. Keep rolling upgrades compatible
+          // without adding a second RPC.
+          const diagnostics = relayProxyDiagnosticsSchema.parse(
+            response.diagnostics
+          )
+          const settings = relayProxySettingsSchema.parse(response.settings)
+          span.attribute("kiln.console.metadata_shape", "legacy_diagnostics")
+          return {
+            browserOrigin: diagnostics.browserOrigin,
+            mode: settings.mode,
+          } satisfies RelayProxyBrowserMetadata
+        },
+        () => {
+          span.attribute("kiln.console.metadata_shape", "registry_fallback")
+          return null
+        }
+      )
     )
   )
 })
@@ -585,7 +588,8 @@ const createBrowserCapabilityEffect = Effect.fn("relay.capability.sign")(
           (action) =>
             action === "instance.console.write" ||
             action === "instance.files.upload" ||
-            action === "app.files.upload"
+            action === "app.files.upload" ||
+            action === "relay.files.upload"
         )
         const payload = {
           actions: input.actions,
@@ -675,13 +679,21 @@ function negotiatedVersion(
 function resourceVersion(
   resource: RelayConsoleResource,
   version: 1 | 2,
-  features: ReadonlySet<string>
+  features: ReadonlySet<string>,
+  operation: RelayBrowserOperationKind = "console"
 ): 1 | 2 {
+  if (operation === "file" && resource.kind === "relay") {
+    if (version !== 2 || !features.has(relayHostFilesV1Feature))
+      throw new Error("Update this Relay to access host files.")
+    return version
+  }
+
   if (
     resource.kind !== "instance" &&
     (version !== 2 ||
       !features.has(relayConsoleResourcesV1Feature) ||
-      (resource.kind === "app" && !features.has(relayAppsV1Feature)))
+      (resource.kind === "app" && !features.has(relayAppsV1Feature)) ||
+      (resource.kind === "relay" && !features.has(relayLogsV1Feature)))
   ) {
     throw new Error("Update this Relay to view these logs.")
   }
@@ -713,8 +725,9 @@ function resourceScope(resource: RelayConsoleResource) {
       return { instanceId: resource.id }
     case "database":
       return { databaseId: resource.id }
-    // App permissions are granted on the Relay.
+    // App and Relay permissions are granted on the Relay.
     case "app":
+    case "relay":
       return {}
     default:
       return resource.kind satisfies never
@@ -756,6 +769,10 @@ function permissionForBrowserAction(action: BrowserAction): AccessPermission {
       return "instance.files.read"
     case "instance.files.upload":
       return "instance.files.write"
+    case "relay.files.download":
+      return "relay.files.read"
+    case "relay.files.upload":
+      return "relay.files.write"
     case "app.files.download":
       return "app.files.read"
     case "app.files.upload":

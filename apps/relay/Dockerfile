@@ -20,6 +20,7 @@ WORKDIR /source
 COPY --chown=vp:vp package.json pnpm-lock.yaml pnpm-workspace.yaml .node-version ./
 COPY --chown=vp:vp apps/relay/package.json ./apps/relay/package.json
 COPY --chown=vp:vp packages/contracts/package.json ./packages/contracts/package.json
+COPY --chown=vp:vp packages/telemetry/package.json ./packages/telemetry/package.json
 COPY --chown=vp:vp patches ./patches
 RUN --mount=type=cache,target=/home/vp/.local/share/pnpm/store,uid=1000,gid=1000,sharing=locked \
   vp install --frozen-lockfile --ignore-scripts --filter relay...
@@ -27,9 +28,20 @@ RUN --mount=type=cache,target=/home/vp/.local/share/pnpm/store,uid=1000,gid=1000
 COPY --chown=vp:vp tsconfig.json vite.config.ts release.json ./
 COPY --chown=vp:vp apps/relay ./apps/relay
 COPY --chown=vp:vp packages/contracts ./packages/contracts
+COPY --chown=vp:vp packages/telemetry ./packages/telemetry
 
 ARG SOURCE_COMMIT
 ARG KILN_VERSION
+# Telemetry defaults are baked into the bundle, not the image environment:
+# the Relay updater carries a container's environment into its replacement,
+# so image ENV values would outlive the release that set them.
+ARG OTEL_EXPORTER_OTLP_ENDPOINT
+ARG OTEL_EXPORTER_OTLP_HEADERS
+ARG OTEL_LOGS_EXPORTER
+ARG OTEL_METRICS_EXPORTER
+ARG OTEL_RESOURCE_ATTRIBUTES
+ARG OTEL_TRACES_EXPORTER
+ARG OTEL_TRACES_SAMPLER_ARG
 ENV SOURCE_COMMIT=$SOURCE_COMMIT
 ENV KILN_VERSION=$KILN_VERSION
 RUN vp run relay#build
@@ -49,7 +61,22 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
   && GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/kiln-relay-healthcheck .
 
-FROM docker:29.8.2-cli AS docker-cli
+# The standalone Compose and buildx binaries the Relay runs for app
+# deployments (Compose v5.5.1 and buildx v0.37.2, as docker:29.8.2-cli
+# bundled them), pinned by checksum for each architecture.
+FROM scratch AS compose-amd64
+ADD --checksum=sha256:db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576 --chmod=755 \
+  https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64 /docker-compose
+ADD --checksum=sha256:982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548 --chmod=755 \
+  https://github.com/docker/buildx/releases/download/v0.37.2/buildx-v0.37.2.linux-amd64 /docker-buildx
+
+FROM scratch AS compose-arm64
+ADD --checksum=sha256:732e3a84c1a0f67256ce80bc2598a24546b10ca05f9faa97efceb1171ece2ef7 --chmod=755 \
+  https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-aarch64 /docker-compose
+ADD --checksum=sha256:efa38cb7aa7db2dbb9ad049b00b0a9737f66f033626177b5a4e845184ad7ab29 --chmod=755 \
+  https://github.com/docker/buildx/releases/download/v0.37.2/buildx-v0.37.2.linux-arm64 /docker-buildx
+
+FROM compose-${TARGETARCH} AS compose
 
 FROM restic/restic:0.19.1 AS restic
 
@@ -59,14 +86,12 @@ ARG KILN_GIT_REPO=https://github.com/kiln-site/kiln
 ENV KILN_GIT_REPO=$KILN_GIT_REPO
 ENV KILN_DEFAULT_GIT_REPO=$KILN_GIT_REPO
 ENV NODE_ENV=production
-ARG SENTRY_DSN
-ENV SENTRY_DSN=$SENTRY_DSN
-ENV SENTRY_TRACES_SAMPLE_RATE=0.05
 WORKDIR /app
 
-COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
-COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
-COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
+# Compose runs on its own from PATH; buildx is a plugin, where Compose and
+# the Relay find it.
+COPY --from=compose /docker-compose /usr/local/bin/docker-compose
+COPY --from=compose /docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
 COPY --from=restic /usr/bin/restic /usr/bin/restic
 COPY --from=healthcheck /out/kiln-relay-healthcheck /usr/local/bin/kiln-relay-healthcheck
 COPY --from=runtime-deps /runtime/node_modules ./node_modules
@@ -92,4 +117,4 @@ EXPOSE 4100 2022
 # interval lets the self-updater see a replacement become healthy quickly.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --start-interval=1s --retries=3 \
   CMD ["/usr/local/bin/kiln-relay-healthcheck"]
-CMD ["--import", "./dist/instrument.mjs", "dist/src/index.mjs"]
+CMD ["dist/src/index.mjs"]

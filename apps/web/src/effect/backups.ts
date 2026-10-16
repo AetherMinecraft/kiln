@@ -43,6 +43,8 @@ import { loadBackupStorageCredentialEffect } from "@/backups/destinations/s3"
 const RESTIC_REPOSITORY_PASSWORD_PURPOSE = "kiln-restic-repository-password"
 // Running copy tasks untouched this long are treated as abandoned.
 const BACKUP_COPY_STALE_MS = 15 * 60 * 1000
+// The backups that count against a target's quantity limit.
+const COUNTED_BACKUP_STATUSES = "('queued', 'running', 'available', 'deleting')"
 
 interface BackupPolicyRow extends RowDataPacket {
   admin_quantity_limit: number | null
@@ -100,6 +102,14 @@ interface BackupCopyTaskRow extends RowDataPacket {
 interface BackupUsageRow extends RowDataPacket {
   quantity_used: number | string
   size_used: number | string
+}
+
+interface BackupQuantityRow extends RowDataPacket {
+  quantity_used: number | string
+}
+
+interface BackupUsageRow extends BackupQuantityRow {
+  quantity_available: number | string | null
 }
 
 interface BackupRow extends RowDataPacket {
@@ -562,7 +572,7 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
             WHERE backup.relay_id = ?
               AND backup.target_kind = ?
               AND backup.target_id = ?
-              AND backup.status IN ('queued', 'running', 'available', 'deleting')`,
+              AND backup.status IN ${COUNTED_BACKUP_STATUSES}`,
           [input.relayId, input.targetKind, input.targetId]
         )
         const usage = usageRows[0]
@@ -2850,6 +2860,54 @@ export const getBackupPolicyEffect = Effect.fn("backups.getPolicy")(function* (
     ),
     storageId: policy?.storage_id ?? null,
   } satisfies BackupPolicy
+})
+
+// How many backups a target keeps against its quantity limit, counted and
+// limited as a new backup's reservation is.
+export const getBackupUsageEffect = Effect.fn("backups.getUsage")(function* (
+  relayId: string,
+  targetKind: BackupTargetKind,
+  targetId: string
+) {
+  const database = yield* Database
+  const [usageRows, policyRows] = yield* Effect.all([
+    database.queryRows<BackupUsageRow>(
+      "backup_usage_get",
+      `SELECT COUNT(*) AS quantity_used,
+              SUM(backup.status = 'available') AS quantity_available
+         FROM ${databaseTable("backup")} backup
+        WHERE backup.relay_id = ?
+          AND backup.target_kind = ?
+          AND backup.target_id = ?
+          AND backup.status IN ${COUNTED_BACKUP_STATUSES}`,
+      [relayId, targetKind, targetId]
+    ),
+    database.queryRows<BackupPolicyRow>(
+      "backup_usage_policy_get",
+      `SELECT exclude_patterns, quantity_limit, size_limit_bytes, storage_id,
+              admin_quantity_limit, admin_size_limit_bytes
+         FROM ${databaseTable("backup_policy")}
+        WHERE relay_id = ? AND target_kind = ? AND target_id = ?
+        LIMIT 1`,
+      [relayId, targetKind, targetId]
+    ),
+  ])
+  const policy = policyRows[0]
+  return {
+    // Finished backups that can be restored.
+    quantityAvailable: safeDatabaseNumber(
+      usageRows[0]?.quantity_available ?? 0,
+      "available backup quantity"
+    ),
+    quantityLimit: effectiveBackupLimit(
+      policy?.quantity_limit ?? null,
+      policy?.admin_quantity_limit ?? null
+    ),
+    quantityUsed: safeDatabaseNumber(
+      usageRows[0]?.quantity_used ?? 0,
+      "backup quantity"
+    ),
+  }
 })
 
 export const updateBackupExcludesEffect = Effect.fn("backups.updateExcludes")(

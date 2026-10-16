@@ -1,9 +1,32 @@
 # Kiln agents
 
-Kiln is a fast, approachable, reliable self-hosted server platform panel/orchestrator. It's catered towards game servers (focus on Minecraft), but should be agnostic to other servers.
-Favor simple operation and existing patterns over new abstractions,
+Kiln is a self-hosted platform for managing apps, databases, and game servers.
+Favor simple operation and existing patterns.
 
-Performance/Speed and UX is always the most important thing to keep in mind for every change you do. Make sure any UI change doesn't cause react to re-render/paint other components. If needed react-scan and react-audit can be used to verify.
+Performance/Speed and UX is always the most important thing to keep in mind for every change you do.
+Avoid unnecessary React renders and paints outside the changed component.
+
+## Naming
+
+Users see different names than the code uses. Keep the code names; don't
+rename identifiers, routes, or wire formats to match the copy.
+User-facing name, then what the code calls it:
+
+- **Game Server**: `server` in Hearth's web UI (`/infra/servers`,
+  `/server/$serverId`, the picker kind `"server"`), and `instance` in the Relay
+  protocol, contracts, permissions (`instance.*`), and storage. CLI commands
+  keep `server` (`kiln servers list`, `kiln server info`).
+- **App**: `app`. **Database**: `database`.
+- **Relay**: `relay`, the host node that runs the containers.
+- **Hearth**: the web panel (`apps/web`).
+
+- Write "game server" in user-facing copy wherever a server sits beside Apps,
+  Databases, or Relays, or could be confused with a host: navigation, titles,
+  pickers, filters, kind labels, activity, and empty states. Inside one game
+  server's own pages, plain "server" is fine ("Server is running").
+- Never call a Relay or its host a "server" in copy; say "Relay" or "node".
+- "Instance" in copy means any managed resource (game server, database, app),
+  as in "All instances".
 
 <!-- intent-skills:start -->
 
@@ -25,10 +48,23 @@ Before editing files for a substantial task:
 - Keep `.agents/skills/kiln-cli/SKILL.md` in sync with CLI changes.
 - Follow the Testing rules below; prefer browser validation during
   development.
-- This project uses Sentry.io for errors, traces, session replays, and more. Review the
-  `sentry-cli` skill when debugging.
+- Hearth, Relays, and the browser export OpenTelemetry traces, logs, and
+  metrics through Effect (`packages/telemetry`), configured by `OTEL_*`
+  variables. Errors are error logs with `exception.*` attributes and an
+  `error.fingerprint` that groups occurrences. They currently go to Sentry
+  over OTLP: query them with `sentry log list` and
+  `sentry explore --dataset logs` (see the `sentry-cli` skill).
+- Name spans with `Effect.fn("Area.operation")` or `Effect.withSpan`, keep
+  names stable and put IDs in attributes. Give long-lived loops and workers no
+  span of their own, span each unit of work instead, and use metrics, not
+  spans, for hot paths.
 - Avoid patching framework/library internals unless explicitly given permission.
 - Use Sonner for transient feedback and shared tooltips
+- The Relay drives Docker through its Engine API client
+  (`apps/relay/src/docker-engine.ts`). Use the API for what the daemon does,
+  run Docker's standalone binaries only for client-side work like Compose and
+  builds, and never start the `docker` CLI. See
+  [Adding Docker calls](docs/relay-runtime.md#adding-docker-calls).
 - For user-visible or runtime work, use T3 Code's collaborative Preview against
   the URL printed by `pnpm dev:docker`; never use a local IP for
   development or validation.
@@ -88,83 +124,21 @@ Before writing any Effect code, first read `node_modules/effect/AGENTS.md`
 If you need to learn more about particular Effect apis and concepts that the
 guide doesn't cover, search through the source code in `node_modules/effect/src`.
 
-## Setup
+## Development and pull requests
 
-Run once per clone from `main`:
+- Follow [Development](docs/development.md) for prerequisites, commands,
+  worktree naming, optional OrbStack access, and cleanup.
+- Before changing core components, start `pnpm dev:docker` and confirm Hearth
+  loads at the printed URL. Validate user-visible changes in the browser.
+  Docs-only work does not need a stack.
+- Validate the changed behavior. Before pushing, run `vp check`,
+  `vp run -r typecheck`, and the tests for what you changed. Follow
+  [Contributing](CONTRIBUTING.md) for PR conventions. When asked to deliver a PR,
+  commit, push, and open it ready for review. Never merge it yourself.
+- After merge, follow the cleanup instructions in the development guide.
 
-```sh
-vp install --frozen-lockfile
-pnpm dev:setup
-```
+## References
 
-# Pull Requests
-
-These are just suggestions, don't treat these as law.
-
-## PR Branches
-
-Name branches as `<type>/<task>`, with a short lowercase kebab-case task:
-
-Examples:
-
-| Prefix  | Use for                        |
-| ------- | ------------------------------ |
-| `feat/` | New capabilities               |
-| `fix/`  | Bugs and regressions           |
-| `ui/`   | Visual and interaction changes |
-| `ci/`   | CI and release automation      |
-
-For example: `fix/panel-disconnect`. Do not use personal or agent-name
-prefixes.
-
-## PR Title
-
-Use `<type>(<scope>): <short human title>`.
-Examples:
-
-- fix(relay): prevent player disconnects when updating relays
-- ci(repo): update agent skills
-- ui(cli): improve help menu visual
-
-## PR Description
-
-Keep PR descriptions minimal and human:
-
-```md
-# Why
-
-What it fixes or implements. Link an issue when one exists.
-
-# Summary
-
-Brief summary.
-
-# Notes
-
-Breaking changes, compatibility notes, migration steps, or anything else reviewers need to know.
-```
-
-Do not update the description during review for follow-up commits or fixes unless the overall PR changes.
-
-# Implementing a change
-
-Before making a change to any of Kiln's core components, you'll need to set up the preview/testing environment:
-
-1. In the new worktree, run `pnpm dev:docker`.
-2. Immediately open the URL printed by `dev:docker` in T3 Preview, leave it available
-   for the user, and confirm Hearth loads before making any changes.
-3. Develop and validate using that T3 Preview.
-4. Commit, push, and open a ready-for-review PR. Never merge the PR yourself.
-
-# After PR Merge Cleanup
-
-1. Run `pnpm dev:docker:destroy` in the merged worktree.
-2. Switch to `main` and run `git pull --ff-only`.
-3. Delete the merged worktree and local branch.
-4. Delete the merged branch from `origin` with `git push origin --delete <branch>`.
-
-# Reference Repos
-
-This project takes inspiration on Pterodactyl's Panel (https://github.com/pterodactyl/panel) and wings (https://github.com/pterodactyl/wings).
-
-References Note: Do not assume that the decisions they make is the correct one. The vision for our project is to be a reimagined pterodactyl, not a pterodactyl clone. We can still learn from them as they have been battletested for millions of users.
+[Pterodactyl Panel](https://github.com/pterodactyl/panel) and
+[Wings](https://github.com/pterodactyl/wings) are useful operational references,
+but Kiln should be a reimagining, not a clone.

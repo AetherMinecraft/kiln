@@ -1,19 +1,16 @@
-import * as Sentry from "@sentry/tanstackstart-react"
-import { wrapFetchWithSentry } from "@sentry/tanstackstart-react"
 import { createStartHandler } from "@tanstack/react-start/server"
 import { createServerEntry } from "@tanstack/react-start/server-entry"
 import { Effect } from "effect"
 
 import { hearthStreamHandler } from "./app-server-handler"
 import { migrateDatabase } from "./effect/migrations"
-import { disposeAppRuntime, runAppEffect } from "./effect/runtime"
+import { disposeAppRuntime, reportAppError } from "./effect/runtime"
 import { forkPromise } from "./effect/promise"
 import { startAccessInvitationDelivery } from "./lib/access-invitation-delivery"
 import { scheduleBackupCopyProcessing } from "./lib/backup-copy"
 import { wakePendingAuthorizationDelivery } from "./lib/authorization-delivery"
 import { scheduleInstancePostProvisionProcessing } from "./lib/instance-post-provision"
 import { startKilnUpdateNotifications } from "./lib/kiln-update-notifications"
-import { resumeSystemUpdates } from "./lib/relay-connection"
 import { scheduleTailscaleCleanupProcessing } from "./lib/tailscale-cleanup.server"
 import {
   initializeRelayFromEnvironment,
@@ -39,9 +36,7 @@ await Effect.runPromise(
       }).pipe(
         Effect.catch((cause) =>
           Effect.sync(() => {
-            Sentry.captureException(cause, {
-              tags: { "kiln.operation": "relay.connection.maintain" },
-            })
+            reportAppError(cause, { operation: "relay.connection.maintain" })
           })
         ),
         Effect.forkDetach
@@ -49,9 +44,7 @@ await Effect.runPromise(
     ),
     Effect.catch((cause) =>
       Effect.sync(() => {
-        Sentry.captureException(cause, {
-          tags: { "kiln.operation": "relay.bootstrap" },
-        })
+        reportAppError(cause, { operation: "relay.bootstrap" })
         console.warn("Automatic Relay pairing did not complete:", cause)
       })
     )
@@ -63,18 +56,8 @@ scheduleBackupCopyProcessing()
 scheduleInstancePostProvisionProcessing()
 scheduleTailscaleCleanupProcessing()
 startKilnUpdateNotifications()
-forkPromise(
-  () => runAppEffect("relay.update.resume", resumeSystemUpdates()),
-  (cause) => {
-    Sentry.captureException(cause, {
-      tags: { "kiln.operation": "relay.update.resume" },
-    })
-  }
-)
 forkPromise(wakePendingAuthorizationDelivery, (cause) => {
-  Sentry.captureException(cause, {
-    tags: { "kiln.operation": "authorization.delivery.recover" },
-  })
+  reportAppError(cause, { operation: "authorization.delivery.recover" })
 })
 
 const handleStartRequest = createStartHandler(hearthStreamHandler)
@@ -82,17 +65,13 @@ const handleStartRequest = createStartHandler(hearthStreamHandler)
 let shutdownPromise: Promise<void> | undefined
 
 export function shutdownHearth(): Promise<void> {
-  shutdownPromise ??= Promise.all([
-    disposeAppRuntime(),
-    Sentry.close(2_000),
-  ]).then(() => undefined)
+  // Disposing the runtime also flushes pending telemetry.
+  shutdownPromise ??= disposeAppRuntime()
   return shutdownPromise
 }
 
-export default createServerEntry(
-  wrapFetchWithSentry({
-    fetch(request: Request) {
-      return handleStartRequest(request)
-    },
-  })
-)
+export default createServerEntry({
+  fetch(request: Request) {
+    return handleStartRequest(request)
+  },
+})

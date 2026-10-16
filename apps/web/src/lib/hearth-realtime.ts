@@ -43,9 +43,12 @@ const hearthRealtimeQueryScopes = {
   activity: [prefix(["activity"])],
   "app-directory": [exact(queryKeys.apps.directory)],
   apps: [prefix(["apps"])],
-  "backup-settings": [prefix(["backups", "policy"])],
+  "backup-settings": [
+    prefix(["backups", "policy"]),
+    prefix(["backups", "usage"]),
+  ],
   "backup-storage": [exact(queryKeys.backups.storage)],
-  backups: [],
+  backups: [prefix(["backups", "usage"])],
   "database-credentials": [prefix(["databases"])],
   "database-directory": [
     exact(queryKeys.databases.directory),
@@ -97,7 +100,10 @@ function queryScopes(
     ]
   }
   if (topic === "backup-settings" && scope) {
-    return [prefix(["backups", "policy", scope.relayId])]
+    return [
+      prefix(["backups", "policy", scope.relayId]),
+      prefix(["backups", "usage", scope.relayId]),
+    ]
   }
   if (topic === "database-credentials" && scope?.databaseId) {
     return [
@@ -110,11 +116,18 @@ function queryScopes(
   if (topic === "file-activity" && scope?.instanceId) {
     return [exact(queryKeys.fileActivity(scope.relayId, scope.instanceId))]
   }
+  if (topic === "apps" && scope) {
+    return hearthRealtimeQueryScopes.apps
+  }
   if (topic === "instance-web-routes" && scope?.instanceId) {
     return [exact(queryKeys.relay.webRoutes(scope.relayId, scope.instanceId))]
   }
   if (topic === "relay-proxy" && scope) {
-    return [exact(["relays", "proxy", scope.relayId])]
+    return [
+      prefix(queryKeys.relayProxy(scope.relayId)),
+      // The Traefik config only exists in Bundled mode.
+      prefix(queryKeys.relayHostFiles(scope.relayId)),
+    ]
   }
   if (topic === "relays" && scope) {
     return [
@@ -122,7 +135,7 @@ function queryScopes(
         ({ queryKey }) => queryKey[0] !== "relays"
       ),
       exact(queryKeys.relays),
-      exact(["relays", "proxy", scope.relayId]),
+      prefix(queryKeys.relayProxy(scope.relayId)),
       prefix(["databases", scope.relayId]),
     ]
   }

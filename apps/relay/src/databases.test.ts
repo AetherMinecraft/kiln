@@ -87,8 +87,9 @@ describe("managed database recovery metadata", () => {
 
 describe("managed database credential rotation", () => {
   it.each([
+    // Valkey's client reads the same variable as Redis's.
     ["redis", "REDISCLI_AUTH"],
-    ["valkey", "VALKEYCLI_AUTH"],
+    ["valkey", "REDISCLI_AUTH"],
   ] as const)(
     "rotates %s credentials without exposing passwords to process arguments",
     async (engine, environmentName) => {
@@ -112,6 +113,121 @@ describe("managed database credential rotation", () => {
       expect(processes[0]?.argv.join(" ")).not.toContain(password)
     }
   )
+})
+
+describe("managed database container details", () => {
+  it("reports the database's container, data folder, and volume size", async () => {
+    const harness = await relayHarness()
+    const id = "f".repeat(40)
+    const other = "1".repeat(40)
+    await createDatabase(harness, id)
+    await createDatabase(harness, other)
+    fakeDocker.volumes.get(volumeOf(id))?.files.set("base/1", "x".repeat(4096))
+    fakeDocker.volumes.get(volumeOf(other))?.files.set("base/1", "x".repeat(10))
+
+    await expect(harness.databases.inspect(id)).resolves.toEqual({
+      containerName: `${TEST_NAMESPACE}-kiln-db-${id}-database`,
+      dataDirectory: `/var/lib/docker/volumes/${volumeOf(id)}/_data`,
+      volumeBytes: 4096,
+    })
+    await expect(harness.databases.inspect("2".repeat(40))).rejects.toThrow(
+      "Database not found"
+    )
+  })
+})
+
+describe("managed database wipe", () => {
+  // Their clients read REDISCLI_AUTH, so a wipe that set another variable
+  // would fail to log in and, without -e, still exit 0.
+  it.each(["redis", "valkey"] as const)(
+    "wipes %s logged in as its user, without exposing the password",
+    async (engine) => {
+      const harness = await relayHarness()
+      const id = "6".repeat(40)
+      await createDatabase(harness, id, engine)
+
+      await harness.databases.wipe({
+        databaseId: id,
+        password,
+        username: "kiln_user",
+      })
+
+      const [wipe] = databaseContainer(id).processes
+      expect(wipe?.env).toEqual({ REDISCLI_AUTH: password })
+      expect(wipe?.argv).toContain("-e")
+      expect(wipe?.argv.join(" ")).not.toContain(password)
+    }
+  )
+
+  it("refuses to wipe a stopped database", async () => {
+    const harness = await relayHarness()
+    const id = "3".repeat(40)
+    await createDatabase(harness, id)
+    await harness.databases.action({ action: "stop", databaseId: id })
+
+    await expect(
+      harness.databases.wipe({
+        databaseId: id,
+        password,
+        username: "kiln_user",
+      })
+    ).rejects.toThrow("Start the database before wiping it")
+  })
+})
+
+describe("managed database custom-format imports", () => {
+  it("refuses dumps that aren't PostgreSQL custom format, or aren't for PostgreSQL", async () => {
+    const harness = await relayHarness()
+    const postgres = "4".repeat(40)
+    const mysql = "5".repeat(40)
+    await createDatabase(harness, postgres)
+    await createDatabase(harness, mysql, "mysql")
+    const customDump = Buffer.from("PGDMP\u0001\u000e\u0000").toString("base64")
+    const credentials = { password, username: "kiln_user" }
+
+    await expect(
+      harness.databases.importDump({
+        ...credentials,
+        content: customDump,
+        databaseId: mysql,
+        format: "postgres-custom",
+      })
+    ).rejects.toThrow("can only be imported into PostgreSQL")
+    await expect(
+      harness.databases.importDump({
+        ...credentials,
+        content: Buffer.from("SELECT 1;").toString("base64"),
+        databaseId: postgres,
+        format: "postgres-custom",
+      })
+    ).rejects.toThrow("isn't a PostgreSQL custom-format dump")
+    await expect(
+      harness.databases.importDump({
+        ...credentials,
+        content: Buffer.alloc(700_001).toString("base64"),
+        databaseId: postgres,
+        format: "postgres-custom",
+      })
+    ).rejects.toThrow("700 KB transfer limit")
+  })
+})
+
+describe("managed database ACL files", () => {
+  it("fails a create whose ACL write Docker breaks off, leaving no one-off container", async () => {
+    const harness = await relayHarness()
+    const id = "f".repeat(40)
+    fakeDocker.streamErrors.set("redis:8", "container is being removed")
+
+    await expect(createDatabase(harness, id, "redis")).rejects.toThrow(
+      "container is being removed"
+    )
+
+    expect(
+      [...fakeDocker.containers.values()].filter(
+        (container) => container.image === "redis:8" && container.autoRemove
+      )
+    ).toEqual([])
+  })
 })
 
 describe("managed database deletion", () => {

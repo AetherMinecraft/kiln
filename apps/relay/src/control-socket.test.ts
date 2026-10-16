@@ -28,6 +28,7 @@ import type {
 
 import { attachControlSocket } from "./control-socket.js"
 import type { ControlSocketOptions } from "./control-socket.js"
+import { RelayNotFoundError } from "./effect/errors.js"
 import { fingerprint } from "./effect/identity.js"
 import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
 import type { RelayClientRole } from "./effect/state.js"
@@ -125,6 +126,41 @@ describe("Relay control socket", () => {
     })
   })
 
+  it.each([
+    "relay.terminal.attach",
+    "relay.terminal.write",
+    "relay.terminal.claim",
+    "relay.terminal.restart",
+  ] as const)(
+    "refuses host shell operation %s for read-only clients",
+    async (operation) => {
+      const relay = await startRelay()
+      const hearth = await relay.pair({ role: "read_only" })
+      const { inbox, socket } = await relay.connect(hearth)
+      const id = sendRequest(socket, operation, {})
+      expect(await inbox.next()).toMatchObject({
+        code: "forbidden",
+        replyTo: id,
+        type: "error",
+      })
+    }
+  )
+
+  it.each(["relay.restart", "relay.host.restart"] as const)(
+    "refuses %s for read-only clients",
+    async (operation) => {
+      const relay = await startRelay()
+      const hearth = await relay.pair({ role: "read_only" })
+      const { inbox, socket } = await relay.connect(hearth)
+      const id = sendRequest(socket, operation, {})
+      expect(await inbox.next()).toMatchObject({
+        code: "forbidden",
+        replyTo: id,
+        type: "error",
+      })
+    }
+  )
+
   it("keeps an app's files behind app file actions, apart from servers'", async () => {
     const relay = await startRelay()
     const appFiles = `app:${"a".repeat(40)}`
@@ -176,6 +212,78 @@ describe("Relay control socket", () => {
     expect(await asAppReader.inbox.next()).toMatchObject({
       code: "forbidden",
       replyTo: forServer,
+      type: "error",
+    })
+  })
+
+  it("refuses Relay state to a client granted ordinary database access", async () => {
+    const relay = await startRelay()
+    const connection = await relay.connect(
+      await relay.pair({
+        role: "custom",
+        actions: ["database.read"],
+      })
+    )
+    const denied = sendRequest(connection.socket, "relay.database.read", {
+      request: { action: "overview" },
+    })
+    expect(await connection.inbox.next()).toMatchObject({
+      code: "forbidden",
+      replyTo: denied,
+      type: "error",
+    })
+    const reader = await relay.connect(
+      await relay.pair({ role: "custom", actions: ["relay.database.read"] })
+    )
+    const accepted = sendRequest(reader.socket, "relay.database.read", {
+      request: { action: "overview" },
+    })
+    expect(await reader.inbox.next()).toMatchObject({
+      payload: { ok: true },
+      replyTo: accepted,
+      type: "response",
+    })
+  })
+
+  it("keeps host files behind their own grants", async () => {
+    const relay = await startRelay()
+    const hostId = "H".repeat(43)
+    for (const actions of [
+      ["instance.files.list", "instance.files.read", "instance.files.write"],
+      ["app.files.read", "app.files.write"],
+    ] as const) {
+      const hearth = await relay.pair({ role: "custom", actions })
+      const connection = await relay.connect(hearth)
+      const id = sendRequest(connection.socket, "instance.files.read", {
+        instanceId: hostId,
+        path: "etc/os-release",
+      })
+      expect(await connection.inbox.next()).toMatchObject({
+        code: "forbidden",
+        replyTo: id,
+        type: "error",
+      })
+    }
+    const reader = await relay.connect(
+      await relay.pair({ role: "custom", actions: ["relay.files.read"] })
+    )
+    const read = sendRequest(reader.socket, "instance.files.read", {
+      instanceId: hostId,
+      path: "etc/os-release",
+    })
+    expect(await reader.inbox.next()).toMatchObject({
+      payload: { ok: true },
+      replyTo: read,
+      type: "response",
+    })
+    const write = sendRequest(reader.socket, "instance.files.write", {
+      instanceId: hostId,
+      path: "etc/os-release",
+      content: "changed",
+    })
+    expect(await reader.inbox.next()).toMatchObject({
+      code: "forbidden",
+      replyTo: write,
       type: "error",
     })
   })
@@ -433,6 +541,27 @@ describe("Relay control socket", () => {
         type: "error",
       })
     }
+  })
+
+  it("answers not_found for something a request named that isn't here", async () => {
+    const relay = await startRelay({
+      execute: async () => {
+        throw RelayNotFoundError.make({
+          message: "Container hearth isn't on this Relay's Docker host",
+        })
+      },
+    })
+    const { inbox, socket } = await relay.connect(await relay.pair())
+
+    const id = sendRequest(socket, "relay.system.inspect", {
+      container: "hearth",
+    })
+    expect(await inbox.next()).toMatchObject({
+      code: "not_found",
+      message: "Container hearth isn't on this Relay's Docker host",
+      replyTo: id,
+      type: "error",
+    })
   })
 
   it("rejects an oversized response without closing the socket", async () => {

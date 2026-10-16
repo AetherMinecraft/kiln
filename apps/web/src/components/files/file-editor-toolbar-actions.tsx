@@ -1,6 +1,6 @@
 import * as React from "react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import type { RelayFileActivity, RelayFileContent } from "@workspace/contracts"
+import { useMutation } from "@tanstack/react-query"
+import type { RelayFileContent } from "@workspace/contracts"
 import {
   ALargeSmall,
   Check,
@@ -38,6 +38,7 @@ import {
 
 import { FileActionMenuItem } from "@/components/files/file-actions"
 import { FileDownloadDialog } from "@/components/files/file-download-dialog"
+import { useFilePin } from "@/components/files/file-pin"
 import {
   type SaveFileRevision,
   isSnbtFile,
@@ -55,10 +56,9 @@ import {
   type FileEditorPreferencesStore,
 } from "@/components/files/file-workspace-stores"
 import { copyToClipboard } from "@/components/files/file-viewer-toolbar"
-import { queryKeys, relayFileActivityQueryOptions } from "@/lib/query-options"
 import { redactSensitiveText } from "@/lib/redaction"
 import type { FileWorkspaceInstance } from "@/lib/relay-selectors"
-import { updateRelayFilePin, uploadToMclogs } from "@/server/relay"
+import { uploadToMclogs } from "@/server/relay"
 
 function formatName(path: string) {
   return path.split("/").filter(Boolean).at(-1) ?? path
@@ -765,55 +765,6 @@ function EditorMobileOverflowMenu({
   )
 }
 
-function useFilePinAction(instance: FileWorkspaceInstance, path: string) {
-  const queryClient = useQueryClient()
-  const selectPinned = React.useCallback(
-    (activity: RelayFileActivity) =>
-      activity.files.find((entry) => entry.path === path)?.pinned ?? false,
-    [path]
-  )
-  const pinQuery = useQuery({
-    ...relayFileActivityQueryOptions(instance.relayId, instance.id),
-    select: selectPinned,
-  })
-  const pinMutation = useMutation({
-    mutationFn: updateRelayFilePin,
-    onSuccess: (nextActivity) => {
-      queryClient.setQueryData(
-        queryKeys.fileActivity(instance.relayId, instance.id),
-        nextActivity
-      )
-    },
-  })
-  const pinned = pinQuery.data ?? false
-  const updatePinned = pinMutation.mutate
-  const setPinned = React.useCallback(
-    (nextPinned: boolean) => {
-      updatePinned({
-        data: {
-          instanceId: instance.id,
-          relayId: instance.relayId,
-          path,
-          pinned: nextPinned,
-        },
-      })
-    },
-    [instance.id, instance.relayId, path, updatePinned]
-  )
-  const error = queryErrorMessage(
-    pinMutation.error,
-    "Could not update file pin"
-  )
-
-  return {
-    error,
-    loading: pinQuery.isPending,
-    pinned,
-    pinning: pinMutation.isPending,
-    setPinned,
-  }
-}
-
 function FilePinActionMenuItem({
   canWrite,
   editorLoading,
@@ -825,7 +776,7 @@ function FilePinActionMenuItem({
   instance: FileWorkspaceInstance
   path: string
 }) {
-  const { error, loading, pinned, pinning, setPinned } = useFilePinAction(
+  const { error, loading, pinned, pinning, setPinned } = useFilePin(
     instance,
     path
   )
@@ -837,9 +788,7 @@ function FilePinActionMenuItem({
       label={pinned ? "Unpin file" : "Pin file"}
       detail={
         error ??
-        (canWrite
-          ? "Shared on this server's Files home"
-          : "Requires file write access")
+        (canWrite ? "Shared on the Files home" : "Requires file write access")
       }
       disabled={editorLoading || loading || pinning || !canWrite}
       onClick={() => setPinned(!pinned)}
@@ -977,11 +926,6 @@ function EditorFontSizeControl({
       </span>
     </div>
   )
-}
-
-function queryErrorMessage(error: Error | null, fallback: string) {
-  if (!error) return null
-  return error.message || fallback
 }
 
 export const StableEditorShareButton = React.memo(EditorShareButton)

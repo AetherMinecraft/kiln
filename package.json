@@ -11,7 +11,6 @@
     "dev:docker": "node scripts/dev-docker.mjs start",
     "dev:docker:up": "node scripts/dev-docker.mjs up",
     "dev:docker:down": "node scripts/dev-docker.mjs down",
-    "dev:docker:hosts": "node scripts/dev-docker.mjs hosts",
     "dev:docker:destroy": "node scripts/dev-docker.mjs destroy",
     "dev:docker:list": "node scripts/dev-docker.mjs list",
     "dev:docker:logs": "node scripts/dev-docker.mjs logs",

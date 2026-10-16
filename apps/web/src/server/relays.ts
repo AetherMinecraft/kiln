@@ -4,7 +4,9 @@ import {
   relayConnectionSettingsSchema,
   relayIdSchema as relayFingerprintSchema,
   relayNameSchema,
+  relayHostAccessSchema,
   relayProxyDiagnosticsSchema,
+  relayProxyModeSchema,
   relayProxySettingsSchema,
   relayTailscaleInstallSchema,
   relayTailscaleOverviewSchema,
@@ -130,6 +132,15 @@ async function requireRelayAdministrator(
   permission: AccessPermission = "relay.configure"
 ) {
   return (await authorizeRelayAdministration(relayId, permission)).user
+}
+
+async function enabledRelay(relayId: string): Promise<PersistedRelay> {
+  const { listPersistedRelays } = await import("@/lib/relay-registry")
+  const relay = (await listPersistedRelays()).find(
+    (candidate) => candidate.enabled && candidate.id === relayId
+  )
+  if (!relay) throw new Error("Relay is not configured or is paused")
+  return relay
 }
 
 async function managedRelays(
@@ -378,31 +389,81 @@ export const getRelayProxy = createServerFn({ method: "GET" })
   .validator(relayIdSchema)
   .handler(async ({ data }) => {
     await requireRelayAdministrator(data.id, "relay.read")
-    const [{ listPersistedRelays }, { relayRpc }] = await Promise.all([
-      import("@/lib/relay-registry"),
+    const [relay, { relayRpc }] = await Promise.all([
+      enabledRelay(data.id),
       import("@/lib/relay-connection"),
     ])
-    const relay = (await listPersistedRelays()).find(
-      (candidate) => candidate.enabled && candidate.id === data.id
-    )
-    if (!relay) throw new Error("Relay is not configured or is paused")
     return relayProxyResponseSchema.parse(
       await relayRpc(relay, "relay.proxy.read", {}, 15_000)
     )
   })
 
+// Files the Info page opens in the Relay's host files: its database, and the
+// bundled Traefik's config in that mode. Paths are relative to the host's
+// root, as the Files tab's are. Each is pinned there the first time. Null
+// from older Relays. Both reads need only relay.read on the Relay, so a
+// connection that can browse host files can always find these.
+export const getRelayHostFiles = createServerFn({ method: "GET" })
+  .validator(relayIdSchema)
+  .handler(async ({ data }) => {
+    await requireRelayAdministrator(data.id, "relay.files.read")
+    const [relay, { relayRpc }] = await Promise.all([
+      enabledRelay(data.id),
+      import("@/lib/relay-connection"),
+    ])
+    const [{ dataDirectory }, proxy] = await Promise.all([
+      relayRpc(relay, "relay.host.read", {}, 15_000).then((value) =>
+        relayHostAccessSchema.parse(value)
+      ),
+      relayRpc(
+        relay,
+        "relay.proxy.read",
+        { includeDiagnostics: false },
+        15_000
+      ).then((value) => relayProxyModeReadSchema.parse(value)),
+    ])
+    if (!dataDirectory) return { database: null, traefikConfig: null }
+    const root = dataDirectory.replace(/^\/+/u, "")
+    const mode = proxy.mode ?? proxy.settings?.mode
+    const files = {
+      database: `${root}/network/relay.sqlite`,
+      traefikConfig:
+        mode === "traefik"
+          ? `${root}/infrastructure/traefik/traefik.yaml`
+          : null,
+    }
+    const { pinFilesByDefault } = await import("@/lib/file-activity")
+    const pinned = await pinFilesByDefault(
+      relay.id,
+      relay.id,
+      [files.database, files.traefikConfig].filter((path) => path !== null)
+    )
+    if (pinned) {
+      publishRealtimeChange({
+        audience: { kind: "relays", relayIds: [relay.id] },
+        scope: { instanceId: relay.id, relayId: relay.id },
+        topics: ["file-activity"],
+        type: "hearth.invalidate",
+      })
+    }
+    return files
+  })
+
+// Relays answer with just the mode when asked without diagnostics; ones that
+// predate that option send the full settings.
+const relayProxyModeReadSchema = z.object({
+  mode: relayProxyModeSchema.optional(),
+  settings: z.object({ mode: relayProxyModeSchema }).optional(),
+})
+
 export const updateRelayProxy = createServerFn({ method: "POST" })
   .validator(relayProxyInputSchema)
   .handler(async ({ data }) => {
     const user = await requireRelayAdministrator(data.relayId)
-    const [{ listPersistedRelays }, { relayRpc }] = await Promise.all([
-      import("@/lib/relay-registry"),
+    const [relay, { relayRpc }] = await Promise.all([
+      enabledRelay(data.relayId),
       import("@/lib/relay-connection"),
     ])
-    const relay = (await listPersistedRelays()).find(
-      (candidate) => candidate.enabled && candidate.id === data.relayId
-    )
-    if (!relay) throw new Error("Relay is not configured or is paused")
     const settings = relayProxySettingsSchema.parse({
       acmeEmail: data.acmeEmail,
       mode: data.mode,
@@ -419,14 +480,10 @@ export const getRelayTailscale = createServerFn({ method: "GET" })
   .validator(relayIdSchema)
   .handler(async ({ data }) => {
     await requireRelayAdministrator(data.id, "relay.configure")
-    const [{ listPersistedRelays }, { relayRpc }] = await Promise.all([
-      import("@/lib/relay-registry"),
+    const [relay, { relayRpc }] = await Promise.all([
+      enabledRelay(data.id),
       import("@/lib/relay-connection"),
     ])
-    const relay = (await listPersistedRelays()).find(
-      (candidate) => candidate.enabled && candidate.id === data.id
-    )
-    if (!relay) throw new Error("Relay is not configured or is paused")
     return relayTailscaleOverviewSchema.parse(
       await relayRpc(relay, "relay.tailscale.read", {}, 15_000)
     )
@@ -436,14 +493,10 @@ export const updateRelayTailscale = createServerFn({ method: "POST" })
   .validator(relayTailscaleInputSchema)
   .handler(async ({ data }) => {
     const user = await requireRelayAdministrator(data.relayId)
-    const [{ listPersistedRelays }, { relayRpc }] = await Promise.all([
-      import("@/lib/relay-registry"),
+    const [relay, { relayRpc }] = await Promise.all([
+      enabledRelay(data.relayId),
       import("@/lib/relay-connection"),
     ])
-    const relay = (await listPersistedRelays()).find(
-      (candidate) => candidate.enabled && candidate.id === data.relayId
-    )
-    if (!relay) throw new Error("Relay is not configured or is paused")
     const settings = relayTailscaleSettingsSchema.parse({
       dnsPort: data.dnsPort,
       domain: data.domain,
@@ -460,14 +513,10 @@ export const installRelayTailscale = createServerFn({ method: "POST" })
   .validator(relayTailscaleInstallInputSchema)
   .handler(async ({ data }) => {
     const user = await requireRelayAdministrator(data.relayId)
-    const [{ listPersistedRelays }, { relayRpc }] = await Promise.all([
-      import("@/lib/relay-registry"),
+    const [relay, { relayRpc }] = await Promise.all([
+      enabledRelay(data.relayId),
       import("@/lib/relay-connection"),
     ])
-    const relay = (await listPersistedRelays()).find(
-      (candidate) => candidate.enabled && candidate.id === data.relayId
-    )
-    if (!relay) throw new Error("Relay is not configured or is paused")
     const input = relayTailscaleInstallSchema.parse({ authKey: data.authKey })
     const tailscale = relayTailscaleOverviewSchema.parse(
       await relayRpc(relay, "relay.tailscale.install", input, 240_000, user.id)

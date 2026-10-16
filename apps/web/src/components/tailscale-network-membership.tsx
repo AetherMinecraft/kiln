@@ -6,6 +6,7 @@ import {
   useSuspenseQuery,
 } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
+import { appTailscaleMember } from "@workspace/contracts"
 import {
   CircleAlert,
   Copy,
@@ -83,7 +84,7 @@ import {
   showTailscaleOperationProgress,
   showTailscaleOperationSuccess,
   tailscaleOperationToastId,
-  type TailscaleOperation,
+  type TailscaleOperationToast,
 } from "@/lib/tailscale-operation-toasts"
 import {
   saveTailscaleStack,
@@ -112,7 +113,7 @@ export function TailscaleConnectedServersTable({
     return (
       <TailscaleEmptyTable
         actionLabel="Setup Tailscale"
-        description="Setup Tailscale before connecting servers"
+        description="Set up Tailscale before connecting game servers"
         icon="network"
         title="No Tailscale networks"
         onAction={onSetup}
@@ -164,9 +165,9 @@ const ConnectedServersTableContent = React.memo(
           </p>
         ) : null}
         <TailscaleMembershipTable
-          emptyActionLabel="Connect Servers"
-          emptyDescription="Connect a server to reach it through this tailnet"
-          emptyMessage="No connected servers"
+          emptyActionLabel="Connect Game Servers"
+          emptyDescription="Connect a game server to reach it through this tailnet"
+          emptyMessage="No connected game servers"
           pending={save.isPending}
           searchStore={searchStore}
           servers={connectedServers}
@@ -281,7 +282,7 @@ export const TailscaleConnectServersPopover = React.memo(
             ) : (
               <Plus />
             )}
-            Connect Servers
+            Connect Game Servers
           </Button>
         </PopoverTrigger>
         <PopoverContent
@@ -289,11 +290,11 @@ export const TailscaleConnectServersPopover = React.memo(
           className="w-[min(28rem,calc(100vw-2rem))] overflow-hidden p-0"
         >
           <InstancePickerContent
-            ariaLabel="Servers"
+            ariaLabel="Game Servers"
             emptyMessage={
               serversPending
-                ? "Loading servers…"
-                : "Every available server is already connected."
+                ? "Loading game servers…"
+                : "Every available game server is already connected."
             }
             items={options}
             pendingKey={pendingKey}
@@ -501,17 +502,17 @@ const TailscaleMembershipTable = React.memo(function TailscaleMembershipTable({
         }
         description={
           serversPending
-            ? "Loading the server inventory."
+            ? "Loading the game server inventory."
             : searchActive
-              ? "Try a server name, short ID, or Relay."
+              ? "Try a game server name, short ID, or Relay."
               : emptyDescription
         }
         icon="server"
         title={
           serversPending
-            ? "Loading servers…"
+            ? "Loading game servers…"
             : searchActive
-              ? "No servers match your search"
+              ? "No game servers match your search"
               : emptyMessage
         }
         onAction={searchActive || serversPending ? undefined : onEmptyAction}
@@ -741,7 +742,7 @@ const TailscaleMembershipRow = React.memo(function TailscaleMembershipRow({
                   <Unplug />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="top">Disconnect server</TooltipContent>
+              <TooltipContent side="top">Disconnect game server</TooltipContent>
             </Tooltip>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -783,8 +784,8 @@ const TailscaleMembershipRow = React.memo(function TailscaleMembershipRow({
             <DialogTitle>Disconnect {server.name}?</DialogTitle>
             <DialogDescription>
               {onlyBindingOnRelay
-                ? `This removes the server from ${stack.name}. Because it is the last connected server on ${server.relayName}, Tailscale will also be removed from that Relay in the background.`
-                : `This removes the server from ${stack.name}. Tailscale will stay installed on ${server.relayName} for its other connected servers.`}
+                ? `This removes the game server from ${stack.name}. Because it is the last connected game server on ${server.relayName}, Tailscale will also be removed from that Relay in the background.`
+                : `This removes the game server from ${stack.name}. Tailscale will stay installed on ${server.relayName} for its other connected game servers.`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1168,13 +1169,13 @@ function useStackMembershipMutation() {
 function membershipOperationToast(
   stack: TailscaleStackOverview,
   bindings: Array<StackBinding>
-) {
+): TailscaleOperationToast {
   const currentBindingKeys = new Set(stack.bindings.map(stackBindingKey))
   const nextBindingKeys = new Set(bindings.map(stackBindingKey))
-  const added = bindings.some(
+  const added = bindings.find(
     (binding) => !currentBindingKeys.has(stackBindingKey(binding))
   )
-  const removed = stack.bindings.some(
+  const removed = stack.bindings.find(
     (binding) => !nextBindingKeys.has(stackBindingKey(binding))
   )
   const deployedRelayIds = new Set(
@@ -1186,7 +1187,7 @@ function membershipOperationToast(
       newRelayIds.add(relayId)
     }
   }
-  const operation: TailscaleOperation =
+  const operation: TailscaleOperationToast["operation"] =
     newRelayIds.size > 0
       ? "install"
       : added
@@ -1194,9 +1195,14 @@ function membershipOperationToast(
         : removed
           ? "disconnect"
           : "update"
+  const changedBinding = added ?? removed
 
   return {
     id: tailscaleOperationToastId(stack.id),
+    memberKind:
+      changedBinding && appTailscaleMember(changedBinding.instanceId)
+        ? "app"
+        : "server",
     networkName: stack.name,
     nodeCount: operation === "install" ? newRelayIds.size : undefined,
     operation,

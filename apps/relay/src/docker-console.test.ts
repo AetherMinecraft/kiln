@@ -1,8 +1,10 @@
+import type { RelayConsoleLine } from "@workspace/contracts"
 import { describe, expect, it, vi } from "vite-plus/test"
 
 vi.mock("./command.js", () => import("./test/docker.js"))
 
 import { parseConsoleLine } from "./console-parsing.js"
+import { fakeDocker } from "./test/docker.js"
 import { relayHarness, serverRecipe, type RelayHarness } from "./test/relay.js"
 
 describe("Docker console parsing", () => {
@@ -224,6 +226,114 @@ describe("console history", () => {
     })
   })
 
+  it("numbers lines in a long-followed log as a history read does", async () => {
+    const harness = await relayHarness()
+    const recipe = serverRecipe()
+    const container = await harness.seedServer({
+      id,
+      labels: {
+        "kiln.brick.snapshot-sha256": await harness.bricks.saveSnapshot(recipe),
+        "kiln.brick.source": await harness.publishRecipe(recipe),
+      },
+      running: true,
+      startedAt,
+      tty: false,
+    })
+    await harness.docker.inspectInstances()
+    const session = await harness.docker.consoleSession(id)
+    // Far more lines than a followed log keeps counts for. Some print twice
+    // in the same instant, others print text seen before, and a burst of
+    // thousands shares one timestamp, repeating a line at either end.
+    const at = (offset: number) =>
+      new Date(Date.parse(startedAt) + 1_000 + offset).toISOString()
+    const burst = at(2_000)
+    const written = [
+      ...Array.from({ length: 2_000 }, (_, index) => ({
+        text: index % 7 === 0 ? "Saving chunks" : `line ${index}`,
+        time: at(index),
+      })).flatMap((line, index) => (index % 50 === 0 ? [line, line] : [line])),
+      { text: "Saving chunks", time: burst },
+      ...Array.from({ length: 2_500 }, (_, index) => ({
+        text: `burst ${index}`,
+        time: burst,
+      })),
+      { text: "Saving chunks", time: burst },
+      ...Array.from({ length: 400 }, (_, index) => ({
+        text: `after ${index}`,
+        time: at(2_001 + index),
+      })),
+    ]
+
+    const controller = new AbortController()
+    const followed: Array<RelayConsoleLine> = []
+    const read = (async () => {
+      for await (const line of session.stream(controller.signal)) {
+        followed.push(line)
+        if (followed.length === written.length) return
+      }
+    })()
+    // Write once the log is followed, as a running server would.
+    await vi.waitFor(() => expect(fakeDocker.followerCount()).toBe(1))
+    fakeDocker.writeLogs(container.name, written)
+    await read
+    controller.abort()
+    const history = await session.history(5_000)
+
+    expect(history.lines).toHaveLength(written.length)
+    expect(followed.map((line) => line.id)).toEqual(
+      history.lines.map((line) => line.id)
+    )
+    expect(new Set(followed.map((line) => line.id)).size).toBe(written.length)
+  })
+
+  it("numbers a repeat that Docker logs thousands of lines out of order", async () => {
+    const harness = await relayHarness()
+    const recipe = serverRecipe()
+    const container = await harness.seedServer({
+      id,
+      labels: {
+        "kiln.brick.snapshot-sha256": await harness.bricks.saveSnapshot(recipe),
+        "kiln.brick.source": await harness.publishRecipe(recipe),
+      },
+      running: true,
+      startedAt,
+      tty: false,
+    })
+    await harness.docker.inspectInstances()
+    const session = await harness.docker.consoleSession(id)
+    const at = (offset: number) =>
+      new Date(Date.parse(startedAt) + 1_000 + offset).toISOString()
+    const repeated = { text: "Saving chunks", time: at(0) }
+    const written = [
+      repeated,
+      ...Array.from({ length: 2_050 }, (_, index) => ({
+        text: `line ${index}`,
+        time: at(1 + index),
+      })),
+      repeated,
+    ]
+
+    const controller = new AbortController()
+    const followed: Array<RelayConsoleLine> = []
+    const read = (async () => {
+      for await (const line of session.stream(controller.signal)) {
+        followed.push(line)
+        if (followed.length === written.length) return
+      }
+    })()
+    await vi.waitFor(() => expect(fakeDocker.followerCount()).toBe(1))
+    fakeDocker.writeLogs(container.name, written)
+    await read
+    controller.abort()
+    const history = await session.history(5_000)
+
+    const followedIds = followed.map((line) => line.id)
+    expect(new Set(followedIds).size).toBe(written.length)
+    expect([...followedIds].sort((a, b) => a.localeCompare(b))).toEqual(
+      history.lines.map((line) => line.id).sort((a, b) => a.localeCompare(b))
+    )
+  })
+
   it("keeps the newest history within its size limit and says it was cut", async () => {
     const session = await serverWithOutput(2_000, 10_000)
 
@@ -232,5 +342,49 @@ describe("console history", () => {
     expect(history.lines.length).toBeLessThan(2_000)
     expect(history.lines.at(-1)?.text).toMatch(/^line 1999 /u)
     expect(history.truncated).toBe(true)
+  })
+})
+
+describe("console completion", () => {
+  it("probes a running server's console, whatever its container attaches at start", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+    const harness = await relayHarness()
+    const recipe = serverRecipe({
+      metadata: {
+        author: "Kiln",
+        description: "A test Brick recipe.",
+        game: "Minecraft",
+        id: "paper",
+        name: "Paper",
+      },
+    })
+    const container = await harness.seedServer({
+      id: "c".repeat(40),
+      labels: {
+        "kiln.brick.id": "paper",
+        "kiln.brick.snapshot-sha256": await harness.bricks.saveSnapshot(recipe),
+        "kiln.brick.source": await harness.publishRecipe(recipe),
+      },
+      running: true,
+      tty: true,
+    })
+    await harness.docker.inspectInstances()
+    const instance = await harness.docker.findInstance("c".repeat(40))
+    if (!instance) throw new Error("Server was not discovered")
+
+    let settled = false
+    const completion = harness.docker
+      .completeCommand(instance, "ver", 3)
+      .finally(() => {
+        settled = true
+      })
+    while (!settled) {
+      await vi.advanceTimersByTimeAsync(100)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    vi.useRealTimers()
+
+    expect((await completion).supported).toBe(true)
+    expect(container.stdin).toContain("ver\t")
   })
 })

@@ -1,6 +1,6 @@
 # Kiln
 
-Kiln is a self-hosted platform for running game servers. Hearth is the web panel that manages them; Relay is the agent that runs on each host.
+Kiln is a self-hosted platform for managing apps, databases, and game servers. Hearth is the web panel; Relay is the agent that runs on each host.
 
 ## Images
 
@@ -46,16 +46,44 @@ KILN_ENABLE_SIGNUPS=false
 
 Generate secrets with `openssl rand -base64 48`. `BETTER_AUTH_SECRETS` is versioned (`1:<secret>`). Keep an offline copy of `KILN_PLATFORM_BACKUP_KEY`; it is intentionally separate from Hearth's live secrets so a platform bundle remains recoverable after Hearth is lost. For a colocated Compose stack, give Hearth and Relay the same bootstrap token so they can pair on first boot. Set `KILN_RELAY_PROXY` to `traefik` or `coolify` when an edge should terminate TLS; `none` leaves that to you.
 
+The Relay workspace includes a root terminal on its Docker host, protected by
+`relay.terminal`. Set `KILN_RELAY_HOST_ACCESS=false` on the Relay to disable host
+access. Its small shell helper is created on first use and removed when host
+access is disabled. Each person's session survives page and Hearth reconnects
+and closes after the configured terminal idle timeout.
+
+The Files page browses and edits the host's files with the same browser and
+editor as server and app files, protected by `relay.files.read` and
+`relay.files.write`. It needs the host's filesystem mounted at `/host`. Someone
+with `relay.files.mount` (Relay owners and platform admins by default) can turn
+that on from the Files page, which restarts the Relay with the mount and puts it
+back as it was if that fails. To set it up yourself instead, start the stack
+below with `docker compose -f compose.yaml -f compose.host-files.yaml up -d`.
+Recreating the Relay from a Compose file without it removes the mount. Saving a
+host file overwrites it in place, as editors do, so its hard links and
+containers that bind-mount it see the change. Where Docker is rootless, remaps
+users, or SELinux confines the Relay, the Files page says which files it can't
+reach. Links with absolute targets resolve inside the Relay's container, so the
+Files page refuses to open them.
+
+The Database page inspects the live `/data/network/relay.sqlite` file in
+read-only mode. `relay.database.read` grants access to its state, including
+sensitive configuration. When host files are mounted, `relay.files.read` can
+read the same file through Docker's volume directory.
+
 Then:
 
 ```sh
 docker compose up -d
 ```
 
+See [Relay runtime](docs/relay-runtime.md) for how the Relay talks to Docker,
+how its health check works, and how to read its memory use.
+
 ## Development
 
-Requires Node 20+, pnpm and Docker. On macOS, OrbStack additionally supplies
-the `*.orb.local` names the stack uses.
+Requires the Node version in `.node-version`, pnpm/Vite+, and Docker with
+Compose v2. OrbStack is optional.
 
 ```sh
 vp install --frozen-lockfile
@@ -63,32 +91,8 @@ pnpm dev:setup
 pnpm dev:docker
 ```
 
-`dev:setup` only needs to run once per clone. Open the URL printed by
-`dev:docker` to use the panel.
-
-### Windows and Linux
-
-Without OrbStack there is nothing answering `*.orb.local`, so the stack
-publishes its ports and names itself under `kiln.localhost` instead. Add the
-line `pnpm dev:docker:hosts` prints to your hosts file once per machine
-(`C:\Windows\System32\drivers\etc\hosts` or `/etc/hosts`, as
-administrator); the browser, the `kiln` CLI and SFTP all need to resolve it.
-Set `KILN_DEV_DOMAIN` to use a different name.
-
-The Relay keeps managed TLS, because Hearth's automatic pairing requires an
-HTTPS origin. Its certificate is signed by a CA the Relay generates, which the
-browser does not trust, and the browser talks to the Relay directly for console
-streams and file transfers. Either accept the warning once for the Relay
-origin, or issue certificates with mkcert and set `KILN_RELAY_TLS_MODE=external`
-with `KILN_RELAY_TLS_CERT_FILE` and `KILN_RELAY_TLS_KEY_FILE`.
-
-If another service already holds a port, set `KILN_HEARTH_PORT`,
-`KILN_RELAY_PORT` or `KILN_RELAY_SFTP_PORT`; a second worktree stack needs its
-own values.
-
-On Windows, clone into the WSL2 filesystem and enable Docker Desktop's WSL
-integration. The stack works from an NTFS path, but every source read crosses
-the VM boundary, which shows up as slow installs and unreliable file watching.
+Open the URL printed by `dev:docker`. See the [development guide](docs/development.md)
+for worktrees, localhost ports, optional OrbStack HTTPS, and cleanup.
 
 ## License
 

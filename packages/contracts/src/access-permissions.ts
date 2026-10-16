@@ -78,6 +78,12 @@ export const accessPermissions = [
   "relay.connections.read",
   "relay.connections.manage",
   "relay.audit.read",
+  "relay.logs.read",
+  "relay.terminal",
+  "relay.database.read",
+  "relay.files.read",
+  "relay.files.write",
+  "relay.files.mount",
   "database.data.read",
   "database.data.write",
   "database.terminal",
@@ -174,6 +180,7 @@ const implicationEdges: Partial<
   "schedule.execute": ["schedule.read"],
   "schedule.delete": ["schedule.read"],
   "relay.connections.manage": ["relay.connections.read"],
+  "relay.files.write": ["relay.files.read"],
 }
 
 /** Explicit editor block and family for every permission; no naming heuristics. */
@@ -189,6 +196,12 @@ const permissionPlacement: Record<
   "relay.connections.read": ["relay.connections", "relay"],
   "relay.connections.manage": ["relay.connections", "relay"],
   "relay.audit.read": ["relay.activity", "relay"],
+  "relay.logs.read": ["relay.logs", "relay"],
+  "relay.terminal": ["relay.terminal", "relay"],
+  "relay.database.read": ["relay.database", "relay"],
+  "relay.files.read": ["relay.files", "relay"],
+  "relay.files.write": ["relay.files", "relay"],
+  "relay.files.mount": ["relay.files", "relay"],
   "instance.create": ["resource.creation", "relay"],
   "database.create": ["resource.creation", "relay"],
   "access.read": ["access", "shared"],
@@ -576,6 +589,34 @@ const permissionCopy: Record<
     label: "View Relay activity",
     description: "Read the Relay’s activity history.",
   },
+  "relay.files.read": {
+    label: "View host files",
+    description:
+      "Browse and download files anywhere on the Relay’s host, including system configuration and secrets.",
+  },
+  "relay.files.write": {
+    label: "Edit host files",
+    description:
+      "Create, upload, edit, move, and delete files anywhere on the Relay’s host. Equivalent to root on the host.",
+  },
+  "relay.files.mount": {
+    label: "Mount host files",
+    description:
+      "Restart the Relay with its host’s filesystem mounted, so host files can be browsed.",
+  },
+  "relay.database.read": {
+    label: "View Relay database",
+    description:
+      "Inspect the Relay’s SQLite state, including pairing records and sensitive configuration.",
+  },
+  "relay.terminal": {
+    label: "Open host terminal",
+    description: "Run a root shell on the Relay’s host node.",
+  },
+  "relay.logs.read": {
+    label: "View Relay logs",
+    description: "Watch the Relay container’s live output.",
+  },
 }
 
 /** Stable IDs are an allowlist, never wildcard patterns. */
@@ -651,6 +692,10 @@ const blockLabels: Record<string, string> = {
   "relay.configuration": "Relay configuration",
   "relay.connections": "Relay connections",
   "relay.activity": "Relay activity",
+  "relay.logs": "Relay logs",
+  "relay.terminal": "Host terminal",
+  "relay.database": "Relay database",
+  "relay.files": "Host files",
 }
 export const permissionBlocks = Object.freeze(
   [...new Set(permissionCatalog.map((entry) => entry.block))].map((key) =>
@@ -984,6 +1029,12 @@ export function permissionsForRelayClientPolicy(
         case "instance.files.list":
         case "instance.files.download":
           permissions = ["instance.files.read"]
+          break
+        case "relay.files.download":
+          permissions = ["relay.files.read"]
+          break
+        case "relay.files.upload":
+          permissions = ["relay.files.write"]
           break
         case "app.files.download":
           permissions = ["app.files.read"]

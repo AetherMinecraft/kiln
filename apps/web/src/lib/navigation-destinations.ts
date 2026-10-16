@@ -99,8 +99,9 @@ export const infrastructureDestinations = [
   {
     access: "instance-read",
     icon: Server,
-    keywords: ["infrastructure", "instances"],
-    label: "Servers",
+    keywords: ["infrastructure", "instances", "servers"],
+    // Users see "Game Servers"; the code keeps "servers". See AGENTS.md Naming.
+    label: "Game Servers",
     to: "/infra/servers",
   },
   {
@@ -313,6 +314,14 @@ export interface DatabaseDestination extends NavigationDestination {
 
 export const databaseDestinations = [
   {
+    icon: SlidersHorizontal,
+    id: "info",
+    keywords: ["settings", "credentials", "details"],
+    label: "Info",
+    permission: "database.read",
+    to: "/db/$databaseId/info",
+  },
+  {
     icon: TerminalSquare,
     id: "terminal",
     keywords: ["console", "shell", "cli", "psql", "mysql"],
@@ -321,12 +330,12 @@ export const databaseDestinations = [
     to: "/db/$databaseId/terminal",
   },
   {
-    icon: ScrollText,
-    id: "logs",
-    keywords: ["output", "container", "errors"],
-    label: "Logs",
-    permission: "database.logs.read",
-    to: "/db/$databaseId/logs",
+    icon: Network,
+    id: "network",
+    keywords: ["servers", "connections"],
+    label: "Network",
+    permission: "database.network.read",
+    to: "/db/$databaseId/network",
   },
   {
     engines: ["mysql", "mariadb", "postgres"],
@@ -338,20 +347,12 @@ export const databaseDestinations = [
     to: "/db/$databaseId/viewer",
   },
   {
-    icon: Network,
-    id: "network",
-    keywords: ["servers", "connections"],
-    label: "Network",
-    permission: "database.network.read",
-    to: "/db/$databaseId/network",
-  },
-  {
-    icon: SlidersHorizontal,
-    id: "info",
-    keywords: ["settings", "credentials", "details"],
-    label: "Info",
-    permission: "database.read",
-    to: "/db/$databaseId/info",
+    icon: ScrollText,
+    id: "logs",
+    keywords: ["output", "container", "errors"],
+    label: "Logs",
+    permission: "database.logs.read",
+    to: "/db/$databaseId/logs",
   },
 ] as const satisfies ReadonlyArray<DatabaseDestination>
 
@@ -470,14 +471,7 @@ export function canAccessAppPermission(
   app: { relayId: string },
   permission: AccessPermission
 ): boolean {
-  if (capabilities.isPlatformAdmin) return true
-  return capabilities.grants.some(
-    (grant) =>
-      grant.relayId === app.relayId &&
-      grant.resourceType === "relay" &&
-      grant.resourceId === app.relayId &&
-      grantHasPermission(grant, permission)
-  )
+  return canAccessRelayPermission(capabilities, app.relayId, permission)
 }
 
 export function accessibleDestinationsForApp(
@@ -495,6 +489,90 @@ export function appDestinationHref(
   routeId: string
 ): string {
   return destination.to.replace("$appId", encodeURIComponent(routeId))
+}
+
+export type RelayDestinationId = "info" | "terminal" | "logs" | "files"
+
+export interface RelayDestination extends NavigationDestination {
+  id: RelayDestinationId
+  permission: AccessPermission
+}
+
+export const relayDestinations = [
+  {
+    icon: SlidersHorizontal,
+    id: "info",
+    keywords: [
+      "settings",
+      "details",
+      "node",
+      "version",
+      "proxy",
+      "traefik",
+      "database",
+      "sqlite",
+    ],
+    label: "Info",
+    permission: "relay.read",
+    to: "/relay/$relayId/info",
+  },
+  {
+    icon: TerminalSquare,
+    id: "terminal",
+    keywords: ["shell", "ssh", "host", "node"],
+    label: "Terminal",
+    permission: "relay.terminal",
+    to: "/relay/$relayId/terminal",
+  },
+  {
+    icon: ScrollText,
+    id: "logs",
+    keywords: ["output", "container", "errors"],
+    label: "Logs",
+    permission: "relay.logs.read",
+    to: "/relay/$relayId/logs",
+  },
+  {
+    icon: Folder,
+    id: "files",
+    keywords: ["host", "filesystem", "editor", "upload", "download"],
+    label: "Files",
+    permission: "relay.files.read",
+    to: "/relay/$relayId/files",
+  },
+] as const satisfies ReadonlyArray<RelayDestination>
+
+// Granted on the Relay itself.
+export function canAccessRelayPermission(
+  capabilities: NavigationAccessCapabilities,
+  relayId: string,
+  permission: AccessPermission
+): boolean {
+  if (capabilities.isPlatformAdmin) return true
+  return capabilities.grants.some(
+    (grant) =>
+      grant.relayId === relayId &&
+      grant.resourceType === "relay" &&
+      grant.resourceId === relayId &&
+      grantHasPermission(grant, permission)
+  )
+}
+
+export function accessibleDestinationsForRelay(
+  relay: { id: string },
+  capabilities: NavigationAccessCapabilities
+): ReadonlyArray<RelayDestination> {
+  const destinations: ReadonlyArray<RelayDestination> = relayDestinations
+  return destinations.filter((destination) =>
+    canAccessRelayPermission(capabilities, relay.id, destination.permission)
+  )
+}
+
+export function relayDestinationHref(
+  destination: RelayDestination,
+  routeId: string
+): string {
+  return destination.to.replace("$relayId", encodeURIComponent(routeId))
 }
 
 export function accessibleInfrastructureDestinations(

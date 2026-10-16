@@ -1,5 +1,4 @@
 import * as React from "react"
-import * as Sentry from "@sentry/tanstackstart-react"
 import {
   useInfiniteQuery,
   useMutation,
@@ -76,9 +75,9 @@ import {
   backupCanBeRemoved,
   backupTargetName,
   BackupActionButton,
-  formatBytes,
   targetKey,
 } from "@/components/backups/table-row"
+import { formatBytes } from "@/lib/format-bytes"
 import { BackupToolbar } from "@/components/backups/toolbar"
 import { grantHasPermission } from "@/lib/permissions"
 import {
@@ -132,6 +131,7 @@ import {
   resetBackupRunsToFirstPage,
 } from "@/lib/backup-runs-cache"
 import { forkPromise } from "@/effect/promise"
+import { reportBrowserError } from "@/lib/browser-telemetry"
 type BackupStorage = Awaited<ReturnType<typeof getBackupStorage>>[number]
 type BackupPolicy = Awaited<ReturnType<typeof getBackupPolicy>>
 type CreateTarget = BackupConfigurationTarget
@@ -885,9 +885,7 @@ function captureBackupRunsBackgroundError(
   cause: unknown
 ): void {
   if (signal.aborted) return
-  Sentry.captureException(cause, {
-    tags: { "kiln.operation": `backups.${operation}` },
-  })
+  reportBrowserError(cause, { operation: `backups.${operation}` })
 }
 
 const BackupDialogHost = React.memo(function BackupDialogHost({
@@ -2300,7 +2298,7 @@ function backupScopeOptions({
   const options: Array<ServerPickerOption> = []
   for (const server of servers) {
     options.push({
-      description: `Server · ${server.relayName} · ${server.id}`,
+      description: `Game Server · ${server.relayName} · ${server.id}`,
       id: server.id,
       kind: "server",
       name: server.name,

@@ -12,7 +12,11 @@ import type {
 
 import { getAccessCapabilities, getInvitationPreview } from "@/server/access"
 import { getActivity } from "@/server/activity"
-import { getBackupPolicy, getBackupRunsPage } from "@/server/backups"
+import {
+  getBackupPolicy,
+  getBackupRunsPage,
+  getBackupUsage,
+} from "@/server/backups"
 import { getBackupStorage } from "@/server/backup-storage"
 import {
   getBrickCatalog,
@@ -28,6 +32,7 @@ import {
 import { getDomainSettings, getInstanceDomain } from "@/server/domains"
 import {
   getManagedDatabaseCredential,
+  getManagedDatabaseContainer,
   getManagedDatabaseDirectory,
   getManagedDatabases,
 } from "@/server/databases"
@@ -45,6 +50,7 @@ import {
   type InstanceFavorite,
 } from "@/lib/instance-favorites"
 import { getMinecraftProfile } from "@/server/minecraft"
+import { getRelayResources } from "@/server/relay-host"
 import { reconcilePendingPowerSnapshot } from "@/lib/instance-power-state"
 import { systemUpdateOverviewRefetchPolicy } from "@/lib/system-update-presence"
 import {
@@ -53,19 +59,30 @@ import {
   getRelayFileEntry,
   getRelayFile,
   getRelayFileActivity,
-  getRelayMemoryReadings,
+  getRelayNodeReadings,
   getRelaySnapshot,
   getRelayTree,
 } from "@/server/relay"
 import {
-  getRelays,
   getRelayOwnerMinecraftProfiles,
+  getRelayProxy,
+  getRelayHostFiles,
   getRelayTailscale,
+  getRelays,
 } from "@/server/relays"
 import { getTailscaleStacks } from "@/server/tailscale"
 import { getAuthState } from "@/server/auth"
 import type { ReleaseHistoryCursor } from "@/effect/kiln-release-feed"
-import { getReleaseHistory, getUpdateOverview } from "@/server/updates"
+import {
+  getRelayRelease,
+  getReleaseHistory,
+  getUpdateOverview,
+} from "@/server/updates"
+import {
+  getResourceOwner,
+  getResourceOwnerMinecraftProfileId,
+  getResourceUserCount,
+} from "@/server/resource-access"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import { withInventoryRelayStatus } from "@/lib/inventory-relay-status"
@@ -113,6 +130,8 @@ export const queryKeys = {
     policy: (relayId: string, target: BackupTarget) =>
       ["backups", "policy", relayId, target.kind, target.id] as const,
     storage: ["backups", "storage"] as const,
+    usage: (relayId: string, target: BackupTarget) =>
+      ["backups", "usage", relayId, target.kind, target.id] as const,
   },
   bricks: ["bricks", "catalog"] as const,
   brickIcons: ["bricks", "icons"] as const,
@@ -142,6 +161,9 @@ export const queryKeys = {
       ["databases", relayId, databaseId, "credential"] as const,
     directory: ["databases", "directory"] as const,
     list: ["databases", "list"] as const,
+    // Outside "databases", so list refreshes don't measure the volume again.
+    container: (relayId: string, databaseId: string) =>
+      ["database-container", relayId, databaseId] as const,
   },
   fileActivity: (relayId: string, instanceId: string) =>
     ["file-activity", relayId, instanceId] as const,
@@ -171,7 +193,8 @@ export const queryKeys = {
       ["relay", relayId, "instances", instanceId, "recipe"] as const,
     snapshot: ["relay", "snapshot"] as const,
     instances: ["relay", "instances"] as const,
-    memory: ["relay", "memory"] as const,
+    nodeReadings: ["relay", "node-readings"] as const,
+    resources: (relayId: string) => ["relay", "resources", relayId] as const,
     webRoutes: (relayId: string, instanceId: string) =>
       ["web-routes", relayId, instanceId] as const,
     tree: (relayId: string, instanceId: string) =>
@@ -182,10 +205,15 @@ export const queryKeys = {
     options: ["schedules", "options"] as const,
   },
   relays: ["relays"] as const,
+  relayProxy: (relayId: string) => ["relays", "proxy", relayId] as const,
+  relayHostFiles: (relayId: string) =>
+    ["relays", "host-files", relayId] as const,
   tailscale: (relayId: string) => ["tailscale", "relays", relayId] as const,
   tailscaleStacks: ["tailscale", "stacks"] as const,
   updates: ["updates", "overview"] as const,
   releaseHistory: ["updates", "release-history"] as const,
+  relayRelease: (relayId: string, version: string) =>
+    ["updates", "relay", relayId, version] as const,
   instanceFavorites: ["instance-favorites"] as const,
   notifications: ["notifications"] as const,
   uiPreferences: ["ui", "preferences"] as const,
@@ -309,6 +337,89 @@ export function backupStorageQueryOptions() {
   })
 }
 
+// How many people the Access page lists for a resource, with its owner.
+// Keyed under the Access page's own queries, so access changes refresh it.
+export function resourceUserCountQueryOptions(scope: {
+  relayId: string
+  resourceId: string
+  resourceType: "database" | "instance" | "relay"
+}) {
+  return queryOptions({
+    queryKey: [
+      "resource-access",
+      scope.relayId,
+      scope.resourceType,
+      scope.resourceId,
+      "count",
+    ] as const,
+    queryFn: () => getResourceUserCount({ data: scope }),
+    retry: false,
+    staleTime: Infinity,
+  })
+}
+
+// Who owns a resource, or null when the platform does. Keyed under the
+// Access page's own queries, so a transfer refreshes it; nothing announces
+// an owner renaming themselves, so it goes stale after a while too.
+export function resourceOwnerQueryOptions(scope: {
+  relayId: string
+  resourceId: string
+  resourceType: "database" | "instance" | "relay"
+}) {
+  return queryOptions({
+    queryKey: [
+      "resource-access",
+      scope.relayId,
+      scope.resourceType,
+      scope.resourceId,
+      "owner",
+    ] as const,
+    queryFn: () => getResourceOwner({ data: scope }),
+    retry: false,
+    staleTime: 30_000,
+  })
+}
+
+// The owner's Minecraft head, apart from the owner so their card shows
+// before Mojang answers. Keyed by the owner's name too, so a new owner or
+// name looks the head up again.
+export function resourceOwnerMinecraftProfileQueryOptions(
+  scope: {
+    relayId: string
+    resourceId: string
+    resourceType: "database" | "instance" | "relay"
+  },
+  ownerName: string
+) {
+  return queryOptions({
+    queryKey: [
+      "resource-access",
+      scope.relayId,
+      scope.resourceType,
+      scope.resourceId,
+      "owner",
+      "minecraft",
+      ownerName,
+    ] as const,
+    queryFn: ({ signal }) =>
+      getResourceOwnerMinecraftProfileId({ data: scope, signal }),
+    gcTime: 60 * 60_000,
+    retry: false,
+    staleTime: 60 * 60_000,
+  })
+}
+
+// How many backups a target keeps, against its quantity limit. Backup and
+// limit changes refresh it.
+export function backupUsageQueryOptions(relayId: string, target: BackupTarget) {
+  return queryOptions({
+    queryKey: queryKeys.backups.usage(relayId, target),
+    queryFn: () => getBackupUsage({ data: { relayId, target } }),
+    retry: false,
+    staleTime: Infinity,
+  })
+}
+
 export function backupPolicyQueryOptions(
   relayId: string,
   target: BackupTarget
@@ -355,14 +466,30 @@ export function relayConnectionQueryOptions(queryClient: QueryClient) {
 }
 
 /** Polled only while a Relay memory cell is mounted and the tab is visible. */
-export function relayMemoryReadingsQueryOptions() {
+export type RelayNodeReading = Awaited<
+  ReturnType<typeof getRelayNodeReadings>
+>[number]
+
+export function relayNodeReadingsQueryOptions() {
   return queryOptions({
-    queryKey: queryKeys.relay.memory,
-    queryFn: ({ signal }) => getRelayMemoryReadings({ signal }),
+    queryKey: queryKeys.relay.nodeReadings,
+    queryFn: ({ signal }) => getRelayNodeReadings({ signal }),
     refetchInterval: connectedRelayPollDelayMs,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
     staleTime: connectedRelayPollDelayMs,
+  })
+}
+
+/** The Relay's own usage, polled while its meters are mounted and visible. */
+export function relayResourcesQueryOptions(relayId: string) {
+  return queryOptions({
+    queryKey: queryKeys.relay.resources(relayId),
+    queryFn: ({ signal }) => getRelayResources({ data: { relayId }, signal }),
+    refetchInterval: 2_000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+    staleTime: 2_000,
   })
 }
 
@@ -525,6 +652,21 @@ export function managedDatabaseCredentialQueryOptions(
   })
 }
 
+// Docker walks the volume to measure it, so this is read only while the Info
+// page shows it, and not refetched often.
+export function managedDatabaseContainerQueryOptions(
+  relayId: string,
+  databaseId: string
+) {
+  return queryOptions({
+    queryKey: queryKeys.databases.container(relayId, databaseId),
+    queryFn: () =>
+      getManagedDatabaseContainer({ data: { databaseId, relayId } }),
+    retry: false,
+    staleTime: 5 * 60_000,
+  })
+}
+
 export function accessCapabilitiesQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.access.capabilities,
@@ -634,6 +776,30 @@ export function relaysQueryOptions() {
   })
 }
 
+export function relayProxyQueryOptions(relayId: string) {
+  return queryOptions({
+    queryFn: () => getRelayProxy({ data: { id: relayId } }),
+    queryKey: queryKeys.relayProxy(relayId),
+    retry: false,
+    staleTime: 10_000,
+  })
+}
+
+// The paths only move if the Relay's data or proxy mode does, so they're read
+// rarely; a proxy change refreshes them, and keying by the Relay's version
+// reads them again after it updates.
+export function relayHostFilesQueryOptions(
+  relayId: string,
+  version: string | null
+) {
+  return queryOptions({
+    queryFn: () => getRelayHostFiles({ data: { id: relayId } }),
+    queryKey: [...queryKeys.relayHostFiles(relayId), version] as const,
+    retry: false,
+    staleTime: 5 * 60_000,
+  })
+}
+
 export function relayTailscaleQueryOptions(relayId: string) {
   return queryOptions({
     queryKey: queryKeys.tailscale(relayId),
@@ -658,6 +824,17 @@ export function updateOverviewQueryOptions() {
     queryKey: queryKeys.updates,
     queryFn: () => getUpdateOverview(),
     staleTime: 30_000,
+  })
+}
+
+// Keyed by the version the Relay runs, so an update refreshes it.
+export function relayReleaseQueryOptions(relayId: string, version: string) {
+  return queryOptions({
+    queryKey: queryKeys.relayRelease(relayId, version),
+    queryFn: ({ signal }) => getRelayRelease({ data: { relayId }, signal }),
+    refetchOnWindowFocus: false,
+    retry: false,
+    staleTime: 10 * 60_000,
   })
 }
 

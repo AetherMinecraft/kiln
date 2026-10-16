@@ -18,6 +18,8 @@ import {
   relayDatabaseTerminalClaimSchema,
   relayDatabaseTerminalRestartSchema,
   relayDatabaseTerminalWriteSchema,
+  relayDatabaseContainerSchema,
+  relayDatabaseDumpFormatSchema,
   relayManagedDatabaseSchema,
 } from "@workspace/contracts"
 import type { RelayManagedDatabase } from "@workspace/contracts"
@@ -30,6 +32,7 @@ import {
   listManagedDatabaseRecordsEffect,
   loadManagedDatabaseCredentialEffect,
   managedDatabaseNameExistsEffect,
+  renameManagedDatabaseRecordEffect,
   rotateManagedDatabaseCredentialEffect,
 } from "@/effect/managed-databases"
 import { runAppEffect } from "@/effect/runtime"
@@ -69,13 +72,25 @@ const databaseInputSchema = z.strictObject({
 const databaseActionInputSchema = databaseInputSchema.extend({
   action: z.enum(["start", "stop", "restart"]),
 })
+const databaseRenameInputSchema = databaseInputSchema.extend({
+  name: relayDatabaseNameSchema,
+})
 const databaseNetworkInputSchema = databaseInputSchema.extend({
   connected: z.boolean(),
   instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
 })
-const databaseImportInputSchema = databaseInputSchema.extend({
-  content: z.string().max(700_000),
-})
+// A text dump, or a PostgreSQL custom-format dump in base64, which the
+// Relay checks against the same 700 KB once decoded.
+const databaseImportInputSchema = databaseInputSchema
+  .extend({
+    content: z.string().max(940_000),
+    format: relayDatabaseDumpFormatSchema.default("sql"),
+  })
+  .refine(
+    ({ content, format }) =>
+      format === "postgres-custom" || content.length <= 700_000,
+    "SQL dumps are currently limited to 700 KB"
+  )
 const databaseRowsRequestSchema = databaseInputSchema.extend({
   request: databaseRowsInputSchema,
 })
@@ -252,6 +267,8 @@ export const getManagedDatabases = createServerFn({ method: "GET" }).handler(
               ...database,
               hasCredentials: Boolean(record),
               inventoryStatus,
+              // A rename lives in Hearth; the Relay keeps the original.
+              name: record?.name ?? database.name,
               permissions,
               relayId: relay.id,
               relayName: relay.name,
@@ -371,6 +388,61 @@ export const getManagedDatabaseCredential = createServerFn({ method: "GET" })
       password: credential.password,
       username: credential.username,
     }
+  })
+
+// The database's container: its name, data folder, and volume size. Docker
+// measures the volume on request, so the Info page asks only while it's open.
+export const getManagedDatabaseContainer = createServerFn({ method: "GET" })
+  .validator(databaseInputSchema)
+  .handler(async ({ data }) => {
+    const { relay, user } = await authorizedDatabase(data, "database.read")
+    return relayDatabaseContainerSchema.parse(
+      await databaseRpc(
+        relay,
+        "database.inspect",
+        { databaseId: data.databaseId },
+        75_000,
+        user.id
+      )
+    )
+  })
+
+// Deletes all of the database's data and keeps the database, so it takes
+// the permission that deletes it.
+export const wipeManagedDatabase = createServerFn({ method: "POST" })
+  .validator(databaseInputSchema)
+  .handler(async ({ data }) => {
+    const { relay, user } = await authorizedDatabase(data, "database.delete")
+    const credential = await requiredCredential(data.relayId, data.databaseId)
+    const database = relayManagedDatabaseSchema.parse(
+      await databaseRpc(
+        relay,
+        "database.wipe",
+        {
+          databaseId: data.databaseId,
+          password: credential.password,
+          username: credential.username,
+        },
+        120_000,
+        user.id
+      )
+    )
+    publishDatabaseChange(relay.id, false)
+    return database
+  })
+
+// Renaming is managing the database as a whole, so it takes the permission
+// that deletes it.
+export const renameManagedDatabase = createServerFn({ method: "POST" })
+  .validator(databaseRenameInputSchema)
+  .handler(async ({ data }) => {
+    const { relay } = await authorizedDatabase(data, "database.delete")
+    await runAppEffect(
+      "managedDatabases.rename",
+      renameManagedDatabaseRecordEffect(relay.id, data.databaseId, data.name)
+    )
+    publishDatabaseChange(relay.id, true)
+    return { name: data.name }
   })
 
 export const createManagedDatabase = createServerFn({ method: "POST" })
@@ -591,6 +663,9 @@ export const importManagedDatabase = createServerFn({ method: "POST" })
       {
         content: data.content,
         databaseId: data.databaseId,
+        // Left out for text dumps, so Relays from before custom-format
+        // imports still take them.
+        ...(data.format === "postgres-custom" ? { format: data.format } : {}),
         password: credential.password,
         username: credential.username,
       },

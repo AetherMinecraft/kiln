@@ -1,22 +1,14 @@
 import * as React from "react"
-import { useQuery } from "@tanstack/react-query"
-import { Link } from "@tanstack/react-router"
 import {
-  Activity,
-  ArrowRight,
   Check,
   Copy,
   Globe2,
   TriangleAlert,
-  Users,
   type LucideIcon,
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
 import { cn } from "@workspace/ui/lib/utils"
-
-import { canAccessActivity } from "@/lib/navigation-destinations"
-import { accessCapabilitiesQueryOptions } from "@/lib/query-options"
 
 // Building blocks shared by the Info pages of every instance kind.
 
@@ -122,95 +114,47 @@ export function CopyMetaRow({
   )
 }
 
-export function ResourceUsersCard({
-  activityServerId,
-  noun,
-  relayId,
-  resourceId,
-  resourceType,
-}: {
-  // Activity filters by server only, so other kinds omit it.
-  activityServerId?: string
-  // Lowercase, for example "server".
-  noun: string
-  relayId: string
-  resourceId: string
-  resourceType: "database" | "instance"
-}) {
-  const { data: access } = useQuery({
-    ...accessCapabilitiesQueryOptions(),
-    select: selectUsersCardAccess,
-  })
-  const canViewActivity = Boolean(access?.canViewActivity && activityServerId)
-  if (!access?.canManageAccess && !canViewActivity) return null
-  return (
-    <InfoCard className="self-start">
-      <InfoCardHeader icon={<Users />} title="Users & access" />
-      <div className="space-y-4 p-4">
-        <p className="text-sm text-muted-foreground">
-          {canViewActivity
-            ? `Manage this ${noun}’s invitations, presets, and permissions, or review recent activity.`
-            : `Manage this ${noun}’s invitations, presets, and permissions.`}
-        </p>
-        <div className="flex flex-wrap gap-2">
-          {access?.canManageAccess ? (
-            <Button asChild size="sm" variant="outline">
-              <Link
-                to="/access"
-                search={{ tab: "users", relayId, resourceType, resourceId }}
-              >
-                Manage access
-                <ArrowRight />
-              </Link>
-            </Button>
-          ) : null}
-          {canViewActivity ? (
-            <Button asChild size="sm" variant="ghost">
-              <Link
-                to="/activity"
-                search={{ relay: relayId, server: activityServerId }}
-              >
-                <Activity />
-                View activity
-              </Link>
-            </Button>
-          ) : null}
-        </div>
-      </div>
-    </InfoCard>
-  )
-}
-
-function selectUsersCardAccess(
-  capabilities: Parameters<typeof canAccessActivity>[0]
-) {
-  return {
-    canManageAccess: capabilities.canManageAccess,
-    canViewActivity: canAccessActivity(capabilities),
-  }
-}
-
 export function DangerZone({
   action,
+  className,
   detail,
   title,
 }: {
   action: React.ReactNode
-  detail: string
-  title: string
+  className?: string
+  detail?: string
+  // Left out when the actions say what they do.
+  title?: string
 }) {
   return (
-    <div className="mt-4 flex flex-col gap-3 rounded-xl border border-destructive/25 bg-destructive/4 px-4 py-3.5 sm:flex-row sm:items-center">
+    <div
+      className={cn(
+        "mt-4 flex flex-col gap-3 rounded-xl border border-destructive/25 bg-destructive/4 px-4 py-3.5 sm:flex-row sm:items-center",
+        className
+      )}
+    >
       <div className="flex min-w-0 flex-1 items-center gap-3">
         <span className="grid size-8 shrink-0 place-items-center rounded-lg border border-destructive/20 bg-destructive/10 text-destructive">
           <TriangleAlert className="size-4" />
         </span>
         <div className="min-w-0">
-          <p className="type-technical-label text-destructive">Danger zone</p>
-          <h3 className="mt-1 text-sm font-semibold">{title}</h3>
-          <p className="type-meta mt-1 font-mono break-all text-muted-foreground">
-            {detail}
-          </p>
+          {title ? (
+            <>
+              <p className="type-technical-label text-destructive">
+                Danger zone
+              </p>
+              <h3 className="mt-1 text-sm font-semibold">{title}</h3>
+            </>
+          ) : (
+            <h3 className="type-technical-label text-sm whitespace-nowrap text-foreground">
+              Danger zone
+            </h3>
+          )}
+          {detail ? (
+            <p className="type-meta mt-1 font-mono break-all text-muted-foreground">
+              {detail}
+            </p>
+          ) : null}
         </div>
       </div>
       {action}
@@ -231,7 +175,7 @@ export function MetaRow({
   className?: string
   icon: LucideIcon
   label: string
-  value: string
+  value: React.ReactNode
   mono?: boolean
   wrap?: boolean
 }) {
@@ -249,7 +193,7 @@ export function MetaRow({
         </span>
         <span
           className={`mt-0.5 block text-xs ${mono ? "font-mono" : "font-medium"} ${wrap ? "break-all" : "truncate"}`}
-          title={value}
+          title={typeof value === "string" ? value : undefined}
         >
           {value}
         </span>

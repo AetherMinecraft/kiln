@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import {
   link,
   mkdir,
+  readdir,
   readFile,
   rename,
   rm,
@@ -19,11 +20,14 @@ import {
   isKilnReleaseVersion,
   kilnReleaseVersionCore,
   kilnImageRepository,
+  relaySystemUpdateSchema,
+  type RelaySystemUpdate,
 } from "@workspace/contracts"
 import { Effect, Semaphore } from "effect"
 
-import { command } from "./command.js"
-import { RelaySystemUpdateError } from "./effect/errors.js"
+import { runContainer } from "./docker-container-spec.js"
+import { DockerEngine, isDockerNotFound } from "./docker-engine.js"
+import { RelayNotFoundError, RelaySystemUpdateError } from "./effect/errors.js"
 import {
   KILN_INSTALLATION_LABEL,
   kilnComponent,
@@ -65,6 +69,9 @@ export interface UpdateOperation {
   id: string
   previousImage: string
   requestedImage: string
+  // The Hearth request that started it, so a browser that lost the reply
+  // can find it in the Relay's snapshot.
+  requestId?: string
   startedAt: string
   status: "failed" | "running" | "succeeded"
   targetContainer: string
@@ -88,20 +95,47 @@ export class SystemUpdateManager {
   readonly #installationId: string | null
   readonly #gitRepository: string
   readonly #operationsDirectory: string
+  readonly #engine: DockerEngine
   #activeBatch: { id: string } | null = null
+  // The latest update of each component. Records on disk are merged in on
+  // the first read.
+  readonly #latest = new Map<KilnComponent, UpdateOperation>()
+  #latestLoaded = false
+  // Updates this process is still starting. Their helper isn't launched yet,
+  // so `status` doesn't take its absence for a helper that stopped.
+  readonly #starting = new Set<string>()
 
   constructor(config: {
     dataDirectory: string
+    dockerSocket?: string
     gitRepository?: string
     installationId?: string | null
   }) {
+    this.#engine = new DockerEngine(
+      config.dockerSocket ?? "/var/run/docker.sock"
+    )
     this.#gitRepository = config.gitRepository ?? DEFAULT_KILN_GIT_REPO
     this.#installationId = config.installationId ?? null
     this.#operationsDirectory = join(config.dataDirectory, "updates")
   }
 
-  inspect(container: string) {
-    return inspectContainerEffect(container).pipe(
+  /**
+   * Inspects a container Hearth named, or this Relay's own when `container`
+   * is null. Hearth asks every Relay for its own container and only the one
+   * on its Docker host has it, so a named container that isn't here fails
+   * with RelayNotFoundError rather than as a Relay error.
+   */
+  inspect(container: string | null) {
+    return inspectContainerEffect(this.#engine, container ?? hostname()).pipe(
+      Effect.catchIf(
+        (cause) => container !== null && isContainerMissing(cause),
+        () =>
+          Effect.fail(
+            RelayNotFoundError.make({
+              message: `Container ${container} isn't on this Relay's Docker host`,
+            })
+          )
+      ),
       Effect.map((inspected) =>
         updateEligibility(inspected, this.#installationId, this.#gitRepository)
       ),
@@ -136,16 +170,19 @@ export class SystemUpdateManager {
   startBatch(
     input: {
       helperImage: string
+      requestId?: string
       targets: ReadonlyArray<SystemUpdateTargetInput>
     },
     signal?: AbortSignal
   ) {
+    const engine = this.#engine
     const installationId = this.#installationId
     const gitRepository = this.#gitRepository
     const operationsDirectory = this.#operationsDirectory
     const setActiveBatch = (id: string) => {
       this.#activeBatch = { id }
     }
+    const starting = this.#starting
     return this.#batchSemaphore.withPermit(
       Effect.gen({ self: this }, function* () {
         yield* ensureNotAbortedEffect(signal)
@@ -174,11 +211,13 @@ export class SystemUpdateManager {
           input.targets,
           (targetInput) =>
             prepareUpdateEffect(
+              engine,
               targetInput,
               batchId,
               startedAt,
               installationId,
-              gitRepository
+              gitRepository,
+              input.requestId
             ),
           { concurrency: "unbounded" }
         )
@@ -192,6 +231,7 @@ export class SystemUpdateManager {
         const operations = prepared.map(({ operation }) => operation)
 
         yield* acquireOperationLocksEffect(operationsDirectory, operations)
+        for (const { id } of operations) starting.add(id)
         const failOperations = (cause: RelaySystemUpdateError) =>
           failQueuedOperationsEffect(
             operationsDirectory,
@@ -201,12 +241,21 @@ export class SystemUpdateManager {
               : cause.message
           )
 
-        return yield* Effect.gen(function* () {
+        return yield* Effect.gen({ self: this }, function* () {
+          // Recorded before the images are pulled, which can take minutes,
+          // so a Relay restarted meanwhile still knows about them.
+          yield* Effect.forEach(
+            operations,
+            (operation) => writeOperationEffect(operationsDirectory, operation),
+            { discard: true }
+          )
+          this.#remember(operations)
           const images = uniqueUpdateImages(input.helperImage, prepared)
           const inspectedImages = yield* Effect.forEach(
             images,
             ({ component, image }) =>
               pullAndVerifyImageEffect(
+                engine,
                 image,
                 component,
                 gitRepository,
@@ -232,7 +281,8 @@ export class SystemUpdateManager {
 
           const volumesFrom =
             prepared.find(({ operation }) => operation.component === "relay")
-              ?.container ?? (yield* inspectContainerEffect(hostname()))
+              ?.container ??
+            (yield* inspectContainerEffect(engine, hostname()))
           const volumesFromLabels = volumesFrom.Config.Labels ?? {}
           if (
             kilnComponent(volumesFromLabels["io.kiln.component"]) !== "relay" ||
@@ -247,11 +297,6 @@ export class SystemUpdateManager {
             )
           }
 
-          yield* Effect.forEach(
-            operations,
-            (operation) => writeOperationEffect(operationsDirectory, operation),
-            { discard: true }
-          )
           const batch: UpdateBatch = {
             id: batchId,
             operationIds: [
@@ -263,11 +308,12 @@ export class SystemUpdateManager {
           yield* ensureNotAbortedEffect(signal)
 
           const helperState = activeBatch
-            ? yield* helperStateEffect(batchId)
+            ? yield* helperStateEffect(engine, batchId)
             : "stopped"
           if (helperState !== "running") {
-            yield* cleanupHelperEffect(batchId)
+            yield* cleanupHelperEffect(engine, batchId)
             yield* launchBatchHelperEffect(
+              engine,
               {
                 batchId,
                 helperImage: input.helperImage,
@@ -283,20 +329,26 @@ export class SystemUpdateManager {
           Effect.catch((cause) =>
             failOperations(cause).pipe(
               Effect.andThen(
+                Effect.sync(() =>
+                  operations.map((operation): UpdateOperation => ({
+                    ...operation,
+                    error: signal?.aborted
+                      ? "The update request was cancelled before replacement started."
+                      : cause.message,
+                    finishedAt: new Date().toISOString(),
+                    status: "failed",
+                  }))
+                )
+              ),
+              Effect.tap((failed) => Effect.sync(() => this.#remember(failed))),
+              Effect.flatMap((failed) =>
                 signal?.aborted
                   ? systemUpdateFailure(
                       "start.cancelled",
                       abortReason(signal).message,
                       abortReason(signal)
                     )
-                  : Effect.succeed(
-                      operations.map((operation): UpdateOperation => ({
-                        ...operation,
-                        error: cause.message,
-                        finishedAt: new Date().toISOString(),
-                        status: "failed",
-                      }))
-                    )
+                  : Effect.succeed(failed)
               )
             )
           ),
@@ -313,16 +365,82 @@ export class SystemUpdateManager {
                 )
               )
             )
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              for (const { id } of operations) starting.delete(id)
+            })
           )
         )
       }).pipe(Effect.withSpan("relay.systemUpdates.startBatch"))
     )
   }
 
+  /**
+   * The latest update of each component, for the Relay's snapshot. The
+   * update helper records a running update's progress and outcome on disk,
+   * so those are read again; this also notices updates that stopped without
+   * an outcome (see `status`). What can't be read now is reported as last
+   * known, and read again next time.
+   */
+  updates(): Effect.Effect<Array<RelaySystemUpdate>> {
+    return Effect.gen({ self: this }, function* () {
+      if (!this.#latestLoaded) {
+        const recorded = yield* recordedOperationsEffect(
+          this.#operationsDirectory
+        ).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              this.#latestLoaded = true
+            })
+          ),
+          Effect.catch((cause) =>
+            Effect.logWarning(
+              "System update records could not be read",
+              cause
+            ).pipe(Effect.as([]))
+          )
+        )
+        this.#remember(recorded)
+      }
+      const running = Array.from(this.#latest.values()).filter(
+        (operation) => operation.status === "running"
+      )
+      const current = yield* Effect.forEach(
+        running,
+        (operation) =>
+          this.status(operation.id).pipe(
+            Effect.catch(() => Effect.succeed(null))
+          ),
+        { concurrency: "unbounded" }
+      )
+      this.#remember(current.flatMap((operation) => operation ?? []))
+      return Array.from(this.#latest.values()).flatMap(reportedUpdate)
+    })
+  }
+
+  #remember(operations: ReadonlyArray<UpdateOperation>) {
+    for (const operation of operations) {
+      // One that can't be reported can't be compared with later ones either.
+      if (reportedUpdate(operation).length === 0) continue
+      const known = this.#latest.get(operation.component)
+      if (!known || known.id === operation.id || isNewer(operation, known)) {
+        this.#latest.set(operation.component, operation)
+      }
+    }
+  }
+
+  // Whether an update this Relay started is still running.
+  running() {
+    return this.#runningBatchEffect().pipe(
+      Effect.map((batch) => batch !== null)
+    )
+  }
+
   #runningBatchEffect() {
     const active = this.#activeBatch
     if (!active) return Effect.succeed<UpdateBatch | null>(null)
-    return helperStateEffect(active.id).pipe(
+    return helperStateEffect(this.#engine, active.id).pipe(
       Effect.flatMap((state) =>
         state === "running"
           ? readBatchEffect(this.#operationsDirectory, active.id)
@@ -335,17 +453,21 @@ export class SystemUpdateManager {
   }
 
   status(id: string) {
+    const engine = this.#engine
     const operationsDirectory = this.#operationsDirectory
+    const starting = this.#starting
     return Effect.gen(function* () {
       if (!/^[0-9a-f-]{36}$/u.test(id)) return null
       const operation = yield* readOperationEffect(operationsDirectory, id)
       if (!operation) return null
+      // Its helper isn't launched yet, so a missing helper means nothing.
+      if (starting.has(operation.id)) return operation
 
       const helperId = operation.batchId ?? operation.id
       if (
         operation.status === "running" &&
         operationIsStale(operation) &&
-        (yield* helperStateEffect(helperId)) === "stopped"
+        (yield* helperStateEffect(engine, helperId)) === "stopped"
       ) {
         const failed: UpdateOperation = {
           ...operation,
@@ -360,7 +482,7 @@ export class SystemUpdateManager {
           operation.targetContainer,
           operation.id
         )
-        yield* cleanupHelperEffect(helperId)
+        yield* cleanupHelperEffect(engine, helperId)
         return failed
       }
 
@@ -372,16 +494,64 @@ export class SystemUpdateManager {
         )
         if (operation.batchId) {
           yield* cleanupCompletedBatchEffect(
+            engine,
             operationsDirectory,
             operation.batchId
           )
         } else {
-          yield* cleanupHelperEffect(id)
+          yield* cleanupHelperEffect(engine, id)
         }
       }
       return operation
     }).pipe(Effect.withSpan("relay.systemUpdates.status"))
   }
+}
+
+const operationFilePattern = /^[0-9a-f-]{36}\.json$/u
+
+const recordedOperationsEffect = Effect.fn("relay.systemUpdates.recorded")(
+  function* (directory: string) {
+    const names = yield* systemUpdateOperation("operations.list", () =>
+      readdir(directory)
+    ).pipe(
+      Effect.catch((cause) =>
+        systemErrorCode(cause) === "ENOENT"
+          ? Effect.succeed<Array<string>>([])
+          : Effect.fail(cause)
+      )
+    )
+    const operations = yield* Effect.forEach(
+      names.filter((name) => operationFilePattern.test(name)),
+      (name) =>
+        readOperationEffect(directory, name.slice(0, -".json".length)).pipe(
+          // One unreadable record must not hide the others.
+          Effect.catch(() => Effect.succeed(null))
+        ),
+      { concurrency: 8 }
+    )
+    return operations.flatMap((operation) => operation ?? [])
+  }
+)
+
+function isNewer(operation: UpdateOperation, than: UpdateOperation): boolean {
+  return Date.parse(operation.startedAt) > Date.parse(than.startedAt)
+}
+
+// Hearth rejects a whole snapshot that breaks its contract, so a long error
+// is clamped and a record that still doesn't fit isn't reported.
+function reportedUpdate(operation: UpdateOperation): Array<RelaySystemUpdate> {
+  const reported = relaySystemUpdateSchema.safeParse({
+    component: operation.component,
+    error: operation.error?.slice(0, 2_000) ?? null,
+    finishedAt: operation.finishedAt,
+    id: operation.id,
+    ...(operation.phase ? { phase: operation.phase.slice(0, 100) } : {}),
+    ...(operation.requestId ? { requestId: operation.requestId } : {}),
+    startedAt: operation.startedAt,
+    status: operation.status,
+    version: operation.version,
+  })
+  return reported.success ? [reported.data] : []
 }
 
 interface PreparedUpdate {
@@ -391,17 +561,19 @@ interface PreparedUpdate {
 }
 
 const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
+  engine: DockerEngine,
   input: SystemUpdateTargetInput,
   batchId: string,
   startedAt: string,
   installationId: string | null,
-  gitRepository: string
+  gitRepository: string,
+  requestId: string | undefined
 ) {
   const targetComponent = releaseImageComponent(
     input.targetImage,
     gitRepository
   )
-  const container = yield* inspectContainerEffect(input.targetContainer)
+  const container = yield* inspectContainerEffect(engine, input.targetContainer)
   const eligibility = updateEligibility(
     container,
     installationId,
@@ -458,6 +630,7 @@ const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
       id: randomUUID(),
       previousImage: container.Config.Image,
       requestedImage: input.targetImage,
+      ...(requestId ? { requestId } : {}),
       startedAt,
       status: "running",
       targetContainer: container.Name.replace(/^\//u, ""),
@@ -547,6 +720,7 @@ function failQueuedOperationsEffect(
 }
 
 function launchBatchHelperEffect(
+  engine: DockerEngine,
   input: {
     batchId: string
     helperImage: string
@@ -555,29 +729,26 @@ function launchBatchHelperEffect(
   },
   signal?: AbortSignal
 ): Effect.Effect<void, RelaySystemUpdateError> {
-  return systemUpdateOperation("start.launchHelper", () =>
-    command(
-      "docker",
-      [
-        "run",
-        "--detach",
-        "--name",
-        `kiln-updater-${input.batchId}`,
-        "--label",
-        "io.kiln.update-helper=true",
+  return systemUpdateEffect(
+    "start.launchHelper",
+    runContainer(
+      engine,
+      {
+        command: ["dist/src/updater.mjs"],
+        env: {
+          KILN_UPDATE_DATA_DIR: input.operationsDirectory,
+          KILN_UPDATE_BATCH_ID: input.batchId,
+        },
         // The helper runs the Relay image without its health endpoint.
-        "--no-healthcheck",
-        "--volumes-from",
-        input.volumesFrom,
-        "--env",
-        `KILN_UPDATE_DATA_DIR=${input.operationsDirectory}`,
-        "--env",
-        `KILN_UPDATE_BATCH_ID=${input.batchId}`,
-        input.helperImage,
-        "dist/src/updater.mjs",
-      ],
-      { signal, timeout: 90_000 }
-    )
+        healthcheck: "none",
+        image: input.helperImage,
+        labels: { "io.kiln.update-helper": "true" },
+        name: `kiln-updater-${input.batchId}`,
+        volumesFrom: [input.volumesFrom],
+      },
+      { timeout: 90_000 }
+    ),
+    signal
   ).pipe(Effect.asVoid)
 }
 
@@ -640,6 +811,7 @@ function writeBatchEffect(
 }
 
 function cleanupCompletedBatchEffect(
+  engine: DockerEngine,
   directory: string,
   batchId: string
 ): Effect.Effect<void, RelaySystemUpdateError> {
@@ -656,8 +828,8 @@ function cleanupCompletedBatchEffect(
     ) {
       return
     }
-    if ((yield* helperStateEffect(batchId)) !== "running") {
-      yield* cleanupHelperEffect(batchId)
+    if ((yield* helperStateEffect(engine, batchId)) !== "running") {
+      yield* cleanupHelperEffect(engine, batchId)
     }
   })
 }
@@ -745,6 +917,7 @@ function updateEligibility(
 }
 
 function inspectContainerEffect(
+  engine: DockerEngine,
   container: string
 ): Effect.Effect<ContainerInspect, RelaySystemUpdateError> {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/u.test(container)) {
@@ -753,24 +926,24 @@ function inspectContainerEffect(
       "Invalid Docker container identifier"
     )
   }
-  return inspectContainerDirectEffect(container).pipe(
+  return inspectContainerDirectEffect(engine, container).pipe(
     Effect.catch((directCause) =>
       Effect.gen(function* () {
-        const listed = yield* systemUpdateOperation(
+        const listed = yield* systemUpdateEffect(
           "inspect.listContainers",
-          () => command("docker", ["ps", "--quiet"])
+          engine.listContainers()
         )
-        const identifiers = listed.stdout.split(/\s+/u).filter(Boolean)
-        if (identifiers.length === 0) return yield* Effect.fail(directCause)
-        const result = yield* systemUpdateOperation(
+        if (listed.length === 0) return yield* Effect.fail(directCause)
+        const inspected = yield* systemUpdateEffect(
           "inspect.inspectCandidates",
-          () => command("docker", ["inspect", ...identifiers])
+          engine.inspectContainers<unknown>(listed.map(({ Id }) => Id))
         )
-        const inspected = yield* decodeJsonArrayEffect(
-          "inspect.decodeCandidates",
-          result.stdout,
-          isContainerInspect
-        )
+        if (!inspected.every(isContainerInspect)) {
+          return yield* systemUpdateFailure(
+            "inspect.decodeCandidates",
+            "Docker returned an invalid inspection response"
+          )
+        }
         const matches = inspected.filter(
           (candidate) => candidate.Config.Hostname === container
         )
@@ -787,30 +960,34 @@ function inspectContainerEffect(
   )
 }
 
+// Docker had no container by that ID or name, and none uses it as a hostname.
+function isContainerMissing(cause: RelaySystemUpdateError): boolean {
+  return (
+    cause.phase === "inspect.inspectContainer" && isDockerNotFound(cause.cause)
+  )
+}
+
 function inspectContainerDirectEffect(
+  engine: DockerEngine,
   container: string
 ): Effect.Effect<ContainerInspect, RelaySystemUpdateError> {
-  return Effect.gen(function* () {
-    const result = yield* systemUpdateOperation(
-      "inspect.inspectContainer",
-      () => command("docker", ["inspect", container])
+  return systemUpdateEffect(
+    "inspect.inspectContainer",
+    engine.inspectContainer<unknown>(container)
+  ).pipe(
+    Effect.flatMap((inspected) =>
+      isContainerInspect(inspected)
+        ? Effect.succeed(inspected)
+        : systemUpdateFailure(
+            "inspect.decodeContainer",
+            "Docker could not inspect the container"
+          )
     )
-    const inspected = (yield* decodeJsonArrayEffect(
-      "inspect.decodeContainer",
-      result.stdout,
-      isContainerInspect
-    ))[0]
-    if (!inspected) {
-      return yield* systemUpdateFailure(
-        "inspect.decodeContainer",
-        "Docker could not inspect the container"
-      )
-    }
-    return inspected
-  })
+  )
 }
 
 function pullAndVerifyImageEffect(
+  engine: DockerEngine,
   image: string,
   expectedComponent: KilnComponent,
   gitRepository: string,
@@ -818,22 +995,18 @@ function pullAndVerifyImageEffect(
 ): Effect.Effect<ImageInspect, RelaySystemUpdateError> {
   return Effect.gen(function* () {
     yield* ensureNotAbortedEffect(signal)
-    yield* systemUpdateOperation("start.pullImage", () =>
-      command("docker", ["pull", image], {
-        signal,
-        timeout: 10 * 60_000,
-      })
+    yield* systemUpdateEffect(
+      "start.pullImage",
+      engine.pullImage(image, { timeout: 10 * 60_000 }),
+      signal
     )
     yield* ensureNotAbortedEffect(signal)
-    const result = yield* systemUpdateOperation("start.inspectImage", () =>
-      command("docker", ["image", "inspect", image], { signal })
+    const inspected = yield* systemUpdateEffect(
+      "start.inspectImage",
+      engine.inspectImage<unknown>(image),
+      signal
     )
-    const inspected = (yield* decodeJsonArrayEffect(
-      "start.decodeImage",
-      result.stdout,
-      isImageInspect
-    ))[0]
-    if (!inspected) {
+    if (!isImageInspect(inspected)) {
       return yield* systemUpdateFailure(
         "start.decodeImage",
         "Docker could not inspect the pulled image"
@@ -981,40 +1154,48 @@ function targetLockPath(directory: string, targetContainer: string): string {
 }
 
 function helperStateEffect(
+  engine: DockerEngine,
   id: string
 ): Effect.Effect<"running" | "stopped" | "unknown", RelaySystemUpdateError> {
   const helperName = `kiln-updater-${id}`
-  return Effect.gen(function* () {
-    const result = yield* systemUpdateOperation("status.inspectHelper", () =>
-      command("docker", ["inspect", helperName])
-    )
-    const inspected = (yield* decodeJsonArrayEffect(
-      "status.decodeHelper",
-      result.stdout,
-      isHelperInspect
-    ))[0]
-    return inspected?.State?.Running ? "running" : "stopped"
-  }).pipe(
+  return systemUpdateEffect(
+    "status.inspectHelper",
+    engine.inspectContainer<unknown>(helperName)
+  ).pipe(
+    Effect.flatMap((inspected) =>
+      isHelperInspect(inspected)
+        ? Effect.succeed(
+            inspected.State?.Running ? ("running" as const) : ("stopped" as const)
+          )
+        : systemUpdateFailure(
+            "status.decodeHelper",
+            "Docker returned an invalid inspection response"
+          )
+    ),
     Effect.catch(() =>
-      systemUpdateOperation("status.findHelper", () =>
-        command("docker", [
-          "ps",
-          "--all",
-          "--quiet",
-          "--filter",
-          `name=^/${helperName}$`,
-        ])
+      systemUpdateEffect(
+        "status.findHelper",
+        engine.listContainers({
+          all: true,
+          filters: { name: [`^/${helperName}$`] },
+        })
       ).pipe(
-        Effect.map((result) => (result.stdout.trim() ? "unknown" : "stopped")),
+        Effect.map((listed) =>
+          listed.length > 0 ? ("unknown" as const) : ("stopped" as const)
+        ),
         Effect.catch(() => Effect.succeed("unknown" as const))
       )
     )
   )
 }
 
-function cleanupHelperEffect(id: string): Effect.Effect<void> {
-  return systemUpdateOperation("helper.cleanup", () =>
-    command("docker", ["rm", "--force", `kiln-updater-${id}`])
+function cleanupHelperEffect(
+  engine: DockerEngine,
+  id: string
+): Effect.Effect<void> {
+  return systemUpdateEffect(
+    "helper.cleanup",
+    engine.removeContainer(`kiln-updater-${id}`, { force: true })
   ).pipe(
     Effect.asVoid,
     Effect.catch((cause) =>
@@ -1132,6 +1313,38 @@ function systemUpdateOperation<TResult>(
   })
 }
 
+/**
+ * A Docker request as a step of an update, failing with its phase; with a
+ * signal, it stops when the request that started the update is cancelled.
+ */
+function systemUpdateEffect<A>(
+  phase: string,
+  operation: Effect.Effect<A, Error>,
+  signal?: AbortSignal
+): Effect.Effect<A, RelaySystemUpdateError> {
+  const mapped = operation.pipe(
+    Effect.mapError((cause) => makeSystemUpdateError(phase, undefined, cause))
+  )
+  if (!signal) return mapped
+  const cancelled = Effect.callback<never, RelaySystemUpdateError>((resume) => {
+    const abort = () =>
+      resume(
+        systemUpdateFailure(
+          "request.cancelled",
+          abortReason(signal).message,
+          abortReason(signal)
+        )
+      )
+    if (signal.aborted) {
+      abort()
+      return
+    }
+    signal.addEventListener("abort", abort, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", abort))
+  })
+  return Effect.raceFirst(mapped, cancelled)
+}
+
 function systemUpdateFailure(
   phase: string,
   reason: string,
@@ -1167,33 +1380,6 @@ function removeBestEffortEffect(
     Effect.asVoid,
     Effect.catch((cause) => Effect.logWarning(warning, cause))
   )
-}
-
-function decodeJsonArrayEffect<T>(
-  phase: string,
-  text: string,
-  predicate: (value: unknown) => value is T
-): Effect.Effect<Array<T>, RelaySystemUpdateError> {
-  return Effect.try({
-    try: () => decodeJsonArray(text, predicate),
-    catch: (cause) =>
-      makeSystemUpdateError(
-        phase,
-        "Docker returned an invalid inspection response",
-        cause
-      ),
-  })
-}
-
-function decodeJsonArray<T>(
-  text: string,
-  predicate: (value: unknown) => value is T
-): Array<T> {
-  const decoded: unknown = JSON.parse(text)
-  if (!Array.isArray(decoded) || !decoded.every(predicate)) {
-    throw new Error("Docker returned an invalid inspection response")
-  }
-  return decoded
 }
 
 function isContainerInspect(value: unknown): value is ContainerInspect {
@@ -1234,6 +1420,7 @@ function isUpdateOperation(value: unknown): value is UpdateOperation {
     typeof value.id === "string" &&
     typeof value.previousImage === "string" &&
     typeof value.requestedImage === "string" &&
+    optionalString(value.requestId) &&
     typeof value.startedAt === "string" &&
     (value.status === "failed" ||
       value.status === "running" ||

@@ -85,7 +85,12 @@ function serverRoutes(
   routeId: string,
   capabilities: NavigationAccessCapabilities
 ) {
-  const serverKeywords = ["server", instance.name, instance.implementation]
+  const serverKeywords = [
+    "server",
+    "game server",
+    instance.name,
+    instance.implementation,
+  ]
   return accessibleDestinationsForServer(instance, capabilities).map(
     (destination) => ({
       icon: destination.icon,
@@ -207,7 +212,7 @@ export function RouteCommandMenuProvider({
             {selectedServerRoutes.length > 0 ? (
               <>
                 <RouteGroup
-                  heading="Server"
+                  heading="Game Server"
                   routes={selectedServerRoutes}
                   onSelect={navigateToRoute}
                 />

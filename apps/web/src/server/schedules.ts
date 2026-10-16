@@ -8,6 +8,7 @@ import { z } from "zod"
 import {
   normalizeScheduleCron,
   relayScheduleOverviewSchema,
+  relaySnapshotSchema,
   scheduleActionAppliesToTarget,
   scheduleActionSchema,
   scheduleDefinitionSchema,
@@ -49,7 +50,7 @@ import { relayRpc } from "@/lib/relay-connection"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { requireScheduleBackupDestinations } from "@/lib/schedule-backup-destinations.server"
 import { scheduleTargetsWithAvailability } from "@/lib/schedule-target-options"
-import { promiseEffect } from "@/effect/promise"
+import { promiseEffect, recoverPromise } from "@/effect/promise"
 import { requireEligibleResourceUser } from "@/server/auth"
 
 const scheduleWriteSchema = scheduleInputSchema
@@ -69,6 +70,7 @@ class ScheduleRevisionConflictError extends Data.TaggedError(
 )<{ readonly message: string }> {}
 
 interface ScheduleRow extends RowDataPacket {
+  continue_on_failure: number
   created_at: number
   created_by: string
   cron_expression: string
@@ -248,6 +250,7 @@ export const createSchedule = createServerFn({ method: "POST" })
       grants,
       user,
     })
+    await requireContinueOnFailureSupport(definition)
     await saveNewSchedule(definition, user.id)
     await deploySchedule(definition, user.id)
     const created = (await loadSchedules()).find(
@@ -309,6 +312,7 @@ export const updateSchedule = createServerFn({ method: "POST" })
       grants,
       user,
     })
+    await requireContinueOnFailureSupport(definition, existing)
     const previousRelayIds = new Set(
       existing.targets.map((target) => target.relayId)
     )
@@ -530,6 +534,54 @@ async function canonicalTargets(
   })
 }
 
+// An older Relay rejects the whole projection and keeps running the revision
+// it has, so a Relay must advertise support before a schedule turns this on
+// for it. Relays that already run it with the option keep it, which lets a
+// schedule be disabled or edited while its Relay is offline.
+async function requireContinueOnFailureSupport(
+  definition: ScheduleDefinition,
+  existing?: Pick<ScheduleDefinition, "continueOnFailure" | "targets">
+) {
+  if (!definition.continueOnFailure) return
+  const supported = new Set(
+    existing?.continueOnFailure
+      ? existing.targets.map((target) => target.relayId)
+      : []
+  )
+  const relayIds = new Set(
+    definition.targets
+      .map((target) => target.relayId)
+      .filter((relayId) => !supported.has(relayId))
+  )
+  if (relayIds.size === 0) return
+  const relays = new Map(
+    (await listPersistedRelays()).map((relay) => [relay.id, relay])
+  )
+  const unsupported = await Promise.all(
+    [...relayIds].map(async (relayId) => {
+      const relay = relays.get(relayId)
+      if (!relay?.enabled) return relay?.name ?? relayId
+      const snapshot = await recoverPromise(
+        async () =>
+          relaySnapshotSchema.parse(
+            await relayRpc(relay, "relay.snapshot", {}, 5_000)
+          ),
+        () => null
+      )
+      return snapshot?.node.capabilities.includes(
+        "schedule-continue-on-failure"
+      )
+        ? null
+        : relay.name
+    })
+  )
+  const names = unsupported.filter((name) => name !== null)
+  if (names.length === 0) return
+  throw new Error(
+    `Continue on failure needs these Relays online and updated: ${names.join(", ")}`
+  )
+}
+
 function targetKey(target: ScheduleTarget) {
   return `${target.relayId}:${target.kind}:${target.id}`
 }
@@ -547,15 +599,17 @@ async function saveNewSchedule(
         Effect.gen(function* () {
           yield* transaction.execute(
             `INSERT INTO ${databaseTable("schedule")}
-               (id, name, cron_expression, timezone, enabled, revision, created_by,
-                created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (id, name, cron_expression, timezone, enabled,
+                continue_on_failure, revision, created_by, created_at,
+                updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               schedule.id,
               schedule.name,
               schedule.cron,
               schedule.timezone,
               schedule.enabled,
+              schedule.continueOnFailure === true,
               schedule.revision,
               createdBy,
               now,
@@ -583,13 +637,14 @@ async function replaceSchedule(
           const result = yield* transaction.execute(
             `UPDATE ${databaseTable("schedule")}
                 SET name = ?, cron_expression = ?, timezone = ?, enabled = ?,
-                    revision = ?, updated_at = ?
+                    continue_on_failure = ?, revision = ?, updated_at = ?
               WHERE id = ? AND revision = ? AND deleted_at IS NULL`,
             [
               schedule.name,
               schedule.cron,
               schedule.timezone,
               schedule.enabled,
+              schedule.continueOnFailure === true,
               schedule.revision,
               now,
               schedule.id,
@@ -654,8 +709,9 @@ async function loadSchedules() {
   const [scheduleRows, actionRows, targetRows, deploymentRows, runRows] =
     await Promise.all([
       databasePool.query<ScheduleRow[]>(
-        `SELECT id, name, cron_expression, timezone, enabled, revision,
-                created_by, created_at, updated_at
+        `SELECT id, name, cron_expression, timezone, enabled,
+                continue_on_failure, revision, created_by, created_at,
+                updated_at
            FROM ${databaseTable("schedule")}
           WHERE deleted_at IS NULL
           ORDER BY updated_at DESC, id DESC`
@@ -694,6 +750,7 @@ async function loadSchedules() {
       actions: (actionsBySchedule.get(row.id) ?? []).map((action) =>
         scheduleActionSchema.parse(jsonValue(action.action_config))
       ),
+      continueOnFailure: Boolean(row.continue_on_failure),
       cron: row.cron_expression,
       enabled: Boolean(row.enabled),
       id: row.id,
@@ -785,8 +842,11 @@ async function deployScheduleToRelay(
   const deployed = await Effect.runPromise(
     Effect.result(
       promiseEffect(async () => {
+        const { continueOnFailure, ...definition } = schedule
         const projection: RelayScheduleProjection = {
-          ...schedule,
+          ...definition,
+          // Older Relays reject unknown keys, so only send the option when on.
+          ...(continueOnFailure ? { continueOnFailure } : {}),
           actions: await prepareRelayScheduleActions(schedule.actions, targets),
           targets: [...targets],
         }

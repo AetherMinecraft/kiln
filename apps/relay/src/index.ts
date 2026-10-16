@@ -1,9 +1,14 @@
+import {
+  HostShell,
+  hostTerminalTarget,
+  HOST_TERMINAL_KEY,
+  HostAccessDisabledError,
+} from "./host-shell.js"
 import { createServer as createHttpServer } from "node:http"
 import { createServer as createHttpsServer } from "node:https"
 import { createHmac, randomBytes, randomUUID } from "node:crypto"
 import { mkdir } from "node:fs/promises"
 import { hostname } from "node:os"
-import * as Sentry from "@sentry/node"
 import { Effect, Schema, Semaphore } from "effect"
 
 import {
@@ -16,12 +21,17 @@ import {
   relayCreateDatabaseSchema,
   relayAppActionSchema,
   relayAppNetworkSchema,
+  relayStateDatabaseReadSchema,
+  relayHostTerminalAttachSchema,
+  relayHostTerminalWriteSchema,
+  relayHostTerminalClaimSchema,
   relayAppTerminalAttachSchema,
   relayAppTerminalClaimSchema,
   relayAppTerminalRestartSchema,
   relayAppTerminalWriteSchema,
   relayCreateAppSchema,
   appIdFromFileRoot,
+  isRelayFileRoot,
   appIdSchema,
   appTailscaleMember,
   relayAppWebRouteStateSchema,
@@ -39,6 +49,8 @@ import {
   relayDatabaseTerminalRestartSchema,
   relayDatabaseTerminalWriteSchema,
   relayDatabaseExportSchema,
+  relayDatabaseInspectRequestSchema,
+  relayDatabaseWipeSchema,
   relayDatabaseNetworkSchema,
   relayDeleteDatabaseSchema,
   relayAuditQuerySchema,
@@ -56,6 +68,7 @@ import {
   relayNetworkingSchema,
   relayProxyBrowserMetadataSchema,
   relayProxyReadInputSchema,
+  relayProxyConfigurationSchema,
   relayProxySettingsSchema,
   relayDirectoryPageInputSchema,
   relayDirectorySizesInputSchema,
@@ -78,6 +91,8 @@ import {
   relayRotateDatabaseCredentialsSchema,
   relayUpdateInstanceStartupSchema,
   relayBootstrapDiscoveryTranscript,
+  relayControlDeadlineMs,
+  relaySystemUpdateSchema,
   RelayBrowserAuthorizationReviseSchema,
   relayBrowserAuthorizationReviseMaxItems,
   relayScheduleProjectionSchema,
@@ -97,10 +112,11 @@ import {
   discoverRelayAdvertisedHost,
   discoverRelayGameHost,
   loadConfig,
+  relayStateDatabasePath,
 } from "./config.js"
 import { attachControlSocket } from "./control-socket.js"
 import { DockerDriver } from "./docker.js"
-import { DatabaseBrowser } from "./database-browser.js"
+import { DatabaseBrowser, readDatabaseFile } from "./database-browser.js"
 import { DatabaseDriver } from "./databases.js"
 import { browseManagedDatabase } from "./database-sql-browser.js"
 import { consoleSources } from "./console-sources.js"
@@ -110,14 +126,25 @@ import {
   databaseTerminalTarget,
 } from "./container-terminal.js"
 import { AppDriver } from "./apps.js"
-import { APP_SERVICE, appRouteOwner } from "./relay-resources.js"
-import { forkPromise } from "./effect/promise.js"
+import {
+  APP_SERVICE,
+  appIdFromRouteOwner,
+  appRouteOwner,
+} from "./relay-resources.js"
+import {
+  traefikDynamicConfiguration,
+  traefikRouteUpstream,
+  traefikStaticConfiguration,
+} from "./traefik.js"
+import { forkPromise, promiseEffect } from "./effect/promise.js"
+import { DockerEngine } from "./docker-engine.js"
 import {
   inspectEncryptedPlatformBackup,
   restoreEncryptedPlatformBackup,
 } from "./platform-backups.js"
 import { FilesystemDriver, type FileRoot } from "./files.js"
 import { DeploymentFileSyncDriver } from "./file-sync.js"
+import { HostFiles } from "./host-files.js"
 import { LifecycleDriver } from "./lifecycle.js"
 import { nodeSnapshot } from "./node.js"
 import { reportRelayMemoryMetrics } from "./relay-memory.js"
@@ -137,7 +164,9 @@ import {
   disposeRelayRuntime,
   forkRelayEffect,
   initializeRelayRuntime,
+  reportRelayError,
   runRelayEffect,
+  runRelayEffectUntraced,
 } from "./effect/runtime.js"
 import { RelayStateStore } from "./effect/state.js"
 import type {
@@ -224,8 +253,40 @@ const docker = new DockerDriver(
   databaseConnections
 )
 const databases = new DatabaseDriver(config, docker, databaseConnections)
+const hostShell = new HostShell(config)
+const relayEngine = new DockerEngine(config.dockerSocket)
 const terminals = new ContainerTerminals(config)
 const systemUpdates = new SystemUpdateManager(config)
+// Set once a restart of the Relay or its host is under way, so a second
+// request in the moment before the Relay goes down doesn't start another.
+let restarting = false
+
+// Reserves the restart before anything is awaited, so concurrent requests
+// can't both begin one, and releases it if the restart never begins.
+function reserveRestart<A, E>(
+  name: string,
+  begin: Effect.Effect<A, E, RelayStateStore>
+): Promise<A> {
+  if (restarting) {
+    return Promise.reject(new Error("This Relay is already restarting."))
+  }
+  restarting = true
+  return runRelayEffect(
+    name,
+    systemUpdates.running().pipe(
+      Effect.flatMap((updating): Effect.Effect<A, unknown, RelayStateStore> =>
+        updating
+          ? Effect.fail(new Error("Wait for this Relay's update to finish."))
+          : begin
+      ),
+      Effect.onError(() =>
+        Effect.sync(() => {
+          restarting = false
+        })
+      )
+    )
+  )
+}
 const filesystem = new FilesystemDriver(config)
 const deploymentFileSync = new DeploymentFileSyncDriver(config)
 await runRelayEffect(
@@ -265,13 +326,31 @@ const appFilesystem = new FilesystemDriver({
   ...config,
   rootDirectory: apps.rootDirectory,
 })
+// Saves overwrite host files in place, as editors do, so hard links and
+// containers that bind-mount a file see the change.
+const hostFilesystem = new FilesystemDriver(
+  { ...config, rootDirectory: config.hostRootDirectory },
+  { saveInPlace: true }
+)
+const hostFiles = new HostFiles(config)
+const hostDatabaseBrowser = new DatabaseBrowser(hostFilesystem)
+async function hostFileRoot(id: string): Promise<FileRoot> {
+  if (!config.hostAccess) throw new HostAccessDisabledError()
+  if (id !== relayIdentity.fingerprint) throw new Error("Relay not found")
+  return { id, directory: "." }
+}
 const appDatabaseBrowser = new DatabaseBrowser(appFilesystem)
+// A helper left from when host access was on goes; one still in use has its
+// sessions swept with the rest.
+if (!hostShell.enabled) forkPromise(() => hostShell.remove())
 forkPromise(async () => {
-  const [managedDatabases, managedApps] = await Promise.all([
+  const [managedDatabases, managedApps, hostContainer] = await Promise.all([
     databases.list(),
     apps.list(),
+    hostShell.enabled ? hostShell.runningContainer() : null,
   ])
   await terminals.sweep([
+    ...(hostContainer ? [hostContainer] : []),
     ...managedDatabases.flatMap((database) =>
       database.containerId && database.observedState === "running"
         ? [database.containerId]
@@ -385,7 +464,7 @@ const webRouteMutation = Semaphore.makeUnsafe(1)
 const snapshotHub = new RelaySnapshotHub(relaySnapshot)
 // Keep one shared snapshot sampler active so crash recovery does not depend on
 // a Hearth control connection. Interactive readers reuse the same cached loop.
-// It also reports Relay memory to Sentry, throttled to once a minute.
+// It also records Relay memory metrics, throttled to once a minute.
 snapshotHub.subscribe(
   ({ snapshot }) => reportRelayMemoryMetrics(snapshot.node.relayMemory),
   false
@@ -434,9 +513,9 @@ const scheduleManager = await ScheduleManager.make({
   platformTargetId: config.installationId ?? relayIdentity.fingerprint,
   relayId: relayIdentity.fingerprint,
   reportError: (message, cause) => {
-    Sentry.captureException(
+    reportRelayError(
       cause instanceof Error ? cause : new Error(message, { cause }),
-      { tags: { "kiln.operation": "schedule.occurrence" } }
+      { operation: "schedule.occurrence" }
     )
   },
   runDatabasePower: async (databaseId, action) => {
@@ -477,6 +556,7 @@ const scheduleManager = await ScheduleManager.make({
     await docker.sendCommand(instance, command)
   },
   stateDirectory: `${config.dataDirectory}/schedules`,
+  state: startup.state.schedules,
 })
 const scheduleFiber = forkRelayEffect(
   "relay.schedules.worker",
@@ -703,8 +783,8 @@ const requestHandler = (
             json(response, 401, { error: cause.message, code: cause.code })
             return
           }
-          Sentry.captureException(cause, {
-            tags: { "kiln.operation": normalizedRequestOperation(request) },
+          reportRelayError(cause, {
+            operation: normalizedRequestOperation(request),
           })
           console.error(cause)
           json(response, 500, {
@@ -737,11 +817,16 @@ const controlSocket = attachControlSocket({
 rejectMalformedUpgrades(server)
 const browserSocket = attachBrowserSocket({
   config,
+  hostFiles: { filesystem: hostFilesystem, root: hostFileRoot },
   appFiles: {
     filesystem: appFilesystem,
     root: (appId) => apps.fileRoot(appId),
   },
-  consoleSources: consoleSources(docker, databases, apps),
+  consoleSources: consoleSources(docker, databases, apps, () => ({
+    // Docker names a container's host after its ID.
+    containerId: process.env.HOSTNAME?.trim() || null,
+    id: config.nodeId,
+  })),
   docker,
   filesystem,
   identity: relayIdentity,
@@ -970,9 +1055,7 @@ function tlsRefreshLoop() {
   let nextDelay = activeTls.mode === "external" ? 60_000 : 6 * 60 * 60_000
   const recordFailure = (cause: unknown) =>
     Effect.sync(() => {
-      Sentry.captureException(cause, {
-        tags: { "kiln.operation": "relay.tls.refresh" },
-      })
+      reportRelayError(cause, { operation: "relay.tls.refresh" })
       console.error(
         "Relay TLS refresh failed; retaining the last valid certificate",
         cause
@@ -1046,13 +1129,8 @@ function shutdownRelay(signal: NodeJS.Signals): Promise<void> {
           "Relay shutdown deadline reached; closed active connections"
         )
       }
-      yield* Effect.all(
-        [
-          cleanupOperation("Effect runtime", disposeRelayRuntime),
-          cleanupOperation("Sentry", () => Sentry.close(2_000)),
-        ],
-        { concurrency: 2, discard: true }
-      )
+      // Disposing the runtime also flushes pending telemetry.
+      yield* cleanupOperation("Effect runtime", disposeRelayRuntime)
       yield* Effect.sync(() => process.exit(0))
     })
   )
@@ -1066,30 +1144,23 @@ async function relaySnapshot() {
     pendingPrimaryPorts,
     provisioningJobs,
     sftpPublication,
+    updates,
   ] = await Effect.runPromise(
     Effect.all(
       [
         relayOperation(() => nodeSnapshot(config, docker)),
         relayOperation(() => docker.inspectInstances()),
         relayOperation(() =>
-          runRelayEffect(
-            "relay.snapshot.instanceNames",
-            startup.state.listInstanceNames()
-          )
+          runRelayEffectUntraced(startup.state.listInstanceNames())
         ),
         relayOperation(() =>
-          runRelayEffect(
-            "relay.snapshot.pendingPrimaryPorts",
-            startup.state.listPendingPrimaryPorts()
-          )
+          runRelayEffectUntraced(startup.state.listPendingPrimaryPorts())
         ),
         relayOperation(() =>
-          runRelayEffect(
-            "relay.snapshot.provisioningJobs",
-            startup.state.listProvisioningJobs()
-          )
+          runRelayEffectUntraced(startup.state.listProvisioningJobs())
         ),
         relayOperation(() => docker.relaySftpPublication(sftpServer.port)),
+        systemUpdates.updates(),
       ] as const,
       { concurrency: 4 }
     )
@@ -1116,7 +1187,7 @@ async function relaySnapshot() {
     }
   })
   return {
-    node,
+    node: { ...node, updates },
     instances: retainProvisioningInstances(
       [...instancesWithProvisioning, ...provisioningById.values()],
       retainedInstances
@@ -1166,15 +1237,20 @@ async function executeControlRequest(
   if (signal.aborted) throw new Error("Relay request was cancelled")
   const payload = payloadRecord(request.payload)
   switch (request.operation) {
-    case "relay.snapshot":
-      return snapshotHub.read()
+    case "relay.snapshot": {
+      // Hearth reads updates from the pushed snapshots and keeps them from
+      // browsers; this read is passed on as is.
+      const { node, ...snapshot } = await snapshotHub.read()
+      const { updates: _updates, ...readable } = node
+      return { ...snapshot, node: readable }
+    }
     case "relay.system.inspect":
       return runRelayEffect(
         "relay.systemUpdates.inspect",
         systemUpdates.inspect(
           typeof payload.container === "string" && payload.container.trim()
             ? payload.container
-            : hostname()
+            : null
         )
       )
     case "relay.update.apply": {
@@ -1187,14 +1263,24 @@ async function executeControlRequest(
         systemUpdates.startBatch(
           {
             helperImage: requiredString(payload, "helperImage"),
+            ...(typeof payload.requestId === "string" &&
+            relaySystemUpdateSchema.shape.requestId.safeParse(payload.requestId)
+              .success
+              ? { requestId: payload.requestId }
+              : {}),
             targets: targetValues
               ? targetValues.map(systemUpdateTarget)
               : [systemUpdateTarget(payload)],
           },
-          signal
+          // An accepted update finishes even if Hearth disconnects, as it
+          // does when the same update replaces Hearth: its outcome is in the
+          // snapshot every Hearth receives.
+          AbortSignal.timeout(relayControlDeadlineMs("relay.update.apply"))
         )
       )
-      await Promise.all(
+      // The updates are running now, so failing to audit them must not
+      // tell Hearth they didn't start.
+      const audits = await Promise.allSettled(
         operations.map((operation) =>
           appendRelayAudit("system.update_started", client.id, request.id, {
             batchId: operation.batchId,
@@ -1205,6 +1291,13 @@ async function executeControlRequest(
           })
         )
       )
+      for (const audit of audits) {
+        if (audit.status === "rejected") {
+          reportRelayError(audit.reason, {
+            operation: "relay.update.apply.audit",
+          })
+        }
+      }
       return batched ? operations : operations[0]
     }
     case "relay.update.status":
@@ -1212,6 +1305,39 @@ async function executeControlRequest(
         "relay.systemUpdates.status",
         systemUpdates.status(requiredString(payload, "operationId"))
       )
+    case "relay.restart": {
+      // Fails here, while Hearth is still waiting, when the Relay isn't a
+      // container Docker can restart.
+      const relayContainer = await reserveRestart(
+        "relay.restart.inspect",
+        relayEngine.inspectContainer(hostname())
+      )
+      // Docker restarts the Relay once Hearth has its answer.
+      forkRelayEffect(
+        "relay.restart",
+        Effect.sleep("1 second").pipe(
+          Effect.andThen(
+            relayEngine.restartContainer(relayContainer.Id, { seconds: 15 })
+          ),
+          Effect.withSpan("Relay.restart"),
+          Effect.catch((cause) =>
+            Effect.sync(() => {
+              restarting = false
+              reportRelayError(cause, { operation: "relay.restart" })
+            })
+          )
+        )
+      )
+      return { restarting: true }
+    }
+    case "relay.host.restart":
+      await reserveRestart(
+        "relay.host.restart",
+        promiseEffect(() => hostShell.restartHost())
+      )
+      return { restarting: true }
+    case "relay.resources.read":
+      return { history: docker.relayResourceHistory() }
     case "relay.networking.read":
       return (await lifecycle.networking()) ?? null
     case "relay.networking.write":
@@ -1259,6 +1385,74 @@ async function executeControlRequest(
       await snapshotHub.refresh()
       return { mode, removed: mode === "commit" }
     }
+    case "relay.database.read": {
+      const input = relayStateDatabaseReadSchema.parse(request.payload)
+      return runRelayEffect(
+        "relay.database.read",
+        readDatabaseFile(relayStateDatabasePath(config), input.request)
+      )
+    }
+    case "relay.host.read":
+      return {
+        terminal: hostShell.enabled,
+        files: await hostFiles.status(),
+        dataDirectory: await lifecycle.hostDataDirectory(),
+      }
+    case "relay.host.files.mount":
+      await hostFiles.mount()
+      return { started: true }
+    case "relay.terminal.attach": {
+      const input = relayHostTerminalAttachSchema.parse(request.payload)
+      return terminals.attach(
+        terminalOwner(client, request),
+        hostTerminalTarget(await hostShell.container()),
+        input,
+        (output, timeoutMs) =>
+          requestHearth("hearth.database.terminal.output", output, timeoutMs)
+      )
+    }
+    case "relay.terminal.heartbeat": {
+      const input = relayDatabaseTerminalHeartbeatSchema.parse(request.payload)
+      return terminals.heartbeat(
+        terminalOwner(client, request),
+        input.attachmentIds
+      )
+    }
+    case "relay.terminal.detach": {
+      const input = relayDatabaseTerminalDetachSchema.parse(request.payload)
+      return terminals.detach(
+        terminalOwner(client, request),
+        input.attachmentId
+      )
+    }
+    case "relay.terminal.restart":
+      if (!hostShell.enabled) throw new HostAccessDisabledError()
+      return terminals.restart(
+        terminalOwner(client, request),
+        HOST_TERMINAL_KEY
+      )
+    case "relay.terminal.write": {
+      if (!hostShell.enabled) throw new HostAccessDisabledError()
+      const input = relayHostTerminalWriteSchema.parse(request.payload)
+      return terminals.write(
+        terminalOwner(client, request),
+        HOST_TERMINAL_KEY,
+        input.sessionId,
+        input.data
+      )
+    }
+    case "relay.terminal.claim": {
+      if (!hostShell.enabled) throw new HostAccessDisabledError()
+      const input = relayHostTerminalClaimSchema.parse(request.payload)
+      return terminals.claim(
+        terminalOwner(client, request),
+        HOST_TERMINAL_KEY,
+        input.sessionId,
+        input.attachmentId,
+        input.rows,
+        input.cols
+      )
+    }
     case "relay.proxy.read": {
       const settings = await lifecycle.proxySettings()
       const input = relayProxyReadInputSchema.parse(request.payload)
@@ -1272,6 +1466,40 @@ async function executeControlRequest(
         diagnostics: await lifecycle.proxyDiagnostics(settings),
         settings,
       }
+    }
+    case "relay.proxy.config.read": {
+      const [settings, routes] = await Promise.all([
+        lifecycle.proxySettings(),
+        runRelayEffect("relay.proxy.routes", startup.state.listWebRoutes()),
+      ])
+      const bundled = settings.mode === "traefik"
+      return relayProxyConfigurationSchema.parse({
+        dynamicConfiguration: bundled
+          ? traefikDynamicConfiguration(config, routes, settings)
+          : null,
+        routes: routes.map((route) => {
+          const appId = appIdFromRouteOwner(route.instanceId)
+          return {
+            hostname: route.hostname,
+            id: route.id,
+            name: route.name,
+            owner: appId
+              ? {
+                  id: appId,
+                  kind: "app",
+                  service: route.service ?? APP_SERVICE,
+                }
+              : { id: route.instanceId, kind: "server", service: null },
+            path: route.path,
+            stripPrefix: route.stripPrefix,
+            targetPort: route.targetPort,
+            upstream: traefikRouteUpstream(config, route),
+          }
+        }),
+        staticConfiguration: bundled
+          ? traefikStaticConfiguration(settings)
+          : null,
+      })
     }
     case "relay.proxy.write": {
       const settings = relayProxySettingsSchema.parse(request.payload)
@@ -1445,10 +1673,16 @@ async function executeControlRequest(
     }
     case "database.list":
       return databases.list()
+    case "database.inspect":
+      return databases.inspect(
+        relayDatabaseInspectRequestSchema.parse(request.payload).databaseId
+      )
     case "database.create":
       return databases.create(relayCreateDatabaseSchema.parse(request.payload))
     case "database.delete":
       return databases.delete(relayDeleteDatabaseSchema.parse(request.payload))
+    case "database.wipe":
+      return databases.wipe(relayDatabaseWipeSchema.parse(request.payload))
     case "database.action":
       return databases.action(relayDatabaseActionSchema.parse(request.payload))
     case "database.credentials.rotate":
@@ -1482,6 +1716,7 @@ async function executeControlRequest(
       return runRelayEffect(
         "relay.databases.data.read",
         browseManagedDatabase(
+          databases,
           await databases.target(input.databaseId),
           input,
           input.request,
@@ -1708,6 +1943,7 @@ async function executeControlRequest(
       return runRelayEffect(
         "relay.databases.data.write",
         browseManagedDatabase(
+          databases,
           await databases.target(input.databaseId),
           input,
           input.request,
@@ -2039,6 +2275,10 @@ async function executeControlRequest(
     }
     case "instance.files.directory.sizes": {
       const input = relayDirectorySizesInputSchema.parse(payload)
+      if (isRelayFileRoot(input.instanceId)) {
+        await hostFileRoot(input.instanceId)
+        return { sizes: {}, pending: [] }
+      }
       return withFileTarget(input, (target) =>
         runRelayEffect(
           "relay.files.directorySizes",
@@ -2509,7 +2749,14 @@ async function withFileTarget<T>(
     root: FileRoot
   }) => Promise<T>
 ): Promise<T> {
-  const appId = appIdFromFileRoot(requiredString(payload, "instanceId"))
+  const id = requiredString(payload, "instanceId")
+  if (isRelayFileRoot(id))
+    return run({
+      databaseBrowser: hostDatabaseBrowser,
+      filesystem: hostFilesystem,
+      root: await hostFileRoot(id),
+    })
+  const appId = appIdFromFileRoot(id)
   return run(
     appId
       ? {
@@ -2664,8 +2911,9 @@ function cleanupOperation(
     Effect.asVoid,
     Effect.catch((cause) =>
       Effect.sync(() => {
-        Sentry.captureException(cause, {
-          tags: { "kiln.operation": "relay.cleanup", "kiln.resource": name },
+        reportRelayError(cause, {
+          operation: "relay.cleanup",
+          attributes: { "kiln.resource": name },
         })
         console.error(`Relay ${name} cleanup failed`, cause)
       })

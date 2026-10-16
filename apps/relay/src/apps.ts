@@ -19,11 +19,16 @@ import type {
 import { appServiceNameSchema, relayAppSchema } from "@workspace/contracts"
 import { Effect, Result, Semaphore } from "effect"
 
-import { command, commandLines } from "./command.js"
+import { commandLines } from "./command.js"
 import type { RelayConfig } from "./config.js"
+import { consoleLineCharacters } from "./console-frames.js"
 import { parseConsoleLine } from "./console-parsing.js"
 import { databaseNetworkName } from "./databases.js"
-import type { DockerConsoleSession } from "./docker.js"
+import {
+  MAX_CONSOLE_HISTORY_CHARACTERS,
+  type DockerConsoleSession,
+} from "./docker.js"
+import { createContainer } from "./docker-container-spec.js"
 import {
   DockerEngine,
   isDockerNotFound,
@@ -56,6 +61,8 @@ const MAX_DEPLOYMENT_LINES = 5_000
 const KEPT_DEPLOYMENTS = 20
 const PULL_TIMEOUT_MS = 15 * 60_000
 const BUILD_TIMEOUT_MS = 30 * 60_000
+// Where the Relay image installs buildx, as a plugin Compose finds too.
+const BUILDX = "/usr/local/libexec/docker/cli-plugins/docker-buildx"
 // How long a new container must stay up before its deployment succeeds.
 const SETTLE_MS = 3_000
 // Variables Docker and Compose read themselves; an app's environment can't
@@ -103,7 +110,9 @@ interface AppContainer extends RelayAppContainer {
 
 interface Deployment extends RelayAppDeployment {
   abort: AbortController
-  // Lines dropped from the front once the log reached its limit.
+  // The characters of `lines`, which aren't saved with them.
+  characters: number
+  // Lines dropped from the front once the log reached its limits.
   dropped: number
   lines: Array<RelayConsoleLine>
 }
@@ -210,6 +219,7 @@ export class AppDriver {
     await this.get(input.appId)
     const deployment: Deployment = {
       abort: new AbortController(),
+      characters: 0,
       dropped: 0,
       error: null,
       finishedAt: null,
@@ -432,10 +442,14 @@ export class AppDriver {
     while (!signal.aborted) {
       const woken = this.#nextWake(appId, signal)
       if (deployment) {
-        next = Math.max(next, deployment.dropped)
-        while (next < deployment.dropped + deployment.lines.length) {
-          yield deployment.lines[next - deployment.dropped]!
-          next += 1
+        // Lines can be dropped while one is being read, so skip past them.
+        for (
+          next = Math.max(next, deployment.dropped);
+          next < deployment.dropped + deployment.lines.length;
+          next = Math.max(next + 1, deployment.dropped)
+        ) {
+          const line = deployment.lines[next - deployment.dropped]
+          if (line) yield line
         }
       }
       if ((this.#deployments.get(appId) ?? null) !== deployment) return
@@ -544,7 +558,7 @@ export class AppDriver {
     await Effect.runPromise(
       promiseEffect(async () => {
         await mkdir(directory, { recursive: true, mode: 0o700 })
-        const { abort: _abort, ...saved } = deployment
+        const { abort: _abort, characters: _characters, ...saved } = deployment
         await writeFile(
           join(directory, `${deployment.id}.json`),
           JSON.stringify(saved),
@@ -568,8 +582,17 @@ export class AppDriver {
         if (!latest) return null
         const saved = JSON.parse(
           await readFile(join(directory, latest), "utf8")
-        ) as Omit<Deployment, "abort">
-        return { ...saved, abort: new AbortController() } satisfies Deployment
+        ) as Omit<Deployment, "abort" | "characters">
+        const deployment: Deployment = {
+          ...saved,
+          abort: new AbortController(),
+          characters: saved.lines.reduce(
+            (total, line) => total + consoleLineCharacters(line),
+            0
+          ),
+        }
+        trimDeploymentLog(deployment)
+        return deployment
       }).pipe(Effect.orElseSucceed(() => null))
     )
     if (restored && !this.#deployments.has(appId)) {
@@ -584,9 +607,13 @@ export class AppDriver {
   async #pullImage(input: RelayDeployApp, deployment: Deployment) {
     const image = input.config.image
     this.#log(input.appId, deployment, `Pulling ${image}`)
-    await this.#stream(input.appId, deployment, ["pull", image], {
-      timeout: PULL_TIMEOUT_MS,
-    })
+    await Effect.runPromise(
+      this.#engine.pullImage(image, {
+        onLine: (line) => this.#logOutput(input.appId, deployment, line),
+        timeout: PULL_TIMEOUT_MS,
+      }),
+      { signal: deployment.abort.signal }
+    )
     return image
   }
 
@@ -604,6 +631,7 @@ export class AppDriver {
     await this.#stream(
       input.appId,
       deployment,
+      BUILDX,
       [
         "build",
         "--progress",
@@ -615,7 +643,8 @@ export class AppDriver {
         dockerfile,
         this.#appDirectory(input.appId),
       ],
-      { timeout: BUILD_TIMEOUT_MS }
+      // Docker's own builder, which loads the image into Docker.
+      { env: { ...process.env, BUILDX_BUILDER: "default" }, timeout: BUILD_TIMEOUT_MS }
     )
     return tag
   }
@@ -642,38 +671,32 @@ export class AppDriver {
     const tailscale = (await this.#networking.tailscale(input.appId)).filter(
       (membership) => membership.service === APP_SERVICE
     )
-    await command(
-      "docker",
-      [
-        "create",
-        "--name",
-        name,
-        "--hostname",
+    await docker(
+      createContainer(this.#engine, {
+        command: shellWords(config.command),
+        env: environment,
         hostname,
-        "--network",
-        this.#networkName(input.appId),
-        "--network-alias",
-        hostname,
-        "--restart",
-        "unless-stopped",
-        "--mount",
-        `type=bind,source=${join(host, "apps", input.appId)},target=${config.dataMount}`,
-        ...labelArguments({
+        image,
+        labels: {
           ...routes.labels(APP_SERVICE),
           ...this.#containerLabels(input.appId, APP_SERVICE, deployment.id),
-        }),
-        ...Object.entries(environment).flatMap(([key, value]) => [
-          "--env",
-          `${key}=${value}`,
-        ]),
-        ...config.ports.flatMap((port) => [
-          "--publish",
-          `${port.hostPort}:${port.containerPort}/${port.protocol}`,
-        ]),
-        image,
-        ...shellWords(config.command),
-      ],
-      { timeout: 120_000 }
+        },
+        mounts: [
+          {
+            source: join(host, "apps", input.appId),
+            target: config.dataMount,
+            type: "bind",
+          },
+        ],
+        name,
+        network: { aliases: [hostname], name: this.#networkName(input.appId) },
+        ports: config.ports.map((port) => ({
+          containerPort: port.containerPort,
+          hostPort: port.hostPort,
+          protocol: port.protocol,
+        })),
+        restart: "unless-stopped",
+      })
     )
     log(`Created container ${name}`)
     for (const network of [
@@ -837,7 +860,8 @@ export class AppDriver {
       KILN_APP_ID: input.appId,
       KILN_DATA: hostDirectory,
     }
-    const compose = ["compose", "--ansi", "never", "-p", project]
+    // The standalone Compose binary, which `docker compose` runs.
+    const compose = ["--ansi", "never", "-p", project]
     compose.push("--project-directory", directory, "-f", "-")
     log("Reading Compose file")
     const normalized = await composeConfig(
@@ -884,6 +908,7 @@ export class AppDriver {
     await this.#stream(
       input.appId,
       deployment,
+      "docker-compose",
       [
         ...compose,
         "--progress",
@@ -1094,11 +1119,12 @@ export class AppDriver {
   async #stream(
     appId: string,
     deployment: Deployment,
+    executable: string,
     arguments_: Array<string>,
     options: { env?: NodeJS.ProcessEnv; input?: string; timeout: number }
   ) {
     await commandLines(
-      "docker",
+      executable,
       arguments_,
       (line) => this.#logOutput(appId, deployment, line),
       { ...options, signal: deployment.abort.signal }
@@ -1123,28 +1149,27 @@ export class AppDriver {
     level: RelayConsoleLevel = "info"
   ) {
     const index = deployment.dropped + deployment.lines.length
-    deployment.lines.push({
+    const line = {
       id: `${deployment.id}-${index}`,
       level,
       text,
       timestamp: new Date().toISOString(),
-    })
-    if (deployment.lines.length > MAX_DEPLOYMENT_LINES) {
-      deployment.lines.shift()
-      deployment.dropped += 1
     }
+    deployment.lines.push(line)
+    deployment.characters += consoleLineCharacters(line)
+    trimDeploymentLog(deployment)
     this.#wake(appId)
   }
 
   async #ensureResources(appId: string) {
     await mkdir(this.#appDirectory(appId), { recursive: true })
     if ((await this.#networks()).includes(appId)) return
-    await command("docker", [
-      "network",
-      "create",
-      ...labelArguments(this.#resourceLabels(appId)),
-      this.#networkName(appId),
-    ])
+    await docker(
+      this.#engine.createNetwork({
+        labels: this.#resourceLabels(appId),
+        name: this.#networkName(appId),
+      })
+    )
   }
 
   #toApp(
@@ -1449,7 +1474,7 @@ interface ComposeProject {
   [key: string]: unknown
 }
 
-// What `docker compose config` makes of a Compose file, interpolated and in
+// What `docker-compose config` makes of a Compose file, interpolated and in
 // its long form, so services can be changed without parsing YAML here.
 function composeConfig(
   arguments_: ReadonlyArray<string>,
@@ -1459,7 +1484,7 @@ function composeConfig(
   onWarning: (line: string) => void
 ): Promise<ComposeProject> {
   return new Promise((resolve, reject) => {
-    const child = spawn("docker", arguments_, {
+    const child = spawn("docker-compose", arguments_, {
       env,
       signal,
       stdio: ["pipe", "pipe", "pipe"],
@@ -1632,6 +1657,20 @@ async function deploymentFiles(directory: string): Promise<Array<string>> {
     .filter((file) => /^\d{14}\.json$/u.test(file))
     .sort()
     .reverse()
+}
+
+// Drops a deployment log's oldest lines past its line or character budget.
+// Lines keep their IDs, which count the dropped lines.
+function trimDeploymentLog(deployment: Deployment): void {
+  while (
+    deployment.lines.length > MAX_DEPLOYMENT_LINES ||
+    (deployment.characters > MAX_CONSOLE_HISTORY_CHARACTERS &&
+      deployment.lines.length > 1)
+  ) {
+    const line = deployment.lines.shift()!
+    deployment.characters -= consoleLineCharacters(line)
+    deployment.dropped += 1
+  }
 }
 
 function labelArguments(labels: Readonly<Record<string, string>>) {

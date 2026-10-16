@@ -53,6 +53,7 @@ import type {
   BackupFilters,
   BackupNameStore,
 } from "@/components/backups/state"
+import { formatBytes } from "@/lib/format-bytes"
 
 type BackupAvailabilityTagView = {
   error: string | null
@@ -73,7 +74,7 @@ type BackupAvailabilityState =
   | "working"
 type BackupTargetPresentation = {
   id: string
-  kindLabel: "Database" | "Relay" | "Server"
+  kindLabel: "Database" | "Relay" | "Game Server"
   name: string
 }
 const activeStatuses = new Set(["queued", "running", "deleting"])
@@ -1048,7 +1049,7 @@ export function backupTargetPresentation(
   const shortId = backup.targetId.slice(0, 8)
   return {
     id: backup.targetId,
-    kindLabel: backup.targetKind === "database" ? "Database" : "Server",
+    kindLabel: backup.targetKind === "database" ? "Database" : "Game Server",
     name: targetName === backup.targetId ? shortId : targetName,
   }
 }
@@ -1056,7 +1057,7 @@ export function backupTargetPresentation(
 function missingTargetMessage(kind: Backup["targetKind"]): string {
   if (kind === "database") return "This database no longer exists"
   if (kind === "platform") return "This Relay no longer exists"
-  return "This server no longer exists"
+  return "This game server no longer exists"
 }
 
 function backupAvailabilityTags(
@@ -1337,16 +1338,4 @@ function formatBackupElapsed(elapsedMs: number): string {
   const minutes = Math.floor(elapsedSeconds / 60)
   const seconds = elapsedSeconds % 60
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
-}
-
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  const units = ["KiB", "MiB", "GiB", "TiB"]
-  let value = bytes / 1024
-  let index = 0
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024
-    index += 1
-  }
-  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`
 }

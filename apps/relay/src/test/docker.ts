@@ -1,9 +1,9 @@
 /**
  * A stateful, in-memory Docker for Relay tests.
  *
- * Relay drives Docker through the Engine API on `config.dockerSocket` and, to
- * create containers, networks, and volumes, pull images, and run clients that
- * read stdin, the CLI (`./command.js`). Tests replace both at that boundary:
+ * Relay drives Docker through the Engine API on `config.dockerSocket`, and
+ * the CLI (`./command.js`) for builds and Compose. Tests replace both at that
+ * boundary:
  *
  *   vi.mock("./command.js", () => import("./test/docker.js"))
  *   config.dockerSocket = await fakeDocker.listen()
@@ -24,9 +24,13 @@ import type { Duplex } from "node:stream"
 import { tmpdir } from "node:os"
 import { join, posix } from "node:path"
 
-import { Effect } from "effect"
+import { Effect, Result } from "effect"
 
 import type { CommandOptions, CommandResult } from "../command.js"
+import {
+  normalizedReference,
+  parseImageReference,
+} from "../docker-reference.js"
 import { CommandError } from "../effect/errors.js"
 
 export type PortBindings = Record<
@@ -40,6 +44,12 @@ export interface FakeMount {
   /** Host path for bind mounts, volume name for volume mounts. */
   readonly source: string
   readonly type: "bind" | "volume"
+  /**
+   * A volume Docker named itself, from `-v /path` or an image's VOLUME. It
+   * appears only in `Config.Volumes`, so a container created from the same
+   * configuration gets a new, empty one.
+   */
+  readonly anonymous?: boolean
 }
 
 export interface FakeContainer {
@@ -70,6 +80,12 @@ export interface FakeContainer {
   }
   /** Number of times Docker started this container after it was created. */
   starts: number
+  /** `--rm`: Docker removes it once it exits. */
+  autoRemove: boolean
+  /** Containers whose volumes it mounts (`--volumes-from`). */
+  volumesFrom: Array<string>
+  /** Running once with stdin attached before it started (`run --rm -i`). */
+  runOnce: { input: Array<Buffer>; socket: Duplex; stdinEnded: boolean } | null
   logs: Array<{ text: string; time: string }>
   /**
    * Set to make reading this container's (non-TTY) logs fail after the
@@ -81,7 +97,15 @@ export interface FakeContainer {
   /** Everything written to the container's console through `attach`. */
   stdin: string
   /** Processes run with `docker exec`, as the container saw them. */
-  processes: Array<{ argv: Array<string>; env: Record<string, string> }>
+  processes: Array<{
+    argv: Array<string>
+    env: Record<string, string>
+    user?: string
+  }>
+  /** What a database client in the container dumps. */
+  sqlDump: string
+  /** SQL database clients in the container were given on stdin. */
+  executedSql: Array<string>
   /** iptables chains inside the container's network namespace. */
   firewall: Map<string, Array<string>>
   /** TCP ports the container's process is listening on. */
@@ -95,6 +119,8 @@ export interface FakeExec {
   readonly cmd: Array<string>
   readonly env: Record<string, string>
   readonly tty: boolean
+  readonly attachStdin: boolean
+  readonly user: string | undefined
   size: { cols: number; rows: number } | null
   running: boolean
   /** Set once a non-interactive exec has run. */
@@ -118,6 +144,8 @@ export interface FakeVolume {
 
 export interface ContainerSeed {
   name: string
+  hostname?: string
+  cmd?: Array<string>
   image?: string
   labels?: Record<string, string>
   env?: Record<string, string>
@@ -150,48 +178,6 @@ export interface HeldOperation {
 }
 
 const NEVER = "0001-01-01T00:00:00Z"
-const VALUE_FLAGS = new Set([
-  "--cap-add",
-  "--cap-drop",
-  "--device",
-  "--entrypoint",
-  "--env",
-  "--health-cmd",
-  "--health-interval",
-  "--health-retries",
-  "--health-start-period",
-  "--health-timeout",
-  "--hostname",
-  "--ip",
-  "--label",
-  "--memory",
-  "--memory-reservation",
-  "--memory-swap",
-  "--mount",
-  "--name",
-  "--network",
-  "--network-alias",
-  "--pids-limit",
-  "--publish",
-  "--restart",
-  "--security-opt",
-  "--stop-signal",
-  "--sysctl",
-  "--tmpfs",
-  "--user",
-  "--volume",
-  "--workdir",
-  "-e",
-])
-const BOOLEAN_FLAGS = new Set([
-  "--detach",
-  "--interactive",
-  "--read-only",
-  "--rm",
-  "--tty",
-  "-i",
-])
-
 /** A failure the daemon reports, with the HTTP status the API answers. */
 class DockerFailure extends Error {
   constructor(
@@ -214,8 +200,32 @@ export class FakeDocker {
   execGreeting = ""
   /** Local images and their labels. */
   readonly images = new Map<string, Record<string, string>>()
+  /**
+   * Programs that fail when a container runs them, with what they print to
+   * stderr; they exit with code 1.
+   */
+  readonly programFailures = new Map<string, string>()
+  /**
+   * Programs whose exec stream Docker breaks with an error frame (as it does
+   * for an error it hits after answering) instead of their output; for a
+   * one-off container (`run --rm -i`), its image.
+   */
+  readonly streamErrors = new Map<string, string>()
   /** Images whose registry cannot be reached; pulling them fails. */
   readonly unreachableImages = new Set<string>()
+  /** What pulling an image prints before its final status, by image. */
+  readonly pullOutput = new Map<string, string>()
+  /**
+   * Each pull, by the image's full reference, with the registry credentials
+   * it carried (`X-Registry-Auth`, decoded), or null for an anonymous pull.
+   */
+  readonly pulls = new Map<string, unknown>()
+  /** Image config beyond labels, such as `Healthcheck`, by image. */
+  readonly imageConfigs = new Map<string, Record<string, unknown>>()
+  /** What each tag points at (`docker image tag`), by full reference. */
+  readonly imageTags = new Map<string, string>()
+  /** Images whose health check fails once they start. */
+  readonly unhealthyImages = new Set<string>()
   /**
    * Images whose process exits as soon as it starts. Under a restart policy
    * Docker keeps restarting them, reporting them running and restarting.
@@ -230,12 +240,19 @@ export class FakeDocker {
     match: FakeDockerOperation
     run: () => Promise<void>
   }> = []
+  /** Operations that fail after Docker applied them. */
+  readonly #afterFaults: Array<{
+    match: FakeDockerOperation
+    message: string
+  }> = []
   #unmodelled: Array<string> = []
   #inFlight = 0
   #lastActivity = 0
   #lastTimestamp = 0
   #socketPath: string | null = null
   readonly #execSockets = new Map<string, Duplex>()
+  /** `POST /containers/{id}/wait` requests, resolved as containers exit. */
+  readonly #exitWaiters = new Map<string, Array<(exitCode: number) => void>>()
   /** Responses following a running container's logs. */
   readonly #followers = new Set<{
     containerId: string
@@ -277,10 +294,18 @@ export class FakeDocker {
     this.volumes.clear()
     this.images.clear()
     this.unreachableImages.clear()
+    this.pullOutput.clear()
+    this.pulls.clear()
+    this.imageConfigs.clear()
+    this.imageTags.clear()
+    this.unhealthyImages.clear()
     this.crashingImages.clear()
+    this.programFailures.clear()
+    this.streamErrors.clear()
     this.tailscale.controlPlaneReachable = true
     this.tailscale.machines.clear()
     this.#faults.length = 0
+    this.#afterFaults.length = 0
     for (const follower of this.#followers) follower.response.end()
     this.#followers.clear()
     this.#unmodelled = []
@@ -322,10 +347,10 @@ export class FakeDocker {
       id: randomBytes(32).toString("hex"),
       name: seed.name,
       image: seed.image ?? "example/server:latest",
-      hostname: seed.name,
+      hostname: seed.hostname ?? seed.name,
       labels: { ...seed.labels },
       env: { ...seed.env },
-      cmd: [],
+      cmd: [...(seed.cmd ?? [])],
       tty: seed.tty ?? false,
       openStdin: seed.tty ?? false,
       restartPolicy: seed.restartPolicy ?? "no",
@@ -349,15 +374,24 @@ export class FakeDocker {
         finishedAt: seed.finishedAt ?? NEVER,
       },
       starts: 0,
+      autoRemove: false,
+      volumesFrom: [],
+      runOnce: null,
       logs: [...(seed.logs ?? [])],
       logStreamError: null,
       lastLogRead: null,
       stdin: "",
       processes: [],
+      sqlDump: "",
+      executedSql: [],
       firewall: new Map(),
       listeningPorts: [...(seed.listeningPorts ?? [])],
     }
     this.containers.set(container.id, container)
+    // A container's image is always local.
+    if (this.#imageKey(container.image) === undefined) {
+      this.images.set(container.image, {})
+    }
     return container
   }
 
@@ -416,6 +450,32 @@ export class FakeDocker {
     this.#endExecs(container)
   }
 
+  /** How many requests are following containers' logs. */
+  followerCount(): number {
+    return this.#followers.size
+  }
+
+  /**
+   * Simulates the container's process writing `lines`, all at once, to its
+   * log and to anyone following it.
+   */
+  writeLogs(
+    containerName: string,
+    lines: ReadonlyArray<{ text: string; time: string }>
+  ): void {
+    const container = this.#requiredContainer(containerName)
+    container.logs.push(...lines)
+    const output = Buffer.concat(
+      lines.map(({ text, time }) => {
+        const line = Buffer.from(`${time} ${text}\n`)
+        return container.tty ? line : frame(1, line)
+      })
+    )
+    for (const follower of this.#followers) {
+      if (follower.containerId === container.id) follower.response.write(output)
+    }
+  }
+
   /** Simulates Docker or the host restarting the container's process. */
   restartProcess(containerName: string): void {
     this.#start(this.#requiredContainer(containerName))
@@ -455,6 +515,25 @@ export class FakeDocker {
   }
 
   /**
+   * Applies the next matching operation, then fails it with `message`, as
+   * when Docker made a change but the answer was lost or came too late.
+   */
+  failAfterNext(match: FakeDockerOperation, message: string): void {
+    this.#afterFaults.push({ match, message })
+  }
+
+  #appliedCheckpoint(command: string, target?: string): void {
+    const index = this.#afterFaults.findIndex(
+      ({ match }) =>
+        match.command === command &&
+        (match.target === undefined || match.target === target)
+    )
+    if (index === -1) return
+    const [fault] = this.#afterFaults.splice(index, 1)
+    throw new DockerFailure(fault!.message, 500)
+  }
+
+  /**
    * Resolves once Docker has been quiet for a moment, for work Relay starts in
    * the background (recovery restarts, compensating stops). A request Relay
    * just sent to the socket can still be on its way, so no request running is
@@ -481,35 +560,90 @@ export class FakeDocker {
     })
   }
 
-  /** The `command()` boundary: runs one Docker CLI invocation. */
+  /**
+   * The `command()` boundary. Of the processes the Relay runs, the fake
+   * models standalone Compose's `up` and buildx's `build`, which Relay runs
+   * for app deployments; anything else, the `docker` CLI included, is
+   * reported.
+   */
   async run(
     executable: string,
     arguments_: ReadonlyArray<string>,
-    options: CommandOptions = {},
+    _options: CommandOptions = {},
     input?: string
   ): Promise<CommandResult> {
-    const commandLine = `${executable} ${arguments_.join(" ")}`
-    if (executable !== "docker") return this.#unsupported(commandLine)
-    this.#begin()
-    try {
-      const stdout = await this.#dispatch([...arguments_], options, input)
-      // As execFile, which `command` runs on, fails on more output.
-      if (Buffer.byteLength(stdout) > (options.maxBuffer ?? 4 * 1024 * 1024)) {
-        throw new Error(
-          `Command failed: ${commandLine}\nstdout maxBuffer length exceeded`
-        )
-      }
-      return { stderr: "", stdout }
-    } catch (cause) {
-      if (cause instanceof DockerFailure) {
-        throw new Error(
-          `Command failed: ${commandLine}\nError response from daemon: ${cause.message}\n`
-        )
-      }
-      throw cause
-    } finally {
-      this.#settled()
+    if (
+      posix.basename(executable) === "docker-buildx" &&
+      arguments_[0] === "build"
+    ) {
+      return this.#buildxBuild(arguments_)
     }
+    if (
+      executable === "docker-compose" &&
+      arguments_.slice(-4).join(" ") === "up --detach --build --remove-orphans"
+    ) {
+      return this.#composeUp(arguments_, input ?? "")
+    }
+    return this.#unsupported(`${executable} ${arguments_.join(" ")}`)
+  }
+
+  // `docker-buildx build --progress plain [--label k=v]… --tag T --file F
+  // context`: the image, tagged and labelled.
+  #buildxBuild(arguments_: ReadonlyArray<string>): CommandResult {
+    const labels: Record<string, string> = {}
+    let tag = ""
+    for (let index = 1; index < arguments_.length; index += 1) {
+      const argument = arguments_[index]
+      if (argument === "--label") {
+        const [key, value = ""] = splitOnce(arguments_[++index] ?? "", "=")
+        labels[key] = value
+      } else if (argument === "--tag") tag = arguments_[++index] ?? ""
+      else if (argument === "--file" || argument === "--progress") index += 1
+    }
+    this.images.set(tag, labels)
+    return {
+      stderr: `#0 building with "default" instance using docker driver\n#1 naming to docker.io/library/${tag} done\n`,
+      stdout: "",
+    }
+  }
+
+  // `docker-compose … -p <project> … up --detach --build --remove-orphans`
+  // with the project on stdin: each service's container, replacing the
+  // project's previous ones.
+  #composeUp(arguments_: ReadonlyArray<string>, input: string): CommandResult {
+    const project = arguments_[arguments_.indexOf("-p") + 1] ?? ""
+    const definition = JSON.parse(input) as {
+      services: Record<
+        string,
+        {
+          container_name?: string
+          image?: string
+          labels?: Record<string, string>
+        }
+      >
+    }
+    for (const container of this.containers.values()) {
+      if (container.labels["com.docker.compose.project"] === project) {
+        this.containers.delete(container.id)
+      }
+    }
+    const lines: Array<string> = []
+    for (const [service, settings] of Object.entries(definition.services)) {
+      const name = settings.container_name ?? `${project}-${service}-1`
+      this.addContainer({
+        image: settings.image ?? `${project}-${service}`,
+        labels: {
+          ...settings.labels,
+          "com.docker.compose.oneoff": "False",
+          "com.docker.compose.project": project,
+          "com.docker.compose.service": service,
+        },
+        name,
+        running: true,
+      })
+      lines.push(` Container ${name}  Started`)
+    }
+    return { stderr: `${lines.join("\n")}\n`, stdout: "" }
   }
 
   #begin(): void {
@@ -520,26 +654,6 @@ export class FakeDocker {
   #settled(): void {
     this.#inFlight -= 1
     this.#lastActivity = Date.now()
-  }
-
-  // What Relay still runs through the CLI; everything else uses the API.
-  async #dispatch(
-    arguments_: Array<string>,
-    options: CommandOptions,
-    input: string | undefined
-  ): Promise<string> {
-    const [first = "", second = ""] = arguments_
-    const rest = arguments_.slice(1)
-    if (first === "container" && second === "create") {
-      return this.#create(arguments_.slice(2), options, false, input)
-    }
-    if (first === "create") return this.#create(rest, options, false, input)
-    if (first === "run") return this.#create(rest, options, true, input)
-    if (first === "network") return this.#networkCommand(rest)
-    if (first === "volume") return this.#volumeCommand(rest)
-    if (first === "exec") return this.#exec(rest)
-    if (first === "pull") return this.#pull(rest)
-    return this.#unsupported(`docker ${arguments_.join(" ")}`)
   }
 
   #unsupported(commandLine: string): never {
@@ -569,6 +683,9 @@ export class FakeDocker {
       return expected === undefined
         ? Object.hasOwn(container.labels, label)
         : container.labels[label] === expected
+    }
+    if (key === "name") {
+      return new RegExp(value, "u").test(`/${container.name}`)
     }
     if (key === "network") {
       const network = this.network(value)
@@ -604,7 +721,7 @@ export class FakeDocker {
           `${mount.source}:${mount.destination}${mount.readOnly ? ":ro" : ""}`
       )
     const volumeMounts = container.mounts
-      .filter((mount) => mount.type === "volume")
+      .filter((mount) => mount.type === "volume" && !mount.anonymous)
       .map((mount) => ({
         ReadOnly: mount.readOnly ?? false,
         Source: mount.source,
@@ -613,9 +730,10 @@ export class FakeDocker {
       }))
     return {
       Config: {
-        AttachStderr: true,
+        // Relay's creates set only stdin's, as they do with Docker.
+        AttachStderr: false,
         AttachStdin: container.openStdin,
-        AttachStdout: true,
+        AttachStdout: false,
         Cmd: container.cmd,
         Env: Object.entries(container.env).map(
           ([name, value]) => `${name}=${value}`
@@ -628,6 +746,11 @@ export class FakeDocker {
         Labels: container.labels,
         OpenStdin: container.openStdin,
         Tty: container.tty,
+        Volumes: Object.fromEntries(
+          container.mounts
+            .filter((mount) => mount.anonymous)
+            .map((mount) => [mount.destination, {}])
+        ),
       },
       HostConfig: {
         Binds: binds,
@@ -635,6 +758,7 @@ export class FakeDocker {
         Mounts: volumeMounts,
         NetworkMode: container.networkMode,
         PortBindings: container.portBindings,
+        VolumesFrom: container.volumesFrom.length ? container.volumesFrom : null,
         RestartPolicy: { MaximumRetryCount: 0, Name: container.restartPolicy },
       },
       Id: container.id,
@@ -696,11 +820,35 @@ export class FakeDocker {
     }
   }
 
+  /** The key of a local image `reference` names, as Docker normalizes it. */
+  #imageKey(reference: string): string | undefined {
+    const wanted = normalizedImage(reference)
+    return [...this.images.keys()].find(
+      (key) =>
+        key === reference ||
+        `sha256:${key}` === reference ||
+        normalizedImage(key) === wanted
+    )
+  }
+
   #imageObject(image: string): unknown {
-    const labels = this.images.get(image)
-    return labels === undefined
+    const key = this.#imageKey(image)
+    const labels = key === undefined ? undefined : this.images.get(key)
+    return labels === undefined || key === undefined
       ? undefined
-      : { Config: { Labels: labels }, Id: `sha256:${image}`, RepoTags: [image] }
+      : {
+          Config: { ...this.imageConfigs.get(key), Labels: labels },
+          Id: this.#imageId(key),
+          RepoTags: [key],
+        }
+  }
+
+  /** The image a reference names: its tag's target, or its own ID. */
+  #imageId(reference: string): string {
+    if (reference.startsWith("sha256:")) return reference
+    return (
+      this.imageTags.get(normalizedImage(reference)) ?? `sha256:${reference}`
+    )
   }
 
   /** Listing networks leaves out their containers, as Docker does. */
@@ -732,46 +880,11 @@ export class FakeDocker {
 
   // --------------------------------------------------------------- creation
 
-  async #create(
-    arguments_: Array<string>,
-    options: CommandOptions,
-    run: boolean,
-    input: string | undefined
-  ): Promise<string> {
-    const parsed = parseRunArguments(arguments_, options.env)
-    await this.#checkpoint(run ? "run" : "create", parsed.name)
-    if (parsed.flags.has("--rm")) return this.#runOnce(parsed, input)
-    const container = this.#createContainer({
-      cmd: parsed.cmd,
-      env: parsed.env,
-      healthCheck: parsed.healthCheck,
-      image: parsed.image,
-      interactive: parsed.flags.has("--interactive"),
-      labels: parsed.labels,
-      memoryBytes: parsed.memoryBytes,
-      mounts: parsed.mounts,
-      name: parsed.name,
-      networkMode: parsed.network,
-      networks:
-        parsed.network && !isNetworkMode(parsed.network)
-          ? [
-              {
-                aliases: parsed.aliases,
-                ipAddress: parsed.ip,
-                name: parsed.network,
-              },
-            ]
-          : [],
-      portBindings: parsed.portBindings,
-      restartPolicy: parsed.restartPolicy,
-      tty: parsed.flags.has("--tty"),
-    })
-    if (run) this.#start(container)
-    return `${container.id}\n`
-  }
-
   #createContainer(input: {
+    autoRemove: boolean
     cmd: Array<string>
+    hostname: string | undefined
+    volumesFrom: Array<string>
     env: Record<string, string>
     healthCheck: boolean
     image: string
@@ -792,15 +905,14 @@ export class FakeDocker {
         `Conflict. The container name "/${name}" is already in use`
       )
     }
-    if (this.unreachableImages.has(input.image)) {
-      throw new DockerFailure(`pull access denied for ${input.image}`)
+    if (this.#imageKey(input.image) === undefined) {
+      throw new DockerFailure(`No such image: ${input.image}`, 404)
     }
     for (const { name: network } of input.networks) {
       if (!this.networks.has(network)) {
-        throw new DockerFailure(`network ${network} not found`)
+        throw new DockerFailure(`network ${network} not found`, 404)
       }
     }
-    this.images.set(input.image, this.images.get(input.image) ?? {})
     const container = this.addContainer({
       env: input.env,
       image: input.image,
@@ -813,6 +925,10 @@ export class FakeDocker {
       tty: input.tty,
     })
     container.cmd = input.cmd
+    // Docker names a container's host after its ID when it isn't given one.
+    container.hostname = input.hostname || container.id.slice(0, 12)
+    container.volumesFrom = input.volumesFrom
+    container.autoRemove = input.autoRemove
     container.openStdin = input.interactive
     container.healthCheck = input.healthCheck
     container.networkMode = input.networkMode ?? "bridge"
@@ -826,21 +942,53 @@ export class FakeDocker {
   }
 
   /** `docker run --rm -i … sh -c "cat > /path"`: writes stdin into a volume. */
-  #runOnce(parsed: ParsedRunArguments, input: string | undefined): string {
-    const script = parsed.cmd[0] === "-c" ? (parsed.cmd[1] ?? "") : ""
+  #runOnce(container: FakeContainer, input: string): string {
+    const script = container.cmd[0] === "-c" ? (container.cmd[1] ?? "") : ""
     const target = /cat > (\S+)/u.exec(script)?.[1]
     if (!target) {
-      return this.#unsupported(`docker run --rm ${parsed.cmd.join(" ")}`)
+      return this.#unsupported(`docker run --rm ${container.cmd.join(" ")}`)
     }
-    for (const mount of parsed.mounts) {
+    for (const mount of container.mounts) {
       const relative = posix.relative(mount.destination, target)
       if (mount.type !== "volume" || relative.startsWith("..")) continue
       const volume = this.volumes.get(mount.source)
       if (!volume) throw new DockerFailure(`no such volume: ${mount.source}`)
-      volume.files.set(relative, input ?? "")
+      volume.files.set(relative, input)
       return ""
     }
     throw new DockerFailure(`${target} is not on a mounted volume`)
+  }
+
+  /**
+   * Runs a `run --rm -i` container once it has started and its stdin has
+   * ended: its output goes to the attached client, then it exits and Docker
+   * removes it.
+   */
+  #finishRunOnce(container: FakeContainer): void {
+    const run = container.runOnce
+    if (!run?.stdinEnded || !container.state.running) return
+    container.runOnce = null
+    let exitCode = 0
+    let stderr = ""
+    try {
+      this.#runOnce(container, Buffer.concat(run.input).toString("utf8"))
+    } catch (cause) {
+      if (!(cause instanceof DockerFailure)) throw cause
+      stderr = `${cause.message}\n`
+      exitCode = 1
+    }
+    const streamError = this.streamErrors.get(container.image)
+    if (streamError !== undefined) {
+      // The stream breaks; the container is left as it was, for Relay to
+      // remove.
+      run.socket.end(frame(3, Buffer.from(streamError)))
+      return
+    }
+    if (stderr && !run.socket.destroyed) {
+      run.socket.write(frame(2, Buffer.from(stderr)))
+    }
+    run.socket.end()
+    this.#stop(container, exitCode)
   }
 
   // ------------------------------------------------------------ power state
@@ -867,17 +1015,29 @@ export class FakeDocker {
       if (container.state.running) this.#stop(container, 0)
       this.#start(container)
     }
+    this.#appliedCheckpoint(action, reference)
     return true
   }
 
   #start(container: FakeContainer): void {
+    if (container.runOnce) {
+      container.state.running = true
+      container.state.startedAt = this.#timestamp()
+      container.starts += 1
+      setImmediate(() => this.#finishRunOnce(container))
+      return
+    }
     const crashing = this.crashingImages.has(container.image)
     container.state.running = true
     container.state.restarting = crashing && container.restartPolicy !== "no"
     container.state.exitCode = crashing ? 1 : 0
     container.state.oomKilled = false
     container.state.startedAt = this.#timestamp()
-    container.state.health = container.healthCheck ? "healthy" : undefined
+    container.state.health = container.healthCheck
+      ? this.unhealthyImages.has(container.image)
+        ? "unhealthy"
+        : "healthy"
+      : undefined
     container.starts += 1
     // Each run gets a fresh network namespace.
     container.firewall = new Map()
@@ -895,6 +1055,13 @@ export class FakeDocker {
   #stop(container: FakeContainer, exitCode: number): void {
     container.state.running = false
     container.state.exitCode = exitCode
+    const waiters = this.#exitWaiters.get(container.id) ?? []
+    this.#exitWaiters.delete(container.id)
+    if (container.autoRemove) {
+      this.#endExecs(container)
+      this.containers.delete(container.id)
+    }
+    for (const waiter of waiters) waiter(exitCode)
     container.state.finishedAt = this.#timestamp()
     container.state.health = undefined
     this.#endExecs(container)
@@ -925,6 +1092,7 @@ export class FakeDocker {
     }
     this.#endExecs(container)
     this.containers.delete(container.id)
+    this.#appliedCheckpoint("rm", reference)
   }
 
   async #renameOne(from: string, to: string): Promise<void> {
@@ -937,6 +1105,7 @@ export class FakeDocker {
       )
     }
     container.name = to
+    this.#appliedCheckpoint("rename", from)
   }
 
   async #setRestartPolicy(reference: string, policy: string): Promise<void> {
@@ -946,39 +1115,26 @@ export class FakeDocker {
 
   // ---------------------------------------------------------- logs and exec
 
-  async #exec(arguments_: Array<string>): Promise<string> {
-    const env: Record<string, string> = {}
-    let index = 0
-    while (arguments_[index]?.startsWith("-")) {
-      const flag = arguments_[index]
-      if (flag === "-e" || flag === "--env") {
-        const [name, value = ""] = splitOnce(arguments_[index + 1] ?? "", "=")
-        env[name] = value
-        index += 2
-      } else if (flag === "-i" || flag === "--interactive") {
-        index += 1
-      } else {
-        return this.#unsupported(`docker exec ${arguments_.join(" ")}`)
-      }
-    }
-    const reference = arguments_[index] ?? ""
-    const argv = arguments_.slice(index + 1)
-    await this.#checkpoint("exec", reference)
-    const container = this.#requiredContainer(reference)
-    if (!container.state.running) {
-      throw new DockerFailure(`container ${reference} is not running`, 409)
-    }
-    return this.#runProgram(container, argv, env)
-  }
-
   /** What a process Relay runs with `docker exec` prints, or how it fails. */
   #runProgram(
     container: FakeContainer,
     argv: Array<string>,
-    env: Record<string, string>
+    env: Record<string, string>,
+    input = "",
+    user?: string
   ): string {
-    container.processes.push({ argv, env })
+    container.processes.push({ argv, env, ...(user ? { user } : {}) })
     const [program = "", ...programArguments] = argv
+    const client = clientOf(argv)
+    const failure = this.programFailures.get(client)
+    if (failure !== undefined) throw new DockerFailure(failure)
+    if (["mysqldump", "mariadb-dump", "pg_dump"].includes(client)) {
+      return container.sqlDump
+    }
+    if (["mysql", "mariadb", "psql"].includes(client)) {
+      container.executedSql.push(input)
+      return ""
+    }
     if (program === "iptables") {
       return iptables(container.firewall, programArguments)
     }
@@ -1013,43 +1169,7 @@ export class FakeDocker {
     return this.#unsupported(`tailscale ${arguments_.join(" ")}`)
   }
 
-  async #pull(arguments_: Array<string>): Promise<string> {
-    const [image = ""] = arguments_
-    await this.#checkpoint("pull", image)
-    if (this.unreachableImages.has(image)) {
-      throw new DockerFailure(
-        `Get "https://registry.example/v2/": net/http: request canceled (registry timeout)`
-      )
-    }
-    this.images.set(image, this.images.get(image) ?? {})
-    return `Status: Downloaded newer image for ${image}\n`
-  }
-
   // ------------------------------------------------------ networks, volumes
-
-  async #networkCommand(arguments_: Array<string>): Promise<string> {
-    const [subcommand = "", ...rest] = arguments_
-    if (subcommand === "create") {
-      const { flags, positional, values } = parseFlags(rest, [
-        "--driver",
-        "--label",
-        "--subnet",
-      ])
-      const [name = ""] = positional
-      await this.#checkpoint("network create", name)
-      if (this.networks.has(name)) {
-        throw new DockerFailure(`network with name ${name} already exists`, 409)
-      }
-      const network = this.addNetwork({
-        internal: flags.has("--internal"),
-        labels: labelsFrom(values.get("--label") ?? []),
-        name,
-        subnet: values.get("--subnet")?.[0],
-      })
-      return `${network.id}\n`
-    }
-    return this.#unsupported(`docker network ${arguments_.join(" ")}`)
-  }
 
   #networkList(filters: Array<string>): Array<FakeNetwork> {
     return [...this.networks.values()].filter((network) =>
@@ -1131,23 +1251,6 @@ export class FakeDocker {
     this.networks.delete(network.name)
   }
 
-  async #volumeCommand(arguments_: Array<string>): Promise<string> {
-    const [subcommand = "", ...rest] = arguments_
-    if (subcommand === "create") {
-      const { positional, values } = parseFlags(rest, ["--label"])
-      const [name = ""] = positional
-      await this.#checkpoint("volume create", name)
-      if (!this.volumes.has(name)) {
-        this.addVolume({
-          labels: labelsFrom(values.get("--label") ?? []),
-          name,
-        })
-      }
-      return `${name}\n`
-    }
-    return this.#unsupported(`docker volume ${arguments_.join(" ")}`)
-  }
-
   async #volumeRemove(name: string): Promise<void> {
     await this.#checkpoint("volume rm", name)
     if (!this.volumes.has(name)) {
@@ -1174,7 +1277,12 @@ export class FakeDocker {
     try {
       const url = new URL(request.url ?? "/", "http://docker")
       const body = await readBody(request)
-      const answer = await this.#route(request.method ?? "GET", url, body)
+      const answer = await this.#route(
+        request.method ?? "GET",
+        url,
+        body,
+        request.headers
+      )
       if (answer.kind === "stream") answer.write(response)
       else if (answer.status === 204 || answer.status === 304) {
         response.writeHead(answer.status).end()
@@ -1197,7 +1305,12 @@ export class FakeDocker {
     }
   }
 
-  async #route(method: string, url: URL, body: string): Promise<ApiAnswer> {
+  async #route(
+    method: string,
+    url: URL,
+    body: string,
+    headers: IncomingMessage["headers"]
+  ): Promise<ApiAnswer> {
     const path = url.pathname
     const json = (status: number, payload: unknown = {}): ApiAnswer => ({
       kind: "json",
@@ -1234,7 +1347,57 @@ export class FakeDocker {
       const name = url.searchParams.get("name") ?? undefined
       await this.#checkpoint("create", name)
       const container = this.#createFromApi(name, JSON.parse(body))
+      this.#appliedCheckpoint("create", name)
       return json(201, { Id: container.id, Warnings: [] })
+    }
+    if (
+      method === "POST" &&
+      (parameters = route(/^\/containers\/([^/]+)\/wait$/u))
+    ) {
+      const target = this.#requiredContainer(parameters[0] ?? "")
+      const exitCode = await new Promise<number>((resolve) => {
+        const waiters = this.#exitWaiters.get(target.id) ?? []
+        waiters.push(resolve)
+        this.#exitWaiters.set(target.id, waiters)
+      })
+      return json(200, { StatusCode: exitCode })
+    }
+    if (method === "POST" && path === "/networks/create") {
+      const input = JSON.parse(body) as {
+        IPAM?: { Config?: Array<{ Subnet?: string }> }
+        Internal?: boolean
+        Labels?: Record<string, string>
+        Name: string
+      }
+      await this.#checkpoint("network create", input.Name)
+      if (this.networks.has(input.Name)) {
+        throw new DockerFailure(
+          `network with name ${input.Name} already exists`,
+          409
+        )
+      }
+      const network = this.addNetwork({
+        internal: input.Internal ?? false,
+        labels: input.Labels ?? {},
+        name: input.Name,
+        subnet: input.IPAM?.Config?.[0]?.Subnet,
+      })
+      return json(201, { Id: network.id, Warning: "" })
+    }
+    if (method === "POST" && path === "/volumes/create") {
+      const input = JSON.parse(body) as {
+        Labels?: Record<string, string>
+        Name: string
+      }
+      await this.#checkpoint("volume create", input.Name)
+      const volume =
+        this.volumes.get(input.Name) ??
+        this.addVolume({ labels: input.Labels ?? {}, name: input.Name })
+      return json(201, {
+        Driver: "local",
+        Labels: volume.labels,
+        Name: volume.name,
+      })
     }
     if (
       method === "GET" &&
@@ -1318,17 +1481,19 @@ export class FakeDocker {
       (parameters = route(/^\/containers\/([^/]+)\/exec$/u))
     ) {
       const target = this.#requiredContainer(parameters[0] ?? "")
+      await this.#checkpoint("exec", target.name)
       if (!target.state.running) {
         throw new DockerFailure(`Container ${target.id} is not running`, 409)
       }
       const input = JSON.parse(body) as {
+        AttachStdin?: boolean
         Cmd?: Array<string>
         Env?: Array<string>
         Tty?: boolean
         User?: string
       }
-      if (input.User) return this.#unsupported(`exec as ${input.User}`)
       const exec: FakeExec = {
+        attachStdin: input.AttachStdin ?? false,
         cmd: input.Cmd ?? [],
         containerId: target.id,
         env: Object.fromEntries(
@@ -1341,6 +1506,7 @@ export class FakeDocker {
         running: false,
         size: null,
         tty: input.Tty ?? false,
+        user: input.User,
       }
       this.execs.set(exec.id, exec)
       return json(201, { Id: exec.id })
@@ -1429,6 +1595,21 @@ export class FakeDocker {
           })),
       })
     }
+    // Each volume is as big as the files written into it.
+    if (method === "GET" && path === "/system/df") {
+      return json(200, {
+        Volumes: [...this.volumes.values()].map((volume) => ({
+          Name: volume.name,
+          UsageData: {
+            RefCount: 0,
+            Size: [...volume.files.values()].reduce(
+              (total, content) => total + Buffer.byteLength(content),
+              0
+            ),
+          },
+        })),
+      })
+    }
     if (method === "GET" && (parameters = route(/^\/volumes\/([^/]+)$/u))) {
       const volume = this.volumes.get(parameters[0] ?? "")
       if (!volume) {
@@ -1437,12 +1618,38 @@ export class FakeDocker {
       return json(200, {
         Driver: "local",
         Labels: volume.labels,
+        Mountpoint: `/var/lib/docker/volumes/${volume.name}/_data`,
         Name: volume.name,
       })
     }
     if (method === "DELETE" && (parameters = route(/^\/volumes\/([^/]+)$/u))) {
       await this.#volumeRemove(parameters[0] ?? "")
       return json(204)
+    }
+    if (method === "POST" && path === "/images/create") {
+      const fromImage = url.searchParams.get("fromImage") ?? ""
+      const tag = url.searchParams.get("tag") ?? "latest"
+      const reference = tag.includes(":")
+        ? `${fromImage}@${tag}`
+        : `${fromImage}:${tag}`
+      return this.#pullFromApi(reference, headers["x-registry-auth"])
+    }
+    if (
+      method === "POST" &&
+      (parameters = route(/^\/images\/(.+)\/tag$/u))
+    ) {
+      const [source = ""] = parameters
+      const key = this.#imageKey(source)
+      if (key === undefined) {
+        throw new DockerFailure(`No such image: ${source}`, 404)
+      }
+      const target = `${url.searchParams.get("repo")}:${url.searchParams.get("tag") ?? "latest"}`
+      await this.#checkpoint("tag", target)
+      this.imageTags.set(normalizedImage(target), this.#imageId(source))
+      this.images.set(target, this.images.get(key) ?? {})
+      const config = this.imageConfigs.get(key)
+      if (config) this.imageConfigs.set(target, config)
+      return json(201)
     }
     if (method === "GET" && path === "/images/json") {
       const filters = apiFilters(url)
@@ -1478,6 +1685,49 @@ export class FakeDocker {
       return json(200, found)
     }
     return this.#unsupported(`${method} ${path}`)
+  }
+
+  /**
+   * `POST /images/create`: its progress as JSON messages. A registry that
+   * can't be reached fails within the stream, after Docker answered 200.
+   */
+  async #pullFromApi(
+    reference: string,
+    auth: string | Array<string> | undefined
+  ): Promise<ApiAnswer> {
+    const named = (images: Iterable<string>) =>
+      [...images].find(
+        (image) => normalizedImage(image) === normalizedImage(reference)
+      )
+    const image = named(this.images.keys()) ?? named(this.pullOutput.keys()) ??
+      named(this.unreachableImages) ?? reference
+    await this.#checkpoint("pull", image)
+    this.pulls.set(
+      normalizedImage(reference),
+      typeof auth === "string"
+        ? JSON.parse(Buffer.from(auth, "base64").toString("utf8"))
+        : null
+    )
+    const messages: Array<unknown> = (this.pullOutput.get(image) ?? "")
+      .split("\n")
+      .filter(Boolean)
+      .map((status) => ({ status }))
+    if (this.unreachableImages.has(image)) {
+      const message = `Get "https://registry.example/v2/": net/http: request canceled (registry timeout)`
+      messages.push({ error: message, errorDetail: { message } })
+    } else {
+      this.images.set(image, this.images.get(image) ?? {})
+      messages.push({ status: `Status: Downloaded newer image for ${image}` })
+    }
+    return {
+      kind: "stream",
+      write: (response) => {
+        response.writeHead(200, { "Content-Type": "application/json" })
+        response.end(
+          messages.map((message) => `${JSON.stringify(message)}\r\n`).join("")
+        )
+      },
+    }
   }
 
   /** `docker logs`; following ends when the container stops. */
@@ -1551,7 +1801,13 @@ export class FakeDocker {
     let stdout = ""
     let stderr = ""
     try {
-      stdout = this.#runProgram(container, exec.cmd, exec.env)
+      stdout = this.#runProgram(
+        container,
+        exec.cmd,
+        exec.env,
+        "",
+        exec.user
+      )
       exec.exitCode = 0
     } catch (cause) {
       if (!(cause instanceof DockerFailure)) throw cause
@@ -1578,19 +1834,42 @@ export class FakeDocker {
       ...(host.Mounts ?? []).map((mount) => ({
         destination: mount.Target,
         readOnly: mount.ReadOnly ?? false,
-        source: mount.Source,
+        ...(mount.Type === "volume" && !mount.Source
+          ? { anonymous: true, source: randomBytes(32).toString("hex") }
+          : { source: mount.Source ?? "" }),
         type: mount.Type === "volume" ? ("volume" as const) : ("bind" as const),
       })),
     ]
+    for (const destination of Object.keys(body.Volumes ?? {})) {
+      if (mounts.some((mount) => mount.destination === destination)) continue
+      mounts.push({
+        anonymous: true,
+        destination,
+        source: randomBytes(32).toString("hex"),
+        type: "volume",
+      })
+    }
     const endpoints = body.NetworkingConfig?.EndpointsConfig ?? {}
+    for (const [network, endpoint] of Object.entries(endpoints)) {
+      if (isNetworkMode(network) && endpoint.Aliases?.length) {
+        throw new DockerFailure(
+          "network-scoped aliases are only supported for user-defined networks",
+          400
+        )
+      }
+    }
     return this.#createContainer({
+      autoRemove: host.AutoRemove ?? false,
       cmd: body.Cmd ?? [],
+      hostname: body.Hostname,
+      volumesFrom: host.VolumesFrom ?? [],
       env: Object.fromEntries(
         (body.Env ?? []).map(
           (entry) => splitOnce(entry, "=") as [string, string]
         )
       ),
-      healthCheck: body.Healthcheck !== undefined,
+      healthCheck:
+        body.Healthcheck !== undefined && body.Healthcheck.Test?.[0] !== "NONE",
       image: body.Image,
       interactive: body.OpenStdin ?? false,
       labels: { ...body.Labels },
@@ -1630,6 +1909,26 @@ export class FakeDocker {
     const container = reference
       ? this.container(decodeURIComponent(reference))
       : undefined
+    if (
+      container &&
+      !container.state.running &&
+      container.autoRemove &&
+      container.openStdin
+    ) {
+      socket.write(
+        "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+      )
+      const run = { input: [] as Array<Buffer>, socket, stdinEnded: false }
+      container.runOnce = run
+      if (head.length > 0) run.input.push(head)
+      socket.on("data", (chunk: Buffer) => run.input.push(chunk))
+      socket.on("end", () => {
+        run.stdinEnded = true
+        this.#finishRunOnce(container)
+      })
+      socket.on("error", () => undefined)
+      return
+    }
     if (!container?.state.running) {
       socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
       return
@@ -1652,6 +1951,10 @@ export class FakeDocker {
     const exec = this.execs.get(execId)
     if (!exec || exec.running) {
       socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+      return
+    }
+    if (!exec.tty) {
+      this.#startStreamedExec(exec, request, socket, head)
       return
     }
     exec.running = true
@@ -1689,6 +1992,86 @@ export class FakeDocker {
       this.#execSockets.delete(execId)
     })
     socket.on("error", () => undefined)
+  }
+
+  /**
+   * A non-TTY exec over an upgraded connection: it reads stdin until the
+   * client half-closes it (or right away without stdin), then answers with
+   * its output, multiplexed, and exits.
+   */
+  #startStreamedExec(
+    exec: FakeExec,
+    request: IncomingMessage,
+    socket: Duplex,
+    head: Buffer
+  ) {
+    exec.running = true
+    this.#execSockets.set(exec.id, socket)
+    socket.write(
+      "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+    )
+    let bodyLeft = Number(request.headers["content-length"] ?? 0)
+    const input: Array<Buffer> = []
+    let finished = false
+    const finish = () => {
+      if (finished) return
+      finished = true
+      const container = this.containers.get(exec.containerId)
+      let stdout = ""
+      let stderr = ""
+      let exitCode = 0
+      if (!container?.state.running) {
+        stderr = "container is not running\n"
+        exitCode = 126
+      } else {
+        try {
+          stdout = this.#runProgram(
+            container,
+            exec.cmd,
+            exec.env,
+            Buffer.concat(input).toString("utf8"),
+            exec.user
+          )
+        } catch (cause) {
+          if (!(cause instanceof DockerFailure)) throw cause
+          stderr = `${cause.message}\n`
+          exitCode = 1
+        }
+      }
+      exec.exitCode = exitCode
+      exec.running = false
+      if (socket.destroyed) return
+      const streamError = this.streamErrors.get(clientOf(exec.cmd))
+      if (streamError !== undefined) {
+        socket.end(frame(3, Buffer.from(streamError)))
+        return
+      }
+      if (stdout) socket.write(frame(1, Buffer.from(stdout)))
+      if (stderr) socket.write(frame(2, Buffer.from(stderr)))
+      socket.end()
+    }
+    const receive = (chunk: Buffer) => {
+      if (bodyLeft > 0) {
+        const taken = Math.min(bodyLeft, chunk.length)
+        bodyLeft -= taken
+        chunk = chunk.subarray(taken)
+      }
+      if (chunk.length === 0) return
+      input.push(chunk)
+      // A failing client stops at its first input, as psql does at a bad
+      // statement, without reading the rest.
+      if (this.programFailures.has(clientOf(exec.cmd))) finish()
+    }
+    if (head.length > 0) receive(head)
+    socket.on("data", receive)
+    // The client half-closing the connection closes the process's stdin.
+    socket.on("end", finish)
+    socket.on("close", () => {
+      exec.running = false
+      this.#execSockets.delete(exec.id)
+    })
+    socket.on("error", () => undefined)
+    if (!exec.attachStdin) setImmediate(finish)
   }
 
   // Detached execs Relay runs are `sh -c` scripts that hang up clients by
@@ -1776,13 +2159,18 @@ export async function commandLines(
   executable: string,
   arguments_: ReadonlyArray<string>,
   onLine: (line: string) => void,
-  options: { signal?: AbortSignal; timeout?: number } = {}
+  options: { input?: string; signal?: AbortSignal; timeout?: number } = {}
 ): Promise<void> {
-  const result = await fakeDocker.run(executable, arguments_, {
-    maxBuffer: Number.POSITIVE_INFINITY,
-    signal: options.signal,
-    timeout: options.timeout,
-  })
+  const result = await fakeDocker.run(
+    executable,
+    arguments_,
+    {
+      maxBuffer: Number.POSITIVE_INFINITY,
+      signal: options.signal,
+      timeout: options.timeout,
+    },
+    options.input
+  )
   for (const output of [result.stdout, result.stderr]) {
     for (const line of output.split("\n")) if (line) onLine(line)
   }
@@ -1791,15 +2179,18 @@ export async function commandLines(
 // ------------------------------------------------------------------ parsing
 
 interface CreateBody {
-  Cmd?: Array<string>
-  Env?: Array<string>
-  Healthcheck?: unknown
+  Cmd?: Array<string> | null
+  Env?: Array<string> | null
+  Healthcheck?: { Test?: Array<string> }
+  Hostname?: string
   HostConfig?: {
-    Binds?: Array<string>
+    AutoRemove?: boolean
+    VolumesFrom?: Array<string> | null
+    Binds?: Array<string> | null
     Memory?: number
     Mounts?: Array<{
       ReadOnly?: boolean
-      Source: string
+      Source?: string
       Target: string
       Type: string
     }>
@@ -1812,6 +2203,7 @@ interface CreateBody {
   }
   Image: string
   Labels?: Record<string, string>
+  Volumes?: Record<string, object>
   NetworkingConfig?: {
     EndpointsConfig?: Record<
       string,
@@ -1820,127 +2212,6 @@ interface CreateBody {
   }
   OpenStdin?: boolean
   Tty?: boolean
-}
-
-interface ParsedRunArguments {
-  aliases: Array<string>
-  cmd: Array<string>
-  env: Record<string, string>
-  flags: Set<string>
-  healthCheck: boolean
-  image: string
-  ip: string
-  labels: Record<string, string>
-  memoryBytes: number
-  mounts: Array<FakeMount>
-  name: string | undefined
-  network: string | undefined
-  portBindings: PortBindings
-  restartPolicy: string
-}
-
-function parseRunArguments(
-  arguments_: Array<string>,
-  processEnv: NodeJS.ProcessEnv | undefined
-): ParsedRunArguments {
-  const flags = new Set<string>()
-  const values = new Map<string, Array<string>>()
-  let index = 0
-  while (index < arguments_.length && arguments_[index]?.startsWith("-")) {
-    const flag = arguments_[index] ?? ""
-    if (BOOLEAN_FLAGS.has(flag)) {
-      flags.add(flag === "-i" ? "--interactive" : flag)
-      index += 1
-      continue
-    }
-    if (!VALUE_FLAGS.has(flag)) {
-      throw new Error(`FakeDocker does not model run flag ${flag}`)
-    }
-    const key = flag === "-e" ? "--env" : flag
-    values.set(key, [...(values.get(key) ?? []), arguments_[index + 1] ?? ""])
-    index += 2
-  }
-  const image = arguments_[index] ?? ""
-  const env: Record<string, string> = {}
-  for (const entry of values.get("--env") ?? []) {
-    const [name, value] = splitOnce(entry, "=")
-    const resolved = value ?? processEnv?.[name]
-    if (resolved !== undefined) env[name] = resolved
-  }
-  const portBindings: PortBindings = {}
-  for (const publish of values.get("--publish") ?? []) {
-    const parts = publish.split(":")
-    const containerPort = parts.at(-1) ?? ""
-    const hostPort = parts.at(-2) ?? ""
-    const hostIp = parts.length === 3 ? (parts[0] ?? "") : ""
-    const key = containerPort.includes("/")
-      ? containerPort
-      : `${containerPort}/tcp`
-    portBindings[key] = [
-      ...(portBindings[key] ?? []),
-      { HostIp: hostIp, HostPort: hostPort },
-    ]
-  }
-  const memory = values.get("--memory")?.[0]
-  return {
-    aliases: values.get("--network-alias") ?? [],
-    cmd: [
-      ...(values.get("--entrypoint") ?? []),
-      ...arguments_.slice(index + 1),
-    ].slice(values.has("--entrypoint") ? 1 : 0),
-    env,
-    flags,
-    healthCheck: values.has("--health-cmd"),
-    image,
-    ip: values.get("--ip")?.[0] ?? "",
-    labels: labelsFrom(values.get("--label") ?? []),
-    memoryBytes: memory ? memoryBytes(memory) : 0,
-    mounts: [
-      ...(values.get("--volume") ?? []).map((volume) => parseVolume(volume)),
-      ...(values.get("--mount") ?? []).map((mount) => {
-        const options = Object.fromEntries(
-          mount.split(",").map((part) => splitOnce(part, "="))
-        ) as Record<string, string>
-        return {
-          destination: options.target ?? options.destination ?? "",
-          readOnly: Object.hasOwn(options, "readonly"),
-          source: options.source ?? "",
-          type:
-            options.type === "volume" ? ("volume" as const) : ("bind" as const),
-        }
-      }),
-    ],
-    name: values.get("--name")?.[0],
-    network: values.get("--network")?.[0],
-    portBindings,
-    restartPolicy: values.get("--restart")?.[0] ?? "no",
-  }
-}
-
-function parseFlags(
-  arguments_: ReadonlyArray<string>,
-  valueFlags: ReadonlyArray<string>
-): {
-  flags: Set<string>
-  positional: Array<string>
-  values: Map<string, Array<string>>
-} {
-  const flags = new Set<string>()
-  const positional: Array<string> = []
-  const values = new Map<string, Array<string>>()
-  for (let index = 0; index < arguments_.length; index += 1) {
-    const argument = arguments_[index] ?? ""
-    const [flag, inline] = splitOnce(argument, "=")
-    if (argument.startsWith("-") && valueFlags.includes(flag)) {
-      const value = inline ?? arguments_[(index += 1)] ?? ""
-      values.set(flag, [...(values.get(flag) ?? []), value])
-    } else if (argument.startsWith("-")) {
-      flags.add(argument)
-    } else {
-      positional.push(argument)
-    }
-  }
-  return { flags, positional, values }
 }
 
 function parseVolume(volume: string): FakeMount {
@@ -1953,25 +2224,35 @@ function parseVolume(volume: string): FakeMount {
   }
 }
 
-function labelsFrom(entries: ReadonlyArray<string>): Record<string, string> {
-  return Object.fromEntries(
-    entries.map((entry) => {
-      const [name, value = ""] = splitOnce(entry, "=")
-      return [name, value]
-    })
-  )
+/** The program a process runs: a shell script names it with `exec`. */
+function clientOf(argv: ReadonlyArray<string>): string {
+  const [program = "", , script = ""] = argv
+  return program === "sh" || program === "bash"
+    ? (/\bexec (\S+)/u.exec(script)?.[1] ?? program)
+    : program
 }
 
-function memoryBytes(value: string): number {
-  const match = /^(\d+)([bkmgt]?)$/iu.exec(value)
-  if (!match) return 0
-  const exponent = "bkmgt".indexOf((match[2] || "b").toLowerCase())
-  return Number(match[1]) * 1024 ** exponent
+/**
+ * An image reference in Docker's normalized form, or itself if invalid. A
+ * digest names the image whatever its tag, as Docker resolves it.
+ */
+function normalizedImage(reference: string): string {
+  const parsed = Result.try(() => parseImageReference(reference))
+  if (Result.isFailure(parsed)) return reference
+  const { digest, tag } = parsed.success
+  return normalizedReference({
+    ...parsed.success,
+    tag: digest ? undefined : tag,
+  })
 }
 
-/** `host`, `none`, `bridge`, and `container:<name>` are modes, not networks. */
+/**
+ * `default`, `host`, `none`, `bridge`, and `container:<name>` are modes, not
+ * networks.
+ */
 function isNetworkMode(network: string): boolean {
   return (
+    network === "default" ||
     network === "host" ||
     network === "none" ||
     network === "bridge" ||

@@ -7,6 +7,8 @@ import type {
   RelayDatabaseDump,
   RelayDatabaseExport,
   RelayDatabaseNetwork,
+  RelayDatabaseContainer,
+  RelayDatabaseWipe,
   RelayDeleteDatabase,
   RelayManagedDatabase,
   RelayRotateDatabaseCredentials,
@@ -16,14 +18,23 @@ import {
   databaseEngineSchema,
   relayManagedDatabaseSchema,
 } from "@workspace/contracts"
-import { Effect, Result, Semaphore } from "effect"
+import { Effect, Option, Result, Semaphore } from "effect"
 
 import { promiseEffect } from "./effect/promise.js"
 import type { DatabaseConnections } from "./database-connections.js"
-import { command, commandWithInput } from "./command.js"
 import type { RelayConfig } from "./config.js"
 import type { DockerDriver } from "./docker.js"
-import { DockerEngine, type DockerContainerSummary } from "./docker-engine.js"
+import {
+  type ContainerHealthcheck,
+  createContainer,
+  runWithInput,
+} from "./docker-container-spec.js"
+import {
+  DockerEngine,
+  ensureImage,
+  type DockerContainerSummary,
+  type DockerExecProcess,
+} from "./docker-engine.js"
 import { relayOwnerLabel, relayOwnsLabels } from "./relay-resources.js"
 
 const DATABASE_KIND_LABEL = "kiln.resource.kind"
@@ -175,6 +186,56 @@ export class DatabaseDriver {
     return this.#required(id)
   }
 
+  // The database's container and data volume. Docker measures the volume on
+  // request; a measurement that fails leaves its size out, not the rest.
+  async inspect(id: string): Promise<RelayDatabaseContainer> {
+    const container = await this.#container(id)
+    const labels = container.Config.Labels ?? {}
+    const volume = requiredLabel(labels, "kiln.database.volume")
+    const engine = this.#engine
+    const [inspected, volumes] = await Effect.runPromise(
+      Effect.all(
+        [
+          Effect.option(engine.inspectVolume(volume)),
+          engine
+            .volumeUsage({ timeout: 60_000 })
+            .pipe(Effect.orElseSucceed(() => [])),
+        ],
+        { concurrency: "unbounded" }
+      )
+    )
+    const size = volumes.find((candidate) => candidate.Name === volume)
+      ?.UsageData?.Size
+    return {
+      containerName: container.Name.replace(/^\//u, ""),
+      dataDirectory: Option.getOrUndefined(inspected)?.Mountpoint || null,
+      volumeBytes: size !== undefined && size >= 0 ? size : null,
+    }
+  }
+
+  // Deletes everything in the database and leaves it empty, with the same
+  // name, login, and connections.
+  wipe(input: RelayDatabaseWipe): Promise<RelayManagedDatabase> {
+    return this.#serialize(input.databaseId, async () => {
+      const database = await this.#required(input.databaseId)
+      if (!database.observedState.match(/^(?:running|starting)$/u)) {
+        throw new Error("Start the database before wiping it")
+      }
+      const container = requiredContainerId(database)
+      const wipe = databaseWipeClient(database, input.username, input.password)
+      await Effect.runPromise(
+        this.#engine.execWithInput(container, wipe.command, {
+          env: wipe.env,
+          input: wipe.input,
+          maxOutputBytes: 64 * 1024,
+          overflow: "The database wipe printed more than expected",
+          timeout: 120_000,
+        })
+      )
+      return this.#required(input.databaseId)
+    })
+  }
+
   async backupTarget(id: string): Promise<RelayManagedDatabase> {
     const database = await this.#required(id)
     if (!databaseEngineSupportsLogicalBackups(database.engine)) {
@@ -205,48 +266,37 @@ export class DatabaseDriver {
     let volumeCreated = false
 
     const created = await promiseResult(async () => {
-      await this.#ensureImage(spec.image)
-      await command("docker", [
-        "volume",
-        "create",
-        ...labelArguments(labels),
-        volume,
-      ])
+      await Effect.runPromise(ensureImage(this.#engine, spec.image))
+      await Effect.runPromise(
+        this.#engine.createVolume({ labels, name: volume })
+      )
       volumeCreated = true
-      await command("docker", [
-        "network",
-        "create",
-        "--internal",
-        ...labelArguments(labels),
-        network,
-      ])
+      await Effect.runPromise(
+        this.#engine.createNetwork({ internal: true, labels, name: network })
+      )
       networkCreated = true
       if (input.engine === "redis" || input.engine === "valkey") {
-        await writeAclFile(spec.image, volume, input.username, input.password)
-      }
-      await command(
-        "docker",
-        [
-          "create",
-          "--name",
-          container,
-          "--hostname",
-          databaseHostname(input.id),
-          "--network",
-          network,
-          "--network-alias",
-          databaseHostname(input.id),
-          "--restart",
-          "unless-stopped",
-          "--mount",
-          `type=volume,source=${volume},target=${spec.dataMount}`,
-          ...labelArguments(labels),
-          ...healthArguments(input.engine),
-          ...environmentArguments(input),
+        await writeAclFile(
+          this.#engine,
           spec.image,
-          ...(spec.command ?? []),
-        ],
-        { timeout: 120_000 }
+          volume,
+          input.username,
+          input.password
+        )
+      }
+      await Effect.runPromise(
+        createContainer(this.#engine, {
+          command: spec.command ?? [],
+          env: databaseEnvironment(input),
+          healthcheck: databaseHealthcheck(input.engine),
+          hostname: databaseHostname(input.id),
+          image: spec.image,
+          labels,
+          mounts: [{ source: volume, target: spec.dataMount, type: "volume" }],
+          name: container,
+          network: { aliases: [databaseHostname(input.id)], name: network },
+          restart: "unless-stopped",
+        })
       )
       containerCreated = true
       await Effect.runPromise(
@@ -370,26 +420,23 @@ export class DatabaseDriver {
       const labels = await this.#labels(database.id)
       const volume = requiredLabel(labels, "kiln.database.volume")
       await writeAclFile(
+        this.#engine,
         database.image,
         volume,
         input.username,
         input.nextPassword
       )
       const loaded = await promiseResult(() =>
-        runProcess(
-          "docker",
-          databaseAclLoadArguments(
-            engine,
-            container,
-            input.username,
-            input.currentPassword
-          ),
+        this.#client(
+          container,
+          databaseAclLoadClient(engine, input.username, input.currentPassword),
           undefined,
           60_000
         )
       )
       if (Result.isFailure(loaded)) {
         await writeAclFile(
+          this.#engine,
           database.image,
           volume,
           input.username,
@@ -401,14 +448,9 @@ export class DatabaseDriver {
     }
 
     const sql = rotationSql(database.engine, input.username, input.nextPassword)
-    await runProcess(
-      "docker",
-      databaseClientArguments(
-        database,
-        input.username,
-        input.currentPassword,
-        "import"
-      ),
+    await this.#client(
+      container,
+      databaseClient(database, input.username, input.currentPassword, "import"),
       sql,
       60_000
     )
@@ -451,14 +493,9 @@ export class DatabaseDriver {
     if (!databaseEngineSupportsLogicalBackups(database.engine)) {
       throw new Error(`${database.engine} dump export is not supported yet`)
     }
-    const result = await runProcess(
-      "docker",
-      databaseClientArguments(
-        database,
-        input.username,
-        input.password,
-        "export"
-      ),
+    const result = await this.#client(
+      requiredContainerId(database),
+      databaseClient(database, input.username, input.password, "export"),
       undefined,
       120_000
     )
@@ -478,23 +515,64 @@ export class DatabaseDriver {
     if (!databaseEngineSupportsLogicalBackups(database.engine)) {
       throw new Error(`${database.engine} dump import is not supported yet`)
     }
-    if (Buffer.byteLength(input.content) > MAX_DUMP_BYTES) {
+    const custom = input.format === "postgres-custom"
+    const dump = custom
+      ? Buffer.from(input.content, "base64")
+      : Buffer.from(input.content)
+    if (dump.byteLength > MAX_DUMP_BYTES) {
       throw new Error(
         "The database dump is larger than the current 700 KB transfer limit"
       )
     }
-    await runProcess(
-      "docker",
-      databaseClientArguments(
-        database,
-        input.username,
-        input.password,
-        "import"
-      ),
-      input.content,
+    if (custom) {
+      if (database.engine !== "postgres") {
+        throw new Error(
+          "PostgreSQL custom-format dumps can only be imported into PostgreSQL"
+        )
+      }
+      if (!dump.subarray(0, 5).equals(POSTGRES_CUSTOM_DUMP_MAGIC)) {
+        throw new Error("This isn't a PostgreSQL custom-format dump")
+      }
+    }
+    await this.#client(
+      requiredContainerId(database),
+      custom
+        ? postgresRestoreClient(database, input.username, input.password)
+        : databaseClient(database, input.username, input.password, "import"),
+      dump,
       120_000
     )
     return { databaseId: database.id, imported: true }
+  }
+
+  /** Starts a process in a database's container, streaming its stdio. */
+  process(
+    database: RelayManagedDatabase,
+    command: ReadonlyArray<string>,
+    options: { readonly stdin?: boolean; readonly user?: string } = {}
+  ): Promise<DockerExecProcess> {
+    return Effect.runPromise(
+      this.#engine.execProcess(requiredContainerId(database), command, options)
+    )
+  }
+
+  // Runs a database client in the database's container, with `input` on its
+  // stdin; credentials go through its environment.
+  #client(
+    container: string,
+    client: DatabaseClient,
+    input: string | Uint8Array | undefined,
+    timeout: number
+  ) {
+    return Effect.runPromise(
+      this.#engine.execWithInput(container, client.command, {
+        env: client.env,
+        input,
+        maxOutputBytes: MAX_DUMP_BYTES + 64 * 1024,
+        overflow: "Database transfer exceeded the current size limit",
+        timeout,
+      })
+    )
   }
 
   async #required(id: string): Promise<RelayManagedDatabase> {
@@ -506,11 +584,15 @@ export class DatabaseDriver {
   }
 
   async #labels(id: string): Promise<Record<string, string | undefined>> {
+    return (await this.#container(id)).Config.Labels ?? {}
+  }
+
+  async #container(id: string): Promise<DatabaseContainerInspect> {
     const container = (await this.#discover()).find(
       (candidate) => candidate.Config.Labels?.["kiln.database.id"] === id
     )
     if (!container) throw new Error("Database not found")
-    return container.Config.Labels ?? {}
+    return container
   }
 
   async #discover(): Promise<Array<DatabaseContainerInspect>> {
@@ -614,7 +696,7 @@ export class DatabaseDriver {
     )
     for (const name of candidates) {
       const inspected = await promiseResult(() =>
-        Effect.runPromise(
+        Effect.runPromise<{ readonly Labels: unknown }, unknown>(
           kind === "network"
             ? this.#engine.inspectNetwork(name)
             : this.#engine.inspectVolume(name)
@@ -632,15 +714,6 @@ export class DatabaseDriver {
       }
     }
     return null
-  }
-
-  async #ensureImage(image: string) {
-    const inspected = await promiseResult(() =>
-      Effect.runPromise(this.#engine.inspectImage(image))
-    )
-    if (Result.isFailure(inspected)) {
-      await command("docker", ["pull", image], { timeout: 300_000 })
-    }
   }
 }
 
@@ -670,141 +743,198 @@ function requiredContainerId(database: RelayManagedDatabase): string {
   return database.containerId
 }
 
-function labelArguments(
-  labels: Readonly<Record<string, string>>
-): Array<string> {
-  return Object.entries(labels).flatMap(([name, value]) => [
-    "--label",
-    `${name}=${value}`,
-  ])
-}
-
-function environmentArguments(input: RelayCreateDatabase): Array<string> {
+function databaseEnvironment(
+  input: RelayCreateDatabase
+): Record<string, string> {
   const rootPassword = randomBytes(36).toString("base64url")
-  const environment =
-    input.engine === "mysql"
+  return input.engine === "mysql"
+    ? {
+        MYSQL_DATABASE: input.databaseName,
+        MYSQL_PASSWORD: input.password,
+        MYSQL_ROOT_PASSWORD: rootPassword,
+        MYSQL_USER: input.username,
+      }
+    : input.engine === "mariadb"
       ? {
-          MYSQL_DATABASE: input.databaseName,
-          MYSQL_PASSWORD: input.password,
-          MYSQL_ROOT_PASSWORD: rootPassword,
-          MYSQL_USER: input.username,
+          MARIADB_DATABASE: input.databaseName,
+          MARIADB_PASSWORD: input.password,
+          MARIADB_ROOT_PASSWORD: rootPassword,
+          MARIADB_USER: input.username,
         }
-      : input.engine === "mariadb"
+      : input.engine === "postgres"
         ? {
-            MARIADB_DATABASE: input.databaseName,
-            MARIADB_PASSWORD: input.password,
-            MARIADB_ROOT_PASSWORD: rootPassword,
-            MARIADB_USER: input.username,
+            POSTGRES_DB: input.databaseName,
+            POSTGRES_PASSWORD: input.password,
+            POSTGRES_USER: input.username,
           }
-        : input.engine === "postgres"
-          ? {
-              POSTGRES_DB: input.databaseName,
-              POSTGRES_PASSWORD: input.password,
-              POSTGRES_USER: input.username,
-            }
-          : {}
-  return Object.entries(environment).flatMap(([name, value]) => [
-    "--env",
-    `${name}=${value}`,
-  ])
+        : {}
 }
 
-function healthArguments(engine: DatabaseEngine): Array<string> {
-  const commandValue =
-    engine === "mysql"
-      ? "mysqladmin ping -h 127.0.0.1 --silent"
-      : engine === "mariadb"
-        ? "healthcheck.sh --connect --innodb_initialized"
-        : engine === "postgres"
-          ? 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-          : "kill -0 1"
-  return [
-    "--health-cmd",
-    commandValue,
-    "--health-interval",
-    "5s",
-    "--health-timeout",
-    "3s",
-    "--health-retries",
-    "24",
-    "--health-start-period",
-    "10s",
-  ]
+function databaseHealthcheck(engine: DatabaseEngine): ContainerHealthcheck {
+  return {
+    command:
+      engine === "mysql"
+        ? "mysqladmin ping -h 127.0.0.1 --silent"
+        : engine === "mariadb"
+          ? "healthcheck.sh --connect --innodb_initialized"
+          : engine === "postgres"
+            ? 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+            : "kill -0 1",
+    intervalMs: 5_000,
+    retries: 24,
+    startPeriodMs: 10_000,
+    timeoutMs: 3_000,
+  }
 }
 
-function databaseClientArguments(
+interface DatabaseClient {
+  readonly command: ReadonlyArray<string>
+  readonly env: ReadonlyArray<string>
+}
+
+function databaseClient(
   database: RelayManagedDatabase,
   username: string,
   password: string,
   mode: "export" | "import"
-): Array<string> {
-  const container = database.containerId ?? database.id
+): DatabaseClient {
   if (database.engine === "mysql") {
-    return [
-      "exec",
-      "-i",
-      "-e",
-      `MYSQL_PWD=${password}`,
-      container,
-      mode === "export" ? "mysqldump" : "mysql",
-      "--user",
-      username,
-      ...(mode === "export"
-        ? ["--single-transaction", "--skip-lock-tables", "--no-tablespaces"]
-        : []),
-      database.databaseName,
-    ]
+    return {
+      command: [
+        mode === "export" ? "mysqldump" : "mysql",
+        "--user",
+        username,
+        ...(mode === "export"
+          ? ["--single-transaction", "--skip-lock-tables", "--no-tablespaces"]
+          : []),
+        database.databaseName,
+      ],
+      env: [`MYSQL_PWD=${password}`],
+    }
   }
   if (database.engine === "mariadb") {
-    return [
-      "exec",
-      "-i",
-      "-e",
-      `MYSQL_PWD=${password}`,
-      container,
-      mode === "export" ? "mariadb-dump" : "mariadb",
-      "--user",
-      username,
-      ...(mode === "export"
-        ? ["--single-transaction", "--skip-lock-tables"]
-        : []),
-      database.databaseName,
-    ]
+    return {
+      command: [
+        mode === "export" ? "mariadb-dump" : "mariadb",
+        "--user",
+        username,
+        ...(mode === "export"
+          ? ["--single-transaction", "--skip-lock-tables"]
+          : []),
+        database.databaseName,
+      ],
+      env: [`MYSQL_PWD=${password}`],
+    }
   }
-  return [
-    "exec",
-    "-i",
-    "-e",
-    `PGPASSWORD=${password}`,
-    container,
-    mode === "export" ? "pg_dump" : "psql",
-    "--username",
-    username,
-    "--dbname",
-    database.databaseName,
-    ...(mode === "export"
-      ? ["--clean", "--if-exists", "--no-owner"]
-      : ["--set", "ON_ERROR_STOP=on"]),
-  ]
+  return {
+    command: [
+      mode === "export" ? "pg_dump" : "psql",
+      "--username",
+      username,
+      "--dbname",
+      database.databaseName,
+      ...(mode === "export"
+        ? ["--clean", "--if-exists", "--no-owner"]
+        : ["--set", "ON_ERROR_STOP=on"]),
+    ],
+    env: [`PGPASSWORD=${password}`],
+  }
 }
 
-function databaseAclLoadArguments(
-  engine: "redis" | "valkey",
-  container: string,
+// SQL databases are dropped and created again as their administrator, from
+// inside the container, the way backup restores reach them. The name comes
+// from the container's label, which only allows [a-z0-9_]. Redis and Valkey
+// flush everything as the database's own user.
+function databaseWipeClient(
+  database: RelayManagedDatabase,
   username: string,
   password: string
-): Array<string> {
-  return [
-    "exec",
-    "-e",
-    `${engine === "redis" ? "REDISCLI_AUTH" : "VALKEYCLI_AUTH"}=${password}`,
-    container,
-    engine === "redis" ? "redis-cli" : "valkey-cli",
-    "--user",
-    username,
-    "ACL",
-    "LOAD",
-  ]
+): DatabaseClient & { input: string } {
+  const name = database.databaseName
+  if (database.engine === "postgres") {
+    return {
+      command: [
+        "psql",
+        "--set",
+        "ON_ERROR_STOP=on",
+        "--username",
+        username,
+        "--dbname",
+        "postgres",
+      ],
+      env: [`PGPASSWORD=${password}`],
+      input: `DROP DATABASE IF EXISTS "${name}" WITH (FORCE);\nCREATE DATABASE "${name}";\n`,
+    }
+  }
+  if (database.engine === "mysql" || database.engine === "mariadb") {
+    const root =
+      database.engine === "mysql" ? "MYSQL_ROOT_PASSWORD" : "MARIADB_ROOT_PASSWORD"
+    const client = database.engine === "mysql" ? "mysql" : "mariadb"
+    return {
+      command: [
+        "sh",
+        "-ec",
+        `MYSQL_PWD="$${root}" exec ${client} --user=root`,
+      ],
+      env: [],
+      input: `DROP DATABASE IF EXISTS \`${name}\`;\nCREATE DATABASE \`${name}\`;\n`,
+    }
+  }
+  return { ...keyValueClient(database.engine, username, password, ["FLUSHALL"]), input: "" }
+}
+
+// Redis and Valkey's clients both read the password from REDISCLI_AUTH, and
+// exit 0 on an error reply, such as a failed login, unless given -e.
+function keyValueClient(
+  engine: "redis" | "valkey",
+  username: string,
+  password: string,
+  command: ReadonlyArray<string>
+): DatabaseClient {
+  return {
+    command: [
+      engine === "redis" ? "redis-cli" : "valkey-cli",
+      "-e",
+      "--user",
+      username,
+      ...command,
+    ],
+    env: [`REDISCLI_AUTH=${password}`],
+  }
+}
+
+// What pg_dump -Fc writes first.
+const POSTGRES_CUSTOM_DUMP_MAGIC = Buffer.from("PGDMP")
+
+// Restores a custom-format dump from stdin into the database, leaving
+// ownership and grants to the database's own user, and stopping at the
+// first error, as text imports do.
+function postgresRestoreClient(
+  database: RelayManagedDatabase,
+  username: string,
+  password: string
+): DatabaseClient {
+  return {
+    command: [
+      "pg_restore",
+      "--username",
+      username,
+      "--dbname",
+      database.databaseName,
+      "--no-owner",
+      "--no-privileges",
+      "--exit-on-error",
+    ],
+    env: [`PGPASSWORD=${password}`],
+  }
+}
+
+function databaseAclLoadClient(
+  engine: "redis" | "valkey",
+  username: string,
+  password: string
+): DatabaseClient {
+  return keyValueClient(engine, username, password, ["ACL", "LOAD"])
 }
 
 function rotationSql(
@@ -821,7 +951,10 @@ function rotationSql(
   return `ALTER USER '${username}'@'%' IDENTIFIED BY '${escapedPassword}';\n`
 }
 
+// Writes the users file Redis and Valkey load into their data volume, with
+// the image's own shell in a one-off container.
 async function writeAclFile(
+  engine: DockerEngine,
   image: string,
   volume: string,
   username: string,
@@ -829,22 +962,22 @@ async function writeAclFile(
 ) {
   const passwordHash = createHash("sha256").update(password).digest("hex")
   const acl = `user default off\nuser ${username} reset on #${passwordHash} ~* &* +@all\n`
-  await runProcess(
-    "docker",
-    [
-      "run",
-      "--rm",
-      "-i",
-      "--mount",
-      `type=volume,source=${volume},target=/data`,
-      "--entrypoint",
-      "sh",
-      image,
-      "-c",
-      "cat > /data/users.acl && chown 999:999 /data/users.acl && chmod 600 /data/users.acl",
-    ],
-    acl,
-    60_000
+  await Effect.runPromise(
+    runWithInput(
+      engine,
+      {
+        command: [
+          "-c",
+          "cat > /data/users.acl && chown 999:999 /data/users.acl && chmod 600 /data/users.acl",
+        ],
+        entrypoint: "sh",
+        image,
+        mounts: [{ source: volume, target: "/data", type: "volume" }],
+        name: "",
+      },
+      acl,
+      { maxOutputBytes: MAX_DUMP_BYTES + 64 * 1024, timeout: 60_000 }
+    )
   )
 }
 
@@ -902,16 +1035,4 @@ function safeFileName(name: string): string {
       .replace(/[^a-z0-9]+/gu, "-")
       .replace(/^-+|-+$/gu, "") || "database"
   )
-}
-
-function runProcess(
-  executable: string,
-  arguments_: ReadonlyArray<string>,
-  input: string | undefined,
-  timeoutMs: number
-): Promise<{ stderr: string; stdout: string }> {
-  return commandWithInput(executable, arguments_, input, {
-    maxOutputBytes: MAX_DUMP_BYTES + 64 * 1024,
-    timeoutMs,
-  })
 }

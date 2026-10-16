@@ -2,6 +2,7 @@ import { createHash } from "node:crypto"
 
 import {
   appIdFromFileRoot,
+  isServerFileRoot,
   relayFileActivitySchema,
   type RelayFileActivity,
 } from "@workspace/contracts"
@@ -17,7 +18,7 @@ const recentFileLimit = 12
 const pinnedFileLimit = 48
 
 interface FileActivityRow extends RowDataPacket {
-  instance_id: string
+  root_id: string
   path: string
   pinned: boolean | number
   last_viewed_at: number
@@ -40,7 +41,7 @@ function activityFromRows(
   return relayFileActivitySchema.parse({
     instanceId,
     files: rows.map((row) => ({
-      instanceId: row.instance_id,
+      instanceId: row.root_id,
       path: row.path,
       pinned: Boolean(row.pinned),
       lastViewedAt: new Date(row.last_viewed_at).toISOString(),
@@ -59,18 +60,19 @@ export const listFileActivityEffect = Effect.fn("files.activity.list")(
       [
         database.queryRows<FileActivityRow>(
           "file_activity_pinned",
-          `SELECT instance_id, path, pinned, last_viewed_at, last_edited_at
+          `SELECT root_id, path, pinned, last_viewed_at, last_edited_at
              FROM ${databaseTable("file_activity")}
-            WHERE relay_id = ? AND instance_id = ? AND pinned = TRUE
+            WHERE relay_id = ? AND root_id = ? AND pinned = TRUE
             ORDER BY GREATEST(last_viewed_at, COALESCE(last_edited_at, last_viewed_at)) DESC
             LIMIT ${pinnedFileLimit}`,
           [relayId, instanceId]
         ),
         database.queryRows<FileActivityRow>(
           "file_activity_recent",
-          `SELECT instance_id, path, pinned, last_viewed_at, last_edited_at
+          `SELECT root_id, path, pinned, last_viewed_at, last_edited_at
              FROM ${databaseTable("file_activity")}
-            WHERE relay_id = ? AND instance_id = ? AND pinned = FALSE
+            WHERE relay_id = ? AND root_id = ? AND pinned = FALSE
+              AND path NOT LIKE '%/'
             ORDER BY GREATEST(last_viewed_at, COALESCE(last_edited_at, last_viewed_at)) DESC
             LIMIT ${recentFileLimit}`,
           [relayId, instanceId]
@@ -82,8 +84,18 @@ export const listFileActivityEffect = Effect.fn("files.activity.list")(
   }
 )
 
+// Servers' rows key on their instance, apps' on their app, and host files'
+// on the Relay itself, so each is dropped along with what owns it.
+function rootColumns(instanceId: string) {
+  return {
+    appId: appIdFromFileRoot(instanceId),
+    serverId: isServerFileRoot(instanceId) ? instanceId : null,
+  }
+}
+
 const ensureActivityInstanceEffect = Effect.fn("files.activity.ensureInstance")(
   function* (relayId: string, instanceId: string, now: number) {
+    if (!isServerFileRoot(instanceId)) return
     const database = yield* Database
     yield* database.execute(
       "file_activity_ensure_instance",
@@ -100,17 +112,28 @@ const recordFileViewedEffect = Effect.fn("files.activity.recordView")(
     const now = yield* Clock.currentTimeMillis
     yield* ensureActivityInstanceEffect(relayId, instanceId, now)
     const database = yield* Database
+    const { appId, serverId } = rootColumns(instanceId)
     yield* database.execute(
       "file_activity_record_view",
       `INSERT INTO ${databaseTable("file_activity")}
-         (relay_id, instance_id, path_hash, path, last_viewed_at, created_at,
-          updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+         (relay_id, root_id, instance_id, app_id, path_hash, path,
+          last_viewed_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          path = VALUES(path),
          last_viewed_at = VALUES(last_viewed_at),
          updated_at = VALUES(updated_at)`,
-      [relayId, instanceId, pathHash(path), path, now, now, now]
+      [
+        relayId,
+        instanceId,
+        serverId,
+        appId,
+        pathHash(path),
+        path,
+        now,
+        now,
+        now,
+      ]
     )
   }
 )
@@ -120,18 +143,30 @@ const recordFileEditedEffect = Effect.fn("files.activity.recordEdit")(
     const now = yield* Clock.currentTimeMillis
     yield* ensureActivityInstanceEffect(relayId, instanceId, now)
     const database = yield* Database
+    const { appId, serverId } = rootColumns(instanceId)
     yield* database.execute(
       "file_activity_record_edit",
       `INSERT INTO ${databaseTable("file_activity")}
-         (relay_id, instance_id, path_hash, path, last_viewed_at, last_edited_at,
-          created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         (relay_id, root_id, instance_id, app_id, path_hash, path,
+          last_viewed_at, last_edited_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          path = VALUES(path),
          last_viewed_at = VALUES(last_viewed_at),
          last_edited_at = VALUES(last_edited_at),
          updated_at = VALUES(updated_at)`,
-      [relayId, instanceId, pathHash(path), path, now, now, now, now]
+      [
+        relayId,
+        instanceId,
+        serverId,
+        appId,
+        pathHash(path),
+        path,
+        now,
+        now,
+        now,
+        now,
+      ]
     )
   }
 )
@@ -151,19 +186,17 @@ const setFilePinnedEffect = Effect.fn("files.activity.setPinned")(function* (
     "file_activity_set_pinned",
     (transaction) =>
       Effect.gen(function* () {
+        // Serializes the pin limit check across every root on the Relay.
         yield* transaction.queryRows(
-          `SELECT instance_id
-           FROM ${databaseTable("instance")}
-          WHERE relay_id = ? AND instance_id = ?
-          FOR UPDATE`,
-          [relayId, instanceId]
+          `SELECT id FROM ${databaseTable("relay")} WHERE id = ? FOR UPDATE`,
+          [relayId]
         )
         if (pinned) {
           const pinnedFiles = yield* transaction.queryRows<PinnedFilePathRow>(
             `SELECT path_hash, path
              FROM ${databaseTable("file_activity")}
             WHERE relay_id = ?
-              AND instance_id = ?
+              AND root_id = ?
               AND pinned = TRUE
             LIMIT ${pinnedFileLimit}`,
             [relayId, instanceId]
@@ -176,7 +209,7 @@ const setFilePinnedEffect = Effect.fn("files.activity.setPinned")(function* (
             yield* transaction.execute(
               `DELETE FROM ${databaseTable("file_activity")}
               WHERE relay_id = ?
-                AND instance_id = ?
+                AND root_id = ?
                 AND path_hash IN (${staleHashes.map(() => "?").join(", ")})`,
               [relayId, instanceId, ...staleHashes]
             )
@@ -185,17 +218,37 @@ const setFilePinnedEffect = Effect.fn("files.activity.setPinned")(function* (
             (file) => validPaths.has(file.path) && file.path_hash !== hash
           ).length
           if (activePinCount >= pinnedFileLimit) return false
+        } else if (path.endsWith("/")) {
+          // Directories are never recent, so an unpinned one has no activity.
+          yield* transaction.execute(
+            `DELETE FROM ${databaseTable("file_activity")}
+            WHERE relay_id = ? AND root_id = ? AND path_hash = ?`,
+            [relayId, instanceId, hash]
+          )
+          return true
         }
+        const { appId, serverId } = rootColumns(instanceId)
         yield* transaction.execute(
           `INSERT INTO ${databaseTable("file_activity")}
-           (relay_id, instance_id, path_hash, path, pinned, last_viewed_at,
-            created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           (relay_id, root_id, instance_id, app_id, path_hash, path, pinned,
+            last_viewed_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            path = VALUES(path),
            pinned = VALUES(pinned),
            updated_at = VALUES(updated_at)`,
-          [relayId, instanceId, hash, path, pinned, now, now, now]
+          [
+            relayId,
+            instanceId,
+            serverId,
+            appId,
+            hash,
+            path,
+            pinned,
+            now,
+            now,
+            now,
+          ]
         )
         return true
       })
@@ -203,15 +256,83 @@ const setFilePinnedEffect = Effect.fn("files.activity.setPinned")(function* (
   if (!updated) return yield* FilePinLimitError.make({ limit: pinnedFileLimit })
 })
 
-// Recent and pinned files belong to servers; apps' data directories
-// (`app:<appId>`) don't keep them yet.
+// Pins files that have no activity yet, so one someone unpinned stays
+// unpinned, as long as the root has room. Holds the Relay row's lock, like
+// setting a pin, so concurrent pins can't pass the limit. Whether it pinned
+// any.
+const pinFilesByDefaultEffect = Effect.fn("files.activity.pinByDefault")(
+  function* (
+    relayId: string,
+    instanceId: string,
+    paths: ReadonlyArray<string>
+  ) {
+    if (paths.length === 0) return false
+    const now = yield* Clock.currentTimeMillis
+    yield* ensureActivityInstanceEffect(relayId, instanceId, now)
+    const database = yield* Database
+    const { appId, serverId } = rootColumns(instanceId)
+    return yield* database.transaction(
+      "file_activity_pin_by_default",
+      (transaction) =>
+        Effect.gen(function* () {
+          yield* transaction.queryRows(
+            `SELECT id FROM ${databaseTable("relay")} WHERE id = ? FOR UPDATE`,
+            [relayId]
+          )
+          const [pins] = yield* transaction.queryRows<
+            RowDataPacket & { count: number }
+          >(
+            `SELECT COUNT(*) AS count FROM ${databaseTable("file_activity")}
+              WHERE relay_id = ? AND root_id = ? AND pinned = TRUE`,
+            [relayId, instanceId]
+          )
+          let room = pinnedFileLimit - Number(pins?.count ?? 0)
+          let pinned = false
+          for (const path of paths) {
+            if (room <= 0) break
+            const result = yield* transaction.execute(
+              `INSERT IGNORE INTO ${databaseTable("file_activity")}
+                 (relay_id, root_id, instance_id, app_id, path_hash, path,
+                  pinned, last_viewed_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?)`,
+              [
+                relayId,
+                instanceId,
+                serverId,
+                appId,
+                pathHash(path),
+                path,
+                now,
+                now,
+                now,
+              ]
+            )
+            if (result.affectedRows === 1) {
+              room -= 1
+              pinned = true
+            }
+          }
+          return pinned
+        })
+    )
+  }
+)
+
+export function pinFilesByDefault(
+  relayId: string,
+  instanceId: string,
+  paths: ReadonlyArray<string>
+): Promise<boolean> {
+  return runAppEffect(
+    "files.activity.pinByDefault",
+    pinFilesByDefaultEffect(relayId, instanceId, paths)
+  )
+}
+
 export function listFileActivity(
   relayId: string,
   instanceId: string
 ): Promise<RelayFileActivity> {
-  if (appIdFromFileRoot(instanceId)) {
-    return Promise.resolve({ files: [], instanceId })
-  }
   return runAppEffect(
     "files.activity.list",
     listFileActivityEffect(relayId, instanceId)
@@ -223,7 +344,6 @@ export function recordFileViewed(
   instanceId: string,
   path: string
 ): Promise<void> {
-  if (appIdFromFileRoot(instanceId)) return Promise.resolve()
   return runAppEffect(
     "files.activity.recordView",
     recordFileViewedEffect(relayId, instanceId, path)
@@ -235,7 +355,6 @@ export function recordFileEdited(
   instanceId: string,
   path: string
 ): Promise<void> {
-  if (appIdFromFileRoot(instanceId)) return Promise.resolve()
   return runAppEffect(
     "files.activity.recordEdit",
     recordFileEditedEffect(relayId, instanceId, path)
@@ -249,9 +368,6 @@ export async function setFilePinned(
   pinned: boolean,
   validPaths: ReadonlySet<string>
 ): Promise<RelayFileActivity> {
-  if (appIdFromFileRoot(instanceId)) {
-    throw new Error("Pinning files isn't available for apps yet")
-  }
   await runAppEffect(
     "files.activity.setPinned",
     setFilePinnedEffect(relayId, instanceId, path, pinned, validPaths)

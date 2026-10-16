@@ -1,8 +1,14 @@
+import { randomBytes } from "node:crypto"
+
 import {
   LEGACY_KILN_GIT_REPO,
   DEFAULT_KILN_GIT_REPO,
   kilnImageRepository,
 } from "@workspace/contracts"
+import { Effect } from "effect"
+
+import { type DockerEngine, isDockerNotFound } from "./docker-engine.js"
+import { RelaySystemUpdateError } from "./effect/errors.js"
 
 // Official images retain the pre-rename source label until older Relays that
 // require this exact value have had a compatibility release available.
@@ -25,6 +31,12 @@ export interface ContainerInspect {
   }
   Id: string
   Image: string
+  Mounts?: Array<{
+    Destination: string
+    Name?: string
+    RW?: boolean
+    Type?: string
+  }>
   Name: string
   NetworkSettings?: {
     Networks?: Record<string, { Aliases?: Array<string> | null }>
@@ -42,17 +54,6 @@ export interface ImageInspect {
   }
 }
 
-export interface ContainerUpdateDocker {
-  command(
-    arguments_: Array<string>,
-    timeout?: number
-  ): Promise<{ stderr: string; stdout: string }>
-  createContainer(name: string, configuration: unknown): Promise<void>
-  inspectContainer(container: string): Promise<ContainerInspect>
-  inspectImage(image: string): Promise<ImageInspect>
-  waitUntilHealthy(container: string): Promise<void>
-}
-
 export function kilnComponent(value: string | undefined): KilnComponent | null {
   return value === "hearth" || value === "relay" ? value : null
 }
@@ -67,6 +68,22 @@ export function managedImageChannel(
   return image === stable || image === nightly ? image : null
 }
 
+// Marks the container an update creates, so rollback can find it even when
+// Docker created it but the answer was lost.
+const UPDATE_OPERATION_LABEL = "io.kiln.update-operation"
+
+/**
+ * Replaces a running Hearth or Relay container with one from the target
+ * image, keeping its configuration, networks, and name.
+ *
+ * The old container is stopped and renamed aside, and the replacement
+ * created, started, and checked. Until the replacement is healthy, any
+ * failure rolls back (see `rollbackContainerReplacementEffect`): the old
+ * container comes back under its name and running, and the channel tag
+ * points at its image again. Once the replacement is healthy the update has
+ * happened: removing the old container is cleanup, and a failure there
+ * never rolls back.
+ */
 export function replaceContainerEffect(
   input: {
     backupName: string
@@ -75,18 +92,20 @@ export function replaceContainerEffect(
     targetReference: string
     targetVersion: string
   },
-  docker: ContainerUpdateDocker,
+  docker: DockerEngine,
   onPhase: (phase: string) => Effect.Effect<void>
 ) {
   return Effect.gen(function* () {
     yield* onPhase("replace.inspectContainer")
     const [current, target] = yield* Effect.all(
       [
-        updateOperation("replace.inspectContainer", () =>
-          docker.inspectContainer(input.targetContainer)
+        updateOperation(
+          "replace.inspectContainer",
+          docker.inspectContainer<ContainerInspect>(input.targetContainer)
         ),
-        updateOperation("replace.inspectImage", () =>
-          docker.inspectImage(input.targetImage)
+        updateOperation(
+          "replace.inspectImage",
+          docker.inspectImage<ImageInspect>(input.targetImage)
         ),
       ] as const,
       { concurrency: 2 }
@@ -105,27 +124,27 @@ export function replaceContainerEffect(
       )
     }
 
-    let replacementCreated = false
-    let backupRenamed = false
+    const operation = randomBytes(8).toString("hex")
+    let replacementId: string | undefined
     yield* Effect.gen(function* () {
       yield* onPhase("replace.tagTarget")
-      yield* updateOperation("replace.tagTarget", () =>
-        docker.command([
-          "image",
-          "tag",
-          input.targetImage,
-          input.targetReference,
-        ])
+      yield* updateOperation(
+        "replace.tagTarget",
+        docker.tagImage(input.targetImage, input.targetReference)
       )
       yield* onPhase("replace.stopCurrent")
-      yield* updateOperation("replace.stopCurrent", () =>
-        docker.command(["stop", "--time", "30", input.targetContainer], 45_000)
+      yield* updateOperation(
+        "replace.stopCurrent",
+        docker.stopContainer(input.targetContainer, {
+          seconds: 30,
+          timeout: 45_000,
+        })
       )
       yield* onPhase("replace.renameCurrent")
-      yield* updateOperation("replace.renameCurrent", () =>
-        docker.command(["rename", input.targetContainer, input.backupName])
+      yield* updateOperation(
+        "replace.renameCurrent",
+        docker.renameContainer(input.targetContainer, input.backupName)
       )
-      backupRenamed = true
 
       const preservedConfig = { ...current.Config }
       delete preservedConfig.Cmd
@@ -138,7 +157,8 @@ export function replaceContainerEffect(
       }
       const targetHealthcheck = target.Config?.Healthcheck
       yield* onPhase("replace.createTarget")
-      yield* updateOperation("replace.createTarget", () =>
+      const created = yield* updateOperation(
+        "replace.createTarget",
         docker.createContainer(input.targetContainer, {
           ...preservedConfig,
           Image: input.targetReference,
@@ -146,6 +166,7 @@ export function replaceContainerEffect(
             ...current.Config.Labels,
             ...target.Config?.Labels,
             "org.opencontainers.image.version": input.targetVersion,
+            [UPDATE_OPERATION_LABEL]: operation,
           },
           ...(targetHealthcheck === undefined
             ? {}
@@ -166,40 +187,35 @@ export function replaceContainerEffect(
           },
         })
       )
-      replacementCreated = true
+      replacementId = created.Id
 
       if (networkNames.length > 1) {
         yield* onPhase("replace.connectNetwork")
       }
       yield* Effect.forEach(
         networkNames.filter((network) => network !== primaryNetwork),
-        (network) => {
-          const arguments_ = ["network", "connect"]
-          for (const alias of networkAliases(
-            networks[network]?.Aliases,
-            input.targetContainer
-          )) {
-            arguments_.push("--alias", alias)
-          }
-          arguments_.push(network, input.targetContainer)
-          return updateOperation("replace.connectNetwork", () =>
-            docker.command(arguments_)
-          )
-        },
+        (network) =>
+          updateOperation(
+            "replace.connectNetwork",
+            docker.connectNetwork(network, input.targetContainer, {
+              aliases: networkAliases(
+                networks[network]?.Aliases,
+                input.targetContainer
+              ),
+            })
+          ),
         { discard: true }
       )
 
       yield* onPhase("replace.startTarget")
-      yield* updateOperation("replace.startTarget", () =>
-        docker.command(["start", input.targetContainer], 120_000)
+      yield* updateOperation(
+        "replace.startTarget",
+        docker.startContainer(input.targetContainer, { timeout: 120_000 })
       )
       yield* onPhase("replace.waitUntilHealthy")
-      yield* updateOperation("replace.waitUntilHealthy", () =>
-        docker.waitUntilHealthy(input.targetContainer)
-      )
-      yield* onPhase("replace.removeBackup")
-      yield* updateOperation("replace.removeBackup", () =>
-        docker.command(["rm", "--force", input.backupName], 90_000)
+      yield* updateOperation(
+        "replace.waitUntilHealthy",
+        waitUntilHealthy(docker, input.targetContainer)
       )
     }).pipe(
       Effect.catch((cause) =>
@@ -207,8 +223,8 @@ export function replaceContainerEffect(
           input,
           current,
           docker,
-          replacementCreated,
-          backupRenamed
+          operation,
+          replacementId
         ).pipe(
           Effect.flatMap((rollbackFailures) =>
             Effect.fail(
@@ -224,9 +240,31 @@ export function replaceContainerEffect(
       ),
       Effect.uninterruptible
     )
+    // The replacement is healthy, so the update has happened. The old
+    // container (by its ID, whatever its name) is left behind if it can't
+    // be removed, rather than undoing a working update.
+    yield* onPhase("replace.removeBackup")
+    yield* docker
+      .removeContainer(current.Id, { force: true, timeout: 90_000 })
+      .pipe(Effect.ignore)
   }).pipe(Effect.withSpan("relay.update.replaceContainer"))
 }
 
+/**
+ * Puts the original container back, working from what Docker reports
+ * rather than which steps reported success, since a step can fail after
+ * Docker applied it (a create, rename, or stop whose answer was lost):
+ *
+ * 1. Containers this update created (by its label, or the ID Docker gave)
+ *    are removed, but only once the original is confirmed to still exist,
+ *    so the only working container is never deleted.
+ * 2. The original (by its ID) gets its name back, unless something this
+ *    update didn't create holds it, which is reported and left alone.
+ * 3. Once it owns its name again, it's started if it was running.
+ * 4. The channel tag points at its image again.
+ *
+ * Each step is attempted; what couldn't be done is returned.
+ */
 const rollbackContainerReplacementEffect = Effect.fn(
   "relay.update.rollbackContainer"
 )(function* (
@@ -236,65 +274,187 @@ const rollbackContainerReplacementEffect = Effect.fn(
     targetReference: string
   },
   current: ContainerInspect,
-  docker: ContainerUpdateDocker,
-  replacementCreated: boolean,
-  backupRenamed: boolean
+  docker: DockerEngine,
+  operation: string,
+  replacementId: string | undefined
 ) {
   const rollbackFailures: Array<string> = []
-  const operations = [
-    ...(replacementCreated
-      ? [
-          updateOperation("rollback.removeReplacement", () =>
-            docker.command(["rm", "--force", input.targetContainer], 90_000)
-          ),
-        ]
-      : []),
-    ...(backupRenamed
-      ? [
-          updateOperation("rollback.restoreBackup", () =>
-            docker.command(["rename", input.backupName, input.targetContainer])
-          ).pipe(
-            Effect.andThen(
-              updateOperation("rollback.startBackup", () =>
-                docker.command(["start", input.targetContainer], 120_000)
+  const fail = (message: string) =>
+    Effect.sync(() => {
+      rollbackFailures.push(message)
+    })
+  const attempt = <A>(
+    phase: string,
+    effect: Effect.Effect<A, Error>
+  ): Effect.Effect<A | undefined> =>
+    updateOperation(phase, effect).pipe(
+      Effect.catch((error) => fail(error.message).pipe(Effect.as(undefined)))
+    )
+  const original = attempt(
+    "rollback.inspectOriginal",
+    docker.inspectContainer<ContainerInspect>(current.Id).pipe(
+      Effect.map((found): ContainerInspect | null => found),
+      Effect.catchIf(isDockerNotFound, () => Effect.succeed(null))
+    )
+  )
+
+  // 1. This update's containers, by its label and the ID Docker answered.
+  const labelled = yield* attempt(
+    "rollback.findReplacement",
+    docker.listContainers({
+      all: true,
+      filters: { label: [`${UPDATE_OPERATION_LABEL}=${operation}`] },
+    })
+  )
+  const replacements = new Set([
+    ...(labelled ?? []).map((container) => container.Id),
+    ...(replacementId ? [replacementId] : []),
+  ])
+  replacements.delete(current.Id)
+  if (replacements.size > 0) {
+    const before = yield* original
+    if (before === null) {
+      yield* fail(
+        "The original container no longer exists, so its replacement was kept"
+      )
+    } else if (before !== undefined) {
+      for (const id of replacements) {
+        // Gone is gone, even if the removal's answer was lost.
+        yield* attempt(
+          "rollback.removeReplacement",
+          docker.removeContainer(id, { force: true, timeout: 90_000 }).pipe(
+            Effect.catch((cause) =>
+              docker.inspectContainer(id).pipe(
+                Effect.andThen(Effect.fail(cause)),
+                Effect.catchIf(isDockerNotFound, () => Effect.void)
               )
             )
-          ),
-        ]
-      : []),
-    updateOperation("rollback.restoreReference", () =>
-      docker.command(["image", "tag", current.Image, input.targetReference])
-    ),
-  ]
-  yield* Effect.forEach(
-    operations,
-    (operation) =>
-      operation.pipe(
-        Effect.catch((error) =>
-          Effect.sync(() => {
-            rollbackFailures.push(error.message)
-          })
+          )
         )
-      ),
-    { discard: true }
+      }
+    }
+  }
+
+  // 2. The original's name, from what holds it now.
+  const restored = yield* original
+  if (!restored) {
+    if (restored === null) {
+      yield* fail("The original container no longer exists")
+    }
+  } else {
+    const owns = (container: ContainerInspect) =>
+      container.Name.replace(/^\//u, "") === input.targetContainer
+    let ownsName = owns(restored)
+    if (!ownsName) {
+      const holder = yield* attempt(
+        "rollback.inspectName",
+        docker.inspectContainer<ContainerInspect>(input.targetContainer).pipe(
+          Effect.map((found): ContainerInspect | null => found),
+          Effect.catchIf(isDockerNotFound, () => Effect.succeed(null))
+        )
+      )
+      if (holder) {
+        yield* fail(
+          `${input.targetContainer} is held by container ${holder.Id.slice(0, 12)}, which this update didn't create, so the original kept the name ${restored.Name.replace(/^\//u, "")}`
+        )
+      } else if (holder === null) {
+        // A rename can fail after Docker applied it: what Docker reports
+        // decides.
+        yield* updateOperation(
+          "rollback.restoreBackup",
+          docker.renameContainer(current.Id, input.targetContainer)
+        ).pipe(Effect.ignore)
+        const renamed = yield* attempt(
+          "rollback.restoreBackup",
+          docker.inspectContainer<ContainerInspect>(current.Id)
+        )
+        ownsName = renamed !== undefined && owns(renamed)
+        if (renamed !== undefined && !ownsName) {
+          yield* fail(
+            `The original container couldn't take back the name ${input.targetContainer}`
+          )
+        }
+      }
+    }
+
+    // 3. Its running state, once it owns its name.
+    if (ownsName && current.State.Running) {
+      yield* updateOperation(
+        "rollback.startBackup",
+        docker.startContainer(current.Id, { timeout: 120_000 })
+      ).pipe(Effect.ignore)
+      const started = yield* attempt(
+        "rollback.startBackup",
+        docker.inspectContainer<ContainerInspect>(current.Id)
+      )
+      if (started !== undefined && !started.State.Running) {
+        yield* fail("The original container couldn't be started again")
+      }
+    }
+  }
+
+  // 4. The channel tag.
+  yield* attempt(
+    "rollback.restoreReference",
+    docker.tagImage(current.Image, input.targetReference)
   )
   return rollbackFailures
 })
 
-function updateOperation<TResult>(phase: string, run: () => Promise<TResult>) {
-  return Effect.tryPromise({
-    try: run,
-    catch: (cause) =>
+/**
+ * Waits for a started container to become healthy, or, without a health
+ * check, to keep running for five seconds.
+ */
+export function waitUntilHealthy(
+  docker: DockerEngine,
+  container: string
+): Effect.Effect<void, Error> {
+  return Effect.gen(function* () {
+    const deadline = Date.now() + 120_000
+    let runningSince = 0
+    while (Date.now() < deadline) {
+      const current =
+        yield* docker.inspectContainer<ContainerInspect>(container)
+      if (!current.State.Running) {
+        return yield* Effect.fail(
+          new Error("The replacement container exited during startup")
+        )
+      }
+      const health = current.State.Health?.Status
+      if (health === "healthy") return
+      if (health === "unhealthy") {
+        return yield* Effect.fail(
+          new Error("The replacement container failed its health check")
+        )
+      }
+      if (!health) {
+        runningSince ||= Date.now()
+        if (Date.now() - runningSince >= 5_000) return
+      }
+      yield* Effect.sleep(1_000)
+    }
+    return yield* Effect.fail(
+      new Error("The replacement container did not become healthy in time")
+    )
+  })
+}
+
+function updateOperation<A>(
+  phase: string,
+  operation: Effect.Effect<A, Error>
+): Effect.Effect<A, RelaySystemUpdateError> {
+  return operation.pipe(
+    Effect.mapError((cause) =>
       cause instanceof RelaySystemUpdateError
         ? cause
         : RelaySystemUpdateError.make({
             phase,
-            reason:
-              cause instanceof Error ? cause.message : "System update failed",
+            reason: cause.message || "System update failed",
             cause,
             rollbackFailures: [],
-          }),
-  })
+          })
+    )
+  )
 }
 
 function updateFailure(phase: string, reason: string) {
@@ -307,14 +467,14 @@ function updateFailure(phase: string, reason: string) {
   )
 }
 
-function isDockerGeneratedHostname(
+export function isDockerGeneratedHostname(
   hostname: string | undefined,
   containerId: string
 ): boolean {
   return hostname === containerId.slice(0, 12) || hostname === containerId
 }
 
-function networkAliases(
+export function networkAliases(
   aliases: Array<string> | null | undefined,
   targetContainer: string
 ): Array<string> {
@@ -325,6 +485,3 @@ function networkAliases(
     ])
   )
 }
-import { Effect } from "effect"
-
-import { RelaySystemUpdateError } from "./effect/errors.js"

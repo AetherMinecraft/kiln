@@ -24,6 +24,18 @@ export const relayFileRequestReplayV1Feature = "file-request-replay-v1"
 export const relayConsoleResourcesV1Feature = "console-resources-v1"
 // The Relay deploys apps: Docker images, Dockerfiles, and Compose projects.
 export const relayAppsV1Feature = "apps-v1"
+// The Relay serves its host's files under its own ID as a file root.
+export const relayHostFilesV1Feature = "relay-host-files-v1"
+// The Relay streams its own container's output as the `relay` console kind.
+export const relayLogsV1Feature = "relay-logs-v1"
+// The Relay answers `relay.proxy.config.read` with its proxy configuration.
+export const relayProxyConfigurationV1Feature = "relay-proxy-configuration-v1"
+// The Relay restarts its own container (`relay.restart`) and its host
+// (`relay.host.restart`).
+export const relayRestartV1Feature = "relay-restart-v1"
+// The Relay reports its own usage in `node.relayResources`, and its recent
+// samples through `relay.resources.read`.
+export const relayResourcesV1Feature = "relay-resources-v1"
 export const relayBrowserAuthorizationReviseMaxItems = 256
 
 export const relayControlOperations = [
@@ -31,6 +43,8 @@ export const relayControlOperations = [
   "relay.system.inspect",
   "relay.update.apply",
   "relay.update.status",
+  "relay.restart",
+  "relay.resources.read",
   "relay.rename",
   "relay.audit.list",
   "relay.networking.read",
@@ -42,7 +56,18 @@ export const relayControlOperations = [
   "relay.tailscale.stack.dns",
   "relay.tailscale.stack.list",
   "relay.tailscale.stack.remove",
+  "relay.host.read",
+  "relay.host.files.mount",
+  "relay.host.restart",
+  "relay.database.read",
+  "relay.terminal.attach",
+  "relay.terminal.heartbeat",
+  "relay.terminal.detach",
+  "relay.terminal.write",
+  "relay.terminal.claim",
+  "relay.terminal.restart",
   "relay.proxy.read",
+  "relay.proxy.config.read",
   "relay.proxy.write",
   "relay.pairing.create",
   "relay.pairing.list",
@@ -54,7 +79,9 @@ export const relayControlOperations = [
   "brick.catalog",
   "brick.recipe",
   "database.list",
+  "database.inspect",
   "database.create",
+  "database.wipe",
   "database.delete",
   "database.action",
   "database.credentials.rotate",
@@ -136,6 +163,8 @@ export type RelayControlOperation = (typeof relayControlOperations)[number]
 const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.rename",
   "relay.update.apply",
+  "relay.restart",
+  "relay.host.restart",
   "relay.pairing.create",
   "relay.pairing.revoke",
   "relay.clients.update",
@@ -147,6 +176,8 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.tailscale.stack.remove",
   "relay.tailscale.write",
   "relay.proxy.write",
+  "relay.terminal.attach",
+  "relay.terminal.restart",
   "instance.create",
   "instance.provision.prepare",
   "instance.provision.claim",
@@ -166,6 +197,7 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "instance.network.databases.remove",
   "database.create",
   "database.delete",
+  "database.wipe",
   "database.action",
   "database.credentials.rotate",
   "database.network.write",
@@ -198,7 +230,10 @@ export function isAuditedRelayControlOperation(
 export function relayControlDeadlineMs(
   operation: RelayControlOperation
 ): number {
+  if (operation === "relay.terminal.attach") return 360_000
   if (operation === "relay.update.apply") return 15 * 60_000
+  // The host's shell helper may have to be pulled first.
+  if (operation === "relay.host.restart") return 120_000
   if (operation === "relay.tailscale.install") return 240_000
   if (operation === "relay.tailscale.stack.apply") return 240_000
   if (operation === "relay.tailscale.stack.remove") return 120_000
@@ -210,6 +245,9 @@ export function relayControlDeadlineMs(
   if (operation === "app.action") return 180_000
   if (operation === "database.credentials.rotate") return 180_000
   if (operation === "database.dump.export") return 120_000
+  // Docker walks every volume to measure them.
+  if (operation === "database.inspect") return 75_000
+  if (operation === "database.wipe") return 120_000
   if (operation === "database.dump.import") return 120_000
   if (operation === "instance.action") return 180_000
   if (
@@ -285,11 +323,13 @@ export const RelayBrowserOperationKindSchema = Schema.Literals([
 ])
 
 // The kinds of resource a browser capability can be for. Its `instanceId` is
-// the resource's ID; capabilities without `resourceKind` are for servers.
+// the resource's ID (a Relay's own ID for `relay`); capabilities without
+// `resourceKind` are for servers.
 export const relayBrowserResourceKinds = [
   "instance",
   "database",
   "app",
+  "relay",
 ] as const
 
 export const RelayBrowserResourceKindSchema = Schema.Literals(
@@ -313,6 +353,7 @@ export const relayConsoleReadActions = {
   app: "app.logs.read",
   database: "database.logs.read",
   instance: "instance.console.read",
+  relay: "relay.logs.read",
 } as const satisfies Record<RelayBrowserResourceKind, string>
 
 export const RelayBrowserCapabilityV1Schema = Schema.Struct({

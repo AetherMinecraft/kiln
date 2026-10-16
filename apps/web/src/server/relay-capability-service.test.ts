@@ -13,12 +13,6 @@ const fakes = vi.hoisted(() => ({
   requirePermissions: vi.fn(),
   revisions: vi.fn(),
   features: new Set<string>(),
-  span: { setAttribute: vi.fn() },
-}))
-
-vi.mock("@sentry/tanstackstart-react", () => ({
-  startSpan: (_options: unknown, run: (span: typeof fakes.span) => unknown) =>
-    run(fakes.span),
 }))
 
 vi.mock("@/lib/access-control", () => ({
@@ -461,6 +455,139 @@ describe("Relay capability issuance orchestration", () => {
 
       expect(payload.actions).toEqual(["app.files.upload"])
       expect(Number(payload.expiresAt) - Number(payload.issuedAt)).toBe(30_000)
+    })
+  })
+
+  describe("host file capabilities", () => {
+    const hostId = "H".repeat(43)
+    let granted: string[]
+    beforeEach(() => {
+      granted = ["relay.files.read"]
+      fakes.loadRelay.mockReturnValue(
+        Effect.succeed({ ...material, relay: { ...relay, id: hostId } })
+      )
+      for (const feature of [
+        "browser-capability-v2",
+        "file-request-replay-v1",
+        "relay-host-files-v1",
+      ])
+        fakes.features.add(feature)
+      fakes.requirePermissions.mockImplementation(
+        (input: { instanceId?: string; permissions: string[] }) =>
+          !input.instanceId &&
+          input.permissions.every((permission) => granted.includes(permission))
+            ? Effect.void
+            : Effect.fail(new Error("Permission denied"))
+      )
+    })
+    const issue = (
+      action: "instance.files.download" | "instance.files.upload",
+      instanceId = hostId
+    ) =>
+      issueFileCapabilityForRequest({
+        action,
+        instanceId,
+        relayId: hostId,
+        path: "etc/os-release",
+        publicKeyJwk,
+        optInV2: true,
+        authenticate: () => Promise.resolve({ sessionId: "session-one", user }),
+      })
+    it("uses host permissions and keeps another Relay's root outside the capability", async () => {
+      expect(
+        decodeCapabilityPayload(
+          (await issue("instance.files.download")).capability
+        )
+      ).toMatchObject({
+        actions: ["relay.files.download"],
+        instanceId: hostId,
+        resourceKind: "relay",
+        operation: "file",
+      })
+      await expect(
+        issue("instance.files.download", "J".repeat(43))
+      ).rejects.toThrow()
+      await expect(issue("instance.files.upload")).rejects.toThrow()
+      granted = ["instance.files.read", "app.files.read"]
+      await expect(issue("instance.files.download")).rejects.toThrow()
+    })
+    it("limits host uploads to a write lease and refuses old Relays", async () => {
+      granted = ["relay.files.write"]
+      const payload = decodeCapabilityPayload(
+        (await issue("instance.files.upload")).capability
+      )
+      expect(Number(payload.expiresAt) - Number(payload.issuedAt)).toBe(30_000)
+      fakes.features.delete("relay-host-files-v1")
+      await expect(issue("instance.files.upload")).rejects.toThrow(
+        "Update this Relay"
+      )
+    })
+  })
+
+  describe("Relay logs", () => {
+    // Alice holds Relay permissions on relay-one; `granted` lists them.
+    let granted: Array<string>
+    beforeEach(() => {
+      granted = ["relay.logs.read"]
+      for (const feature of [
+        "browser-capability-v2",
+        "browser-lease-renewal-v1",
+        "console-resources-v1",
+        "relay-logs-v1",
+      ]) {
+        fakes.features.add(feature)
+      }
+      fakes.requirePermissions.mockImplementation(
+        (input: {
+          databaseId?: string
+          instanceId?: string
+          permissions: Array<string>
+        }) =>
+          !input.databaseId &&
+          !input.instanceId &&
+          input.permissions.every((permission) => granted.includes(permission))
+            ? Effect.void
+            : Effect.fail(new Error("Permission denied"))
+      )
+    })
+
+    const issueLogs = (id = "relay-one") =>
+      issueBrowserCapabilitiesForRequest({
+        authenticate: () => Promise.resolve({ sessionId: "session-one", user }),
+        publicKeyJwk,
+        relayId: "relay-one",
+        requests: [{ kind: "console", optInV2: true, write: false }],
+        resource: { id, kind: "relay" },
+      })
+
+    it("issues a capability to read the Relay's own logs", async () => {
+      const issued = await issueLogs()
+
+      expect(
+        decodeCapabilityPayload(issued.capabilities[0]!.capability)
+      ).toMatchObject({
+        actions: ["relay.logs.read"],
+        instanceId: "relay-one",
+        resourceKind: "relay",
+      })
+    })
+
+    it("refuses another Relay's logs through this Relay", async () => {
+      await expect(issueLogs("relay-two")).rejects.toThrow("Relay not found")
+    })
+
+    it("refuses people who can only view the Relay", async () => {
+      granted = ["relay.read"]
+
+      await expect(issueLogs()).rejects.toThrow("Permission denied")
+    })
+
+    it("refuses Relays that can't stream their own logs", async () => {
+      fakes.features.delete("relay-logs-v1")
+
+      await expect(issueLogs()).rejects.toThrow(
+        "Update this Relay to view these logs."
+      )
     })
   })
 

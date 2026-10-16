@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   CircleAlert,
   Copy,
+  Eraser,
   LoaderCircle,
   RotateCw,
   Trash2,
@@ -37,6 +38,7 @@ import {
   exportManagedDatabase,
   importManagedDatabase,
   rotateManagedDatabasePassword,
+  wipeManagedDatabase,
 } from "@/server/databases"
 
 export function CredentialsDialog({
@@ -59,18 +61,6 @@ export function CredentialsDialog({
     })
     onOpenChange(false)
   }, [database.id, database.relayId, onOpenChange, queryClient])
-  const rotate = useMutation({
-    mutationFn: () =>
-      rotateManagedDatabasePassword({
-        data: { databaseId: database.id, relayId: database.relayId },
-      }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: queryKeys.databases.credential(database.relayId, database.id),
-      })
-      showToast({ message: "Database password rotated", type: "success" })
-    },
-  })
 
   return (
     <Dialog
@@ -126,30 +116,116 @@ export function CredentialsDialog({
             />
           </div>
         ) : null}
-        {rotate.error ? (
-          <p className="text-xs text-destructive">{rotate.error.message}</p>
-        ) : null}
         <DialogFooter className="sm:justify-between">
           {databaseRelayAvailable(database) &&
           database.permissions.includes("database.credentials.rotate") ? (
-            <Button
-              disabled={rotate.isPending}
-              type="button"
-              variant="outline"
-              onClick={() => rotate.mutate()}
-            >
-              {rotate.isPending ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <RotateCw />
-              )}
-              Rotate password
-            </Button>
+            <RotateDatabasePasswordButton database={database} />
           ) : (
             <span />
           )}
           <Button type="button" onClick={close}>
             Done
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Rotate password, confirmed first: anything still using the old password,
+// like a game server's config, loses access until it gets the new one.
+export function RotateDatabasePasswordButton({
+  database,
+  disabledReason,
+  size = "default",
+}: {
+  database: Pick<ManagedDatabase, "id" | "name" | "relayId">
+  disabledReason?: string
+  size?: "default" | "sm"
+}) {
+  const [open, setOpen] = React.useState(false)
+  return (
+    <>
+      <Button
+        type="button"
+        size={size}
+        variant="outline"
+        disabled={Boolean(disabledReason)}
+        title={disabledReason}
+        onClick={() => setOpen(true)}
+      >
+        <RotateCw />
+        Rotate Password
+      </Button>
+      {open ? (
+        <RotateDatabasePasswordDialog
+          database={database}
+          onOpenChange={setOpen}
+        />
+      ) : null}
+    </>
+  )
+}
+
+function RotateDatabasePasswordDialog({
+  database,
+  onOpenChange,
+}: {
+  database: Pick<ManagedDatabase, "id" | "name" | "relayId">
+  onOpenChange: (open: boolean) => void
+}) {
+  const queryClient = useQueryClient()
+  const rotate = useMutation({
+    mutationFn: () =>
+      rotateManagedDatabasePassword({
+        data: { databaseId: database.id, relayId: database.relayId },
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.databases.credential(database.relayId, database.id),
+      })
+      showToast({ message: "Database password rotated", type: "success" })
+      onOpenChange(false)
+    },
+  })
+  return (
+    <Dialog
+      open
+      onOpenChange={(nextOpen) => !rotate.isPending && onOpenChange(nextOpen)}
+    >
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Rotate {database.name}&apos;s password?</DialogTitle>
+          <DialogDescription>
+            The database gets a new password right away. Anything still using
+            the current one, like a game server&apos;s config, can&apos;t
+            connect until you give it the new password.
+          </DialogDescription>
+        </DialogHeader>
+        {rotate.error ? (
+          <p className="text-xs text-destructive">{rotate.error.message}</p>
+        ) : null}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={rotate.isPending}
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={rotate.isPending}
+            onClick={() => rotate.mutate()}
+          >
+            {rotate.isPending ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <RotateCw />
+            )}
+            Rotate Password
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -209,15 +285,20 @@ export function CredentialField({
 
 export function ImportDatabaseDialog({
   database,
+  initialFile = null,
   open,
   onOpenChange,
 }: {
   database: ManagedDatabase
+  // A file already chosen, such as one dropped on the Info page.
+  initialFile?: File | null
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
-  const [file, setFile] = React.useState<File | null>(null)
-  const [localError, setLocalError] = React.useState<string | null>(null)
+  const [file, setFile] = React.useState<File | null>(initialFile)
+  const [localError, setLocalError] = React.useState<string | null>(() =>
+    dumpSizeError(initialFile)
+  )
   const upload = useMutation({
     mutationFn: async () => {
       if (!file) throw new Error("Choose a SQL dump first")
@@ -226,7 +307,7 @@ export function ImportDatabaseDialog({
       }
       return importManagedDatabase({
         data: {
-          content: await file.text(),
+          ...(await readDatabaseDump(file, database.engine)),
           databaseId: database.id,
           relayId: database.relayId,
         },
@@ -247,30 +328,28 @@ export function ImportDatabaseDialog({
         <DialogHeader>
           <DialogTitle>Import SQL dump</DialogTitle>
           <DialogDescription>
-            Statements run against {database.databaseName}. Existing data is not
+            The dump runs against {database.databaseName}. Existing data is not
             cleared first. Current upload limit: 700 KB.
           </DialogDescription>
         </DialogHeader>
         <label className="block rounded-lg border border-dashed border-border p-4 text-center">
           <Upload className="mx-auto size-5 text-muted-foreground" />
           <span className="mt-2 block text-xs font-medium">
-            {file?.name ?? "Choose a .sql file"}
+            {file?.name ?? "Choose a .sql or .dmp file"}
           </span>
           <span className="type-meta mt-1 block text-muted-foreground">
-            MySQL, MariaDB, and PostgreSQL text dumps
+            {database.engine === "postgres"
+              ? "Text dumps, or custom-format dumps from pg_dump -Fc"
+              : "Text dumps from mysqldump or mariadb-dump"}
           </span>
           <input
-            accept=".sql,application/sql,text/plain"
+            accept={DATABASE_DUMP_ACCEPT}
             className="sr-only"
             type="file"
             onChange={(event) => {
               const next = event.currentTarget.files?.[0] ?? null
               setFile(next)
-              setLocalError(
-                next && next.size > DATABASE_DUMP_LIMIT_BYTES
-                  ? "SQL dumps are currently limited to 700 KB"
-                  : null
-              )
+              setLocalError(dumpSizeError(next))
             }}
           />
         </label>
@@ -298,6 +377,129 @@ export function ImportDatabaseDialog({
               <Upload />
             )}
             Import
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// What the file pickers offer. Dropped files of any name are read the same
+// way.
+export const DATABASE_DUMP_ACCEPT = ".sql,.dmp,application/sql,text/plain"
+
+// A text dump is sent as is. A PostgreSQL custom-format dump (pg_dump -Fc),
+// which starts with "PGDMP", is binary, so it goes in base64 for pg_restore.
+// Any other binary file isn't a dump we can import.
+async function readDatabaseDump(
+  file: File,
+  engine: ManagedDatabase["engine"]
+): Promise<{ content: string; format: "postgres-custom" | "sql" }> {
+  const bytes = new Uint8Array(await file.arrayBuffer())
+  const custom = new TextDecoder().decode(bytes.subarray(0, 5)) === "PGDMP"
+  if (custom) {
+    if (engine !== "postgres") {
+      throw new Error(
+        "This is a PostgreSQL custom-format dump, which only a PostgreSQL database can import"
+      )
+    }
+    return { content: base64(bytes), format: "postgres-custom" }
+  }
+  if (bytes.includes(0)) {
+    throw new Error(
+      "This file isn't a text SQL dump or a PostgreSQL custom-format dump"
+    )
+  }
+  return { content: new TextDecoder().decode(bytes), format: "sql" }
+}
+
+function base64(bytes: Uint8Array): string {
+  let binary = ""
+  // In chunks, so a large file doesn't overflow the argument list.
+  for (let start = 0; start < bytes.length; start += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(start, start + 0x8000))
+  }
+  return btoa(binary)
+}
+
+function dumpSizeError(file: File | null): string | null {
+  return file && file.size > DATABASE_DUMP_LIMIT_BYTES
+    ? "SQL dumps are currently limited to 700 KB"
+    : null
+}
+
+// Deletes every table and row and keeps the database, its login, and its
+// connections. Confirmed the way deleting is.
+export function WipeDatabaseDialog({
+  database,
+  onOpenChange,
+}: {
+  database: ManagedDatabase
+  onOpenChange: (open: boolean) => void
+}) {
+  const queryClient = useQueryClient()
+  const wipe = useMutation({
+    mutationFn: () =>
+      wipeManagedDatabase({
+        data: { databaseId: database.id, relayId: database.relayId },
+      }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.databases.list }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.databases.container(
+            database.relayId,
+            database.id
+          ),
+        }),
+      ])
+      showToast({ message: `${database.name} wiped`, type: "success" })
+      onOpenChange(false)
+    },
+  })
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(nextOpen) => !wipe.isPending && onOpenChange(nextOpen)}
+    >
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Wipe {database.name}?</DialogTitle>
+          <DialogDescription>
+            Every table and row will be permanently deleted. The database, its
+            credentials, and its game server connections stay.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs">
+          <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+          This action cannot be undone. Export a SQL dump first if you need a
+          recovery copy.
+        </div>
+        {wipe.error ? (
+          <p className="text-xs text-destructive">{wipe.error.message}</p>
+        ) : null}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={wipe.isPending}
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button
+            disabled={wipe.isPending}
+            type="button"
+            variant="destructive"
+            onClick={() => wipe.mutate()}
+          >
+            {wipe.isPending ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <Eraser />
+            )}
+            Wipe database
           </Button>
         </DialogFooter>
       </DialogContent>

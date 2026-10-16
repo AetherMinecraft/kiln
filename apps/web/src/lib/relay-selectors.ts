@@ -101,10 +101,13 @@ export type InstanceSettingsInstance = Pick<
   | "containerId"
   | "directory"
   | "game"
+  | "hostDirectory"
   | "id"
   | "implementation"
   | "javaVersion"
+  | "limits"
   | "name"
+  | "ports"
   | "provisioning"
   | "publicHost"
   | "publicPort"
@@ -150,6 +153,17 @@ export function selectSidebarInstanceCount(
     if (isServerInstance(instance)) count += 1
   }
   return count
+}
+
+// How many servers one Relay runs, and how many of those are running.
+export function selectRelayServerCount(relayId: string) {
+  return (snapshot: RelayFleetSnapshot): number => {
+    let total = 0
+    for (const instance of snapshot.instances) {
+      if (instance.relayId === relayId && isServerInstance(instance)) total += 1
+    }
+    return total
+  }
 }
 
 function sidebarInstance(
@@ -289,10 +303,13 @@ export function selectInstanceSettings(instanceId: string, relayId?: string) {
         containerId: instance.containerId,
         directory: instance.directory,
         game: instance.game,
+        hostDirectory: instance.hostDirectory,
         id: instance.id,
         implementation: instance.implementation,
         javaVersion: instance.javaVersion,
+        limits: instance.limits,
         name: instance.name,
+        ports: instance.ports,
         provisioning: instance.provisioning,
         publicHost: instance.publicHost,
         publicPort: instance.publicPort,
