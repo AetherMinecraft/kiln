@@ -24,6 +24,7 @@ import {
   createAppRecordEffect,
   deleteAppRecordEffect,
   listAppRecordsEffect,
+  renameAppRecordEffect,
   saveAppConfigEffect,
 } from "@/effect/managed-apps"
 import { runAppEffect } from "@/effect/runtime"
@@ -32,14 +33,17 @@ import {
   listUserGrants,
   requireRelayPermission,
 } from "@/lib/access-control"
-import type { AccessGrant } from "@/lib/access-control"
-import type { AuthenticatedUser } from "@/lib/auth-session"
-import { accessPermissions, grantHasPermission } from "@/lib/permissions"
+import { accessPermissions } from "@/lib/permissions"
 import type { AccessPermission } from "@/lib/permissions"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { isRelayUpdating } from "@/lib/relay-connection"
 import { listPersistedRelays } from "@/lib/relay-registry"
-import { authorizedApp } from "@/server/app-access"
+import {
+  authorizedApp,
+  getAppOwnerHandler,
+  getAppOwnerMinecraftProfileIdHandler,
+  hasAppPermission,
+} from "@/server/app-access"
 import { requireEligibleResourceUser } from "@/server/auth"
 import { databaseRpc, requiredRelay } from "@/server/managed-database-access"
 
@@ -59,6 +63,7 @@ const appActionInputSchema = appInputSchema.extend({
 const appConfigInputSchema = appInputSchema.extend({
   config: appConfigSchema.omit({ databaseIds: true }).partial(),
 })
+const appRenameInputSchema = appInputSchema.extend({ name: appNameSchema })
 const appNetworkInputSchema = appInputSchema.extend({
   databaseIds: z.array(databaseIdSchema).max(32),
 })
@@ -236,6 +241,23 @@ export const getAppConfig = createServerFn({ method: "GET" })
     }
   })
 
+// Who created the app, for its Info rail. Their email only for those who can
+// read the Relay's people.
+export const getAppOwner = createServerFn({ method: "GET" })
+  .validator(appInputSchema)
+  .handler(async ({ data }) =>
+    getAppOwnerHandler(await requireEligibleResourceUser(), data)
+  )
+
+export const getAppOwnerMinecraftProfileId = createServerFn({ method: "GET" })
+  .validator(appInputSchema)
+  .handler(async ({ data }) =>
+    getAppOwnerMinecraftProfileIdHandler(
+      await requireEligibleResourceUser(),
+      data
+    )
+  )
+
 export const createApp = createServerFn({ method: "POST" })
   .validator(createAppInputSchema)
   .handler(async ({ data }) => {
@@ -303,6 +325,20 @@ export const updateAppConfig = createServerFn({ method: "POST" })
     )
     publishAppChange(data.relayId, false)
     return { config }
+  })
+
+// Hearth keeps the name, so renaming doesn't need the Relay. It's
+// configuring the app, so it takes the permission that does.
+export const renameApp = createServerFn({ method: "POST" })
+  .validator(appRenameInputSchema)
+  .handler(async ({ data }) => {
+    const { relay } = await authorizedApp(data, "app.manage")
+    await runAppEffect(
+      "apps.rename",
+      renameAppRecordEffect(relay.id, data.appId, data.name)
+    )
+    publishAppChange(relay.id, true)
+    return { name: data.name }
   })
 
 // Deploys the saved configuration. The Relay answers once the deployment
@@ -509,21 +545,6 @@ function publishAppChange(relayId: string, directoryChanged: boolean): void {
     topics: directoryChanged ? ["apps", "app-directory"] : ["apps"],
     type: "hearth.invalidate",
   })
-}
-
-function hasAppPermission(
-  user: AuthenticatedUser,
-  grants: ReadonlyArray<AccessGrant>,
-  relayId: string,
-  permission: AccessPermission
-): boolean {
-  if (isPlatformAdmin(user)) return true
-  return grants.some(
-    (grant) =>
-      grant.relayId === relayId &&
-      grant.resourceType === "relay" &&
-      grantHasPermission(grant, permission)
-  )
 }
 
 function promiseResult<TResult>(run: () => Promise<TResult>) {
