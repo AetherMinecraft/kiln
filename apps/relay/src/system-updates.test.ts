@@ -13,6 +13,8 @@ import { it as effectIt } from "@effect/vitest"
 import { Effect, Exit, Fiber } from "effect"
 import { beforeEach, describe, expect } from "vite-plus/test"
 
+import { relaySnapshotSchema } from "@workspace/contracts"
+
 import { SystemUpdateManager, type UpdateOperation } from "./system-updates.js"
 import { fakeDocker, type HeldOperation } from "./test/docker.js"
 import { KILN_IMAGE_SOURCE } from "./update-container.js"
@@ -411,6 +413,111 @@ describe("update operation lifecycle", () => {
       )
   )
 
+  effectIt.effect(
+    "reports an update from its acceptance, through the Relay's replacement, to its outcome",
+    () =>
+      withTemporaryDataDirectory((dataDirectory) =>
+        Effect.gen(function* () {
+          docker.holdPull = true
+          const manager = yield* Effect.promise(() =>
+            docker.manager({ dataDirectory })
+          )
+          expect(yield* manager.updates()).toEqual([])
+          const requestId = "33333333-3333-4333-8333-333333333333"
+          const starting = yield* manager
+            .startBatch({
+              helperImage: targetImage,
+              requestId,
+              targets: [{ ...relayTarget, version: "0.1.0" }],
+            })
+            .pipe(Effect.forkChild)
+          yield* Effect.promise(() => docker.pullStarted)
+
+          // Reported, named by its request, while its images are pulled.
+          const [pulling] = yield* manager.updates()
+          expect(pulling).toMatchObject({
+            component: "relay",
+            phase: "Preparing",
+            requestId,
+            status: "running",
+          })
+          // A pull long enough to look stale doesn't fail an update whose
+          // helper hasn't launched yet.
+          const recorded = yield* readRecord(dataDirectory, pulling!.id)
+          yield* recordOutcome(dataDirectory, {
+            ...recorded,
+            startedAt: "2020-01-01T00:00:00.000Z",
+          })
+          expect(yield* manager.updates()).toMatchObject([
+            { id: pulling!.id, status: "running" },
+          ])
+          expect((yield* manager.status(pulling!.id))?.status).toBe("running")
+
+          docker.holdPull = false
+          const [operation] = yield* Fiber.join(starting)
+          expect(operation).toMatchObject({
+            id: pulling!.id,
+            status: "running",
+          })
+          expect(docker.helpers.size).toBe(1)
+
+          // The helper replaces this Relay; its replacement reports the
+          // update from the records, and the outcome the helper records.
+          const replaced = yield* Effect.promise(() =>
+            docker.manager({ dataDirectory })
+          )
+          expect(yield* replaced.updates()).toMatchObject([
+            { id: operation!.id, requestId, status: "running" },
+          ])
+          yield* recordOutcome(dataDirectory, {
+            ...operation!,
+            error: "x".repeat(5_000),
+            finishedAt: new Date().toISOString(),
+            phase: "replace.waitUntilHealthy",
+            status: "failed",
+          })
+          const reported = yield* replaced.updates()
+          expect(reported).toMatchObject([
+            { id: operation!.id, status: "failed" },
+          ])
+          // Hearth rejects a snapshot that doesn't match the contract.
+          expect(() =>
+            relaySnapshotSchema.shape.node.shape.updates.parse(reported)
+          ).not.toThrow()
+        })
+      )
+  )
+
+  effectIt.effect(
+    "leaves out a record the snapshot contract would reject, and reports later ones",
+    () =>
+      withTemporaryDataDirectory((dataDirectory) =>
+        Effect.gen(function* () {
+          const manager = yield* Effect.promise(() =>
+            docker.manager({ dataDirectory })
+          )
+          yield* Effect.promise(() =>
+            mkdir(join(dataDirectory, "updates"), { recursive: true })
+          )
+          yield* recordOutcome(dataDirectory, {
+            ...staleOperation(),
+            finishedAt: new Date().toISOString(),
+            startedAt: "not-a-date",
+            status: "failed",
+          })
+          expect(yield* manager.updates()).toEqual([])
+
+          const operation = yield* manager.start({
+            ...relayTarget,
+            version: "0.1.0",
+          })
+          expect(yield* manager.updates()).toMatchObject([
+            { id: operation.id, status: "running" },
+          ])
+        })
+      )
+  )
+
   effectIt.effect("recovers an orphaned target lock", () =>
     withTemporaryDataDirectory((dataDirectory) =>
       Effect.gen(function* () {
@@ -501,4 +608,20 @@ function withTemporaryDataDirectory<TResult, TError, TRequirements>(
     use,
     (directory) => Effect.promise(() => removeTemporaryDirectory(directory))
   )
+}
+
+// Records an operation's outcome as the update helper does.
+function recordOutcome(dataDirectory: string, operation: UpdateOperation) {
+  return Effect.promise(() =>
+    writeFile(
+      join(dataDirectory, "updates", `${operation.id}.json`),
+      JSON.stringify(operation)
+    )
+  )
+}
+
+function readRecord(dataDirectory: string, id: string) {
+  return Effect.promise(() =>
+    readFile(join(dataDirectory, "updates", `${id}.json`), "utf8")
+  ).pipe(Effect.map((text) => JSON.parse(text) as UpdateOperation))
 }

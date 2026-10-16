@@ -11,7 +11,7 @@ import {
   useVirtualizer,
   type Range,
 } from "@tanstack/react-virtual"
-import { Effect, Result } from "effect"
+import { Effect, Option, Result } from "effect"
 import {
   ArrowRight,
   Check,
@@ -113,7 +113,11 @@ import {
   setSystemUpdateOverviewRefetchBlocked,
 } from "@/lib/system-update-presence"
 import type { UpdateOverview } from "@/server/updates"
-import { getSystemUpdateStatus, startSystemUpdates } from "@/server/updates"
+import {
+  getSystemUpdates,
+  getSystemUpdateStatus,
+  startSystemUpdates,
+} from "@/server/updates"
 
 type UpdateTarget = {
   component: "hearth" | "relay"
@@ -3459,71 +3463,133 @@ async function startUpdates(
 ): Promise<{
   failures: Array<{ message: string; target: UpdateTarget }>
 }> {
+  const requestId = crypto.randomUUID()
+  const start = (target: UpdateTarget, operationId: string, relayId: string) =>
+    onStarted({
+      component: target.component,
+      name: target.name,
+      operationId,
+      previousVersion: target.currentVersion,
+      relayId,
+      targetVersion: latestVersion,
+      targetKey: target.key,
+      versionName: latestVersionName,
+    })
   return Effect.runPromise(
-    Effect.tryPromise({
-      try: () =>
+    Effect.gen(function* () {
+      const failures: Array<{ message: string; target: UpdateTarget }> = []
+      // Targets whose updates may have started without this browser hearing.
+      const uncertain: Array<{ message: string; target: UpdateTarget }> = []
+      const result = yield* Effect.tryPromise(() =>
         startSystemUpdates({
           data: {
+            requestId,
             targets: targets.map(({ component, relayId }) => ({
               component,
               relayId,
             })),
           },
-        }),
-      catch: (cause) => cause,
-    }).pipe(
-      Effect.match({
-        onFailure: (cause) => {
-          return {
-            failures: targets.map((target) => ({
-              message:
-                cause instanceof Error
-                  ? cause.message
-                  : "Update could not start.",
-              target,
-            })),
-          }
-        },
-        onSuccess: (result) => {
-          const failures: Array<{
-            message: string
-            target: UpdateTarget
-          }> = []
-          for (const failure of result.failures) {
-            const target = targets.find(
-              (candidate) =>
-                candidate.component === failure.component &&
-                (candidate.component === "hearth" ||
-                  candidate.relayId === failure.relayId)
-            )
-            if (!target) continue
-            failures.push({ message: failure.message, target })
-          }
-          for (const started of result.started) {
-            const target = targets.find(
-              (candidate) =>
-                candidate.component === started.operation.component &&
-                (candidate.component === "hearth" ||
-                  candidate.relayId === started.relayId)
-            )
-            if (!target) continue
-            onStarted({
-              component: started.operation.component,
-              name: target.name,
-              operationId: started.operation.id,
-              previousVersion: target.currentVersion,
-              relayId: started.relayId,
-              targetVersion: latestVersion,
-              targetKey: target.key,
-              versionName: latestVersionName,
-            })
-          }
-          return { failures }
-        },
-      })
-    )
+        })
+      ).pipe(Effect.result)
+      if (Result.isFailure(result)) {
+        const cause = result.failure.cause
+        const message =
+          cause instanceof Error ? cause.message : "Update could not start."
+        for (const target of targets) uncertain.push({ message, target })
+      } else {
+        for (const failure of result.success.failures) {
+          const target = targets.find(
+            (candidate) =>
+              candidate.component === failure.component &&
+              (candidate.component === "hearth" ||
+                candidate.relayId === failure.relayId)
+          )
+          if (!target) continue
+          const entry = { message: failure.message, target }
+          if (failure.outcomeUnknown) uncertain.push(entry)
+          else failures.push(entry)
+        }
+        for (const started of result.success.started) {
+          const target = targets.find(
+            (candidate) =>
+              candidate.component === started.operation.component &&
+              (candidate.component === "hearth" ||
+                candidate.relayId === started.relayId)
+          )
+          if (target) start(target, started.operation.id, started.relayId)
+        }
+      }
+      if (uncertain.length > 0) {
+        const found = yield* findStartedUpdates(
+          requestId,
+          uncertain.map(({ target }) => target),
+          start
+        )
+        for (const { message, target } of uncertain) {
+          if (!found.has(target.key)) failures.push({ message, target })
+        }
+      }
+      return { failures }
+    })
   )
 }
+
+// How long to look for updates a lost reply started, and how long a Relay
+// must report without one before it counts as not started. Hearth may still
+// be starting it, or be replaced by an update and come back.
+const startRecoveryWindowMs = 5 * 60_000
+const notStartedAfterMs = 20_000
+
+/**
+ * Finds the updates a request started from what the Relays report, for
+ * targets whose reply was lost: each Relay names the request in the updates
+ * it accepted. Each is started as soon as it's found; returns the keys of
+ * the targets found.
+ */
+const findStartedUpdates = Effect.fnUntraced(function* (
+  requestId: string,
+  targets: ReadonlyArray<UpdateTarget>,
+  onFound: (target: UpdateTarget, operationId: string, relayId: string) => void
+) {
+  const found = new Set<string>()
+  const unresolved = new Map(targets.map((target) => [target.key, target]))
+  const reportingWithout = new Map<string, number>()
+  const deadline = Date.now() + startRecoveryWindowMs
+  while (unresolved.size > 0 && Date.now() < deadline) {
+    const reports = yield* Effect.tryPromise(() => getSystemUpdates()).pipe(
+      Effect.option
+    )
+    if (Option.isSome(reports)) {
+      for (const target of unresolved.values()) {
+        const report = reports.value.find(
+          (candidate) => candidate.relayId === target.relayId
+        )
+        const update = report?.updates.find(
+          (candidate) =>
+            candidate.component === target.component &&
+            candidate.requestId === requestId
+        )
+        if (report && update) {
+          found.add(target.key)
+          onFound(target, update.id, report.relayId)
+        }
+        if (update || !report || report.state === "unsupported") {
+          unresolved.delete(target.key)
+        } else if (report.state === "unavailable") {
+          reportingWithout.delete(target.key)
+        } else {
+          const since = reportingWithout.get(target.key) ?? Date.now()
+          reportingWithout.set(target.key, since)
+          if (Date.now() - since >= notStartedAfterMs) {
+            unresolved.delete(target.key)
+          }
+        }
+      }
+    }
+    if (unresolved.size > 0) yield* Effect.sleep("2 seconds")
+  }
+  return found
+})
 
 function registerUpdatePresence(update: ActiveUpdate): void {
   markSystemUpdateActive(update)

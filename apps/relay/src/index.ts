@@ -86,6 +86,8 @@ import {
   relayRotateDatabaseCredentialsSchema,
   relayUpdateInstanceStartupSchema,
   relayBootstrapDiscoveryTranscript,
+  relayControlDeadlineMs,
+  relaySystemUpdateSchema,
   RelayBrowserAuthorizationReviseSchema,
   relayBrowserAuthorizationReviseMaxItems,
   relayScheduleProjectionSchema,
@@ -1131,6 +1133,7 @@ async function relaySnapshot() {
     pendingPrimaryPorts,
     provisioningJobs,
     sftpPublication,
+    updates,
   ] = await Effect.runPromise(
     Effect.all(
       [
@@ -1146,6 +1149,7 @@ async function relaySnapshot() {
           runRelayEffectUntraced(startup.state.listProvisioningJobs())
         ),
         relayOperation(() => docker.relaySftpPublication(sftpServer.port)),
+        systemUpdates.updates(),
       ] as const,
       { concurrency: 4 }
     )
@@ -1172,7 +1176,7 @@ async function relaySnapshot() {
     }
   })
   return {
-    node,
+    node: { ...node, updates },
     instances: retainProvisioningInstances(
       [...instancesWithProvisioning, ...provisioningById.values()],
       retainedInstances
@@ -1222,8 +1226,13 @@ async function executeControlRequest(
   if (signal.aborted) throw new Error("Relay request was cancelled")
   const payload = payloadRecord(request.payload)
   switch (request.operation) {
-    case "relay.snapshot":
-      return snapshotHub.read()
+    case "relay.snapshot": {
+      // Hearth reads updates from the pushed snapshots and keeps them from
+      // browsers; this read is passed on as is.
+      const { node, ...snapshot } = await snapshotHub.read()
+      const { updates: _updates, ...readable } = node
+      return { ...snapshot, node: readable }
+    }
     case "relay.system.inspect":
       return runRelayEffect(
         "relay.systemUpdates.inspect",
@@ -1243,14 +1252,24 @@ async function executeControlRequest(
         systemUpdates.startBatch(
           {
             helperImage: requiredString(payload, "helperImage"),
+            ...(typeof payload.requestId === "string" &&
+            relaySystemUpdateSchema.shape.requestId.safeParse(payload.requestId)
+              .success
+              ? { requestId: payload.requestId }
+              : {}),
             targets: targetValues
               ? targetValues.map(systemUpdateTarget)
               : [systemUpdateTarget(payload)],
           },
-          signal
+          // An accepted update finishes even if Hearth disconnects, as it
+          // does when the same update replaces Hearth: its outcome is in the
+          // snapshot every Hearth receives.
+          AbortSignal.timeout(relayControlDeadlineMs("relay.update.apply"))
         )
       )
-      await Promise.all(
+      // The updates are running now, so failing to audit them must not
+      // tell Hearth they didn't start.
+      const audits = await Promise.allSettled(
         operations.map((operation) =>
           appendRelayAudit("system.update_started", client.id, request.id, {
             batchId: operation.batchId,
@@ -1261,6 +1280,13 @@ async function executeControlRequest(
           })
         )
       )
+      for (const audit of audits) {
+        if (audit.status === "rejected") {
+          reportRelayError(audit.reason, {
+            operation: "relay.update.apply.audit",
+          })
+        }
+      }
       return batched ? operations : operations[0]
     }
     case "relay.update.status":
