@@ -1,4 +1,5 @@
 import type { RowDataPacket } from "mysql2/promise"
+import { Effect } from "effect"
 import {
   accessPermissionSupported,
   builtinPermissionPresets,
@@ -9,11 +10,15 @@ import {
   type PermissionSelection,
 } from "@workspace/contracts"
 
+import { resolveMinecraftProfileEffect } from "@/effect/minecraft-profile"
+import { ownerDisplayName } from "@/effect/relay-owners"
 import { runAppEffect } from "@/effect/runtime"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { databaseTable } from "@/lib/database-config"
 import { databasePool } from "@/lib/database"
+import type { AccessPermission } from "@/lib/permissions"
 import {
+  databaseScopeCapabilities,
   effectiveScopePermissions,
   loadResourceGrantsEffect,
   type ResourceScope,
@@ -152,4 +157,112 @@ export async function getResourceUserCountHandler(
     [...people.values, ...owner.values]
   )
   return Number(rows[0]?.count ?? 0)
+}
+
+interface ResourceOwnerRow extends RowDataPacket {
+  email: string
+  id: string
+  name: string | null
+}
+
+// The permissions a viewer holds on a scope that apply to it, as the Access
+// page reads them: Relay access that doesn't reach this kind of resource,
+// or this database's engine, doesn't count.
+export async function supportedScopePermissions(
+  data: ResourceScope,
+  permissions: ReadonlyArray<AccessPermission>
+): Promise<{
+  permissions: Array<AccessPermission>
+  supportedCapabilities: Array<string> | undefined
+}> {
+  const [engines] =
+    data.resourceType === "database"
+      ? await databasePool.query<Array<RowDataPacket & { engine: string }>>(
+          `SELECT engine FROM ${databaseTable("database")} WHERE relay_id = ? AND database_id = ?`,
+          [data.relayId, data.resourceId]
+        )
+      : [[]]
+  const supportedCapabilities =
+    data.resourceType === "database"
+      ? databaseScopeCapabilities(engines[0]?.engine)
+      : undefined
+  return {
+    permissions: permissions.filter((permission) =>
+      accessPermissionSupported(
+        permission,
+        data.resourceType,
+        supportedCapabilities
+      )
+    ),
+    supportedCapabilities,
+  }
+}
+
+// A scope's owner, for those the Access page would show the scope to. Like
+// it, only those who can read its people see the owner's email.
+async function readableResourceOwner(
+  user: AuthenticatedUser,
+  data: ResourceScope
+): Promise<{ canReadPeople: boolean; row: ResourceOwnerRow } | null> {
+  if (data.resourceType === "relay" && data.resourceId !== data.relayId)
+    throw new Error("Resource not found")
+  const admin = user.role === "admin" || user.isDevelopmentBypass
+  const permissions = admin
+    ? expandPermissionSelections(
+        [{ kind: "collection", key: "all" }],
+        data.resourceType
+      )
+    : [
+        ...effectiveScopePermissions(
+          await runAppEffect(
+            "access.scope",
+            loadResourceGrantsEffect(user.id, data.relayId, undefined, data)
+          ),
+          data
+        ),
+      ]
+  const supported = await supportedScopePermissions(data, permissions)
+  if (!supported.permissions.length) throw new Error("Resource not found")
+  const owner = ownerIdQuery(data)
+  const [rows] = await databasePool.query<Array<ResourceOwnerRow>>(
+    `SELECT u.id, u.name, u.email FROM (${owner.sql}) owner
+       JOIN ${databaseTable("user")} u ON u.id = owner.user_id`,
+    owner.values
+  )
+  const row = rows[0]
+  return row
+    ? { canReadPeople: permissions.includes("access.read"), row }
+    : null
+}
+
+// Who owns a scope, as its Info rail shows them, or null when no one does
+// and the platform manages it.
+export async function getResourceOwnerHandler(
+  user: AuthenticatedUser,
+  data: ResourceScope
+): Promise<{ email: string | null; name: string } | null> {
+  const owner = await readableResourceOwner(user, data)
+  if (!owner) return null
+  return {
+    email: owner.canReadPeople ? owner.row.email : null,
+    name: ownerDisplayName(owner.row, owner.canReadPeople),
+  }
+}
+
+// The owner's Minecraft profile ID, for their avatar. Only a stored display
+// name reaches Mojang, never one derived from an email.
+export async function getResourceOwnerMinecraftProfileIdHandler(
+  user: AuthenticatedUser,
+  data: ResourceScope
+): Promise<string | null> {
+  const owner = await readableResourceOwner(user, data)
+  const name = owner?.row.name?.trim()
+  if (!name) return null
+  const profile = await runAppEffect(
+    "minecraft.resourceOwnerProfile.resolve",
+    resolveMinecraftProfileEffect(name).pipe(
+      Effect.catch(() => Effect.succeed(null))
+    )
+  )
+  return profile?.id ?? null
 }

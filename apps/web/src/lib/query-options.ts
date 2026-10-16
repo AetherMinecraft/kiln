@@ -78,7 +78,11 @@ import {
   getReleaseHistory,
   getUpdateOverview,
 } from "@/server/updates"
-import { getResourceUserCount } from "@/server/resource-access"
+import {
+  getResourceOwner,
+  getResourceOwnerMinecraftProfileId,
+  getResourceUserCount,
+} from "@/server/resource-access"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import { withInventoryRelayStatus } from "@/lib/inventory-relay-status"
@@ -351,6 +355,57 @@ export function resourceUserCountQueryOptions(scope: {
     queryFn: () => getResourceUserCount({ data: scope }),
     retry: false,
     staleTime: Infinity,
+  })
+}
+
+// Who owns a resource, or null when the platform does. Keyed under the
+// Access page's own queries, so a transfer refreshes it; nothing announces
+// an owner renaming themselves, so it goes stale after a while too.
+export function resourceOwnerQueryOptions(scope: {
+  relayId: string
+  resourceId: string
+  resourceType: "database" | "instance" | "relay"
+}) {
+  return queryOptions({
+    queryKey: [
+      "resource-access",
+      scope.relayId,
+      scope.resourceType,
+      scope.resourceId,
+      "owner",
+    ] as const,
+    queryFn: () => getResourceOwner({ data: scope }),
+    retry: false,
+    staleTime: 30_000,
+  })
+}
+
+// The owner's Minecraft head, apart from the owner so their card shows
+// before Mojang answers. Keyed by the owner's name too, so a new owner or
+// name looks the head up again.
+export function resourceOwnerMinecraftProfileQueryOptions(
+  scope: {
+    relayId: string
+    resourceId: string
+    resourceType: "database" | "instance" | "relay"
+  },
+  ownerName: string
+) {
+  return queryOptions({
+    queryKey: [
+      "resource-access",
+      scope.relayId,
+      scope.resourceType,
+      scope.resourceId,
+      "owner",
+      "minecraft",
+      ownerName,
+    ] as const,
+    queryFn: ({ signal }) =>
+      getResourceOwnerMinecraftProfileId({ data: scope, signal }),
+    gcTime: 60 * 60_000,
+    retry: false,
+    staleTime: 60 * 60_000,
   })
 }
 
