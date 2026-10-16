@@ -61,11 +61,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
   && GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/kiln-relay-healthcheck .
 
-FROM docker:29.8.2-cli AS docker-cli
-
 # The standalone Compose and buildx binaries the Relay runs for app
-# deployments: the versions docker:29.8.2-cli bundles, pinned by checksum
-# for each architecture.
+# deployments (Compose v5.5.1 and buildx v0.37.2, as docker:29.8.2-cli
+# bundled them), pinned by checksum for each architecture.
 FROM scratch AS compose-amd64
 ADD --checksum=sha256:db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576 --chmod=755 \
   https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64 /docker-compose
@@ -90,7 +88,6 @@ ENV KILN_DEFAULT_GIT_REPO=$KILN_GIT_REPO
 ENV NODE_ENV=production
 WORKDIR /app
 
-COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 # Compose runs on its own from PATH; buildx is a plugin, where Compose and
 # the Relay find it.
 COPY --from=compose /docker-compose /usr/local/bin/docker-compose
