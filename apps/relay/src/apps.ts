@@ -61,6 +61,8 @@ const MAX_DEPLOYMENT_LINES = 5_000
 const KEPT_DEPLOYMENTS = 20
 const PULL_TIMEOUT_MS = 15 * 60_000
 const BUILD_TIMEOUT_MS = 30 * 60_000
+// Where the Relay image installs buildx, as a plugin Compose finds too.
+const BUILDX = "/usr/local/libexec/docker/cli-plugins/docker-buildx"
 // How long a new container must stay up before its deployment succeeds.
 const SETTLE_MS = 3_000
 // Variables Docker and Compose read themselves; an app's environment can't
@@ -629,6 +631,7 @@ export class AppDriver {
     await this.#stream(
       input.appId,
       deployment,
+      BUILDX,
       [
         "build",
         "--progress",
@@ -640,7 +643,8 @@ export class AppDriver {
         dockerfile,
         this.#appDirectory(input.appId),
       ],
-      { timeout: BUILD_TIMEOUT_MS }
+      // Docker's own builder, which loads the image into Docker.
+      { env: { ...process.env, BUILDX_BUILDER: "default" }, timeout: BUILD_TIMEOUT_MS }
     )
     return tag
   }
@@ -856,7 +860,8 @@ export class AppDriver {
       KILN_APP_ID: input.appId,
       KILN_DATA: hostDirectory,
     }
-    const compose = ["compose", "--ansi", "never", "-p", project]
+    // The standalone Compose binary, which `docker compose` runs.
+    const compose = ["--ansi", "never", "-p", project]
     compose.push("--project-directory", directory, "-f", "-")
     log("Reading Compose file")
     const normalized = await composeConfig(
@@ -903,6 +908,7 @@ export class AppDriver {
     await this.#stream(
       input.appId,
       deployment,
+      "docker-compose",
       [
         ...compose,
         "--progress",
@@ -1113,11 +1119,12 @@ export class AppDriver {
   async #stream(
     appId: string,
     deployment: Deployment,
+    executable: string,
     arguments_: Array<string>,
     options: { env?: NodeJS.ProcessEnv; input?: string; timeout: number }
   ) {
     await commandLines(
-      "docker",
+      executable,
       arguments_,
       (line) => this.#logOutput(appId, deployment, line),
       { ...options, signal: deployment.abort.signal }
@@ -1467,7 +1474,7 @@ interface ComposeProject {
   [key: string]: unknown
 }
 
-// What `docker compose config` makes of a Compose file, interpolated and in
+// What `docker-compose config` makes of a Compose file, interpolated and in
 // its long form, so services can be changed without parsing YAML here.
 function composeConfig(
   arguments_: ReadonlyArray<string>,
@@ -1477,7 +1484,7 @@ function composeConfig(
   onWarning: (line: string) => void
 ): Promise<ComposeProject> {
   return new Promise((resolve, reject) => {
-    const child = spawn("docker", arguments_, {
+    const child = spawn("docker-compose", arguments_, {
       env,
       signal,
       stdio: ["pipe", "pipe", "pipe"],
