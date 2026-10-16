@@ -49,6 +49,8 @@ import {
   relayDatabaseTerminalRestartSchema,
   relayDatabaseTerminalWriteSchema,
   relayDatabaseExportSchema,
+  relayDatabaseInspectRequestSchema,
+  relayDatabaseWipeSchema,
   relayDatabaseNetworkSchema,
   relayDeleteDatabaseSchema,
   relayAuditQuerySchema,
@@ -1662,10 +1664,16 @@ async function executeControlRequest(
     }
     case "database.list":
       return databases.list()
+    case "database.inspect":
+      return databases.inspect(
+        relayDatabaseInspectRequestSchema.parse(request.payload).databaseId
+      )
     case "database.create":
       return databases.create(relayCreateDatabaseSchema.parse(request.payload))
     case "database.delete":
       return databases.delete(relayDeleteDatabaseSchema.parse(request.payload))
+    case "database.wipe":
+      return databases.wipe(relayDatabaseWipeSchema.parse(request.payload))
     case "database.action":
       return databases.action(relayDatabaseActionSchema.parse(request.payload))
     case "database.credentials.rotate":

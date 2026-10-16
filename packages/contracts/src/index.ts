@@ -190,9 +190,14 @@ export const relayDatabaseNetworkSchema = z
   })
   .strict()
 
+// A text SQL dump, or a PostgreSQL custom-format dump (pg_dump -Fc) in
+// base64. Either holds at most 700 KB of dump; base64 makes that ~933 KB.
+export const relayDatabaseDumpFormatSchema = z.enum(["sql", "postgres-custom"])
+
 export const relayDatabaseDumpSchema = z
   .object({
-    content: z.string().max(700_000),
+    content: z.string().max(940_000),
+    format: relayDatabaseDumpFormatSchema.optional(),
     databaseId: databaseIdSchema,
     password: z.string().min(24).max(256),
     username: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/u),
@@ -201,7 +206,25 @@ export const relayDatabaseDumpSchema = z
 
 export const relayDatabaseExportSchema = relayDatabaseDumpSchema.omit({
   content: true,
+  format: true,
 })
+
+export const relayDatabaseInspectRequestSchema = z
+  .object({ databaseId: databaseIdSchema })
+  .strict()
+
+// The database's container as Docker has it: its name, its data volume's
+// folder on the host, and how much that volume holds, or null when Docker
+// can't say.
+export const relayDatabaseContainerSchema = z
+  .object({
+    containerName: z.string().min(1).max(256),
+    dataDirectory: z.string().min(1).max(4096).nullable(),
+    volumeBytes: z.number().int().nonnegative().nullable(),
+  })
+  .strict()
+
+export const relayDatabaseWipeSchema = relayDatabaseExportSchema
 
 export const relayStateDatabaseReadSchema = z
   .object({ request: databaseReadRequestSchema })
@@ -2022,7 +2045,14 @@ export type RelayRotateDatabaseCredentials = z.infer<
 >
 export type RelayDatabaseNetwork = z.infer<typeof relayDatabaseNetworkSchema>
 export type RelayDatabaseDump = z.infer<typeof relayDatabaseDumpSchema>
+export type RelayDatabaseDumpFormat = z.infer<
+  typeof relayDatabaseDumpFormatSchema
+>
 export type RelayDatabaseExport = z.infer<typeof relayDatabaseExportSchema>
+export type RelayDatabaseContainer = z.infer<
+  typeof relayDatabaseContainerSchema
+>
+export type RelayDatabaseWipe = z.infer<typeof relayDatabaseWipeSchema>
 export type RelayDatabaseDataRead = z.infer<typeof relayDatabaseDataReadSchema>
 export type DatabaseTerminalControl = z.infer<
   typeof databaseTerminalControlSchema

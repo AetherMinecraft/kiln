@@ -126,7 +126,15 @@ export interface DockerNetwork {
 
 export interface DockerVolume {
   readonly Labels: Readonly<Record<string, string>> | null
+  // The volume's folder on the host, as the daemon sees it.
+  readonly Mountpoint?: string
   readonly Name: string
+}
+
+export interface DockerVolumeUsage {
+  readonly Name: string
+  // Size is -1 when Docker can't measure the volume.
+  readonly UsageData?: { readonly Size: number } | null
 }
 
 export interface DockerImage {
@@ -565,7 +573,7 @@ export class DockerEngine {
     command: ReadonlyArray<string>,
     options: {
       readonly env?: ReadonlyArray<string>
-      readonly input?: string
+      readonly input?: string | Uint8Array
       readonly maxOutputBytes: number
       /** Why output past `maxOutputBytes` failed. */
       readonly overflow: string
@@ -824,6 +832,22 @@ export class DockerEngine {
       method: "POST",
       path: "/volumes/create",
     })
+  }
+
+  /**
+   * How much each volume holds, as `docker system df -v`. Docker walks every
+   * volume to answer, so ask only when someone wants the figure.
+   */
+  volumeUsage(
+    options: { readonly timeout?: number } = {}
+  ): Effect.Effect<ReadonlyArray<DockerVolumeUsage>, DockerEngineError> {
+    return this.#json<{
+      readonly Volumes?: ReadonlyArray<DockerVolumeUsage> | null
+    }>({
+      method: "GET",
+      path: `/system/df${query({ type: "volume" })}`,
+      timeout: options.timeout,
+    }).pipe(Effect.map((answer) => answer.Volumes ?? []))
   }
 
   inspectVolume(name: string): Effect.Effect<DockerVolume, DockerEngineError> {
@@ -1257,7 +1281,7 @@ export async function streamIntoProcess(
 export function completeWithInput(
   process: DockerExecProcess,
   options: {
-    readonly input?: string
+    readonly input?: string | Uint8Array
     readonly maxOutputBytes: number
     readonly operation: string
     /** Why output past `maxOutputBytes` failed. */

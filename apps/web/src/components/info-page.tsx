@@ -1,7 +1,17 @@
 import * as React from "react"
 import { createLink } from "@tanstack/react-router"
-import { Check, ChevronRight, Copy, Info } from "lucide-react"
+import {
+  ArrowRight,
+  Check,
+  ChevronRight,
+  Copy,
+  Eye,
+  EyeOff,
+  Info,
+  Trash2,
+} from "lucide-react"
 
+import { Button, buttonVariants } from "@workspace/ui/components/button"
 import {
   Popover,
   PopoverContent,
@@ -14,6 +24,7 @@ import {
 } from "@workspace/ui/components/tooltip"
 import { cn } from "@workspace/ui/lib/utils"
 
+import { DangerZone } from "@/components/info-card"
 import { useCopyFeedback } from "@/components/workspace-header"
 
 // Building blocks for Info pages: sections of facts in the main column and a
@@ -47,12 +58,16 @@ export function InfoPage({
 export function InfoSection({
   action,
   children,
+  content = false,
   icon,
   status,
   title,
 }: {
   action?: React.ReactNode
-  children: React.ReactNode
+  // Left out when the header says it all, such as actions alone.
+  children?: React.ReactNode
+  // Holds something other than facts, such as a drop zone.
+  content?: boolean
   icon?: React.ReactNode
   // Beside the title, such as a status indicator.
   status?: React.ReactNode
@@ -60,22 +75,53 @@ export function InfoSection({
 }) {
   return (
     <section className="min-w-0 border bg-background/45">
-      <header className="flex min-h-12 items-center gap-3 border-b px-4 py-2">
-        <h3 className="flex min-w-0 items-center gap-2 text-sm font-semibold [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground">
+      {/* On narrow screens, actions that don't fit beside the title wrap
+          below it rather than squeezing it out. */}
+      <header
+        className={cn(
+          "flex min-h-12 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2",
+          children != null && "border-b"
+        )}
+      >
+        <h3 className="flex shrink-0 items-center gap-2 text-sm font-semibold [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground">
           {icon}
-          <span className="truncate">{title}</span>
+          <span>{title}</span>
         </h3>
         {status}
         {action ? (
-          <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
             {action}
           </div>
         ) : null}
       </header>
-      <dl className="px-4">{children}</dl>
+      {children == null ? null : content ? (
+        <div className="p-4">{children}</div>
+      ) : (
+        <dl className="px-4">{children}</dl>
+      )}
     </section>
   )
 }
+
+// A section action that opens the page where more of it changes, such as
+// Network.
+const InfoSectionLinkAnchor = React.forwardRef<
+  HTMLAnchorElement,
+  React.ComponentPropsWithoutRef<"a">
+>(function InfoSectionLinkAnchor({ children, className, ...props }, ref) {
+  return (
+    <a
+      ref={ref}
+      {...props}
+      className={cn(buttonVariants({ size: "sm", variant: "outline" }), className)}
+    >
+      {children}
+      <ArrowRight />
+    </a>
+  )
+})
+
+export const InfoSectionLink = createLink(InfoSectionLinkAnchor)
 
 export function InfoFact({
   children,
@@ -214,12 +260,143 @@ export function InfoCopyValue({
         </button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={6}>
-        {copied
-          ? `${label.charAt(0).toUpperCase()}${label.slice(1)} copied`
-          : `Copy ${label}`}
+        {copied ? `${capitalize(label)} copied` : `Copy ${label}`}
       </TooltipContent>
     </Tooltip>
   )
+}
+
+// The Danger zone at the bottom of an Info page, or after the sections when
+// they're taller, holding InfoDangerActions.
+export function InfoDangerZone({ children }: { children: React.ReactNode }) {
+  return (
+    <DangerZone
+      className="mt-auto"
+      action={
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {children}
+        </div>
+      }
+    />
+  )
+}
+
+// A Danger zone button and the dialog it opens, mounted only while open.
+export function InfoDangerAction({
+  children,
+  dialog,
+  disabledReason,
+  icon = <Trash2 />,
+}: {
+  // The button's label, such as "Delete server".
+  children: string
+  dialog: (onOpenChange: (open: boolean) => void) => React.ReactNode
+  // Why the action can't run right now, such as a disconnected Relay.
+  disabledReason?: string
+  icon?: React.ReactNode
+}) {
+  const [open, setOpen] = React.useState(false)
+  return (
+    <>
+      <Button
+        type="button"
+        variant="destructive"
+        disabled={Boolean(disabledReason)}
+        title={disabledReason}
+        onClick={() => setOpen(true)}
+      >
+        {icon}
+        {children}
+      </Button>
+      {open ? dialog(setOpen) : null}
+    </>
+  )
+}
+
+// A secret, masked until revealed, that copies without being revealed.
+export function InfoSecretValue({
+  label,
+  masked,
+  value,
+}: {
+  // Lowercase noun, for example "password".
+  label: string
+  // Shown in place of the value, such as dots, or a URL with its password
+  // dotted out.
+  masked: string
+  value: string
+}) {
+  const [revealed, setRevealed] = React.useState(false)
+  const { copied, copy } = useCopyFeedback(value)
+  return (
+    <>
+      <span
+        className={cn(
+          "min-w-0 truncate font-mono text-xs",
+          !revealed && "text-muted-foreground"
+        )}
+        title={revealed ? value : undefined}
+      >
+        {revealed ? value : masked}
+      </span>
+      <InfoIconButton
+        label={revealed ? `Hide ${label}` : `Reveal ${label}`}
+        pressed={revealed}
+        onClick={() => setRevealed((current) => !current)}
+      >
+        {revealed ? <EyeOff /> : <Eye />}
+      </InfoIconButton>
+      <InfoIconButton
+        label={copied ? `${capitalize(label)} copied` : `Copy ${label}`}
+        tone={copied ? "success" : undefined}
+        onClick={() => void copy()}
+      >
+        {copied ? <Check /> : <Copy />}
+      </InfoIconButton>
+    </>
+  )
+}
+
+function InfoIconButton({
+  children,
+  label,
+  onClick,
+  pressed,
+  tone,
+}: {
+  children: React.ReactNode
+  label: string
+  onClick: () => void
+  pressed?: boolean
+  tone?: "success"
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={label}
+          aria-pressed={pressed}
+          className={cn(
+            "grid size-6 shrink-0 place-items-center transition-colors outline-none focus-visible:text-primary [&_svg]:size-3.5",
+            tone === "success"
+              ? "text-emerald-400"
+              : "text-muted-foreground hover:text-primary"
+          )}
+          onClick={onClick}
+        >
+          {children}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={6}>
+        {label}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function capitalize(text: string): string {
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`
 }
 
 export function InfoRailGroup({

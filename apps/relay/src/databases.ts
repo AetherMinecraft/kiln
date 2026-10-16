@@ -7,6 +7,8 @@ import type {
   RelayDatabaseDump,
   RelayDatabaseExport,
   RelayDatabaseNetwork,
+  RelayDatabaseContainer,
+  RelayDatabaseWipe,
   RelayDeleteDatabase,
   RelayManagedDatabase,
   RelayRotateDatabaseCredentials,
@@ -16,7 +18,7 @@ import {
   databaseEngineSchema,
   relayManagedDatabaseSchema,
 } from "@workspace/contracts"
-import { Effect, Result, Semaphore } from "effect"
+import { Effect, Option, Result, Semaphore } from "effect"
 
 import { promiseEffect } from "./effect/promise.js"
 import type { DatabaseConnections } from "./database-connections.js"
@@ -182,6 +184,56 @@ export class DatabaseDriver {
   // The database as Docker reports it, for work that runs inside it.
   async target(id: string): Promise<RelayManagedDatabase> {
     return this.#required(id)
+  }
+
+  // The database's container and data volume. Docker measures the volume on
+  // request; a measurement that fails leaves its size out, not the rest.
+  async inspect(id: string): Promise<RelayDatabaseContainer> {
+    const container = await this.#container(id)
+    const labels = container.Config.Labels ?? {}
+    const volume = requiredLabel(labels, "kiln.database.volume")
+    const engine = this.#engine
+    const [inspected, volumes] = await Effect.runPromise(
+      Effect.all(
+        [
+          Effect.option(engine.inspectVolume(volume)),
+          engine
+            .volumeUsage({ timeout: 60_000 })
+            .pipe(Effect.orElseSucceed(() => [])),
+        ],
+        { concurrency: "unbounded" }
+      )
+    )
+    const size = volumes.find((candidate) => candidate.Name === volume)
+      ?.UsageData?.Size
+    return {
+      containerName: container.Name.replace(/^\//u, ""),
+      dataDirectory: Option.getOrUndefined(inspected)?.Mountpoint || null,
+      volumeBytes: size !== undefined && size >= 0 ? size : null,
+    }
+  }
+
+  // Deletes everything in the database and leaves it empty, with the same
+  // name, login, and connections.
+  wipe(input: RelayDatabaseWipe): Promise<RelayManagedDatabase> {
+    return this.#serialize(input.databaseId, async () => {
+      const database = await this.#required(input.databaseId)
+      if (!database.observedState.match(/^(?:running|starting)$/u)) {
+        throw new Error("Start the database before wiping it")
+      }
+      const container = requiredContainerId(database)
+      const wipe = databaseWipeClient(database, input.username, input.password)
+      await Effect.runPromise(
+        this.#engine.execWithInput(container, wipe.command, {
+          env: wipe.env,
+          input: wipe.input,
+          maxOutputBytes: 64 * 1024,
+          overflow: "The database wipe printed more than expected",
+          timeout: 120_000,
+        })
+      )
+      return this.#required(input.databaseId)
+    })
   }
 
   async backupTarget(id: string): Promise<RelayManagedDatabase> {
@@ -463,15 +515,31 @@ export class DatabaseDriver {
     if (!databaseEngineSupportsLogicalBackups(database.engine)) {
       throw new Error(`${database.engine} dump import is not supported yet`)
     }
-    if (Buffer.byteLength(input.content) > MAX_DUMP_BYTES) {
+    const custom = input.format === "postgres-custom"
+    const dump = custom
+      ? Buffer.from(input.content, "base64")
+      : Buffer.from(input.content)
+    if (dump.byteLength > MAX_DUMP_BYTES) {
       throw new Error(
         "The database dump is larger than the current 700 KB transfer limit"
       )
     }
+    if (custom) {
+      if (database.engine !== "postgres") {
+        throw new Error(
+          "PostgreSQL custom-format dumps can only be imported into PostgreSQL"
+        )
+      }
+      if (!dump.subarray(0, 5).equals(POSTGRES_CUSTOM_DUMP_MAGIC)) {
+        throw new Error("This isn't a PostgreSQL custom-format dump")
+      }
+    }
     await this.#client(
       requiredContainerId(database),
-      databaseClient(database, input.username, input.password, "import"),
-      input.content,
+      custom
+        ? postgresRestoreClient(database, input.username, input.password)
+        : databaseClient(database, input.username, input.password, "import"),
+      dump,
       120_000
     )
     return { databaseId: database.id, imported: true }
@@ -493,7 +561,7 @@ export class DatabaseDriver {
   #client(
     container: string,
     client: DatabaseClient,
-    input: string | undefined,
+    input: string | Uint8Array | undefined,
     timeout: number
   ) {
     return Effect.runPromise(
@@ -516,11 +584,15 @@ export class DatabaseDriver {
   }
 
   async #labels(id: string): Promise<Record<string, string | undefined>> {
+    return (await this.#container(id)).Config.Labels ?? {}
+  }
+
+  async #container(id: string): Promise<DatabaseContainerInspect> {
     const container = (await this.#discover()).find(
       (candidate) => candidate.Config.Labels?.["kiln.database.id"] === id
     )
     if (!container) throw new Error("Database not found")
-    return container.Config.Labels ?? {}
+    return container
   }
 
   async #discover(): Promise<Array<DatabaseContainerInspect>> {
@@ -624,7 +696,7 @@ export class DatabaseDriver {
     )
     for (const name of candidates) {
       const inspected = await promiseResult(() =>
-        Effect.runPromise(
+        Effect.runPromise<{ readonly Labels: unknown }, unknown>(
           kind === "network"
             ? this.#engine.inspectNetwork(name)
             : this.#engine.inspectVolume(name)
@@ -769,23 +841,100 @@ function databaseClient(
   }
 }
 
-function databaseAclLoadClient(
+// SQL databases are dropped and created again as their administrator, from
+// inside the container, the way backup restores reach them. The name comes
+// from the container's label, which only allows [a-z0-9_]. Redis and Valkey
+// flush everything as the database's own user.
+function databaseWipeClient(
+  database: RelayManagedDatabase,
+  username: string,
+  password: string
+): DatabaseClient & { input: string } {
+  const name = database.databaseName
+  if (database.engine === "postgres") {
+    return {
+      command: [
+        "psql",
+        "--set",
+        "ON_ERROR_STOP=on",
+        "--username",
+        username,
+        "--dbname",
+        "postgres",
+      ],
+      env: [`PGPASSWORD=${password}`],
+      input: `DROP DATABASE IF EXISTS "${name}" WITH (FORCE);\nCREATE DATABASE "${name}";\n`,
+    }
+  }
+  if (database.engine === "mysql" || database.engine === "mariadb") {
+    const root =
+      database.engine === "mysql" ? "MYSQL_ROOT_PASSWORD" : "MARIADB_ROOT_PASSWORD"
+    const client = database.engine === "mysql" ? "mysql" : "mariadb"
+    return {
+      command: [
+        "sh",
+        "-ec",
+        `MYSQL_PWD="$${root}" exec ${client} --user=root`,
+      ],
+      env: [],
+      input: `DROP DATABASE IF EXISTS \`${name}\`;\nCREATE DATABASE \`${name}\`;\n`,
+    }
+  }
+  return { ...keyValueClient(database.engine, username, password, ["FLUSHALL"]), input: "" }
+}
+
+// Redis and Valkey's clients both read the password from REDISCLI_AUTH, and
+// exit 0 on an error reply, such as a failed login, unless given -e.
+function keyValueClient(
   engine: "redis" | "valkey",
+  username: string,
+  password: string,
+  command: ReadonlyArray<string>
+): DatabaseClient {
+  return {
+    command: [
+      engine === "redis" ? "redis-cli" : "valkey-cli",
+      "-e",
+      "--user",
+      username,
+      ...command,
+    ],
+    env: [`REDISCLI_AUTH=${password}`],
+  }
+}
+
+// What pg_dump -Fc writes first.
+const POSTGRES_CUSTOM_DUMP_MAGIC = Buffer.from("PGDMP")
+
+// Restores a custom-format dump from stdin into the database, leaving
+// ownership and grants to the database's own user, and stopping at the
+// first error, as text imports do.
+function postgresRestoreClient(
+  database: RelayManagedDatabase,
   username: string,
   password: string
 ): DatabaseClient {
   return {
     command: [
-      engine === "redis" ? "redis-cli" : "valkey-cli",
-      "--user",
+      "pg_restore",
+      "--username",
       username,
-      "ACL",
-      "LOAD",
+      "--dbname",
+      database.databaseName,
+      "--no-owner",
+      "--no-privileges",
+      "--exit-on-error",
     ],
-    env: [
-      `${engine === "redis" ? "REDISCLI_AUTH" : "VALKEYCLI_AUTH"}=${password}`,
-    ],
+    env: [`PGPASSWORD=${password}`],
   }
+}
+
+function databaseAclLoadClient(
+  engine: "redis" | "valkey",
+  username: string,
+  password: string
+): DatabaseClient {
+  return keyValueClient(engine, username, password, ["ACL", "LOAD"])
 }
 
 function rotationSql(
