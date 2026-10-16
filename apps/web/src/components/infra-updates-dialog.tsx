@@ -121,6 +121,7 @@ import {
 } from "@/lib/system-update-reports"
 import type { UpdateOverview } from "@/server/updates"
 import {
+  checkForKilnReleases,
   getSystemUpdates,
   getSystemUpdateStatus,
   startSystemUpdates,
@@ -191,6 +192,7 @@ type UpdateDialogViewStore = ReturnType<typeof createUpdateDialogViewStore>
 
 const updateFailureStorageKey = "kiln.system-update-failures"
 const systemUpdateToastId = "system-update"
+const checkNoticeDuration = 5_000
 const minimumUpdateCheckDuration = 750
 const completedUpdateDisplayDuration = 1_500
 const mockRelayPhaseDuration = 325
@@ -411,9 +413,9 @@ export const InfraUpdatesDialog = React.memo(function InfraUpdatesDialog({
     if (!open) return
     let current = true
     void Effect.runPromise(
-      Effect.tryPromise(() => getSystemUpdates({ data: { relayIds: null } })).pipe(
-        Effect.option
-      )
+      Effect.tryPromise(() =>
+        getSystemUpdates({ data: { relayIds: null } })
+      ).pipe(Effect.option)
     ).then((reports) => {
       if (!current || Option.isNone(reports)) return
       const overview = queryClient.getQueryData<UpdateOverview>(
@@ -1399,12 +1401,55 @@ const UpdaterChangelogButton = React.memo(function UpdaterChangelogButton({
   )
 })
 
-const UpdaterCheckButton = React.memo(function UpdaterCheckButton({
+// The check button and when Hearth last asked GitHub, or for a few seconds
+// after a check that didn't get an answer, why not.
+const UpdaterCheck = React.memo(function UpdaterCheck({
   activityStore,
   open,
 }: {
   activityStore: SystemUpdateActivityStore
   open: boolean
+}) {
+  const [notice, setNotice] = React.useState<string | null>(null)
+  const noticeTimer = React.useRef<number | null>(null)
+  const showNotice = React.useCallback((message: string) => {
+    if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current)
+    setNotice(message)
+    noticeTimer.current = window.setTimeout(() => {
+      noticeTimer.current = null
+      setNotice(null)
+    }, checkNoticeDuration)
+  }, [])
+  React.useEffect(
+    () => () => {
+      if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current)
+    },
+    []
+  )
+  return (
+    <>
+      <UpdaterCheckButton
+        activityStore={activityStore}
+        open={open}
+        onNotice={showNotice}
+      />
+      {notice ? (
+        <span className="truncate text-amber-200">{notice}</span>
+      ) : (
+        <LastCheckedLabel activityStore={activityStore} open={open} />
+      )}
+    </>
+  )
+})
+
+const UpdaterCheckButton = React.memo(function UpdaterCheckButton({
+  activityStore,
+  open,
+  onNotice,
+}: {
+  activityStore: SystemUpdateActivityStore
+  open: boolean
+  onNotice: (message: string) => void
 }) {
   const updating = React.useSyncExternalStore(
     activityStore.subscribeActivities,
@@ -1416,10 +1461,23 @@ const UpdaterCheckButton = React.memo(function UpdaterCheckButton({
     enabled: () => open && !updating && canRefetchSystemUpdateOverview(),
     notifyOnChangeProps: ["isFetching"],
   })
+  const refetchOverview = overviewQuery.refetch
+  // Hearth asks GitHub itself only every few minutes, so checking asks it
+  // now before reading the updates again.
+  const checkMutation = useMutation({
+    mutationFn: async () => {
+      const { failed } = await checkForKilnReleases()
+      // An update that started meanwhile holds the overview still.
+      if (canRefetchSystemUpdateOverview()) await refetchOverview()
+      if (failed) onNotice("Couldn’t reach GitHub")
+    },
+    onError: () => onNotice("Couldn’t check for updates"),
+  })
   const checking = useMinimumDuration(
-    overviewQuery.isFetching,
+    overviewQuery.isFetching || checkMutation.isPending,
     minimumUpdateCheckDuration
   )
+  const check = checkMutation.mutate
 
   return (
     <Tooltip>
@@ -1432,7 +1490,7 @@ const UpdaterCheckButton = React.memo(function UpdaterCheckButton({
           size="icon-sm"
           type="button"
           variant="ghost"
-          onClick={() => void overviewQuery.refetch()}
+          onClick={() => check()}
         >
           <RefreshCw className={checking ? "animate-spin" : ""} />
         </Button>
@@ -2345,8 +2403,7 @@ const UpdaterFooter = React.memo(function UpdaterFooter({
         </span>
       ) : (
         <span className="-ml-2 flex min-w-0 items-center gap-1">
-          <UpdaterCheckButton activityStore={activityStore} open={open} />
-          <LastCheckedLabel activityStore={activityStore} open={open} />
+          <UpdaterCheck activityStore={activityStore} open={open} />
         </span>
       )}
       <span className="flex shrink-0 items-center gap-1.5">
@@ -2457,19 +2514,25 @@ const LastCheckedLabel = React.memo(function LastCheckedLabel({
     activityStore.getBusySnapshot,
     activityStore.getBusySnapshot
   )
-  const overviewQuery = useQuery({
+  // When Hearth last asked GitHub, which is what a check refreshes.
+  const { data: checkedAt } = useQuery({
     ...updateOverviewQueryOptions(),
     enabled: () => open && !updating && canRefetchSystemUpdateOverview(),
-    notifyOnChangeProps: ["dataUpdatedAt"],
+    select: selectReleasesCheckedAt,
+    notifyOnChangeProps: ["data"],
   })
   return (
     <span className="truncate">
-      {overviewQuery.dataUpdatedAt > 0
-        ? `Checked ${lastCheckedFormatter.format(new Date(overviewQuery.dataUpdatedAt))}`
+      {checkedAt
+        ? `Checked ${lastCheckedFormatter.format(new Date(checkedAt))}`
         : null}
     </span>
   )
 })
+
+function selectReleasesCheckedAt(overview: UpdateOverview): number | null {
+  return overview.releasesCheckedAt
+}
 
 // Rows have fixed heights so the virtualizer never measures, and nothing
 // shifts while older releases load in below.
@@ -3692,8 +3755,7 @@ function reportedActiveUpdate(
   return {
     component: update.component,
     name:
-      target?.name ??
-      (update.component === "hearth" ? "Panel" : report.name),
+      target?.name ?? (update.component === "hearth" ? "Panel" : report.name),
     operationId: update.id,
     phase: update.phase,
     previousVersion: target?.currentVersion ?? null,
