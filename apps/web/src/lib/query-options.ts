@@ -54,6 +54,7 @@ import { reconcilePendingPowerSnapshot } from "@/lib/instance-power-state"
 import { systemUpdateOverviewRefetchPolicy } from "@/lib/system-update-presence"
 import {
   getRelayConnectionState,
+  getRelayReachability,
   getRelayDirectoryPage,
   getRelayFileEntry,
   getRelayFile,
@@ -84,6 +85,7 @@ import {
 } from "@/server/resource-access"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
+import { readRelayReachability } from "@/lib/relay-reachability"
 import { getInfraServerDirectory } from "@/server/infra-directory"
 import {
   getAppConfig,
@@ -169,6 +171,7 @@ export const queryKeys = {
   relay: {
     all: ["relay"] as const,
     connection: ["relay", "connection"] as const,
+    reachability: ["relay", "reachability"] as const,
     console: (relayId: string, resource: RelayConsoleResource) =>
       [
         "relay",
@@ -460,6 +463,33 @@ export function relayConnectionQueryOptions(queryClient: QueryClient) {
     },
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: (query) => query.state.data?.status !== "connected",
+    staleTime: connectedRelayPollDelayMs,
+  })
+}
+
+export type RelayReachability = Awaited<ReturnType<typeof getRelayReachability>>
+
+/**
+ * Which visible Relays Hearth is connected to, for connection toasts.
+ * Realtime Relay status events patch it; it polls only while one is away.
+ */
+export function relayReachabilityQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.relay.reachability,
+    queryFn: (context) =>
+      readRelayReachability(context, () =>
+        getRelayReachability({
+          headers: relayPollHeaders,
+          signal: context.signal,
+        })
+      ),
+    refetchInterval: (query) =>
+      query.state.data?.some((relay) => relay.status === "unreachable")
+        ? disconnectedRelayPollDelayMs
+        : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: (query) =>
+      query.state.data?.some((relay) => relay.status === "unreachable") ?? true,
     staleTime: connectedRelayPollDelayMs,
   })
 }

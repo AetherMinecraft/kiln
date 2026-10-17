@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 vi.mock("@/server/instance-inventory", () => ({
   getInstanceInventory: vi.fn(),
 }))
+const relayServer = vi.hoisted(() => ({ getRelayReachability: vi.fn() }))
+vi.mock("@/server/relay", () => relayServer)
 
 import { QueryObserver } from "@tanstack/react-query"
 import type {
@@ -14,7 +16,12 @@ import type {
 import { getRelayInstancesCollection } from "@/lib/collections/relay-instances"
 import { instanceStateQueryOptions } from "@/lib/instance-state"
 import { createAppClients, type AppRouterContext } from "@/lib/query-client"
-import { queryKeys, type RelayConnection } from "@/lib/query-options"
+import {
+  queryKeys,
+  relayReachabilityQueryOptions,
+  type RelayConnection,
+  type RelayReachability,
+} from "@/lib/query-options"
 import { getInstanceInventory } from "@/server/instance-inventory"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import type {
@@ -28,6 +35,8 @@ import {
   applyRecoveredRelayConnection,
   applyRealtimeEventSafely,
   applyUpdatedInstance,
+  fleetEventNeedsRecovery,
+  recheckPushedState,
   resetRealtimeEpoch,
 } from "@/lib/realtime-client"
 
@@ -126,6 +135,24 @@ async function readyFleet(rows: Array<FleetInstance>) {
   return clients
 }
 
+// A reachability read in flight, as a route loader starts it. The test
+// resolves each request Hearth receives.
+function controlledReads(queryClient: QueryClient) {
+  const pending: Array<(relays: RelayReachability) => void> = []
+  relayServer.getRelayReachability.mockImplementation(
+    () =>
+      new Promise<RelayReachability>((resolve) => {
+        pending.push(resolve)
+      })
+  )
+  const first = queryClient.fetchQuery(relayReachabilityQueryOptions())
+  return { first, pending }
+}
+
+const relayA = (status: "connected" | "unreachable") => [
+  { id: "relay-a", name: "Relay A", status },
+]
+
 function applyEvent(
   clients: ReturnType<typeof fleet>,
   event: StreamEvent,
@@ -182,6 +209,47 @@ describe("realtime event application", () => {
         queryKeys.relay.instances
       )
     ).toEqual([beta])
+  })
+
+  it("leaves the fleet unloaded when nothing on the page reads it", () => {
+    const clients = fleet()
+
+    applyEvent(clients, instancesDelta([beta]))
+
+    expect(
+      clients.queryClient.getQueryData(queryKeys.relay.instances)
+    ).toBeUndefined()
+  })
+
+  it("recovers a push that arrives while the fleet's first read is in flight", async () => {
+    const clients = fleet()
+    let resolveFirstRead!: (instances: Array<FleetInstance>) => void
+    const firstRead = clients.queryClient.fetchQuery({
+      queryKey: queryKeys.relay.instances,
+      queryFn: () =>
+        new Promise<Array<FleetInstance>>((resolve) => {
+          resolveFirstRead = resolve
+        }),
+    })
+
+    // The read began before this push, so it would overwrite the change.
+    expect(
+      fleetEventNeedsRecovery(
+        clients.queryClient,
+        clients.instances,
+        instancesDelta([beta])
+      )
+    ).toBe(true)
+
+    resolveFirstRead([alpha])
+    await firstRead
+    expect(
+      fleetEventNeedsRecovery(
+        clients.queryClient,
+        clients.instances,
+        instancesDelta([beta])
+      )
+    ).toBe(false)
   })
 
   it("reports collection write failures so the stream can recover", async () => {
@@ -363,6 +431,74 @@ describe("realtime event application", () => {
       a.unsubscribe()
       b.unsubscribe()
     }
+  })
+
+  it("keeps a Relay status pushed while a reachability read is in flight", async () => {
+    const clients = fleet()
+    const reads = controlledReads(clients.queryClient)
+
+    applyEvent(clients, relayStatus("relay-a", "unreachable"))
+    // Hearth may have sampled the Relay before the push.
+    reads.pending[0]!(relayA("connected"))
+
+    await expect(reads.first).resolves.toEqual(relayA("unreachable"))
+    expect(reads.pending).toHaveLength(1)
+    expect(
+      clients.queryClient.getQueryData(queryKeys.relay.reachability)
+    ).toEqual(relayA("unreachable"))
+  })
+
+  it("trusts a reachability read that starts after a push", async () => {
+    const clients = fleet()
+    applyEvent(clients, relayStatus("relay-a", "unreachable"))
+    const reads = controlledReads(clients.queryClient)
+
+    reads.pending[0]!(relayA("connected"))
+
+    await expect(reads.first).resolves.toEqual(relayA("connected"))
+  })
+
+  it("reads reachability again after a read that spans a stream gap", async () => {
+    const clients = fleet()
+    const reads = controlledReads(clients.queryClient)
+    // A connection toast reads it.
+    const observer = new QueryObserver(
+      clients.queryClient,
+      relayReachabilityQueryOptions()
+    )
+    const unsubscribe = observer.subscribe(() => undefined)
+    try {
+      // Pushes may have been missed while the stream was down.
+      recheckPushedState(clients.queryClient)
+      reads.pending[0]!(relayA("connected"))
+      await vi.waitFor(() => expect(reads.pending).toHaveLength(2))
+      reads.pending[1]!(relayA("unreachable"))
+
+      await vi.waitFor(() =>
+        expect(observer.getCurrentResult().data).toEqual(relayA("unreachable"))
+      )
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it("tells connection toasts when a Relay drops and returns", () => {
+    const clients = fleet()
+    clients.queryClient.setQueryData(queryKeys.relay.reachability, [
+      { id: "relay-a", name: "Relay A", status: "connected" },
+      { id: "relay-b", name: "Relay B", status: "connected" },
+    ])
+    applyEvent(clients, relayStatus("relay-a", "unreachable"))
+    expect(
+      clients.queryClient.getQueryData(queryKeys.relay.reachability)
+    ).toEqual([
+      { id: "relay-a", name: "Relay A", status: "unreachable" },
+      { id: "relay-b", name: "Relay B", status: "connected" },
+    ])
+    applyEvent(clients, relayStatus("relay-a", "connected", 2))
+    expect(
+      clients.queryClient.getQueryData(queryKeys.relay.reachability)
+    ).toMatchObject([{ id: "relay-a", status: "connected" }, {}])
   })
 
   it("keeps Relay connection state and fleet rows in sync", () => {
