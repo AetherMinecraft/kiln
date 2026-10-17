@@ -112,6 +112,7 @@ import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import {
   isRelayUpdating,
   relayConnectionNode,
+  relayConnectionFailing,
   relayConnectionState,
 } from "@/lib/relay-connection"
 import { updateInstanceSourceName } from "@/lib/instance-registry"
@@ -1297,32 +1298,44 @@ async function authorizedRelayEntry(
     warnOnUnavailable: boolean
   }
 ) {
+  const fallback = Effect.tryPromise({
+    try: () => relayFallbackSnapshot(relay),
+    catch: (fallbackCause) => fallbackCause,
+  }).pipe(
+    Effect.option,
+    Effect.map((snapshot) => ({
+      snapshot: snapshot._tag === "Some" ? snapshot.value : null,
+      status: "unreachable" as const,
+    }))
+  )
+  const live = Effect.tryPromise({
+    try: () =>
+      options.fresh ? freshRelaySnapshot(relay) : relaySnapshot(relay),
+    catch: (cause) => cause,
+  }).pipe(
+    Effect.map((snapshot) => ({
+      snapshot,
+      status: "connected" as const,
+    })),
+    Effect.catch((cause) => {
+      if (!options.fallbackOnError) return Effect.fail(cause)
+      if (options.warnOnUnavailable) {
+        warnRelayUnavailable(relay.id, cause)
+      }
+      return fallback
+    })
+  )
+  // A read through a Relay this process has failed to reach waits for a
+  // reconnect attempt, up to the request timeout, which holds page loads for
+  // seconds. Connections are retried in the background and push a fresh
+  // snapshot when they return, so serve the last one Hearth holds instead.
+  // A first connection after startup is allowed to finish.
+  const failing =
+    options.fallbackOnError &&
+    !options.fresh &&
+    relayConnectionFailing(relay.id)
   return Effect.runPromise(
-    Effect.tryPromise({
-      try: () =>
-        options.fresh ? freshRelaySnapshot(relay) : relaySnapshot(relay),
-      catch: (cause) => cause,
-    }).pipe(
-      Effect.map((snapshot) => ({
-        snapshot,
-        status: "connected" as const,
-      })),
-      Effect.catch((cause) => {
-        if (!options.fallbackOnError) return Effect.fail(cause)
-        if (options.warnOnUnavailable) {
-          warnRelayUnavailable(relay.id, cause)
-        }
-        return Effect.tryPromise({
-          try: () => relayFallbackSnapshot(relay),
-          catch: (fallbackCause) => fallbackCause,
-        }).pipe(
-          Effect.option,
-          Effect.map((snapshot) => ({
-            snapshot: snapshot._tag === "Some" ? snapshot.value : null,
-            status: "unreachable" as const,
-          }))
-        )
-      }),
+    (failing ? fallback : live).pipe(
       Effect.map(({ snapshot, status }) => ({
         relay,
         snapshot: snapshot
