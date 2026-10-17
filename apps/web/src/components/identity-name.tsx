@@ -5,6 +5,8 @@ import { cn } from "@workspace/ui/lib/utils"
 export interface IdentityStatusPresentation {
   detail?: string
   label: string
+  /** Not yet known; revealed only if it stays unknown for a moment. */
+  pending?: boolean
   pulse?: boolean
   tone: "danger" | "info" | "neutral" | "success" | "warning"
 }
@@ -49,6 +51,7 @@ export const IdentityName = React.memo(function IdentityName({
           <IdentityStatus
             className={statusClassName}
             label={status.label}
+            pending={status.pending}
             pulse={status.pulse}
             tone={status.tone}
           />
@@ -82,11 +85,14 @@ export const IdentityName = React.memo(function IdentityName({
 const IdentityStatus = React.memo(function IdentityStatus({
   className,
   label,
+  pending,
   pulse,
   tone,
 }: IdentityStatusPresentation & { className?: string }) {
+  // The delayed reveal sits on a wrapper so it does not replace the pulse.
+  // The wrapper generates no box, so the icon box still centers its icon.
   return (
-    <>
+    <span className={cn("contents", pending && "reveal-delayed")}>
       <span
         className={cn(
           "absolute -right-0.5 -bottom-0.5 size-1.5 rounded-full ring-2 ring-background",
@@ -97,7 +103,7 @@ const IdentityStatus = React.memo(function IdentityStatus({
         aria-hidden="true"
       />
       <span className="sr-only">Status: {label}</span>
-    </>
+    </span>
   )
 })
 
