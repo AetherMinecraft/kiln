@@ -398,6 +398,18 @@ export const getRelayProxy = createServerFn({ method: "GET" })
     )
   })
 
+// Every web route the Relay's proxy serves that the user may see, for the
+// infrastructure map. Null from Relays that predate it.
+export const getRelayWebRoutes = createServerFn({ method: "GET" })
+  .validator(relayIdSchema)
+  .handler(async ({ data }) => {
+    const user = await requireEligibleResourceUser()
+    const { relayWebRoutesHandler } = await import(
+      "@/server/relay-web-routes.server"
+    )
+    return relayWebRoutesHandler(user, data.id)
+  })
+
 // Files the Info page opens in the Relay's host files: its database, and the
 // bundled Traefik's config in that mode. Paths are relative to the host's
 // root, as the Files tab's are. Each is pinned there the first time. Null

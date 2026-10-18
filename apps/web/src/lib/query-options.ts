@@ -30,6 +30,7 @@ import {
   listBrickCatalogs,
 } from "@/server/brick-catalogs"
 import { getDomainSettings, getInstanceDomain } from "@/server/domains"
+import { getHearthEdge } from "@/server/hearth-edge"
 import {
   getManagedDatabaseCredential,
   getManagedDatabaseContainer,
@@ -62,12 +63,14 @@ import {
   getRelayFileActivity,
   getInstanceWebRoutes,
   getRelayNodeReadings,
+  getRelayProxyModes,
   getRelaySnapshot,
   getRelayTree,
 } from "@/server/relay"
 import {
   getRelayOwnerMinecraftProfiles,
   getRelayProxy,
+  getRelayWebRoutes,
   getRelayHostFiles,
   getRelayTailscale,
   getRelays,
@@ -154,6 +157,7 @@ export const queryKeys = {
       ["domains", "instances", relayId, instanceId] as const,
     settings: ["domains", "settings"] as const,
   },
+  hearthEdge: ["hearth", "edge"] as const,
   servers: {
     directory: ["servers", "directory"] as const,
     navigation: ["servers", "navigation"] as const,
@@ -220,6 +224,9 @@ export const queryKeys = {
   },
   relays: ["relays"] as const,
   relayProxy: (relayId: string) => ["relays", "proxy", relayId] as const,
+  relayProxyModes: ["relays", "proxy-modes"] as const,
+  // Beside each game server's own routes, so route changes refresh both.
+  relayWebRoutes: (relayId: string) => ["web-routes", relayId] as const,
   relayHostFiles: (relayId: string) =>
     ["relays", "host-files", relayId] as const,
   tailscale: (relayId: string) => ["tailscale", "relays", relayId] as const,
@@ -805,6 +812,25 @@ export function relaysQueryOptions() {
   })
 }
 
+/** Which readable Relays run which proxy, read from Hearth's connections. */
+export function relayProxyModesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.relayProxyModes,
+    queryFn: () => getRelayProxyModes(),
+    staleTime: 30_000,
+  })
+}
+
+/** The web routes a Relay's proxy serves, with the resource each reaches. */
+export function relayWebRoutesQueryOptions(relayId: string) {
+  return queryOptions({
+    queryKey: queryKeys.relayWebRoutes(relayId),
+    queryFn: () => getRelayWebRoutes({ data: { id: relayId } }),
+    retry: false,
+    staleTime: 15_000,
+  })
+}
+
 export function relayProxyQueryOptions(relayId: string) {
   return queryOptions({
     queryFn: () => getRelayProxy({ data: { id: relayId } }),
@@ -924,6 +950,16 @@ export function domainSettingsQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.domains.settings,
     queryFn: () => getDomainSettings(),
+  })
+}
+
+// Fixed for the life of the page: the address comes from Hearth's
+// configuration and the edge from the request path.
+export function hearthEdgeQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.hearthEdge,
+    queryFn: () => getHearthEdge(),
+    staleTime: Infinity,
   })
 }
 
