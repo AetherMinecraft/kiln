@@ -6,47 +6,36 @@ import { relayInstanceRouteId } from "@/lib/relay-fleet"
 import { Outlet, createFileRoute, redirect } from "@tanstack/react-router"
 
 import {
-  relayConnectionQueryOptions,
-  relaySnapshotQueryOptions,
   serverDirectoryQueryOptions,
   serverNavigationQueryOptions,
 } from "@/lib/query-options"
-import {
-  relayInstanceRouteIdentifier,
-  resolveRelayInstance,
-} from "@/lib/relay-selectors"
+import { ensureServerWorkspace } from "@/lib/server-workspace"
 
 export const Route = createFileRoute("/_app/server/$serverId")({
   staleTime: Infinity,
   beforeLoad: async ({ context, location, params }) => {
     if (params.serverId === "unavailable") return { instance: null }
 
-    // The sidebar opens this server; load its entry with the route so it
-    // never shows the previous one. A loaded directory already answers it.
+    // The page reads its own server, not the fleet. The sidebar opens this
+    // server too; load its entry with the route so it never shows the
+    // previous one. A loaded directory already answers it.
     const directoryLoaded =
       context.queryClient.getQueryData(
         serverDirectoryQueryOptions().queryKey
       ) !== undefined
-    const [connection] = await Promise.all([
-      context.queryClient.ensureQueryData(
-        relayConnectionQueryOptions(context.queryClient)
-      ),
+    const [workspace] = await Promise.all([
+      ensureServerWorkspace(context.queryClient, params.serverId),
       directoryLoaded
         ? undefined
         : context.queryClient.ensureQueryData(
             serverNavigationQueryOptions({ serverId: params.serverId })
           ),
     ])
-    const snapshot =
-      connection.status === "connected"
-        ? connection.snapshot
-        : await context.queryClient.ensureQueryData(relaySnapshotQueryOptions())
 
-    const resolution = resolveRelayInstance(snapshot.instances, params.serverId)
-    if (resolution.status === "ambiguous") {
+    if (workspace.status === "ambiguous") {
       throw redirectToServerList(params.serverId)
     }
-    if (resolution.status === "not-found") {
+    if (workspace.status === "not-found") {
       const invitations = await context.queryClient.ensureQueryData(
         myInvitationsQueryOptions()
       )
@@ -68,11 +57,9 @@ export const Route = createFileRoute("/_app/server/$serverId")({
 
       throw redirect({ to: "/infra/servers", replace: true })
     }
-    const instance = resolution.instance
-    const routeIdentifier = relayInstanceRouteIdentifier(
-      snapshot.instances,
-      instance
-    )
+    const [instance] = workspace.snapshot.instances
+    if (!instance) throw redirect({ to: "/infra/servers", replace: true })
+    const routeIdentifier = workspace.routeIdentifier
     if (!routeIdentifier) {
       throw redirectToServerList(instance.shortId)
     }

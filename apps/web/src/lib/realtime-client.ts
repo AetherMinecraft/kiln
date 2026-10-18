@@ -27,6 +27,11 @@ import {
   recordReachabilityGap,
   recordReachabilityPush,
 } from "@/lib/relay-reachability"
+import {
+  applyPushedServerWorkspaceChange,
+  updateRelaySnapshots,
+  updateServerWorkspaces,
+} from "@/lib/server-workspace"
 
 export interface ApplyRealtimeEventInput {
   event: Exclude<RealtimeClientEvent, { type: "relay.invalidate" | "reset" }>
@@ -74,6 +79,23 @@ function applyRealtimeEvent(input: ApplyRealtimeEventInput): void {
               connection.snapshot,
           }
         : connection
+    }
+  )
+  applyPushedServerWorkspaceChange(
+    queryClient,
+    (snapshot) => applyRealtimeSnapshotEvent(snapshot, event),
+    {
+      removesServers:
+        event.type === "instances.delta" && event.deleted.length > 0,
+      upserted: event.type === "instances.delta" ? event.upserted : undefined,
+      relay:
+        event.type === "relay.status"
+          ? {
+              id: event.relayId,
+              status: event.status,
+              updating: event.updating ?? false,
+            }
+          : undefined,
     }
   )
   if (event.type === "instances.delta") {
@@ -285,6 +307,11 @@ export function applyProvisioningInstance(
           }
         : connection
   )
+  updateServerWorkspaces(
+    queryClient,
+    (snapshot) => upsertRelaySnapshotInstance(snapshot, updated),
+    { upserted: [updated] }
+  )
   queryClient.setQueryData<Array<FleetInstance>>(
     queryKeys.relay.instances,
     (instances) => {
@@ -313,9 +340,10 @@ export function applyUpdatedInstance(
       (instance) =>
         instance.id === updated.id && instance.relayId === updated.relayId
     )
-  queryClient.setQueryData<RelayFleetSnapshot>(
-    queryKeys.relay.snapshot,
-    (snapshot) => replaceRelaySnapshotInstance(snapshot, updated)
+  updateRelaySnapshots(
+    queryClient,
+    (snapshot) => replaceRelaySnapshotInstance(snapshot, updated),
+    { upserted: [{ ...current, ...updated } as FleetInstance] }
   )
   queryClient.setQueryData<Array<FleetInstance>>(
     queryKeys.relay.instances,
@@ -341,12 +369,13 @@ export function applyDeletedInstance(
         instance.id !== deleted.instanceId ||
         instance.relayId !== deleted.relayId
     )
-  queryClient.setQueryData<RelayFleetSnapshot>(
-    queryKeys.relay.snapshot,
+  updateRelaySnapshots(
+    queryClient,
     (snapshot) =>
       snapshot
         ? { ...snapshot, instances: remove(snapshot.instances) }
-        : snapshot
+        : snapshot,
+    { removesServers: true }
   )
   queryClient.setQueryData<RelayConnection>(
     queryKeys.relay.connection,
