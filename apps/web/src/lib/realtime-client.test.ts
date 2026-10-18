@@ -1224,6 +1224,8 @@ describe("game server pages", () => {
     unsubscribe()
   })
 
+  const settleReads = () => new Promise((resolve) => setTimeout(resolve, 20))
+
   // Each read Hearth receives, answered by the test. `answered` settles
   // after the read's own code has seen the answer, before the query stores it.
   function stagedPageReads() {
@@ -1366,6 +1368,89 @@ describe("game server pages", () => {
     }
 
     await expect(navigation).rejects.toThrow("kept changing")
+  })
+
+  it("brings back a shown page whose server is replaced", async () => {
+    const clients = fleet()
+    const page = openPage(clients)
+    const observer = new QueryObserver(
+      clients.queryClient,
+      serverWorkspaceQueryOptions(alpha.shortId)
+    )
+    const unsubscribe = observer.subscribe(() => undefined)
+    relayServer.getServerWorkspace.mockResolvedValue(foundPage(alpha))
+
+    // Replacing a container deletes the server, then pushes it again.
+    applyEvent(clients, instancesDelta([], [alpha]))
+    expect(page()).toEqual({ status: "not-found" })
+    applyEvent(clients, instancesDelta([alpha]))
+
+    await vi.waitFor(() => expect(page()).toEqual(foundPage(alpha)))
+    unsubscribe()
+  })
+
+  it("does not reread a page named by any of its IDs on unrelated pushes", async () => {
+    const clients = fleet()
+    relayServer.getServerWorkspace.mockResolvedValue(foundPage(alpha))
+    const unsubscribes = await Promise.all(
+      [
+        alpha.shortId,
+        alpha.routeId,
+        alpha.id,
+        `${alpha.relayId}-${alpha.id}`,
+      ].map(async (serverId) => {
+        const options = serverWorkspaceQueryOptions(serverId)
+        clients.queryClient.setQueryData(options.queryKey, foundPage(alpha))
+        return new QueryObserver(clients.queryClient, options).subscribe(
+          () => undefined
+        )
+      })
+    )
+    relayServer.getServerWorkspace.mockClear()
+
+    applyEvent(clients, instancesDelta([beta]))
+    applyEvent(clients, instancesDelta([{ ...alpha, status: "stopped" }]))
+    applyEvent(clients, relayStatus("relay-b", "unreachable"))
+    await settleReads()
+
+    expect(relayServer.getServerWorkspace).not.toHaveBeenCalled()
+    for (const unsubscribe of unsubscribes) unsubscribe()
+  })
+
+  it("lets a sibling deployment collide only with routes it also matches", async () => {
+    const clients = fleet()
+    // A Tailscale stack runs the same server ID on each Relay.
+    const sibling = {
+      ...alpha,
+      relayId: "relay-b",
+      relayName: "Relay B",
+      routeId: `relay-b-${alpha.shortId}`,
+    } as FleetInstance
+    relayServer.getServerWorkspace.mockResolvedValue(foundPage(alpha))
+    const observe = (serverId: string) => {
+      const options = serverWorkspaceQueryOptions(serverId)
+      clients.queryClient.setQueryData(options.queryKey, foundPage(alpha))
+      return new QueryObserver(clients.queryClient, options).subscribe(
+        () => undefined
+      )
+    }
+    const unsubscribes = [
+      observe(alpha.routeId),
+      observe(`${alpha.relayId}-${alpha.id}`),
+    ]
+    relayServer.getServerWorkspace.mockClear()
+
+    applyEvent(clients, instancesDelta([sibling]))
+    await settleReads()
+    expect(relayServer.getServerWorkspace).not.toHaveBeenCalled()
+
+    // A bare short ID now names both deployments.
+    unsubscribes.push(observe(alpha.shortId))
+    applyEvent(clients, instancesDelta([sibling]))
+    await vi.waitFor(() =>
+      expect(relayServer.getServerWorkspace).toHaveBeenCalledTimes(1)
+    )
+    for (const unsubscribe of unsubscribes) unsubscribe()
   })
 
   it("rereads a mounted page after a gap in pushed changes", async () => {

@@ -125,9 +125,7 @@ export async function ensureServerWorkspace(
     query !== undefined &&
     instance !== undefined &&
     !readState(queryClient).unresolvedSince.has(query.queryHash) &&
-    (serverId === instance.shortId ||
-      serverId === instance.routeId ||
-      serverId === instance.id)
+    namesById(serverId, instance)
   if (reusable && cached) return cached
   // A change during the read may leave its route needing resolution again.
   for (let attempt = 1; ; attempt += 1) {
@@ -224,27 +222,32 @@ function applyChange(
 ) {
   const state = readState(queryClient)
   state.sequence += 1
-  if (state.readsStartedAt.size > 0)
-    state.changes.push({
-      apply,
-      removesServers,
-      sequence: state.sequence,
-      type: "change",
-      upserted,
-    })
+  const change: Change = {
+    apply,
+    removesServers,
+    sequence: state.sequence,
+    type: "change",
+    upserted,
+  }
+  if (state.readsStartedAt.size > 0) state.changes.push(change)
   for (const query of serverWorkspaceQueries(queryClient)) {
     const workspace = query.state.data
-    if (workspace?.status !== "found") continue
-    if (takesShortId(workspace, upserted)) {
+    if (!workspace) continue
+    const serverId = String(query.queryKey[2])
+    const next = workspace.status === "found" ? apply(workspace) : workspace
+    // A missing page whose server returns, or a route that now names
+    // another server, resolves again. A read in flight answers for the old
+    // meaning, so it reads again once stored.
+    if (
+      changesResolution(serverId, workspace, change) ||
+      renamedAway(serverId, next)
+    ) {
       state.unresolvedSince.set(query.queryHash, state.sequence)
-      // A read in flight answers for the old meaning; it reads again once
-      // stored.
       void queryClient.invalidateQueries(
         { exact: true, queryKey: query.queryKey },
         { cancelRefetch: false }
       )
     }
-    const next = apply(workspace)
     if (next !== workspace) queryClient.setQueryData(query.queryKey, next)
   }
 }
@@ -300,9 +303,11 @@ function watchStoredReads(queryClient: QueryClient, state: ReadState) {
 }
 
 // Whether a change a stored answer missed may change what its route names.
-// After a gap, anything may have. A server found by an ID is ambiguous once
-// another takes its short ID; one found by name, once another takes the name
-// or it is renamed away (checked after the change applies). A missing answer
+// After a gap, anything may have. A found server's route is ambiguous once
+// another server alone would match its identifier: a shared short ID, the
+// same short ID on its Relay, its full ID on another Relay, or its name; a
+// Relay-qualified full ID matches no other. A server found by name may also
+// be renamed away (checked after the change applies). A missing answer
 // changes when a server its identifier names appears. An ambiguous answer is
 // rare and changes with any server's arrival, rename, or removal.
 function changesResolution(
@@ -318,14 +323,11 @@ function changesResolution(
       resolveRelayInstance([...change.upserted], serverId).status !==
       "not-found"
     )
-  return (
-    takesShortId(workspace, change.upserted) ||
-    (foundByName(serverId, workspace) &&
-      change.upserted.some(
-        (instance) =>
-          instance.name === serverId &&
-          !sameServer(instance, workspace.snapshot.instances[0])
-      ))
+  const [current] = workspace.snapshot.instances
+  return change.upserted.some(
+    (instance) =>
+      !sameServer(instance, current) &&
+      resolveRelayInstance([instance], serverId).status !== "not-found"
   )
 }
 
@@ -340,11 +342,17 @@ function renamedAway(serverId: string, workspace: ServerWorkspace) {
 
 function foundByName(serverId: string, workspace: FoundServerWorkspace) {
   const [instance] = workspace.snapshot.instances
+  return instance !== undefined && !namesById(serverId, instance)
+}
+
+// Whether `serverId` is one of the server's IDs: short, Relay-qualified
+// short or full, or full.
+function namesById(serverId: string, instance: ServerInstance) {
   return (
-    instance !== undefined &&
-    serverId !== instance.shortId &&
-    serverId !== instance.routeId &&
-    serverId !== instance.id
+    serverId === instance.shortId ||
+    serverId === instance.routeId ||
+    serverId === instance.id ||
+    serverId === `${instance.relayId}-${instance.id}`
   )
 }
 
@@ -360,21 +368,6 @@ function unresolved(queryClient: QueryClient, queryKey: QueryKey) {
   return (
     query !== undefined &&
     readState(queryClient).unresolvedSince.has(query.queryHash)
-  )
-}
-
-// Another server taking a page's short ID makes that ID ambiguous.
-function takesShortId(
-  workspace: FoundServerWorkspace,
-  upserted: ReadonlyArray<ServerInstance>
-) {
-  const [current] = workspace.snapshot.instances
-  return (
-    current !== undefined &&
-    upserted.some(
-      (instance) =>
-        instance.shortId === current.shortId && !sameServer(instance, current)
-    )
   )
 }
 
