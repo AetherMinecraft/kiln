@@ -6,9 +6,11 @@ import { listFileActivityEffect } from "@/lib/file-activity"
 import { migrations } from "@/migrations"
 import { baseline } from "@/migrations/0001_baseline"
 import { fileActivityRoots } from "@/migrations/0009_file_activity_roots"
+import { incrementalBackupArtifacts } from "@/migrations/0013_incremental_backup_artifacts"
 import { baselineTables } from "@/migrations/baseline-schema"
 import { describeMysql, testDatabaseClient } from "@/test/database"
 import {
+  insertBackup,
   insertInstance,
   insertRelay,
   insertRows,
@@ -240,6 +242,122 @@ describeMysql("database migrations", () => {
           expect(yield* roots).toEqual([relayId])
           yield* sql`DELETE FROM kiln_relay WHERE id = ${relayId}`
           expect(yield* roots).toEqual([])
+        }),
+      120_000
+    )
+    it.effect(
+      "finishes incremental deletes left behind by legacy artifacts",
+      () =>
+        Effect.gen(function* () {
+          const artifact = (
+            id: string,
+            backupId: string,
+            destinationKey: string,
+            createdAt: number
+          ) => ({
+            id,
+            backup_id: backupId,
+            destination_key: destinationKey,
+            status: "available",
+            created_at: createdAt,
+            updated_at: createdAt,
+          })
+          const ids = {
+            forgotten: "10000000-0000-4000-8000-000000000001",
+            kept: "10000000-0000-4000-8000-000000000002",
+            full: "10000000-0000-4000-8000-000000000003",
+            promoted: "10000000-0000-4000-8000-000000000004",
+          }
+
+          yield* dropAllTables
+          yield* applyMigrations(
+            migrations.filter(
+              (migration) => migration.id < incrementalBackupArtifacts.id
+            )
+          )
+          // The legacy copy predates the restic artifact, so a task
+          // dispatched with it first reported only the copy.
+          const incremental = [
+            [ids.forgotten, { status: "deleted", deleted_at: 400 }, {}],
+            [ids.kept, {}, {}],
+            [
+              ids.promoted,
+              { bytes: 512, completed_at: 250 },
+              { status: "queued" },
+            ],
+          ] as const
+          for (const [id, phantom, snapshot] of incremental) {
+            yield* insertBackup(id, {
+              artifact_kind: "restic_snapshot",
+              backup_mode: "incremental",
+            })
+            yield* insertRows("backup_artifact", [
+              {
+                ...artifact(id, id, "local", 1),
+                bytes: null,
+                completed_at: null,
+                deleted_at: null,
+                ...phantom,
+              },
+              {
+                ...artifact(`3${id.slice(1)}`, id, "restic", 2),
+                bytes: null,
+                completed_at: null,
+                deleted_at: null,
+                ...snapshot,
+              },
+            ])
+          }
+          yield* insertBackup(ids.full)
+          yield* insertRows(
+            "backup_artifact",
+            artifact(ids.full, ids.full, "local", 1)
+          )
+          yield* insertRows("backup_task", {
+            id: "20000000-0000-4000-8000-000000000001",
+            backup_id: ids.forgotten,
+            task_kind: "delete",
+            status: "succeeded",
+            finished_at: 400,
+            created_at: 300,
+            updated_at: 400,
+          })
+
+          yield* applyMigrations(migrations)
+
+          const backups = new Map(
+            (yield* selectRows<{
+              deleted_at: number | null
+              id: string
+              status: string
+            }>("backup")).map((row) => [row.id, row])
+          )
+          expect(backups.get(ids.forgotten)?.status).toBe("deleted")
+          expect(Number(backups.get(ids.forgotten)?.deleted_at)).toBe(400)
+          expect(backups.get(ids.kept)?.status).toBe("available")
+          expect(backups.get(ids.promoted)?.status).toBe("available")
+          expect(backups.get(ids.full)?.status).toBe("available")
+          const artifactRows = yield* selectRows<{
+            backup_id: string
+            bytes: number | null
+            destination_key: string
+            status: string
+          }>("backup_artifact")
+          expect(artifactRows).toHaveLength(4)
+          const artifacts = new Map(
+            artifactRows.map((row) => [
+              row.backup_id,
+              [row.destination_key, row.status, Number(row.bytes)],
+            ])
+          )
+          expect(artifacts).toEqual(
+            new Map([
+              [ids.forgotten, ["restic", "deleted", 0]],
+              [ids.kept, ["restic", "available", 0]],
+              [ids.promoted, ["restic", "available", 512]],
+              [ids.full, ["local", "available", 0]],
+            ])
+          )
         }),
       120_000
     )
