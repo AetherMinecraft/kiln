@@ -31,9 +31,16 @@ import type { ControlSocketOptions } from "./control-socket.js"
 import { RelayNotFoundError } from "./effect/errors.js"
 import { fingerprint } from "./effect/identity.js"
 import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
+import { adoptInstallationId, loadInstallationId } from "./installation.js"
 import type { RelayClientRole } from "./effect/state.js"
 import type { RelayAction } from "./permissions.js"
+import type { RelayConfig } from "./config.js"
 import { sendRawRequest } from "./test/raw-http.js"
+
+type InstallationConfig = Pick<
+  RelayConfig,
+  "installationId" | "installationIdConfigured"
+>
 
 describe("Relay control socket", () => {
   it("authenticates a paired Hearth with signed challenges and serves its requests", async () => {
@@ -69,6 +76,51 @@ describe("Relay control socket", () => {
       replyTo: id,
       type: "response",
     })
+  })
+
+  it("saves the installation ID a full-access Hearth authenticates with", async () => {
+    const installationId = "0b7e5f0e-6d0f-4a4f-9a51-0f1f6c1d2a3b"
+    const relay = await startRelay({
+      installation: { installationId: null, installationIdConfigured: false },
+    })
+    await relay.connect(await relay.pair(), { installationId })
+    await relay.connect(await relay.pair({ role: "read_only" }), {
+      installationId: "read-only-hearth",
+    })
+    await Promise.all(relay.adoptions)
+
+    // The next start loads it.
+    const restarted = { installationId: null, installationIdConfigured: false }
+    await relay.loadInstallationId(restarted)
+    expect(restarted.installationId).toBe(installationId)
+  })
+
+  it("adopts Hearth's installation ID before the session accepts requests", async () => {
+    // The longest ID Hearth accepts from KILN_INSTALLATION_ID.
+    const hearthInstallationId = `Kiln.Production_${"a".repeat(104)}`
+    const installation = {
+      installationId: "previous-installation",
+      installationIdConfigured: false,
+    }
+    // The first snapshot never arrives, so the session stays between
+    // readiness and its snapshot.
+    const relay = await startRelay({
+      initialSnapshot: () => new Promise(() => undefined),
+      installation,
+    })
+    const hearth = await relay.pair()
+    const { inbox, socket } = await relay.open()
+
+    const challenge = (await inbox.next()) as RelayAuthChallenge
+    socket.send(
+      JSON.stringify({
+        ...authResponse(challenge, hearth),
+        installationId: hearthInstallationId,
+      })
+    )
+
+    expect((await inbox.next()).type).toBe("auth.ready")
+    expect(installation.installationId).toBe(hearthInstallationId)
   })
 
   it("ignores upgrade targets that URL parsing rejects instead of crashing", async () => {
@@ -703,7 +755,11 @@ interface TestHearth {
 }
 
 async function startRelay(
-  options: { readonly execute?: ControlSocketOptions["execute"] } = {}
+  options: {
+    readonly execute?: ControlSocketOptions["execute"]
+    readonly initialSnapshot?: ControlSocketOptions["initialSnapshot"]
+    readonly installation?: InstallationConfig
+  } = {}
 ) {
   const directory = mkdtempSync(join(tmpdir(), "kiln-relay-control-"))
   const runtime = ManagedRuntime.make(
@@ -714,7 +770,20 @@ async function startRelay(
   const listeners = new Set<(snapshot: unknown) => void>()
   const sockets = new Set<WebSocket>()
   const server = createServer()
+  const adoptions: Array<Promise<void>> = []
+  const installation = options.installation
   const control = attachControlSocket({
+    ...(installation
+      ? {
+          adoptInstallationId: (installationId: string) => {
+            const adopted = runtime.runPromise(
+              adoptInstallationId(installation, state, installationId)
+            )
+            adoptions.push(adopted)
+            return adopted
+          },
+        }
+      : {}),
     execute: options.execute ?? (async () => ({ ok: true })),
     identity: {
       fingerprint: fingerprint(relayKeys.public),
@@ -722,7 +791,7 @@ async function startRelay(
       privateKeyPem: relayKeys.private,
       publicKeyPem: relayKeys.public,
     },
-    initialSnapshot: async () => initialSnapshot,
+    initialSnapshot: options.initialSnapshot ?? (async () => initialSnapshot),
     runEffect: (effect) => runtime.runPromise(effect),
     server,
     state,
@@ -755,27 +824,36 @@ async function startRelay(
   }
 
   return {
+    adoptions,
     audits: () => runtime.runPromise(state.listAudits({ limit: 100 })),
     connect: async (
       hearth: TestHearth,
-      connectOptions: { readonly features?: ReadonlyArray<string> } = {}
+      connectOptions: {
+        readonly features?: ReadonlyArray<string>
+        readonly installationId?: string
+      } = {}
     ) => {
       const connection = await open()
       const challenge = (await connection.inbox.next()) as RelayAuthChallenge
       connection.socket.send(
-        JSON.stringify(
-          authResponse(
+        JSON.stringify({
+          ...authResponse(
             challenge,
             hearth,
             connectOptions.features ?? [relaySnapshotDeltaFeature]
-          )
-        )
+          ),
+          ...(connectOptions.installationId
+            ? { installationId: connectOptions.installationId }
+            : {}),
+        })
       )
       expect((await connection.inbox.next()).type).toBe("auth.ready")
       expect((await connection.inbox.next()).type).toBe("event")
       return connection
     },
     control,
+    loadInstallationId: (config: InstallationConfig) =>
+      runtime.runPromise(loadInstallationId(config, state)),
     open,
     server,
     pair: async (

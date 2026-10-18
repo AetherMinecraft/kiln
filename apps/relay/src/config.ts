@@ -10,6 +10,7 @@ import type {
   RelayInstanceTailscale,
 } from "@workspace/contracts"
 import {
+  isKilnInstallationId,
   kilnGitRepositoryRawUrl,
   resolveKilnGitRepository,
 } from "@workspace/contracts"
@@ -97,7 +98,11 @@ export interface RelayConfig {
   gitRepository: string
   healthPort: number
   host: string
+  // From KILN_INSTALLATION_ID, or else the ID Hearth gave this Relay, which
+  // it saves and loads at startup.
   installationId: string | null
+  // Whether KILN_INSTALLATION_ID set it, so Hearth's ID doesn't replace it.
+  installationIdConfigured: boolean
   managedLabel: string
   mclogsApiUrl: string
   serverIdLabel: string
@@ -178,10 +183,7 @@ export function loadConfig(
         : 443
       : directPublicPort
   const tlsMode = relayTlsMode(environment)
-  const installationId = optionalDockerIdentifier(
-    environment,
-    "KILN_INSTALLATION_ID"
-  )
+  const installationId = optionalInstallationId(environment)
   const resourceNamespace = optionalDockerIdentifier(
     environment,
     "KILN_RELAY_RESOURCE_NAMESPACE"
@@ -239,6 +241,7 @@ export function loadConfig(
     healthPort,
     host: environment.KILN_RELAY_BIND_HOST?.trim() || "0.0.0.0",
     installationId,
+    installationIdConfigured: installationId !== null,
     managedLabel: "kiln.relay.managed=true",
     mclogsApiUrl:
       environment.MCLOGS_API_URL?.trim() || "https://api.mclo.gs/1/log",
@@ -379,6 +382,17 @@ function optionalPlatformBackupKey(
     throw new Error("KILN_PLATFORM_BACKUP_KEY must be at least 32 bytes")
   }
   return key
+}
+
+function optionalInstallationId(environment: NodeJS.ProcessEnv): string | null {
+  const value = environment.KILN_INSTALLATION_ID?.trim()
+  if (!value) return null
+  if (!isKilnInstallationId(value)) {
+    throw new Error(
+      "KILN_INSTALLATION_ID must use 1-120 letters, numbers, dots, underscores, or hyphens"
+    )
+  }
+  return value
 }
 
 function optionalDockerIdentifier(
