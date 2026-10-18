@@ -16,6 +16,8 @@ import {
   gzipSync,
 } from "node:zlib"
 import { Effect, Fiber, Option, Result, Schema } from "effect"
+import type { Tracer } from "effect"
+import { Headers, HttpTraceContext } from "effect/http"
 import { WebSocket, WebSocketServer } from "ws"
 import ZipStream from "zip-stream"
 
@@ -405,6 +407,10 @@ function authenticateBrowser(
   let browserKey: ReturnType<typeof createPublicKey> | null = null
   let capability: RelayBrowserCapability | null = null
   let pendingConsoleOperations = 0
+  // A browser's trace is continued for one auth and one subscription per
+  // socket, so it cannot have every message of a busy socket sampled.
+  let tracedAuth = false
+  let tracedSubscription = false
   // Messages that arrived while the auth was being checked, handled once it
   // is accepted with the same checks as if they had arrived after it.
   let earlyMessages: Array<BrowserMessage> = []
@@ -437,12 +443,17 @@ function authenticateBrowser(
         return
       }
       authenticationAttempt = true
+      const parent = tracedAuth ? undefined : browserTraceParent(value)
+      tracedAuth = true
       forkPromise(
         () =>
           ensuringPromise(
             () =>
-              traceRelayPromise("relay.browser.auth", () =>
-                authenticate(value)
+              traceRelayPromise(
+                "relay.browser.auth",
+                () => authenticate(value),
+                undefined,
+                parent
               ),
             () => {
               authenticationAttempt = false
@@ -502,8 +513,21 @@ function authenticateBrowser(
         socket.close(4403, "Console capability does not allow this resource")
         return
       }
+      const parent = tracedSubscription
+        ? undefined
+        : browserTraceParent(value)
+      tracedSubscription = true
       forkPromise(
-        () => hubs.subscribe(socket, resource, source),
+        () =>
+          traceRelayPromise(
+            "Subscribe browser console",
+            (span) => hubs.subscribe(socket, resource, source, span),
+            {
+              "kiln.operation": "relay.console.subscribe",
+              "kiln.resource.kind": resource.kind,
+            },
+            parent
+          ),
         () => socket.close(4500, "Console stream failed")
       )
       return
@@ -2102,6 +2126,9 @@ class ConsoleHubRegistry {
   readonly #pendingHubs = new Map<string, Fiber.Fiber<ConsoleHub, Error>>()
   readonly #subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"]
   readonly #subscriptions = new Map<WebSocket, string>()
+  // Each socket's latest subscription. One it replaced while its hub was
+  // still starting is settled as left instead of joining the hub.
+  readonly #subscriptionTokens = new Map<WebSocket, symbol>()
 
   constructor(
     subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"],
@@ -2113,23 +2140,29 @@ class ConsoleHubRegistry {
     this.#room = room
   }
 
+  // Resolves once the socket has been sent its session, or has left.
   subscribe(
     socket: WebSocket,
     resource: RelayConsoleResource,
-    source: ConsoleSource
+    source: ConsoleSource,
+    span?: Tracer.Span
   ): Promise<void> {
     const key = `${resource.kind}:${resource.id}:${resource.stream ?? ""}`
+    const token = Symbol(key)
     this.remove(socket)
     this.#subscriptions.set(socket, key)
+    this.#subscriptionTokens.set(socket, token)
     let hubEffect: Effect.Effect<ConsoleHub, Error>
     const existingHub = this.#hubs.get(key)
     if (existingHub) {
+      span?.attribute("kiln.console.hub", "existing")
       hubEffect = Effect.succeed(existingHub)
     } else {
       let pending = this.#pendingHubs.get(key)
+      span?.attribute("kiln.console.hub", pending ? "pending" : "new")
       if (!pending) {
         pending = Effect.runFork(
-          this.#createHubEffect(key, resource.id, source)
+          this.#createHubEffect(key, resource.id, source, span)
         )
         this.#pendingHubs.set(key, pending)
       }
@@ -2145,10 +2178,10 @@ class ConsoleHubRegistry {
     }
     return Effect.runPromise(
       hubEffect.pipe(
-        Effect.tap((hub) =>
-          Effect.sync(() => {
+        Effect.flatMap((hub) =>
+          Effect.callback<void>((resume) => {
             if (
-              this.#subscriptions.get(socket) !== key ||
+              this.#subscriptionTokens.get(socket) !== token ||
               socket.readyState !== WebSocket.OPEN
             ) {
               const hasWaitingSubscriber = [
@@ -2157,12 +2190,16 @@ class ConsoleHubRegistry {
               if (hub.subscriberCount === 0 && !hasWaitingSubscriber) {
                 hub.close()
               }
+              span?.attribute("kiln.console.result", "left")
+              resume(Effect.void)
               return
             }
-            hub.add(socket)
+            hub.add(socket, (sent) => {
+              span?.attribute("kiln.console.result", sent ? "sent" : "left")
+              resume(Effect.void)
+            })
           })
-        ),
-        Effect.asVoid
+        )
       )
     )
   }
@@ -2171,6 +2208,7 @@ class ConsoleHubRegistry {
     const key = this.#subscriptions.get(socket)
     if (!key) return
     this.#subscriptions.delete(socket)
+    this.#subscriptionTokens.delete(socket)
     this.#hubs.get(key)?.remove(socket)
   }
 
@@ -2182,17 +2220,22 @@ class ConsoleHubRegistry {
     for (const hub of this.#hubs.values()) hub.close()
     this.#hubs.clear()
     this.#subscriptions.clear()
+    this.#subscriptionTokens.clear()
   }
 
+  // `span` is the subscription that asked for the hub, which its discovery
+  // and first history read nest under.
   #createHubEffect(
     key: string,
     resourceId: string,
-    source: ConsoleSource
+    source: ConsoleSource,
+    span?: Tracer.Span
   ): Effect.Effect<ConsoleHub, Error> {
     return timedBrowserOperation(
       "Discover console session",
       "relay.console.discovery",
-      (signal) => source.session(signal)
+      (signal) => source.session(signal),
+      span
     ).pipe(
       Effect.map((session) => {
         const hub = new ConsoleHub(
@@ -2204,7 +2247,8 @@ class ConsoleHubRegistry {
           this.#room,
           () => {
             if (hub.subscriberCount === 0) this.#hubs.delete(key)
-          }
+          },
+          span
         )
         this.#hubs.set(key, hub)
         return hub
@@ -2318,6 +2362,8 @@ class ConsoleHub {
   readonly #historyReaders = new Map<WebSocket, { position: number }>()
   readonly #lineIds = new Set<string>()
   readonly #onEmpty: () => void
+  // Told whether each new subscriber was sent its session or left first.
+  readonly #sessionWaiters = new Map<WebSocket, (sent: boolean) => void>()
   // The session's newest output, within MAX_CONSOLE_HISTORY_LINES and
   // MAX_CONSOLE_HISTORY_CHARACTERS.
   readonly #recent: Array<RelayConsoleLine> = []
@@ -2328,6 +2374,8 @@ class ConsoleHub {
   #appended = 0
   #backfillStartedAt: string | null | undefined
   #closed = false
+  // The subscription that created the hub, which its first read nests under.
+  #firstReadParent: Tracer.Span | undefined
   #historyFrameCharacters = 0
   #graceFiber: Fiber.Fiber<void, never> | null = null
   #recentCharacters = 0
@@ -2349,9 +2397,11 @@ class ConsoleHub {
     subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"],
     deliver: BrowserDelivery,
     room: BrowserRoom,
-    onEmpty: () => void
+    onEmpty: () => void,
+    firstReadParent?: Tracer.Span
   ) {
     this.#deliver = deliver
+    this.#firstReadParent = firstReadParent
     this.#room = room
     this.#resourceId = resourceId
     this.#source = source
@@ -2368,16 +2418,24 @@ class ConsoleHub {
     return this.#subscribers.size
   }
 
-  add(socket: WebSocket): void {
-    if (this.#closed) return
+  add(socket: WebSocket, onSession?: (sent: boolean) => void): void {
+    if (this.#closed) {
+      onSession?.(false)
+      return
+    }
     this.#graceFiber?.interruptUnsafe()
     this.#graceFiber = null
     this.#subscribers.add(socket)
+    if (onSession) {
+      this.#notifySession(socket, false)
+      this.#sessionWaiters.set(socket, onSession)
+    }
     if (this.#sessionLifecycle !== undefined) this.#sendSession(socket)
     this.#startStream()
   }
 
   remove(socket: WebSocket): void {
+    this.#notifySession(socket, false)
     this.#subscribers.delete(socket)
     this.#historyReaders.delete(socket)
     if (this.#subscribers.size > 0 || this.#graceFiber || this.#closed) return
@@ -2402,6 +2460,9 @@ class ConsoleHub {
   close(): void {
     if (this.#closed) return
     this.#closed = true
+    for (const socket of this.#sessionWaiters.keys()) {
+      this.#notifySession(socket, false)
+    }
     this.#graceFiber?.interruptUnsafe()
     this.#graceFiber = null
     this.#streamFiber?.interruptUnsafe()
@@ -2457,7 +2518,8 @@ class ConsoleHub {
         timedBrowserOperation(
           "Read initial console history",
           "relay.console.history",
-          (signal) => session.history(200, signal)
+          (signal) => session.history(200, signal),
+          this.#takeFirstReadParent()
         ).pipe(
           Effect.tap((snapshot) =>
             Effect.sync(() => {
@@ -2494,6 +2556,12 @@ class ConsoleHub {
         )
       )
     )
+  }
+
+  #takeFirstReadParent(): Tracer.Span | undefined {
+    const parent = this.#firstReadParent
+    this.#firstReadParent = undefined
+    return parent
   }
 
   #takeSessionEffect(): Effect.Effect<DockerConsoleSession, Error> {
@@ -2717,7 +2785,19 @@ class ConsoleHub {
     )
   }
 
+  #notifySession(socket: WebSocket, sent: boolean): void {
+    const waiter = this.#sessionWaiters.get(socket)
+    if (!waiter) return
+    this.#sessionWaiters.delete(socket)
+    waiter(sent)
+  }
+
   #sendSession(socket: WebSocket): void {
+    this.#deliverSession(socket)
+    this.#notifySession(socket, true)
+  }
+
+  #deliverSession(socket: WebSocket): void {
     const lifecycle = this.#sessionLifecycle ?? []
     const snapshotStart = Math.max(0, this.#recent.length - 200)
     if (socket.protocol === relayBrowserProtocol) {
@@ -2959,10 +3039,35 @@ function browserFileAuthenticationEffect<TResult>(
 function timedBrowserOperation<TResult>(
   name: string,
   op: string,
-  run: (signal: AbortSignal) => Promise<TResult>
+  run: (signal: AbortSignal) => Promise<TResult>,
+  parent?: Tracer.AnySpan
 ): Effect.Effect<TResult, Error> {
   return browserOperation((signal) =>
-    traceRelayPromise(name, () => run(signal), { "kiln.operation": op })
+    traceRelayPromise(
+      name,
+      () => run(signal),
+      { "kiln.operation": op },
+      parent
+    )
+  )
+}
+
+// The browser span a message continues, from its W3C `traceparent`, so the
+// Relay's work joins the browser's trace and follows its sampling.
+function browserTraceParent(value: unknown): Tracer.ExternalSpan | undefined {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !("traceparent" in value) ||
+    typeof value.traceparent !== "string" ||
+    value.traceparent.length > 64
+  ) {
+    return undefined
+  }
+  return Option.getOrUndefined(
+    HttpTraceContext.w3c(
+      Headers.fromInput({ traceparent: value.traceparent })
+    )
   )
 }
 

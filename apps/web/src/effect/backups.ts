@@ -208,6 +208,7 @@ interface DispatchableBackupRow extends RowDataPacket {
 }
 
 interface KnownBackupTaskRow extends RowDataPacket {
+  backup_mode: BackupRow["backup_mode"]
   backup_status: BackupRow["status"]
   bytes_completed: number | string
   id: string
@@ -889,7 +890,7 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
       Effect.gen(function* () {
         const knownTasks = yield* transaction.queryRows<KnownBackupTaskRow>(
           `SELECT task.id, task.status, task.bytes_completed,
-                  backup.status AS backup_status,
+                  backup.status AS backup_status, backup.backup_mode,
                   task.relay_updated_at_ms
              FROM ${databaseTable("backup_task")} task
              JOIN ${databaseTable("backup")} backup ON backup.id = task.backup_id
@@ -903,7 +904,7 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
           changed = true
           const adoptedTasks = yield* transaction.queryRows<KnownBackupTaskRow>(
             `SELECT task.id, task.status, task.bytes_completed,
-                      backup.status AS backup_status,
+                      backup.status AS backup_status, backup.backup_mode,
                       task.relay_updated_at_ms
                  FROM ${databaseTable("backup_task")} task
                  JOIN ${databaseTable("backup")} backup ON backup.id = task.backup_id
@@ -957,6 +958,9 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
           ]
         )
         if (task.kind === "delete") {
+          // Once deleted, a backup stays deleted whatever an older or retried
+          // delete task reports afterwards.
+          if (knownTask.backup_status === "deleted") return
           const active = task.status === "queued" || task.status === "running"
           const outcomes =
             task.result && !("bytes" in task.result)
@@ -1005,7 +1009,12 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
               )
             }
           } else if (task.status === "succeeded") {
-            if (outcomes.length === 0) {
+            // A forgotten restic snapshot leaves nothing behind in any of
+            // the backup's artifacts, whichever one the Relay reported.
+            if (
+              outcomes.length === 0 ||
+              knownTask.backup_mode === "incremental"
+            ) {
               yield* transaction.execute(
                 `UPDATE ${databaseTable("backup_artifact")}
                     SET status = 'deleted', deleted_at = ?, updated_at = ?
@@ -1110,7 +1119,12 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
           const filename = archiveResult?.filename ?? null
           const checksum = archiveResult?.checksumSha256 ?? null
           const snapshotId = resticResult?.snapshotId ?? null
-          const outcomes = task.result.artifacts ?? []
+          // A restic snapshot is one copy of the data, so every artifact of an
+          // incremental backup shares its outcome.
+          const outcomes =
+            knownTask.backup_mode === "incremental"
+              ? []
+              : (task.result.artifacts ?? [])
           if (outcomes.length === 0) {
             yield* transaction.execute(
               `UPDATE ${databaseTable("backup_artifact")}
