@@ -4,7 +4,12 @@ import {
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query"
-import { useNavigate, useRouterState } from "@tanstack/react-router"
+import {
+  useMatch,
+  useNavigate,
+  useRouter,
+  useRouterState,
+} from "@tanstack/react-router"
 
 import { AppWorkspaceShell } from "@/components/app/app-workspace"
 import { DatabaseWorkspaceShell } from "@/components/database/database-workspace"
@@ -130,8 +135,9 @@ function InstanceRouteBoundary({ children }: { children: React.ReactNode }) {
   )
 }
 
-// The route loads the server's own workspace before it renders; the fleet is
-// read only to explain an empty state.
+// The route reads the server's own workspace, usually before it renders; a
+// server the page already knew opens at once and its read lands after. The
+// fleet is read only to explain an empty state.
 function ServerRouteBoundary({
   children,
   serverId,
@@ -139,18 +145,91 @@ function ServerRouteBoundary({
   children: React.ReactNode
   serverId: string
 }) {
-  const { data: found } = useQuery({
-    ...serverWorkspaceQueryOptions(serverId),
-    select: selectServerFound,
+  const opened = useMatch({
+    from: "/_app/server/$serverId",
+    select: selectOpenedServer,
+    shouldThrow: false,
+    structuralSharing: true,
   })
-  if (found === undefined)
+  // Read on its own: a failed resolution leaves the match without a server.
+  const matchStatus = useMatch({
+    from: "/_app/server/$serverId",
+    select: (match) => match.status,
+    shouldThrow: false,
+  })
+  const {
+    data: route,
+    error,
+    isError,
+  } = useQuery({
+    ...serverWorkspaceQueryOptions(serverId),
+    select: React.useCallback(
+      (workspace: ServerWorkspace) => routeVerdict(workspace, serverId, opened),
+      [opened, serverId]
+    ),
+  })
+  const router = useRouter()
+  // An open the read disagrees with resolves again, which redirects as a
+  // navigation would have: to the list, an invitation, or the canonical URL.
+  const misrouted =
+    opened?.verified === false && route !== undefined && route !== "open"
+  React.useEffect(() => {
+    if (misrouted) void router.invalidate()
+  }, [misrouted, router])
+
+  // A route whose resolution failed shows the route's error page, with its
+  // retry, as the awaited route would have.
+  if (matchStatus === "error") return children
+  if (isError && (route === undefined || misrouted)) throw error
+  if (route === undefined || misrouted)
     return <div className="min-h-0 flex-1 bg-background" />
-  if (!found) return <RouteEmptyState />
+  if (route === "missing") return <RouteEmptyState />
   return <InstanceRouteFrame serverId={serverId}>{children}</InstanceRouteFrame>
 }
 
-function selectServerFound(workspace: ServerWorkspace) {
-  return workspace.status === "found"
+interface OpenedServer {
+  brickId?: string | null
+  id: string
+  relayId: string
+  verified: boolean
+}
+
+function selectOpenedServer(match: {
+  context: {
+    instance: { brickId?: string | null; id: string; relayId: string } | null
+    serverVerified: boolean
+  }
+}): OpenedServer | undefined {
+  const { instance, serverVerified } = match.context
+  return instance
+    ? {
+        brickId: instance.brickId ?? null,
+        id: instance.id,
+        relayId: instance.relayId,
+        verified: serverVerified,
+      }
+    : undefined
+}
+
+// What the server's own read says about the route that opened it. A route
+// that opened on a known server, before its read, is confirmed only by the
+// same server: its access checks ran for that one.
+function routeVerdict(
+  workspace: ServerWorkspace,
+  serverId: string,
+  opened: OpenedServer | undefined
+): "missing" | "moved" | "open" {
+  if (workspace.status !== "found") return "missing"
+  const [instance] = workspace.snapshot.instances
+  const canonical =
+    serverId === workspace.routeIdentifier || serverId === instance?.routeId
+  const sameServer =
+    !opened ||
+    opened.verified ||
+    (instance?.id === opened.id &&
+      instance.relayId === opened.relayId &&
+      (instance.brickId ?? null) === opened.brickId)
+  return canonical && sameServer ? "open" : "moved"
 }
 
 function RouteEmptyState() {
