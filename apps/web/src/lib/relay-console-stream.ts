@@ -9,11 +9,15 @@ import type {
 import { Effect, Exit, Fiber, Result, Scope, Stream } from "effect"
 
 import { consoleCopy } from "@/lib/console-copy"
+import { browserTraceparent, startBrowserSpan } from "@/lib/browser-telemetry"
 import {
   startConsoleTimingSpan,
   withConsoleTimingSpan,
 } from "@/lib/console-performance"
-import type { ConsoleLoadTiming } from "@/lib/console-performance"
+import type {
+  ConsoleLoadTiming,
+  ConsoleTrace,
+} from "@/lib/console-performance"
 import {
   authenticateRelayBrowserSocket,
   isTerminalRelayBrowserFailure,
@@ -161,9 +165,10 @@ function openDirectRelayConsoleStream(
             (prewarm) => (prewarm ? closeConsolePrewarm(prewarm) : Effect.void)
           )
         : undefined
-      const { inbox, socket } = prewarmed
+      const { adopted, connection } = prewarmed
         ? yield* adoptConsolePrewarm(prewarmed, connect, timing)
-        : yield* connect
+        : { adopted: false, connection: yield* connect }
+      const { inbox, socket } = connection
 
       // Commands and completions go to servers only.
       if (resource.kind === "instance") {
@@ -188,7 +193,8 @@ function openDirectRelayConsoleStream(
         traceInitialSnapshot(
           timing,
           "Receive initial Relay console snapshot",
-          "websocket.console.snapshot"
+          "websocket.console.snapshot",
+          { "kiln.console.prewarmed": adopted }
         )
       )
       return events.pipe(
@@ -211,7 +217,7 @@ function connectDirectRelayConsole(
   relayId: string,
   resource: RelayConsoleResource,
   browserOrigin: string | null,
-  timing: ConsoleLoadTiming | undefined,
+  timing: ConsoleTrace | undefined,
   write: boolean
 ) {
   return Effect.gen(function* () {
@@ -279,9 +285,12 @@ function connectDirectRelayConsole(
       }
     }
     const { socket } = relaySocket
+    // The Relay's auth and subscription join this console's trace.
+    const traceparent = browserTraceparent(timing?.parentSpan())
     const subscription = {
       instanceId: resource.id,
       ...(resource.stream ? { stream: resource.stream } : {}),
+      ...(traceparent ? { traceparent } : {}),
       type: "console.subscribe",
       v: 1,
     }
@@ -296,6 +305,7 @@ function connectDirectRelayConsole(
         credentials: { keys, publicKeyJwk },
         instanceId: resource.id,
         relayId,
+        traceparent,
       })
     )
     if (capability.version === 2) {
@@ -381,14 +391,38 @@ export function prewarmRelayConsole(input: {
   }
 
   const scope = Scope.makeUnsafe()
+  // Its own trace, which the connection's spans and the Relay's nest under,
+  // rather than one for each step.
+  const span = startBrowserSpan("Prewarm console", {
+    attributes: {
+      "kiln.console.write": input.write,
+      "kiln.operation": "ui.console.prewarm",
+    },
+  })
   const connection = Effect.runFork(
     connectDirectRelayConsole(
       input.relayId,
       { id: input.instanceId, kind: "instance" },
       input.browserOrigin,
-      undefined,
+      { parentSpan: () => span },
       input.write
-    ).pipe(Effect.result, Scope.provide(scope))
+    ).pipe(
+      Effect.onExit((exit) =>
+        Effect.sync(() => {
+          span.setAttribute(
+            "kiln.console.result",
+            Exit.isSuccess(exit)
+              ? "ok"
+              : Exit.hasInterrupts(exit)
+                ? "cancelled"
+                : "error"
+          )
+          span.end(Exit.isFailure(exit) ? exit.cause : undefined)
+        })
+      ),
+      Effect.result,
+      Scope.provide(scope)
+    )
   )
   const forget = () => {
     clearTimeout(expiry)
@@ -450,12 +484,12 @@ function adoptConsolePrewarm(
       exit.value.success.socket.readyState === WebSocket.OPEN
     ) {
       timing?.markPrewarmed()
-      return exit.value.success
+      return { adopted: true, connection: exit.value.success }
     }
     // A prewarm that failed, or whose socket has closed since, such as when
     // a busy console filled its inbox before anyone read it, connects again.
     yield* closeConsolePrewarm(prewarm)
-    return yield* connect
+    return { adopted: false, connection: yield* connect }
   })
 }
 
@@ -482,7 +516,7 @@ function closeConsolePrewarm(prewarm: ConsolePrewarm) {
 function forkRelayConsoleSocket(
   browserOrigin: string,
   relayId: string,
-  timing?: ConsoleLoadTiming
+  timing?: ConsoleTrace
 ) {
   return Effect.gen(function* () {
     const scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
@@ -500,7 +534,7 @@ function forkRelayConsoleSocket(
 function openRelayConsoleSocket(
   browserOrigin: string,
   relayId: string,
-  timing?: ConsoleLoadTiming
+  timing?: ConsoleTrace
 ) {
   return withConsoleTimingSpan(
     timing,
@@ -638,13 +672,17 @@ function parseHearthConsoleEvent(
 function traceInitialSnapshot<TError, TRequirements>(
   timing: ConsoleLoadTiming | undefined,
   name: string,
-  op: string
+  op: string,
+  attributes: Record<string, unknown> = {}
 ) {
   return (
     stream: Stream.Stream<RelayConsoleStreamEvent, TError, TRequirements>
   ): Stream.Stream<RelayConsoleStreamEvent, TError, TRequirements> =>
     Stream.suspend(() => {
       const span = startConsoleTimingSpan(timing, name, op)
+      for (const [key, value] of Object.entries(attributes)) {
+        span.setAttribute(key, value)
+      }
       let pending = true
       return stream.pipe(
         Stream.tap((event) =>
