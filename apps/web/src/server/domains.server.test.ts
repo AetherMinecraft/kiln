@@ -12,6 +12,10 @@ import { disposeAppRuntime } from "@/effect/runtime"
 import { TestDatabase, describeMysql, resetDatabase } from "@/test/database"
 import { insertRows, selectRows } from "@/test/seed"
 import { betterAuthSecrets } from "@/lib/environment"
+import {
+  insertInstanceDomainAssignmentEffect,
+  saveCloudflareIntegrationEffect,
+} from "@/effect/domains"
 import { finalizeInstanceDeletionEffect } from "@/server/instance-deletion-cleanup"
 
 import { encryptWithKeyring } from "../../keyring.mjs"
@@ -28,6 +32,7 @@ import {
 
 const relayId = "relay-one"
 const instanceId = "b".repeat(40)
+const aliasId = "00000000-0000-4000-8000-00000000a11a"
 
 const disabledCache = Layer.succeed(AppCache)({
   backend: "disabled",
@@ -56,6 +61,8 @@ function memoryCache() {
 
 const insertAssignment = (assignment: InstanceDomainAssignment) =>
   insertRows("instance_domain", {
+    id: assignment.id,
+    is_primary: assignment.primary,
     relay_id: assignment.relayId,
     instance_id: assignment.instanceId,
     integration_id: assignment.integrationId,
@@ -76,24 +83,50 @@ const insertAssignment = (assignment: InstanceDomainAssignment) =>
 
 vi.stubEnv("BETTER_AUTH_SECRETS", `1:${"s".repeat(32)}`)
 
-const insertCredential = Effect.suspend(() =>
-  insertRows("domain_integration", {
-    id: "cloudflare",
-    provider: "cloudflare",
-    domain: "kiln.site",
-    zone_id: "zone-id",
-    zone_name: "kiln.site",
-    api_token_ciphertext: encryptWithKeyring(
-      "api-token",
-      betterAuthSecrets(),
-      "kiln-cloudflare-api-token"
-    ),
-    blacklist_patterns: "[]",
-    enabled: true,
-    created_at: 0,
-    updated_at: 0,
+const insertCredential = (
+  options: {
+    disabled?: Array<string>
+    domains?: Array<string>
+    strategy?: "balanced" | "default" | "random"
+  } = {}
+) =>
+  Effect.gen(function* () {
+    yield* insertRows("domain_integration", {
+      id: "cloudflare",
+      provider: "cloudflare",
+      api_token_ciphertext: encryptWithKeyring(
+        "api-token",
+        betterAuthSecrets(),
+        "kiln-cloudflare-api-token"
+      ),
+      assignment_strategy: options.strategy ?? "default",
+      blacklist_patterns: "[]",
+      enabled: true,
+      created_at: 0,
+      updated_at: 0,
+    })
+    const domains = options.domains ?? ["kiln.site"]
+    yield* insertRows(
+      "domain_zone",
+      domains.map((domain, index) => ({
+        domain,
+        integration_id: "cloudflare",
+        zone_id: index === 0 ? "zone-id" : `zone-${index}`,
+        zone_name: domain,
+        is_default: index === 0,
+        enabled: !options.disabled?.includes(domain),
+        created_at: 0,
+        updated_at: 0,
+      }))
+    )
   })
-)
+
+const assignmentRows = selectRows<{
+  domain: string
+  id: string
+  is_primary: number
+  vanity_label: string
+}>("instance_domain")
 
 const assignmentStatuses = Effect.map(
   selectRows<{ status: string }>("instance_domain"),
@@ -143,25 +176,40 @@ function fakeCloudflare(
             .map(([id, recordName]) => ({ id, name: recordName, type: "A" }))
         )
       }
-      if (method === "POST") {
-        const record = JSON.parse(String(init?.body)) as {
-          name: string
-          type: string
-        }
+      const create = (record: { name: string; type: string }) => {
         nextId += 1
         const id = `record-${nextId}`
         records.set(id, record.name)
-        return success({ id, name: record.name, type: record.type })
+        return { id, name: record.name, type: record.type }
+      }
+      if (method === "POST" && url.pathname.endsWith("/batch")) {
+        const batch = JSON.parse(String(init?.body)) as {
+          deletes: Array<{ id: string }>
+          posts: Array<{ name: string; type: string }>
+        }
+        for (const { id } of batch.deletes) records.delete(id)
+        return success({ posts: batch.posts.map(create) })
+      }
+      if (method === "POST") {
+        return success(create(JSON.parse(String(init?.body))))
       }
       const id = url.pathname.split("/").at(-1) ?? ""
       if (method === "DELETE") {
         if (refuseDelete.has(id)) return failure(503)
         if (!records.delete(id)) return failure(404, 81_044)
+        return success({ id })
       }
-      return success({ id })
+      const record = JSON.parse(String(init?.body)) as {
+        name: string
+        type: string
+      }
+      if (!records.has(id)) return failure(404, 81_044)
+      records.set(id, record.name)
+      return success({ id, name: record.name, type: record.type })
     })
   )
   return {
+    names: () => [...records.values()].sort(),
     records: () => [...records.keys()].sort(),
     refuseDelete,
   }
@@ -239,6 +287,7 @@ describeMysql("managed domain deletion", () => {
           yield* insertAssignment(testAssignment())
           yield* insertAssignment({
             ...testAssignment(),
+            id: aliasId,
             relayId: "another-relay",
             vanityLabel: "other",
           })
@@ -295,14 +344,15 @@ describeMysql("removing a game server's domain", () => {
       Effect.gen(function* () {
         yield* resetDatabase
         const dns = fakeCloudflare()
-        yield* insertCredential
+        yield* insertCredential()
         const provision = Effect.promise(() =>
           provisionInstanceDomain(testInstance(), relayId)
         )
         yield* provision
         assert.deepEqual(dns.records(), ["record-1"])
 
-        yield* removeInstanceDomainEffect(relayId, instanceId)
+        const [provisioned] = yield* assignmentRows
+        yield* removeInstanceDomainEffect(relayId, instanceId, provisioned!.id)
         yield* provision
 
         assert.deepEqual(dns.records(), [])
@@ -317,34 +367,114 @@ describeMysql("removing a game server's domain", () => {
           records: ["address-record", "srv-record"],
         })
         dns.refuseDelete.add("srv-record")
-        yield* insertCredential
+        yield* insertCredential()
         yield* insertAssignment(testAssignment())
 
         const failure = yield* removeInstanceDomainEffect(
           relayId,
-          instanceId
+          instanceId,
+          testAssignment().id
         ).pipe(Effect.flip)
 
         assert.strictEqual(failure._tag, "ExternalServiceError")
         assert.deepEqual(dns.records(), ["srv-record"])
-        assert.deepEqual(yield* assignmentStatuses, ["error"])
+        assert.deepEqual(yield* assignmentStatuses, ["removing"])
         assert.deepEqual(yield* optOutKeys, [`${relayId}:${instanceId}`])
 
+        // A start or Sync before the retry doesn't bring the address back.
+        yield* Effect.promise(() =>
+          provisionInstanceDomain(testInstance(), relayId)
+        )
+        assert.deepEqual(dns.records(), ["srv-record"])
+        assert.deepEqual(yield* assignmentStatuses, ["removing"])
+
         dns.refuseDelete.clear()
-        yield* removeInstanceDomainEffect(relayId, instanceId)
+        yield* removeInstanceDomainEffect(
+          relayId,
+          instanceId,
+          testAssignment().id
+        )
 
         assert.deepEqual(dns.records(), [])
         assert.deepEqual(yield* assignmentKeys, [])
       }).pipe(Effect.provide(disabledCache))
     )
 
+    it.effect(
+      "keeps a domain added after a removal in step with the game server",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          fakeCloudflare({ records: ["address-record", "srv-record"] })
+          yield* insertCredential()
+          // Its last domain was removed, then a new one was added and fixed
+          // by hand, which leaves the removal on record.
+          yield* insertRows("instance_domain_opt_out", {
+            relay_id: relayId,
+            instance_id: instanceId,
+            created_at: 0,
+          })
+          yield* insertAssignment(testAssignment())
+
+          yield* Effect.promise(() =>
+            provisionInstanceDomain(testInstance(), relayId)
+          )
+
+          const [row] = yield* selectRows<{ public_host: string }>(
+            "instance_domain"
+          )
+          assert.strictEqual(row?.public_host, "new-relay.example.com")
+        }).pipe(Effect.provide(disabledCache))
+    )
+
+    it.effect(
+      "retries a failed replacement while leaving a failed delete alone",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          const dns = fakeCloudflare({ records: ["address-record"] })
+          dns.refuseDelete.add("address-record")
+          yield* insertCredential()
+          yield* insertAssignment({ ...testAssignment(), srvRecordId: null })
+          // Its last domain's delete half-failed, then a replacement added by
+          // hand failed before Cloudflare had any records for it.
+          yield* removeInstanceDomainEffect(
+            relayId,
+            instanceId,
+            testAssignment().id
+          ).pipe(Effect.flip)
+          yield* insertAssignment({
+            ...testAlias(),
+            addressRecordId: null,
+            status: "error",
+          })
+
+          yield* Effect.promise(() =>
+            provisionInstanceDomain(testInstance(), relayId)
+          )
+
+          const rows = yield* selectRows<{ id: string; status: string }>(
+            "instance_domain"
+          )
+          const statuses = new Map(rows.map((row) => [row.id, row.status]))
+          assert.strictEqual(statuses.get(testAssignment().id), "removing")
+          assert.strictEqual(statuses.get(aliasId), "active")
+          assert.include(dns.names(), "alias.kiln.site")
+          assert.notInclude(dns.names(), "play.kiln.site")
+        }).pipe(Effect.provide(disabledCache))
+    )
+
     it.effect("keeps the removal until the game server is gone", () =>
       Effect.gen(function* () {
         yield* resetDatabase
         fakeCloudflare({ records: ["address-record", "srv-record"] })
-        yield* insertCredential
+        yield* insertCredential()
         yield* insertAssignment(testAssignment())
-        yield* removeInstanceDomainEffect(relayId, instanceId)
+        yield* removeInstanceDomainEffect(
+          relayId,
+          instanceId,
+          testAssignment().id
+        )
 
         // Deletion clears the domain before asking the Relay, which may
         // refuse and leave the game server running.
@@ -364,7 +494,7 @@ describeMysql("reprovisioning a failed domain", () => {
       Effect.gen(function* () {
         yield* resetDatabase
         const dns = fakeCloudflare({ records: ["address-record"] })
-        yield* insertCredential
+        yield* insertCredential()
         yield* insertAssignment({
           ...testAssignment(),
           srvRecordId: null,
@@ -378,6 +508,363 @@ describeMysql("reprovisioning a failed domain", () => {
         assert.deepEqual(dns.records(), ["record-1"])
         assert.deepEqual(yield* assignmentStatuses, ["active"])
       }).pipe(Effect.provide(disabledCache))
+    )
+  })
+})
+
+describeMysql("a game server with several domains", () => {
+  layer(TestDatabase)((it) => {
+    it.effect(
+      "keeps its other domains when the primary is removed, promoting one",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          const dns = fakeCloudflare({
+            records: ["address-record", "srv-record", "alias-record"],
+          })
+          yield* insertCredential()
+          yield* insertAssignment(testAssignment())
+          yield* insertAssignment(testAlias())
+
+          yield* removeInstanceDomainEffect(
+            relayId,
+            instanceId,
+            testAssignment().id
+          )
+
+          assert.deepEqual(dns.records(), ["alias-record"])
+          assert.deepEqual(
+            (yield* assignmentRows).map((row) => [row.id, row.is_primary]),
+            [[aliasId, 1]]
+          )
+          // Still has a domain, so starts and Sync keep managing it.
+          assert.deepEqual(yield* optOutKeys, [])
+          assert.deepEqual(yield* loadManagedDomainAddressesEffect(), {
+            [`${relayId}:${instanceId}`]: {
+              address: "alias.kiln.site:25565",
+              publicHost: "203.0.113.10",
+              publicPort: 25_565,
+            },
+          })
+        }).pipe(Effect.provide(disabledCache))
+    )
+
+    it.effect("advertises the primary domain as its connect address", () =>
+      Effect.gen(function* () {
+        yield* resetDatabase
+        // Created first, so only the primary flag can put the other ahead.
+        yield* insertAssignment(testAlias())
+        yield* insertAssignment(testAssignment())
+
+        assert.deepEqual(yield* loadManagedDomainAddressesEffect(), {
+          [`${relayId}:${instanceId}`]: {
+            address: "play.kiln.site",
+            publicHost: "203.0.113.10",
+            publicPort: 25_565,
+          },
+        })
+      }).pipe(Effect.provide(disabledCache))
+    )
+
+    it.effect("moves every domain to the game server's new endpoint", () =>
+      Effect.gen(function* () {
+        yield* resetDatabase
+        fakeCloudflare({
+          records: ["address-record", "srv-record", "alias-record"],
+        })
+        yield* insertCredential()
+        yield* insertAssignment(testAssignment())
+        yield* insertAssignment(testAlias())
+
+        yield* Effect.promise(() =>
+          provisionInstanceDomain(testInstance(), relayId)
+        )
+
+        const rows = yield* selectRows<{ public_host: string }>(
+          "instance_domain"
+        )
+        assert.deepEqual(
+          rows.map((row) => row.public_host),
+          ["new-relay.example.com", "new-relay.example.com"]
+        )
+      }).pipe(Effect.provide(disabledCache))
+    )
+
+    it.effect("keeps a domain whose delete failed from coming back", () =>
+      Effect.gen(function* () {
+        yield* resetDatabase
+        const dns = fakeCloudflare({
+          records: ["address-record", "srv-record", "alias-record"],
+        })
+        dns.refuseDelete.add("alias-record")
+        yield* insertCredential()
+        yield* insertAssignment(testAssignment())
+        yield* insertAssignment(testAlias())
+
+        yield* removeInstanceDomainEffect(relayId, instanceId, aliasId).pipe(
+          Effect.flip
+        )
+        // The game server keeps its primary, so starts and Sync still run.
+        yield* Effect.promise(() =>
+          provisionInstanceDomain(testInstance(), relayId)
+        )
+
+        const rows = yield* selectRows<{ id: string; status: string }>(
+          "instance_domain"
+        )
+        assert.strictEqual(
+          rows.find((row) => row.id === aliasId)?.status,
+          "removing"
+        )
+        assert.notInclude(dns.names(), "alias.kiln.site")
+
+        dns.refuseDelete.clear()
+        yield* removeInstanceDomainEffect(relayId, instanceId, aliasId)
+        assert.deepEqual(yield* assignmentKeys, [`${relayId}:${instanceId}`])
+      }).pipe(Effect.provide(disabledCache))
+    )
+
+    it.effect("moves its other domains when one of them fails", () =>
+      Effect.gen(function* () {
+        yield* resetDatabase
+        // The primary's address record was deleted in Cloudflare by hand.
+        fakeCloudflare({ records: ["srv-record", "alias-record"] })
+        yield* insertCredential()
+        yield* insertAssignment({
+          ...testAssignment(),
+          addressRecordType: "CNAME",
+        })
+        yield* insertAssignment({ ...testAlias(), addressRecordType: "CNAME" })
+
+        const exit = yield* Effect.exit(
+          Effect.promise(() => provisionInstanceDomain(testInstance(), relayId))
+        )
+
+        assert.isTrue(exit._tag === "Failure")
+        const rows = yield* selectRows<{ id: string; public_host: string }>(
+          "instance_domain"
+        )
+        assert.strictEqual(
+          rows.find((row) => row.id === aliasId)?.public_host,
+          "new-relay.example.com"
+        )
+      }).pipe(Effect.provide(disabledCache))
+    )
+
+    it.effect("deletes every domain when the game server is deleted", () =>
+      Effect.gen(function* () {
+        yield* resetDatabase
+        const dns = fakeCloudflare({
+          records: ["address-record", "srv-record", "alias-record"],
+        })
+        yield* insertCredential()
+        yield* insertAssignment(testAssignment())
+        yield* insertAssignment(testAlias())
+
+        yield* deleteInstanceDomainEffect(relayId, instanceId)
+
+        assert.deepEqual(dns.records(), [])
+        assert.deepEqual(yield* assignmentKeys, [])
+      }).pipe(Effect.provide(disabledCache))
+    )
+  })
+})
+
+describeMysql("choosing a new game server's domain", () => {
+  layer(TestDatabase)((it) => {
+    it.effect("spreads new game servers to the least used domain", () =>
+      Effect.gen(function* () {
+        yield* resetDatabase
+        fakeCloudflare()
+        yield* insertCredential({
+          domains: ["kiln.site", "other.site"],
+          strategy: "balanced",
+        })
+        yield* insertAssignment({
+          ...testAssignment(),
+          instanceId: "c".repeat(40),
+        })
+
+        yield* Effect.promise(() =>
+          provisionInstanceDomain(testInstance(), relayId)
+        )
+
+        const rows = yield* selectRows<{ domain: string; instance_id: string }>(
+          "instance_domain"
+        )
+        assert.deepEqual(
+          rows.find((row) => row.instance_id === instanceId)?.domain,
+          "other.site"
+        )
+      }).pipe(Effect.provide(disabledCache))
+    )
+
+    it.effect(
+      "keeps new game servers off a disabled domain while its domains still sync",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          fakeCloudflare({ records: ["address-record", "srv-record"] })
+          yield* insertCredential({
+            disabled: ["other.site"],
+            domains: ["kiln.site", "other.site"],
+            strategy: "balanced",
+          })
+          // other.site is the least used, but disabled.
+          yield* insertAssignment({
+            ...testAssignment(),
+            id: aliasId,
+            instanceId: "c".repeat(40),
+          })
+          yield* insertAssignment({
+            ...testAssignment(),
+            domain: "other.site",
+            instanceId: "d".repeat(40),
+          })
+          const otherServer = {
+            ...testInstance(),
+            id: "d".repeat(40),
+          }
+
+          yield* Effect.promise(() =>
+            provisionInstanceDomain(testInstance(), relayId)
+          )
+          yield* Effect.promise(() =>
+            provisionInstanceDomain(otherServer, relayId)
+          )
+
+          const rows = yield* selectRows<{
+            domain: string
+            instance_id: string
+            public_host: string
+          }>("instance_domain")
+          const byServer = new Map(rows.map((row) => [row.instance_id, row]))
+          assert.strictEqual(byServer.get(instanceId)?.domain, "kiln.site")
+          const existing = byServer.get("d".repeat(40))
+          assert.strictEqual(existing?.domain, "other.site")
+          assert.strictEqual(existing?.public_host, "new-relay.example.com")
+        }).pipe(Effect.provide(disabledCache))
+    )
+
+    it.effect("uses the default domain when told to", () =>
+      Effect.gen(function* () {
+        yield* resetDatabase
+        fakeCloudflare()
+        yield* insertCredential({ domains: ["kiln.site", "other.site"] })
+        yield* insertAssignment({
+          ...testAssignment(),
+          instanceId: "c".repeat(40),
+        })
+
+        yield* Effect.promise(() =>
+          provisionInstanceDomain(testInstance(), relayId)
+        )
+
+        const rows = yield* selectRows<{ domain: string; instance_id: string }>(
+          "instance_domain"
+        )
+        assert.deepEqual(
+          rows.find((row) => row.instance_id === instanceId)?.domain,
+          "kiln.site"
+        )
+      }).pipe(Effect.provide(disabledCache))
+    )
+  })
+})
+
+describeMysql("saving vanity domains", () => {
+  layer(TestDatabase)((it) => {
+    const zoneRows = Effect.map(
+      selectRows<{ domain: string; enabled: number }>("domain_zone"),
+      (rows) =>
+        rows
+          .map((row) => `${row.domain}:${row.enabled ? "on" : "off"}`)
+          .sort()
+    )
+    const save = (reachableZoneIds: Array<string>) =>
+      saveCloudflareIntegrationEffect({
+        apiToken: "api-token",
+        blacklistPatterns: [],
+        domains: [testCredential().domains[0]!],
+        enabled: true,
+        reachableZoneIds: new Set(reachableZoneIds),
+        strategy: "default",
+      })
+
+    it.effect(
+      "keeps a left-out domain with game server domains, and drops the rest",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertCredential({
+            domains: ["kiln.site", "other.site", "spare.site"],
+          })
+          yield* insertAssignment({ ...testAssignment(), domain: "other.site" })
+
+          yield* save(["zone-id", "zone-1", "zone-2"])
+
+          assert.deepEqual(yield* zoneRows, ["kiln.site:on", "other.site:off"])
+          // Disabled, so it takes no new game server domains.
+          const refused = yield* insertInstanceDomainAssignmentEffect({
+            domain: "other.site",
+            id: aliasId,
+            instanceId: "c".repeat(40),
+            primary: true,
+            publicHost: "203.0.113.10",
+            publicPort: 25_565,
+            relayId,
+            srvProtocol: null,
+            srvService: null,
+            supportsSrv: false,
+            vanityLabel: "fresh",
+            zoneId: "zone-1",
+          }).pipe(Effect.flip)
+          assert.strictEqual(refused._tag, "DomainConfigurationError")
+        })
+    )
+
+    it.effect(
+      "refuses a new game server domain in the zone its domain moved from",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertCredential()
+
+          // Loaded before the domain moved zones, so its records would land
+          // in the old zone.
+          const refused = yield* insertInstanceDomainAssignmentEffect({
+            domain: "kiln.site",
+            id: aliasId,
+            instanceId,
+            primary: true,
+            publicHost: "203.0.113.10",
+            publicPort: 25_565,
+            relayId,
+            srvProtocol: null,
+            srvService: null,
+            supportsSrv: false,
+            vanityLabel: "fresh",
+            zoneId: "previous-zone-id",
+          }).pipe(Effect.flip)
+
+          assert.strictEqual(refused._tag, "DomainConfigurationError")
+          assert.deepEqual(yield* assignmentKeys, [])
+        })
+    )
+
+    it.effect(
+      "refuses a token that can't reach a domain game servers still use",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertCredential({ domains: ["kiln.site", "other.site"] })
+          yield* insertAssignment({ ...testAssignment(), domain: "other.site" })
+
+          const refused = yield* save(["zone-id"]).pipe(Effect.flip)
+
+          assert.strictEqual(refused._tag, "DomainConfigurationError")
+          assert.deepEqual(yield* zoneRows, ["kiln.site:on", "other.site:on"])
+        })
     )
   })
 })
@@ -415,9 +902,11 @@ function testAssignment(): InstanceDomainAssignment {
     addressRecordId: "address-record",
     addressRecordType: "A",
     domain: "kiln.site",
+    id: "00000000-0000-4000-8000-000000000001",
     instanceId,
     integrationId: "cloudflare",
     lastError: null,
+    primary: true,
     publicHost: "203.0.113.10",
     publicPort: 25_565,
     relayId,
@@ -427,6 +916,19 @@ function testAssignment(): InstanceDomainAssignment {
     status: "active",
     supportsSrv: true,
     vanityLabel: "play",
+    zoneId: "zone-id",
+  }
+}
+
+/** A second domain on the same game server, without an SRV record. */
+function testAlias(): InstanceDomainAssignment {
+  return {
+    ...testAssignment(),
+    addressRecordId: "alias-record",
+    id: aliasId,
+    primary: false,
+    srvRecordId: null,
+    vanityLabel: "alias",
   }
 }
 
@@ -434,13 +936,20 @@ function testCredential(): CloudflareIntegrationCredential {
   return {
     apiToken: "api-token",
     blacklistPatterns: [],
-    domain: "kiln.site",
+    domains: [
+      {
+        domain: "kiln.site",
+        enabled: true,
+        isDefault: true,
+        zoneId: "zone-id",
+        zoneName: "kiln.site",
+      },
+    ],
     enabled: true,
     id: "cloudflare",
     lastError: null,
     lastVerifiedAt: null,
     provider: "cloudflare",
-    zoneId: "zone-id",
-    zoneName: "kiln.site",
+    strategy: "default",
   }
 }

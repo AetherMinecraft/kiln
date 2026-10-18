@@ -1,39 +1,21 @@
 import * as React from "react"
 import {
-  useMutation,
+  useQuery,
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
-import { Effect, Result } from "effect"
 import {
-  ArrowLeft,
   Check,
-  ChevronDown,
-  ChevronRight,
-  CircleAlert,
-  CircleHelp,
   ExternalLink,
   Globe2,
-  KeyRound,
-  LoaderCircle,
   Pencil,
+  Plus,
   Settings2,
   Trash2,
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@workspace/ui/components/dialog"
-import { Input } from "@workspace/ui/components/input"
-import { Switch } from "@workspace/ui/components/switch"
-import { Textarea } from "@workspace/ui/components/textarea"
 import { showToast } from "@workspace/ui/components/sonner"
 import {
   Tooltip,
@@ -44,7 +26,6 @@ import {
 import {
   DataTableActionGroup,
   DataTableEmptyState,
-  DataTableTextCell,
 } from "@/components/data-table"
 import { DataTable } from "@/components/data-table-view"
 import {
@@ -52,13 +33,39 @@ import {
   DataTableWorkspace,
 } from "@/components/data-table-workspace"
 import type { IdentityStatusPresentation } from "@/components/identity-name"
-import { InfoCopyValue } from "@/components/info-page"
+import {
+  InfoCopyValue,
+  InfoFact,
+  InfoRailCard,
+  InfoRailCardSection,
+} from "@/components/info-page"
 import { InfraSyncButton } from "@/components/infra-sync-button"
 import { InstanceCard } from "@/components/instance-card"
 import { statusColumnWidth } from "@/components/instance-name-presentation"
+import {
+  ServerScopePicker,
+  type ServerPickerOption,
+} from "@/components/server-scope-picker"
 import { StatusIndicator } from "@/components/status-indicator"
 import { WorkspaceCopyValueButton } from "@/components/workspace-header"
-import { WorkspaceSummaryCard } from "@/components/workspace-summary-card"
+import {
+  cloudflareDnsRecordsUrl,
+  domainHostname,
+  serverKey,
+  showErrorToast,
+  strategyOptions,
+  type DirectoryServer,
+} from "@/components/domains-shared"
+import { WorkspacePage } from "@/components/workspace-page"
+import type {
+  DomainIntegration,
+  ManagedDomain,
+} from "@/effect/domains"
+import {
+  ensuringPromise,
+  forkPromise,
+  tapPromiseError,
+} from "@/effect/promise"
 import {
   createDataTableColumnHelper,
   dataTableColumnMeta,
@@ -70,29 +77,18 @@ import {
 } from "@/lib/data-table-search"
 import type { DataTableSource } from "@/lib/data-table-source"
 import {
-  defaultDomainBlacklistPatterns,
-  domainNameSchema,
-  validateBlacklistPatterns,
-  vanityLabelSchema,
-} from "@/lib/domain-schemas"
-import { domainSettingsQueryOptions, queryKeys } from "@/lib/query-options"
-import { ensuringPromise } from "@/effect/promise"
+  domainSettingsQueryOptions,
+  queryKeys,
+  serverDirectoryQueryOptions,
+} from "@/lib/query-options"
 import {
-  configureDomainIntegration,
-  removeInstanceDomain,
   resyncDomainAssignments,
-  setInstanceVanity,
   type ManagedDomainOverview,
 } from "@/server/domains"
 
-interface DomainIntegrationView {
-  blacklistPatterns: Array<string>
-  domain: string
-  enabled: boolean
-  zoneName: string
-}
-
 type DomainDialog =
+  | { kind: "configure" }
+  | { kind: "create" }
   | { kind: "delete"; domain: ManagedDomainOverview }
   | { kind: "edit"; domain: ManagedDomainOverview }
   | null
@@ -112,123 +108,371 @@ const domainTableSearchFields = [
   (row: ManagedDomainOverview) => srvRecordLabel(row),
 ] as const
 
+// The dialogs are large and opened rarely, so they load after the page: when
+// the browser is idle, or when one first opens.
+let dialogsModulePromise:
+  | Promise<typeof import("@/components/domains-dialogs")>
+  | undefined
+
+function loadDomainDialogs() {
+  dialogsModulePromise ??= tapPromiseError(
+    () => import("@/components/domains-dialogs"),
+    (error) => {
+      dialogsModulePromise = undefined
+      throw error
+    }
+  )
+  return dialogsModulePromise
+}
+
+const CreateDomainDialog = React.lazy(async () => ({
+  default: (await loadDomainDialogs()).CreateDomainDialog,
+}))
+const DeleteDomainDialog = React.lazy(async () => ({
+  default: (await loadDomainDialogs()).DeleteDomainDialog,
+}))
+const DomainConfigurationDialog = React.lazy(async () => ({
+  default: (await loadDomainDialogs()).DomainConfigurationDialog,
+}))
+const EditDomainDialog = React.lazy(async () => ({
+  default: (await loadDomainDialogs()).EditDomainDialog,
+}))
+
+/** The game server the table is filtered to. */
+interface DomainScope {
+  instanceId: string
+  /** Missing when a link names only the game server. */
+  relayId: string | undefined
+}
+
 export const DomainsPage = React.memo(function DomainsPage({
+  initialScope,
   searchStore,
 }: {
+  initialScope: DomainScope | null
   searchStore: DataTableSearchStore
 }) {
   const { data } = useSuspenseQuery(domainSettingsQueryOptions())
-  const [configurationOpen, setConfigurationOpen] = React.useState(false)
   const [dialog, setDialog] = React.useState<DomainDialog>(null)
+  const [scope, setScope] = React.useState(initialScope)
+  React.useEffect(() => {
+    const idle =
+      "requestIdleCallback" in window
+        ? // No timeout: forcing it during a busy startup would defeat it.
+          window.requestIdleCallback(() => forkPromise(loadDomainDialogs))
+        : undefined
+    return () => {
+      if (idle !== undefined) window.cancelIdleCallback(idle)
+    }
+  }, [])
+  const selectScope = React.useCallback((next: DomainScope | null) => {
+    setScope(next)
+    // Like the table search, the URL follows without a router render.
+    replaceDataTableUrlSearch(next?.instanceId ?? "", "server")
+    replaceDataTableUrlSearch(next?.relayId ?? "", "relay")
+  }, [])
+  const scopedDomains = React.useMemo(
+    () =>
+      scope
+        ? data.managedDomains.filter(
+            (domain) =>
+              domain.instanceId === scope.instanceId &&
+              (!scope.relayId || domain.relayId === scope.relayId)
+          )
+        : data.managedDomains,
+    [data.managedDomains, scope]
+  )
   const openConfiguration = React.useCallback(
-    () => setConfigurationOpen(true),
+    () => setDialog({ kind: "configure" }),
     []
   )
+  const openCreate = React.useCallback(() => setDialog({ kind: "create" }), [])
   const closeDialog = React.useCallback((open: boolean) => {
     if (!open) setDialog(null)
   }, [])
+  const domains = data.integration?.domains
+  const enabledDomains = React.useMemo(
+    () => domains?.filter((domain) => domain.enabled) ?? [],
+    [domains]
+  )
+  const domainUsage = React.useMemo(() => {
+    const usage = new Map<string, number>()
+    for (const domain of data.managedDomains) {
+      usage.set(domain.domain, (usage.get(domain.domain) ?? 0) + 1)
+    }
+    return usage
+  }, [data.managedDomains])
 
   return (
-    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col gap-3 px-3 pb-3 sm:px-5 sm:pb-5">
-      <DomainSummaryCard
-        integration={data.integration}
-        onConfigure={openConfiguration}
-      />
-
+    <WorkspacePage
+      rail={
+        <DomainsRail
+          integration={data.integration}
+          onConfigure={openConfiguration}
+        />
+      }
+      summary={<DomainScopePicker scope={scope} onSelect={selectScope} />}
+    >
       <DataTableWorkspace
         toolbar={
           <DomainsToolbar
-            syncEnabled={data.integration?.enabled === true}
+            canCreate={enabledDomains.length > 0}
+            syncEnabled={data.integration !== null}
             searchStore={searchStore}
+            onCreate={openCreate}
           />
         }
       >
         <ManagedDomainsTable
-          domains={data.managedDomains}
+          domains={scopedDomains}
           searchStore={searchStore}
-          zoneName={data.integration?.zoneName}
           onDialog={setDialog}
         />
       </DataTableWorkspace>
 
-      {configurationOpen ? (
+      <React.Suspense fallback={null}>
+      {dialog?.kind === "configure" ? (
         <DomainConfigurationDialog
-          key={domainIntegrationKey(data.integration)}
+          domainUsage={domainUsage}
           hearthDomain={data.hearthDomain}
           integration={data.integration}
-          open
-          onOpenChange={setConfigurationOpen}
+          onOpenChange={closeDialog}
+        />
+      ) : null}
+      {dialog?.kind === "create" ? (
+        <CreateDomainDialog
+          domains={enabledDomains}
+          initialServerKey={
+            scope?.relayId ? serverKey(scope.relayId, scope.instanceId) : null
+          }
+          managedDomains={data.managedDomains}
+          onOpenChange={closeDialog}
         />
       ) : null}
       {dialog?.kind === "edit" ? (
         <EditDomainDialog
-          key={managedDomainRowKey(dialog.domain)}
+          key={dialog.domain.id}
           domain={dialog.domain}
+          domains={enabledDomains}
           onOpenChange={closeDialog}
         />
       ) : null}
       {dialog?.kind === "delete" ? (
         <DeleteDomainDialog
-          key={managedDomainRowKey(dialog.domain)}
+          key={dialog.domain.id}
           domain={dialog.domain}
           onOpenChange={closeDialog}
         />
       ) : null}
-    </div>
+      </React.Suspense>
+    </WorkspacePage>
   )
 })
 
-const DomainSummaryCard = React.memo(function DomainSummaryCard({
+/** Filters the table to one game server, as Backups and Activity do. */
+const DomainScopePicker = React.memo(function DomainScopePicker({
+  onSelect,
+  scope,
+}: {
+  onSelect: (scope: DomainScope | null) => void
+  scope: DomainScope | null
+}) {
+  const { data: servers = emptyScopeServers } = useQuery({
+    ...serverDirectoryQueryOptions(),
+    select: selectScopeServers,
+  })
+  const selectedServer =
+    (scope &&
+      servers.find(
+        (server) =>
+          server.id === scope.instanceId &&
+          (!scope.relayId || server.relayId === scope.relayId)
+      )) ||
+    null
+  const select = React.useCallback(
+    (server: ServerPickerOption | null) =>
+      onSelect(
+        server ? { instanceId: server.id, relayId: server.relayId } : null
+      ),
+    [onSelect]
+  )
+  return (
+    <ServerScopePicker
+      selectedServer={selectedServer}
+      servers={servers}
+      onSelect={select}
+    />
+  )
+})
+
+const emptyScopeServers: Array<ServerPickerOption> = []
+
+function selectScopeServers(
+  servers: ReadonlyArray<DirectoryServer>
+): Array<ServerPickerOption> {
+  return servers.map((server) => ({
+    id: server.id,
+    name: server.name,
+    relayId: server.relayId,
+    relayName: server.relayName,
+  }))
+}
+
+/** Reloads the configured domains and the table. */
+const DomainsRefreshButton = React.memo(function DomainsRefreshButton() {
+  const queryClient = useQueryClient()
+  const refresh = React.useCallback(
+    () =>
+      queryClient.invalidateQueries({ queryKey: queryKeys.domains.settings }),
+    [queryClient]
+  )
+  return (
+    <InfraSyncButton
+      label="Refresh domains"
+      size="icon-sm"
+      sync={refresh}
+      onError={showErrorToast}
+    />
+  )
+})
+
+/**
+ * The configured domains, set apart from the facts above. Beside the table it
+ * fills the rail; stacked below it, it shows seven and a half rows so the
+ * cut-off row says the list scrolls.
+ */
+function VanityDomainList({
+  domains,
+}: {
+  domains: ReadonlyArray<ManagedDomain>
+}) {
+  return (
+    <InfoRailCardSection
+      action={
+        <span className="type-meta text-muted-foreground tabular-nums">
+          {domains.length}
+        </span>
+      }
+      className="xl:flex xl:min-h-0 xl:flex-1 xl:flex-col"
+      contentClassName="max-h-[calc(7.5*2.25rem)] overflow-y-auto xl:max-h-none xl:min-h-0 xl:flex-1"
+      title="Domains"
+    >
+      <ul aria-label="Vanity domains">
+        {domains.map((domain) => (
+          // Dividers span the middle 85%, centered.
+          <li
+            key={domain.domain}
+            className="relative after:absolute after:inset-x-[7.5%] after:bottom-0 after:h-px after:bg-border/60 last:after:hidden"
+          >
+            <a
+              aria-label={`View ${domain.domain} on Cloudflare`}
+              className={`group flex h-9 items-center gap-2 px-2 font-mono text-[0.8125rem] outline-none hover:bg-muted/60 focus-visible:bg-muted/60 ${
+                domain.enabled ? "" : "text-muted-foreground"
+              }`}
+              href={cloudflareDnsRecordsUrl(domain.zoneName)}
+              rel="noreferrer"
+              target="_blank"
+            >
+              <span className="min-w-0 flex-1 truncate">{domain.domain}</span>
+              <ExternalLink className="size-3 shrink-0 text-muted-foreground/40 transition-colors group-hover:text-primary group-focus-visible:text-primary" />
+            </a>
+          </li>
+        ))}
+      </ul>
+    </InfoRailCardSection>
+  )
+}
+
+/** What vanity is set up to do, beside the table. */
+const DomainsRail = React.memo(function DomainsRail({
   integration,
   onConfigure,
 }: {
-  integration: DomainIntegrationView | null
+  integration: DomainIntegration | null
   onConfigure: () => void
 }) {
-  const active = integration?.enabled === true
-  const configured = integration !== null
-
+  const strategy = strategyOptions.find(
+    (option) => option.value === integration?.strategy
+  )
+  const defaultDomain = integration?.domains.find((domain) => domain.isDefault)
   return (
-    <WorkspaceSummaryCard
+    <InfoRailCard
       action={
-        <Button
-          className="shrink-0"
-          size="sm"
-          type="button"
-          variant="outline"
-          onClick={onConfigure}
-        >
-          <Settings2 />
-          Configure Vanity
-        </Button>
+        <div className="flex items-center gap-1.5">
+          {integration ? <DomainsRefreshButton /> : null}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-label="Configure vanity"
+                size="icon-sm"
+                type="button"
+                variant="outline"
+                onClick={onConfigure}
+              >
+                <Settings2 />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={6}>
+              Configure vanity
+            </TooltipContent>
+          </Tooltip>
+        </div>
       }
-      icon={<Globe2 className="size-5" />}
-      iconClassName={
-        active
-          ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
-          : configured
-            ? "border-amber-300/25 bg-amber-300/8 text-amber-200"
-            : "border-border/80 bg-background/70 text-muted-foreground"
+      // Half the rail beside the table, leaving the rest for more cards. The
+      // domain list fills what's left of the card.
+      className="xl:flex xl:min-h-0 xl:flex-none xl:basis-1/2 xl:flex-col"
+      icon={<Globe2 />}
+      sections={
+        integration && integration.domains.length > 0 ? (
+          <VanityDomainList domains={integration.domains} />
+        ) : null
       }
-      title="Vanity URL"
-      titleAccessory={<DomainStatus enabled={active} verified={configured} />}
+      title="Vanity"
     >
-      <p className="type-code mt-1 truncate text-muted-foreground">
-        {`<vanity>.${integration?.domain ?? "example.com"}`}
-      </p>
-    </WorkspaceSummaryCard>
+      {integration ? (
+        <>
+          <InfoFact label="Auto provisioning">
+            {integration.enabled ? (strategy?.label ?? "Default only") : "Off"}
+          </InfoFact>
+          {defaultDomain ? (
+            <InfoFact label="Default">
+              <span className="truncate font-mono">{defaultDomain.domain}</span>
+            </InfoFact>
+          ) : null}
+        </>
+      ) : (
+        <InfoFact label="Cloudflare">
+          <span className="text-muted-foreground">Not connected</span>
+        </InfoFact>
+      )}
+    </InfoRailCard>
   )
 })
 
 const DomainsToolbar = React.memo(function DomainsToolbar({
+  canCreate,
+  onCreate,
   searchStore,
   syncEnabled,
 }: {
+  canCreate: boolean
+  onCreate: () => void
   searchStore: DataTableSearchStore
   syncEnabled: boolean
 }) {
   return (
     <DataTableToolbar
+      actions={
+        <Button
+          aria-label="New domain"
+          disabled={!canCreate}
+          type="button"
+          onClick={onCreate}
+        >
+          <Plus />
+          <span className="hidden sm:inline">New domain</span>
+        </Button>
+      }
       leading={<DomainSyncButton enabled={syncEnabled} />}
       search={{
         ariaLabel: "Search domains",
@@ -284,28 +528,24 @@ const ManagedDomainsTable = React.memo(function ManagedDomainsTable({
   domains,
   onDialog,
   searchStore,
-  zoneName,
 }: {
   domains: Array<ManagedDomainOverview>
   onDialog: (dialog: DomainDialog) => void
   searchStore: DataTableSearchStore
-  zoneName: string | undefined
 }) {
   // The server sorts by domain, so a rename or delete shifts later rows.
-  // Match rows by game server instead of position, so only changed rows
-  // repaint.
+  // Match rows by ID instead of position, so only changed rows repaint.
   const [rowCache] = React.useState(
     () => new Map<string, { json: string; row: ManagedDomainOverview }>()
   )
   const source = React.useMemo<DataTableSource<ManagedDomainOverview>>(() => {
     const seen = new Set<string>()
     const rows = domains.map((domain) => {
-      const key = managedDomainRowKey(domain)
       const json = JSON.stringify(domain)
-      seen.add(key)
-      const cached = rowCache.get(key)
+      seen.add(domain.id)
+      const cached = rowCache.get(domain.id)
       if (cached?.json === json) return cached.row
-      rowCache.set(key, { json, row: domain })
+      rowCache.set(domain.id, { json, row: domain })
       return domain
     })
     for (const key of rowCache.keys()) {
@@ -335,15 +575,15 @@ const ManagedDomainsTable = React.memo(function ManagedDomainsTable({
         ),
       }),
       domainTableColumnHelper.accessor((domain) => domain.server.name, {
-        id: "server",
-        header: "Game Server",
+        id: "instance",
+        header: "Instance",
         sortFn: "text",
         cell: ({ row }) => <DomainServerCell domain={row.original} />,
         meta: dataTableColumnMeta(
           {
             // Phones keep the domain, which this table is about.
             hideBelow: "sm",
-            width: { base: "minmax(0,1fr)", md: "minmax(0,1.1fr)" },
+            width: "minmax(8rem,0.55fr)",
           },
           { cellClassName: "px-0" }
         ),
@@ -352,17 +592,8 @@ const ManagedDomainsTable = React.memo(function ManagedDomainsTable({
         id: "domain",
         header: "Domain",
         sortFn: "text",
-        cell: ({ row }) => (
-          <div className="type-meta flex w-full min-w-0">
-            <WorkspaceCopyValueButton
-              label="domain"
-              value={domainHostname(row.original)}
-            />
-          </div>
-        ),
-        meta: dataTableColumnMeta({
-          width: { base: "minmax(0,1fr)", md: "minmax(0,1.2fr)" },
-        }),
+        cell: ({ row }) => <DomainHostnameCell domain={row.original} />,
+        meta: dataTableColumnMeta({ width: "minmax(0,1.4fr)" }),
       }),
       domainTableColumnHelper.accessor((domain) => domain.port, {
         id: "port",
@@ -371,51 +602,37 @@ const ManagedDomainsTable = React.memo(function ManagedDomainsTable({
         cell: ({ row }) => (
           <InfoCopyValue label="port" value={String(row.original.port)} />
         ),
-        meta: dataTableColumnMeta({ hideBelow: "sm", width: "6.5rem" }),
+        meta: dataTableColumnMeta({ hideBelow: "sm", width: "5.75rem" }),
       }),
       domainTableColumnHelper.accessor((domain) => srvRecordLabel(domain), {
         id: "srv",
         header: "SRV",
         sortFn: "text",
         cell: ({ row }) => <SrvRecordCell domain={row.original} />,
-        meta: dataTableColumnMeta({ hideBelow: "md", width: "7.5rem" }),
-      }),
-      domainTableColumnHelper.accessor((domain) => domain.relayName, {
-        id: "relay",
-        header: "Relay",
-        sortFn: "text",
-        cell: ({ row }) => <DataTableTextCell value={row.original.relayName} />,
-        meta: dataTableColumnMeta({
-          hideBelow: "lg",
-          width: "minmax(0,0.7fr)",
-        }),
+        meta: dataTableColumnMeta({ hideBelow: "md", width: "6.5rem" }),
       }),
       domainTableColumnHelper.display({
         id: "actions",
         header: () => <span className="sr-only">Actions</span>,
         enableSorting: false,
         cell: ({ row }) => (
-          <DomainActions
-            domain={row.original}
-            zoneName={zoneName}
-            onDialog={onDialog}
-          />
+          <DomainActions domain={row.original} onDialog={onDialog} />
         ),
         meta: dataTableColumnMeta(
-          { width: "7rem" },
-          { cellClassName: "px-1 sm:px-3", headerClassName: "px-1 sm:px-3" }
+          { width: "6.5rem" },
+          { cellClassName: "px-1 sm:px-2", headerClassName: "px-1 sm:px-2" }
         ),
       }),
     ])
     return defineDataTable({
       ariaLabel: "Managed domains",
       columns,
-      getRowId: managedDomainRowKey,
+      getRowId: (domain) => domain.id,
       model: { initialState: initialTableState },
       search: { fields: domainTableSearchFields },
       virtualization: true,
     })
-  }, [initialTableState, onDialog, zoneName])
+  }, [initialTableState, onDialog])
 
   return (
     <DataTable
@@ -463,6 +680,14 @@ const DomainServerCell = React.memo(function DomainServerCell({
   )
 })
 
+function DomainHostnameCell({ domain }: { domain: ManagedDomainOverview }) {
+  return (
+    <div className="type-meta flex w-full min-w-0">
+      <WorkspaceCopyValueButton label="domain" value={domainHostname(domain)} />
+    </div>
+  )
+}
+
 function SrvRecordCell({ domain }: { domain: ManagedDomainOverview }) {
   return domain.srvActive ? (
     <span className="type-meta inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-300">
@@ -479,11 +704,9 @@ function SrvRecordCell({ domain }: { domain: ManagedDomainOverview }) {
 const DomainActions = React.memo(function DomainActions({
   domain,
   onDialog,
-  zoneName,
 }: {
   domain: ManagedDomainOverview
   onDialog: (dialog: DomainDialog) => void
-  zoneName: string | undefined
 }) {
   const hostname = domainHostname(domain)
 
@@ -494,6 +717,8 @@ const DomainActions = React.memo(function DomainActions({
           <Button
             aria-label={`Edit ${hostname}`}
             className="text-muted-foreground hover:text-primary"
+            // A domain being deleted can only be deleted again.
+            disabled={domain.status === "removing"}
             size="icon-sm"
             type="button"
             variant="ghost"
@@ -519,7 +744,7 @@ const DomainActions = React.memo(function DomainActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">Delete</TooltipContent>
       </Tooltip>
-      {zoneName ? (
+      {domain.zoneName ? (
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -530,7 +755,7 @@ const DomainActions = React.memo(function DomainActions({
             >
               <a
                 aria-label={`View ${hostname} on Cloudflare`}
-                href={cloudflareDnsRecordsUrl(zoneName)}
+                href={cloudflareDnsRecordsUrl(domain.zoneName)}
                 rel="noreferrer"
                 target="_blank"
               >
@@ -552,7 +777,7 @@ function renderEmptyDomains({ searchActive }: { searchActive: boolean }) {
         <span className="block max-w-sm">
           {searchActive
             ? "Try a vanity address, game server, Relay, port, status, or ID."
-            : "Active vanity addresses will appear here after a game server is provisioned."}
+            : "Create a domain for a game server, or turn on automatic provisioning to give new game servers one."}
         </span>
       }
       icon={<Globe2 className="size-6 text-muted-foreground/45" />}
@@ -563,742 +788,6 @@ function renderEmptyDomains({ searchActive }: { searchActive: boolean }) {
   )
 }
 
-function EditDomainDialog({
-  domain,
-  onOpenChange,
-}: {
-  domain: ManagedDomainOverview
-  onOpenChange: (open: boolean) => void
-}) {
-  const queryClient = useQueryClient()
-  const [vanityLabel, setVanityLabel] = React.useState(domain.vanityLabel)
-  const parsed = vanityLabelSchema.safeParse(vanityLabel)
-  const unchanged = parsed.success && parsed.data === domain.vanityLabel
-  const save = useMutation({
-    mutationFn: (label: string) =>
-      setInstanceVanity({
-        data: {
-          instanceId: domain.instanceId,
-          relayId: domain.relayId,
-          vanityLabel: label,
-        },
-      }),
-    // A failed rename can still clear a failed domain's leftover records.
-    onSettled: () =>
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.domains.settings,
-      }),
-    onSuccess: (result) => {
-      showToast({ message: `Renamed to ${result.address}`, type: "success" })
-      onOpenChange(false)
-    },
-  })
-
-  return (
-    <Dialog open onOpenChange={save.isPending ? undefined : onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Edit domain</DialogTitle>
-          <DialogDescription>
-            Choose the vanity name players use to join {domain.server.name}.
-          </DialogDescription>
-        </DialogHeader>
-        <form
-          className="space-y-4"
-          onSubmit={(event) => {
-            event.preventDefault()
-            if (parsed.success && !unchanged) save.mutate(parsed.data)
-          }}
-        >
-          <label className="type-label block space-y-1.5">
-            Vanity name
-            <div className="flex min-w-0 items-center gap-2">
-              <Input
-                autoCapitalize="none"
-                autoCorrect="off"
-                autoFocus
-                aria-invalid={!parsed.success || undefined}
-                className="min-w-0 flex-1 font-mono"
-                maxLength={63}
-                name="vanityLabel"
-                spellCheck={false}
-                value={vanityLabel}
-                onChange={(event) => setVanityLabel(event.currentTarget.value)}
-              />
-              <span className="type-code shrink-0 text-muted-foreground">
-                .{domain.domain}
-              </span>
-            </div>
-            <span
-              className={
-                parsed.success
-                  ? "type-meta block text-muted-foreground"
-                  : "type-meta block text-destructive"
-              }
-            >
-              {parsed.success
-                ? "Kiln updates the DNS records in Cloudflare."
-                : (parsed.error.issues[0]?.message ?? "Enter a vanity name")}
-            </span>
-          </label>
-
-          {save.error ? <ConfigurationError error={save.error} /> : null}
-
-          <DialogFooter>
-            <Button
-              disabled={save.isPending}
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              disabled={save.isPending || !parsed.success || unchanged}
-              type="submit"
-            >
-              {save.isPending ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <Check />
-              )}
-              Save
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function DeleteDomainDialog({
-  domain,
-  onOpenChange,
-}: {
-  domain: ManagedDomainOverview
-  onOpenChange: (open: boolean) => void
-}) {
-  const queryClient = useQueryClient()
-  const hostname = domainHostname(domain)
-  const remove = useMutation({
-    mutationFn: () =>
-      removeInstanceDomain({
-        data: { instanceId: domain.instanceId, relayId: domain.relayId },
-      }),
-    // A failed delete marks the domain as failed, so refresh either way.
-    onSettled: () =>
-      Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.domains.settings,
-        }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.relay.snapshot }),
-      ]),
-    onSuccess: () => {
-      showToast({ message: `Deleted ${hostname}`, type: "success" })
-      onOpenChange(false)
-    },
-  })
-
-  return (
-    <Dialog open onOpenChange={remove.isPending ? undefined : onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Delete domain</DialogTitle>
-          <DialogDescription>
-            Kiln deletes <span className="font-mono">{hostname}</span> from
-            Cloudflare. Players join {domain.server.name} by its Relay address
-            instead, and Kiln won&apos;t give it a new vanity domain when it
-            starts or syncs.
-          </DialogDescription>
-        </DialogHeader>
-
-        {remove.error ? <ConfigurationError error={remove.error} /> : null}
-
-        <DialogFooter>
-          <Button
-            disabled={remove.isPending}
-            type="button"
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            disabled={remove.isPending}
-            type="button"
-            variant="destructive"
-            onClick={() => remove.mutate()}
-          >
-            {remove.isPending ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <Trash2 />
-            )}
-            Delete domain
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function DomainConfigurationDialog({
-  hearthDomain,
-  integration,
-  open,
-  onOpenChange,
-}: {
-  hearthDomain: string
-  integration: DomainIntegrationView | null
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}) {
-  const queryClient = useQueryClient()
-  const [mode, setMode] = React.useState<"settings" | "permissions">("settings")
-  const [domain, setDomain] = React.useState(integration?.domain ?? "")
-  const [permissionsDomain, setPermissionsDomain] = React.useState(hearthDomain)
-  const [permissionsPending, setPermissionsPending] = React.useState(false)
-  const [enabled, setEnabled] = React.useState(integration?.enabled ?? true)
-  const [blacklistPatterns, setBlacklistPatterns] = React.useState(() =>
-    (
-      integration?.blacklistPatterns ?? [...defaultDomainBlacklistPatterns]
-    ).join("\n")
-  )
-  const [apiToken, setApiToken] = React.useState("")
-  const configure = useMutation({
-    mutationFn: configureDomainIntegration,
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.domains.settings,
-        }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.relay.snapshot }),
-      ])
-      showToast({
-        message: "Cloudflare vanity configuration saved",
-        type: "success",
-      })
-      onOpenChange(false)
-    },
-  })
-
-  const save = React.useCallback(() => {
-    const parsedDomain = domainNameSchema.safeParse(domain)
-    if (!parsedDomain.success) {
-      showToast({
-        message:
-          parsedDomain.error.issues[0]?.message ?? "Enter a valid domain",
-        type: "error",
-      })
-      return
-    }
-    const patternsResult = Result.try(() =>
-      validateBlacklistPatterns(
-        blacklistPatterns
-          .split(/\r?\n/u)
-          .map((pattern) => pattern.trim())
-          .filter(Boolean)
-      )
-    )
-    if (Result.isFailure(patternsResult)) {
-      showToast({
-        message: errorMessage(patternsResult.failure),
-        type: "error",
-      })
-      return
-    }
-    const token = apiToken.trim()
-    if ((!integration && !token) || (token && token.length < 20)) {
-      showToast({
-        message: "Enter a valid Cloudflare API token",
-        type: "error",
-      })
-      return
-    }
-    configure.mutate({
-      data: {
-        apiToken: token || undefined,
-        blacklistPatterns: patternsResult.success,
-        domain: parsedDomain.data,
-        enabled,
-      },
-    })
-  }, [apiToken, blacklistPatterns, configure, domain, enabled, integration])
-  const openPermissions = React.useCallback(async () => {
-    setPermissionsPending(true)
-    await Effect.runPromise(
-      Effect.tryPromise({
-        try: () => import("@/lib/domain-name"),
-        catch: (cause) => cause,
-      }).pipe(
-        Effect.match({
-          onFailure: () => {
-            showToast({
-              message: "Could not load the Cloudflare permissions preview",
-              type: "error",
-            })
-          },
-          onSuccess: ({ rootDomainForHostname }) => {
-            setPermissionsDomain(rootDomainForHostname(domain) || hearthDomain)
-            setMode("permissions")
-          },
-        }),
-        Effect.ensuring(
-          Effect.sync(() => {
-            setPermissionsPending(false)
-          })
-        )
-      )
-    )
-  }, [domain, hearthDomain])
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className={mode === "permissions" ? "sm:max-w-3xl" : "sm:max-w-xl"}
-      >
-        <DialogHeader>
-          {mode === "settings" ? (
-            <>
-              <DialogTitle>Configure vanity URLs</DialogTitle>
-              <DialogDescription>
-                Choose the suffix Kiln uses for managed game-server addresses.
-              </DialogDescription>
-            </>
-          ) : (
-            <div className="flex items-center gap-3">
-              <Button
-                className="-ml-2"
-                size="sm"
-                type="button"
-                variant="ghost"
-                onClick={() => setMode("settings")}
-              >
-                <ArrowLeft /> Back
-              </Button>
-              <DialogTitle>Required Cloudflare permissions</DialogTitle>
-              <DialogDescription className="sr-only">
-                Cloudflare permissions required by Kiln.
-              </DialogDescription>
-            </div>
-          )}
-        </DialogHeader>
-
-        {mode === "settings" ? (
-          <VanitySettingsForm
-            apiToken={apiToken}
-            blacklistPatterns={blacklistPatterns}
-            domain={domain}
-            enabled={enabled}
-            error={configure.error}
-            hasIntegration={Boolean(integration)}
-            isPending={configure.isPending}
-            permissionsPending={permissionsPending}
-            onApiTokenChange={setApiToken}
-            onBlacklistPatternsChange={setBlacklistPatterns}
-            onCancel={() => onOpenChange(false)}
-            onDomainChange={setDomain}
-            onEnabledChange={setEnabled}
-            onOpenPermissions={openPermissions}
-            onSave={save}
-          />
-        ) : (
-          <CloudflarePermissionsPreview
-            domain={permissionsDomain}
-            error={configure.error}
-          />
-        )}
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function VanitySettingsForm({
-  apiToken,
-  blacklistPatterns,
-  domain,
-  enabled,
-  error,
-  hasIntegration,
-  isPending,
-  permissionsPending,
-  onApiTokenChange,
-  onBlacklistPatternsChange,
-  onCancel,
-  onDomainChange,
-  onEnabledChange,
-  onOpenPermissions,
-  onSave,
-}: {
-  apiToken: string
-  blacklistPatterns: string
-  domain: string
-  enabled: boolean
-  error: Error | null
-  hasIntegration: boolean
-  isPending: boolean
-  permissionsPending: boolean
-  onApiTokenChange: (value: string) => void
-  onBlacklistPatternsChange: (value: string) => void
-  onCancel: () => void
-  onDomainChange: (value: string) => void
-  onEnabledChange: (enabled: boolean) => void
-  onOpenPermissions: () => void
-  onSave: () => void
-}) {
-  const tokenLength = apiToken.trim().length
-  const tokenInvalid = tokenLength < 20 && (!hasIntegration || tokenLength > 0)
-
-  return (
-    <div className="space-y-4">
-      <label className="type-label block space-y-1.5">
-        Vanity domain
-        <Input
-          autoCapitalize="none"
-          autoCorrect="off"
-          className="font-mono"
-          name="domain"
-          placeholder="example.gg"
-          required
-          value={domain}
-          onChange={(event) => onDomainChange(event.currentTarget.value)}
-        />
-        <span className="type-meta block font-mono text-muted-foreground">
-          {`<vanity>.${domain.trim() || "example.gg"}`}
-        </span>
-      </label>
-
-      <div className="space-y-1.5">
-        <div className="flex items-center justify-between gap-3">
-          <label className="type-control-sm" htmlFor="cloudflare-api-token">
-            Cloudflare API token
-          </label>
-          <a
-            className="type-label inline-flex items-center gap-1 text-primary hover:underline"
-            href="https://dash.cloudflare.com/profile/api-tokens"
-            rel="noreferrer"
-            target="_blank"
-          >
-            Create token <ExternalLink className="size-2.5" />
-          </a>
-        </div>
-        <div className="flex items-center gap-2">
-          <Input
-            autoComplete="new-password"
-            className="min-w-0 flex-1 font-mono"
-            id="cloudflare-api-token"
-            minLength={20}
-            name="apiToken"
-            placeholder="Cloudflare Token"
-            required={!hasIntegration}
-            type="password"
-            value={apiToken}
-            onChange={(event) => onApiTokenChange(event.currentTarget.value)}
-          />
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                aria-label="Preview required Cloudflare permissions"
-                aria-busy={permissionsPending}
-                disabled={permissionsPending}
-                size="icon"
-                type="button"
-                variant="outline"
-                onClick={onOpenPermissions}
-              >
-                {permissionsPending ? (
-                  <LoaderCircle className="animate-spin" />
-                ) : (
-                  <CircleHelp />
-                )}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="left">
-              Preview required permissions
-            </TooltipContent>
-          </Tooltip>
-        </div>
-        <p className="type-meta flex items-start gap-1.5 text-muted-foreground">
-          <KeyRound className="mt-0.5 size-3 shrink-0" />
-          <span>
-            {hasIntegration
-              ? "Optional. Leave blank to keep the encrypted token already on file."
-              : "Stored encrypted and restricted to the DNS zone Kiln manages."}
-          </span>
-        </p>
-      </div>
-
-      <div className="flex items-center justify-between gap-4 border border-border/75 bg-background/35 p-3">
-        <div>
-          <p className="text-xs font-medium">Automatic provisioning</p>
-          <p className="type-meta mt-0.5 text-muted-foreground">
-            Create and reconcile DNS records as servers are provisioned.
-          </p>
-        </div>
-        <Switch
-          aria-label="Enable automatic domain provisioning"
-          checked={enabled}
-          onCheckedChange={onEnabledChange}
-        />
-      </div>
-
-      <label className="type-label block space-y-1.5">
-        Blacklisted vanity names
-        <Textarea
-          aria-label="Blacklisted vanity name patterns"
-          className="min-h-36 font-mono text-xs"
-          placeholder={"^(admin|api|www)$\n^staff-"}
-          value={blacklistPatterns}
-          onChange={(event) =>
-            onBlacklistPatternsChange(event.currentTarget.value)
-          }
-        />
-        <span className="type-meta block text-muted-foreground">
-          One case-insensitive regular expression per line.
-        </span>
-      </label>
-
-      {error ? <ConfigurationError error={error} /> : null}
-
-      <DialogFooter>
-        <Button type="button" variant="outline" onClick={onCancel}>
-          Cancel
-        </Button>
-        <Button
-          disabled={isPending || tokenInvalid}
-          type="button"
-          onClick={onSave}
-        >
-          {isPending ? <LoaderCircle className="animate-spin" /> : <Check />}
-          {tokenLength ? "Verify & save" : "Save configuration"}
-        </Button>
-      </DialogFooter>
-    </div>
-  )
-}
-
-function CloudflarePermissionsPreview({
-  domain,
-  error,
-}: {
-  domain: string
-  error: Error | null
-}) {
-  return (
-    <div className="space-y-4">
-      <CloudflarePermissionPolicy domain={domain} />
-
-      <div className="flex gap-2 border border-amber-500/25 bg-amber-400/8 p-3 text-amber-950/85 dark:border-amber-400/20 dark:bg-amber-400/5 dark:text-amber-100/85">
-        <KeyRound className="mt-0.5 size-3.5 shrink-0 text-amber-700 dark:text-amber-300" />
-        <p className="type-meta">
-          Kiln encrypts the token at rest, never returns it to the browser, and
-          keeps every managed record DNS-only.
-        </p>
-      </div>
-
-      {error ? <ConfigurationError error={error} /> : null}
-    </div>
-  )
-}
-
-function CloudflarePermissionPolicy({ domain }: { domain: string }) {
-  return (
-    <div className="overflow-hidden rounded-lg border border-black/15 bg-[#fafafa] text-[#191919] shadow-lg shadow-black/10 dark:border-white/12 dark:bg-[#101010] dark:text-[#ededed] dark:shadow-black/15">
-      <div className="flex items-center justify-between border-b border-black/10 bg-[#f1f1f1] px-3 py-2.5 dark:border-white/10 dark:bg-[#141414]">
-        <p className="type-label">Edit policy</p>
-        <span className="type-meta text-stone-600 dark:text-stone-300">
-          Custom
-        </span>
-      </div>
-
-      <div className="grid gap-2 border-b border-black/10 p-3 sm:grid-cols-[minmax(9rem,0.8fr)_minmax(0,1.35fr)] dark:border-white/10">
-        <div className="flex min-w-0 items-center justify-between gap-3 rounded-md border border-black/15 bg-white px-3 py-2.5 dark:border-white/15 dark:bg-white/[0.025]">
-          <span className="type-label">Specified domains</span>
-          <ChevronDown className="size-3.5 shrink-0 text-black/45 dark:text-white/45" />
-        </div>
-        <div className="flex min-w-0 items-center gap-2 rounded-md border border-black/20 bg-white px-3 py-2.5 dark:border-white/20 dark:bg-white/[0.045]">
-          <Globe2 className="size-3.5 shrink-0 text-black/70 dark:text-white/70" />
-          <span className="type-code truncate text-stone-900 dark:text-stone-100">
-            {domain}
-          </span>
-          <ChevronDown className="ml-auto size-3.5 shrink-0 text-black/45 dark:text-white/45" />
-        </div>
-      </div>
-
-      <VisualPermissionGroup label="Developer Platform" total={4} />
-      <VisualPermissionGroup label="AI & Machine Learning" total={4} />
-      <VisualPermissionGroup label="DNS & Zones" selected={2} total={12}>
-        <CloudflarePermissionRow
-          description="Grants write access to DNS"
-          edit
-          name="DNS"
-        />
-        <CloudflarePermissionRow
-          description="Grants read access to zone management"
-          name="Zone"
-          read
-        />
-        <CloudflarePermissionRow
-          description="Grants read access to zone custom assets"
-          name="Zone Custom Asset"
-        />
-        <CloudflarePermissionRow
-          description="Grants access to Zone DNS Settings"
-          name="Zone DNS Settings"
-        />
-        <CloudflarePermissionRow
-          description="Grants access to zone settings"
-          name="Zone Settings"
-        />
-      </VisualPermissionGroup>
-      <VisualPermissionGroup label="App Security" total={25} />
-    </div>
-  )
-}
-
-function VisualPermissionGroup({
-  children,
-  label,
-  selected = 0,
-  total,
-}: {
-  children?: React.ReactNode
-  label: string
-  selected?: number
-  total: number
-}) {
-  const expanded = children !== undefined
-
-  return (
-    <div className="border-b border-black/10 last:border-b-0 dark:border-white/10">
-      <div className="flex items-center gap-2 bg-black/[0.015] px-3 py-2.5 dark:bg-white/[0.015]">
-        {expanded ? (
-          <ChevronDown className="size-3.5 shrink-0 text-black/75 dark:text-white/75" />
-        ) : (
-          <ChevronRight className="size-3.5 shrink-0 text-black/30 dark:text-white/30" />
-        )}
-        <span
-          className={
-            expanded
-              ? "type-label text-stone-900 dark:text-stone-100"
-              : "type-label text-stone-600 dark:text-stone-300"
-          }
-        >
-          {label}
-        </span>
-        <span className="type-meta ml-auto font-mono text-stone-600 dark:text-stone-300">
-          {selected}/{total}
-        </span>
-      </div>
-      {children}
-    </div>
-  )
-}
-
-function CloudflarePermissionRow({
-  description,
-  edit = false,
-  name,
-  read = false,
-}: {
-  description: string
-  edit?: boolean
-  name: string
-  read?: boolean
-}) {
-  return (
-    <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 border-t border-dashed border-black/10 px-3 py-2.5 sm:grid-cols-[minmax(8rem,0.8fr)_minmax(10rem,1.25fr)_auto] sm:items-center dark:border-white/10">
-      <p className="type-label col-start-1 row-start-1 truncate text-stone-900 dark:text-stone-100">
-        {name}
-      </p>
-      <p className="type-meta col-start-1 row-start-2 mt-0.5 truncate text-stone-600 sm:col-start-2 sm:row-start-1 sm:mt-0 dark:text-stone-300">
-        {description}
-      </p>
-      <div className="col-start-2 row-span-2 row-start-1 flex items-center rounded-md border border-black/12 bg-black/[0.035] p-1 sm:col-start-3 sm:row-span-1 dark:border-white/12 dark:bg-black/25">
-        <PermissionAccess active={read} label="Read" />
-        <PermissionAccess active={edit} label="Edit" />
-      </div>
-    </div>
-  )
-}
-
-function PermissionAccess({
-  active,
-  label,
-}: {
-  active: boolean
-  label: string
-}) {
-  return (
-    <span
-      className={
-        active
-          ? "type-label flex items-center gap-1.5 rounded px-1.5 py-1 text-stone-900 dark:text-stone-100"
-          : "type-meta flex items-center gap-1.5 rounded px-1.5 py-1 text-stone-600 dark:text-stone-300"
-      }
-    >
-      <span
-        className={
-          active
-            ? "grid size-3.5 place-items-center rounded-[3px] border border-black bg-black text-white dark:border-white dark:bg-white dark:text-black"
-            : "size-3.5 rounded-[3px] border border-black/20 bg-black/[0.025] dark:border-white/15 dark:bg-black/20"
-        }
-      >
-        {active ? <Check className="size-2.5" strokeWidth={3} /> : null}
-      </span>
-      {label}
-      <span className="sr-only">{active ? "selected" : "not selected"}</span>
-    </span>
-  )
-}
-
-function ConfigurationError({ error }: { error: Error }) {
-  return (
-    <p className="border border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-      {errorMessage(error)}
-    </p>
-  )
-}
-
-function DomainStatus({
-  enabled,
-  verified,
-}: {
-  enabled: boolean
-  verified: boolean
-}) {
-  const active = verified && enabled
-  return (
-    <span
-      className={
-        active
-          ? "type-technical-label inline-flex items-center gap-1 text-emerald-300"
-          : "type-technical-label inline-flex items-center gap-1 text-muted-foreground"
-      }
-    >
-      {verified ? (
-        <span
-          className={
-            active
-              ? "size-1.5 rounded-full bg-emerald-400"
-              : "size-1.5 rounded-full bg-muted-foreground"
-          }
-        />
-      ) : (
-        <CircleAlert className="size-2.5" />
-      )}
-      {active ? "Active" : verified ? "Paused" : "Setup required"}
-    </span>
-  )
-}
-
-function managedDomainRowKey(domain: ManagedDomainOverview): string {
-  return `${domain.relayId}:${domain.instanceId}`
-}
-
-function domainHostname(domain: ManagedDomainOverview): string {
-  return `${domain.vanityLabel}.${domain.domain}`
-}
 
 function srvRecordLabel(domain: ManagedDomainOverview): string {
   return domain.srvActive
@@ -1315,28 +804,15 @@ function domainStatusPresentation(
   if (domain.status === "pending") {
     return { label: "Pending", pulse: true, tone: "warning" }
   }
+  // Only stays deleting when Cloudflare refused; deleting again finishes it.
+  if (domain.status === "removing") {
+    return domain.lastError
+      ? { detail: domain.lastError, label: "Delete failed", tone: "danger" }
+      : { label: "Deleting", pulse: true, tone: "warning" }
+  }
   return {
     detail: domain.lastError ?? undefined,
     label: "Error",
     tone: "danger",
   }
-}
-
-// Cloudflare resolves `:account` to the signed-in account that owns the zone.
-function cloudflareDnsRecordsUrl(zoneName: string): string {
-  return `https://dash.cloudflare.com/?to=/:account/${encodeURIComponent(zoneName)}/dns/records`
-}
-
-function domainIntegrationKey(integration: DomainIntegrationView | null) {
-  return integration
-    ? `${integration.domain}:${integration.enabled}:${integration.blacklistPatterns.join("|")}`
-    : "new"
-}
-
-function errorMessage(cause: unknown) {
-  return cause instanceof Error ? cause.message : "Could not save the domain"
-}
-
-function showErrorToast(cause: Error) {
-  showToast({ message: errorMessage(cause), type: "error" })
 }
