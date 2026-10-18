@@ -113,7 +113,8 @@ export async function relayRpc(
   timeoutMs = operation === "instance.delete"
     ? relayControlDeadlineMs(operation)
     : 10_000,
-  subject?: string
+  subject?: string,
+  signal?: AbortSignal
 ): Promise<unknown> {
   const effectiveRelay = relayControlEndpoint(relay)
   let connection = connections.get(relay.id)
@@ -132,7 +133,8 @@ export async function relayRpc(
   }
   const result = await runAppEffect(
     `relay.rpc.${operation}`,
-    connection.request(operation, payload, timeoutMs, subject)
+    connection.request(operation, payload, timeoutMs, subject),
+    { signal }
   )
   if (subject && isAuditedRelayControlOperation(operation)) {
     publishRealtimeChange({
@@ -224,6 +226,15 @@ function publishRelayState(relayId: string): void {
   })
 }
 
+/**
+ * Whether this process has failed to reach the Relay since it last
+ * authenticated. A first connection after startup is still in progress, not
+ * failing.
+ */
+export function relayConnectionFailing(relayId: string): boolean {
+  return connections.get(relayId)?.failing ?? false
+}
+
 export function relayConnectionState(relayId: string): RelayConnectionState {
   return (
     connections.get(relayId)?.state ?? {
@@ -241,6 +252,25 @@ export function relayConnectionState(relayId: string): RelayConnectionState {
  */
 export function relayConnectionNode(relayId: string): RelayNode | null {
   return connections.get(relayId)?.pushedNode ?? null
+}
+
+export function relayConnectionIds(): ReadonlyArray<string> {
+  return Array.from(connections.keys())
+}
+
+export function relayConnectionInstances(
+  relayId: string
+): ReadonlyArray<RelaySnapshot["instances"][number]> | null {
+  return connections.get(relayId)?.pushedInstances ?? null
+}
+
+/**
+ * The snapshot the Relay last pushed over this Hearth process's own control
+ * socket, kept current by its deltas. Null until this process has
+ * authenticated with the Relay. Callers must authorize the reader first.
+ */
+export function relayConnectionSnapshot(relayId: string): RelaySnapshot | null {
+  return connections.get(relayId)?.pushedSnapshot ?? null
 }
 
 export function relayConnectionBrowserMetadata(
@@ -313,10 +343,29 @@ class RelayConnection {
     return this.#state
   }
 
+  get failing(): boolean {
+    return (
+      this.#state.status !== "authenticated" &&
+      (this.#attempt > 0 || this.#state.status === "unreachable")
+    )
+  }
+
   /** The node from the pushed snapshot, without consuming it for RPC reads. */
   get pushedNode(): RelayNode | null {
     return this.#state.status === "authenticated"
       ? (this.#pushedSnapshot?.node ?? null)
+      : null
+  }
+
+  get pushedSnapshot(): RelaySnapshot | null {
+    return this.#state.status === "authenticated" ? this.#pushedSnapshot : null
+  }
+
+  get pushedInstances(): ReadonlyArray<
+    RelaySnapshot["instances"][number]
+  > | null {
+    return this.#state.status === "authenticated"
+      ? (this.#pushedSnapshot?.instances ?? null)
       : null
   }
 

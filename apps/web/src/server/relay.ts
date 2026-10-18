@@ -79,7 +79,7 @@ import {
   ExternalServiceError,
   ResourceNotFoundError,
 } from "@/effect/errors"
-import { runAppEffect } from "@/effect/runtime"
+import { forkAppEffect, runAppEffect } from "@/effect/runtime"
 import {
   applyManagedDomainAddressesEffect,
   provisionInstanceDomainBestEffort,
@@ -96,6 +96,7 @@ import {
   relayCachePolicy,
   relayFetchEffect,
   relayJsonEffect,
+  writeRelayCache,
 } from "@/lib/relay-client"
 import { relayConsoleTransport } from "@/lib/relay-console-route"
 import type { RelayEndpoint } from "@/lib/relay-client"
@@ -109,12 +110,26 @@ import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { resolveMclogsApiUrl } from "@/lib/mclogs"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
-import { isRelayUpdating, relayConnectionNode } from "@/lib/relay-connection"
+import {
+  isRelayUpdating,
+  relayConnectionNode,
+  relayConnectionFailing,
+  relayConnectionSnapshot,
+  relayConnectionState,
+} from "@/lib/relay-connection"
+import {
+  relayInstanceRouteIdentifier,
+  resolveRelayInstance,
+} from "@/lib/relay-selectors"
 import { updateInstanceSourceName } from "@/lib/instance-registry"
 
 const instanceInputSchema = z.object({
   instanceId: z.string().min(1),
   relayId: relayIdSchema,
+})
+
+const serverWorkspaceInputSchema = z.object({
+  serverId: z.string().min(1).max(256),
 })
 
 const treeInputSchema = instanceInputSchema.extend({
@@ -318,10 +333,122 @@ export const getFreshRelayInstance = createServerFn({ method: "POST" })
     return managed ?? null
   })
 
+/**
+ * One game server's page: the server and its node, in the fleet snapshot's
+ * shape, and its Relay's connection. The route resolves against every game
+ * server the reader can see, as with the fleet, so ambiguous and canonical
+ * identifiers match it. Connected Relays answer from the state they push to
+ * Hearth, without a Relay round trip.
+ */
+export const getServerWorkspace = createServerFn({ method: "GET" })
+  .validator(serverWorkspaceInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireEligibleResourceUser()
+    return readServerWorkspace(user, data.serverId)
+  })
+
+// Reading pushed snapshots skips the read-through cache, which also keeps a
+// Relay's last-known snapshot for while it is offline. Keep that current, at
+// most every few seconds per Relay.
+const lastKnownSnapshotIntervalMs = 15_000
+const lastKnownSnapshotWrites = new Map<string, number>()
+
+function rememberPushedSnapshot(
+  relayId: string,
+  snapshot: NonNullable<ReturnType<typeof relayConnectionSnapshot>>
+) {
+  const now = Date.now()
+  const last = lastKnownSnapshotWrites.get(relayId)
+  if (last !== undefined && now - last < lastKnownSnapshotIntervalMs) return
+  lastKnownSnapshotWrites.set(relayId, now)
+  forkAppEffect(
+    "relay.snapshot.remember",
+    writeRelayCache(relayCachePolicy.snapshot(relayId), snapshot)
+  )
+}
+
+async function readServerWorkspace(user: AuthenticatedUser, serverId: string) {
+  const { grants, relays: visibleRelays } = await authorizedRelays(
+    user,
+    await listPersistedRelays()
+  )
+  const entries = await Promise.all(
+    visibleRelays
+      .filter((relay) => relay.enabled)
+      .map(async (relay) => {
+        const pushed = relayConnectionSnapshot(relay.id)
+        if (pushed) rememberPushedSnapshot(relay.id, pushed)
+        return pushed
+          ? {
+              relay,
+              snapshot: authorizeRelaySnapshot(pushed, relay, user, grants),
+              status: "connected" as const,
+            }
+          : authorizedRelayEntry(relay, user, grants, {
+              fallbackOnError: true,
+              warnOnUnavailable: false,
+            })
+      })
+  )
+  const instances = entries.flatMap(({ relay, snapshot }) =>
+    (snapshot?.instances ?? []).map((instance) => ({
+      ...instance,
+      relayId: relay.id,
+      routeId: relayInstanceRouteId(relay.id, instance.shortId),
+    }))
+  )
+  const resolution = resolveRelayInstance(instances, serverId)
+  if (resolution.status === "ambiguous") return { status: "ambiguous" as const }
+  if (resolution.status === "not-found") return { status: "not-found" as const }
+  const { instance } = resolution
+  const entry = entries.find(({ relay }) => relay.id === instance.relayId)
+  if (!entry?.snapshot) return { status: "not-found" as const }
+  const snapshot = await mergeRelaySnapshots([
+    {
+      ...entry,
+      snapshot: {
+        ...entry.snapshot,
+        instances: entry.snapshot.instances.filter(
+          (candidate) => candidate.id === instance.id
+        ),
+      },
+    },
+  ])
+  return {
+    status: "found" as const,
+    relay: publicRelayState(entry),
+    // Null when the short ID is shared and no Relay-qualified ID is unique.
+    routeIdentifier: relayInstanceRouteIdentifier(instances, instance) ?? null,
+    snapshot,
+  }
+}
+
 export const getRelayInstances = createServerFn({ method: "POST" }).handler(
   async () => {
     const user = await requireEligibleResourceUser()
     return (await authorizedFleetSnapshot(user, true)).instances
+  }
+)
+
+/**
+ * Each enabled Relay the user can see and whether Hearth holds its live
+ * connection. Answers from Hearth's own state, so it never waits on a Relay
+ * or returns any of its workloads.
+ */
+export const getRelayReachability = createServerFn({ method: "GET" }).handler(
+  async () => {
+    const user = await requireEligibleResourceUser()
+    const { relays } = await authorizedRelays(user, await listPersistedRelays())
+    return relays
+      .filter((relay) => relay.enabled)
+      .map((relay) => ({
+        id: relay.id,
+        name: relay.name,
+        status:
+          relayConnectionState(relay.id).status === "authenticated"
+            ? ("connected" as const)
+            : ("unreachable" as const),
+      }))
   }
 )
 
@@ -1271,32 +1398,44 @@ async function authorizedRelayEntry(
     warnOnUnavailable: boolean
   }
 ) {
+  const fallback = Effect.tryPromise({
+    try: () => relayFallbackSnapshot(relay),
+    catch: (fallbackCause) => fallbackCause,
+  }).pipe(
+    Effect.option,
+    Effect.map((snapshot) => ({
+      snapshot: snapshot._tag === "Some" ? snapshot.value : null,
+      status: "unreachable" as const,
+    }))
+  )
+  const live = Effect.tryPromise({
+    try: () =>
+      options.fresh ? freshRelaySnapshot(relay) : relaySnapshot(relay),
+    catch: (cause) => cause,
+  }).pipe(
+    Effect.map((snapshot) => ({
+      snapshot,
+      status: "connected" as const,
+    })),
+    Effect.catch((cause) => {
+      if (!options.fallbackOnError) return Effect.fail(cause)
+      if (options.warnOnUnavailable) {
+        warnRelayUnavailable(relay.id, cause)
+      }
+      return fallback
+    })
+  )
+  // A read through a Relay this process has failed to reach waits for a
+  // reconnect attempt, up to the request timeout, which holds page loads for
+  // seconds. Connections are retried in the background and push a fresh
+  // snapshot when they return, so serve the last one Hearth holds instead.
+  // A first connection after startup is allowed to finish.
+  const failing =
+    options.fallbackOnError &&
+    !options.fresh &&
+    relayConnectionFailing(relay.id)
   return Effect.runPromise(
-    Effect.tryPromise({
-      try: () =>
-        options.fresh ? freshRelaySnapshot(relay) : relaySnapshot(relay),
-      catch: (cause) => cause,
-    }).pipe(
-      Effect.map((snapshot) => ({
-        snapshot,
-        status: "connected" as const,
-      })),
-      Effect.catch((cause) => {
-        if (!options.fallbackOnError) return Effect.fail(cause)
-        if (options.warnOnUnavailable) {
-          warnRelayUnavailable(relay.id, cause)
-        }
-        return Effect.tryPromise({
-          try: () => relayFallbackSnapshot(relay),
-          catch: (fallbackCause) => fallbackCause,
-        }).pipe(
-          Effect.option,
-          Effect.map((snapshot) => ({
-            snapshot: snapshot._tag === "Some" ? snapshot.value : null,
-            status: "unreachable" as const,
-          }))
-        )
-      }),
+    (failing ? fallback : live).pipe(
       Effect.map(({ snapshot, status }) => ({
         relay,
         snapshot: snapshot

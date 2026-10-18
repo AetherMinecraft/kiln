@@ -1,7 +1,6 @@
 import * as React from "react"
 import {
   useMutation,
-  useQuery,
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query"
@@ -74,17 +73,25 @@ import {
 } from "@/lib/resource-history-store"
 import {
   accessCapabilitiesQueryOptions,
-  queryKeys,
-  relayConnectionQueryOptions,
-  relaySnapshotQueryOptions,
   replaceRelaySnapshotInstance,
 } from "@/lib/query-options"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import {
   selectInstanceObservedState,
   selectInstanceWorkspaceInstance,
-  selectRelayConnected,
 } from "@/lib/relay-selectors"
+import {
+  cachedRelayInstance,
+  knownServer,
+  updateRelaySnapshots,
+  type KnownServer,
+} from "@/lib/server-workspace"
+import {
+  selectServerRelayConnected,
+  useRouteServerId,
+  useServerRelay,
+  useServerSnapshot,
+} from "@/lib/use-server-workspace"
 import type { InstanceWorkspaceInstance } from "@/lib/relay-selectors"
 import { performRelayAction } from "@/server/relay"
 
@@ -133,15 +140,9 @@ function InstanceRelayConnectionBoundary({
   children: React.ReactNode
   instance: InstanceWorkspaceInstance
 }) {
-  const queryClient = useQueryClient()
-  const selectRelayConnection = React.useMemo(
-    () => selectRelayConnected(instance.relayId),
-    [instance.relayId]
+  const { data: relayConnected = false } = useServerRelay(
+    selectServerRelayConnected
   )
-  const { data: relayConnected = false } = useQuery({
-    ...relayConnectionQueryOptions(queryClient),
-    select: selectRelayConnection,
-  })
 
   return (
     <InstanceRelayConnectedContext.Provider value={relayConnected}>
@@ -442,21 +443,18 @@ function RelayResourceStreamController({
                   const durableChanged = nextFingerprint !== durableFingerprint
                   if (durableChanged) {
                     durableFingerprint = nextFingerprint
-                    queryClient.setQueryData<RelayFleetSnapshot>(
-                      queryKeys.relay.snapshot,
-                      (snapshot) => {
-                        const current = snapshot?.instances.find(
-                          (candidate) =>
-                            candidate.id === streamedInstance.id &&
-                            candidate.relayId === instance.relayId
-                        )
-                        return replaceRelaySnapshotInstance(snapshot, {
-                          ...streamedInstance,
-                          resources: current?.resources ?? null,
-                          relayId: instance.relayId,
-                        })
-                      }
-                    )
+                    updateRelaySnapshots(queryClient, (snapshot) => {
+                      const current = snapshot?.instances.find(
+                        (candidate) =>
+                          candidate.id === streamedInstance.id &&
+                          candidate.relayId === instance.relayId
+                      )
+                      return replaceRelaySnapshotInstance(snapshot, {
+                        ...streamedInstance,
+                        resources: current?.resources ?? null,
+                        relayId: instance.relayId,
+                      })
+                    })
                   }
                 })
               ),
@@ -494,10 +492,17 @@ function RelayResourceStreamController({
 function InstanceWorkspaceHeader() {
   const [error, setError] = React.useState<string | null>(null)
   const instance = useRouteWorkspaceInstance()
+  const known = useKnownRouteServer(instance === undefined)
 
   return (
     <WorkspaceHeader
-      identity={<InstanceIdentityBoundary error={error} instance={instance} />}
+      identity={
+        <InstanceIdentityBoundary
+          error={error}
+          instance={instance}
+          known={known}
+        />
+      }
       center={<LiveResourceMetersBoundary instance={instance} />}
       actions={
         <InstancePowerControlsBoundary instance={instance} onError={setError} />
@@ -506,40 +511,47 @@ function InstanceWorkspaceHeader() {
   )
 }
 
+// A server the page knows from the directory, shown while its own read is in
+// flight after the route opened at once.
+function useKnownRouteServer(pending: boolean) {
+  const queryClient = useQueryClient()
+  const serverId = useRouteServerId()
+  return React.useMemo(
+    () =>
+      pending && serverId
+        ? knownServer(queryClient, serverId)?.server
+        : undefined,
+    [pending, queryClient, serverId]
+  )
+}
+
 function useRouteWorkspaceInstance() {
-  const serverId = useRouterState({
-    select: (state) => {
-      const params = state.matches.at(-1)?.params
-      return params &&
-        "serverId" in params &&
-        typeof params.serverId === "string"
-        ? params.serverId
-        : undefined
-    },
-  })
+  const serverId = useRouteServerId()
   const selectInstance = React.useMemo(
     () => selectInstanceWorkspaceInstance(serverId ?? ""),
     [serverId]
   )
-  const { data: instance } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    select: selectInstance,
-  })
+  const { data: instance } = useServerSnapshot(selectInstance)
   return instance
 }
 
 const InstanceIdentityBoundary = React.memo(function InstanceIdentityBoundary({
   error,
   instance,
+  known,
 }: {
   error: string | null
   instance: InstanceWorkspaceInstance | null | undefined
+  known: KnownServer | undefined
 }) {
-  return instance ? (
+  // The same element whether known or read, so the name never remounts.
+  const shown = instance ?? known
+  return shown ? (
     <InstanceIdentity
-      key={`${instance.relayId}:${instance.id}`}
+      key={`${shown.relayId}:${shown.id}`}
       error={error}
-      instance={instance}
+      instance={shown}
+      statusConfirmed={Boolean(instance)}
     />
   ) : null
 })
@@ -627,14 +639,21 @@ function InstanceAddressControl({ address }: { address: string }) {
 function InstanceIdentity({
   error,
   instance,
+  statusConfirmed,
 }: {
   error: string | null
-  instance: InstanceWorkspaceInstance
+  instance: Pick<
+    InstanceWorkspaceInstance,
+    "connectAddress" | "id" | "implementation" | "name" | "shortId" | "version"
+  >
+  // The server's own read carries its live state; the directory does not.
+  statusConfirmed: boolean
 }) {
   return (
     <WorkspaceIdentity
       error={error}
       name={instance.name}
+      statusConfirmed={statusConfirmed}
       title={<InstanceRouteTitle />}
     >
       <span className="hidden shrink-0 items-center gap-1.5 @[30rem]:inline-flex">
@@ -692,18 +711,10 @@ function InstancePowerControls({
     () => selectInstanceObservedState(instance.id, instance.relayId),
     [instance.id, instance.relayId]
   )
-  const { data: observedState } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    select: selectObservedState,
-  })
-  const selectRelayConnection = React.useMemo(
-    () => selectRelayConnected(instance.relayId),
-    [instance.relayId]
+  const { data: observedState } = useServerSnapshot(selectObservedState)
+  const { data: relayConnected = false } = useServerRelay(
+    selectServerRelayConnected
   )
-  const { data: relayConnected = false } = useQuery({
-    ...relayConnectionQueryOptions(queryClient),
-    select: selectRelayConnection,
-  })
   const relayActionMutation = useMutation({
     mutationFn: performRelayAction,
     onSuccess: (updated) => {
@@ -711,9 +722,8 @@ function InstancePowerControls({
         instance.relayId,
         updated
       )
-      queryClient.setQueryData<RelayFleetSnapshot>(
-        queryKeys.relay.snapshot,
-        (snapshot) => replaceRelaySnapshotInstance(snapshot, reconciled)
+      updateRelaySnapshots(queryClient, (snapshot) =>
+        replaceRelaySnapshotInstance(snapshot, reconciled)
       )
     },
   })
@@ -731,11 +741,10 @@ function InstancePowerControls({
       ) {
         return
       }
-      const previousSnapshot = queryClient.getQueryData<RelayFleetSnapshot>(
-        queryKeys.relay.snapshot
-      )
-      const previousInstance = previousSnapshot?.instances.find(
-        (item) => item.id === instance.id && item.relayId === instance.relayId
+      const previousInstance = cachedRelayInstance(
+        queryClient,
+        instance.relayId,
+        instance.id
       )
       const pendingPowerAction = beginPendingPowerAction(
         instance.relayId,
@@ -746,15 +755,13 @@ function InstancePowerControls({
           "started"
         )
       )
-      queryClient.setQueryData<RelayFleetSnapshot>(
-        queryKeys.relay.snapshot,
-        (snapshot) =>
-          updateInstancePowerState(
-            snapshot,
-            instance.id,
-            instance.relayId,
-            pendingPowerAction.phase
-          )
+      updateRelaySnapshots(queryClient, (snapshot) =>
+        updateInstancePowerState(
+          snapshot,
+          instance.id,
+          instance.relayId,
+          pendingPowerAction.phase
+        )
       )
       setAction(nextAction)
       onError(null)
@@ -774,15 +781,13 @@ function InstancePowerControls({
             Effect.sync(() => {
               finishPendingPowerAction(instance.relayId, instance.id)
               if (previousInstance) {
-                queryClient.setQueryData<RelayFleetSnapshot>(
-                  queryKeys.relay.snapshot,
-                  (snapshot) =>
-                    updateInstancePowerState(
-                      snapshot,
-                      instance.id,
-                      instance.relayId,
-                      previousInstance.observedState
-                    )
+                updateRelaySnapshots(queryClient, (snapshot) =>
+                  updateInstancePowerState(
+                    snapshot,
+                    instance.id,
+                    instance.relayId,
+                    previousInstance.observedState
+                  )
                 )
               }
               onError(
@@ -914,10 +919,7 @@ function LiveResourceMeter({
     },
     [instanceId, relayId]
   )
-  const { data: observedState } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    select: selectObservedState,
-  })
+  const { data: observedState } = useServerSnapshot(selectObservedState)
   const resources = React.useSyncExternalStore(
     historyStore.subscribe,
     historyStore.getCurrentSnapshot,
@@ -955,10 +957,7 @@ function InstanceUptimeMeter({
     },
     [instanceId, relayId]
   )
-  const { data: runtime } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    select: selectRuntime,
-  })
+  const { data: runtime } = useServerSnapshot(selectRuntime)
 
   return (
     <UptimeMeter

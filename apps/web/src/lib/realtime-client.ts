@@ -15,18 +15,23 @@ import {
   queryKeys,
   replaceRelaySnapshotInstance,
   type RelayConnection,
+  type RelayReachability,
 } from "@/lib/query-options"
 import type { FleetInstance, RealtimeClientEvent } from "@/lib/realtime-events"
-import type { getApps } from "@/server/apps"
-import type { getManagedDatabases } from "@/server/databases"
 import {
-  inventoryStale,
-  withInventoryRelayStatus,
-} from "@/lib/inventory-relay-status"
+  instanceInventoryScope,
+  recheckInstanceObservations,
+} from "@/lib/instance-inventory"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
-
-type ManagedDatabaseOverview = Awaited<ReturnType<typeof getManagedDatabases>>
-type AppOverview = Awaited<ReturnType<typeof getApps>>
+import {
+  recordReachabilityGap,
+  recordReachabilityPush,
+} from "@/lib/relay-reachability"
+import {
+  applyPushedServerWorkspaceChange,
+  updateRelaySnapshots,
+  updateServerWorkspaces,
+} from "@/lib/server-workspace"
 
 export interface ApplyRealtimeEventInput {
   event: Exclude<RealtimeClientEvent, { type: "relay.invalidate" | "reset" }>
@@ -76,18 +81,47 @@ function applyRealtimeEvent(input: ApplyRealtimeEventInput): void {
         : connection
     }
   )
+  applyPushedServerWorkspaceChange(
+    queryClient,
+    (snapshot) => applyRealtimeSnapshotEvent(snapshot, event),
+    {
+      removesServers:
+        event.type === "instances.delta" && event.deleted.length > 0,
+      upserted: event.type === "instances.delta" ? event.upserted : undefined,
+      relay:
+        event.type === "relay.status"
+          ? {
+              id: event.relayId,
+              status: event.status,
+              updating: event.updating ?? false,
+            }
+          : undefined,
+    }
+  )
   if (event.type === "instances.delta") {
+    // Game servers push their state; refresh only the ones that changed.
+    for (const { relayId, id } of [
+      ...event.upserted,
+      ...event.deleted.map(({ relayId, instanceId }) => ({
+        relayId,
+        id: instanceId,
+      })),
+    ])
+      void recheckInstanceObservations(queryClient, {
+        queryKey: instanceInventoryScope({ kind: "server", relayId, id }),
+      })
     if (!instances.isReady()) {
       const snapshot = queryClient.getQueryData<RelayFleetSnapshot>(
         queryKeys.relay.snapshot
       )
+      // With no fleet loaded there is nothing to patch; its first reader
+      // fetches it fresh.
       queryClient.setQueryData<Array<FleetInstance>>(
         queryKeys.relay.instances,
-        (current) =>
-          applyRealtimeInstancesEvent(
-            current ?? snapshot?.instances ?? [],
-            event
-          )
+        (current) => {
+          const rows = current ?? snapshot?.instances
+          return rows && applyRealtimeInstancesEvent(rows, event)
+        }
       )
       if (instanceIdentityChanged) {
         void invalidateNameDependentBackupRuns(queryClient)
@@ -119,22 +153,21 @@ function applyRealtimeEvent(input: ApplyRealtimeEventInput): void {
     return
   }
   if (event.type === "relay.status") {
-    const staleTopics = [
-      ...(applyRelayStatusToDatabases(queryClient, event)
-        ? (["databases"] as const)
-        : []),
-      ...(applyRelayStatusToApps(queryClient, event)
-        ? (["apps"] as const)
-        : []),
-    ]
-    if (staleTopics.length > 0) {
-      void (
-        refreshTopics?.(staleTopics, { relayId: event.relayId }) ??
-        refreshHearthRealtimeTopics(queryClient, staleTopics, {
-          relayId: event.relayId,
-        })
-      )
-    }
+    queryClient.setQueryData<RelayReachability>(
+      queryKeys.relay.reachability,
+      (relays) =>
+        relays?.map((relay) =>
+          relay.id === event.relayId && relay.status !== event.status
+            ? { ...relay, status: event.status }
+            : relay
+        )
+    )
+    recordReachabilityPush(queryClient, event.relayId, event.status)
+    // Every observation on this Relay depends on its reachability.
+    void recheckInstanceObservations(queryClient, {
+      predicate: ({ queryKey }) =>
+        queryKey[0] === "instance-inventory" && queryKey[2] === event.relayId,
+    })
     if (!instances.isReady()) {
       const snapshot = queryClient.getQueryData<RelayFleetSnapshot>(
         queryKeys.relay.snapshot
@@ -209,56 +242,6 @@ function applyRealtimeSnapshotEvent(
 
 type RelayStatusEvent = Extract<RealtimeClientEvent, { type: "relay.status" }>
 
-/**
- * Patches Relay reachability onto cached database rows. Returns whether the
- * Relay came back to inventory that may have changed while it was away.
- */
-function applyRelayStatusToDatabases(
-  queryClient: QueryClient,
-  event: RelayStatusEvent
-): boolean {
-  let stale = false
-  queryClient.setQueryData<ManagedDatabaseOverview>(
-    queryKeys.databases.list,
-    (overview) => {
-      if (!overview) return overview
-      stale =
-        event.status === "connected" &&
-        inventoryStale(overview, "databases", event.relayId)
-      return withInventoryRelayStatus(
-        overview,
-        "databases",
-        relayStatusMap(event)
-      )
-    }
-  )
-  return stale
-}
-
-function applyRelayStatusToApps(
-  queryClient: QueryClient,
-  event: RelayStatusEvent
-): boolean {
-  let stale = false
-  queryClient.setQueryData<AppOverview>(queryKeys.apps.list, (overview) => {
-    if (!overview) return overview
-    stale =
-      event.status === "connected" &&
-      inventoryStale(overview, "apps", event.relayId)
-    return withInventoryRelayStatus(overview, "apps", relayStatusMap(event))
-  })
-  return stale
-}
-
-function relayStatusMap(event: RelayStatusEvent) {
-  return new Map([
-    [
-      event.relayId,
-      { status: event.status, updating: event.updating ?? false },
-    ],
-  ])
-}
-
 function relayStatusChanged(
   item: { relayId: string; relayStatus: string; relayUpdating?: boolean },
   event: RelayStatusEvent
@@ -324,6 +307,11 @@ export function applyProvisioningInstance(
           }
         : connection
   )
+  updateServerWorkspaces(
+    queryClient,
+    (snapshot) => upsertRelaySnapshotInstance(snapshot, updated),
+    { upserted: [updated] }
+  )
   queryClient.setQueryData<Array<FleetInstance>>(
     queryKeys.relay.instances,
     (instances) => {
@@ -352,9 +340,10 @@ export function applyUpdatedInstance(
       (instance) =>
         instance.id === updated.id && instance.relayId === updated.relayId
     )
-  queryClient.setQueryData<RelayFleetSnapshot>(
-    queryKeys.relay.snapshot,
-    (snapshot) => replaceRelaySnapshotInstance(snapshot, updated)
+  updateRelaySnapshots(
+    queryClient,
+    (snapshot) => replaceRelaySnapshotInstance(snapshot, updated),
+    { upserted: [{ ...current, ...updated } as FleetInstance] }
   )
   queryClient.setQueryData<Array<FleetInstance>>(
     queryKeys.relay.instances,
@@ -380,12 +369,13 @@ export function applyDeletedInstance(
         instance.id !== deleted.instanceId ||
         instance.relayId !== deleted.relayId
     )
-  queryClient.setQueryData<RelayFleetSnapshot>(
-    queryKeys.relay.snapshot,
+  updateRelaySnapshots(
+    queryClient,
     (snapshot) =>
       snapshot
         ? { ...snapshot, instances: remove(snapshot.instances) }
-        : snapshot
+        : snapshot,
+    { removesServers: true }
   )
   queryClient.setQueryData<RelayConnection>(
     queryKeys.relay.connection,
@@ -424,7 +414,75 @@ export function applyRecoveredRelayConnection(
   queryClient.setQueryData(queryKeys.relay.instances, snapshot.instances)
   queryClient.setQueryData(queryKeys.relay.snapshot, snapshot)
   queryClient.setQueryData(queryKeys.relay.connection, connection)
+  recheckPushedState(queryClient)
   return cancellation
+}
+
+/**
+ * Whether anything on this page holds, reads, or is loading the fleet
+ * snapshot. Stream recovery only needs a fresh fleet when it does.
+ */
+export function fleetCacheInUse(
+  queryClient: QueryClient,
+  instances: RelayInstancesCollection
+): boolean {
+  if (instances.status !== "idle" && instances.status !== "cleaned-up")
+    return true
+  return [
+    queryKeys.relay.connection,
+    queryKeys.relay.snapshot,
+    queryKeys.relay.instances,
+  ].some((queryKey) => {
+    const query = queryClient.getQueryCache().find({ queryKey, exact: true })
+    return (
+      query !== undefined &&
+      (query.state.data !== undefined ||
+        query.getObserversCount() > 0 ||
+        query.state.fetchStatus !== "idle")
+    )
+  })
+}
+
+/**
+ * Whether a pushed fleet change arrived while the fleet's first read is in
+ * flight. That read would overwrite the change when it lands, so the stream
+ * recovers with an authoritative read instead.
+ */
+export function fleetEventNeedsRecovery(
+  queryClient: QueryClient,
+  instances: RelayInstancesCollection,
+  event: Exclude<RealtimeClientEvent, { type: "relay.invalidate" | "reset" }>
+): boolean {
+  if (event.type === "collections.invalidate") return false
+  if (instances.status === "loading") return true
+  return [
+    queryKeys.relay.connection,
+    queryKeys.relay.snapshot,
+    queryKeys.relay.instances,
+  ].some((queryKey) => {
+    const query = queryClient.getQueryCache().find({ queryKey, exact: true })
+    return (
+      query !== undefined &&
+      query.state.data === undefined &&
+      query.state.fetchStatus !== "idle"
+    )
+  })
+}
+
+/**
+ * Game server and Relay state refreshes only on pushed changes, and stream
+ * recovery means some may have been missed. Recheck what is mounted.
+ */
+export function recheckPushedState(queryClient: QueryClient): void {
+  recordReachabilityGap(queryClient)
+  void queryClient.invalidateQueries({
+    queryKey: queryKeys.relay.reachability,
+    exact: true,
+  })
+  for (const kind of ["server", "relay"] as const)
+    void recheckInstanceObservations(queryClient, {
+      queryKey: instanceInventoryScope({ kind }),
+    })
 }
 
 function applyRealtimeRelayStatus(

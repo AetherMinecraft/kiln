@@ -34,7 +34,6 @@ import {
   getManagedDatabaseCredential,
   getManagedDatabaseContainer,
   getManagedDatabaseDirectory,
-  getManagedDatabases,
 } from "@/server/databases"
 import {
   isMinecraftUsername,
@@ -55,10 +54,12 @@ import { reconcilePendingPowerSnapshot } from "@/lib/instance-power-state"
 import { systemUpdateOverviewRefetchPolicy } from "@/lib/system-update-presence"
 import {
   getRelayConnectionState,
+  getRelayReachability,
   getRelayDirectoryPage,
   getRelayFileEntry,
   getRelayFile,
   getRelayFileActivity,
+  getInstanceWebRoutes,
   getRelayNodeReadings,
   getRelaySnapshot,
   getRelayTree,
@@ -85,13 +86,17 @@ import {
 } from "@/server/resource-access"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
-import { withInventoryRelayStatus } from "@/lib/inventory-relay-status"
+import { readRelayReachability } from "@/lib/relay-reachability"
+import type { ServerNavigationInput } from "@/lib/server-navigation"
+import {
+  getInfraServerDirectory,
+  getServerNavigation,
+} from "@/server/infra-directory"
 import {
   getAppConfig,
   getAppDirectory,
   getAppOwner,
   getAppOwnerMinecraftProfileId,
-  getApps,
   getAppWebRoutes,
 } from "@/server/apps"
 import {
@@ -148,12 +153,15 @@ export const queryKeys = {
       ["domains", "instances", relayId, instanceId] as const,
     settings: ["domains", "settings"] as const,
   },
+  servers: {
+    directory: ["servers", "directory"] as const,
+    navigation: ["servers", "navigation"] as const,
+  },
   apps: {
     all: ["apps"] as const,
     config: (relayId: string, appId: string) =>
       ["apps", relayId, appId, "config"] as const,
     directory: ["apps", "directory"] as const,
-    list: ["apps", "list"] as const,
     webRoutes: (relayId: string, appId: string) =>
       ["apps", relayId, appId, "web-routes"] as const,
   },
@@ -162,7 +170,6 @@ export const queryKeys = {
     credential: (relayId: string, databaseId: string) =>
       ["databases", relayId, databaseId, "credential"] as const,
     directory: ["databases", "directory"] as const,
-    list: ["databases", "list"] as const,
     // Outside "databases", so list refreshes don't measure the volume again.
     container: (relayId: string, databaseId: string) =>
       ["database-container", relayId, databaseId] as const,
@@ -172,6 +179,7 @@ export const queryKeys = {
   relay: {
     all: ["relay"] as const,
     connection: ["relay", "connection"] as const,
+    reachability: ["relay", "reachability"] as const,
     console: (relayId: string, resource: RelayConsoleResource) =>
       [
         "relay",
@@ -194,6 +202,9 @@ export const queryKeys = {
     recipe: (relayId: string, instanceId: string) =>
       ["relay", relayId, "instances", instanceId, "recipe"] as const,
     snapshot: ["relay", "snapshot"] as const,
+    // One game server's page: its server and node, and its Relay.
+    servers: ["relay", "server"] as const,
+    server: (serverId: string) => ["relay", "server", serverId] as const,
     instances: ["relay", "instances"] as const,
     nodeReadings: ["relay", "node-readings"] as const,
     resources: (relayId: string) => ["relay", "resources", relayId] as const,
@@ -467,6 +478,33 @@ export function relayConnectionQueryOptions(queryClient: QueryClient) {
   })
 }
 
+export type RelayReachability = Awaited<ReturnType<typeof getRelayReachability>>
+
+/**
+ * Which visible Relays Hearth is connected to, for connection toasts.
+ * Realtime Relay status events patch it; it polls only while one is away.
+ */
+export function relayReachabilityQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.relay.reachability,
+    queryFn: (context) =>
+      readRelayReachability(context, () =>
+        getRelayReachability({
+          headers: relayPollHeaders,
+          signal: context.signal,
+        })
+      ),
+    refetchInterval: (query) =>
+      query.state.data?.some((relay) => relay.status === "unreachable")
+        ? disconnectedRelayPollDelayMs
+        : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: (query) =>
+      query.state.data?.some((relay) => relay.status === "unreachable") ?? true,
+    staleTime: connectedRelayPollDelayMs,
+  })
+}
+
 /** Polled only while a Relay memory cell is mounted and the tab is visible. */
 export type RelayNodeReading = Awaited<
   ReturnType<typeof getRelayNodeReadings>
@@ -548,62 +586,41 @@ function connectionWithCanonicalSnapshot(
 export function managedDatabaseDirectoryQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.databases.directory,
-    queryFn: () => getManagedDatabaseDirectory(),
+    queryFn: ({ signal }) => getManagedDatabaseDirectory({ signal }),
     refetchOnWindowFocus: false,
     staleTime: 30_000,
   })
 }
 
-export function managedDatabasesQueryOptions() {
+export function serverDirectoryQueryOptions() {
   return queryOptions({
-    queryKey: queryKeys.databases.list,
-    queryFn: ({ client }) => fetchManagedDatabases(client),
-    refetchOnWindowFocus: "always",
-    staleTime: 5_000,
+    queryKey: queryKeys.servers.directory,
+    queryFn: ({ signal }) => getInfraServerDirectory({ signal }),
+    refetchOnWindowFocus: false,
+    staleTime: 30_000,
   })
 }
 
-/**
- * Inventory responses can resolve after newer Relay status events, so the
- * live Relay status from the connection cache is reapplied to every result.
- */
-export async function fetchManagedDatabases(queryClient: QueryClient) {
-  const overview = await getManagedDatabases()
-  const statuses = liveRelayStatuses(queryClient)
-  return statuses
-    ? withInventoryRelayStatus(overview, "databases", statuses)
-    : overview
+export function serverNavigationQueryOptions(input: ServerNavigationInput) {
+  return queryOptions({
+    queryKey: [
+      ...queryKeys.servers.navigation,
+      "serverId" in input ? input.serverId : null,
+      "selectedRouteId" in input ? input.selectedRouteId : null,
+    ],
+    queryFn: ({ signal }) => getServerNavigation({ data: input, signal }),
+    refetchOnWindowFocus: false,
+    staleTime: 30_000,
+  })
 }
 
 export function appDirectoryQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.apps.directory,
-    queryFn: () => getAppDirectory(),
+    queryFn: ({ signal }) => getAppDirectory({ signal }),
     refetchOnWindowFocus: false,
     staleTime: 30_000,
   })
-}
-
-export function appsQueryOptions() {
-  return queryOptions({
-    queryKey: queryKeys.apps.list,
-    queryFn: ({ client }) => fetchApps(client),
-    refetchOnWindowFocus: "always",
-    // Deployments run on the Relay; follow them until they finish.
-    refetchInterval: (query) =>
-      query.state.data?.apps.some((app) => app.deployment?.state === "running")
-        ? 2_000
-        : false,
-    staleTime: 5_000,
-  })
-}
-
-export async function fetchApps(queryClient: QueryClient) {
-  const overview = await getApps()
-  const statuses = liveRelayStatuses(queryClient)
-  return statuses
-    ? withInventoryRelayStatus(overview, "apps", statuses)
-    : overview
 }
 
 export function appWebRoutesQueryOptions(relayId: string, appId: string) {
@@ -649,26 +666,6 @@ export function appConfigQueryOptions(relayId: string, appId: string) {
     queryFn: () => getAppConfig({ data: { appId, relayId } }),
     staleTime: 30_000,
   })
-}
-
-// The connection cache's live Relay status, which inventory responses can
-// be older than.
-function liveRelayStatuses(queryClient: QueryClient) {
-  const connection = queryClient.getQueryData<RelayConnection>(
-    queryKeys.relay.connection
-  )
-  if (
-    connection?.status !== "connected" &&
-    connection?.status !== "unreachable"
-  ) {
-    return null
-  }
-  return new Map(
-    connection.relays.map((relay) => [
-      relay.id,
-      { status: relay.status, updating: relay.updating === true },
-    ])
-  )
 }
 
 export function managedDatabaseCredentialQueryOptions(
@@ -1029,6 +1026,17 @@ export function relayFileEntryQueryOptions(
       getRelayFileEntry({ data: { instanceId, path, relayId }, signal }),
     retry: false,
     staleTime: 15_000,
+  })
+}
+
+export function instanceWebRoutesQueryOptions(
+  relayId: string,
+  instanceId: string
+) {
+  return queryOptions({
+    queryKey: queryKeys.relay.webRoutes(relayId, instanceId),
+    queryFn: () => getInstanceWebRoutes({ data: { instanceId, relayId } }),
+    staleTime: 10_000,
   })
 }
 

@@ -76,14 +76,19 @@ import {
 } from "@/components/workspace-table"
 import {
   accessCapabilitiesQueryOptions,
+  instanceWebRoutesQueryOptions,
   queryKeys,
   replaceRelaySnapshotInstance,
-  relaySnapshotQueryOptions,
 } from "@/lib/query-options"
+import { instanceInventoryScope } from "@/lib/instance-inventory"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
+import {
+  invalidateRelaySnapshots,
+  updateRelaySnapshots,
+} from "@/lib/server-workspace"
+import { useServerSnapshot } from "@/lib/use-server-workspace"
 import type { InstanceWorkspaceInstance } from "@/lib/relay-selectors"
 import {
-  getInstanceWebRoutes,
   performRelayAction,
   removeInstanceDatabaseConnection,
   releaseInstancePort,
@@ -137,12 +142,8 @@ function WebRoutesNetworkPage({
     [instance.id, instance.relayId]
   )
   const routes = useQuery({
+    ...instanceWebRoutesQueryOptions(instance.relayId, instance.id),
     enabled: permissions.networkRead,
-    queryFn: () =>
-      getInstanceWebRoutes({
-        data: { instanceId: instance.id, relayId: instance.relayId },
-      }),
-    queryKey,
   })
   const update = useMutation({
     mutationFn: (next: Array<RelayInstanceWebRouteInput>) =>
@@ -165,15 +166,12 @@ function WebRoutesNetworkPage({
         },
       }),
     onSuccess: async (updated) => {
-      queryClient.setQueryData<RelayFleetSnapshot>(
-        queryKeys.relay.snapshot,
-        (snapshot) => replaceRelaySnapshotInstance(snapshot, updated)
+      updateRelaySnapshots(queryClient, (snapshot) =>
+        replaceRelaySnapshotInstance(snapshot, updated)
       )
       await Promise.all([
         queryClient.invalidateQueries({ queryKey }),
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.relay.snapshot,
-        }),
+        invalidateRelaySnapshots(queryClient),
       ])
     },
   })
@@ -272,10 +270,7 @@ function DatabaseConnectionWarnings() {
       )?.databaseConnectionWarnings ?? noDatabaseWarnings,
     [instance.id, instance.relayId]
   )
-  const { data: warnings = noDatabaseWarnings } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    select,
-  })
+  const { data: warnings = noDatabaseWarnings } = useServerSnapshot(select)
   if (warnings.length === 0) return null
   return (
     <div
@@ -314,10 +309,8 @@ function SavedDatabaseConnections() {
       )?.savedDatabaseConnections ?? noSavedDatabaseConnections,
     [instance.id, instance.relayId]
   )
-  const { data: connections = noSavedDatabaseConnections } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    select,
-  })
+  const { data: connections = noSavedDatabaseConnections } =
+    useServerSnapshot(select)
   const remove = useMutation({
     mutationFn: (connection: (typeof connections)[number]) =>
       removeInstanceDatabaseConnection({
@@ -329,12 +322,13 @@ function SavedDatabaseConnections() {
         },
       }),
     onSuccess: (updated) => {
-      queryClient.setQueryData<RelayFleetSnapshot>(
-        queryKeys.relay.snapshot,
-        (snapshot) => replaceRelaySnapshotInstance(snapshot, updated)
+      updateRelaySnapshots(queryClient, (snapshot) =>
+        replaceRelaySnapshotInstance(snapshot, updated)
       )
       forkPromise(() =>
-        queryClient.invalidateQueries({ queryKey: queryKeys.databases.list })
+        queryClient.invalidateQueries({
+          queryKey: instanceInventoryScope({ kind: "database" }),
+        })
       )
       showToast({
         type: "success",
@@ -533,9 +527,8 @@ const ConfiguredRoutesSection = React.memo(function ConfiguredRoutesSection({
         },
       }),
     onSuccess: async (updated) => {
-      queryClient.setQueryData<RelayFleetSnapshot>(
-        queryKeys.relay.snapshot,
-        (snapshot) => replaceRelaySnapshotInstance(snapshot, updated)
+      updateRelaySnapshots(queryClient, (snapshot) =>
+        replaceRelaySnapshotInstance(snapshot, updated)
       )
       setDialog(null)
       clearEditGamePortIntent()
@@ -543,9 +536,7 @@ const ConfiguredRoutesSection = React.memo(function ConfiguredRoutesSection({
         queryClient.invalidateQueries({
           queryKey: queryKeys.relay.connection,
         }),
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.relay.snapshot,
-        }),
+        invalidateRelaySnapshots(queryClient),
       ])
       showToast({
         description: updated.pendingPrimaryPort

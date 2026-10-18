@@ -1,4 +1,4 @@
-import { Effect, Option, Result } from "effect"
+import { Clock, Effect, Exit, Option, Result, Schema, Scope } from "effect"
 
 import { AppCache } from "@/effect/cache"
 import type { CacheError } from "@/effect/errors"
@@ -53,6 +53,108 @@ export const readThroughCache = Effect.fn("cache.readThrough")(function* <
 
   const value = yield* options.load
   yield* writeCachedJson(options.policy, value)
+  return value
+})
+
+export interface WarmCachePolicy {
+  // How long a value is served without refreshing it.
+  freshMs: number
+  key: string
+  name: string
+  // How long a value is kept, to be served while it refreshes.
+  ttlMs: number
+}
+
+interface WarmCacheOptions<TResult, TError, TRequirements> {
+  decode: (input: unknown) => TResult
+  load: Effect.Effect<TResult, TError, TRequirements>
+  // A value to serve when nothing is cached and the load fails, such as one
+  // kept under an older key. It is not stored, so the next read loads again.
+  lastKnown?: Effect.Effect<TResult | undefined, never, TRequirements>
+  policy: WarmCachePolicy
+}
+
+const WarmEntrySchema = Schema.Struct({
+  storedAt: Schema.Number,
+  value: Schema.Unknown,
+})
+const decodeWarmEntry = Schema.decodeUnknownSync(WarmEntrySchema)
+
+// Keys this process is refreshing, so a refresh starts once however many
+// readers find the value stale.
+const warmRefreshes = new Set<string>()
+// Refreshes outlive the request that started them, but not Hearth: shutdown
+// closes this scope before the cache and telemetry they write through.
+const warmRefreshScope = Scope.makeUnsafe()
+
+/** Interrupts background refreshes still running, for shutdown. */
+export const stopWarmCacheRefreshes: Effect.Effect<void> = Scope.close(
+  warmRefreshScope,
+  Exit.void
+)
+
+/**
+ * Serves a cached value at once, however old, and refreshes one that is past
+ * `freshMs` in the background, so only the first read of a value waits for
+ * its source. A failed refresh keeps the value it would have replaced.
+ */
+export const readWarmCache = Effect.fn("cache.readWarm")(function* <
+  TResult,
+  TError,
+  TRequirements,
+>(options: WarmCacheOptions<TResult, TError, TRequirements>) {
+  const cache = yield* AppCache
+  if (!cache.enabled) return yield* options.load
+  const { policy } = options
+  const cached = yield* readCachedJson(
+    { key: policy.key, name: policy.name, ttlMs: policy.ttlMs },
+    (input) => {
+      const entry = decodeWarmEntry(input)
+      return { storedAt: entry.storedAt, value: options.decode(entry.value) }
+    }
+  )
+  if (Option.isNone(cached)) {
+    const loaded = yield* Effect.result(storeWarm(options))
+    if (Result.isSuccess(loaded)) return loaded.success
+    // Served, never stored: another reader may have stored a newer value.
+    const lastKnown = options.lastKnown ? yield* options.lastKnown : undefined
+    if (lastKnown === undefined) return yield* Effect.fail(loaded.failure)
+    return lastKnown
+  }
+
+  const now = yield* Clock.currentTimeMillis
+  if (
+    now - cached.value.storedAt >= policy.freshMs &&
+    !warmRefreshes.has(policy.key)
+  ) {
+    warmRefreshes.add(policy.key)
+    yield* storeWarm(options).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Could not refresh a cached value; keeping it", {
+          cache: policy.name,
+          error,
+        })
+      ),
+      Effect.ensuring(Effect.sync(() => warmRefreshes.delete(policy.key))),
+      Effect.forkIn(warmRefreshScope)
+    )
+  }
+  return cached.value.value
+})
+
+const storeWarm = Effect.fnUntraced(function* <TResult, TError, TRequirements>(
+  options: WarmCacheOptions<TResult, TError, TRequirements>
+) {
+  const value = yield* options.load
+  const storedAt = yield* Clock.currentTimeMillis
+  yield* writeCachedJson(
+    {
+      key: options.policy.key,
+      name: options.policy.name,
+      ttlMs: options.policy.ttlMs,
+    },
+    { storedAt, value }
+  )
   return value
 })
 

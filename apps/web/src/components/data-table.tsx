@@ -1,4 +1,5 @@
 import * as React from "react"
+import { useHydrated } from "@tanstack/react-router"
 import { useVirtualizer } from "@tanstack/react-virtual"
 import {
   FlexRender,
@@ -179,8 +180,11 @@ const DataTableRowsContext = React.createContext<
   ReadonlyArray<DataTableSelectableRow>
 >([])
 
+// Each row draws its own bottom border. The body ends 1px past the table, so a
+// last row that reaches the bottom tucks its border under the card's border
+// instead of stacking a second line beside it.
 const dataTableScrollAreaClassName =
-  "block min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-y-contain border-b border-border/70"
+  "-mb-px block min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-y-contain"
 
 export function DataTableRenderer<TData extends RowData>({
   leadingBody,
@@ -278,7 +282,7 @@ function DataTableRowModel<TData extends RowData>({
           aria-rowcount={
             leadingBody ? undefined : hasBodyState ? 2 : rows.length + 1
           }
-          className="flex h-full min-h-0 w-full min-w-0 border-collapse flex-col overflow-hidden pb-px text-left"
+          className="flex h-full min-h-0 w-full min-w-0 border-collapse flex-col overflow-hidden text-left"
           role="table"
           style={gridStyle}
         >
@@ -843,6 +847,8 @@ function DataTableBody<TData extends RowData>({
   )
 }
 
+const ssrTableRect = { height: 1080, width: 0 }
+
 function VirtualDataTableBody<TData extends RowData>({
   columns,
   getRowClassName,
@@ -861,6 +867,15 @@ function VirtualDataTableBody<TData extends RowData>({
   const showLoadMoreRow = shouldRenderDataTableLoadMore(loadMoreSource)
   const virtualizationOptions =
     virtualization === true ? defaultDataTableVirtualization : virtualization
+  // Rows are sized in rem, and the root size follows the viewport, so the
+  // server cannot know their pixel height. Until hydration, place rows with
+  // CSS from their real height; afterwards use the measured positions.
+  const hydrated = useHydrated()
+  const rowHeight =
+    virtualizationOptions.rowHeight ??
+    `${virtualizationOptions.estimateRowHeight ?? defaultDataTableVirtualization.estimateRowHeight}px`
+  const rowStart = (index: number, start: number) =>
+    hydrated ? `${start}px` : `calc(${index} * (${rowHeight}))`
   const rowVirtualizer = useVirtualizer({
     count: rows.length + (showLoadMoreRow ? 1 : 0),
     estimateSize: () =>
@@ -868,6 +883,14 @@ function VirtualDataTableBody<TData extends RowData>({
       defaultDataTableVirtualization.estimateRowHeight,
     getItemKey: (index) => rows[index]?.id ?? `load-more-${index}`,
     getScrollElement: () => scrollElementRef.current,
+    // Server rendering and hydration have no element to measure. Assume a
+    // tall viewport so the first HTML holds the rows above the fold.
+    initialRect: ssrTableRect,
+    // Keep fractional heights. Rem-sized rows are rarely whole pixels, and
+    // rounding them would drift rows away from their server-rendered places.
+    measureElement: (element, entry) =>
+      entry?.borderBoxSize[0]?.blockSize ??
+      element.getBoundingClientRect().height,
     overscan:
       virtualizationOptions.overscan ?? defaultDataTableVirtualization.overscan,
   })
@@ -882,7 +905,11 @@ function VirtualDataTableBody<TData extends RowData>({
         aria-hidden="true"
         className="pointer-events-none block w-full"
         role="presentation"
-        style={{ height: rowVirtualizer.getTotalSize() }}
+        style={{
+          height: hydrated
+            ? rowVirtualizer.getTotalSize()
+            : `calc(${rows.length + (showLoadMoreRow ? 1 : 0)} * (${rowHeight}))`,
+        }}
       >
         <td className="block p-0" role="presentation" />
       </tr>
@@ -899,7 +926,7 @@ function VirtualDataTableBody<TData extends RowData>({
               colSpan={rows[0]?.getAllCells().length ?? 1}
               dataIndex={virtualRow.index}
               loadMoreSource={loadMoreSource}
-              virtualStart={virtualRow.start}
+              virtualStart={rowStart(virtualRow.index, virtualRow.start)}
             />
           )
         }
@@ -916,7 +943,7 @@ function VirtualDataTableBody<TData extends RowData>({
             dataIndex={virtualRow.index}
             row={row}
             rowClassName={getRowClassName?.(row)}
-            virtualStart={virtualRow.start}
+            virtualStart={rowStart(virtualRow.index, virtualRow.start)}
           />
         )
       })}
@@ -934,7 +961,8 @@ function DataTableLoadMoreRow({
   colSpan: number
   dataIndex?: number
   loadMoreSource: DataTableLoadMoreSource
-  virtualStart?: number
+  /** A CSS length from the top of the body. */
+  virtualStart?: string
   ref?: React.Ref<HTMLTableRowElement>
 }) {
   const triggerRef =
@@ -957,7 +985,7 @@ function DataTableLoadMoreRow({
               left: 0,
               position: "absolute",
               top: 0,
-              transform: `translateY(${virtualStart}px)`,
+              transform: `translateY(${virtualStart})`,
               width: "100%",
             }
       }
@@ -982,7 +1010,8 @@ interface DataTableRowProps<TData extends RowData> {
   isSelected: boolean
   row: Row<typeof dataTableFeatures, TData>
   rowClassName?: string
-  virtualStart?: number
+  /** A CSS length from the top of the body. */
+  virtualStart?: string
   ref?: React.Ref<HTMLTableRowElement>
 }
 
@@ -1055,7 +1084,7 @@ function DataTableRow<TData extends RowData>({
               left: 0,
               position: "absolute",
               top: 0,
-              transform: `translateY(${virtualStart}px)`,
+              transform: `translateY(${virtualStart})`,
               width: "100%",
             }
       }

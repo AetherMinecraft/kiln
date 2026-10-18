@@ -2,16 +2,14 @@ import { isAccountEnabled, isAccountVerified } from "@/lib/account-policy"
 import { Outlet, createFileRoute, redirect } from "@tanstack/react-router"
 
 import { AppNotFoundPage } from "@/components/app-error-page"
-import { appRouteIdFromSelection } from "@/lib/app-route"
-import { databaseRouteIdFromSelection } from "@/lib/database-route"
-import { relayRouteIdFromSelection } from "@/lib/relay-route"
 import {
   accessCapabilitiesQueryOptions,
   appDirectoryQueryOptions,
   authStateQueryOptions,
+  instanceFavoritesQueryOptions,
   managedDatabaseDirectoryQueryOptions,
-  relayConnectionQueryOptions,
   relaysQueryOptions,
+  serverNavigationQueryOptions,
   uiPreferencesQueryOptions,
 } from "@/lib/query-options"
 
@@ -36,26 +34,30 @@ export const Route = createFileRoute("/_app")({
     await context.queryClient.ensureQueryData(accessCapabilitiesQueryOptions())
     return { user }
   },
+  // The sidebar and command menu list and count what the user can reach
+  // from Hearth's own records. Load them with the frame so it renders
+  // complete in the first HTML, without asking any Relay. Game servers can
+  // number in the thousands, so the frame loads only the one it opens and
+  // their count; the picker loads the rest when opened.
   loader: async ({ context }) => {
-    const [, uiPreferences] = await Promise.all([
+    await Promise.all([
+      context.queryClient
+        .ensureQueryData(uiPreferencesQueryOptions())
+        .then((preferences) =>
+          context.queryClient.ensureQueryData(
+            serverNavigationQueryOptions({
+              selectedRouteId: preferences.selectedInstanceRouteId,
+            })
+          )
+        ),
+      context.queryClient.ensureQueryData(appDirectoryQueryOptions()),
       context.queryClient.ensureQueryData(
-        relayConnectionQueryOptions(context.queryClient)
-      ),
-      context.queryClient.ensureQueryData(uiPreferencesQueryOptions()),
-    ])
-    // The sidebar shows a remembered database from the directory; load it
-    // with the frame so the sidebar does not switch after hydration.
-    if (databaseRouteIdFromSelection(uiPreferences.selectedInstanceRouteId)) {
-      await context.queryClient.ensureQueryData(
         managedDatabaseDirectoryQueryOptions()
-      )
-    }
-    if (appRouteIdFromSelection(uiPreferences.selectedInstanceRouteId)) {
-      await context.queryClient.ensureQueryData(appDirectoryQueryOptions())
-    }
-    if (relayRouteIdFromSelection(uiPreferences.selectedInstanceRouteId)) {
-      await context.queryClient.ensureQueryData(relaysQueryOptions())
-    }
+      ),
+      context.queryClient.ensureQueryData(relaysQueryOptions()),
+      // Stars render with their rows instead of popping in afterwards.
+      context.queryClient.ensureQueryData(instanceFavoritesQueryOptions()),
+    ])
   },
   component: AuthenticatedApp,
   notFoundComponent: AppNotFoundPage,

@@ -4,6 +4,7 @@ import type {
   HearthRealtimeScope,
   HearthRealtimeTopic,
 } from "@/lib/hearth-realtime-topics"
+import { instanceInventoryScope } from "@/lib/instance-inventory"
 import { queryKeys } from "@/lib/query-options"
 import {
   backupRunsInputFromQueryKey,
@@ -32,6 +33,13 @@ const prefix = (queryKey: QueryKey): HearthRealtimeQueryScope => ({
 
 const hearthRealtimeQueryScopes = {
   access: [
+    exact(queryKeys.relay.reachability),
+    exact(queryKeys.servers.directory),
+    prefix(queryKeys.servers.navigation),
+    exact(queryKeys.apps.directory),
+    exact(queryKeys.databases.directory),
+    prefix(["infra-directory"]),
+    prefix(["instance-inventory"]),
     exact(queryKeys.access.capabilities),
     prefix(["resource-access"]),
     prefix(["access-resources"]),
@@ -42,7 +50,7 @@ const hearthRealtimeQueryScopes = {
   ],
   activity: [prefix(["activity"])],
   "app-directory": [exact(queryKeys.apps.directory)],
-  apps: [prefix(["apps"])],
+  apps: [prefix(["apps"]), prefix(["instance-inventory", "app"])],
   "backup-settings": [
     prefix(["backups", "policy"]),
     prefix(["backups", "usage"]),
@@ -54,21 +62,36 @@ const hearthRealtimeQueryScopes = {
     exact(queryKeys.databases.directory),
     exact(queryKeys.schedules.options),
   ],
-  databases: [exact(queryKeys.databases.list)],
-  domains: [prefix(["domains"])],
+  databases: [prefix(["instance-inventory", "database"])],
+  domains: [
+    exact(queryKeys.servers.directory),
+    prefix(queryKeys.servers.navigation),
+    prefix(["domains"]),
+  ],
   favorites: [exact(queryKeys.instanceFavorites)],
   "file-activity": [prefix(["file-activity"])],
-  "instance-directory": [exact(queryKeys.schedules.options)],
+  "instance-directory": [
+    exact(queryKeys.servers.directory),
+    prefix(queryKeys.servers.navigation),
+    exact(queryKeys.schedules.options),
+  ],
   "instance-web-routes": [prefix(["web-routes"])],
   notifications: [exact(queryKeys.notifications)],
   preferences: [exact(queryKeys.uiPreferences)],
-  "relay-health": [exact(queryKeys.relays)],
+  "relay-health": [
+    exact(queryKeys.relays),
+    prefix(["instance-inventory", "relay"]),
+  ],
   "relay-proxy": [prefix(["relays", "proxy"])],
   relays: [
+    prefix(["infra-directory"]),
+    prefix(["instance-inventory"]),
+    exact(queryKeys.access.capabilities),
+    exact(queryKeys.relay.reachability),
     exact(queryKeys.relays),
-    exact(queryKeys.databases.list),
     exact(queryKeys.databases.directory),
-    exact(queryKeys.apps.list),
+    exact(queryKeys.servers.directory),
+    prefix(queryKeys.servers.navigation),
     exact(queryKeys.apps.directory),
     exact(queryKeys.domains.settings),
     exact(queryKeys.schedules.all),
@@ -92,6 +115,13 @@ function queryScopes(
     // One Relay's access edit: refresh that Relay's records and what the
     // viewer can reach, never the platform user or invitation lists.
     return [
+      exact(queryKeys.relay.reachability),
+      exact(queryKeys.servers.directory),
+      prefix(queryKeys.servers.navigation),
+      exact(queryKeys.apps.directory),
+      exact(queryKeys.databases.directory),
+      prefix(["infra-directory"]),
+      prefix(["instance-inventory"]),
       exact(queryKeys.access.capabilities),
       prefix(["resource-access", scope.relayId]),
       prefix(["access-resources"]),
@@ -111,13 +141,27 @@ function queryScopes(
     ]
   }
   if (topic === "domains" && scope?.instanceId) {
-    return [exact(queryKeys.domains.instance(scope.relayId, scope.instanceId))]
+    return [
+      exact(queryKeys.servers.directory),
+      prefix(queryKeys.servers.navigation),
+      exact(queryKeys.domains.instance(scope.relayId, scope.instanceId)),
+    ]
   }
   if (topic === "file-activity" && scope?.instanceId) {
     return [exact(queryKeys.fileActivity(scope.relayId, scope.instanceId))]
   }
   if (topic === "apps" && scope) {
-    return hearthRealtimeQueryScopes.apps
+    return [
+      prefix(["apps"]),
+      prefix(instanceInventoryScope({ kind: "app", relayId: scope.relayId })),
+    ]
+  }
+  if (topic === "databases" && scope) {
+    return [
+      prefix(
+        instanceInventoryScope({ kind: "database", relayId: scope.relayId })
+      ),
+    ]
   }
   if (topic === "instance-web-routes" && scope?.instanceId) {
     return [exact(queryKeys.relay.webRoutes(scope.relayId, scope.instanceId))]

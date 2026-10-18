@@ -15,7 +15,11 @@ vi.mock("@/server/relay-capability", () => ({
 }))
 
 import { createRelayBrowserSocketInbox } from "./authenticated-relay-socket"
-import { openRelayConsoleStream } from "./relay-console-stream"
+import { notifyRelayBrowserAuthorizationChanged } from "./relay-browser-credentials"
+import {
+  openRelayConsoleStream,
+  prewarmRelayConsole,
+} from "./relay-console-stream"
 
 type ConsoleCapability = {
   browserOrigin: string
@@ -26,6 +30,8 @@ type ConsoleCapability = {
 }
 
 afterEach(() => {
+  // Discards any prewarm a test left, as an authorization change does.
+  notifyRelayBrowserAuthorizationChanged()
   relayCapability.issue.mockReset()
   FakeWebSocket.reset()
   vi.restoreAllMocks()
@@ -113,6 +119,41 @@ describe("Relay console connection setup", () => {
       expect.objectContaining({ type: "auth" }),
       { instanceId: "instance-one", type: "console.subscribe", v: 1 },
     ])
+  })
+
+  it("subscribes right behind its auth when the Relay handles it", async () => {
+    const capability = deferredCapability()
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    const running = Effect.runPromise(
+      openRelayConsoleStream(
+        "relay-one",
+        { id: "instance-one", kind: "instance" },
+        "https://relay.example.com"
+      ).pipe(Stream.runHead)
+    )
+    await capability.requested
+    const socket = await FakeWebSocket.opened(0)
+    socket.receive({
+      expiresAt: Date.now() + 30_000,
+      features: ["early-messages"],
+      nonce: "nonce-one",
+      relayId: "relay-one",
+      sessionId: "session-one",
+      type: "auth.challenge",
+    })
+    capability.resolve(consoleCapability())
+
+    // Both are sent before the Relay confirms the auth.
+    await socket.sentFrames(2)
+    expect(socket.sent).toEqual([
+      expect.objectContaining({ type: "auth" }),
+      { instanceId: "instance-one", type: "console.subscribe", v: 1 },
+    ])
+    socket.receive({ instanceId: "instance-one", type: "auth.ready" })
+    await running
+    expect(socket.sent).toHaveLength(2)
   })
 
   it("closes the unauthenticated socket without proxying a permission denial", async () => {
@@ -330,6 +371,269 @@ describe("Relay console connection setup", () => {
     await finishDirectConnection(socket, running)
 
     expect(fetchFallback).not.toHaveBeenCalled()
+  })
+})
+
+describe("Relay console prewarm", () => {
+  const prewarm = {
+    browserOrigin: "https://relay.example.com",
+    instanceId: "instance-one",
+    relayId: "relay-one",
+    write: false,
+  }
+  const openConsole = (write = false) =>
+    openRelayConsoleStream(
+      "relay-one",
+      { id: "instance-one", kind: "instance" },
+      "https://relay.example.com",
+      null,
+      undefined,
+      write
+    )
+
+  it("hands the next console a hovered link's connection, its output waiting", async () => {
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    // Hovering the console link connects and subscribes at once.
+    prewarmRelayConsole(prewarm)
+    const socket = await FakeWebSocket.opened(0)
+    dispatchChallenge(socket)
+    await subscribed(socket)
+    socket.receive({ instanceId: "instance-one", lifecycle: [], type: "ready" })
+
+    const events = await Effect.runPromise(
+      openConsole().pipe(Stream.take(2), Stream.runCollect)
+    )
+
+    expect(events).toEqual([
+      { message: null, transport: "direct", type: "transport" },
+      { instanceId: "instance-one", lifecycle: [], type: "ready" },
+    ])
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(relayCapability.issue).toHaveBeenCalledTimes(1)
+    expect(socket.sent).toEqual([
+      expect.objectContaining({ type: "auth" }),
+      { instanceId: "instance-one", type: "console.subscribe", v: 1 },
+    ])
+  })
+
+  it("subscribes a hovered link's connection right behind its auth", async () => {
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    prewarmRelayConsole(prewarm)
+    const socket = await FakeWebSocket.opened(0)
+    dispatchChallenge(socket, { features: ["early-messages"] })
+    // Both go out before the Relay confirms the auth.
+    await socket.sentFrames(2)
+    socket.receive({ instanceId: "instance-one", type: "auth.ready" })
+    socket.receive({ instanceId: "instance-one", lifecycle: [], type: "ready" })
+
+    const events = await Effect.runPromise(
+      openConsole().pipe(Stream.take(2), Stream.runCollect)
+    )
+
+    expect(events).toContainEqual({
+      instanceId: "instance-one",
+      lifecycle: [],
+      type: "ready",
+    })
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(socket.sent).toEqual([
+      expect.objectContaining({ type: "auth" }),
+      { instanceId: "instance-one", type: "console.subscribe", v: 1 },
+    ])
+  })
+
+  it("closes a read-only prewarm when a console that can write opens", async () => {
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    prewarmRelayConsole(prewarm)
+    const readOnly = await FakeWebSocket.opened(0)
+    dispatchChallenge(readOnly)
+    await subscribed(readOnly)
+
+    // Left open, the Relay would take either as replacing the other.
+    const running = Effect.runPromise(openConsole(true).pipe(Stream.runHead))
+    const socket = await FakeWebSocket.opened(1)
+    expect(readOnly.close).toHaveBeenCalled()
+    dispatchChallenge(socket)
+    await finishDirectConnection(socket, running)
+  })
+
+  it("closes a prewarm when the console reconnects from scratch", async () => {
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    prewarmRelayConsole(prewarm)
+    const warm = await FakeWebSocket.opened(0)
+    dispatchChallenge(warm)
+    await warm.sentFrames(1)
+
+    // A retry reconnects without the cached origin, and must not leave the
+    // prewarm to replace it once authenticated.
+    const running = Effect.runPromise(
+      openRelayConsoleStream(
+        "relay-one",
+        { id: "instance-one", kind: "instance" },
+        null
+      ).pipe(Stream.runHead)
+    )
+    expect(warm.close).toHaveBeenCalled()
+    const socket = await FakeWebSocket.opened(1)
+    dispatchChallenge(socket)
+    await finishDirectConnection(socket, running)
+  })
+
+  it("keeps one prewarm per server", async () => {
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    prewarmRelayConsole(prewarm)
+    const readOnly = await FakeWebSocket.opened(0)
+    dispatchChallenge(readOnly)
+    await subscribed(readOnly)
+    // Such as after the user's access changed between two hovers.
+    prewarmRelayConsole({ ...prewarm, write: true })
+
+    expect(readOnly.close).toHaveBeenCalled()
+    const writer = await FakeWebSocket.opened(1)
+    dispatchChallenge(writer)
+    await subscribed(writer)
+    expect(writer.close).not.toHaveBeenCalled()
+  })
+
+  it("prewarms nothing for a console that is already open", async () => {
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+    const running = Effect.runFork(openConsole().pipe(Stream.runDrain))
+    const socket = await FakeWebSocket.opened(0)
+    dispatchChallenge(socket)
+    await subscribed(socket)
+
+    // Such as hovering the Console tab of the console being read.
+    prewarmRelayConsole(prewarm)
+    await flush()
+
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    await Effect.runPromise(Fiber.interrupt(running))
+  })
+
+  it("keeps an adopted prewarm open past its expiry", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout"],
+    })
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    prewarmRelayConsole(prewarm)
+    const socket = await FakeWebSocket.opened(0)
+    dispatchChallenge(socket)
+    const running = Effect.runFork(openConsole().pipe(Stream.runDrain))
+    await subscribed(socket)
+
+    vi.advanceTimersByTime(8_000)
+    await flush()
+    expect(socket.close).not.toHaveBeenCalled()
+
+    await Effect.runPromise(Fiber.interrupt(running))
+    expect(socket.close).toHaveBeenCalled()
+    vi.useRealTimers()
+  })
+
+  it("discards a prewarm when browser authorization changes", async () => {
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    prewarmRelayConsole(prewarm)
+    const stale = await FakeWebSocket.opened(0)
+    dispatchChallenge(stale)
+    await subscribed(stale)
+    // Such as a sign-out or a permission change while the link was hovered.
+    notifyRelayBrowserAuthorizationChanged()
+    await vi.waitFor(() => expect(stale.close).toHaveBeenCalled())
+
+    const running = Effect.runPromise(openConsole().pipe(Stream.runHead))
+    const next = await FakeWebSocket.opened(1)
+    dispatchChallenge(next)
+    await finishDirectConnection(next, running)
+    expect(next.sent).toEqual([
+      expect.objectContaining({ type: "auth" }),
+      { instanceId: "instance-one", type: "console.subscribe", v: 1 },
+    ])
+  })
+
+  it("closes a prewarm nobody adopts", async () => {
+    // Time still passes, so the stream's own scheduling runs.
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout"],
+    })
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    prewarmRelayConsole(prewarm)
+    const socket = await FakeWebSocket.opened(0)
+    dispatchChallenge(socket)
+    await subscribed(socket)
+    vi.advanceTimersByTime(8_000)
+    await vi.waitFor(() => expect(socket.close).toHaveBeenCalled())
+    vi.useRealTimers()
+
+    // The next console opens its own connection.
+    const running = Effect.runPromise(openConsole().pipe(Stream.runHead))
+    const next = await FakeWebSocket.opened(1)
+    dispatchChallenge(next)
+    await finishDirectConnection(next, running)
+    expect(FakeWebSocket.instances).toHaveLength(2)
+  })
+
+  it.each([
+    [
+      "failed",
+      async (socket: FakeWebSocket) => {
+        await socket.sentFrames(1)
+        dispatchSocketClose(socket, 1011, "Relay restarting")
+      },
+    ],
+    [
+      // Such as one whose inbox filled before anyone read it.
+      "closed after subscribing",
+      async (socket: FakeWebSocket) => {
+        await subscribed(socket)
+        dispatchSocketClose(socket, 4013, "console consumer is too slow")
+      },
+    ],
+  ])("connects directly again when the prewarm %s", async (_, end) => {
+    deferredCapability().resolve(consoleCapability())
+    vi.stubGlobal("navigator", { onLine: true })
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+
+    prewarmRelayConsole(prewarm)
+    const ended = await FakeWebSocket.opened(0)
+    dispatchChallenge(ended)
+    await end(ended)
+
+    // Rather than falling back to Hearth.
+    const running = Effect.runPromise(openConsole().pipe(Stream.runHead))
+    const next = await FakeWebSocket.opened(1)
+    dispatchChallenge(next)
+    await finishDirectConnection(next, running)
+    expect(Option.getOrThrow(await running)).toMatchObject({
+      transport: "direct",
+    })
   })
 })
 
@@ -606,6 +910,7 @@ function dispatchChallenge(
   socket: FakeWebSocket,
   overrides: Partial<{
     expiresAt: number
+    features: Array<string>
     nonce: string
     relayId: string
     sessionId: string
@@ -634,6 +939,13 @@ function dispatchSocketClose(
 /** Lets the stream's fibers and promise callbacks run one event-loop turn. */
 function flush(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve))
+}
+
+/** Answers a socket's auth, then waits for its console subscription. */
+async function subscribed(socket: FakeWebSocket): Promise<void> {
+  await socket.sentFrames(1)
+  socket.receive({ instanceId: "instance-one", type: "auth.ready" })
+  await socket.sentFrames(2)
 }
 
 async function finishDirectConnection(

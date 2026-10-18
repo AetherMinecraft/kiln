@@ -8,9 +8,14 @@ import { disposeAppRuntime, reportAppError } from "./effect/runtime"
 import { forkPromise } from "./effect/promise"
 import { startAccessInvitationDelivery } from "./lib/access-invitation-delivery"
 import { scheduleBackupCopyProcessing } from "./lib/backup-copy"
+import { stopWarmCacheRefreshes } from "./lib/cache"
 import { wakePendingAuthorizationDelivery } from "./lib/authorization-delivery"
 import { scheduleInstancePostProvisionProcessing } from "./lib/instance-post-provision"
 import { startKilnUpdateNotifications } from "./lib/kiln-update-notifications"
+import {
+  startInstanceDirectorySync,
+  stopInstanceDirectorySync,
+} from "./lib/instance-directory-sync"
 import { scheduleTailscaleCleanupProcessing } from "./lib/tailscale-cleanup.server"
 import {
   initializeRelayFromEnvironment,
@@ -18,6 +23,7 @@ import {
 } from "./lib/relay-registry"
 
 await migrateDatabase()
+startInstanceDirectorySync()
 
 await Effect.runPromise(
   Effect.tryPromise({
@@ -66,7 +72,9 @@ let shutdownPromise: Promise<void> | undefined
 
 export function shutdownHearth(): Promise<void> {
   // Disposing the runtime also flushes pending telemetry.
-  shutdownPromise ??= disposeAppRuntime()
+  shutdownPromise ??= stopInstanceDirectorySync()
+    .then(() => Effect.runPromise(stopWarmCacheRefreshes))
+    .then(disposeAppRuntime)
   return shutdownPromise
 }
 

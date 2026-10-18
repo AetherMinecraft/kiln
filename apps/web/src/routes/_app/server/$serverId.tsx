@@ -3,36 +3,82 @@ import {
   invitationInfrastructureHref,
 } from "@/lib/resource-invitation-query"
 import { relayInstanceRouteId } from "@/lib/relay-fleet"
-import { Outlet, createFileRoute, redirect } from "@tanstack/react-router"
+import {
+  Outlet,
+  createFileRoute,
+  redirect,
+  type ParsedLocation,
+} from "@tanstack/react-router"
 
 import {
-  relayConnectionQueryOptions,
-  relaySnapshotQueryOptions,
+  serverDirectoryQueryOptions,
+  serverNavigationQueryOptions,
 } from "@/lib/query-options"
+import { forkPromise } from "@/effect/promise"
 import {
-  relayInstanceRouteIdentifier,
-  resolveRelayInstance,
-} from "@/lib/relay-selectors"
+  ensureServerWorkspace,
+  knownServer,
+  serverWorkspaceQueryOptions,
+  type KnownServer,
+} from "@/lib/server-workspace"
 
 export const Route = createFileRoute("/_app/server/$serverId")({
   staleTime: Infinity,
   beforeLoad: async ({ context, location, params }) => {
-    if (params.serverId === "unavailable") return { instance: null }
+    if (params.serverId === "unavailable")
+      return { instance: null, serverVerified: true }
+    const { queryClient } = context
 
-    const connection = await context.queryClient.ensureQueryData(
-      relayConnectionQueryOptions(context.queryClient)
-    )
-    const snapshot =
-      connection.status === "connected"
-        ? connection.snapshot
-        : await context.queryClient.ensureQueryData(relaySnapshotQueryOptions())
+    // The sidebar opens this server too; load its entry with the route so it
+    // never shows the previous one. A loaded directory already answers it.
+    const directoryLoaded =
+      queryClient.getQueryData(serverDirectoryQueryOptions().queryKey) !==
+      undefined
+    const navigation = directoryLoaded
+      ? undefined
+      : queryClient.ensureQueryData(
+          serverNavigationQueryOptions({ serverId: params.serverId })
+        )
 
-    const resolution = resolveRelayInstance(snapshot.instances, params.serverId)
-    if (resolution.status === "ambiguous") {
+    // A server this page already knows, opened for the first time by its
+    // canonical ID, opens at once: the page reads its own server in the
+    // background, and the route resolves again if that read disagrees. A link
+    // that would redirect waits for Hearth's answer, since a cached one may
+    // send it to the wrong server.
+    const known =
+      queryClient.getQueryData(
+        serverWorkspaceQueryOptions(params.serverId).queryKey
+      ) === undefined
+        ? knownServer(queryClient, params.serverId)
+        : undefined
+    if (
+      known &&
+      (params.serverId === known.routeIdentifier ||
+        params.serverId === known.server.routeId)
+    ) {
+      forkPromise(() => ensureServerWorkspace(queryClient, params.serverId))
+      if (navigation) forkPromise(() => navigation)
+      return {
+        ...openedServer(
+          location,
+          params.serverId,
+          known.server,
+          known.routeIdentifier
+        ),
+        serverVerified: false,
+      }
+    }
+
+    const [workspace] = await Promise.all([
+      ensureServerWorkspace(queryClient, params.serverId),
+      navigation,
+    ])
+
+    if (workspace.status === "ambiguous") {
       throw redirectToServerList(params.serverId)
     }
-    if (resolution.status === "not-found") {
-      const invitations = await context.queryClient.ensureQueryData(
+    if (workspace.status === "not-found") {
+      const invitations = await queryClient.ensureQueryData(
         myInvitationsQueryOptions()
       )
       const matches = invitations.filter(
@@ -53,37 +99,53 @@ export const Route = createFileRoute("/_app/server/$serverId")({
 
       throw redirect({ to: "/infra/servers", replace: true })
     }
-    const instance = resolution.instance
-    const routeIdentifier = relayInstanceRouteIdentifier(
-      snapshot.instances,
-      instance
-    )
-    if (!routeIdentifier) {
+    const [instance] = workspace.snapshot.instances
+    if (!instance) throw redirect({ to: "/infra/servers", replace: true })
+    if (!workspace.routeIdentifier) {
       throw redirectToServerList(instance.shortId)
     }
-
-    // Relay-qualified links are already unambiguous. Rewriting one while its
-    // client transition is resolving can start a second transition for the
-    // same instance and lock the router.
-    const alreadyRelayQualified = params.serverId === instance.routeId
-    if (!alreadyRelayQualified && params.serverId !== routeIdentifier) {
-      const segments = location.pathname.split("/")
-      segments[2] = encodeURIComponent(routeIdentifier)
-      throw redirect({
-        href: `${segments.join("/")}${location.searchStr}${location.hash ? `#${location.hash}` : ""}`,
-        replace: true,
-      })
-    }
     return {
-      instance: {
-        brickId: instance.brickId,
-        id: instance.id,
-        relayId: instance.relayId,
-      },
+      ...openedServer(
+        location,
+        params.serverId,
+        instance,
+        workspace.routeIdentifier
+      ),
+      serverVerified: true,
     }
   },
   component: Outlet,
 })
+
+// The route's context for a resolved server, after redirecting a link that
+// does not use its canonical ID.
+function openedServer(
+  location: ParsedLocation,
+  serverId: string,
+  server: Pick<KnownServer, "id" | "relayId" | "routeId"> &
+    Partial<Pick<KnownServer, "brickId">>,
+  routeIdentifier: string
+) {
+  // Relay-qualified links are already unambiguous. Rewriting one while its
+  // client transition is resolving can start a second transition for the
+  // same instance and lock the router.
+  const alreadyRelayQualified = serverId === server.routeId
+  if (!alreadyRelayQualified && serverId !== routeIdentifier) {
+    const segments = location.pathname.split("/")
+    segments[2] = encodeURIComponent(routeIdentifier)
+    throw redirect({
+      href: `${segments.join("/")}${location.searchStr}${location.hash ? `#${location.hash}` : ""}`,
+      replace: true,
+    })
+  }
+  return {
+    instance: {
+      brickId: server.brickId,
+      id: server.id,
+      relayId: server.relayId,
+    },
+  }
+}
 
 function redirectToServerList(shortId: string) {
   return redirect({

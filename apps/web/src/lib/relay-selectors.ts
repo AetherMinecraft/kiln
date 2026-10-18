@@ -14,16 +14,10 @@ export type RelayConnectionSummary =
       "relay" | "relays" | "status"
     >
 
+/** A game server as navigation shows it: identity only, never live state. */
 export type SidebarInstance = Pick<
   RelayInstance,
-  | "brickId"
-  | "brickSource"
-  | "id"
-  | "implementation"
-  | "name"
-  | "observedState"
-  | "shortId"
-  | "version"
+  "brickId" | "id" | "implementation" | "name" | "shortId" | "version"
 > & {
   relayId: string
   relayName: string
@@ -78,14 +72,8 @@ export type InstanceWorkspaceInstance = Pick<
 // data directory (whose `id` is its file root, `app:<appId>`).
 export type FileWorkspaceInstance = Pick<
   InstanceWorkspaceInstance,
-  | "id"
-  | "implementation"
-  | "name"
-  | "observedState"
-  | "relayId"
-  | "shortId"
-  | "version"
->
+  "id" | "implementation" | "name" | "relayId" | "shortId" | "version"
+> & { observedState?: RelayInstance["observedState"] }
 
 export type InstanceRuntime = Pick<
   RelayInstance,
@@ -171,11 +159,9 @@ function sidebarInstance(
 ): SidebarInstance {
   return {
     brickId: instance.brickId,
-    brickSource: instance.brickSource,
     id: instance.id,
     implementation: instance.implementation,
     name: instance.name,
-    observedState: instance.observedState,
     relayId: instance.relayId,
     relayName: instance.relayName,
     routeId: instance.routeId,
@@ -249,21 +235,6 @@ export function selectInstanceWorkspaceInstance(identifier: string) {
       version: instance.version,
     }
   }
-}
-
-export function selectInstanceRelayConnected(
-  identifier: string,
-  relayId?: string
-) {
-  return (snapshot: RelayFleetSnapshot): boolean =>
-    snapshot.instances.find(
-      (instance) =>
-        (!relayId || instance.relayId === relayId) &&
-        (instance.routeId === identifier ||
-          instance.shortId === identifier ||
-          instance.id === identifier ||
-          instance.name === identifier)
-    )?.relayStatus === "connected"
 }
 
 export type ConsoleInstanceRuntime = Omit<InstanceRuntime, "resources">
@@ -408,8 +379,14 @@ export function resolveRelayInstance<
     )
   }
 
+  // A Relay-qualified full ID names one server exactly, even where two on a
+  // Relay share a short ID.
   const routeIdMatches = instances.filter(
-    (instance) => instance.routeId === identifier
+    (instance) =>
+      instance.routeId === identifier ||
+      (instance.routeId !== undefined &&
+        identifier ===
+          instance.routeId.slice(0, -instance.shortId.length) + instance.id)
   )
   if (routeIdMatches.length > 0) {
     return resolveRelayInstanceMatches(routeIdMatches)

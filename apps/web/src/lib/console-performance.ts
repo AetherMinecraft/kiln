@@ -2,6 +2,7 @@ import { Effect } from "effect"
 
 import type { BrowserSpan } from "@/lib/browser-telemetry"
 import { startBrowserSpan } from "@/lib/browser-telemetry"
+import { currentPageOpenId, markPageMilestone } from "@/lib/page-timing"
 
 type ConsoleSpan = BrowserSpan
 
@@ -9,6 +10,9 @@ export interface ConsoleLoadTiming {
   cancel: () => void
   markCache: (cacheHit: boolean) => void
   markFirstRowsPainted: (lineCount: number) => void
+  // The console took over a connection opened before it rendered, such as
+  // by hovering its link.
+  markPrewarmed: () => void
   markReady: (transport: "direct" | "hearth" | null, lineCount: number) => void
   markRetryableFailure: (cause: unknown) => void
   markTransport: (transport: "direct" | "hearth") => void
@@ -16,6 +20,9 @@ export interface ConsoleLoadTiming {
 }
 
 export function createConsoleLoadTiming(): ConsoleLoadTiming {
+  // The page open this console belongs to; a console that is leaving must
+  // not report for the page replacing it.
+  const pageOpenId = currentPageOpenId()
   let cacheHit = false
   let open = true
   let openSpan: ConsoleSpan | undefined
@@ -39,6 +46,7 @@ export function createConsoleLoadTiming(): ConsoleLoadTiming {
     if (!open || !ready || rowsPending) return
     open = false
     openSpan?.end()
+    markPageMilestone("content", pageOpenId)
   }
   const finishRows = (
     result: "cached" | "empty" | "stream",
@@ -85,6 +93,11 @@ export function createConsoleLoadTiming(): ConsoleLoadTiming {
     },
     markFirstRowsPainted: (lineCount) => {
       finishRows(cacheHit ? "cached" : "stream", lineCount)
+    },
+    markPrewarmed: () => {
+      if (!open) return
+      start()
+      openSpan?.setAttribute("kiln.console.prewarmed", true)
     },
     markReady: (transport, lineCount) => {
       if (!open) return

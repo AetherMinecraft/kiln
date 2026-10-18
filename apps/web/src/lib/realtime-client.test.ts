@@ -1,21 +1,31 @@
 import { QueryClient } from "@tanstack/react-query"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 
-// Database inventory is fetched from Hearth; tests control when it resolves.
-vi.mock("@/server/databases", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/server/databases")>()),
-  getManagedDatabases: vi.fn(),
+// Observations are read from Hearth; tests decide what Hearth reports.
+vi.mock("@/server/instance-inventory", () => ({
+  getInstanceInventory: vi.fn(),
 }))
+const relayServer = vi.hoisted(() => ({
+  getRelayReachability: vi.fn(),
+  getServerWorkspace: vi.fn(),
+}))
+vi.mock("@/server/relay", () => relayServer)
 
-import { getManagedDatabasesCollection } from "@/lib/collections/managed-databases"
+import { QueryObserver } from "@tanstack/react-query"
+import type {
+  InstanceInventoryRequest,
+  InstanceInventoryResult,
+} from "@workspace/contracts"
 import { getRelayInstancesCollection } from "@/lib/collections/relay-instances"
+import { instanceStateQueryOptions } from "@/lib/instance-state"
 import { createAppClients, type AppRouterContext } from "@/lib/query-client"
 import {
-  managedDatabasesQueryOptions,
   queryKeys,
+  relayReachabilityQueryOptions,
   type RelayConnection,
+  type RelayReachability,
 } from "@/lib/query-options"
-import { getManagedDatabases } from "@/server/databases"
+import { getInstanceInventory } from "@/server/instance-inventory"
 import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import type {
   FleetInstance,
@@ -28,8 +38,16 @@ import {
   applyRecoveredRelayConnection,
   applyRealtimeEventSafely,
   applyUpdatedInstance,
+  fleetEventNeedsRecovery,
+  recheckPushedState,
   resetRealtimeEpoch,
 } from "@/lib/realtime-client"
+import {
+  ensureServerWorkspace,
+  recheckServerWorkspaces,
+  serverWorkspaceQueryOptions,
+  type ServerWorkspace,
+} from "@/lib/server-workspace"
 
 const epoch = "00000000-0000-4000-8000-000000000001"
 const defaultBackupRunsKey = queryKeys.backups.runs({
@@ -126,6 +144,24 @@ async function readyFleet(rows: Array<FleetInstance>) {
   return clients
 }
 
+// A reachability read in flight, as a route loader starts it. The test
+// resolves each request Hearth receives.
+function controlledReads(queryClient: QueryClient) {
+  const pending: Array<(relays: RelayReachability) => void> = []
+  relayServer.getRelayReachability.mockImplementation(
+    () =>
+      new Promise<RelayReachability>((resolve) => {
+        pending.push(resolve)
+      })
+  )
+  const first = queryClient.fetchQuery(relayReachabilityQueryOptions())
+  return { first, pending }
+}
+
+const relayA = (status: "connected" | "unreachable") => [
+  { id: "relay-a", name: "Relay A", status },
+]
+
 function applyEvent(
   clients: ReturnType<typeof fleet>,
   event: StreamEvent,
@@ -182,6 +218,47 @@ describe("realtime event application", () => {
         queryKeys.relay.instances
       )
     ).toEqual([beta])
+  })
+
+  it("leaves the fleet unloaded when nothing on the page reads it", () => {
+    const clients = fleet()
+
+    applyEvent(clients, instancesDelta([beta]))
+
+    expect(
+      clients.queryClient.getQueryData(queryKeys.relay.instances)
+    ).toBeUndefined()
+  })
+
+  it("recovers a push that arrives while the fleet's first read is in flight", async () => {
+    const clients = fleet()
+    let resolveFirstRead!: (instances: Array<FleetInstance>) => void
+    const firstRead = clients.queryClient.fetchQuery({
+      queryKey: queryKeys.relay.instances,
+      queryFn: () =>
+        new Promise<Array<FleetInstance>>((resolve) => {
+          resolveFirstRead = resolve
+        }),
+    })
+
+    // The read began before this push, so it would overwrite the change.
+    expect(
+      fleetEventNeedsRecovery(
+        clients.queryClient,
+        clients.instances,
+        instancesDelta([beta])
+      )
+    ).toBe(true)
+
+    resolveFirstRead([alpha])
+    await firstRead
+    expect(
+      fleetEventNeedsRecovery(
+        clients.queryClient,
+        clients.instances,
+        instancesDelta([beta])
+      )
+    ).toBe(false)
   })
 
   it("reports collection write failures so the stream can recover", async () => {
@@ -243,127 +320,194 @@ describe("realtime event application", () => {
     expect(result?.nodes).toEqual([updatedNode])
   })
 
-  it("patches database rows from Relay status and refetches only when the Relay returns", async () => {
-    const app = createAppClients()
-    openClients.push(app)
-    const clients = {
-      instances: getRelayInstancesCollection(app.dbClient),
-      queryClient: app.queryClient,
-    }
-    const databases = getManagedDatabasesCollection(app.dbClient)
-    const database = {
-      id: "d".repeat(40),
-      inventoryStatus: "available",
-      observedState: "running",
-      relayId: alpha.relayId,
-      relayStatus: "connected",
-      relayUpdating: false,
-    }
-    clients.queryClient.setQueryData(queryKeys.databases.list, {
-      databases: [database],
-      relayErrors: [],
-      relays: [],
-    })
-    await databases.preload()
-    const refreshTopics = vi.fn().mockResolvedValue(undefined)
-
-    applyEvent(
-      clients,
-      {
-        epoch,
-        relayId: alpha.relayId,
-        sequence: 1,
-        status: "unreachable",
-        type: "relay.status",
-        updating: true,
-      },
-      refreshTopics
+  it("rereads an observation whose first read began before a Relay status change", async () => {
+    const answers: Array<(reachability: "connected" | "unreachable") => void> =
+      []
+    vi.mocked(getInstanceInventory).mockImplementation(
+      (({ data }: { data: Array<InstanceInventoryRequest> }) =>
+        new Promise<Array<InstanceInventoryResult>>((resolve) => {
+          answers.push((reachability) =>
+            resolve(
+              data.map((request) => ({
+                request,
+                value: {
+                  kind: request.reference.kind,
+                  view: "status",
+                  data: null,
+                  observation: {
+                    ...request.reference,
+                    reachability,
+                    runtime: null,
+                    inventory: "unavailable",
+                    updating: false,
+                  },
+                },
+              }))
+            )
+          )
+        })) as unknown as typeof getInstanceInventory
     )
-    // The collection follows its backing query cache.
-    await vi.waitFor(() =>
-      expect(databases.toArray).toMatchObject([
-        { relayStatus: "unreachable", relayUpdating: true },
-      ])
-    )
-    expect(refreshTopics).not.toHaveBeenCalled()
-
-    applyEvent(
-      clients,
-      relayStatus(alpha.relayId, "connected", 2),
-      refreshTopics
-    )
-    await vi.waitFor(() =>
-      expect(databases.toArray).toMatchObject([
-        { relayStatus: "connected", relayUpdating: false },
-      ])
-    )
-    expect(refreshTopics).toHaveBeenCalledWith(["databases"], {
-      relayId: alpha.relayId,
-    })
-  })
-
-  it("keeps a newer Relay status when an older inventory response arrives", async () => {
     const clients = fleet()
-    clients.queryClient.setQueryData(queryKeys.relay.connection, {
-      relay: { id: alpha.relayId, name: alpha.relayName },
-      relays: [
-        { id: alpha.relayId, name: alpha.relayName, status: "connected" },
-      ],
-      snapshot: snapshot(),
-      status: "connected",
-    })
-    type Overview = Awaited<ReturnType<typeof getManagedDatabases>>
-    let resolveResponse!: (overview: Overview) => void
-    vi.mocked(getManagedDatabases).mockReturnValueOnce(
-      new Promise<Overview>((resolve) => {
-        resolveResponse = resolve
+    const observer = new QueryObserver(
+      clients.queryClient,
+      instanceStateQueryOptions({
+        kind: "server",
+        relayId: "relay-a",
+        id: "a".repeat(40),
       })
     )
-    const fetching = clients.queryClient.fetchQuery(
-      managedDatabasesQueryOptions()
-    )
-
-    applyEvent(clients, relayStatus(alpha.relayId, "unreachable"))
-    resolveResponse({
-      databases: [
-        {
-          id: "d".repeat(40),
-          inventoryStatus: "available",
-          observedState: "running",
-          relayId: alpha.relayId,
-          relayStatus: "connected",
-          relayUpdating: false,
-        },
-      ],
-      relayErrors: [],
-      relays: [],
-    } as unknown as Overview)
-
-    expect((await fetching).databases).toMatchObject([
-      { relayStatus: "unreachable" },
-    ])
+    const unsubscribe = observer.subscribe(() => {})
+    try {
+      await vi.waitFor(() => expect(answers).toHaveLength(1))
+      applyEvent(clients, relayStatus("relay-a", "unreachable"))
+      // The first read answers with what it saw before the change.
+      answers[0]!("connected")
+      await vi.waitFor(() => expect(answers).toHaveLength(2))
+      answers[1]!("unreachable")
+      await vi.waitFor(() =>
+        expect(observer.getCurrentResult().data?.reachability).toBe(
+          "unreachable"
+        )
+      )
+    } finally {
+      unsubscribe()
+    }
   })
 
-  it("refetches databases when a Relay whose inventory failed returns", () => {
-    const clients = fleet()
-    clients.queryClient.setQueryData(queryKeys.databases.list, {
-      databases: [],
-      relayErrors: [
-        {
-          message: "Relay database inventory is unavailable",
-          relayId: alpha.relayId,
-          relayName: alpha.relayName,
+  it("rechecks only the observations on a Relay whose reachability changed", async () => {
+    const reachability = new Map([
+      ["relay-a", "connected"],
+      ["relay-b", "connected"],
+    ])
+    vi.mocked(getInstanceInventory).mockImplementation((async ({
+      data,
+    }: {
+      data: Array<InstanceInventoryRequest>
+    }) =>
+      data.map((request): InstanceInventoryResult => ({
+        request,
+        value: {
+          kind: request.reference.kind,
+          view: "status",
+          data: null,
+          observation: {
+            ...request.reference,
+            reachability:
+              reachability.get(request.reference.relayId) === "connected"
+                ? "connected"
+                : "unreachable",
+            runtime: null,
+            inventory: "available",
+            updating: false,
+          },
         },
-      ],
-      relays: [],
-    })
-    const refreshTopics = vi.fn().mockResolvedValue(undefined)
+      }))) as unknown as typeof getInstanceInventory)
+    const clients = fleet()
+    const observe = (relayId: string) => {
+      const observer = new QueryObserver(
+        clients.queryClient,
+        instanceStateQueryOptions({
+          kind: "database",
+          relayId,
+          id: "d".repeat(40),
+        })
+      )
+      const unsubscribe = observer.subscribe(() => {})
+      return { observer, unsubscribe }
+    }
+    const a = observe("relay-a")
+    const b = observe("relay-b")
+    try {
+      await vi.waitFor(() => {
+        expect(a.observer.getCurrentResult().data?.reachability).toBe(
+          "connected"
+        )
+        expect(b.observer.getCurrentResult().data?.reachability).toBe(
+          "connected"
+        )
+      })
+      // Both Relays now drop, but only relay-a has said so.
+      reachability.set("relay-a", "unreachable")
+      reachability.set("relay-b", "unreachable")
+      applyEvent(clients, relayStatus("relay-a", "unreachable"))
+      await vi.waitFor(() =>
+        expect(a.observer.getCurrentResult().data?.reachability).toBe(
+          "unreachable"
+        )
+      )
+      expect(b.observer.getCurrentResult().data?.reachability).toBe("connected")
+    } finally {
+      a.unsubscribe()
+      b.unsubscribe()
+    }
+  })
 
-    applyEvent(clients, relayStatus(alpha.relayId, "connected"), refreshTopics)
+  it("keeps a Relay status pushed while a reachability read is in flight", async () => {
+    const clients = fleet()
+    const reads = controlledReads(clients.queryClient)
 
-    expect(refreshTopics).toHaveBeenCalledWith(["databases"], {
-      relayId: alpha.relayId,
-    })
+    applyEvent(clients, relayStatus("relay-a", "unreachable"))
+    // Hearth may have sampled the Relay before the push.
+    reads.pending[0]!(relayA("connected"))
+
+    await expect(reads.first).resolves.toEqual(relayA("unreachable"))
+    expect(reads.pending).toHaveLength(1)
+    expect(
+      clients.queryClient.getQueryData(queryKeys.relay.reachability)
+    ).toEqual(relayA("unreachable"))
+  })
+
+  it("trusts a reachability read that starts after a push", async () => {
+    const clients = fleet()
+    applyEvent(clients, relayStatus("relay-a", "unreachable"))
+    const reads = controlledReads(clients.queryClient)
+
+    reads.pending[0]!(relayA("connected"))
+
+    await expect(reads.first).resolves.toEqual(relayA("connected"))
+  })
+
+  it("reads reachability again after a read that spans a stream gap", async () => {
+    const clients = fleet()
+    const reads = controlledReads(clients.queryClient)
+    // A connection toast reads it.
+    const observer = new QueryObserver(
+      clients.queryClient,
+      relayReachabilityQueryOptions()
+    )
+    const unsubscribe = observer.subscribe(() => undefined)
+    try {
+      // Pushes may have been missed while the stream was down.
+      recheckPushedState(clients.queryClient)
+      reads.pending[0]!(relayA("connected"))
+      await vi.waitFor(() => expect(reads.pending).toHaveLength(2))
+      reads.pending[1]!(relayA("unreachable"))
+
+      await vi.waitFor(() =>
+        expect(observer.getCurrentResult().data).toEqual(relayA("unreachable"))
+      )
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it("tells connection toasts when a Relay drops and returns", () => {
+    const clients = fleet()
+    clients.queryClient.setQueryData(queryKeys.relay.reachability, [
+      { id: "relay-a", name: "Relay A", status: "connected" },
+      { id: "relay-b", name: "Relay B", status: "connected" },
+    ])
+    applyEvent(clients, relayStatus("relay-a", "unreachable"))
+    expect(
+      clients.queryClient.getQueryData(queryKeys.relay.reachability)
+    ).toEqual([
+      { id: "relay-a", name: "Relay A", status: "unreachable" },
+      { id: "relay-b", name: "Relay B", status: "connected" },
+    ])
+    applyEvent(clients, relayStatus("relay-a", "connected", 2))
+    expect(
+      clients.queryClient.getQueryData(queryKeys.relay.reachability)
+    ).toMatchObject([{ id: "relay-a", status: "connected" }, {}])
   })
 
   it("keeps Relay connection state and fleet rows in sync", () => {
@@ -509,6 +653,61 @@ describe("realtime event application", () => {
 })
 
 describe("authoritative Relay recovery", () => {
+  it("rechecks game server observations that pushes may have missed", async () => {
+    let reported: "unavailable" | "available" = "unavailable"
+    vi.mocked(getInstanceInventory).mockImplementation((async ({
+      data,
+    }: {
+      data: Array<InstanceInventoryRequest>
+    }) =>
+      data.map((request): InstanceInventoryResult => ({
+        request,
+        value: {
+          kind: request.reference.kind,
+          view: "status",
+          data: null,
+          observation: {
+            ...request.reference,
+            reachability: "connected",
+            runtime: reported === "available" ? "running" : null,
+            inventory: reported,
+            updating: false,
+          },
+        },
+      }))) as unknown as typeof getInstanceInventory)
+    const queryClient = new QueryClient()
+    const observer = new QueryObserver(
+      queryClient,
+      instanceStateQueryOptions({
+        kind: "server",
+        relayId: alpha.relayId,
+        id: alpha.id,
+      })
+    )
+    const unsubscribe = observer.subscribe(() => {})
+    try {
+      // Read while the reconnected Relay had not yet sent its snapshot.
+      await vi.waitFor(() =>
+        expect(observer.getCurrentResult().data?.inventory).toBe("unavailable")
+      )
+      reported = "available"
+      await applyRecoveredRelayConnection(queryClient, {
+        relay: { id: alpha.relayId, name: alpha.relayName },
+        relays: [
+          { id: alpha.relayId, name: alpha.relayName, status: "connected" },
+        ],
+        snapshot: snapshot(),
+        status: "connected",
+      } as RelayConnection)
+      await vi.waitFor(() =>
+        expect(observer.getCurrentResult().data?.runtime).toBe("running")
+      )
+    } finally {
+      unsubscribe()
+      queryClient.clear()
+    }
+  })
+
   it("replaces connection membership during authoritative recovery", async () => {
     const queryClient = new QueryClient()
     queryClient.setQueryData(queryKeys.relay.connection, {
@@ -801,5 +1000,532 @@ describe("mutation responses", () => {
         queryKeys.relay.connection
       )?.snapshot.instances
     ).toEqual([beta])
+  })
+})
+
+describe("game server pages", () => {
+  const relayAState = {
+    browserOrigin: "https://relay-a.example.test",
+    consoleTransport: "direct",
+    id: "relay-a",
+    name: "Relay A",
+    status: "connected",
+    updating: false,
+  } as const
+
+  function foundPage(instance: FleetInstance): ServerWorkspace {
+    return {
+      relay: relayAState,
+      routeIdentifier: instance.shortId,
+      snapshot: { instances: [instance], nodes: [node] },
+      status: "found",
+    } as ServerWorkspace
+  }
+
+  // A page that has loaded its server, as its route leaves it.
+  function openPage(clients: ReturnType<typeof fleet>) {
+    const { queryKey } = serverWorkspaceQueryOptions(alpha.shortId)
+    clients.queryClient.setQueryData(queryKey, foundPage(alpha))
+    return () => clients.queryClient.getQueryData<ServerWorkspace>(queryKey)
+  }
+
+  it("keeps a page on its own server as pushed changes arrive", () => {
+    const clients = fleet()
+    const page = openPage(clients)
+
+    applyEvent(clients, instancesDelta([{ ...alpha, name: "Alpha 2" }, beta]))
+
+    expect(page()).toEqual(foundPage({ ...alpha, name: "Alpha 2" }))
+  })
+
+  it("learns that its server was deleted", () => {
+    const clients = fleet()
+    const page = openPage(clients)
+
+    applyEvent(clients, instancesDelta([], [alpha]))
+
+    expect(page()).toEqual({ status: "not-found" })
+  })
+
+  it("follows its Relay's reachability", () => {
+    const clients = fleet()
+    const page = openPage(clients)
+
+    applyEvent(clients, relayStatus("relay-a", "unreachable"))
+
+    expect(page()).toMatchObject({
+      relay: { status: "unreachable" },
+      snapshot: { instances: [{ relayStatus: "unreachable" }] },
+    })
+  })
+
+  it("writes a mutation response to the page", () => {
+    const clients = fleet()
+    const page = openPage(clients)
+
+    applyUpdatedInstance(clients.queryClient, { ...alpha, name: "Renamed" })
+
+    expect(page()).toMatchObject({
+      snapshot: { instances: [{ id: alpha.id, name: "Renamed" }] },
+    })
+  })
+
+  // Reads Hearth receives, resolved by the test.
+  function controlledPageReads() {
+    const reads: Array<(workspace: ServerWorkspace) => void> = []
+    relayServer.getServerWorkspace.mockImplementation(
+      () =>
+        new Promise<ServerWorkspace>((resolve) => {
+          reads.push(resolve)
+        })
+    )
+    return reads
+  }
+
+  it("replays changes pushed during a read onto its answer", async () => {
+    const clients = fleet()
+    const reads = controlledPageReads()
+    const read = clients.queryClient.fetchQuery(
+      serverWorkspaceQueryOptions(alpha.shortId)
+    )
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([{ ...alpha, name: "Alpha 2" }]))
+    applyEvent(clients, instancesDelta([{ ...alpha, name: "Alpha 3" }]))
+    // Hearth answered from before both pushes.
+    reads[0]!(foundPage(alpha))
+    await read
+
+    expect(
+      clients.queryClient.getQueryData(
+        serverWorkspaceQueryOptions(alpha.shortId).queryKey
+      )
+    ).toEqual(foundPage({ ...alpha, name: "Alpha 3" }))
+    expect(reads).toHaveLength(1)
+  })
+
+  it("keeps a deletion pushed during a read", async () => {
+    const clients = fleet()
+    const reads = controlledPageReads()
+    const read = clients.queryClient.fetchQuery(
+      serverWorkspaceQueryOptions(alpha.shortId)
+    )
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([beta]))
+    applyEvent(clients, instancesDelta([], [alpha]))
+    reads[0]!(foundPage(alpha))
+    await read
+
+    expect(
+      clients.queryClient.getQueryData(
+        serverWorkspaceQueryOptions(alpha.shortId).queryKey
+      )
+    ).toEqual({ status: "not-found" })
+  })
+
+  it("reads again when a navigation's read spans a gap in pushed changes", async () => {
+    const clients = fleet()
+    const reads = controlledPageReads()
+    // The route waits on this read, so it must settle, not be cancelled.
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    const recheck = recheckServerWorkspaces(clients.queryClient)
+    reads[0]!(foundPage(alpha))
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!(foundPage({ ...alpha, name: "Missed rename" }))
+
+    await expect(navigation).resolves.toEqual(
+      foundPage({ ...alpha, name: "Missed rename" })
+    )
+    await recheck
+  })
+
+  it("keeps a deletion pushed after a read answered but before it is stored", async () => {
+    const clients = fleet()
+    let answer!: (workspace: ServerWorkspace) => void
+    const answered = new Promise<ServerWorkspace>((resolve) => {
+      answer = resolve
+    })
+    relayServer.getServerWorkspace.mockReturnValue(answered)
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    await vi.waitFor(() =>
+      expect(relayServer.getServerWorkspace).toHaveBeenCalled()
+    )
+
+    answer(foundPage(alpha))
+    // Runs after the read's own code has seen the answer, before the query
+    // stores it.
+    await answered
+    applyEvent(clients, instancesDelta([], [alpha]))
+
+    await expect(navigation).resolves.toEqual({ status: "not-found" })
+    expect(
+      clients.queryClient.getQueryData(
+        serverWorkspaceQueryOptions(alpha.shortId).queryKey
+      )
+    ).toEqual({ status: "not-found" })
+  })
+
+  it("keeps a page marked for resolution through later updates", async () => {
+    const clients = fleet()
+    openPage(clients)
+    relayServer.getServerWorkspace.mockResolvedValue({ status: "not-found" })
+
+    // The gap may have hidden this server's deletion.
+    await recheckServerWorkspaces(clients.queryClient)
+    applyEvent(clients, instancesDelta([beta]))
+    applyEvent(clients, instancesDelta([{ ...alpha, name: "Alpha 2" }]))
+
+    await expect(
+      ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    ).resolves.toEqual({ status: "not-found" })
+  })
+
+  it("resolves again when another server takes its short ID during the first read", async () => {
+    const clients = fleet()
+    const reads = controlledPageReads()
+    const twin = { ...beta, shortId: alpha.shortId } as FleetInstance
+    const read = clients.queryClient.fetchQuery(
+      serverWorkspaceQueryOptions(alpha.shortId)
+    )
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([twin]))
+    reads[0]!(foundPage(alpha))
+    await read
+    relayServer.getServerWorkspace.mockResolvedValue({ status: "ambiguous" })
+
+    await expect(
+      ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    ).resolves.toEqual({ status: "ambiguous" })
+  })
+
+  it("resolves a shown page again when another server takes its short ID mid-read", async () => {
+    const clients = fleet()
+    const page = openPage(clients)
+    const reads = controlledPageReads()
+    const twin = { ...beta, shortId: alpha.shortId } as FleetInstance
+    const observer = new QueryObserver(
+      clients.queryClient,
+      serverWorkspaceQueryOptions(alpha.shortId)
+    )
+    const unsubscribe = observer.subscribe(() => undefined)
+    void observer.refetch()
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([twin]))
+    reads[0]!(foundPage(alpha))
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!({ status: "ambiguous" })
+
+    await vi.waitFor(() => expect(page()).toEqual({ status: "ambiguous" }))
+    unsubscribe()
+  })
+
+  const settleReads = () => new Promise((resolve) => setTimeout(resolve, 20))
+
+  // Each read Hearth receives, answered by the test. `answered` settles
+  // after the read's own code has seen the answer, before the query stores it.
+  function stagedPageReads() {
+    const reads: Array<{
+      answer: (workspace: ServerWorkspace) => void
+      answered: Promise<ServerWorkspace>
+      fail: (cause: Error) => void
+    }> = []
+    relayServer.getServerWorkspace.mockImplementation(() => {
+      let answer!: (workspace: ServerWorkspace) => void
+      let fail!: (cause: Error) => void
+      const answered = new Promise<ServerWorkspace>((resolve, reject) => {
+        answer = resolve
+        fail = reject
+      })
+      reads.push({ answer, answered, fail })
+      return answered
+    })
+    return reads
+  }
+
+  it("does not open a server whose short ID another server took during the read", async () => {
+    const clients = fleet()
+    const reads = stagedPageReads()
+    const twin = { ...beta, shortId: alpha.shortId } as FleetInstance
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([twin]))
+    reads[0]!.answer(foundPage(alpha))
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!.answer({ status: "ambiguous" })
+
+    await expect(navigation).resolves.toEqual({ status: "ambiguous" })
+  })
+
+  it("opens a server created while a missing answer is stored", async () => {
+    const clients = fleet()
+    const reads = stagedPageReads()
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    reads[0]!.answer({ status: "not-found" })
+    await reads[0]!.answered
+    applyEvent(clients, instancesDelta([alpha]))
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!.answer(foundPage(alpha))
+
+    await expect(navigation).resolves.toEqual(foundPage(alpha))
+  })
+
+  it("keeps a missing answer when an unrelated server is pushed", async () => {
+    const clients = fleet()
+    const reads = stagedPageReads()
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([beta]))
+    reads[0]!.answer({ status: "not-found" })
+
+    await expect(navigation).resolves.toEqual({ status: "not-found" })
+    expect(reads).toHaveLength(1)
+  })
+
+  it("fails recovery when the reread a gap requires fails", async () => {
+    const clients = fleet()
+    openPage(clients)
+    const reads = stagedPageReads()
+    const observer = new QueryObserver(clients.queryClient, {
+      ...serverWorkspaceQueryOptions(alpha.shortId),
+      retry: false,
+    })
+    const unsubscribe = observer.subscribe(() => undefined)
+    void observer.refetch().catch(() => undefined)
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    // The gap begins after Hearth answered, before the answer is stored.
+    reads[0]!.answer(foundPage(alpha))
+    await reads[0]!.answered
+    const recheck = recheckServerWorkspaces(clients.queryClient)
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!.fail(new Error("Hearth is restarting"))
+
+    await expect(recheck).rejects.toThrow("Hearth is restarting")
+    unsubscribe()
+  })
+
+  it("does not open a server by a name another server took during the read", async () => {
+    const clients = fleet()
+    const reads = stagedPageReads()
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.name)
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([{ ...beta, name: alpha.name }]))
+    reads[0]!.answer(foundPage(alpha))
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!.answer({ status: "ambiguous" })
+
+    await expect(navigation).resolves.toEqual({ status: "ambiguous" })
+  })
+
+  it("does not open a server by a name it was renamed away from during the read", async () => {
+    const clients = fleet()
+    const reads = stagedPageReads()
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.name)
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([{ ...alpha, name: "Renamed" }]))
+    reads[0]!.answer(foundPage(alpha))
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!.answer({ status: "not-found" })
+
+    await expect(navigation).resolves.toEqual({ status: "not-found" })
+  })
+
+  it("resolves an ambiguous name again when one match is renamed away", async () => {
+    const clients = fleet()
+    const reads = stagedPageReads()
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.name)
+    await vi.waitFor(() => expect(reads).toHaveLength(1))
+
+    applyEvent(clients, instancesDelta([{ ...beta, name: "Beta again" }]))
+    reads[0]!.answer({ status: "ambiguous" })
+    await vi.waitFor(() => expect(reads).toHaveLength(2))
+    reads[1]!.answer(foundPage(alpha))
+
+    await expect(navigation).resolves.toEqual(foundPage(alpha))
+  })
+
+  it("fails a navigation whose reads never settle rather than guess", async () => {
+    const clients = fleet()
+    const reads = stagedPageReads()
+    const navigation = ensureServerWorkspace(clients.queryClient, alpha.shortId)
+
+    for (let read = 1; read <= 10; read += 1) {
+      await vi.waitFor(() => expect(reads).toHaveLength(read))
+      // Every read spans a gap in pushed changes.
+      await recheckServerWorkspaces(clients.queryClient)
+      reads[read - 1]!.answer(foundPage(alpha))
+    }
+
+    await expect(navigation).rejects.toThrow("kept changing")
+  })
+
+  it("brings back a shown page whose server is replaced", async () => {
+    const clients = fleet()
+    const page = openPage(clients)
+    const observer = new QueryObserver(
+      clients.queryClient,
+      serverWorkspaceQueryOptions(alpha.shortId)
+    )
+    const unsubscribe = observer.subscribe(() => undefined)
+    relayServer.getServerWorkspace.mockResolvedValue(foundPage(alpha))
+
+    // Replacing a container deletes the server, then pushes it again.
+    applyEvent(clients, instancesDelta([], [alpha]))
+    expect(page()).toEqual({ status: "not-found" })
+    applyEvent(clients, instancesDelta([alpha]))
+
+    await vi.waitFor(() => expect(page()).toEqual(foundPage(alpha)))
+    unsubscribe()
+  })
+
+  it("does not reread a page named by any of its IDs on unrelated pushes", async () => {
+    const clients = fleet()
+    relayServer.getServerWorkspace.mockResolvedValue(foundPage(alpha))
+    const unsubscribes = await Promise.all(
+      [
+        alpha.shortId,
+        alpha.routeId,
+        alpha.id,
+        `${alpha.relayId}-${alpha.id}`,
+      ].map(async (serverId) => {
+        const options = serverWorkspaceQueryOptions(serverId)
+        clients.queryClient.setQueryData(options.queryKey, foundPage(alpha))
+        return new QueryObserver(clients.queryClient, options).subscribe(
+          () => undefined
+        )
+      })
+    )
+    relayServer.getServerWorkspace.mockClear()
+
+    applyEvent(clients, instancesDelta([beta]))
+    applyEvent(clients, instancesDelta([{ ...alpha, status: "stopped" }]))
+    applyEvent(clients, relayStatus("relay-b", "unreachable"))
+    await settleReads()
+
+    expect(relayServer.getServerWorkspace).not.toHaveBeenCalled()
+    for (const unsubscribe of unsubscribes) unsubscribe()
+  })
+
+  it("lets a sibling deployment collide only with routes it also matches", async () => {
+    const clients = fleet()
+    // A Tailscale stack runs the same server ID on each Relay.
+    const sibling = {
+      ...alpha,
+      relayId: "relay-b",
+      relayName: "Relay B",
+      routeId: `relay-b-${alpha.shortId}`,
+    } as FleetInstance
+    relayServer.getServerWorkspace.mockResolvedValue(foundPage(alpha))
+    const observe = (serverId: string) => {
+      const options = serverWorkspaceQueryOptions(serverId)
+      clients.queryClient.setQueryData(options.queryKey, foundPage(alpha))
+      return new QueryObserver(clients.queryClient, options).subscribe(
+        () => undefined
+      )
+    }
+    const unsubscribes = [
+      observe(alpha.routeId),
+      observe(`${alpha.relayId}-${alpha.id}`),
+    ]
+    relayServer.getServerWorkspace.mockClear()
+
+    applyEvent(clients, instancesDelta([sibling]))
+    await settleReads()
+    expect(relayServer.getServerWorkspace).not.toHaveBeenCalled()
+
+    // A bare short ID now names both deployments.
+    unsubscribes.push(observe(alpha.shortId))
+    applyEvent(clients, instancesDelta([sibling]))
+    await vi.waitFor(() =>
+      expect(relayServer.getServerWorkspace).toHaveBeenCalledTimes(1)
+    )
+    for (const unsubscribe of unsubscribes) unsubscribe()
+  })
+
+  it("rereads a mounted page after a gap in pushed changes", async () => {
+    const clients = fleet()
+    const page = openPage(clients)
+    const observer = new QueryObserver(
+      clients.queryClient,
+      serverWorkspaceQueryOptions(alpha.shortId)
+    )
+    const unsubscribe = observer.subscribe(() => undefined)
+    relayServer.getServerWorkspace.mockResolvedValue(
+      foundPage({ ...alpha, name: "Missed rename" })
+    )
+
+    await recheckServerWorkspaces(clients.queryClient)
+
+    expect(page()).toEqual(foundPage({ ...alpha, name: "Missed rename" }))
+    unsubscribe()
+  })
+
+  it("fails a recheck whose reread fails, so recovery retries", async () => {
+    const clients = fleet()
+    openPage(clients)
+    const observer = new QueryObserver(clients.queryClient, {
+      ...serverWorkspaceQueryOptions(alpha.shortId),
+      retry: false,
+    })
+    const unsubscribe = observer.subscribe(() => undefined)
+    relayServer.getServerWorkspace.mockRejectedValue(new Error("offline"))
+
+    await expect(recheckServerWorkspaces(clients.queryClient)).rejects.toThrow(
+      "offline"
+    )
+    unsubscribe()
+  })
+
+  it("resolves a navigation again after a gap marked its page stale", async () => {
+    const clients = fleet()
+    openPage(clients)
+    relayServer.getServerWorkspace.mockResolvedValue({ status: "not-found" })
+
+    // Nothing shows the page, so the recheck only marks it stale.
+    await recheckServerWorkspaces(clients.queryClient)
+
+    await expect(
+      ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    ).resolves.toEqual({ status: "not-found" })
+  })
+
+  it("reuses a page a navigation names by ID, but not by name", async () => {
+    const clients = fleet()
+    openPage(clients)
+    const { queryKey } = serverWorkspaceQueryOptions(alpha.name)
+    clients.queryClient.setQueryData(queryKey, foundPage(alpha))
+    relayServer.getServerWorkspace.mockResolvedValue(foundPage(beta))
+
+    await expect(
+      ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    ).resolves.toEqual(foundPage(alpha))
+    // The name may belong to another server by now.
+    await expect(
+      ensureServerWorkspace(clients.queryClient, alpha.name)
+    ).resolves.toEqual(foundPage(beta))
+  })
+
+  it("resolves a page again when another server takes its short ID", async () => {
+    const clients = fleet()
+    openPage(clients)
+    const twin = { ...beta, shortId: alpha.shortId } as FleetInstance
+    relayServer.getServerWorkspace.mockResolvedValue({ status: "ambiguous" })
+
+    applyEvent(clients, instancesDelta([twin]))
+
+    await expect(
+      ensureServerWorkspace(clients.queryClient, alpha.shortId)
+    ).resolves.toEqual({ status: "ambiguous" })
   })
 })

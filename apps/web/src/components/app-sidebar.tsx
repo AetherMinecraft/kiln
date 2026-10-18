@@ -57,8 +57,7 @@ import {
   RouteCommandMenuProvider,
   RouteCommandMenuTrigger,
 } from "@/components/route-command-menu"
-import { InstanceName } from "@/components/instance-name"
-import { useRelayLiveStatus } from "@/components/relay/relay-presentation"
+import { InstanceCard } from "@/components/instance-card"
 import {
   InstancePickerContent,
   type InstancePickerItem,
@@ -70,9 +69,8 @@ import {
   accessCapabilitiesQueryOptions,
   appDirectoryQueryOptions,
   managedDatabaseDirectoryQueryOptions,
-  relayConnectionQueryOptions,
-  relaySnapshotQueryOptions,
   relaysQueryOptions,
+  serverDirectoryQueryOptions,
 } from "@/lib/query-options"
 import { kilnReleaseLabel } from "@/lib/release-version"
 import { disableDevelopmentBypass } from "@/server/auth"
@@ -92,7 +90,6 @@ import {
   resolveAppRoute,
   type AppDirectoryEntry,
 } from "@/lib/app-route"
-import type { RelayFleetSnapshot } from "@/lib/relay-fleet"
 import {
   relayRouteIdFromSelection,
   relayRouteIdentifier,
@@ -100,14 +97,7 @@ import {
   resolveRelayRoute,
   type RelayDirectoryEntry,
 } from "@/lib/relay-route"
-import {
-  findFirstCanonicalRelayInstance,
-  relayInstanceRouteIdentifier,
-  resolveCanonicalRelayInstance,
-  selectRelayConfigured,
-  selectSidebarInstanceCount,
-  selectSidebarInstances,
-} from "@/lib/relay-selectors"
+import { relayInstanceRouteIdentifier } from "@/lib/relay-selectors"
 import type { SidebarInstance } from "@/lib/relay-selectors"
 import { globalSectionFromRouteId } from "@/lib/route-sections"
 import type { GlobalSection } from "@/lib/route-sections"
@@ -133,6 +123,7 @@ import {
   persistSelectedInstanceRouteId,
   readSelectedInstanceRouteId,
 } from "@/lib/ui-preference-cookies"
+import { useSidebarServerNavigation } from "@/lib/use-server-navigation"
 import { warmFileWorkspaceModule } from "@/lib/workspace-module-preloads"
 
 export type InstanceTab = ServerDestinationId
@@ -144,21 +135,15 @@ interface AppSidebarViewProps {
   relayConfigured: boolean
 }
 
-const emptyInstances: Array<SidebarInstance> = []
-
 export const AppSidebar = React.memo(function AppSidebar({
   initialSelectedInstanceRouteId,
 }: {
   initialSelectedInstanceRouteId: string | null
 }) {
-  const queryClient = useQueryClient()
-  const { data: relayConfigured } = useSuspenseQuery({
-    ...relayConnectionQueryOptions(queryClient),
-    select: selectRelayConfigured,
-  })
   const { data: capabilities } = useSuspenseQuery(
     accessCapabilitiesQueryOptions()
   )
+  const { relayConfigured } = capabilities
 
   return (
     <AppSidebarView
@@ -210,6 +195,7 @@ const AppSidebarView = React.memo(function AppSidebarView({
         <SidebarContent>
           <InfrastructureNavigation
             capabilities={capabilities}
+            initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
             relayConfigured={relayConfigured}
           />
 
@@ -241,9 +227,11 @@ function HeaderNotificationsBell() {
 
 function InfrastructureNavigation({
   capabilities,
+  initialSelectedInstanceRouteId,
   relayConfigured,
 }: {
   capabilities: NavigationAccessCapabilities
+  initialSelectedInstanceRouteId: string | null
   relayConfigured: boolean
 }) {
   const destinations = accessibleInfrastructureDestinations(capabilities)
@@ -266,7 +254,10 @@ function InfrastructureNavigation({
       <SidebarGroupContent>
         <SidebarMenu>
           {showServers ? (
-            <ServersNavigationItem relayConfigured={relayConfigured} />
+            <ServersNavigationItem
+              initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
+              relayConfigured={relayConfigured}
+            />
           ) : null}
           {showDatabases ? (
             <DatabasesNavigationItem relayConfigured={relayConfigured} />
@@ -355,8 +346,10 @@ const AppCount = React.memo(function AppCount({
 })
 
 function ServersNavigationItem({
+  initialSelectedInstanceRouteId,
   relayConfigured,
 }: {
+  initialSelectedInstanceRouteId: string | null
   relayConfigured: boolean
 }) {
   return (
@@ -373,7 +366,10 @@ function ServersNavigationItem({
         </Link>
       </SidebarMenuButton>
       <SidebarMenuBadge className="text-sidebar-muted-foreground">
-        <InfrastructureInstanceCount relayConfigured={relayConfigured} />
+        <InfrastructureInstanceCount
+          initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
+          relayConfigured={relayConfigured}
+        />
       </SidebarMenuBadge>
     </SidebarMenuItem>
   )
@@ -381,17 +377,18 @@ function ServersNavigationItem({
 
 const InfrastructureInstanceCount = React.memo(
   function InfrastructureInstanceCount({
+    initialSelectedInstanceRouteId,
     relayConfigured,
   }: {
+    initialSelectedInstanceRouteId: string | null
     relayConfigured: boolean
   }) {
-    const { data: instanceCount = 0 } = useQuery({
-      ...relaySnapshotQueryOptions(),
-      enabled: relayConfigured,
-      select: selectSidebarInstanceCount,
-    })
+    const { data } = useSidebarServerNavigation(
+      initialSelectedInstanceRouteId,
+      relayConfigured
+    )
 
-    return instanceCount
+    return data?.serverCount ?? 0
   }
 )
 
@@ -806,37 +803,11 @@ function SidebarServerNavigation({
   initialSelectedInstanceRouteId: string | null
   relayConfigured: boolean
 }) {
-  const { data: instances = emptyInstances, isPending } = useQuery({
-    ...relaySnapshotQueryOptions(),
-    enabled: relayConfigured,
-    select: selectSidebarInstances,
-  })
-  const serverId = useRouterState({
-    select: (state) =>
-      (state.matches.at(-1)?.params as { serverId?: string } | undefined)
-        ?.serverId,
-  })
-  const selectedInstanceRouteId = React.useMemo(
-    () =>
-      serverId ??
-      readSelectedInstanceRouteId() ??
-      initialSelectedInstanceRouteId,
-    [initialSelectedInstanceRouteId, serverId]
-  )
-  const preferredResolution = resolveCanonicalRelayInstance(
-    instances,
-    selectedInstanceRouteId
-  )
-  const instance =
-    preferredResolution.status === "found"
-      ? preferredResolution.instance
-      : serverId || preferredResolution.status === "ambiguous"
-        ? null
-        : (findFirstCanonicalRelayInstance(instances) ?? null)
-  const instanceRouteId = instance
-    ? (relayInstanceRouteIdentifier(instances, instance) ?? null)
-    : null
-  if (instances.length === 0) return isPending ? null : emptyFallback
+  const { data, isPending, selectedRouteId, serverId } =
+    useSidebarServerNavigation(initialSelectedInstanceRouteId, relayConfigured)
+  if (!data || data.serverCount === 0)
+    return isPending ? null : emptyFallback
+  const { instance, routeId: instanceRouteId } = data
 
   return (
     <>
@@ -848,12 +819,10 @@ function SidebarServerNavigation({
         capabilities={capabilities}
         instance={instance}
         instanceRouteId={instanceRouteId}
-        instances={instances}
+        serverCount={data.serverCount}
         unresolvedServerId={
           serverId ??
-          (preferredResolution.status === "ambiguous"
-            ? (selectedInstanceRouteId ?? undefined)
-            : undefined)
+          (data.ambiguous ? (selectedRouteId ?? undefined) : undefined)
         }
       />
     </>
@@ -876,13 +845,13 @@ const InstanceNavigation = React.memo(function InstanceNavigation({
   capabilities,
   instance,
   instanceRouteId,
-  instances,
+  serverCount,
   unresolvedServerId,
 }: {
   capabilities: NavigationAccessCapabilities
   instance: SidebarInstance | null
   instanceRouteId: string | null
-  instances: Array<SidebarInstance>
+  serverCount: number
   unresolvedServerId: string | undefined
 }) {
   const navigate = useNavigate()
@@ -939,7 +908,7 @@ const InstanceNavigation = React.memo(function InstanceNavigation({
             selection={
               instance
                 ? { kind: "server", instance }
-                : { kind: "none", serverCount: instances.length }
+                : { kind: "none", serverCount }
             }
           />
           <InstanceTabNavigation
@@ -983,6 +952,11 @@ const InstanceSelector = React.memo(function InstanceSelector({
     setOpen(nextOpen)
   }, [])
   const closePicker = React.useCallback(() => setOpen(false), [])
+  // The picker lists every instance; fetch the lists as the pointer arrives
+  // so it opens filled.
+  const warmPicker = React.useCallback(() => {
+    void queryClient.prefetchQuery(serverDirectoryQueryOptions())
+  }, [queryClient])
   const selectInstance = React.useCallback(
     (item: InstancePickerItem) => {
       handleOpenChange(false)
@@ -1052,11 +1026,10 @@ const InstanceSelector = React.memo(function InstanceSelector({
         )
         return
       }
-      const snapshot = queryClient.getQueryData(
-        relaySnapshotQueryOptions().queryKey
+      const instances = queryClient.getQueryData(
+        serverDirectoryQueryOptions().queryKey
       )
-      if (!snapshot) return
-      const instances = selectSidebarInstances(snapshot)
+      if (!instances) return
       const selected = instances.find(
         (candidate) =>
           candidate.id === item.identity.id &&
@@ -1123,17 +1096,17 @@ const InstanceSelector = React.memo(function InstanceSelector({
             aria-label={
               selection.kind === "none" ? "Choose a game server" : undefined
             }
+            onFocus={warmPicker}
+            onPointerEnter={warmPicker}
             className="mb-1.5 h-auto border border-sidebar-border/75 bg-background/35 px-2 py-2 group-data-[collapsible=icon]:h-[32px]! group-data-[collapsible=icon]:overflow-visible group-data-[collapsible=icon]:bg-black/10 hover:border-sidebar-border hover:bg-sidebar-accent group-data-[collapsible=icon]:hover:bg-black/15 data-[state=open]:border-sidebar-border data-[state=open]:bg-sidebar-accent dark:group-data-[collapsible=icon]:bg-black/25 dark:group-data-[collapsible=icon]:hover:bg-black/35"
           >
             {instance ? (
               <SelectorInstanceName
                 instance={{
                   brickId: instance.brickId,
-                  brickSource: instance.brickSource,
                   id: instance.id,
                   implementation: instance.implementation,
                   kind: "server",
-                  observedState: instance.observedState,
                   relayId: instance.relayId,
                 }}
                 label="Switch game server."
@@ -1211,27 +1184,23 @@ const InstanceSelector = React.memo(function InstanceSelector({
 function SelectorInstanceName({
   instance,
   label,
-  live,
   meta,
   name,
 }: {
-  instance: React.ComponentProps<typeof InstanceName>["instance"]
+  instance: React.ComponentProps<typeof InstanceCard>["instance"]
   // Read before the name by screen readers, for example "Switch app."
   label: string
-  // False when the caller already tracks the instance's live status.
-  live?: boolean
   meta: string
   name: string
 }) {
   return (
     <>
       <span className="sr-only">{label} </span>
-      <InstanceName
+      <InstanceCard
         className="min-w-0 flex-1 gap-2 group-data-[collapsible=icon]:gap-0"
         iconClassName="border-sidebar-border/70 bg-background/25 text-sidebar-foreground/85 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent"
         iconSizeClassName="group-data-[collapsible=icon]:size-5!"
         instance={instance}
-        live={live}
         meta={meta}
         metaClassName="text-sidebar-muted-foreground"
         name={name}
@@ -1245,19 +1214,14 @@ function SelectorInstanceName({
 }
 
 function SelectorRelayName({ relay }: { relay: RelayDirectoryEntry }) {
-  const { relayStatus, updating } = useRelayLiveStatus(relay)
   return (
     <SelectorInstanceName
       instance={{
-        enabled: relay.enabled,
         id: relay.id,
         kind: "relay",
         relayId: relay.id,
-        relayStatus,
-        updating,
       }}
       label="Switch Relay."
-      live={false}
       meta={`${relay.nodeArch ?? "unknown"} · ${relay.id.slice(0, 8)}`}
       name={relay.name}
     />
@@ -1286,11 +1250,11 @@ const SidebarInstancePicker = React.memo(function SidebarInstancePicker({
     (destination) => destination.to === "/infra/apps"
   )
   const { data: serverItems = emptyPickerItems } = useQuery({
-    ...relaySnapshotQueryOptions(),
+    ...serverDirectoryQueryOptions(),
     select: selectSidebarServerPickerItems,
   })
   const { data: relayItems = emptyPickerItems } = useQuery({
-    ...relaySnapshotQueryOptions(),
+    ...relaysQueryOptions(),
     enabled: showRelays,
     select: selectSidebarRelayPickerItems,
   })
@@ -1351,41 +1315,34 @@ function sidebarPickerKey(
 }
 
 function selectSidebarServerPickerItems(
-  snapshot: RelayFleetSnapshot
+  servers: ReadonlyArray<SidebarInstance>
 ): Array<InstancePickerItem> {
-  return selectSidebarInstances(snapshot).map((instance) => ({
+  return servers.map((instance) => ({
     identity: {
       brickId: instance.brickId,
-      brickSource: instance.brickSource,
       id: instance.id,
       implementation: instance.implementation,
       kind: "server",
-      observedState: instance.observedState,
       relayId: instance.relayId,
     },
     key: sidebarPickerKey("server", instance.relayId, instance.id),
     meta: `${instance.implementation} ${instance.version} · ${instance.shortId}`,
     name: instance.name,
-    searchText: `${instance.routeId} ${instance.relayName} ${instance.observedState}`,
+    searchText: `${instance.routeId} ${instance.relayName}`,
   }))
 }
 
 function selectSidebarRelayPickerItems(
-  snapshot: RelayFleetSnapshot
+  relays: Array<RelayDirectoryEntry>
 ): Array<InstancePickerItem> {
-  return snapshot.nodes.map((node) => ({
-    identity: {
-      id: node.relayId,
-      kind: "relay",
-      relayId: node.relayId,
-      relayStatus: node.relayStatus,
-      source: "fleet",
-      updating: node.relayUpdating,
-    },
-    key: sidebarPickerKey("relay", node.relayId, node.relayId),
-    meta: `${node.arch} · ${kilnReleaseLabel(node.version)}`,
-    name: node.relayName,
-    searchText: `${node.relayId} ${node.version}`,
+  return relays.map((relay) => ({
+    identity: { id: relay.id, kind: "relay", relayId: relay.id },
+    key: sidebarPickerKey("relay", relay.id, relay.id),
+    meta: `${relay.nodeArch ?? "unknown"} · ${
+      relay.nodeVersion ? kilnReleaseLabel(relay.nodeVersion) : relay.id.slice(0, 8)
+    }`,
+    name: relay.name,
+    searchText: `${relay.id} ${relay.nodeVersion ?? ""}`,
   }))
 }
 
@@ -1471,7 +1428,9 @@ const InstanceTabNavigationItem = React.memo(
               params={{ serverId: instanceRouteId }}
               activeOptions={{ exact: true }}
               activeProps={{ "data-active": true }}
-              preload="render"
+              // Warming on hover keeps the console quick to open without
+              // loading the fleet on every page while a server is selected.
+              preload="intent"
             >
               {content}
             </Link>
