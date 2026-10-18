@@ -48,6 +48,7 @@ import {
   resourceItem,
   type ResourceId,
 } from "@/components/resource-meters"
+import { PageContent } from "@/components/page-content"
 import { WorkspaceFrame } from "@/components/workspace-frame"
 import {
   WorkspaceCopyValueButton,
@@ -213,7 +214,19 @@ function InstanceProvisioningBoundary({
   })
   if (!instance.provisioning) return children
   if (isInfoRoute) return children
-  return <InstanceProvisioningState instance={instance} />
+  // Completes a fresh tab's open. A client navigation shown here never
+  // resolves its route, because the router waits for the matches this
+  // replaces to render, so that open still ends at its timeout.
+  return (
+    <>
+      <PageContent
+        view={
+          instance.provisioning.phase === "failed" ? "unavailable" : "waiting"
+        }
+      />
+      <InstanceProvisioningState instance={instance} />
+    </>
+  )
 }
 
 const InstanceProvisioningState = React.memo(

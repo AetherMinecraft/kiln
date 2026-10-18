@@ -1,4 +1,5 @@
 import { useFileRootPath } from "@/components/files/file-root-context"
+import { FilePageContent } from "@/components/files/file-page-content"
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { HardDriveDownload } from "lucide-react"
@@ -114,6 +115,7 @@ function UnavailablePreview({
         treeCollapsed={treeCollapsed}
         onTreeExpand={onTreeExpand}
       />
+      <FilePageContent path={path} reached={!loading} view="unavailable" />
       {loading ? (
         <div className="flex min-h-0 flex-1">
           <div
@@ -362,6 +364,8 @@ export function FileViewer({
             onNotDatabase={() => setTextFallbackPath(selectedPath)}
             onTreeExpand={onTreeExpand}
           />
+          {/* The viewer is on screen; its tables load after. */}
+          <FilePageContent path={selectedPath} view="database" />
         </React.Suspense>
       </>
     )

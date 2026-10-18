@@ -1,4 +1,5 @@
 import { useFileRootPath } from "@/components/files/file-root-context"
+import { FilePageContent } from "@/components/files/file-page-content"
 import * as React from "react"
 import { useInfiniteQuery, useQueries, useQuery } from "@tanstack/react-query"
 import type { RelayFileEntry } from "@workspace/contracts"
@@ -222,6 +223,8 @@ function useFileDirectory(
     complete: !query.hasNextPage && !!query.data,
     error: query.error,
     loading: query.isPending || query.isFetchingNextPage,
+    // The first page, or the error instead of it, is on screen.
+    settled: !query.isPending,
   }
 }
 
@@ -654,6 +657,11 @@ function DirectoryViewContent({
       className="group/drop relative flex min-h-[360px] min-w-0 flex-1 flex-col bg-card"
       {...dropTarget}
     >
+      <FilePageContent
+        path={path}
+        reached={directory.settled}
+        view="directory"
+      />
       <FileDropOverlay directory={path} />
       <div className={fileEditorHeaderClassName}>
         {treeCollapsed ? <FileTreeRevealButton onClick={onTreeExpand} /> : null}

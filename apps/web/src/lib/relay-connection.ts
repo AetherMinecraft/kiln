@@ -1,5 +1,6 @@
 import { randomUUID, sign, verify } from "node:crypto"
-import { Effect, Fiber, Option, Schema } from "effect"
+import { Effect, Fiber, Option, Schema, Tracer } from "effect"
+import { HttpTraceContext } from "effect/http"
 import { WebSocket } from "ws"
 
 import {
@@ -302,6 +303,18 @@ export function closeRelayConnection(relayId: string): void {
   relayUpdates.delete(relayId)
 }
 
+// The trace context the Relay's work for a request continues, so it joins
+// Hearth's trace and follows its sampling. Without a configured tracer Hearth
+// keeps no traces, yet its spans still claim to be sampled, so it sends none
+// and the Relay samples on its own.
+const relayTraceparent = Effect.gen(function* () {
+  if ((yield* Effect.tracer) === Tracer.nativeTracer) return undefined
+  const span = yield* Effect.option(Effect.currentSpan)
+  return Option.isSome(span)
+    ? HttpTraceContext.toHeaders(span.value).traceparent
+    : undefined
+})
+
 class RelayConnection {
   #attempt = 0
   #closed = false
@@ -468,7 +481,8 @@ class RelayConnection {
     subject?: string
   ) {
     return this.#connectEffect().pipe(
-      Effect.flatMap(() => {
+      Effect.andThen(relayTraceparent),
+      Effect.flatMap((traceparent) => {
         if (operation === "relay.snapshot" && this.#hasPushedSnapshot) {
           const snapshot = this.#pushedSnapshot
           this.#hasPushedSnapshot = false
@@ -495,6 +509,7 @@ class RelayConnection {
           payload,
           ...(subject ? { subject } : {}),
           timeoutMs: duration,
+          ...(traceparent ? { traceparent } : {}),
           type: "request",
           v: 1,
         }
