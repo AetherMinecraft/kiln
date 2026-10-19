@@ -32,6 +32,24 @@ const authorizationFakes = vi.hoisted(() => ({
   synchronizeMinimum: vi.fn(),
   wake: vi.fn(),
 }))
+const auditFakes = vi.hoisted(() => ({
+  finished: [] as Array<{ operationId: string; outcome: string }>,
+  started: [] as Array<{ operation: string; operationId: string }>,
+}))
+vi.mock("@/lib/hearth-audit.server", async () => {
+  const { Effect } = await import("effect")
+  return {
+    reconcilePendingRelayChanges: () => Effect.void,
+    recordRelayChangeFinished: (input: {
+      operationId: string
+      outcome: string
+    }) => Effect.sync(() => auditFakes.finished.push(input)),
+    recordRelayChangeStarted: (input: {
+      operation: string
+      operationId: string
+    }) => Effect.sync(() => auditFakes.started.push(input)),
+  }
+})
 vi.mock("@/lib/authorization-delivery", () => ({
   synchronizeRelayIssuerGeneration: authorizationFakes.synchronize,
   synchronizeRelayIssuerGenerationMinimum:
@@ -362,6 +380,61 @@ effectIt.effect(
 )
 
 effectIt.effect(
+  "records a person's change in Hearth's audit, and sends a paused Relay none",
+  () =>
+    withRelayServer(({ endpoint, requests }) =>
+      Effect.gen(function* () {
+        auditFakes.started.length = 0
+        auditFakes.finished.length = 0
+        yield* promiseEffect(() =>
+          relayRpc(
+            endpoint,
+            "instance.rename",
+            { instanceId: "a".repeat(40), name: "Lobby" },
+            1_000,
+            "user-a"
+          )
+        )
+        const sent = requests.find(
+          (r): r is RelayControlRequestMessage =>
+            r.type === "request" && r.operation === "instance.rename"
+        )!
+        expect(auditFakes.started).toMatchObject([
+          { operation: "instance.rename", operationId: sent.operationId },
+        ])
+        // The outcome is written after the reply, without holding it up.
+        yield* promiseEffect(() =>
+          vi.waitFor(() =>
+            expect(auditFakes.finished).toEqual([
+              { operationId: sent.operationId, outcome: "succeeded" },
+            ])
+          )
+        )
+
+        const paused = yield* promiseEffect(() =>
+          relayRpc(
+            { ...endpoint, enabled: false },
+            "instance.action",
+            { action: "start", instanceId: "a".repeat(40) },
+            1_000,
+            "user-a"
+          )
+        ).pipe(Effect.flip)
+        expect(paused).toMatchObject({ code: "relay_paused" })
+        expect(
+          requests.filter(
+            (r) => r.type === "request" && r.operation === "instance.action"
+          )
+        ).toHaveLength(0)
+        // Reads still work.
+        yield* promiseEffect(() =>
+          relayRpc({ ...endpoint, enabled: false }, "relay.system.inspect", {})
+        )
+      })
+    )
+)
+
+effectIt.effect(
   "learns how a change went after the connection that sent it dropped",
   () => {
     let applied: string | undefined
@@ -378,7 +451,10 @@ effectIt.effect(
             advanceTimersUntil(
               new Promise<void>((resolve) => {
                 const check = () =>
-                  requests.some((r) => r.type === "request" && r.operation === "instance.action")
+                  requests.some(
+                    (r) =>
+                      r.type === "request" && r.operation === "instance.action"
+                  )
                     ? resolve()
                     : setImmediate(check)
                 check()
@@ -442,7 +518,8 @@ effectIt.effect(
               new Promise<void>((resolve) => {
                 const check = () =>
                   requests.some(
-                    (r) => r.type === "request" && r.operation === "instance.action"
+                    (r) =>
+                      r.type === "request" && r.operation === "instance.action"
                   )
                     ? resolve()
                     : setImmediate(check)
@@ -475,7 +552,10 @@ effectIt.effect(
             advanceTimersUntil(
               new Promise<void>((resolve) => {
                 const check = () =>
-                  requests.some((r) => r.type === "request" && r.operation === "instance.action")
+                  requests.some(
+                    (r) =>
+                      r.type === "request" && r.operation === "instance.action"
+                  )
                     ? resolve()
                     : setImmediate(check)
                 check()

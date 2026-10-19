@@ -1,5 +1,5 @@
 import { randomUUID, sign, verify } from "node:crypto"
-import { Effect, Fiber, Option, Schema, Tracer } from "effect"
+import { Effect, Fiber, Option, Result, Schema, Tracer } from "effect"
 import { HttpTraceContext } from "effect/http"
 import { WebSocket } from "ws"
 
@@ -48,14 +48,16 @@ import {
   relayControlEndpoint,
   type RelayEndpoint,
 } from "@/lib/relay-control-endpoint"
+import type { Database } from "@/effect/database"
 import { RelayUnavailableError } from "@/effect/errors"
 import { loadedKilnInstallationId } from "@/effect/installation"
 import { forkAppEffect, reportAppError, runAppEffect } from "@/effect/runtime"
-import { ensuringPromise, forkPromise } from "@/effect/promise"
+import { ensuringPromise, forkPromise, promiseEffect } from "@/effect/promise"
 import type { RelayCredentials } from "@/lib/relay-registry"
 import { resolveSftpAuthorization } from "@/lib/sftp-authorization"
 import { relayControlFailureError } from "@/lib/relay-control-errors"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
+import { relayPausedError } from "@/lib/relay-availability"
 
 export { relayControlEndpoint }
 export type { RelayEndpoint }
@@ -111,8 +113,22 @@ const connections = (globalThis.kilnRelayConnections ??= new Map())
 const relayUpdates = (globalThis.kilnRelayUpdates ??= new Map())
 const ABSENT_RELAY_UPDATE_MS = 15 * 60_000
 
+// Changes a paused Relay still takes: revoking access, which must reach it
+// whatever its state.
+const changesAllowedWhilePaused = new Set<RelayControlOperation>([
+  "browser.authorization.revise",
+  "relay.clients.revoke",
+  "relay.pairing.revoke",
+])
+
+/**
+ * Sends one request to a Relay. A change gets an operation ID, and one a
+ * person or CLI credential asked for (`subject`) is recorded in Hearth's
+ * audit before it's sent and given its outcome after. A paused Relay
+ * (`enabled: false`) is sent no changes.
+ */
 export async function relayRpc(
-  relay: RelayEndpoint,
+  relay: RelayEndpoint & { readonly enabled?: boolean },
   operation: RelayControlOperation,
   payload: unknown,
   timeoutMs = operation === "instance.delete"
@@ -120,6 +136,66 @@ export async function relayRpc(
     : 10_000,
   subject?: string,
   signal?: AbortSignal
+): Promise<unknown> {
+  const changes = relayControlOperationChanges(operation)
+  if (
+    changes &&
+    relay.enabled === false &&
+    !changesAllowedWhilePaused.has(operation)
+  ) {
+    throw relayPausedError()
+  }
+  const operationId = changes ? randomUUID() : undefined
+  const audit =
+    operationId !== undefined && subject !== undefined
+      ? auditChange((hearthAudit) =>
+          hearthAudit.recordRelayChangeStarted({
+            operation,
+            operationId,
+            payload,
+            relayId: relay.id,
+            subject,
+          })
+        )
+      : null
+  if (audit) await audit.started
+  const result = await Effect.runPromise(
+    Effect.result(
+      promiseEffect(() =>
+        relaySend(
+          relay,
+          operation,
+          payload,
+          timeoutMs,
+          subject,
+          signal,
+          operationId
+        )
+      )
+    )
+  )
+  if (audit && operationId) {
+    audit.finish((hearthAudit) =>
+      hearthAudit.recordRelayChangeFinished({
+        operationId,
+        ...(Result.isSuccess(result)
+          ? { outcome: "succeeded" }
+          : auditFailure(result.failure)),
+      })
+    )
+  }
+  if (Result.isFailure(result)) throw result.failure
+  return result.success
+}
+
+async function relaySend(
+  relay: RelayEndpoint,
+  operation: RelayControlOperation,
+  payload: unknown,
+  timeoutMs: number,
+  subject: string | undefined,
+  signal: AbortSignal | undefined,
+  operationId: string | undefined
 ): Promise<unknown> {
   const effectiveRelay = relayControlEndpoint(relay)
   let connection = connections.get(relay.id)
@@ -138,7 +214,7 @@ export async function relayRpc(
   }
   const result = await runAppEffect(
     `relay.rpc.${operation}`,
-    connection.request(operation, payload, timeoutMs, subject),
+    connection.request(operation, payload, timeoutMs, subject, operationId),
     { signal }
   )
   if (subject && isAuditedRelayControlOperation(operation)) {
@@ -351,6 +427,7 @@ class RelayConnection {
   #browserIssuerGeneration = 0
   #relay: RelayEndpoint
   #reconnectFiber: Fiber.Fiber<void, unknown> | null = null
+  #auditFiber: Fiber.Fiber<void, unknown> | null = null
   #socket: WebSocket | null = null
   #state: RelayConnectionState = {
     lastError: null,
@@ -487,7 +564,11 @@ class RelayConnection {
     operation: RelayControlOperation,
     payload: unknown,
     timeoutMs: number,
-    subject?: string
+    subject?: string,
+    // Given by relayRpc for changes, so Hearth's audit can name them too.
+    operationId: string | undefined = relayControlOperationChanges(operation)
+      ? randomUUID()
+      : undefined
   ) {
     return this.#connectEffect().pipe(
       Effect.andThen(relayTraceparent),
@@ -513,9 +594,6 @@ class RelayConnection {
         )
         // A change keeps one ID across reconnects, so its outcome can be
         // looked up if its answer is lost.
-        const operationId = relayControlOperationChanges(operation)
-          ? randomUUID()
-          : undefined
         const deadline = Date.now() + duration
         const request: RelayControlRequest = {
           deadline,
@@ -583,6 +661,8 @@ class RelayConnection {
     this.#connecting = null
     this.#reconnectFiber?.interruptUnsafe()
     this.#reconnectFiber = null
+    this.#auditFiber?.interruptUnsafe()
+    this.#auditFiber = null
     this.#socket?.close(1000, "Hearth connection closed")
     this.#socket = null
     this.#features.clear()
@@ -955,6 +1035,8 @@ class RelayConnection {
           `Relay connection closed (${code}${reason.length ? `: ${reason.toString()}` : ""})`
         )
         this.#socket = null
+        this.#auditFiber?.interruptUnsafe()
+        this.#auditFiber = null
         this.#rejectBrowserAuthorizationReadiness(error)
         this.#abortReverseRequests()
         this.#rejectPending(error)
@@ -1298,7 +1380,9 @@ class RelayConnection {
       const lookup = await runAppEffect(
         "relay.operation.lookup",
         this.request("operation.get", { operationId }, 10_000).pipe(
-          Effect.flatMap(Schema.decodeUnknownEffect(RelayOperationLookupSchema)),
+          Effect.flatMap(
+            Schema.decodeUnknownEffect(RelayOperationLookupSchema)
+          ),
           Effect.option
         )
       )
@@ -1318,25 +1402,26 @@ class RelayConnection {
                   retryable: false,
                 })
               )
-          : outcome.status === "failed" && outcome.code === "operation_withdrawn"
+          : outcome.status === "failed" &&
+              outcome.code === "operation_withdrawn"
             ? relayConnectionFailure(
                 "The connection to this Relay dropped before the change ran. It didn't run."
               )
-          : outcome.status === "failed"
-            ? Effect.fail(
-                RelayUnavailableError.make({
-                  code: outcome.code,
-                  message: outcome.message,
-                  retryable: outcome.retryable,
-                })
-              )
-            : outcome.status === "unknown"
-              ? relayConnectionFailure(
-                  "The connection to this Relay dropped before the change reached it. It didn't run."
+            : outcome.status === "failed"
+              ? Effect.fail(
+                  RelayUnavailableError.make({
+                    code: outcome.code,
+                    message: outcome.message,
+                    retryable: outcome.retryable,
+                  })
                 )
-              : unknownOutcome(
-                  "This Relay restarted while running the change. Check the result before trying again."
-                )
+              : outcome.status === "unknown"
+                ? relayConnectionFailure(
+                    "The connection to this Relay dropped before the change reached it. It didn't run."
+                  )
+                : unknownOutcome(
+                    "This Relay restarted while running the change. Check the result before trying again."
+                  )
       )
     }
   }
@@ -1392,7 +1477,49 @@ class RelayConnection {
           )
         )
       )
+      // Settles audited changes a Hearth restart left pending: now, once
+      // more after the longest change this process could still be awaiting,
+      // and again while some are still running on the Relay.
+      this.#auditFiber?.interruptUnsafe()
+      this.#auditFiber = forkAppEffect(
+        "audit.reconcileOnConnect",
+        Effect.gen({ self: this }, function* () {
+          yield* this.#reconcileAudit()
+          for (let pass = 1; pass < AUDIT_RECONCILE_PASSES; pass += 1) {
+            yield* Effect.sleep(AUDIT_IN_FLIGHT_MS)
+            if ((yield* this.#reconcileAudit()) === 0) return
+          }
+        })
+      )
     }
+  }
+
+  // How many pending changes it couldn't settle yet. One Effect throughout,
+  // so interrupting it stops the scan and its lookups.
+  #reconcileAudit(): Effect.Effect<number, never, Database> {
+    return promiseEffect(() => import("@/lib/hearth-audit.server")).pipe(
+      Effect.flatMap(({ reconcilePendingRelayChanges }) =>
+        this.#state.status === "authenticated"
+          ? reconcilePendingRelayChanges(
+              this.#relay.id,
+              Date.now() - AUDIT_IN_FLIGHT_MS,
+              (operationId) =>
+                this.request("operation.get", { operationId }, 10_000).pipe(
+                  Effect.flatMap(
+                    Schema.decodeUnknownEffect(RelayOperationLookupSchema)
+                  )
+                )
+            )
+          : Effect.succeed(0)
+      ),
+      Effect.withSpan("audit.reconcile"),
+      Effect.catch((cause) =>
+        Effect.logWarning("Audit reconciliation after Relay connect failed", {
+          cause,
+          relayId: this.#relay.id,
+        }).pipe(Effect.as(0))
+      )
+    )
   }
 
   #scheduleReconnect(): void {
@@ -1484,6 +1611,81 @@ function sendSocketEffect(
   })
 }
 
+type AuditWrite = (
+  audit: typeof import("@/lib/hearth-audit.server")
+) => Effect.Effect<void, unknown, Database>
+
+/**
+ * Records a change in Hearth's audit. `started` settles once its row is
+ * written, or after `AUDIT_START_WAIT_MS` if the database is slow, so the
+ * change goes ahead either way. Its outcome is written after its row, in the
+ * background. Audit writes never fail the change they record.
+ */
+function auditChange(start: AuditWrite): {
+  readonly finish: (write: AuditWrite) => void
+  readonly started: Promise<void>
+} {
+  const starting = forkAppEffect("relay.audit.start", auditWrite(start))
+  return {
+    finish: (write) => {
+      forkAppEffect(
+        "relay.audit.finish",
+        Fiber.await(starting).pipe(Effect.andThen(auditWrite(write)))
+      )
+    },
+    started: runAppEffect(
+      "relay.audit.wait",
+      Fiber.await(starting).pipe(
+        Effect.timeoutOption(AUDIT_START_WAIT_MS),
+        Effect.asVoid
+      )
+    ),
+  }
+}
+
+function auditWrite(write: AuditWrite): Effect.Effect<void, never, Database> {
+  return promiseEffect(() => import("@/lib/hearth-audit.server")).pipe(
+    Effect.flatMap(write),
+    Effect.catch((cause) =>
+      Effect.sync(() => {
+        reportAppError(cause, { operation: "relay.audit" })
+      })
+    )
+  )
+}
+
+function auditFailure(error: unknown): {
+  readonly errorCode?: string
+  readonly outcome: "failed" | "not_run" | "succeeded" | "unknown"
+} {
+  if (!(error instanceof RelayUnavailableError)) return { outcome: "failed" }
+  if (error.outcome === "unknown") {
+    return {
+      ...(error.code ? { errorCode: error.code } : {}),
+      outcome: "unknown",
+    }
+  }
+  // It went through; only its reply was lost.
+  if (error.code === "result_unavailable") {
+    return { errorCode: error.code, outcome: "succeeded" }
+  }
+  // An error the Relay sent back carries a code. One without came from the
+  // connection, before the Relay had the change.
+  if (
+    !error.code ||
+    error.code === "forbidden" ||
+    error.code === "operation_withdrawn" ||
+    error.code === "relay_paused" ||
+    error.code === "too_many_requests"
+  ) {
+    return {
+      ...(error.code ? { errorCode: error.code } : {}),
+      outcome: "not_run",
+    }
+  }
+  return { errorCode: error.code, outcome: "failed" }
+}
+
 interface PendingRequest {
   readonly deadline: number
   readonly operationId: string | undefined
@@ -1498,12 +1700,21 @@ interface UnsettledChange {
 }
 
 const UNSETTLED_CHANGE_POLL_MS = 1_000
+// Past the longest change deadline, a pending audit row has no request left
+// waiting for it in any Hearth process.
+const AUDIT_IN_FLIGHT_MS = relayControlDeadlineMs("relay.update.apply") + 60_000
+const AUDIT_RECONCILE_PASSES = 6
+const AUDIT_START_WAIT_MS = 2_000
 
 function unknownOutcome(
   message: string
 ): Effect.Effect<never, RelayUnavailableError> {
   return Effect.fail(
-    RelayUnavailableError.make({ message, outcome: "unknown", retryable: false })
+    RelayUnavailableError.make({
+      message,
+      outcome: "unknown",
+      retryable: false,
+    })
   )
 }
 
