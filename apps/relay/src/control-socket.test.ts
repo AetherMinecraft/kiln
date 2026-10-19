@@ -1,4 +1,10 @@
-import { generateKeyPairSync, randomBytes, sign, verify } from "node:crypto"
+import {
+  generateKeyPairSync,
+  randomBytes,
+  randomUUID,
+  sign,
+  verify,
+} from "node:crypto"
 import { once } from "node:events"
 import { mkdtempSync, rmSync } from "node:fs"
 import { createServer } from "node:http"
@@ -6,8 +12,7 @@ import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Duplex } from "node:stream"
-import { ManagedRuntime } from "effect"
-import type { Effect } from "effect"
+import { Effect, ManagedRuntime } from "effect"
 import { WebSocket } from "ws"
 import { describe, expect, it, onTestFinished, vi } from "vite-plus/test"
 
@@ -41,6 +46,8 @@ import {
   controlRequestLocks,
   type InstanceResolver,
 } from "./operation-plans.js"
+import { DatabaseSync } from "node:sqlite"
+import { exclusive } from "./operation-lanes.js"
 
 type InstallationConfig = Pick<
   RelayConfig,
@@ -511,6 +518,375 @@ describe("Relay control socket", () => {
     expect(started).toEqual(["stop", "restart"])
   })
 
+  describe("operation IDs", () => {
+    const features = [relaySnapshotDeltaFeature]
+    const instanceId = "d".repeat(40)
+
+    it("tells a reconnected Hearth how a change went after its reply was lost", async () => {
+      const release = deferred<void>()
+      const relay = await startRelay({
+        execute: async () => {
+          await release.promise
+          return { stopped: true }
+        },
+      })
+      const hearth = await relay.pair()
+      const first = await relay.connect(hearth, { features })
+      const operationId = randomUUID()
+      sendRequest(
+        first.socket,
+        "instance.action",
+        { action: "stop", instanceId },
+        { operationId }
+      )
+      await vi.waitFor(async () =>
+        expect(await lookup(relay, hearth, operationId)).toEqual({
+          status: "running",
+        })
+      )
+      first.socket.close()
+      await vi.waitFor(() => expect(relay.control.sessions.size).toBe(0))
+
+      // The change keeps running without its Hearth, and its outcome is kept.
+      release.resolve()
+      await vi.waitFor(async () =>
+        expect(await lookup(relay, hearth, operationId)).toEqual({
+          result: { stopped: true },
+          status: "succeeded",
+        })
+      )
+    })
+
+    it("doesn't run a change again when its ID is sent twice", async () => {
+      let runs = 0
+      const relay = await startRelay({
+        execute: async () => {
+          runs += 1
+          return { runs }
+        },
+      })
+      const { inbox, socket } = await relay.connect(await relay.pair(), {
+        features,
+      })
+      const operationId = randomUUID()
+      const payload = { action: "restart", instanceId }
+
+      sendRequest(socket, "instance.action", payload, { operationId })
+      expect(await inbox.next()).toMatchObject({ payload: { runs: 1 } })
+      sendRequest(socket, "instance.action", payload, { operationId })
+      expect(await inbox.next()).toMatchObject({ payload: { runs: 1 } })
+      expect(runs).toBe(1)
+
+      // The same ID for a different change is refused, not run.
+      const conflict = sendRequest(
+        socket,
+        "instance.action",
+        { action: "kill", instanceId },
+        { operationId }
+      )
+      expect(await inbox.next()).toMatchObject({
+        code: "operation_conflict",
+        replyTo: conflict,
+        type: "error",
+      })
+      expect(runs).toBe(1)
+    })
+
+    it("keeps a failed change's error for lookups", async () => {
+      const relay = await startRelay({
+        execute: async () => {
+          throw new Error("Server is not stopped")
+        },
+      })
+      const hearth = await relay.pair()
+      const { inbox, socket } = await relay.connect(hearth, { features })
+      const operationId = randomUUID()
+      sendRequest(
+        socket,
+        "instance.action",
+        { action: "start", instanceId },
+        { operationId }
+      )
+      expect(await inbox.next()).toMatchObject({ type: "error" })
+      expect(await lookup(relay, hearth, operationId)).toMatchObject({
+        code: "operation_failed",
+        message: "Server is not stopped",
+        status: "failed",
+      })
+    })
+
+    it("reports a change it never received as unknown, and one a restart cut off as interrupted", async () => {
+      const relay = await startRelay()
+      const hearth = await relay.pair()
+      expect(await lookup(relay, hearth, randomUUID())).toEqual({
+        status: "unknown",
+      })
+
+      const operationId = randomUUID()
+      await relay.run(
+        relay.state.startOperation({
+          clientId: hearth.id,
+          operation: "instance.action",
+          operationId,
+          payloadSha256: "x",
+          startedAt: Date.now(),
+        })
+      )
+      await relay.run(relay.state.interruptRunningOperations(Date.now()))
+      expect(await lookup(relay, hearth, operationId)).toEqual({
+        status: "interrupted",
+      })
+    })
+
+    it("keeps no reply in its journal, only how the change went", async () => {
+      const relay = await startRelay({
+        execute: async () => ({ token: "kiln_pair_secret_token" }),
+      })
+      const hearth = await relay.pair()
+      const { inbox, socket } = await relay.connect(hearth, { features })
+      const operationId = randomUUID()
+      sendRequest(socket, "relay.pairing.create", {}, { operationId })
+      expect(await inbox.next()).toMatchObject({
+        payload: { token: "kiln_pair_secret_token" },
+      })
+      // The reply stays in memory for this Hearth to look up.
+      expect(await lookup(relay, hearth, operationId)).toEqual({
+        result: { token: "kiln_pair_secret_token" },
+        status: "succeeded",
+      })
+      const database = new DatabaseSync(relay.databaseFile)
+      try {
+        const rows = database.prepare("SELECT * FROM relay_operations").all()
+        expect(rows).toHaveLength(1)
+        expect(JSON.stringify(rows)).not.toContain("kiln_pair_secret_token")
+      } finally {
+        database.close()
+      }
+    })
+
+    it("keeps how a journaled change went when a request reuses its ID for something else", async () => {
+      let runs = 0
+      const relay = await startRelay({
+        execute: async () => {
+          runs += 1
+          return {}
+        },
+      })
+      const hearth = await relay.pair()
+      const { inbox, socket } = await relay.connect(hearth, { features })
+      // A change from before a restart, so only the journal knows it.
+      const operationId = randomUUID()
+      await relay.run(
+        relay.state.startOperation({
+          clientId: hearth.id,
+          operation: "instance.action",
+          operationId,
+          payloadSha256: "an-earlier-change",
+          startedAt: Date.now(),
+        })
+      )
+      await relay.run(
+        relay.state.finishOperation({
+          clientId: hearth.id,
+          errorCode: null,
+          errorMessage: null,
+          finishedAt: Date.now(),
+          operationId,
+          retryable: false,
+          status: "succeeded",
+        })
+      )
+
+      sendRequest(
+        socket,
+        "instance.action",
+        { action: "kill", instanceId },
+        { operationId }
+      )
+      expect(await inbox.next()).toMatchObject({ code: "operation_conflict" })
+      expect(runs).toBe(0)
+      expect(await lookup(relay, hearth, operationId)).toEqual({
+        status: "succeeded",
+      })
+    })
+
+    it("runs a change once when its repeat claims the ID first", async () => {
+      const slowLookup = deferred<void>()
+      const clientLookups: Array<Promise<void>> = []
+      let runs = 0
+      const relay = await startRelay({
+        clientLookups,
+        execute: async () => {
+          runs += 1
+          return { runs }
+        },
+      })
+      const hearth = await relay.pair()
+      const first = await relay.connect(hearth, { features })
+      const second = await relay.connect(hearth, { features })
+      const operationId = randomUUID()
+      const payload = { action: "restart", instanceId }
+
+      // The first is first in line but slower to be checked, so its repeat
+      // claims the ID and then waits its turn behind it.
+      clientLookups.push(slowLookup.promise)
+      sendRequest(first.socket, "instance.action", payload, { operationId })
+      await vi.waitFor(() => expect(clientLookups).toHaveLength(0))
+      sendRequest(second.socket, "instance.action", payload, { operationId })
+      await vi.waitFor(async () =>
+        expect(await lookup(relay, hearth, operationId)).toEqual({
+          status: "running",
+        })
+      )
+      slowLookup.resolve()
+
+      expect(await first.inbox.next()).toMatchObject({ payload: { runs: 1 } })
+      expect(await second.inbox.next()).toMatchObject({ payload: { runs: 1 } })
+      expect(runs).toBe(1)
+    })
+
+    it("refuses each of two requests that reuse a journaled change's ID at once", async () => {
+      const journalRead = deferred<void>()
+      const relay = await startRelay({
+        execute: async () => ({}),
+        journalReads: journalRead.promise,
+      })
+      const hearth = await relay.pair()
+      const { inbox, socket } = await relay.connect(hearth, { features })
+      const operationId = randomUUID()
+      await relay.run(
+        relay.state.startOperation({
+          clientId: hearth.id,
+          operation: "instance.action",
+          operationId,
+          payloadSha256: "an-earlier-change",
+          startedAt: Date.now(),
+        })
+      )
+      await relay.run(
+        relay.state.finishOperation({
+          clientId: hearth.id,
+          errorCode: null,
+          errorMessage: null,
+          finishedAt: Date.now(),
+          operationId,
+          retryable: false,
+          status: "succeeded",
+        })
+      )
+
+      // The second arrives while the Relay still reads the first's journal.
+      const payload = { action: "kill", instanceId }
+      sendRequest(socket, "instance.action", payload, { operationId })
+      sendRequest(socket, "instance.action", payload, { operationId })
+      await vi.waitFor(async () =>
+        expect(await lookup(relay, hearth, operationId)).toEqual({
+          status: "running",
+        })
+      )
+      journalRead.resolve()
+      expect(await inbox.next()).toMatchObject({ code: "operation_conflict" })
+      expect(await inbox.next()).toMatchObject({ code: "operation_conflict" })
+    })
+
+    it("runs a change sent from two sessions at once only once", async () => {
+      const release = deferred<void>()
+      let runs = 0
+      const relay = await startRelay({
+        execute: async () => {
+          runs += 1
+          await release.promise
+          return { renamed: true }
+        },
+      })
+      const hearth = await relay.pair()
+      const first = await relay.connect(hearth, { features })
+      const second = await relay.connect(hearth, { features })
+      const operationId = randomUUID()
+      const payload = { name: "Lobby" }
+      sendRequest(first.socket, "relay.rename", payload, { operationId })
+      await vi.waitFor(() => expect(runs).toBe(1))
+      sendRequest(second.socket, "relay.rename", payload, { operationId })
+      // A different change under the same ID is refused, even while it runs.
+      const conflict = sendRequest(
+        second.socket,
+        "relay.rename",
+        { name: "Other" },
+        { operationId }
+      )
+      expect(await second.inbox.next()).toMatchObject({
+        code: "operation_conflict",
+        replyTo: conflict,
+      })
+
+      release.resolve()
+      expect(await first.inbox.next()).toMatchObject({
+        payload: { renamed: true },
+      })
+      expect(await second.inbox.next()).toMatchObject({
+        payload: { renamed: true },
+      })
+      expect(runs).toBe(1)
+      expect(await lookup(relay, hearth, operationId)).toMatchObject({
+        status: "succeeded",
+      })
+    })
+
+    it("records a change withdrawn before it ran, after it already acted", async () => {
+      const appId = "f".repeat(40)
+      let aborted = 0
+      const relay = await startRelay({
+        beforeRun: () => {
+          aborted += 1
+        },
+      })
+      const hearth = await relay.pair()
+      const { socket } = await relay.connect(hearth, { features })
+      // Something already holds the App, so the delete waits.
+      const holding = relay.lanes.admit({
+        label: "deployment",
+        locks: [exclusive(`app:${appId}`)],
+      })
+      const operationId = randomUUID()
+      sendRequest(
+        socket,
+        "app.delete",
+        { appId, deleteData: false },
+        { operationId }
+      )
+      await vi.waitFor(() => expect(aborted).toBe(1))
+      socket.close()
+      await vi.waitFor(() => expect(relay.control.sessions.size).toBe(0))
+      holding.cancel()
+
+      // It didn't run, but the Relay knows it took it.
+      await vi.waitFor(async () =>
+        expect(await lookup(relay, hearth, operationId)).toMatchObject({
+          code: "operation_withdrawn",
+          status: "failed",
+        })
+      )
+    })
+
+    it("keeps one Hearth's operations from another", async () => {
+      const relay = await startRelay({ execute: async () => ({ ok: true }) })
+      const owner = await relay.pair()
+      const other = await relay.pair()
+      const { inbox, socket } = await relay.connect(owner, { features })
+      const operationId = randomUUID()
+      sendRequest(
+        socket,
+        "instance.action",
+        { action: "start", instanceId },
+        { operationId }
+      )
+      await inbox.next()
+      expect(await lookup(relay, other, operationId)).toEqual({
+        status: "unknown",
+      })
+    })
+  })
+
   it("aborts an in-flight operation when Hearth cancels it", async () => {
     const started = deferred<void>()
     const aborted = deferred<void>()
@@ -540,7 +916,13 @@ describe("Relay control socket", () => {
     )
     await aborted.promise
 
-    // The cancelled request never answers; the next frame belongs to a later request.
+    // A change already running answers with how it went, so Hearth learns
+    // whether it ran.
+    expect(await inbox.next()).toMatchObject({
+      code: "request_cancelled",
+      replyTo: cancelledId,
+      type: "error",
+    })
     const followUpId = sendRequest(socket, "relay.snapshot", {})
     expect(await inbox.next()).toMatchObject({
       replyTo: followUpId,
@@ -913,6 +1295,11 @@ async function startRelay(
     readonly initialSnapshot?: ControlSocketOptions["initialSnapshot"]
     readonly installation?: InstallationConfig
     readonly resolveInstance?: InstanceResolver
+    readonly beforeRun?: ControlSocketOptions["beforeRun"]
+    /** Holds reads of the operation journal until it settles, as a slow disk would. */
+    readonly journalReads?: Promise<void>
+    /** Each request's client lookup waits for the next of these, if any. */
+    readonly clientLookups?: Array<Promise<void>>
   } = {}
 ) {
   const directory = mkdtempSync(join(tmpdir(), "kiln-relay-control-"))
@@ -939,6 +1326,7 @@ async function startRelay(
           },
         }
       : {}),
+    ...(options.beforeRun ? { beforeRun: options.beforeRun } : {}),
     execute: options.execute ?? (async () => ({ ok: true })),
     lanes,
     requestLocks: (request) =>
@@ -956,7 +1344,23 @@ async function startRelay(
     initialSnapshot: options.initialSnapshot ?? (async () => initialSnapshot),
     runEffect: (effect) => runtime.runPromise(effect),
     server,
-    state,
+    state: {
+      ...state,
+      findClientById: (clientId) => {
+        const lookup = options.clientLookups?.shift()
+        return lookup
+          ? Effect.promise(() => lookup).pipe(
+              Effect.andThen(state.findClientById(clientId))
+            )
+          : state.findClientById(clientId)
+      },
+      getOperation: (clientId, operationId) =>
+        options.journalReads
+          ? Effect.promise(() => options.journalReads!).pipe(
+              Effect.andThen(state.getOperation(clientId, operationId))
+            )
+          : state.getOperation(clientId, operationId),
+    },
     subscribeSnapshots: (listener) => {
       listeners.add(listener)
       return () => listeners.delete(listener)
@@ -1014,6 +1418,7 @@ async function startRelay(
       return connection
     },
     control,
+    databaseFile: join(directory, "relay.sqlite"),
     lanes,
     loadInstallationId: (config: InstallationConfig) =>
       runtime.runPromise(loadInstallationId(config, state)),
@@ -1092,6 +1497,24 @@ function authResponse(
   }
 }
 
+async function lookup(
+  relay: Awaited<ReturnType<typeof startRelay>>,
+  hearth: TestHearth,
+  operationId: string
+) {
+  const { inbox, socket } = await relay.connect(hearth, {
+    features: [relaySnapshotDeltaFeature],
+  })
+  try {
+    const id = sendRequest(socket, "operation.get", { operationId })
+    const reply = await inbox.next()
+    expect(reply).toMatchObject({ replyTo: id, type: "response" })
+    return (reply as { payload: unknown }).payload
+  } finally {
+    socket.close()
+  }
+}
+
 function sendRequest(
   socket: WebSocket,
   operation: RelayControlOperation,
@@ -1099,6 +1522,7 @@ function sendRequest(
   overrides: {
     readonly deadline?: number
     readonly id?: string
+    readonly operationId?: string
     readonly subject?: string
     readonly timeoutMs?: number
     readonly traceparent?: string

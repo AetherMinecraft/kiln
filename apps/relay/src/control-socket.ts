@@ -1,11 +1,22 @@
 import {
+  createHash,
   createPublicKey,
   randomBytes,
   randomUUID,
   sign,
   verify,
 } from "node:crypto"
-import { Deferred, Effect, Fiber, Option, Result, Schema } from "effect"
+import {
+  Cause,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  Result,
+  Schedule,
+  Schema,
+} from "effect"
 import type { Effect as EffectType } from "effect"
 import { WebSocket, WebSocketServer } from "ws"
 
@@ -34,6 +45,7 @@ import {
   relaySnapshotDeltaFeature,
   relaySnapshotNodeResourcesFeature,
   isAuditedRelayControlOperation,
+  relayControlOperationChanges,
 } from "@workspace/contracts"
 import type {
   RelayAuthChallenge,
@@ -43,6 +55,7 @@ import type {
   RelayControlRequest,
   RelayControlResponse,
   RelayControlOperation,
+  RelayOperationLookup,
   RelaySnapshot,
 } from "@workspace/contracts"
 
@@ -69,7 +82,11 @@ import {
   type OperationLanes,
 } from "./operation-lanes.js"
 import type { RelayIdentity } from "./effect/identity.js"
-import type { RelayClientGrant, RelayStateStore } from "./effect/state.js"
+import type {
+  RelayClientGrant,
+  RelayOperationRecord,
+  RelayStateStore,
+} from "./effect/state.js"
 import type { Server } from "node:http"
 
 const HEARTBEAT_INTERVAL_MS = 15_000
@@ -135,6 +152,12 @@ export function attachControlSocket(
   options: ControlSocketOptions
 ): ControlSocketServer {
   const sessions = new Map<string, RelayClientGrant>()
+  // Changes under an operation ID, by client and ID, so a lookup or a
+  // repeated request from any of the client's sessions sees them.
+  const operations: OperationRegistry = {
+    finished: new Map(),
+    running: new Map(),
+  }
   const sockets = new Set<WebSocket>()
   const socketSessions = new WeakMap<WebSocket, string>()
   const authenticatedSockets = new Map<WebSocket, RelayClientGrant>()
@@ -181,6 +204,7 @@ export function attachControlSocket(
       socketSessions,
       authenticatedSockets,
       reverseRequesters,
+      operations,
       request.socket.remoteAddress
     )
     socket.once("close", () => {
@@ -285,6 +309,7 @@ function authenticateSocket(
       timeoutMs: number
     ) => Promise<unknown>
   >,
+  operations: OperationRegistry,
   peerAddress: string | undefined
 ): void {
   const unsignedChallenge = {
@@ -389,7 +414,10 @@ function authenticateSocket(
       const request = inFlight.get(message.replyTo)
       request?.ticket?.cancel()
       request?.controller.abort()
-      request?.fiber?.interruptUnsafe()
+      // A change withdrawn from its lane answers that it was cancelled, and
+      // one already running answers with how it went, so Hearth learns
+      // which. Requests outside the lanes stop here.
+      if (!request?.ticket) request?.fiber?.interruptUnsafe()
       return
     }
     if (message.type === "response" || message.type === "error") {
@@ -567,6 +595,14 @@ function authenticateSocket(
             currentClient.role,
             currentClient.actions
           )
+          if (request.operation === "operation.get") {
+            const lookup = yield* lookupOperation(
+              currentClient.id,
+              objectString(request.payload, "operationId") ?? ""
+            )
+            yield* Effect.sync(() => sendResponse(request, lookup))
+            return
+          }
           const issuerInternal =
             request.operation === "browser.authorization.revise"
           if (
@@ -603,9 +639,24 @@ function authenticateSocket(
               traceParentSpan(request.traceparent)
             )
           )
-          options.beforeRun?.(request)
-          const payload = yield* ticket ? ticket.run(execution) : execution
-          if (isAuditedRelayControlOperation(request.operation)) {
+          const operationId = relayControlOperationChanges(request.operation)
+            ? request.operationId
+            : undefined
+          if (operationId === undefined) options.beforeRun?.(request)
+          const { payload, ran } =
+            operationId === undefined
+              ? {
+                  payload: yield* ticket ? ticket.run(execution) : execution,
+                  ran: true,
+                }
+              : yield* journaled(
+                  currentClient.id,
+                  operationId,
+                  request,
+                  ticket,
+                  execution
+                )
+          if (ran && isAuditedRelayControlOperation(request.operation)) {
             Effect.runFork(
               promiseOperation(() =>
                 options.runEffect(
@@ -629,61 +680,24 @@ function authenticateSocket(
               )
             )
           }
-          const response: RelayControlResponse = {
-            id: randomUUID(),
-            payload,
-            replyTo: request.id,
-            type: "response",
-            v: 1,
-          }
-          yield* Effect.sync(() => {
-            const serialized = JSON.stringify(response)
-            if (Buffer.byteLength(serialized) > relayControlMaxFrameBytes) {
-              sendError(
-                socket,
-                request.id,
-                "response_too_large",
-                `${request.operation} produced a ${(Buffer.byteLength(serialized) / (1024 * 1024)).toFixed(1)} MiB response, over the ${relayControlMaxFrameBytes / (1024 * 1024)} MiB control message limit`
-              )
-              return
-            }
-            sendSerialized(socket, serialized)
-          })
+          yield* Effect.sync(() => sendResponse(request, payload))
         }),
       (timeoutFiber) => Fiber.interrupt(timeoutFiber)
     )
     return operation.pipe(
       Effect.catch((cause) =>
         Effect.sync(() => {
-          if (controller.signal.aborted) {
-            sendError(
-              socket,
-              request.id,
-              "request_cancelled",
-              "Relay request was cancelled"
-            )
-            return
-          }
-          if (cause instanceof RelayNotFoundError) {
-            sendError(socket, request.id, "not_found", cause.message)
-            return
-          }
-          if (cause instanceof LaneRejectedError && cause.reason === "busy") {
-            sendError(
-              socket,
-              request.id,
-              "too_many_requests",
-              cause.message,
-              true
-            )
-            return
-          }
-          reportRelayError(cause, relayControlErrorContext(request))
+          const failure = controlFailureFor(
+            request,
+            cause,
+            controller.signal.aborted
+          )
           sendError(
             socket,
             request.id,
-            "operation_failed",
-            relayControlErrorMessage(cause)
+            failure.code,
+            failure.message,
+            failure.retryable
           )
         })
       ),
@@ -693,6 +707,211 @@ function authenticateSocket(
           ticket?.cancel()
           inFlight.delete(request.id)
         })
+      )
+    )
+  }
+
+  function sendResponse(request: RelayControlRequest, payload: unknown) {
+    const response: RelayControlResponse = {
+      id: randomUUID(),
+      payload,
+      replyTo: request.id,
+      type: "response",
+      v: 1,
+    }
+    const serialized = JSON.stringify(response)
+    if (Buffer.byteLength(serialized) > relayControlMaxFrameBytes) {
+      sendError(
+        socket,
+        request.id,
+        "response_too_large",
+        `${request.operation} produced a ${(Buffer.byteLength(serialized) / (1024 * 1024)).toFixed(1)} MiB response, over the ${relayControlMaxFrameBytes / (1024 * 1024)} MiB control message limit`
+      )
+      return
+    }
+    sendSerialized(socket, serialized)
+  }
+
+  function lookupOperation(
+    clientId: string,
+    operationId: string
+  ): EffectType.Effect<RelayOperationLookup, Error> {
+    const key = operationKey(clientId, operationId)
+    if (operations.running.has(key)) {
+      return Effect.succeed({ status: "running" })
+    }
+    const recent = recentOperation(operations, key)
+    if (recent) return Effect.succeed(lookupFor(recent.outcome))
+    return promiseOperation(() =>
+      options.runEffect(options.state.getOperation(clientId, operationId))
+    ).pipe(
+      Effect.map((record): RelayOperationLookup =>
+        record ? lookupFor(recordedOutcome(record)) : { status: "unknown" }
+      )
+    )
+  }
+
+  /**
+   * Runs a change under its operation ID. It's claimed at once, so a repeat
+   * from any session waits for it; recorded as accepted before anything it
+   * does, including `beforeRun`; and its outcome is recorded before its locks
+   * release. A repeat of a change this Relay already took gets that change's
+   * answer instead, and `ran: false`.
+   */
+  function journaled(
+    clientId: string,
+    operationId: string,
+    request: RelayControlRequest,
+    ticket: LaneTicket | null,
+    execution: EffectType.Effect<unknown, unknown>
+  ): EffectType.Effect<{ payload: unknown; ran: boolean }, unknown> {
+    const key = operationKey(clientId, operationId)
+    const digest = payloadDigest(request)
+    const repeat = (earlier: SettledOperation) =>
+      Effect.gen(function* () {
+        ticket?.cancel()
+        const settled =
+          earlier.digest === digest ? earlier.outcome : conflictingOutcome
+        return { payload: yield* settleRecorded(settled), ran: false }
+      })
+    const live = operations.running.get(key)
+    if (live) {
+      // A repeat gives up its place in line before waiting: the change may
+      // be waiting behind it.
+      ticket?.cancel()
+      // Until the journal is read, the request that claimed the ID may not
+      // be the one that made the change under it.
+      return live.digest !== null && live.digest !== digest
+        ? repeat({ digest: live.digest, outcome: conflictingOutcome })
+        : Deferred.await(live.settled).pipe(Effect.flatMap(repeat))
+    }
+    const recent = recentOperation(operations, key)
+    if (recent) return repeat(recent)
+
+    const claim: LiveOperation = {
+      digest: null,
+      settled: Deferred.makeUnsafe<SettledOperation>(),
+    }
+    operations.running.set(key, claim)
+    let settled = false
+    // Remembers how the change under this ID went, as the request that made
+    // it sent it (`madeWith`).
+    const settle = (outcome: RecordedOutcome, madeWith = digest) =>
+      Effect.sync(() => {
+        if (settled) return
+        settled = true
+        operations.running.delete(key)
+        rememberOperation(operations, key, madeWith, outcome)
+        Deferred.doneUnsafe(
+          claim.settled,
+          Exit.succeed({ digest: madeWith, outcome })
+        )
+      })
+    const run = Effect.gen(function* () {
+      const prior = yield* promiseOperation(() =>
+        options.runEffect(options.state.getOperation(clientId, operationId))
+      )
+      if (prior) {
+        // Taken before this Relay last restarted, or before its memory of
+        // it lapsed.
+        ticket?.cancel()
+        // The change made under this ID keeps its own outcome; a request
+        // reusing the ID for something else only learns of the conflict.
+        const outcome = recordedOutcome(prior)
+        yield* settle(outcome, prior.payloadSha256)
+        return {
+          payload: yield* settleRecorded(
+            prior.payloadSha256 === digest ? outcome : conflictingOutcome
+          ),
+          ran: false,
+        }
+      }
+      claim.digest = digest
+      yield* promiseOperation(() =>
+        options.runEffect(
+          options.state.startOperation({
+            clientId,
+            operation: request.operation,
+            operationId,
+            payloadSha256: digest,
+            startedAt: Date.now(),
+          })
+        )
+      )
+      options.beforeRun?.(request)
+      const exit = yield* Effect.exit(
+        ticket ? ticket.run(execution) : execution
+      )
+      const outcome: RecordedOutcome = Exit.isSuccess(exit)
+        ? { kept: true, payload: exit.value, status: "succeeded" }
+        : {
+            ...controlFailureFor(request, Cause.squash(exit.cause), false),
+            status: "failed",
+          }
+      yield* recordOutcome(clientId, operationId, outcome)
+      yield* settle(outcome)
+      return { payload: yield* exit, ran: true }
+    })
+    // Once claimed, it always settles, even if Hearth stops waiting: nothing
+    // may wait on it forever.
+    return Effect.uninterruptible(
+      run.pipe(
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit)
+            ? Effect.void
+            : settle({
+                ...controlFailureFor(request, Cause.squash(exit.cause), false),
+                status: "failed",
+              })
+        )
+      )
+    )
+  }
+
+  // Records how a change went. It already ran, so a failed write is retried,
+  // in the background once the first attempts fail, and never raised; the
+  // outcome stays in memory for lookups meanwhile.
+  function recordOutcome(
+    clientId: string,
+    operationId: string,
+    outcome: RecordedOutcome
+  ): EffectType.Effect<void> {
+    // Only the outcome, never the reply, so retries hold nothing large.
+    const finished = {
+      clientId,
+      errorCode: outcome.status === "failed" ? outcome.code : null,
+      errorMessage: outcome.status === "failed" ? outcome.message : null,
+      finishedAt: Date.now(),
+      operationId,
+      retryable: outcome.status === "failed" && outcome.retryable,
+      status:
+        outcome.status === "succeeded"
+          ? ("succeeded" as const)
+          : ("failed" as const),
+    }
+    const write = promiseOperation(() =>
+      options.runEffect(options.state.finishOperation(finished))
+    )
+    return write.pipe(
+      Effect.retry({ schedule: Schedule.spaced("1 second"), times: 3 }),
+      Effect.catch((cause) =>
+        Effect.sync(() => {
+          reportRelayError(cause, {
+            operation: "relay.control.operation.record",
+          })
+        }).pipe(
+          Effect.andThen(
+            write.pipe(
+              Effect.retry({
+                schedule: Schedule.spaced("30 seconds"),
+                times: 120,
+              }),
+              Effect.ignore,
+              Effect.forkDetach
+            )
+          ),
+          Effect.asVoid
+        )
       )
     )
   }
@@ -1312,6 +1531,240 @@ function sendError(
     v: 1,
   }
   send(socket, error)
+}
+
+/** How a change run under an operation ID went, as later lookups see it. */
+type RecordedOutcome =
+  | {
+      /** False once the reply itself is no longer kept. */
+      readonly kept: boolean
+      readonly payload: unknown
+      readonly status: "succeeded"
+    }
+  | {
+      readonly code: string
+      readonly message: string
+      readonly retryable: boolean
+      readonly status: "failed"
+    }
+  | { readonly status: "interrupted" }
+
+/** A recorded failure, answered with its own code. */
+class RecordedFailure extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retryable: boolean
+  ) {
+    super(message)
+  }
+}
+
+const conflictingOutcome: RecordedOutcome = {
+  code: "operation_conflict",
+  message: "A different request already used this operation ID",
+  retryable: false,
+  status: "failed",
+}
+
+function operationKey(clientId: string, operationId: string): string {
+  return `${clientId}\u0000${operationId}`
+}
+
+function payloadDigest(request: RelayControlRequest): string {
+  return createHash("sha256")
+    .update(JSON.stringify([request.operation, request.payload ?? null]))
+    .digest("hex")
+}
+
+/** How a change under an ID went, and the request that made it (`digest`). */
+interface SettledOperation {
+  readonly digest: string
+  readonly outcome: RecordedOutcome
+}
+
+interface LiveOperation {
+  /** The request making the change, once the journal shows it's this one. */
+  digest: string | null
+  readonly settled: Deferred.Deferred<SettledOperation>
+}
+
+interface FinishedOperation extends SettledOperation {
+  readonly expiresAt: number
+}
+
+interface OperationRegistry {
+  /** Recently finished changes, with their replies, held only in memory. */
+  readonly finished: Map<string, FinishedOperation>
+  readonly running: Map<string, LiveOperation>
+}
+
+// Long enough for Hearth to look up any change whose reply it lost: past the
+// longest change deadline.
+const RECENT_OPERATION_MS = 20 * 60_000
+const MAX_RECENT_OPERATIONS = 500
+// Larger replies are dropped from memory; lookups report the outcome alone.
+const MAX_RECENT_RESULT_BYTES = 64 * 1024
+
+function rememberOperation(
+  operations: OperationRegistry,
+  key: string,
+  digest: string,
+  outcome: RecordedOutcome
+) {
+  const now = Date.now()
+  for (const [oldest, entry] of operations.finished) {
+    if (
+      entry.expiresAt > now &&
+      operations.finished.size < MAX_RECENT_OPERATIONS
+    ) {
+      break
+    }
+    operations.finished.delete(oldest)
+  }
+  const kept =
+    outcome.status !== "succeeded" ||
+    Buffer.byteLength(JSON.stringify(outcome.payload) ?? "") <=
+      MAX_RECENT_RESULT_BYTES
+  operations.finished.set(key, {
+    digest,
+    expiresAt: now + RECENT_OPERATION_MS,
+    outcome: kept
+      ? outcome
+      : { kept: false, payload: null, status: "succeeded" },
+  })
+}
+
+function recentOperation(
+  operations: OperationRegistry,
+  key: string
+): FinishedOperation | null {
+  const entry = operations.finished.get(key)
+  if (!entry) return null
+  if (entry.expiresAt > Date.now()) return entry
+  operations.finished.delete(key)
+  return null
+}
+
+function lookupFor(outcome: RecordedOutcome): RelayOperationLookup {
+  if (outcome.status === "succeeded") {
+    return outcome.kept
+      ? { result: outcome.payload, status: "succeeded" }
+      : { status: "succeeded" }
+  }
+  if (outcome.status === "interrupted") return { status: "interrupted" }
+  return {
+    code: outcome.code,
+    message: outcome.message,
+    retryable: outcome.retryable,
+    status: "failed",
+  }
+}
+
+// What the journal says of a change. It keeps outcomes, never replies,
+// which can carry secrets such as pairing tokens.
+function recordedOutcome(record: RelayOperationRecord): RecordedOutcome {
+  if (record.status === "succeeded") {
+    return { kept: false, payload: null, status: "succeeded" }
+  }
+  if (record.status === "failed") {
+    return {
+      code: record.errorCode ?? "operation_failed",
+      message: record.errorMessage ?? "Relay operation failed",
+      retryable: record.retryable,
+      status: "failed",
+    }
+  }
+  // Running in the journal but not in this process: a restart cut it off.
+  return { status: "interrupted" }
+}
+
+// The reply for a change that ran before, or is running, under the same ID.
+function settleRecorded(
+  earlier: Deferred.Deferred<RecordedOutcome> | RecordedOutcome
+): EffectType.Effect<unknown, RecordedFailure> {
+  const outcome: EffectType.Effect<RecordedOutcome> = Deferred.isDeferred(
+    earlier
+  )
+    ? Deferred.await(earlier as Deferred.Deferred<RecordedOutcome>)
+    : Effect.succeed(earlier as RecordedOutcome)
+  return outcome.pipe(
+    Effect.flatMap((outcome) =>
+      outcome.status === "succeeded"
+        ? outcome.kept
+          ? Effect.succeed(outcome.payload)
+          : Effect.fail(
+              new RecordedFailure(
+                "result_unavailable",
+                "The change went through, but the Relay no longer has its reply. Refresh to see the result.",
+                false
+              )
+            )
+        : Effect.fail(
+            outcome.status === "failed"
+              ? new RecordedFailure(
+                  outcome.code,
+                  outcome.message,
+                  outcome.retryable
+                )
+              : new RecordedFailure(
+                  "operation_interrupted",
+                  "The Relay restarted while this change ran; check whether it took effect",
+                  false
+                )
+          )
+    )
+  )
+}
+
+// The error code, message, and retryability a failed request answers with.
+function controlFailureFor(
+  request: RelayControlRequest,
+  cause: unknown,
+  aborted: boolean
+): {
+  readonly code: string
+  readonly message: string
+  readonly retryable: boolean
+} {
+  if (cause instanceof RecordedFailure) {
+    return {
+      code: cause.code,
+      message: cause.message,
+      retryable: cause.retryable,
+    }
+  }
+  // Withdrawn from its lane before it ran, as when Hearth disconnected.
+  if (cause instanceof LaneRejectedError && cause.reason === "cancelled") {
+    return {
+      code: "operation_withdrawn",
+      message: "The change was withdrawn before it ran",
+      retryable: true,
+    }
+  }
+  if (aborted) {
+    return {
+      code: "request_cancelled",
+      message: "Relay request was cancelled",
+      retryable: false,
+    }
+  }
+  if (cause instanceof RelayNotFoundError) {
+    return { code: "not_found", message: cause.message, retryable: false }
+  }
+  if (cause instanceof LaneRejectedError && cause.reason === "busy") {
+    return {
+      code: "too_many_requests",
+      message: cause.message,
+      retryable: true,
+    }
+  }
+  reportRelayError(cause, relayControlErrorContext(request))
+  return {
+    code: "operation_failed",
+    message: relayControlErrorMessage(cause),
+    retryable: false,
+  }
 }
 
 function relayControlErrorMessage(cause: unknown): string {
