@@ -74,6 +74,8 @@ import {
   relayDirectoryPageInputSchema,
   relayDirectorySizesInputSchema,
   relayFileMutationInputSchema,
+  relayFilePutInputSchema,
+  relayFilePutResultSchema,
   relayFileSearchPageInputSchema,
   relayFileStatInputSchema,
   relayFileDatabaseReadInputSchema,
@@ -2343,6 +2345,48 @@ async function executeControlRequest(
               requiredString(payload, "path"),
               input
             )
+          )
+        )
+      )
+    }
+    case "instance.files.put": {
+      const input = relayFilePutInputSchema.parse(payload)
+      const content = Buffer.from(input.contentBase64, "base64")
+      return withFileTarget(input, (target) =>
+        serializeInstanceMutation(target.root.id, () =>
+          runRelayEffect(
+            "relay.files.put",
+            target.filesystem
+              .upload(
+                target.root,
+                input.path,
+                (async function* () {
+                  yield content
+                })(),
+                () => true,
+                input.unlessModifiedSince
+              )
+              .pipe(
+                Effect.map((written) =>
+                  relayFilePutResultSchema.parse({
+                    ...written,
+                    conflict: false,
+                  })
+                ),
+                // The precondition is checked as the file is committed.
+                Effect.catchIf(
+                  (error) => error.code === "file_changed",
+                  () =>
+                    target.filesystem.fingerprint(target.root, input.path).pipe(
+                      Effect.map((current) =>
+                        relayFilePutResultSchema.parse({
+                          conflict: true,
+                          current,
+                        })
+                      )
+                    )
+                )
+              )
           )
         )
       )

@@ -2,6 +2,7 @@ import {
   chmod,
   chown,
   cp,
+  link,
   lstat,
   mkdir,
   open,
@@ -79,6 +80,7 @@ import { ensuringPromise, promiseEffect } from "./effect/promise.js"
 import { decodeNbt, encodeNbt } from "./nbt.js"
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024
+const MAX_FINGERPRINT_BYTES = 8 * 1024 * 1024
 const MAX_LOG_SHARE_BYTES = 10 * 1024 * 1024
 const MAX_TREE_ITEMS = 5_000
 const MAX_TREE_DEPTH = 10
@@ -800,7 +802,13 @@ export class FilesystemDriver {
     instance: FileRoot,
     requestedPath: string,
     source: AsyncIterable<Uint8Array>,
-    authorizeCommit: () => boolean = () => true
+    authorizeCommit: () => boolean = () => true,
+    /**
+     * Replace the file only if it's unchanged: its modification time in whole
+     * milliseconds still matches, or null for a file that must not exist.
+     * Otherwise the upload fails with `file_changed`.
+     */
+    unchangedSince?: number | null
   ) {
     return Effect.gen({ self: this }, function* () {
       yield* requireLinuxDescriptorAnchoring()
@@ -826,7 +834,8 @@ export class FilesystemDriver {
               name,
               requestedPath,
               source,
-              authorizeCommit
+              authorizeCommit,
+              unchangedSince
             )
           )
         )
@@ -1104,6 +1113,37 @@ export class FilesystemDriver {
 
   resolveFile(instance: FileRoot, requestedPath: string) {
     return this.#existingFile(instance, requestedPath)
+  }
+
+  /**
+   * A file's Git blob ID, as Git hashes its content, and its modification
+   * time in whole milliseconds; null when it doesn't exist or isn't a
+   * regular file. Files over 8 MiB aren't hashed.
+   */
+  fingerprint(instance: FileRoot, requestedPath: string) {
+    return this.#existingFile(instance, requestedPath).pipe(
+      Effect.flatMap((path) =>
+        filesystemOperation("fingerprint.read", async () => {
+          const metadata = await stat(path)
+          const content =
+            metadata.size > MAX_FINGERPRINT_BYTES ? null : await readFile(path)
+          return {
+            blob: content
+              ? createHash("sha1")
+                  .update(`blob ${content.byteLength}\0`)
+                  .update(content)
+                  .digest("hex")
+              : null,
+            modifiedAt: Math.floor(metadata.mtimeMs),
+          }
+        })
+      ),
+      Effect.catchIf(
+        (error) => error.code === "not_a_file" || isMissingFile(error.cause),
+        () => Effect.succeed(null)
+      ),
+      Effect.withSpan("relay.files.fingerprint")
+    )
   }
 
   #existingFile(instance: FileRoot, requestedPath: string) {
@@ -1511,7 +1551,8 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
   name: string,
   requestedPath: string,
   source: AsyncIterable<Uint8Array>,
-  authorizeCommit: () => boolean
+  authorizeCommit: () => boolean,
+  unchangedSince: number | null | undefined
 ) {
   const anchoredParent = fileDescriptorPath(parentHandle)
   const resolvedParent = yield* filesystemOperation(
@@ -1562,6 +1603,17 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
             })
           )
         )
+        if (existing) {
+          // A replacement keeps the file's owner and mode, as saving does: a
+          // root Relay would otherwise hand the file to root, and the umask
+          // would narrow its mode.
+          yield* filesystemOperation("upload.keepOwnership", async () => {
+            if (process.getuid?.() === 0) {
+              await file.chown(existing.uid, existing.gid)
+            }
+            await file.chmod(existing.mode & 0o7777)
+          })
+        }
         yield* filesystemOperation("upload.sync", () => file.sync()).pipe(
           Effect.uninterruptible
         )
@@ -1576,6 +1628,28 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
             "upload.authorizeCommit",
             "Upload authorization changed before commit"
           )
+        }
+        if (unchangedSince === null) {
+          // Linking fails if the file appeared meanwhile, so nothing the
+          // instance created is replaced.
+          yield* filesystemOperation("upload.create", () =>
+            link(temporary, target)
+          ).pipe(
+            Effect.catchIf(
+              (error) => isAlreadyExists(error.cause),
+              () => uploadChangedFailure()
+            ),
+            Effect.uninterruptible
+          )
+          return
+        }
+        if (unchangedSince !== undefined) {
+          // POSIX has no compare-and-swap rename; checking last leaves only
+          // the instant between this check and the rename.
+          const current = yield* optionalFileMetadata(target)
+          if (!current || Math.floor(current.mtimeMs) !== unchangedSince) {
+            return yield* uploadChangedFailure()
+          }
         }
         yield* filesystemOperation("upload.replace", () =>
           rename(temporary, target)
@@ -1595,6 +1669,14 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
     size,
   }
 })
+
+function uploadChangedFailure() {
+  return filesystemFailure(
+    "file_changed",
+    "upload",
+    "The file changed on disk before the upload finished"
+  )
+}
 
 function requireLinuxDescriptorAnchoring() {
   return process.platform === "linux"

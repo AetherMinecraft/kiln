@@ -7,6 +7,8 @@ import {
   Database,
   Folder,
   FolderDown,
+  FolderGit2,
+  FolderSync,
   Globe2,
   History,
   LayoutDashboard,
@@ -14,7 +16,6 @@ import {
   Network,
   Palette,
   RadioTower,
-  RefreshCw,
   Rocket,
   ScrollText,
   Server,
@@ -47,6 +48,7 @@ export type InfrastructureDestinationAccess =
   | "instance-read"
   | "manage-relays"
   | "platform-admin"
+  | "sources"
 
 export interface NavigationAccessCapabilities {
   canManageAccess: boolean
@@ -125,6 +127,14 @@ export const infrastructureDestinations = [
     label: "Domains",
     to: "/infra/domains",
   },
+  {
+    access: "sources",
+    group: "network",
+    icon: FolderGit2,
+    keywords: ["infrastructure", "github", "git", "repositories"],
+    label: "Sources",
+    to: "/infra/sources",
+  },
 ] as const satisfies ReadonlyArray<
   NavigationDestination & {
     access: InfrastructureDestinationAccess
@@ -132,32 +142,39 @@ export const infrastructureDestinations = [
   }
 >
 
+// Tabs render in this order, with a divider wherever `group` changes.
 export const automationDestinations = [
   {
+    group: "calendar",
+    icon: CalendarDays,
+    keywords: ["automations", "dates"],
+    label: "Calendar",
+    to: "/automations/calendar",
+  },
+  {
+    group: "automations",
     icon: ListTodo,
     keywords: ["automations", "tasks"],
     label: "Schedules",
     to: "/automations/schedules",
   },
   {
-    icon: RefreshCw,
+    group: "automations",
+    icon: FolderSync,
     keywords: ["automations", "synchronize"],
     label: "Sync",
     to: "/automations/sync",
   },
   {
+    group: "history",
     icon: History,
     keywords: ["automations", "runs"],
     label: "History",
     to: "/automations/history",
   },
-  {
-    icon: CalendarDays,
-    keywords: ["automations", "dates"],
-    label: "Calendar",
-    to: "/automations/calendar",
-  },
-] as const satisfies ReadonlyArray<NavigationDestination>
+] as const satisfies ReadonlyArray<
+  NavigationDestination & { group: "automations" | "calendar" | "history" }
+>
 
 export const settingsDestinations = [
   {
@@ -613,6 +630,10 @@ export function canAccessInfrastructureDestination(
   if (destination.access === "platform-admin") {
     return capabilities.isPlatformAdmin
   }
+  if (destination.access === "sources") {
+    // Sources feed syncs. Each person's sources are their own.
+    return canUseSyncs(capabilities)
+  }
   if (destination.access === "app-read") {
     return hasScopedPermission(capabilities, "app.read", ["relay"])
   }
@@ -654,7 +675,24 @@ export function canAccessAccessManagement(
 export function canAccessAutomations(
   capabilities: NavigationAccessCapabilities
 ): boolean {
-  return hasScopedPermission(capabilities, "schedule.read")
+  return (
+    hasScopedPermission(capabilities, "schedule.read") ||
+    canUseSyncs(capabilities)
+  )
+}
+
+/** Syncs write files, so they're for whoever may edit files somewhere. */
+function canUseSyncs(capabilities: NavigationAccessCapabilities): boolean {
+  return (
+    capabilities.isPlatformAdmin ||
+    capabilities.canManageRelays ||
+    hasScopedPermission(capabilities, "instance.files.write", [
+      "instance",
+      "relay",
+    ]) ||
+    hasScopedPermission(capabilities, "app.files.write", ["relay"]) ||
+    hasScopedPermission(capabilities, "relay.files.write", ["relay"])
+  )
 }
 
 export function canAccessBackups(

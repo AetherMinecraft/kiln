@@ -9,8 +9,10 @@ import {
   stat,
   symlink,
   truncate,
+  utimes,
   writeFile,
 } from "node:fs/promises"
+import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { resolve } from "node:path"
 import { buffer as consumeBuffer } from "node:stream/consumers"
@@ -646,6 +648,113 @@ describeLinux("Relay direct file transfers", () => {
           )
         })
       )
+  )
+
+  // A GitHub sync that keeps existing files commits only if the file is
+  // still absent, or unchanged since it last wrote it. The checks happen at
+  // commit, so a file the instance writes meanwhile survives.
+  it.effect("keeps a file created or edited while an upload is in flight", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        const path = resolve(root, "server.properties")
+        const failure = (
+          effect: Effect.Effect<unknown, RelayFilesystemError>
+        ) =>
+          effect.pipe(
+            Effect.flip,
+            Effect.map((error) => error.code)
+          )
+
+        // Absent when the upload starts, created before it commits.
+        assert.strictEqual(
+          yield* failure(
+            driver.upload(
+              instance,
+              "server.properties",
+              (async function* () {
+                await writeFile(path, "motd=instance\n")
+                yield Buffer.from("motd=github\n")
+              })(),
+              () => true,
+              null
+            )
+          ),
+          "file_changed"
+        )
+        assert.strictEqual(
+          yield* fromPromise(() => readFile(path, "utf8")),
+          "motd=instance\n"
+        )
+        // What's there, so a caller can tell its own write from an edit.
+        // The Git blob ID `git hash-object` gives this content.
+        assert.strictEqual(
+          (yield* driver.fingerprint(instance, "server.properties"))?.blob,
+          createHash("sha1").update("blob 14\0motd=instance\n").digest("hex")
+        )
+        assert.isNull(yield* driver.fingerprint(instance, "missing.properties"))
+
+        // Unchanged since the last upload: replaced.
+        const before = Math.floor(
+          (yield* fromPromise(() => stat(path))).mtimeMs
+        )
+        const replaced = yield* driver.upload(
+          instance,
+          "server.properties",
+          chunks("motd=github\n"),
+          () => true,
+          before
+        )
+        assert.strictEqual(
+          yield* fromPromise(() => readFile(path, "utf8")),
+          "motd=github\n"
+        )
+
+        // Edited while the next upload streams: kept.
+        assert.strictEqual(
+          yield* failure(
+            driver.upload(
+              instance,
+              "server.properties",
+              (async function* () {
+                await writeFile(path, "motd=edited\n")
+                await utimes(path, new Date(), new Date(Date.now() + 60_000))
+                yield Buffer.from("motd=newer\n")
+              })(),
+              () => true,
+              Date.parse(replaced.modifiedAt)
+            )
+          ),
+          "file_changed"
+        )
+        assert.strictEqual(
+          yield* fromPromise(() => readFile(path, "utf8")),
+          "motd=edited\n"
+        )
+      })
+    )
+  )
+
+  // A sync replaces config files the instance reads; the replacement must
+  // stay readable to it.
+  it.effect("keeps a replaced file's mode", () =>
+    withSetup(({ driver, instance, root }) =>
+      Effect.gen(function* () {
+        const path = resolve(root, "server.properties")
+        yield* fromPromise(() => writeFile(path, "motd=old\n"))
+        yield* fromPromise(() => chmod(path, 0o666))
+
+        yield* driver.upload(
+          instance,
+          "server.properties",
+          chunks("motd=new\n")
+        )
+
+        assert.strictEqual(
+          (yield* fromPromise(() => stat(path))).mode & 0o777,
+          0o666
+        )
+      })
+    )
   )
 
   it.effect("atomically uploads and reads through a pinned file handle", () =>

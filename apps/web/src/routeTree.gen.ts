@@ -58,6 +58,7 @@ import { Route as AppInfraDomainsRouteImport } from './routes/_app.infra.domains
 import { Route as AppInfraOverviewRouteImport } from './routes/_app.infra.overview'
 import { Route as AppInfraRelaysRouteImport } from './routes/_app.infra.relays'
 import { Route as AppInfraServersRouteImport } from './routes/_app.infra.servers'
+import { Route as AppInfraSourcesRouteImport } from './routes/_app.infra.sources'
 import { Route as AppInfraTailscaleRouteImport } from './routes/_app.infra.tailscale'
 import { Route as AppRelayRelayIdRouteImport } from './routes/_app/relay/$relayId'
 import { Route as AppServerServerIdRouteImport } from './routes/_app/server/$serverId'
@@ -71,6 +72,9 @@ import { Route as ApiAppTerminalAppIdRouteImport } from './routes/api.app-termin
 import { Route as ApiAuthSplatRouteImport } from './routes/api.auth.$'
 import { Route as ApiConsoleInstanceIdRouteImport } from './routes/api.console.$instanceId'
 import { Route as ApiDatabaseTerminalDatabaseIdRouteImport } from './routes/api.database-terminal.$databaseId'
+import { Route as ApiGithubManifestRouteImport } from './routes/api.github.manifest'
+import { Route as ApiGithubSetupRouteImport } from './routes/api.github.setup'
+import { Route as ApiGithubWebhookRouteImport } from './routes/api.github.webhook'
 import { Route as ApiRelayTerminalRelayIdRouteImport } from './routes/api.relay-terminal.$relayId'
 import { Route as AppAppAppIdIndexRouteImport } from './routes/_app/app/$appId.index'
 import { Route as AppAppAppIdSplatRouteImport } from './routes/_app/app/$appId.$'
@@ -356,6 +360,11 @@ const AppInfraServersRoute = AppInfraServersRouteImport.update({
   path: '/servers',
   getParentRoute: () => AppInfraRoute,
 } as any)
+const AppInfraSourcesRoute = AppInfraSourcesRouteImport.update({
+  id: '/sources',
+  path: '/sources',
+  getParentRoute: () => AppInfraRoute,
+} as any)
 const AppInfraTailscaleRoute = AppInfraTailscaleRouteImport.update({
   id: '/tailscale',
   path: '/tailscale',
@@ -422,6 +431,21 @@ const ApiDatabaseTerminalDatabaseIdRoute =
     path: '/api/database-terminal/$databaseId',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiGithubManifestRoute = ApiGithubManifestRouteImport.update({
+  id: '/api/github/manifest',
+  path: '/api/github/manifest',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiGithubSetupRoute = ApiGithubSetupRouteImport.update({
+  id: '/api/github/setup',
+  path: '/api/github/setup',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiGithubWebhookRoute = ApiGithubWebhookRouteImport.update({
+  id: '/api/github/webhook',
+  path: '/api/github/webhook',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiRelayTerminalRelayIdRoute = ApiRelayTerminalRelayIdRouteImport.update({
   id: '/api/relay-terminal/$relayId',
   path: '/api/relay-terminal/$relayId',
@@ -675,6 +699,7 @@ export interface FileRoutesByFullPath {
   '/infra/overview': typeof AppInfraOverviewRoute
   '/infra/relays': typeof AppInfraRelaysRoute
   '/infra/servers': typeof AppInfraServersRoute
+  '/infra/sources': typeof AppInfraSourcesRoute
   '/infra/tailscale': typeof AppInfraTailscaleRoute
   '/relay/$relayId': typeof AppRelayRelayIdRouteWithChildren
   '/server/$serverId': typeof AppServerServerIdRouteWithChildren
@@ -687,6 +712,9 @@ export interface FileRoutesByFullPath {
   '/api/auth/$': typeof ApiAuthSplatRoute
   '/api/console/$instanceId': typeof ApiConsoleInstanceIdRoute
   '/api/database-terminal/$databaseId': typeof ApiDatabaseTerminalDatabaseIdRoute
+  '/api/github/manifest': typeof ApiGithubManifestRoute
+  '/api/github/setup': typeof ApiGithubSetupRoute
+  '/api/github/webhook': typeof ApiGithubWebhookRoute
   '/api/relay-terminal/$relayId': typeof ApiRelayTerminalRelayIdRoute
   '/automations/': typeof AppAutomationsIndexRoute
   '/backups/': typeof AppBackupsIndexRoute
@@ -772,6 +800,7 @@ export interface FileRoutesByTo {
   '/infra/overview': typeof AppInfraOverviewRoute
   '/infra/relays': typeof AppInfraRelaysRoute
   '/infra/servers': typeof AppInfraServersRoute
+  '/infra/sources': typeof AppInfraSourcesRoute
   '/infra/tailscale': typeof AppInfraTailscaleRoute
   '/settings/account': typeof AppSettingsAccountRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
@@ -782,6 +811,9 @@ export interface FileRoutesByTo {
   '/api/auth/$': typeof ApiAuthSplatRoute
   '/api/console/$instanceId': typeof ApiConsoleInstanceIdRoute
   '/api/database-terminal/$databaseId': typeof ApiDatabaseTerminalDatabaseIdRoute
+  '/api/github/manifest': typeof ApiGithubManifestRoute
+  '/api/github/setup': typeof ApiGithubSetupRoute
+  '/api/github/webhook': typeof ApiGithubWebhookRoute
   '/api/relay-terminal/$relayId': typeof ApiRelayTerminalRelayIdRoute
   '/automations': typeof AppAutomationsIndexRoute
   '/backups': typeof AppBackupsIndexRoute
@@ -875,6 +907,7 @@ export interface FileRoutesById {
   '/_app/infra/overview': typeof AppInfraOverviewRoute
   '/_app/infra/relays': typeof AppInfraRelaysRoute
   '/_app/infra/servers': typeof AppInfraServersRoute
+  '/_app/infra/sources': typeof AppInfraSourcesRoute
   '/_app/infra/tailscale': typeof AppInfraTailscaleRoute
   '/_app/relay/$relayId': typeof AppRelayRelayIdRouteWithChildren
   '/_app/server/$serverId': typeof AppServerServerIdRouteWithChildren
@@ -887,6 +920,9 @@ export interface FileRoutesById {
   '/api/auth/$': typeof ApiAuthSplatRoute
   '/api/console/$instanceId': typeof ApiConsoleInstanceIdRoute
   '/api/database-terminal/$databaseId': typeof ApiDatabaseTerminalDatabaseIdRoute
+  '/api/github/manifest': typeof ApiGithubManifestRoute
+  '/api/github/setup': typeof ApiGithubSetupRoute
+  '/api/github/webhook': typeof ApiGithubWebhookRoute
   '/api/relay-terminal/$relayId': typeof ApiRelayTerminalRelayIdRoute
   '/_app/automations/': typeof AppAutomationsIndexRoute
   '/_app/backups/': typeof AppBackupsIndexRoute
@@ -980,6 +1016,7 @@ export interface FileRouteTypes {
     | '/infra/overview'
     | '/infra/relays'
     | '/infra/servers'
+    | '/infra/sources'
     | '/infra/tailscale'
     | '/relay/$relayId'
     | '/server/$serverId'
@@ -992,6 +1029,9 @@ export interface FileRouteTypes {
     | '/api/auth/$'
     | '/api/console/$instanceId'
     | '/api/database-terminal/$databaseId'
+    | '/api/github/manifest'
+    | '/api/github/setup'
+    | '/api/github/webhook'
     | '/api/relay-terminal/$relayId'
     | '/automations/'
     | '/backups/'
@@ -1077,6 +1117,7 @@ export interface FileRouteTypes {
     | '/infra/overview'
     | '/infra/relays'
     | '/infra/servers'
+    | '/infra/sources'
     | '/infra/tailscale'
     | '/settings/account'
     | '/settings/appearance'
@@ -1087,6 +1128,9 @@ export interface FileRouteTypes {
     | '/api/auth/$'
     | '/api/console/$instanceId'
     | '/api/database-terminal/$databaseId'
+    | '/api/github/manifest'
+    | '/api/github/setup'
+    | '/api/github/webhook'
     | '/api/relay-terminal/$relayId'
     | '/automations'
     | '/backups'
@@ -1179,6 +1223,7 @@ export interface FileRouteTypes {
     | '/_app/infra/overview'
     | '/_app/infra/relays'
     | '/_app/infra/servers'
+    | '/_app/infra/sources'
     | '/_app/infra/tailscale'
     | '/_app/relay/$relayId'
     | '/_app/server/$serverId'
@@ -1191,6 +1236,9 @@ export interface FileRouteTypes {
     | '/api/auth/$'
     | '/api/console/$instanceId'
     | '/api/database-terminal/$databaseId'
+    | '/api/github/manifest'
+    | '/api/github/setup'
+    | '/api/github/webhook'
     | '/api/relay-terminal/$relayId'
     | '/_app/automations/'
     | '/_app/backups/'
@@ -1263,6 +1311,9 @@ export interface RootRouteChildren {
   ApiAuthSplatRoute: typeof ApiAuthSplatRoute
   ApiConsoleInstanceIdRoute: typeof ApiConsoleInstanceIdRoute
   ApiDatabaseTerminalDatabaseIdRoute: typeof ApiDatabaseTerminalDatabaseIdRoute
+  ApiGithubManifestRoute: typeof ApiGithubManifestRoute
+  ApiGithubSetupRoute: typeof ApiGithubSetupRoute
+  ApiGithubWebhookRoute: typeof ApiGithubWebhookRoute
   ApiRelayTerminalRelayIdRoute: typeof ApiRelayTerminalRelayIdRoute
   ApiCliAuthDeviceRoute: typeof ApiCliAuthDeviceRoute
   ApiCliAuthTokenRoute: typeof ApiCliAuthTokenRoute
@@ -1615,6 +1666,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppInfraServersRouteImport
       parentRoute: typeof AppInfraRoute
     }
+    '/_app/infra/sources': {
+      id: '/_app/infra/sources'
+      path: '/sources'
+      fullPath: '/infra/sources'
+      preLoaderRoute: typeof AppInfraSourcesRouteImport
+      parentRoute: typeof AppInfraRoute
+    }
     '/_app/infra/tailscale': {
       id: '/_app/infra/tailscale'
       path: '/tailscale'
@@ -1704,6 +1762,27 @@ declare module '@tanstack/react-router' {
       path: '/api/database-terminal/$databaseId'
       fullPath: '/api/database-terminal/$databaseId'
       preLoaderRoute: typeof ApiDatabaseTerminalDatabaseIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/github/manifest': {
+      id: '/api/github/manifest'
+      path: '/api/github/manifest'
+      fullPath: '/api/github/manifest'
+      preLoaderRoute: typeof ApiGithubManifestRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/github/setup': {
+      id: '/api/github/setup'
+      path: '/api/github/setup'
+      fullPath: '/api/github/setup'
+      preLoaderRoute: typeof ApiGithubSetupRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/github/webhook': {
+      id: '/api/github/webhook'
+      path: '/api/github/webhook'
+      fullPath: '/api/github/webhook'
+      preLoaderRoute: typeof ApiGithubWebhookRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/relay-terminal/$relayId': {
@@ -2034,6 +2113,7 @@ interface AppInfraRouteChildren {
   AppInfraOverviewRoute: typeof AppInfraOverviewRoute
   AppInfraRelaysRoute: typeof AppInfraRelaysRoute
   AppInfraServersRoute: typeof AppInfraServersRoute
+  AppInfraSourcesRoute: typeof AppInfraSourcesRoute
   AppInfraTailscaleRoute: typeof AppInfraTailscaleRoute
   AppInfraIndexRoute: typeof AppInfraIndexRoute
   AppInfraUpdatesChangelogRoute: typeof AppInfraUpdatesChangelogRoute
@@ -2047,6 +2127,7 @@ const AppInfraRouteChildren: AppInfraRouteChildren = {
   AppInfraOverviewRoute: AppInfraOverviewRoute,
   AppInfraRelaysRoute: AppInfraRelaysRoute,
   AppInfraServersRoute: AppInfraServersRoute,
+  AppInfraSourcesRoute: AppInfraSourcesRoute,
   AppInfraTailscaleRoute: AppInfraTailscaleRoute,
   AppInfraIndexRoute: AppInfraIndexRoute,
   AppInfraUpdatesChangelogRoute: AppInfraUpdatesChangelogRoute,
@@ -2276,6 +2357,9 @@ const rootRouteChildren: RootRouteChildren = {
   ApiAuthSplatRoute: ApiAuthSplatRoute,
   ApiConsoleInstanceIdRoute: ApiConsoleInstanceIdRoute,
   ApiDatabaseTerminalDatabaseIdRoute: ApiDatabaseTerminalDatabaseIdRoute,
+  ApiGithubManifestRoute: ApiGithubManifestRoute,
+  ApiGithubSetupRoute: ApiGithubSetupRoute,
+  ApiGithubWebhookRoute: ApiGithubWebhookRoute,
   ApiRelayTerminalRelayIdRoute: ApiRelayTerminalRelayIdRoute,
   ApiCliAuthDeviceRoute: ApiCliAuthDeviceRoute,
   ApiCliAuthTokenRoute: ApiCliAuthTokenRoute,

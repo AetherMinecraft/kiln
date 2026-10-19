@@ -1790,6 +1790,48 @@ export const relayRemoteFileUploadResultSchema = z
   })
   .strict()
 
+export const relayFilePutInputSchema = z
+  .object({
+    instanceId: fileRootIdSchema,
+    path: relayFileMutationPathSchema,
+    /**
+     * The file's bytes, base64-encoded. 700 KiB of base64 (about 525 KiB of
+     * file) keeps the control frame under `relayControlMaxFrameBytes`.
+     */
+    contentBase64: z.base64().max(700 * 1024),
+    /**
+     * Write only if the file is unchanged: its modification time, in whole
+     * milliseconds, still matches, or null for a file that must not exist.
+     * Omitted to write regardless.
+     */
+    unlessModifiedSince: z.number().int().nonnegative().nullable().optional(),
+  })
+  .strict()
+
+/**
+ * A precondition that failed leaves the file alone and says what's there,
+ * so a caller can tell its own earlier write from someone else's.
+ */
+export const relayFilePutResultSchema = z.union([
+  relayRemoteFileUploadResultSchema.extend({ conflict: z.literal(false) }),
+  z
+    .object({
+      conflict: z.literal(true),
+      current: z
+        .object({
+          /** The content's Git blob ID; null for a file too large to hash. */
+          blob: z
+            .string()
+            .regex(/^[a-f0-9]{40}$/u)
+            .nullable(),
+          modifiedAt: z.number().int().nonnegative(),
+        })
+        .strict()
+        .nullable(),
+    })
+    .strict(),
+])
+
 export const relayFileMutationInputSchema = z.discriminatedUnion("operation", [
   z.object({
     operation: z.literal("rename"),
@@ -2381,6 +2423,8 @@ export type RelayRemoteFileUpload = z.infer<typeof relayRemoteFileUploadSchema>
 export type RelayRemoteFileUploadResult = z.infer<
   typeof relayRemoteFileUploadResultSchema
 >
+export type RelayFilePutInput = z.infer<typeof relayFilePutInputSchema>
+export type RelayFilePutResult = z.infer<typeof relayFilePutResultSchema>
 export type RelayFileActivityEntry = z.infer<
   typeof relayFileActivityEntrySchema
 >
