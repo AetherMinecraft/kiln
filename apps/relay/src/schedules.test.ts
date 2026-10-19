@@ -78,6 +78,7 @@ async function manager(
     reportError: (message: string, cause: unknown) => void
     sendConsoleCommand: (instanceId: string, command: string) => Promise<void>
     instancePowerIntent: (instanceId: string) => string
+    isPaused: () => boolean
     runInstancePower: ScheduleManagerOptions["runInstancePower"]
   }> = {}
 ) {
@@ -97,6 +98,7 @@ async function manager(
     relayId: "relay-a",
     reportError: overrides.reportError,
     instancePowerIntent: overrides.instancePowerIntent ?? (() => "0"),
+    isPaused: overrides.isPaused ?? (() => false),
     runDatabasePower: async () => undefined,
     runInstancePower: overrides.runInstancePower ?? (async () => undefined),
     sendConsoleCommand: overrides.sendConsoleCommand ?? (async () => undefined),
@@ -1126,6 +1128,61 @@ describe("Relay schedule persistence", () => {
     ).toBeGreaterThanOrEqual(5 * minuteMs)
     expect((await latestRun(schedules))?.sequenceAttempts).toMatchObject([
       { actionType: "wait", status: "succeeded" },
+    ])
+  })
+
+  it("runs no actions while the Relay is paused", async () => {
+    const commands: Array<string> = []
+    const { schedules } = await manager({
+      findInstance: async () => ({}),
+      isPaused: () => true,
+      sendConsoleCommand: async (_instanceId, command) => {
+        commands.push(command)
+      },
+    })
+    await schedules.apply(projection)
+
+    await runNow(schedules)
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).not.toBe("running")
+    })
+    expect(commands).toEqual([])
+    expect((await latestRun(schedules))?.targetRuns[0]?.attempts).toMatchObject(
+      [{ error: "Not run: the Relay is paused", status: "not_run" }]
+    )
+  })
+
+  it("records a step a pause withdrew while it waited its turn as not run", async () => {
+    const { schedules } = await manager({
+      findInstance: async () => ({}),
+      // Paused after the step checked, while it waited for its lane.
+      runInstancePower: async () => {
+        throw new LaneRejectedError({
+          message: "paused",
+          reason: "paused",
+        })
+      },
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        {
+          action: "restart",
+          id: "0e9a7f5c-77e8-4b39-8c1a-6d5bb9c0b3a1",
+          type: "power",
+        },
+      ],
+    })
+
+    await runNow(schedules)
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).not.toBe("running")
+    })
+    const run = await latestRun(schedules)
+    // Nothing ran, and nothing failed.
+    expect(run?.status).toBe("noop")
+    expect(run?.targetRuns[0]?.attempts).toMatchObject([
+      { error: "Not run: the Relay is paused", status: "not_run" },
     ])
   })
 

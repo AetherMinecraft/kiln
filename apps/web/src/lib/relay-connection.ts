@@ -1,5 +1,13 @@
 import { randomUUID, sign, verify } from "node:crypto"
-import { Effect, Fiber, Option, Result, Schema, Tracer } from "effect"
+import {
+  Effect,
+  Fiber,
+  Option,
+  Result,
+  Schema,
+  Semaphore,
+  Tracer,
+} from "effect"
 import { HttpTraceContext } from "effect/http"
 import { WebSocket } from "ws"
 
@@ -17,6 +25,7 @@ import {
   relayControlDeadlineMs,
   relayControlMaxFrameBytes,
   relayControlOperationChanges,
+  relayControlOperationRefusedWhilePaused,
   RelayOperationLookupSchema,
   relayControlRequestTimeoutMs,
   relayControlProtocol,
@@ -113,14 +122,6 @@ const connections = (globalThis.kilnRelayConnections ??= new Map())
 const relayUpdates = (globalThis.kilnRelayUpdates ??= new Map())
 const ABSENT_RELAY_UPDATE_MS = 15 * 60_000
 
-// Changes a paused Relay still takes: revoking access, which must reach it
-// whatever its state.
-const changesAllowedWhilePaused = new Set<RelayControlOperation>([
-  "browser.authorization.revise",
-  "relay.clients.revoke",
-  "relay.pairing.revoke",
-])
-
 /**
  * Sends one request to a Relay. A change gets an operation ID, and one a
  * person or CLI credential asked for (`subject`) is recorded in Hearth's
@@ -139,9 +140,8 @@ export async function relayRpc(
 ): Promise<unknown> {
   const changes = relayControlOperationChanges(operation)
   if (
-    changes &&
     relay.enabled === false &&
-    !changesAllowedWhilePaused.has(operation)
+    relayControlOperationRefusedWhilePaused(operation)
   ) {
     throw relayPausedError()
   }
@@ -188,15 +188,7 @@ export async function relayRpc(
   return result.success
 }
 
-async function relaySend(
-  relay: RelayEndpoint,
-  operation: RelayControlOperation,
-  payload: unknown,
-  timeoutMs: number,
-  subject: string | undefined,
-  signal: AbortSignal | undefined,
-  operationId: string | undefined
-): Promise<unknown> {
+function connectionFor(relay: RelayEndpoint): RelayConnection {
   const effectiveRelay = relayControlEndpoint(relay)
   let connection = connections.get(relay.id)
   // Vite preserves this global registry across SSR reloads. Existing instances
@@ -212,6 +204,31 @@ async function relaySend(
     connection = new RelayConnection(effectiveRelay)
     connections.set(relay.id, connection)
   }
+  return connection
+}
+
+/**
+ * Tells a Relay whether this Hearth holds it paused, connecting to it if
+ * need be. The connection keeps telling it, on every connect and while the
+ * Relay reports otherwise, so a pause or resume it missed still arrives.
+ */
+export async function setRelayPause(
+  relay: RelayEndpoint,
+  paused: boolean
+): Promise<void> {
+  await runAppEffect("relay.pause.set", connectionFor(relay).holdPaused(paused))
+}
+
+async function relaySend(
+  relay: RelayEndpoint,
+  operation: RelayControlOperation,
+  payload: unknown,
+  timeoutMs: number,
+  subject: string | undefined,
+  signal: AbortSignal | undefined,
+  operationId: string | undefined
+): Promise<unknown> {
+  const connection = connectionFor(relay)
   const result = await runAppEffect(
     `relay.rpc.${operation}`,
     connection.request(operation, payload, timeoutMs, subject, operationId),
@@ -342,6 +359,22 @@ export function relayConnectionProxyMode(
   return connections.get(relayId)?.pushedSnapshot?.relay?.proxyMode ?? null
 }
 
+/**
+ * Whether the Relay reports itself paused, by this Hearth or another, as of
+ * its last snapshot here. False while this process isn't connected to it.
+ */
+export function relayReportsPaused(relayId: string): boolean {
+  return connections.get(relayId)?.reportsPaused === true
+}
+
+/**
+ * Whether the Relay has this Hearth's pause: it reports itself paused, or,
+ * while away, it took the pause when last connected.
+ */
+export function relayConfirmsPause(relayId: string): boolean {
+  return connections.get(relayId)?.confirmsPause === true
+}
+
 export function relayConnectionIds(): ReadonlyArray<string> {
   return Array.from(connections.keys())
 }
@@ -428,6 +461,13 @@ class RelayConnection {
   #relay: RelayEndpoint
   #reconnectFiber: Fiber.Fiber<void, unknown> | null = null
   #auditFiber: Fiber.Fiber<void, unknown> | null = null
+  // Whether this Hearth wants the Relay paused, and what the Relay last
+  // took from it, so the pause loop knows when to tell it again.
+  #wantsPaused: boolean | null = null
+  #toldPaused: boolean | null = null
+  #pauseFiber: Fiber.Fiber<void, unknown> | null = null
+  // One pause write at a time, so an older one can't land after a newer.
+  readonly #pauseWrites = Semaphore.makeUnsafe(1)
   #socket: WebSocket | null = null
   #state: RelayConnectionState = {
     lastError: null,
@@ -459,6 +499,82 @@ class RelayConnection {
 
   get pushedSnapshot(): RelaySnapshot | null {
     return this.#state.status === "authenticated" ? this.#pushedSnapshot : null
+  }
+
+  get reportsPaused(): boolean {
+    return this.pushedSnapshot?.relay?.paused === true
+  }
+
+  get confirmsPause(): boolean {
+    return this.#state.status === "authenticated"
+      ? this.reportsPaused
+      : this.#toldPaused === true
+  }
+
+  /**
+   * Sets whether this Hearth holds the Relay paused, and tells it now. If it
+   * can't be reached, connecting tells it.
+   */
+  holdPaused(paused: boolean): Effect.Effect<void> {
+    return Effect.suspend(() => {
+      this.#wantsPaused = paused
+      // What it took before no longer answers whether it has this.
+      if (this.#toldPaused !== paused) this.#toldPaused = null
+      return this.#connectEffect().pipe(
+        Effect.andThen(this.#tellPause(false)),
+        Effect.ignore
+      )
+    })
+  }
+
+  // Tells the Relay whether this Hearth holds it paused, unless it already
+  // took that: a pause it reports, or a resume, since another Hearth may
+  // still hold it paused.
+  #tellPause(always: boolean): Effect.Effect<void> {
+    return this.#pauseWrites.withPermit(
+      Effect.suspend(() => {
+        const paused = this.#wantsPaused
+        if (paused === null || this.#state.status !== "authenticated") {
+          return Effect.void
+        }
+        if (
+          !always &&
+          this.#toldPaused === paused &&
+          (!paused || this.reportsPaused)
+        ) {
+          return Effect.void
+        }
+        return this.request("relay.pause.write", { paused }, 10_000).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              if (this.#wantsPaused === paused) this.#toldPaused = paused
+            })
+          ),
+          Effect.catch((cause) =>
+            Effect.sync(() => {
+              // It may or may not have taken it, so tell it again next time.
+              if (this.#wantsPaused === paused) this.#toldPaused = null
+            }).pipe(
+              Effect.andThen(
+                Effect.logWarning("Relay pause sync failed", {
+                  cause,
+                  relayId: this.#relay.id,
+                })
+              )
+            )
+          ),
+          Effect.asVoid
+        )
+      })
+    )
+  }
+
+  // Lets browsers know when the Relay's pause changes.
+  #noticePause(previous: RelaySnapshot | null): void {
+    const was = previous?.relay?.paused === true
+    const is = this.#pushedSnapshot?.relay?.paused === true
+    if (was === is && (previous || !is)) return
+    publishRealtimeChange({ relayId: this.#relay.id, type: "relay.metadata" })
   }
 
   get pushedInstances(): ReadonlyArray<
@@ -663,6 +779,8 @@ class RelayConnection {
     this.#reconnectFiber = null
     this.#auditFiber?.interruptUnsafe()
     this.#auditFiber = null
+    this.#pauseFiber?.interruptUnsafe()
+    this.#pauseFiber = null
     this.#socket?.close(1000, "Hearth connection closed")
     this.#socket = null
     this.#features.clear()
@@ -964,6 +1082,7 @@ class RelayConnection {
             }
             this.#pushedSnapshot = pushed
             this.#hasPushedSnapshot = true
+            this.#noticePause(previousSnapshot)
             if (!previousSnapshot) {
               publishRealtimeChange({
                 relayId: this.#relay.id,
@@ -1005,6 +1124,7 @@ class RelayConnection {
               delta
             )
             this.#hasPushedSnapshot = true
+            this.#noticePause(previousSnapshot)
             // Resource-only node samples refresh the cached snapshot without
             // waking browsers on the fleet-wide realtime channel.
             const controlDelta = relaySnapshotControlDelta(
@@ -1037,6 +1157,8 @@ class RelayConnection {
         this.#socket = null
         this.#auditFiber?.interruptUnsafe()
         this.#auditFiber = null
+        this.#pauseFiber?.interruptUnsafe()
+        this.#pauseFiber = null
         this.#rejectBrowserAuthorizationReadiness(error)
         this.#abortReverseRequests()
         this.#rejectPending(error)
@@ -1459,6 +1581,52 @@ class RelayConnection {
       })
     }
     if (becameAuthenticated) {
+      // The Relay keeps its own pause. Tell it whether this Hearth holds it
+      // on every connect, and again while it reports otherwise, so a pause
+      // or resume it missed still arrives.
+      this.#pauseFiber?.interruptUnsafe()
+      this.#pauseFiber = forkAppEffect(
+        "relay.pause.syncOnConnect",
+        Effect.gen({ self: this }, function* () {
+          // Until Hearth's database answers whether it's paused here.
+          while (this.#wantsPaused === null) {
+            const loaded = yield* Effect.result(
+              promiseEffect(async () => {
+                const { listPersistedRelays } =
+                  await import("@/lib/relay-registry")
+                return (await listPersistedRelays()).find(
+                  (relay) => relay.id === this.#relay.id
+                )
+              })
+            )
+            if (Result.isSuccess(loaded)) {
+              if (!loaded.success) return
+              this.#wantsPaused ??= !loaded.success.enabled
+            } else {
+              yield* Effect.logWarning(
+                "Relay pause sync couldn't read Hearth",
+                {
+                  cause: loaded.failure,
+                  relayId: this.#relay.id,
+                }
+              )
+              yield* Effect.sleep(PAUSE_RECHECK_MS)
+            }
+          }
+          yield* this.#tellPause(true)
+          while (true) {
+            yield* Effect.sleep(PAUSE_RECHECK_MS)
+            yield* this.#tellPause(false)
+          }
+        }).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Relay pause sync after connect failed", {
+              cause,
+              relayId: this.#relay.id,
+            })
+          )
+        )
+      )
       forkAppEffect(
         "backups.reconcileOnConnect",
         Effect.tryPromise({
@@ -1704,6 +1872,8 @@ const UNSETTLED_CHANGE_POLL_MS = 1_000
 // waiting for it in any Hearth process.
 const AUDIT_IN_FLIGHT_MS = relayControlDeadlineMs("relay.update.apply") + 60_000
 const AUDIT_RECONCILE_PASSES = 6
+// How often a connection checks that the Relay has the pause it was told.
+const PAUSE_RECHECK_MS = 30_000
 const AUDIT_START_WAIT_MS = 2_000
 
 function unknownOutcome(

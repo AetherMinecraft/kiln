@@ -69,7 +69,7 @@ import {
   relaySystemUpdates,
   relayUpdateReportState,
 } from "@/lib/relay-connection"
-import { loadRelayCredentials } from "@/lib/relay-registry"
+import { listPersistedRelays, loadRelayCredentials } from "@/lib/relay-registry"
 import { subscribeRealtimeChanges } from "@/lib/realtime-source.server"
 
 const relayId = "relay-connection-effect-test"
@@ -377,6 +377,76 @@ effectIt.effect(
         expect(isRelayUpdating(relayId)).toBe(false)
       })
     )
+)
+
+effectIt.effect(
+  "tells a paused Relay it's paused each time Hearth connects to it",
+  () =>
+    withRelayServer(({ endpoint, requests }) =>
+      Effect.gen(function* () {
+        vi.mocked(listPersistedRelays).mockResolvedValue([
+          { ...endpoint, enabled: false },
+        ] as unknown as Awaited<ReturnType<typeof listPersistedRelays>>)
+        // Paused while it was away, say, and Hearth has restarted since.
+        yield* promiseEffect(() =>
+          relayRpc({ ...endpoint, enabled: false }, "relay.snapshot", {})
+        )
+        yield* promiseEffect(() =>
+          vi.waitFor(() =>
+            expect(requests).toContainEqual(
+              expect.objectContaining({
+                operation: "relay.pause.write",
+                payload: { paused: true },
+              })
+            )
+          )
+        )
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() =>
+            vi.mocked(listPersistedRelays).mockResolvedValue([])
+          )
+        )
+      )
+    )
+)
+
+effectIt.effect(
+  "tells a Relay again about a resume it never answered, until it takes it",
+  () => {
+    const pauseWrites: Array<unknown> = []
+    let retold: () => void = () => {}
+    const tellsAgain = new Promise<void>((resolve) => {
+      retold = resolve
+    })
+    return withRelayServer(
+      ({ endpoint }) =>
+        Effect.gen(function* () {
+          vi.mocked(listPersistedRelays).mockResolvedValue([
+            { ...endpoint, enabled: true },
+          ] as unknown as Awaited<ReturnType<typeof listPersistedRelays>>)
+          yield* promiseEffect(() => relayRpc(endpoint, "relay.snapshot", {}))
+          yield* Effect.promise(() => advanceTimersUntil(tellsAgain))
+          // Once it has taken the resume, later passes leave it alone.
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(65_000))
+          expect(pauseWrites).toEqual([{ paused: false }, { paused: false }])
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() =>
+              vi.mocked(listPersistedRelays).mockResolvedValue([])
+            )
+          )
+        ),
+      (message) => {
+        if (message.operation !== "relay.pause.write") return { ok: true }
+        pauseWrites.push(message.payload)
+        // The first is lost; the next is answered.
+        if (pauseWrites.length === 1) return noAnswer
+        retold()
+        return { paused: false }
+      }
+    )
+  }
 )
 
 effectIt.effect(

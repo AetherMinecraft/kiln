@@ -157,6 +157,7 @@ export const relayControlOperations = [
   "hearth.database.terminal.output",
   "sftp.authorization.resolve",
   "operation.get",
+  "relay.pause.write",
 ] as const
 
 export type RelayControlOperation = (typeof relayControlOperations)[number]
@@ -296,6 +297,7 @@ export function relayControlOperationChanges(
     case "sftp.authorization.resolve":
     case "operation.get":
       return false
+    case "relay.pause.write":
     case "relay.update.apply":
     case "relay.restart":
     case "relay.rename":
@@ -360,6 +362,47 @@ export function relayControlOperationChanges(
 
 // How long a Relay keeps the record of a finished change for `operation.get`.
 export const relayOperationRetentionMs = 7 * 24 * 60 * 60_000
+
+// Terminal traffic isn't journaled, but opening a shell or sending it input
+// can change anything. Heartbeats and detaching only keep or end a session.
+const terminalInputOperations = new Set<RelayControlOperation>([
+  "app.terminal.attach",
+  "app.terminal.claim",
+  "app.terminal.restart",
+  "app.terminal.write",
+  "database.terminal.attach",
+  "database.terminal.claim",
+  "database.terminal.restart",
+  "database.terminal.write",
+  "relay.terminal.attach",
+  "relay.terminal.claim",
+  "relay.terminal.restart",
+  "relay.terminal.write",
+])
+
+/**
+ * Whether a paused Relay refuses an operation. A Relay is paused while any
+ * Hearth holds it paused (`relay.pause.write`), and then runs nothing that
+ * changes anything, from Hearth or of its own accord: no change and no
+ * terminal input. Pausing and resuming it, and revoking access, still reach
+ * it whatever its state.
+ */
+export function relayControlOperationRefusedWhilePaused(
+  operation: RelayControlOperation
+): boolean {
+  if (
+    operation === "relay.pause.write" ||
+    operation === "browser.authorization.revise" ||
+    operation === "relay.clients.revoke" ||
+    operation === "relay.pairing.revoke"
+  ) {
+    return false
+  }
+  return (
+    relayControlOperationChanges(operation) ||
+    terminalInputOperations.has(operation)
+  )
+}
 
 export function relayControlDeadlineMs(
   operation: RelayControlOperation

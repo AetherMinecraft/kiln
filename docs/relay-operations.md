@@ -179,12 +179,49 @@ optionally for one resource.
 
 ## Paused Relays
 
-`relayRpc` sends a paused Relay no changes, and fails them with
-`RelayUnavailableError` and code `relay_paused`. Reads still go through, as do
-access revocations, which must reach a Relay whatever its state.
-`activeRelay` in `lib/relay-registry.ts` is the one way server functions find
-the Relay for a person's change: a missing Relay fails as not found, a paused
-one with `relay_paused` and the same message.
+Pausing a Relay freezes it. Its game servers keep running, but nothing on it
+changes until it's resumed, whoever asks: Hearth, the CLI, the browser's
+console and uploads, SFTP, schedules, crash recovery, the disk-quota stop,
+and the backup, provisioning, and deployment workers.
+
+Each paired Hearth holds the pause for itself (`relay.pause.write`), and the
+Relay is paused while any Hearth holds it, so one Hearth resuming can't undo
+another's pause. Hearth sends its hold when someone pauses or resumes the
+Relay, on every connect, and every 30 seconds while the Relay reports
+otherwise, so a pause or resume it missed still arrives. Hearth keeps a
+connection to paused Relays from startup for this, so the pause still
+arrives if Hearth restarted while the Relay was away. What Hearth shows comes
+from the Relay's own `relay.paused`: a Relay paused in Hearth reads as
+Pausing until it has the pause, and one another Hearth paused reads as
+Paused. The Relay keeps
+holds in SQLite and reads them before any worker starts, so it stays paused
+across restarts. Revoking a Hearth clears its hold, and a pause that raced
+the revocation leaves none behind.
+
+While paused:
+
+- New changes and terminal input are refused with `relay_paused`, and
+  changes waiting their turn, or let through but not yet started, are
+  withdrawn. Work already running finishes.
+- Schedule actions are recorded as not run, including one withdrawn while it
+  waited its turn.
+- Queued backups and provisioning jobs wait, and start once it's resumed. One
+  already taken from the queue but withdrawn before it started goes back in
+  line, without using an attempt.
+- Crash recovery waits without spending its attempts, and starts a crashed
+  server once it's resumed.
+- A deployment waiting its turn is finished as failed.
+
+`relayControlOperationRefusedWhilePaused` says what a paused Relay refuses.
+It still takes pausing and resuming, and access revocations, which must reach
+it whatever its state, and terminal heartbeats and detaching. Reads, the
+snapshot loop, and network upkeep such as Tailscale forwarding rules carry
+on.
+
+Hearth also sends a paused Relay no changes: `relayRpc` refuses them with the
+same `relay_paused` error, and `activeRelay` in `lib/relay-registry.ts` is
+the one way server functions find the Relay for a person's change, failing
+the same way for a paused one and as not found for a missing one.
 
 ## Limits
 

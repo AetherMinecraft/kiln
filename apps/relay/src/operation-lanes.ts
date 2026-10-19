@@ -54,7 +54,7 @@ export const laneKeys = {
 export class LaneRejectedError extends Schema.TaggedError<LaneRejectedError>()(
   "LaneRejectedError",
   {
-    reason: Schema.Literals(["busy", "cancelled", "superseded"]),
+    reason: Schema.Literals(["busy", "cancelled", "paused", "superseded"]),
     message: Schema.String,
   }
 ) {}
@@ -95,6 +95,8 @@ interface Waiter {
   locks: ReadonlyArray<LaneLock> | null
   readonly precondition: (() => boolean) | undefined
   readonly granted: Deferred.Deferred<void, LaneRejectedError>
+  /** Why a granted operation was withdrawn before it started. */
+  refusal?: LaneRejectedError
   state: WaiterState
 }
 
@@ -116,6 +118,7 @@ export class OperationLanes {
   readonly #nested: Array<Waiter> = []
   readonly #active = new Set<Waiter>()
   readonly #exclusiveStarts = new Map<string, number>()
+  #paused = false
   readonly #held = new Map<string, HeldLock>()
 
   constructor(options: OperationLanesOptions = {}) {
@@ -154,6 +157,30 @@ export class OperationLanes {
     return Effect.suspend(() => this.#admit(admission, true).run(effect))
   }
 
+  /**
+   * While paused, nothing new starts: work admitted now is refused, and work
+   * still waiting, or granted but not yet started, is withdrawn. Work already
+   * running finishes, and can take the nested locks it needs to.
+   */
+  setPaused(paused: boolean): void {
+    this.#paused = paused
+    if (!paused) return
+    for (const waiter of this.#waiting.splice(0)) {
+      waiter.state = "done"
+      Deferred.doneUnsafe(waiter.granted, Exit.fail(pausedError(waiter.label)))
+    }
+    for (const waiter of this.#active) {
+      if (waiter.nested || waiter.state !== "granted") continue
+      waiter.refusal = pausedError(waiter.label)
+      this.#release(waiter)
+    }
+    this.#grant()
+  }
+
+  get paused(): boolean {
+    return this.#paused
+  }
+
   #admit(admission: LaneAdmission, nested: boolean): LaneTicket {
     const waiter: Waiter = {
       granted: Deferred.makeUnsafe<void, LaneRejectedError>(),
@@ -164,7 +191,9 @@ export class OperationLanes {
       state: "waiting",
     }
     const queue = nested ? this.#nested : this.#waiting
-    if (!nested && this.#waiting.length >= this.#maxWaiting) {
+    if (!nested && this.#paused) {
+      this.#reject(waiter, pausedError(admission.label))
+    } else if (!nested && this.#waiting.length >= this.#maxWaiting) {
       this.#reject(
         waiter,
         new LaneRejectedError({
@@ -233,10 +262,11 @@ export class OperationLanes {
           Effect.onInterrupt(() => Effect.sync(() => this.#cancel(waiter)))
         )
         if (waiter.state !== "granted") {
-          return yield* new LaneRejectedError({
-            message: `${waiter.label} was already run or withdrawn`,
-            reason: "cancelled",
-          })
+          return yield* (waiter.refusal ??
+            new LaneRejectedError({
+              message: `${waiter.label} was already run or withdrawn`,
+              reason: "cancelled",
+            }))
         }
         waiter.state = "running"
         // Counted once it runs, so a request refused or withdrawn after its
@@ -358,6 +388,13 @@ export class OperationLanes {
       Deferred.doneUnsafe(waiter.granted, Exit.void)
     }
   }
+}
+
+function pausedError(label: string): LaneRejectedError {
+  return new LaneRejectedError({
+    message: `${label} didn't run: this Relay is paused`,
+    reason: "paused",
+  })
 }
 
 function conflicts(held: HeldLock | undefined, mode: LaneMode): boolean {

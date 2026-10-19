@@ -426,6 +426,16 @@ export class RelayStateStore extends Context.Service<
     readonly pruneOperations: (
       finishedBefore: number
     ) => Effect.Effect<void, RelayStateError>
+    /** The paired Hearths holding this Relay paused. */
+    readonly listPauseHolds: () => Effect.Effect<
+      ReadonlyArray<string>,
+      RelayStateError
+    >
+    readonly setPauseHold: (
+      clientId: string,
+      paused: boolean,
+      now: number
+    ) => Effect.Effect<void, RelayStateError>
     readonly createInvitation: (
       input: RelayInvitationInput
     ) => Effect.Effect<void, RelayStateError>
@@ -468,6 +478,11 @@ export class RelayStateStore extends Context.Service<
     readonly claimNextBackupTask: (
       now: number
     ) => Effect.Effect<RelayBackupTask | null, RelayStateError>
+    /** Puts back a claimed task that never started, as when a pause withdrew it. */
+    readonly returnBackupTask: (
+      taskId: string,
+      now: number
+    ) => Effect.Effect<boolean, RelayStateError>
     readonly getBackupTask: (
       taskId: string
     ) => Effect.Effect<RelayBackupTask | null, RelayStateError>
@@ -550,6 +565,11 @@ export class RelayStateStore extends Context.Service<
     readonly requeueInterruptedProvisioningJobs: (
       now: number
     ) => Effect.Effect<number, RelayStateError>
+    /** Puts back a claimed job that never started, without using an attempt. */
+    readonly returnProvisioningJob: (
+      instanceId: string,
+      now: number
+    ) => Effect.Effect<boolean, RelayStateError>
     readonly listClients: () => Effect.Effect<
       ReadonlyArray<RelayClientRecord>,
       RelayStateError
@@ -1112,6 +1132,13 @@ const migrations = SqliteMigrator.fromRecord({
       PRIMARY KEY (client_id, operation_id)
     ) STRICT`
     yield* sql`CREATE INDEX relay_operations_started ON relay_operations (started_at)`
+  }),
+  "20_pause_holds": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE relay_pause_holds (
+      client_id TEXT PRIMARY KEY NOT NULL,
+      paused_at INTEGER NOT NULL
+    ) STRICT`
   }),
 })
 
@@ -1792,6 +1819,31 @@ const makeRelayStateStore = Effect.gen(function* () {
           WHERE status <> 'running' AND started_at < ${finishedBefore}
         `.pipe(Effect.asVoid)
       ),
+    listPauseHolds: () =>
+      run(
+        "list_pause_holds",
+        sql<{ clientId: string }>`
+          SELECT client_id AS clientId FROM relay_pause_holds
+        `.pipe(Effect.map((rows) => rows.map((row) => row.clientId)))
+      ),
+    setPauseHold: (clientId, paused, now) =>
+      run(
+        "set_pause_hold",
+        (paused
+          ? // Only while the Hearth is still paired: a pause that raced its
+            // revocation leaves no hold behind that nobody could lift.
+            sql`
+              INSERT INTO relay_pause_holds (client_id, paused_at)
+              SELECT ${clientId}, ${now}
+              WHERE EXISTS (
+                SELECT 1 FROM relay_clients
+                WHERE id = ${clientId} AND revoked_at IS NULL
+              )
+              ON CONFLICT (client_id) DO NOTHING
+            `
+          : sql`DELETE FROM relay_pause_holds WHERE client_id = ${clientId}`
+        ).pipe(Effect.asVoid)
+      ),
     appendAudit: (input) =>
       run(
         "append_audit",
@@ -1945,6 +1997,19 @@ const makeRelayStateStore = Effect.gen(function* () {
             }
           })
         )
+      ),
+    returnBackupTask: (taskId, now) =>
+      run(
+        "return_backup_task",
+        sql<{ taskId: string }>`
+          UPDATE relay_backup_tasks
+          SET status = 'queued',
+              started_at = NULL,
+              phase = NULL,
+              updated_at = ${now}
+          WHERE task_id = ${taskId} AND status = 'running'
+          RETURNING task_id AS taskId
+        `.pipe(Effect.map((rows) => rows.length > 0))
       ),
     getBackupTask: (taskId) =>
       run(
@@ -2354,6 +2419,18 @@ const makeRelayStateStore = Effect.gen(function* () {
           `
           return true
         })
+      ),
+    returnProvisioningJob: (instanceId, now) =>
+      run(
+        "return_provisioning_job",
+        sql<{ instanceId: string }>`
+          UPDATE relay_instance_provisioning_jobs
+          SET status = 'queued',
+              attempt = attempt - 1,
+              updated_at = ${now}
+          WHERE instance_id = ${instanceId} AND status = 'running'
+          RETURNING instance_id AS instanceId
+        `.pipe(Effect.map((rows) => rows.length > 0))
       ),
     requeueInterruptedProvisioningJobs: (now) =>
       run(
@@ -2852,6 +2929,8 @@ const makeRelayStateStore = Effect.gen(function* () {
               SET revoked_at = ${revokedAt}
               WHERE id = ${clientId} AND revoked_at IS NULL
             `
+            // A revoked Hearth no longer holds the Relay paused.
+            yield* sql`DELETE FROM relay_pause_holds WHERE client_id = ${clientId}`
             return true
           })
         )
