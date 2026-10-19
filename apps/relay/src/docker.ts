@@ -20,6 +20,7 @@ import {
 import type { BrickCatalog } from "./bricks.js"
 import { directoryApparentSizeEffect } from "./disk-usage.js"
 import { ensuringPromise, recoverPromise } from "./effect/promise.js"
+import { reportRelayError } from "./effect/runtime.js"
 import type {
   RelayStateStore,
   RelayStoredLifecycleSession,
@@ -2231,6 +2232,7 @@ export class DockerDriver {
       cached.directory = directory
       const findCurrent = () => this.#findDiscovered(instance.config.id)
       const engine = this.#engine
+      const runtimeRecovery = this.#runtimeRecovery
       const refresh = Effect.gen(function* () {
         const usedBytes = yield* directoryApparentSizeEffect(directory)
         cached.usedBytes = usedBytes
@@ -2250,10 +2252,39 @@ export class DockerDriver {
               `Stopping ${current.config.name}: disk usage exceeded its configured quota`
             )
           })
-          yield* engine.stopContainer(current.config.service, {
-            seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
-            timeout: (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000,
-          })
+          // Record the stop as intended so crash recovery doesn't start the
+          // server again while it's still over quota. Stopping matters more
+          // than the record, so a failed write doesn't prevent it.
+          const recorded = current.config.managedByRelay
+            ? yield* runtimeRecovery
+                .recordPowerAction(current.config.id, "stop")
+                .pipe(
+                  Effect.map((previous) => ({ previous })),
+                  Effect.catch((cause) =>
+                    Effect.sync(() => {
+                      reportRelayError(cause, {
+                        operation: "relay.quota.recordStop",
+                      })
+                      return null
+                    })
+                  )
+                )
+            : null
+          yield* engine
+            .stopContainer(current.config.service, {
+              seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
+              timeout: (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000,
+            })
+            .pipe(
+              // A stop Docker refused leaves the server running as before.
+              Effect.onError(() =>
+                recorded
+                  ? runtimeRecovery
+                      .restore(current.config.id, recorded.previous)
+                      .pipe(Effect.ignore)
+                  : Effect.void
+              )
+            )
         }
       }).pipe(
         // Keep the last healthy value. Directory scans race with normal game

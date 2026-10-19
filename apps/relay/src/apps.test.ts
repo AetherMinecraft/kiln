@@ -83,10 +83,7 @@ async function deploy(
   harness: RelayHarness,
   config: Partial<AppConfig>
 ): Promise<RelayApp> {
-  vi.useFakeTimers({
-    now: Math.max(Date.now(), clock),
-    toFake: ["Date", "setTimeout", "clearTimeout"],
-  })
+  useDeploymentClock()
   await harness.apps.deploy(
     relayDeployAppSchema.parse({
       appId,
@@ -94,6 +91,17 @@ async function deploy(
       name: "Website",
     })
   )
+  return settledDeployment(harness)
+}
+
+function useDeploymentClock() {
+  vi.useFakeTimers({
+    now: Math.max(Date.now(), clock),
+    toFake: ["Date", "setTimeout", "clearTimeout"],
+  })
+}
+
+async function settledDeployment(harness: RelayHarness): Promise<RelayApp> {
   // Docker and the filesystem are real I/O; each step lets them progress
   // before the clock moves on.
   for (let step = 0; step < 10_000; step += 1) {
@@ -145,6 +153,32 @@ describe("apps", () => {
         destination: "/data",
         source: join(harness.config.dataDirectory, "apps", appId),
       })
+    )
+  })
+
+  it("refuses a second deployment sent while the first is starting", async () => {
+    const harness = await createdApp()
+    const request = relayDeployAppSchema.parse({
+      appId,
+      config: { ...defaultAppConfig, image: "nginx:alpine" },
+      name: "Website",
+    })
+
+    useDeploymentClock()
+    const results = await Promise.allSettled([
+      harness.apps.deploy(request),
+      harness.apps.deploy(request),
+    ])
+
+    expect(results.map((result) => result.status).sort()).toEqual([
+      "fulfilled",
+      "rejected",
+    ])
+    expect(results.find((result) => result.status === "rejected")).toMatchObject(
+      { reason: new Error("A deployment is already running") }
+    )
+    expect((await settledDeployment(harness)).deployment?.state).toBe(
+      "succeeded"
     )
   })
 
