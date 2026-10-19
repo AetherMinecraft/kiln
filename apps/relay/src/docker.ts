@@ -12,6 +12,8 @@ import {
   type DatabaseConnections,
   type DatabaseConnectionSnapshot,
 } from "./database-connections.js"
+import type { OperationLanes } from "./operation-lanes.js"
+import { instanceLifecycleLocks } from "./operation-plans.js"
 import {
   DockerEngine,
   DockerEngineError,
@@ -444,6 +446,8 @@ export class DockerDriver {
   readonly #consoleSizeStarts = new Map<string, string>()
   readonly #consoleSizePending = new Map<string, Promise<void>>()
   readonly #diskUsageCache = new Map<string, DiskUsageCacheEntry>()
+  // Servers with a quota stop waiting for or holding their lane.
+  readonly #quotaStops = new Set<string>()
   readonly #engine: DockerEngine
   readonly #powerTransitions = new Map<string, InstancePowerTransition>()
   readonly #runtimeRecovery: RuntimeRecoveryManager
@@ -463,17 +467,20 @@ export class DockerDriver {
   #relayProcessCpu: { at: number; usage: NodeJS.CpuUsage } | null = null
   #relayResourceHistory: Array<RelayInstanceResources> = []
   readonly #state: RelayStateStore["Service"]
+  readonly #lanes: OperationLanes
 
   constructor(
     config: RelayConfig,
     runtimeRecovery: RuntimeRecoveryManager,
     bricks: BrickCatalog,
     state: RelayStateStore["Service"],
-    readonly databaseConnections: DatabaseConnections
+    readonly databaseConnections: DatabaseConnections,
+    lanes: OperationLanes
   ) {
     this.#bricks = bricks
     this.#config = config
     this.#engine = new DockerEngine(config.dockerSocket)
+    this.#lanes = lanes
     this.#resources = relayResourceNames(config)
     this.#runtimeRecovery = runtimeRecovery
     this.#state = state
@@ -1430,10 +1437,15 @@ export class DockerDriver {
     )
   }
 
+  /**
+   * Writes a line to the server's console. Reports whether it was one of the
+   * server's stop commands, which records the server as intentionally
+   * stopped.
+   */
   async sendCommand(
     instance: RelayInstanceConfig,
     input: string
-  ): Promise<void> {
+  ): Promise<{ readonly intentionalStop: boolean }> {
     const stopCommands = await this.#consoleStopCommands(instance)
     const intentionalStop = isIntentionalServerStopCommand(stopCommands, input)
     const previousRecovery = intentionalStop
@@ -1460,6 +1472,7 @@ export class DockerDriver {
         )
       )
     )
+    return { intentionalStop }
   }
 
   async #consoleStopCommands(
@@ -2232,7 +2245,67 @@ export class DockerDriver {
       cached.directory = directory
       const findCurrent = () => this.#findDiscovered(instance.config.id)
       const engine = this.#engine
+      const lanes = this.#lanes
       const runtimeRecovery = this.#runtimeRecovery
+      const exceeded = (
+        current: DiscoveredInstance | null,
+        usedBytes: number
+      ): current is DiscoveredInstance =>
+        current !== null &&
+        diskQuotaExceeded(
+          usedBytes,
+          current.config.limits.diskBytes,
+          current.container.State.Running
+        )
+      const quotaStops = this.#quotaStops
+      // Stops in the server's power lane, so it can't interleave with a
+      // start or console input, and measures again once its turn comes.
+      const stopOverQuota = Effect.gen(function* () {
+        const usedBytes = yield* directoryApparentSizeEffect(directory)
+        cached.usedBytes = usedBytes
+        const current = yield* promiseEffect(findCurrent).pipe(
+          Effect.catch(() => Effect.succeed(null))
+        )
+        if (!exceeded(current, usedBytes)) return
+        yield* Effect.sync(() => {
+          console.warn(
+            `Stopping ${current.config.name}: disk usage exceeded its configured quota`
+          )
+        })
+        // Record the stop as intended so crash recovery doesn't start the
+        // server again while it's still over quota. Stopping matters more
+        // than the record, so a failed write doesn't prevent it.
+        const recorded = current.config.managedByRelay
+          ? yield* runtimeRecovery
+              .recordPowerAction(current.config.id, "stop")
+              .pipe(
+                Effect.map((previous) => ({ previous })),
+                Effect.catch((cause) =>
+                  Effect.sync(() => {
+                    reportRelayError(cause, {
+                      operation: "relay.quota.recordStop",
+                    })
+                    return null
+                  })
+                )
+              )
+          : null
+        yield* engine
+          .stopContainer(current.config.service, {
+            seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
+            timeout: (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000,
+          })
+          .pipe(
+            // A stop Docker refused leaves the server running as before.
+            Effect.onError(() =>
+              recorded
+                ? runtimeRecovery
+                    .restore(current.config.id, recorded.previous)
+                    .pipe(Effect.ignore)
+                : Effect.void
+            )
+          )
+      })
       const refresh = Effect.gen(function* () {
         const usedBytes = yield* directoryApparentSizeEffect(directory)
         cached.usedBytes = usedBytes
@@ -2240,50 +2313,34 @@ export class DockerDriver {
           Effect.catch(() => Effect.succeed(null))
         )
         if (
-          current &&
-          diskQuotaExceeded(
-            usedBytes,
-            current.config.limits.diskBytes,
-            current.container.State.Running
-          )
+          exceeded(current, usedBytes) &&
+          !quotaStops.has(current.config.id)
         ) {
-          yield* Effect.sync(() => {
-            console.warn(
-              `Stopping ${current.config.name}: disk usage exceeded its configured quota`
+          // Waits for its lane apart from the scan, so a server busy
+          // reinstalling doesn't hold up every other server's scan. One
+          // waits per server at a time.
+          const instanceId = current.config.id
+          quotaStops.add(instanceId)
+          yield* lanes
+            .run(
+              {
+                label: "quota.stop",
+                locks: instanceLifecycleLocks(instanceId),
+              },
+              stopOverQuota
             )
-          })
-          // Record the stop as intended so crash recovery doesn't start the
-          // server again while it's still over quota. Stopping matters more
-          // than the record, so a failed write doesn't prevent it.
-          const recorded = current.config.managedByRelay
-            ? yield* runtimeRecovery
-                .recordPowerAction(current.config.id, "stop")
-                .pipe(
-                  Effect.map((previous) => ({ previous })),
-                  Effect.catch((cause) =>
-                    Effect.sync(() => {
-                      reportRelayError(cause, {
-                        operation: "relay.quota.recordStop",
-                      })
-                      return null
-                    })
-                  )
-                )
-            : null
-          yield* engine
-            .stopContainer(current.config.service, {
-              seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
-              timeout: (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000,
-            })
             .pipe(
-              // A stop Docker refused leaves the server running as before.
-              Effect.onError(() =>
-                recorded
-                  ? runtimeRecovery
-                      .restore(current.config.id, recorded.previous)
-                      .pipe(Effect.ignore)
-                  : Effect.void
-              )
+              Effect.catch((cause) =>
+                Effect.sync(() => {
+                  reportRelayError(cause, { operation: "relay.quota.stop" })
+                })
+              ),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  quotaStops.delete(instanceId)
+                })
+              ),
+              Effect.forkDetach
             )
         }
       }).pipe(

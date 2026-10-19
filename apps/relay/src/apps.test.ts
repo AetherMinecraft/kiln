@@ -17,6 +17,8 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 
 vi.mock("./command.js", () => import("./test/docker.js"))
 
+import { exclusive } from "./operation-lanes.js"
+import { appLifecycleLocks, appReplaceLocks } from "./operation-plans.js"
 import { appRouteOwner } from "./relay-resources.js"
 import { fakeDocker } from "./test/docker.js"
 import {
@@ -445,6 +447,115 @@ describe("apps", () => {
       ])
     ).toEqual([["web", true]])
     await rm(bin, { force: true, recursive: true })
+  })
+
+  it("doesn't recreate an App deleted while its deployment waited", async () => {
+    const harness = await createdApp()
+    // The deploy request holds the App's lane while it records the
+    // deployment, and a delete arrives behind it.
+    let releaseDeploy: () => void = () => undefined
+    const deployRequest = Effect.runPromise(
+      harness.lanes.run(
+        { label: "app.deploy", locks: appLifecycleLocks(appId) },
+        Effect.promise(
+          () =>
+            new Promise<void>((resolve) => {
+              releaseDeploy = resolve
+            })
+        )
+      )
+    )
+    const deletion = Effect.runPromise(
+      harness.lanes.run(
+        { label: "app.delete", locks: appReplaceLocks(appId) },
+        Effect.promise(() =>
+          harness.apps.delete({ appId, deleteData: true })
+        )
+      )
+    )
+    await harness.apps.deploy(
+      relayDeployAppSchema.parse({
+        appId,
+        config: { ...defaultAppConfig, image: "nginx:alpine" },
+        name: "Website",
+      })
+    )
+    // As the control socket does before the delete waits its turn.
+    harness.apps.abortDeployment(appId)
+    releaseDeploy()
+    await deployRequest
+    await expect(deletion).resolves.toMatchObject({ deleted: true })
+    await fakeDocker.idle()
+
+    expect((await harness.apps.list()).map((app) => app.id)).not.toContain(
+      appId
+    )
+    expect(appContainers()).toHaveLength(0)
+  })
+
+  it("finishes a deployment a withdrawn delete aborted, so the next one can run", async () => {
+    const harness = await createdApp()
+    let releaseDeploy: () => void = () => undefined
+    const deployRequest = Effect.runPromise(
+      harness.lanes.run(
+        { label: "app.deploy", locks: appLifecycleLocks(appId) },
+        Effect.promise(
+          () =>
+            new Promise<void>((resolve) => {
+              releaseDeploy = resolve
+            })
+        )
+      )
+    )
+    await harness.apps.deploy(
+      relayDeployAppSchema.parse({
+        appId,
+        config: { ...defaultAppConfig, image: "nginx:alpine" },
+        name: "Website",
+      })
+    )
+    // A delete stops the deployment, then is withdrawn before it runs.
+    harness.apps.abortDeployment(appId)
+    releaseDeploy()
+    await deployRequest
+    await vi.waitFor(async () =>
+      expect((await harness.apps.get(appId)).deployment).toMatchObject({
+        error: "The deployment was cancelled",
+        state: "failed",
+      })
+    )
+
+    const app = await deploy(harness, {})
+    expect(app.deployment).toMatchObject({ state: "succeeded" })
+  })
+
+  it("finishes a deployment the Relay was too busy to start", async () => {
+    const harness = await createdApp()
+    // Fill the lanes' queue behind something that holds its lock.
+    const holder = harness.lanes.admit({
+      label: "holder",
+      locks: [exclusive("busy")],
+    })
+    const queued = Array.from({ length: 512 }, (_, index) =>
+      harness.lanes.admit({ label: `queued-${index}`, locks: [exclusive("busy")] })
+    )
+    await harness.apps.deploy(
+      relayDeployAppSchema.parse({
+        appId,
+        config: { ...defaultAppConfig, image: "nginx:alpine" },
+        name: "Website",
+      })
+    )
+    await vi.waitFor(async () =>
+      expect((await harness.apps.get(appId)).deployment).toMatchObject({
+        state: "failed",
+      })
+    )
+    for (const ticket of [holder, ...queued]) ticket.cancel()
+
+    expect((await deploy(harness, {})).deployment).toMatchObject({
+      state: "succeeded",
+    })
   })
 
   it("removes an app's containers, network, and data when deleted", async () => {
