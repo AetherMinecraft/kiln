@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto"
-
 import {
   relayCreateDatabaseSchema,
   type DatabaseEngine,
 } from "@workspace/contracts"
-import { Effect } from "effect"
+import { randomUUID } from "node:crypto"
+
+import { Effect, Fiber } from "effect"
 import { describe, expect, it, vi } from "vite-plus/test"
 
 vi.mock("./command.js", () => import("./test/docker.js"))
@@ -15,8 +16,12 @@ import {
   TEST_NAMESPACE,
   type RelayHarness,
 } from "./test/relay.js"
+import { databaseProvisioning } from "./database-provisioning.js"
 import { DockerEngine } from "./docker-engine.js"
-import { controlRequestLocks } from "./operation-plans.js"
+import { RelayStateStore } from "./effect/state.js"
+import { ProvisioningManager } from "./provisioning.js"
+import { serverProvisioning } from "./server-provisioning.js"
+import { controlRequestLocks, databaseLocks } from "./operation-plans.js"
 
 const serverId = "a".repeat(40)
 const password = "correct-horse-battery-staple-1"
@@ -120,6 +125,200 @@ describe("managed database recovery metadata", () => {
       volumeOf(first),
       volumeOf(second),
     ])
+  })
+})
+
+describe("managed database provisioning", () => {
+  // The Relay's provisioning queue and worker over the harness's drivers.
+  async function provisioning(harness: RelayHarness) {
+    const manager = await Effect.runPromise(
+      ProvisioningManager.make({
+        adapters: {
+          database: databaseProvisioning(harness.databases),
+          server: serverProvisioning({
+            lifecycle: harness.lifecycle,
+            refreshSnapshot: async () => undefined,
+            state: harness.state,
+          }),
+        },
+        lanes: harness.lanes,
+      }).pipe(Effect.provideService(RelayStateStore, harness.state))
+    )
+    const worker = Effect.runFork(manager.run())
+    return {
+      manager,
+      stop: () => Effect.runPromise(Fiber.interrupt(worker)),
+    }
+  }
+
+  function input(id: string) {
+    return relayCreateDatabaseSchema.parse({
+      databaseName: "kiln_app",
+      engine: "postgres",
+      id,
+      name: "Main database",
+      password,
+      username: "kiln_user",
+    })
+  }
+
+  async function settled(harness: RelayHarness, id: string) {
+    for (let tries = 0; tries < 10_000; tries += 1) {
+      const database = (await harness.databases.list()).find(
+        (candidate) => candidate.id === id
+      )
+      if (database && database.observedState !== "provisioning") {
+        return database
+      }
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    throw new Error("The database never finished provisioning")
+  }
+
+  it("shows a placeholder at once, then creates the database once Hearth claims it", async () => {
+    const harness = await relayHarness()
+    const { manager, stop } = await provisioning(harness)
+    const id = "c".repeat(40)
+    const job = {
+      idempotencyKey: randomUUID(),
+      input: input(id),
+      instanceId: id,
+      kind: "database" as const,
+      placeholder: harness.databases.placeholder(input(id)),
+    }
+
+    await Effect.runPromise(manager.prepare(job))
+    // A retried prepare answers the same job.
+    await Effect.runPromise(manager.prepare(job))
+    expect(await harness.databases.list()).toEqual([
+      expect.objectContaining({
+        containerId: null,
+        id,
+        observedState: "provisioning",
+        provisioning: expect.objectContaining({ phase: "awaiting_claim" }),
+      }),
+    ])
+    expect(
+      await harness.databases.inventory(
+        [{ id, view: "status" }],
+        new AbortController().signal
+      )
+    ).toEqual([{ id, view: "status", observedState: "provisioning" }])
+
+    await Effect.runPromise(manager.claim("database", id))
+    const database = await settled(harness, id)
+
+    expect(database).toMatchObject({ id, observedState: "running" })
+    expect(database.provisioning).toBeUndefined()
+    expect(databaseContainer(id).state.running).toBe(true)
+    await stop()
+  })
+
+  it("shows where a failed create stopped and leaves nothing behind", async () => {
+    const harness = await relayHarness()
+    const { manager, stop } = await provisioning(harness)
+    const id = "c".repeat(40)
+    fakeDocker.failNext({ command: "start" }, "port is already allocated")
+
+    await Effect.runPromise(
+      manager.prepare({
+        idempotencyKey: randomUUID(),
+        input: input(id),
+        instanceId: id,
+        kind: "database",
+        placeholder: harness.databases.placeholder(input(id)),
+      })
+    )
+    await Effect.runPromise(manager.claim("database", id))
+    const database = await settled(harness, id)
+
+    expect(database).toMatchObject({
+      containerId: null,
+      observedState: "failed",
+      provisioning: { failedPhase: "finalizing", phase: "failed" },
+    })
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(false)
+    expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
+    await stop()
+  })
+
+  it("keeps a deleted job visible until what it made is gone, and never runs it", async () => {
+    const harness = await relayHarness()
+    const { manager, stop } = await provisioning(harness)
+    const id = "c".repeat(40)
+    await Effect.runPromise(
+      manager.prepare({
+        idempotencyKey: randomUUID(),
+        input: input(id),
+        instanceId: id,
+        kind: "database",
+        placeholder: harness.databases.placeholder(input(id)),
+      })
+    )
+
+    await expect(
+      Effect.runPromise(
+        manager.discard("database", id, async () => {
+          throw new Error("Docker unavailable")
+        })
+      )
+    ).rejects.toThrow("Docker unavailable")
+    expect(await harness.databases.list()).toEqual([
+      expect.objectContaining({ id, observedState: "failed" }),
+    ])
+    // Hearth's claim no longer starts it.
+    await expect(
+      Effect.runPromise(manager.claim("database", id))
+    ).resolves.toMatchObject({ observedState: "failed" })
+
+    await Effect.runPromise(manager.discard("database", id, async () => {}))
+    expect(await harness.databases.list()).toEqual([])
+    expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
+    await stop()
+  })
+
+  it("refuses to delete a job the worker has taken", async () => {
+    const harness = await relayHarness()
+    const { manager, stop } = await provisioning(harness)
+    const id = "c".repeat(40)
+    // Another change to the database holds its lanes, so the worker takes
+    // the job and waits its turn.
+    let release: () => void = () => undefined
+    const held = Effect.runPromise(
+      harness.lanes.run(
+        { label: "database.action", locks: databaseLocks(id) },
+        Effect.promise(
+          () =>
+            new Promise<void>((resolve) => {
+              release = resolve
+            })
+        )
+      )
+    )
+    await Effect.runPromise(
+      manager.prepare({
+        idempotencyKey: randomUUID(),
+        input: input(id),
+        instanceId: id,
+        kind: "database",
+        placeholder: harness.databases.placeholder(input(id)),
+      })
+    )
+    await Effect.runPromise(manager.claim("database", id))
+    for (let tries = 0; tries < 10_000; tries += 1) {
+      const job = await Effect.runPromise(harness.state.getProvisioningJob(id))
+      if (job?.status === "running") break
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+
+    await expect(
+      Effect.runPromise(manager.discard("database", id, async () => {}))
+    ).rejects.toThrow("Wait for the database to finish provisioning")
+
+    release()
+    await held
+    expect(await settled(harness, id)).toMatchObject({ observedState: "running" })
+    await stop()
   })
 })
 
@@ -530,6 +729,51 @@ describe("managed database deletion", () => {
     expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
     expect(server.networks.has(networkOf(id))).toBe(false)
     expect(server.state.running).toBe(true)
+  })
+
+  it("fails a delete whose network won't go, so it can be retried", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    fakeDocker.failNext(
+      { command: "network rm", target: networkOf(id) },
+      "network has active endpoints"
+    )
+
+    await expect(
+      harness.databases.delete({ databaseId: id, deleteData: true })
+    ).rejects.toThrow("network has active endpoints")
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(true)
+
+    await harness.databases.delete({ databaseId: id, deleteData: true })
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(false)
+    expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
+  })
+
+  it("doesn't call a database gone when Docker can't say what's left of it", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    // An earlier delete stopped after removing the container.
+    await Effect.runPromise(
+      new DockerEngine(harness.config.dockerSocket).removeContainer(
+        databaseContainer(id).id,
+        { force: true }
+      )
+    )
+    fakeDocker.failNext(
+      { command: "network inspect", target: networkOf(id) },
+      "Docker unavailable"
+    )
+
+    await expect(
+      harness.databases.delete({ databaseId: id, deleteData: true })
+    ).rejects.toThrow("Docker unavailable")
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(true)
+
+    await harness.databases.delete({ databaseId: id, deleteData: true })
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(false)
+    expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
   })
 
   it("finishes when the container disappears before Docker removes it", async () => {

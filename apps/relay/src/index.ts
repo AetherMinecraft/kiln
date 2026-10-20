@@ -20,6 +20,8 @@ import {
   relayConsoleCompletionInputSchema,
   relayConsoleShareInputSchema,
   relayCreateDatabaseSchema,
+  relayPrepareDatabaseSchema,
+  relayProvisionDatabaseSchema,
   relayAppActionSchema,
   relayAppLimitsSchema,
   relayAppNetworkSchema,
@@ -211,6 +213,7 @@ import { RelaySnapshotHub } from "./snapshot-hub.js"
 import { retainProvisioningInstances } from "./instance-mutation-snapshot.js"
 import { RuntimeRecoveryManager } from "./runtime-recovery.js"
 import { ProvisioningManager } from "./provisioning.js"
+import { databaseProvisioning } from "./database-provisioning.js"
 import { serverProvisioning } from "./server-provisioning.js"
 import { SystemUpdateManager } from "./system-updates.js"
 import { ScheduleManager } from "./schedules.js"
@@ -560,10 +563,14 @@ const provisioningManager = await runRelayEffect(
   "relay.startup.provisioning",
   ProvisioningManager.make({
     adapters: {
-      server: serverProvisioning({ lifecycle, state: startupCore.state }),
+      database: databaseProvisioning(databases),
+      server: serverProvisioning({
+        lifecycle,
+        refreshSnapshot: () => snapshotHub.refresh(),
+        state: startupCore.state,
+      }),
     },
     lanes,
-    refreshSnapshot: () => snapshotHub.refresh(),
   })
 )
 const provisioningFiber = forkRelayEffect(
@@ -1829,8 +1836,61 @@ async function executeControlRequest(
       )
     case "database.create":
       return databases.create(relayCreateDatabaseSchema.parse(request.payload))
-    case "database.delete":
-      return databases.delete(relayDeleteDatabaseSchema.parse(request.payload))
+    case "database.provision.prepare": {
+      const { idempotencyKey, ...input } = relayPrepareDatabaseSchema.parse(
+        request.payload
+      )
+      return runRelayEffect(
+        "relay.database.provision.prepare",
+        provisioningManager.prepare({
+          kind: "database",
+          idempotencyKey,
+          input,
+          instanceId: input.id,
+          placeholder: databases.placeholder(input),
+        })
+      )
+    }
+    case "database.provision.claim": {
+      const { databaseId } = relayProvisionDatabaseSchema.parse(
+        request.payload
+      )
+      return runRelayEffect(
+        "relay.database.provision.claim",
+        provisioningManager.claim("database", databaseId)
+      )
+    }
+    case "database.provision.cancel": {
+      const { databaseId } = relayProvisionDatabaseSchema.parse(
+        request.payload
+      )
+      const cancelled = await runRelayEffect(
+        "relay.database.provision.cancel",
+        provisioningManager.cancel("database", databaseId)
+      )
+      return { cancelled, databaseId }
+    }
+    case "database.delete": {
+      const input = relayDeleteDatabaseSchema.parse(request.payload)
+      // One still provisioning goes with whatever its create made. A failed
+      // create removed what it made, unless the Relay stopped partway.
+      const discarded = await runRelayEffect(
+        "relay.database.provision.discard",
+        provisioningManager.discard("database", input.databaseId, () =>
+          recoverPromise(
+            () => databases.delete({ ...input, deleteData: true }),
+            (cause) => {
+              if (
+                !(cause instanceof Error && cause.message === "Database not found")
+              )
+                throw cause
+            }
+          )
+        )
+      )
+      if (discarded) return { databaseId: input.databaseId, deleted: true }
+      return databases.delete(input)
+    }
     case "database.wipe":
       return databases.wipe(relayDatabaseWipeSchema.parse(request.payload))
     case "database.action":
