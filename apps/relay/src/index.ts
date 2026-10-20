@@ -40,6 +40,7 @@ import {
   relayDeleteAppSchema,
   relayDeployAppSchema,
   relayDatabaseActionSchema,
+  relayDatabaseLimitsSchema,
   relayDatabaseDumpSchema,
   relayDatabaseDataReadSchema,
   relayDatabaseDataWriteSchema,
@@ -319,6 +320,8 @@ const docker = new DockerDriver(
   lanes
 )
 const databases = new DatabaseDriver(config, docker, databaseConnections)
+// Before anything reads the databases, so none shows twice.
+await databases.recoverReplacements()
 const hostShell = new HostShell(config)
 const relayEngine = new DockerEngine(config.dockerSocket)
 const terminals = new ContainerTerminals(config)
@@ -359,7 +362,8 @@ const lifecycle = new LifecycleDriver(
   config,
   docker,
   bricks,
-  databaseConnections
+  databaseConnections,
+  lanes
 )
 const apps = new AppDriver(
   config,
@@ -1802,6 +1806,10 @@ async function executeControlRequest(
       return databases.wipe(relayDatabaseWipeSchema.parse(request.payload))
     case "database.action":
       return databases.action(relayDatabaseActionSchema.parse(request.payload))
+    case "database.limits.write":
+      return databases.setLimits(
+        relayDatabaseLimitsSchema.parse(request.payload)
+      )
     case "database.credentials.rotate":
       return databases.rotateCredentials(
         relayRotateDatabaseCredentialsSchema.parse(request.payload)
