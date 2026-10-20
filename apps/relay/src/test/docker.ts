@@ -139,6 +139,11 @@ export interface FakeNetwork {
 export interface FakeVolume {
   readonly name: string
   readonly labels: Record<string, string>
+  /**
+   * `local` unless set. Docker's disk usage leaves out volumes of other
+   * drivers, as it does local ones with mount options.
+   */
+  driver?: string
   /** File contents written into the volume, keyed by path inside it. */
   readonly files: Map<string, string>
 }
@@ -1712,14 +1717,18 @@ export class FakeDocker {
           .map((volume) => ({
             Driver: "local",
             Labels: volume.labels,
+            Mountpoint: `/var/lib/docker/volumes/${volume.name}/_data`,
             Name: volume.name,
           })),
       })
     }
     // Each volume is as big as the files written into it.
     if (method === "GET" && path === "/system/df") {
+      await this.#checkpoint("system df")
       return json(200, {
-        Volumes: [...this.volumes.values()].map((volume) => ({
+        Volumes: [...this.volumes.values()]
+          .filter((volume) => (volume.driver ?? "local") === "local")
+          .map((volume) => ({
           Name: volume.name,
           UsageData: {
             RefCount: 0,
@@ -2473,6 +2482,14 @@ function containerSummary(container: FakeContainer): unknown {
     Id: container.id,
     Image: container.image,
     Labels: container.labels,
+    // As `docker ps` reports them; anonymous volumes have hex names too.
+    Mounts: container.mounts.map((mount) => ({
+      Destination: mount.destination,
+      Name: mount.type === "volume" ? mount.source : undefined,
+      RW: !mount.readOnly,
+      Source: mount.source,
+      Type: mount.type,
+    })),
     Names: [`/${container.name}`],
     Ports: Object.entries(container.portBindings).flatMap(([port, hosts]) => {
       const [privatePort = "0", type = "tcp"] = port.split("/")
