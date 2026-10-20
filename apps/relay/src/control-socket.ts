@@ -42,6 +42,7 @@ import {
   relayResourceLimitsV1Feature,
   relayDatabaseLimitsV1Feature,
   relayAppLimitsV1Feature,
+  relayAppGitHubV1Feature,
   relayDatabaseProvisioningV1Feature,
   relayAppProvisioningV1Feature,
   appIdFromFileRoot,
@@ -1039,6 +1040,7 @@ function authenticateSocket(
           relayAppLimitsV1Feature,
           relayDatabaseProvisioningV1Feature,
           relayAppProvisioningV1Feature,
+          relayAppGitHubV1Feature,
         ],
         protocol: relayControlProtocol,
         relayBuild: relayBuildLabel(),
@@ -1442,6 +1444,8 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "app.list":
     case "app.network.routes.read":
       return "app.read"
+    case "app.deployment.read":
+      return "app.logs.read"
     case "app.create":
     case "app.provision.prepare":
     case "app.provision.claim":

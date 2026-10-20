@@ -49,11 +49,14 @@ const hearthRealtimeQueryScopes = {
     prefix(["users"]),
   ],
   activity: [prefix(["activity"])],
+  "app-deployments": [prefix(["app-deployments"])],
   "app-directory": [exact(queryKeys.apps.directory)],
   apps: [
     prefix(["apps"]),
     prefix(["instance-inventory", "app"]),
     prefix(["web-routes"]),
+    // Whether an app shows its repository follows its source type.
+    prefix(["app-deployments", "summary"]),
   ],
   "backup-settings": [
     prefix(["backups", "policy"]),
