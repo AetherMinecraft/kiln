@@ -160,7 +160,10 @@ describe("Relay control socket", () => {
     const challenge = (await inbox.next()) as RelayAuthChallenge
     socket.send(
       JSON.stringify(
-        authResponse(challenge, { ...hearth, privateKey: hearthKeys().private })
+        authResponse(challenge, {
+          ...hearth,
+          privateKey: hearthKeys().private,
+        })
       )
     )
 
@@ -170,7 +173,10 @@ describe("Relay control socket", () => {
 
   it("rejects operations outside the client's grant", async () => {
     const relay = await startRelay()
-    const hearth = await relay.pair({ actions: ["relay.read"], role: "custom" })
+    const hearth = await relay.pair({
+      actions: ["relay.read"],
+      role: "custom",
+    })
     const { inbox, socket } = await relay.connect(hearth)
 
     const id = sendRequest(socket, "relay.networking.write", {})
@@ -1086,6 +1092,138 @@ describe("Relay control socket", () => {
       }
     }
     expect([...answered].sort()).toEqual([...held].sort())
+  })
+
+  it("counts work Hearth stopped waiting for until it settles", async () => {
+    const started = deferred<void>()
+    const finish = deferred<void>()
+    onTestFinished(() => finish.resolve())
+    const relay = await startRelay({
+      // Like a file read, it doesn't stop when its request is cancelled.
+      execute: async () => {
+        started.resolve()
+        await finish.promise
+        return { ok: true }
+      },
+    })
+    const { socket } = await relay.connect(await relay.pair())
+
+    const id = sendRequest(socket, "relay.snapshot", {})
+    await started.promise
+    expect(relay.control.capacity()).toMatchObject({
+      inFlight: 1,
+      orphanedWork: 0,
+    })
+
+    socket.send(
+      JSON.stringify({
+        id: randomBytes(12).toString("hex"),
+        replyTo: id,
+        type: "cancel",
+        v: 1,
+      })
+    )
+    // The cancel frees the request's place, but its work runs on.
+    await vi.waitFor(() =>
+      expect(relay.control.capacity()).toMatchObject({
+        inFlight: 0,
+        orphanedWork: 1,
+      })
+    )
+
+    finish.resolve()
+    await vi.waitFor(() =>
+      expect(relay.control.capacity()).toMatchObject({ orphanedWork: 0 })
+    )
+  })
+
+  it("counts a change still running after its Hearth disconnects", async () => {
+    const started = deferred<void>()
+    const finish = deferred<void>()
+    onTestFinished(() => finish.resolve())
+    const relay = await startRelay({
+      execute: async () => {
+        started.resolve()
+        await finish.promise
+        return { ok: true }
+      },
+    })
+    const hearth = await relay.pair()
+    const { socket } = await relay.connect(hearth)
+
+    const operationId = randomUUID()
+    sendRequest(
+      socket,
+      "instance.action",
+      { action: "stop", instanceId: "d".repeat(40) },
+      { operationId }
+    )
+    await started.promise
+    socket.close()
+    await vi.waitFor(() => expect(relay.control.sessions.size).toBe(0))
+    // A change finishes once started, with no session left to wait for it.
+    expect(relay.control.capacity()).toMatchObject({
+      inFlight: 0,
+      orphanedWork: 1,
+    })
+
+    finish.resolve()
+    await vi.waitFor(async () =>
+      expect(await lookup(relay, hearth, operationId)).toMatchObject({
+        status: "succeeded",
+      })
+    )
+    await vi.waitFor(() =>
+      expect(relay.control.capacity()).toMatchObject({ orphanedWork: 0 })
+    )
+  })
+
+  it("counts a change that starts after its Hearth disconnected", async () => {
+    const journalRead = deferred<void>()
+    const started = deferred<void>()
+    const finish = deferred<void>()
+    onTestFinished(() => {
+      journalRead.resolve()
+      finish.resolve()
+    })
+    const relay = await startRelay({
+      journalReads: journalRead.promise,
+      execute: async () => {
+        started.resolve()
+        await finish.promise
+        return { ok: true }
+      },
+    })
+    const hearth = await relay.pair()
+    const { socket } = await relay.connect(hearth)
+
+    const operationId = randomUUID()
+    sendRequest(socket, "relay.rename", { name: "review" }, { operationId })
+    await vi.waitFor(async () =>
+      expect(await lookup(relay, hearth, operationId)).toEqual({
+        status: "running",
+      })
+    )
+    socket.close()
+    await vi.waitFor(() => expect(relay.control.sessions.size).toBe(0))
+
+    // Its journal read held it back; it starts with its session gone.
+    journalRead.resolve()
+    await started.promise
+    expect(relay.control.capacity()).toMatchObject({
+      inFlight: 0,
+      orphanedWork: 1,
+    })
+
+    finish.resolve()
+    await vi.waitFor(async () =>
+      expect(await lookup(relay, hearth, operationId)).toMatchObject({
+        status: "succeeded",
+      })
+    )
+    await vi.waitFor(() =>
+      expect(relay.control.capacity()).toMatchObject({ orphanedWork: 0 })
+    )
   })
 
   it("enforces the relative request timeout", async () => {
