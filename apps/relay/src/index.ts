@@ -34,6 +34,8 @@ import {
   relayAppTerminalRestartSchema,
   relayAppTerminalWriteSchema,
   relayCreateAppSchema,
+  relayPrepareAppSchema,
+  relayProvisionAppSchema,
   appIdFromFileRoot,
   isRelayFileRoot,
   appIdSchema,
@@ -213,6 +215,7 @@ import { RelaySnapshotHub } from "./snapshot-hub.js"
 import { retainProvisioningInstances } from "./instance-mutation-snapshot.js"
 import { RuntimeRecoveryManager } from "./runtime-recovery.js"
 import { ProvisioningManager } from "./provisioning.js"
+import { appProvisioning } from "./app-provisioning.js"
 import { databaseProvisioning } from "./database-provisioning.js"
 import { serverProvisioning } from "./server-provisioning.js"
 import { SystemUpdateManager } from "./system-updates.js"
@@ -563,6 +566,7 @@ const provisioningManager = await runRelayEffect(
   "relay.startup.provisioning",
   ProvisioningManager.make({
     adapters: {
+      app: appProvisioning(apps),
       database: databaseProvisioning(databases),
       server: serverProvisioning({
         lifecycle,
@@ -2000,8 +2004,47 @@ async function executeControlRequest(
         : apps.list()
     case "app.create":
       return apps.create(relayCreateAppSchema.parse(request.payload))
+    case "app.provision.prepare": {
+      const { idempotencyKey, ...input } = relayPrepareAppSchema.parse(
+        request.payload
+      )
+      return runRelayEffect(
+        "relay.app.provision.prepare",
+        provisioningManager.prepare({
+          kind: "app",
+          idempotencyKey,
+          input,
+          instanceId: input.id,
+          placeholder: apps.placeholder(input),
+        })
+      )
+    }
+    case "app.provision.claim": {
+      const { appId } = relayProvisionAppSchema.parse(request.payload)
+      return runRelayEffect(
+        "relay.app.provision.claim",
+        provisioningManager.claim("app", appId)
+      )
+    }
+    case "app.provision.cancel": {
+      const { appId } = relayProvisionAppSchema.parse(request.payload)
+      const cancelled = await runRelayEffect(
+        "relay.app.provision.cancel",
+        provisioningManager.cancel("app", appId)
+      )
+      return { appId, cancelled }
+    }
     case "app.delete": {
       const input = relayDeleteAppSchema.parse(request.payload)
+      // One still provisioning goes with whatever its create made: at most
+      // its network and data directory.
+      const discarded = await runRelayEffect(
+        "relay.app.provision.discard",
+        provisioningManager.discard("app", input.appId, () =>
+          apps.discard(input.appId)
+        )
+      )
+      if (discarded) return { appId: input.appId, deleted: true }
       // Hearth removes its services' DNS records from every node first.
       await lifecycle.detachAppFromTailscale(
         input.appId,
