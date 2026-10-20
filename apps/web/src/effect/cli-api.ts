@@ -32,6 +32,7 @@ import {
   cliSftpResponseSchema,
   cliUpdateServerStartupRequestSchema,
   databaseEngineSupportsLogicalBackups,
+  DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
   relayConsoleCommandResultSchema,
   relayConsoleSchema,
   relayFileContentSchema,
@@ -39,7 +40,10 @@ import {
   relayInstanceSchema,
   relayRemoteFileUploadSchema,
   relayRemoteFileUploadResultSchema,
+  relayResourceLimitsV1Feature,
   relaySnapshotSchema,
+  type ResourceLimits,
+  type ResourceLimitsInput,
 } from "@workspace/contracts"
 import { Effect, Option, Result, Schedule } from "effect"
 import { logException } from "@workspace/telemetry"
@@ -77,7 +81,7 @@ import { signS3BackupDownload } from "@/backups/destinations/s3"
 import type { AccessPermission } from "@/lib/permissions"
 import { grantHasPermission } from "@/lib/permissions"
 import { invalidateRelayCache, relayCachePolicy } from "@/lib/relay-client"
-import { relayRpc } from "@/lib/relay-connection"
+import { relayConnectionFeatures, relayRpc } from "@/lib/relay-connection"
 import {
   dispatchBackupTask,
   reconcileRelayBackups,
@@ -94,6 +98,8 @@ import { getActivityForUser } from "@/server/activity-data.server"
 import { provisionInstanceDomainBestEffort } from "@/server/domains.server"
 import { visibleBrickCatalogs } from "@/server/brick-catalogs.server"
 import { cliInvalidRequest } from "@/lib/cli-http"
+import { dockerMemoryBytes } from "@/lib/managed-java-flags"
+import { relayResourceLimitsRequest } from "@/lib/resource-limits.server"
 import {
   startupConfigurationChanged,
   startupPowerPermission,
@@ -775,11 +781,20 @@ export const createCliServerEffect = Effect.fn("cli.api.servers.create")(
       permission: "instance.create",
     })
     const brick = yield* resolveBrickSource(input.brick, principal)
+    const limits = yield* cliRelayLimitsRequest(
+      relay.id,
+      {
+        cpuMillis: null,
+        diskBytes: DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
+        memoryBytes: null,
+      },
+      cliResourceLimitsInput(input, undefined)
+    )
     const result = yield* relayRpcEffect(
       relay,
       "instance.create",
       {
-        diskLimitBytes: input.diskLimitBytes,
+        ...limits,
         name: input.name,
         recipe: brick.source,
         ...(brick.recipeDefinition
@@ -840,6 +855,8 @@ export const updateCliServerStartupEffect = Effect.fn(
     ? input.variables
     : { ...instance.variables, ...input.variables }
   let recipeDefinition = brick?.recipeDefinition
+  // CLIs before resource limits set memory with the Brick's variable.
+  let legacyMemoryBytes: number | undefined
   if (hasConfigurationInput) {
     if (!instance.brickSource)
       return yield* cliConflict("This server has no Brick recipe.")
@@ -870,8 +887,22 @@ export const updateCliServerStartupEffect = Effect.fn(
         instance.variables ?? {},
         variables
       )
+    // A Relay without resource limits still sizes memory from the
+    // variable itself.
+    const memoryVariable = relayConnectionFeatures(relay.id).has(
+      relayResourceLimitsV1Feature
+    )
+      ? brickMemoryVariable(nextRecipe)
+      : null
+    const legacyMemory =
+      memoryVariable && Object.hasOwn(input.variables, memoryVariable)
+        ? dockerMemoryBytes(String(input.variables[memoryVariable]))
+        : null
+    if (legacyMemory !== null) legacyMemoryBytes = legacyMemory
+    // Any limit on the command needs limits authority, even an unchanged one.
     const limitsChanged =
-      input.diskLimitBytes !== undefined ||
+      Object.keys(cliResourceLimitsInput(input, legacyMemoryBytes)).length >
+        0 ||
       startupResourceLimitsChanged(
         previousRecipe,
         nextRecipe,
@@ -898,13 +929,16 @@ export const updateCliServerStartupEffect = Effect.fn(
   }
   const powerPermission = startupPowerPermission(instance, input)
   if (powerPermission) yield* authorizeTarget(principal, input, powerPermission)
+  const limits = yield* cliRelayLimitsRequest(
+    relay.id,
+    instance.limits,
+    cliResourceLimitsInput(input, legacyMemoryBytes)
+  )
   const result = yield* relayRpcEffect(
     relay,
     "instance.startup.write",
     {
-      ...(input.diskLimitBytes === undefined
-        ? {}
-        : { diskLimitBytes: input.diskLimitBytes }),
+      ...limits,
       instanceId: instance.id,
       ...(brick
         ? {
@@ -1640,18 +1674,67 @@ function cliRelaySummary(
   })
 }
 
+/** The limits a CLI request sets; a missing field keeps the current one. */
+function cliResourceLimitsInput(
+  input: {
+    cpuLimitMillis?: number | null
+    diskLimitBytes?: number | null
+    memoryLimitBytes?: number | null
+  },
+  legacyMemoryBytes: number | undefined
+): ResourceLimitsInput {
+  const memoryBytes = input.memoryLimitBytes ?? legacyMemoryBytes
+  return {
+    ...(input.cpuLimitMillis === undefined
+      ? {}
+      : { cpuMillis: input.cpuLimitMillis }),
+    ...(input.diskLimitBytes === undefined
+      ? {}
+      : { diskBytes: input.diskLimitBytes }),
+    ...(input.memoryLimitBytes === null
+      ? { memoryBytes: null }
+      : memoryBytes === undefined
+        ? {}
+        : { memoryBytes }),
+  }
+}
+
+const cliRelayLimitsRequest = Effect.fnUntraced(function* (
+  relayId: string,
+  current: ResourceLimits,
+  limits: ResourceLimitsInput
+) {
+  return yield* Effect.try({
+    try: () => relayResourceLimitsRequest(relayId, current, limits),
+    catch: (cause) =>
+      cliConflict(
+        cause instanceof Error ? cause.message : "The Relay can't set limits."
+      ),
+  })
+})
+
+/** The Brick variable its memory limit comes from, as in `{{ variables.memory }}`. */
+function brickMemoryVariable(recipe: BrickRecipe): string | null {
+  return (
+    recipe.runtime.resources.memory.match(
+      /^\{\{\s*variables\.([a-z][a-z0-9_]{0,47})\s*\}\}$/u
+    )?.[1] ?? null
+  )
+}
+
 function cliServerMetadata(instance: z.infer<typeof relayInstanceSchema>) {
   return {
     brickId: instance.brickId ?? null,
     brickSource: safeCliBrickSource(instance.brickSource),
     connectAddress: instance.connectAddress,
     desiredState: instance.desiredState,
-    diskLimitBytes: instance.limits.diskBytes,
+    // Older CLIs read 0 as no limit.
+    diskLimitBytes: instance.limits.diskBytes ?? 0,
     game: instance.game,
     id: instance.id,
     implementation: instance.implementation,
     javaVersion: instance.javaVersion,
-    memoryLimitBytes: instance.limits.memoryBytes,
+    memoryLimitBytes: instance.limits.memoryBytes ?? 0,
     name: instance.name,
     observedState: instance.observedState,
     stateReason: instance.stateReason,
