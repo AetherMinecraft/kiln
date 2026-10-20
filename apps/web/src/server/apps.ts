@@ -7,6 +7,8 @@ import {
   appNameSchema,
   appServiceNameSchema,
   databaseIdSchema,
+  appServiceLimitsSchema,
+  relayAppLimitsV1Feature,
   relayAppSchema,
   relayAppTerminalClaimSchema,
   relayAppTerminalRestartSchema,
@@ -25,7 +27,7 @@ import {
   deleteAppRecordEffect,
   listAppRecordsEffect,
   renameAppRecordEffect,
-  saveAppConfigEffect,
+  updateAppConfigEffect,
 } from "@/effect/managed-apps"
 import { runAppEffect } from "@/effect/runtime"
 import {
@@ -58,9 +60,16 @@ const appActionInputSchema = appInputSchema.extend({
   action: z.enum(["start", "stop", "restart"]),
 })
 // Databases change through the network, which also connects running
-// containers; everything else waits for the next deployment.
+// containers, and limits through their own update, which applies them to
+// running ones; everything else waits for the next deployment.
 const appConfigInputSchema = appInputSchema.extend({
-  config: appConfigSchema.omit({ databaseIds: true }).partial(),
+  config: appConfigSchema
+    .omit({ databaseIds: true, diskLimitBytes: true, serviceLimits: true })
+    .partial(),
+})
+const appLimitsInputSchema = appInputSchema.extend({
+  diskLimitBytes: appConfigSchema.shape.diskLimitBytes.unwrap(),
+  serviceLimits: appServiceLimitsSchema,
 })
 const appRenameInputSchema = appInputSchema.extend({ name: appNameSchema })
 const appNetworkInputSchema = appInputSchema.extend({
@@ -221,11 +230,13 @@ export const createApp = createServerFn({ method: "POST" })
 export const updateAppConfig = createServerFn({ method: "POST" })
   .validator(appConfigInputSchema)
   .handler(async ({ data }) => {
-    const { app } = await authorizedApp(data, "app.manage")
-    const config = appConfigSchema.parse({ ...app.config, ...data.config })
-    await runAppEffect(
+    await authorizedApp(data, "app.manage")
+    // Only the fields this edit changes, into the config saved now.
+    const config = await runAppEffect(
       "apps.config.save",
-      saveAppConfigEffect(data.relayId, data.appId, config)
+      updateAppConfigEffect(data.relayId, data.appId, (current) =>
+        appConfigSchema.parse({ ...current, ...data.config })
+      )
     )
     publishAppChange(data.relayId, false)
     return { config }
@@ -255,13 +266,52 @@ export const deployApp = createServerFn({ method: "POST" })
       await databaseRpc(
         relay,
         "app.deploy",
-        { appId: data.appId, config: app.config, name: app.name },
+        {
+          appId: data.appId,
+          config: await relayAppConfig(relay.id, app.config),
+          name: app.name,
+        },
         30_000,
         user.id
       )
     )
     publishAppChange(relay.id, false)
     return deployed
+  })
+
+// Saves the app's limits and applies them to its running containers. A
+// removed memory or CPU limit applies when the app next deploys.
+export const updateAppLimits = createServerFn({ method: "POST" })
+  .validator(appLimitsInputSchema)
+  .handler(async ({ data }) => {
+    const { relay, user } = await authorizedApp(data, "app.manage")
+    if (!(await relayAppLimitsSupported(relay.id))) {
+      throw new Error("Update this Relay to set app limits")
+    }
+    const limits = appConfigSchema
+      .pick({ diskLimitBytes: true, serviceLimits: true })
+      .parse(data)
+    // Saved once the Relay applies them, so limits it refuses aren't used
+    // by the next deployment, and into the config saved by then, so other
+    // edits made meanwhile stay.
+    const updated = relayAppSchema.parse(
+      await databaseRpc(
+        relay,
+        "app.limits.write",
+        { appId: data.appId, ...limits },
+        60_000,
+        user.id
+      )
+    )
+    await runAppEffect(
+      "apps.limits.save",
+      updateAppConfigEffect(data.relayId, data.appId, (config) => ({
+        ...config,
+        ...limits,
+      }))
+    )
+    publishAppChange(relay.id, false)
+    return updated
   })
 
 export const runAppAction = createServerFn({ method: "POST" })
@@ -298,10 +348,12 @@ export const updateAppNetwork = createServerFn({ method: "POST" })
         user,
       })
     }
-    const config = { ...app.config, databaseIds: [...after] }
-    await runAppEffect(
+    const config = await runAppEffect(
       "apps.network.save",
-      saveAppConfigEffect(relay.id, data.appId, config)
+      updateAppConfigEffect(relay.id, data.appId, (current) => ({
+        ...current,
+        databaseIds: [...after],
+      }))
     )
     const updated = relayAppSchema.parse(
       await databaseRpc(
@@ -461,4 +513,24 @@ async function ignorePromise(run: () => Promise<unknown>): Promise<void> {
   await Effect.runPromise(
     Effect.tryPromise({ try: run, catch: (cause) => cause }).pipe(Effect.ignore)
   )
+}
+
+async function relayAppLimitsSupported(relayId: string): Promise<boolean> {
+  const { relayConnectionFeatures } = await import("@/lib/relay-connection")
+  return relayConnectionFeatures(relayId).has(relayAppLimitsV1Feature)
+}
+
+// The config as the Relay takes it. A Relay without app limits refuses
+// their fields, so it gets the config without them, or none if it would
+// have to drop limits.
+async function relayAppConfig(
+  relayId: string,
+  config: z.infer<typeof appConfigSchema>
+) {
+  if (await relayAppLimitsSupported(relayId)) return config
+  const { diskLimitBytes, serviceLimits, ...rest } = config
+  if (diskLimitBytes !== null || Object.keys(serviceLimits).length > 0) {
+    throw new Error("Update this Relay to deploy an app with limits")
+  }
+  return rest
 }
