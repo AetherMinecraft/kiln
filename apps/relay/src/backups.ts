@@ -20,6 +20,7 @@ import {
 } from "node:fs/promises"
 import { basename, dirname, relative, resolve, sep } from "node:path"
 import { constants as zlibConstants } from "node:zlib"
+import { logException } from "@workspace/telemetry"
 import { Effect, Fiber, Queue, Result } from "effect"
 import { minimatch } from "minimatch"
 import ZipStream from "zip-stream"
@@ -32,6 +33,7 @@ import {
   type BackupCreateTaskResult,
   type BackupDeleteTaskInput,
   type BackupExportTaskResult,
+  type BackupFailureCode,
   type BackupResticCreateTaskResult,
   type BackupTaskInput,
   type BackupTaskPhase,
@@ -51,14 +53,25 @@ import {
 import { createEncryptedPlatformBackup } from "./platform-backups.js"
 import { RelayBackupError } from "./effect/errors.js"
 import { promiseEffect, recoverPromise } from "./effect/promise.js"
-import { RelayStateStore } from "./effect/state.js"
+import {
+  RelayStateStore,
+  type ScheduledBackupPrune,
+} from "./effect/state.js"
 import { LaneRejectedError } from "./operation-lanes.js"
 import type { OperationLanes } from "./operation-lanes.js"
 import { backupTaskLocks } from "./operation-plans.js"
+import { backupFailureCode } from "./backups/failure.js"
+import {
+  backupTaskAttributes,
+  type BackupTaskOutcome,
+  recordBackupTask,
+  recordBackupTaskQueued,
+} from "./backups/telemetry.js"
 import {
   backupArchivePath,
   backupDestinationFor,
   backupDirectoryPath,
+  resticRepositoryString,
 } from "./backups/destinations/index.js"
 import {
   installPreparedInstanceRestore,
@@ -68,10 +81,12 @@ import {
   requireRestoreSpace,
   restorePortableInstanceBackup,
   settleRestoreJournal,
+  type RestoreInstallGate,
 } from "./backup-restore.js"
 import {
   createResticDriver,
   requiredRepositoryPassword,
+  RESTIC_EXIT_REPOSITORY_MISSING,
   resticDriverLocation,
   resticRepositoryPath,
   resticSnapshotSelector,
@@ -88,7 +103,6 @@ const BACKUP_TIMEOUT_REASON =
 const EXPORT_SWEEP_INTERVAL = "1 hour"
 const RESTIC_CACHE_CLEANUP_TIMEOUT_MS = 30_000
 const RESTIC_RECOVERY_TIMEOUT_MS = 30_000
-const RESTIC_RECOVERY_PRUNE_TIMEOUT_MS = 30_000
 const DEFAULT_EXCLUDES = [
   ".DS_Store",
   "Thumbs.db",
@@ -121,6 +135,11 @@ type ArchiveEntry = {
   modifiedAt: number
   name: string
   size: number
+}
+
+type BackupTaskEnd = {
+  outcome: BackupTaskOutcome
+  failure: BackupFailureCode | null
 }
 
 export class BackupManager {
@@ -268,25 +287,54 @@ export class BackupManager {
         this.#activeCreates.set(task.taskId, controller)
         const current = yield* this.#state.getBackupTask(task.taskId)
         if (!current || current.status !== "running") controller.abort()
+        const startedAt = Date.now()
+        yield* recordBackupTaskQueued(
+          this.#config.nodeId,
+          task,
+          startedAt - task.createdAt
+        )
+        let timedOut = false
+        // A restore that has started swapping its files in finishes; before
+        // then its deadline stops it. Each side decides synchronously, before
+        // it awaits anything, so exactly one wins.
+        let installing = false
+        let deadlinePassed = false
+        const beginInstall = () => {
+          if (deadlinePassed || controller.signal.aborted) {
+            throw controller.signal.aborted
+              ? backupAbortError(controller.signal)
+              : new Error(BACKUP_TIMEOUT_REASON)
+          }
+          installing = true
+        }
         const timeoutFiber = yield* Effect.forkChild(
           Effect.sleep(this.#config.backupTimeoutMs).pipe(
             Effect.andThen(
-              Effect.suspend(() =>
-                task.kind === "create"
+              Effect.suspend(() => {
+                if (installing) return Effect.succeed(false)
+                deadlinePassed = true
+                return task.kind === "create"
                   ? this.#state.cancelBackupTask(
                       task.taskId,
                       Date.now(),
-                      BACKUP_TIMEOUT_REASON
+                      BACKUP_TIMEOUT_REASON,
+                      "timed_out"
                     )
                   : this.#state.failBackupTask(
                       task.taskId,
                       BACKUP_TIMEOUT_REASON,
-                      Date.now()
+                      Date.now(),
+                      "timed_out"
                     )
-              )
+              })
             ),
             Effect.tap((stopped) =>
-              stopped ? Effect.sync(() => controller.abort()) : Effect.void
+              stopped
+                ? Effect.sync(() => {
+                    timedOut = true
+                    controller.abort()
+                  })
+                : Effect.void
             ),
             Effect.asVoid
           )
@@ -309,10 +357,10 @@ export class BackupManager {
                     )
               ),
             },
-            this.#execute(task, controller.signal)
+            this.#execute(task, controller.signal, beginInstall)
           )
           .pipe(
-            Effect.as("ran" as const),
+            Effect.as<BackupTaskEnd>({ outcome: "succeeded", failure: null }),
             // Withdrawn by a pause before it started: it goes back in line
             // and starts once the Relay is resumed.
             Effect.catch((cause) =>
@@ -331,20 +379,51 @@ export class BackupManager {
                 .failBackupTask(
                   task.taskId,
                   backupErrorMessage(cause),
-                  Date.now()
+                  Date.now(),
+                  backupFailureCode(cause)
                 )
                 .pipe(
-                  Effect.tap((failed) =>
-                    failed
-                      ? Effect.logError("Relay backup task failed", {
-                          backupId: task.backupId,
-                          cause,
-                          taskId: task.taskId,
-                        })
-                      : Effect.void
-                  ),
-                  Effect.as("ran" as const)
+                  Effect.flatMap((failed): Effect.Effect<BackupTaskEnd> => {
+                    // Cancelled by a user, or stopped by its deadline, which
+                    // already recorded the timeout.
+                    if (!failed && !timedOut) {
+                      return Effect.succeed({
+                        outcome: "cancelled",
+                        failure: null,
+                      })
+                    }
+                    const failure = failed
+                      ? backupFailureCode(cause)
+                      : "timed_out"
+                    return logException(cause, {
+                      operation: `Backups.${task.kind}`,
+                      attributes: {
+                        ...backupTaskAttributes(task),
+                        "backup.failure.code": failure,
+                        "backup.error.code":
+                          cause instanceof RelayBackupError ? cause.code : null,
+                      },
+                    }).pipe(Effect.as({ outcome: "failed", failure }))
+                  })
                 )
+            ),
+            Effect.tap((ended) =>
+              ended === "paused"
+                ? Effect.void
+                : Effect.annotateCurrentSpan({
+                    "backup.task.outcome": ended.outcome,
+                    "backup.failure.code": ended.failure,
+                  }).pipe(
+                    Effect.andThen(
+                      recordBackupTask(
+                        this.#config.nodeId,
+                        task,
+                        ended.outcome,
+                        ended.failure,
+                        Date.now() - startedAt
+                      )
+                    )
+                  )
             ),
             Effect.ensuring(
               timeoutFiber ? Fiber.interrupt(timeoutFiber) : Effect.void
@@ -353,16 +432,23 @@ export class BackupManager {
               controller
                 ? Effect.sync(() => this.#activeCreates.delete(task.taskId))
                 : Effect.void
-            )
+            ),
+            Effect.withSpan(`Backups.${task.kind}`, {
+              attributes: backupTaskAttributes(task),
+            })
           )
         if (outcome === "paused") return
       }
     })
   }
 
-  #execute(task: RelayBackupTask, signal?: AbortSignal) {
+  #execute(
+    task: RelayBackupTask,
+    signal: AbortSignal,
+    beginInstall: RestoreInstallGate
+  ) {
     return Effect.gen({ self: this }, function* () {
-      const createSignal = signal ?? new AbortController().signal
+      const createSignal = signal
       if (task.input.kind === "export") {
         const result = yield* runResticExport(
           this.#config,
@@ -537,14 +623,16 @@ export class BackupManager {
               this.#restic,
               input,
               instance,
-              createSignal
+              createSignal,
+              beginInstall
             )
           : Effect.tryPromise({
               try: () =>
                 restorePortableInstanceBackup(
                   this.#config,
                   { ...input, kind: "restore" },
-                  instance
+                  instance,
+                  beginInstall
                 ),
               catch: (cause) =>
                 cause instanceof RelayBackupError
@@ -576,40 +664,35 @@ export class BackupManager {
           deleteUpdatedAt = Math.max(Date.now(), deleteUpdatedAt + 1)
           return deleteUpdatedAt
         }
-        const result =
+        const { prune, result } =
           task.input.destination.kind === "restic"
             ? yield* runResticForget(
                 this.#config,
                 this.#restic,
                 task.input,
-                (progress) =>
-                  this.#state.updateBackupTaskProgress(
-                    task.taskId,
-                    progress.completed,
-                    progress.total || null,
-                    progress.phase,
-                    progress.currentPath,
-                    progress.currentArtifactId,
-                    Date.now()
-                  ),
-                createSignal,
-                () => createSignal
+                createSignal
               )
-            : yield* deleteBackupArtifacts(
-                this.#config,
-                task.input,
-                (currentArtifactId, progress) =>
-                  this.#state.updateBackupTaskOperationProgress(
-                    task.taskId,
-                    currentArtifactId,
-                    progress,
-                    nextDeleteUpdatedAt()
-                  )
-              )
+            : {
+                prune: undefined,
+                result: yield* deleteBackupArtifacts(
+                  this.#config,
+                  task.input,
+                  (currentArtifactId, progress) =>
+                    this.#state.updateBackupTaskOperationProgress(
+                      task.taskId,
+                      currentArtifactId,
+                      progress,
+                      nextDeleteUpdatedAt()
+                    )
+                ),
+              }
+        // The forgotten snapshot's data goes in one prune shared with the
+        // repository's other deletes; see `scheduleBackupPrune`.
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
           result,
-          nextDeleteUpdatedAt()
+          nextDeleteUpdatedAt(),
+          prune
         )
         if (!completed) {
           return yield* backupFailure(
@@ -815,6 +898,7 @@ export class BackupManager {
         input.artifactKind === "restic_snapshot" &&
         input.target.kind === "instance"
       ) {
+        const destination = input.destination
         const result = yield* runResticCreate(
           this.#config,
           this.#restic,
@@ -831,6 +915,23 @@ export class BackupManager {
               Date.now()
             ),
           createSignal
+        ).pipe(
+          // Data a failed backup uploaded belongs to no snapshot; prune it,
+          // unless storage or the repository itself refused the work, which
+          // a prune would hit too.
+          Effect.tapError((cause) =>
+            destination.repositoryPassword &&
+            !refusedByStorage(backupFailureCode(cause))
+              ? this.#state.scheduleBackupPrune(
+                  resticPruneFor(this.#config, {
+                    repository: destination.repository,
+                    repositoryPassword: destination.repositoryPassword,
+                    target: input.target,
+                  }),
+                  Date.now()
+                )
+              : Effect.void
+          )
         )
         const completed = yield* this.#state.completeBackupTask(
           task.taskId,
@@ -852,9 +953,11 @@ export class BackupManager {
                 target: input.target,
                 taskId: randomUUID(),
               },
-              () => Effect.succeed(false),
-              AbortSignal.timeout(RESTIC_RECOVERY_TIMEOUT_MS),
-              () => AbortSignal.timeout(RESTIC_RECOVERY_PRUNE_TIMEOUT_MS)
+              AbortSignal.timeout(RESTIC_RECOVERY_TIMEOUT_MS)
+            ).pipe(
+              Effect.flatMap(({ prune }) =>
+                this.#state.scheduleBackupPrune(prune, Date.now())
+              )
             )
           )
           if (Result.isFailure(cleaned)) {
@@ -1182,6 +1285,7 @@ function storeCreatedBackup(
     progress.total = result.bytes
     const outcomes: NonNullable<BackupArchiveCreateTaskResult["artifacts"]> = []
     let available = 0
+    let lastFailure: unknown = null
     let lastUploadedArtifactId: string | null = null
     for (const destination of destinations) {
       signal.throwIfAborted()
@@ -1231,9 +1335,11 @@ function storeCreatedBackup(
         outcomes.push({
           artifactId: destination.artifactId,
           error: backupErrorMessage(uploaded.failure),
+          errorCode: backupFailureCode(uploaded.failure),
           status: "failed",
         })
       }
+      if (Result.isFailure(uploaded)) lastFailure = uploaded.failure
     }
     if (
       !destinations.some(
@@ -1247,11 +1353,13 @@ function storeCreatedBackup(
       ).pipe(Effect.ignore)
     }
     if (available === 0) {
-      return yield* backupFailure(
-        "backup_storage_failed",
-        "create.store",
-        "The backup archive could not be stored in any destination"
-      )
+      // Says why, so the task is classified by the destination's failure.
+      return yield* RelayBackupError.make({
+        code: "backup_storage_failed",
+        operation: "create.store",
+        reason: `The backup archive could not be stored in any destination: ${backupErrorMessage(lastFailure)}`,
+        cause: lastFailure,
+      })
     }
     signal.throwIfAborted()
     progress.phase = "finalizing"
@@ -1290,11 +1398,7 @@ function deleteBackupArtifacts(
   >
 ) {
   return Effect.gen(function* () {
-    const outcomes: Array<{
-      artifactId: string
-      error: string | null
-      status: "deleted" | "failed"
-    }> = []
+    const outcomes: NonNullable<BackupOperationTaskResult["artifacts"]> = []
     for (const destination of [input.destination, ...(input.replicas ?? [])]) {
       const currentArtifactId = destination.artifactId ?? null
       const started = yield* updateProgress(currentArtifactId, {
@@ -1331,6 +1435,7 @@ function deleteBackupArtifacts(
           : {
               artifactId: destination.artifactId,
               error: backupErrorMessage(deleted.failure),
+              errorCode: backupFailureCode(deleted.failure),
               status: "failed",
             }
       )
@@ -1582,7 +1687,11 @@ async function createResticSnapshot(
         : undefined,
       bytes: stats.totalSize,
       snapshotId: reuse.id,
-      warnings: translated.warnings,
+      warnings: [
+        ...translated.warnings,
+        // restic's report of files it couldn't read went with the process.
+        "Recovered after the Relay restarted, so files restic couldn't read, if any, aren't listed",
+      ],
     }
   }
   if (location.kind === "local") {
@@ -1672,7 +1781,7 @@ async function createResticSnapshot(
       : undefined,
     bytes: summary.success.totalBytesProcessed,
     snapshotId: summary.success.snapshotId,
-    warnings: translated.warnings,
+    warnings: [...translated.warnings, ...summary.success.warnings],
   }
 }
 
@@ -1715,7 +1824,7 @@ async function rejectOverLimitSnapshot(
     signal,
     snapshotId: input.snapshotId,
   })
-  await pruneResticAfterRecovery(restic, input)
+  // The failed create queues the prune; see `scheduleBackupPrune`.
   throw backupTooLarge()
 }
 
@@ -1744,37 +1853,6 @@ async function forgetTaskSnapshotsAfterFailedCreate(
       snapshotId: snapshot.id,
     })
   }
-  if (snapshots.length > 0) await pruneResticAfterRecovery(restic, input)
-}
-
-async function pruneResticAfterRecovery(
-  restic: ResticDriver,
-  input: {
-    backupId: string
-    location: ResticDriverLocation
-    password: string
-    taskId: string
-  }
-): Promise<void> {
-  await Effect.runPromise(
-    Effect.tryPromise({
-      try: () =>
-        restic.prune({
-          location: input.location,
-          password: input.password,
-          signal: AbortSignal.timeout(RESTIC_RECOVERY_PRUNE_TIMEOUT_MS),
-        }),
-      catch: (cause) => cause,
-    }).pipe(
-      Effect.catch((cause) =>
-        Effect.logError("Could not prune restic recovery data", {
-          backupId: input.backupId,
-          cause,
-          taskId: input.taskId,
-        })
-      )
-    )
-  )
 }
 
 function runResticRestore(
@@ -1782,7 +1860,8 @@ function runResticRestore(
   restic: ResticDriver,
   input: Extract<BackupTaskInput, { kind: "restore" }>,
   instance: RelayInstanceConfig,
-  signal: AbortSignal
+  signal: AbortSignal,
+  beginInstall: RestoreInstallGate
 ) {
   return Effect.tryPromise({
     try: async () => {
@@ -1840,7 +1919,7 @@ function runResticRestore(
                 prepared.paths.staging,
                 instance.limits
               )
-              await installPreparedInstanceRestore(prepared)
+              await installPreparedInstanceRestore(prepared, beginInstall)
               return { warnings: validated.warnings }
             },
             catch: (cause) => cause,
@@ -1878,15 +1957,15 @@ function runResticRestore(
   )
 }
 
+/**
+ * Forgets a backup's restic snapshot. Its data stays in the repository
+ * until the returned prune runs.
+ */
 function runResticForget(
   config: RelayConfig,
   restic: ResticDriver,
   input: BackupDeleteTaskInput & { kind: "delete" },
-  updateProgress: (
-    progress: BackupProgress
-  ) => ReturnType<RelayStateStore["Service"]["updateBackupTaskProgress"]>,
-  signal: AbortSignal,
-  pruneSignal: () => AbortSignal
+  signal: AbortSignal
 ) {
   return Effect.gen(function* () {
     const destination = input.destination
@@ -1950,47 +2029,57 @@ function runResticForget(
             }),
     })
     yield* promiseEffect(() => removeBackupExport(config, input.backupId))
-    const pruned = yield* Effect.result(
-      runResticPrune(
-        config,
-        restic,
-        {
-          backupId: randomUUID(),
-          kind: "prune",
-          repository: destination.repository,
-          repositoryPassword: password,
-          target: input.target,
-          taskId: randomUUID(),
-        },
-        updateProgress,
-        pruneSignal()
-      )
-    )
-    if (Result.isFailure(pruned)) {
-      yield* Effect.logError(
-        "Could not prune restic after forgetting a snapshot",
-        {
-          backupId: input.backupId,
-          cause: pruned.failure,
-          taskId: input.taskId,
-        }
-      )
-    }
     return {
-      artifacts: input.destination.artifactId
-        ? [
-            {
-              artifactId: input.destination.artifactId,
-              error: null,
-              status: "deleted" as const,
-            },
-          ]
-        : undefined,
-      warnings: Result.isFailure(pruned)
-        ? ["The snapshot was deleted, but unused repository data remains"]
-        : [],
+      prune: resticPruneFor(config, {
+        repository: destination.repository,
+        repositoryPassword: password,
+        target: input.target,
+      }),
+      result: {
+        artifacts: input.destination.artifactId
+          ? [
+              {
+                artifactId: input.destination.artifactId,
+                error: null,
+                status: "deleted" as const,
+              },
+            ]
+          : undefined,
+        warnings: [],
+      },
     }
   })
+}
+
+function refusedByStorage(code: BackupFailureCode | null): boolean {
+  return (
+    code !== null &&
+    (code.startsWith("storage_") || code.startsWith("repository_"))
+  )
+}
+
+/** A prune of one restic repository, to queue with `scheduleBackupPrune`. */
+function resticPruneFor(
+  config: RelayConfig,
+  input: {
+    repository: ResticRepositoryLocation
+    repositoryPassword: string
+    target: BackupTaskInput["target"]
+  }
+): ScheduledBackupPrune {
+  return {
+    input: {
+      backupId: randomUUID(),
+      kind: "prune",
+      repository: input.repository,
+      repositoryPassword: input.repositoryPassword,
+      target: input.target,
+      taskId: randomUUID(),
+    },
+    repositoryKey: resticRepositoryString(
+      resticDriverLocation(config, input.target.id, input.repository)
+    ),
+  }
 }
 
 function runResticPrune(
@@ -2047,6 +2136,12 @@ function runResticPrune(
               cause,
             }),
     }).pipe(
+      // Removed while the prune waited, as when its server was deleted:
+      // nothing is left to prune.
+      Effect.catchIf(
+        (cause) => cause.exitCode === RESTIC_EXIT_REPOSITORY_MISSING,
+        () => Effect.void
+      ),
       Effect.ensuring(Fiber.interrupt(progressFiber)),
       Effect.ensuring(
         cleanupResticCache(config, restic, {
@@ -2082,9 +2177,7 @@ function cleanupResticCache(
     catch: (cause) => cause,
   }).pipe(
     Effect.catch((cause) =>
-      Effect.sync(() => {
-        console.error("restic cache cleanup failed", cause)
-      })
+      Effect.logWarning("restic cache cleanup failed", { cause })
     )
   )
 }

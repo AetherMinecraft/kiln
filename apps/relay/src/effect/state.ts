@@ -3,6 +3,7 @@ import type { z } from "zod"
 import { Context, Effect, Layer, Result, Schema } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import type {
+  BackupFailureCode,
   BackupTaskInput,
   BackupTaskPhase,
   BackupTaskResult,
@@ -360,6 +361,12 @@ const RelayBackupTaskPhaseSchema = Schema.Literals([
   "uploading",
   "finalizing",
 ])
+export type ScheduledBackupPrune = {
+  input: Extract<BackupTaskInput, { kind: "prune" }>
+  /** Names the repository, so one queued prune covers it. */
+  repositoryKey: string
+}
+
 const RelayBackupTaskRowSchema = Schema.Struct({
   backupId: Schema.String,
   bytesCompleted: Schema.Number,
@@ -368,6 +375,7 @@ const RelayBackupTaskRowSchema = Schema.Struct({
   currentArtifactId: Schema.NullOr(Schema.String),
   currentPath: Schema.NullOr(Schema.String),
   error: Schema.NullOr(Schema.String),
+  errorCode: Schema.NullOr(Schema.String),
   finishedAt: Schema.NullOr(Schema.Number),
   inputRefreshRequired: Schema.Number,
   inputJson: Schema.String,
@@ -539,17 +547,33 @@ export class RelayStateStore extends Context.Service<
     readonly cancelBackupTask: (
       taskId: string,
       now: number,
-      reason?: string
+      reason?: string,
+      errorCode?: BackupFailureCode | null
     ) => Effect.Effect<boolean, RelayStateError>
+    /**
+     * Records a task's result. A `prune` is queued with it, in the same
+     * transaction, unless one for the same repository is already waiting.
+     */
     readonly completeBackupTask: (
       taskId: string,
       result: BackupTaskResult,
-      now: number
+      now: number,
+      prune?: ScheduledBackupPrune
     ) => Effect.Effect<boolean, RelayStateError>
+    /**
+     * Queues a prune of a restic repository unless one is already waiting.
+     * A prune waits while deletes are queued, so a batch of them shares
+     * one; it keeps its place ahead of later creates and restores.
+     */
+    readonly scheduleBackupPrune: (
+      prune: ScheduledBackupPrune,
+      now: number
+    ) => Effect.Effect<void, RelayStateError>
     readonly failBackupTask: (
       taskId: string,
       error: string,
-      now: number
+      now: number,
+      errorCode?: BackupFailureCode | null
     ) => Effect.Effect<boolean, RelayStateError>
     readonly requeueInterruptedBackupTasks: (
       now: number
@@ -1243,6 +1267,25 @@ const migrations = SqliteMigrator.fromRecord({
       updated_at INTEGER NOT NULL
     ) STRICT`
   }),
+  // Why a backup task failed, when the Relay can tell; see
+  // `backupFailureCodes`.
+  "24_backup_task_error_codes": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const columns = yield* sql<{
+      name: string
+    }>`PRAGMA table_info(relay_backup_tasks)`
+    if (columns.some((column) => column.name === "error_code")) return
+    yield* sql`ALTER TABLE relay_backup_tasks ADD COLUMN error_code TEXT`
+  }),
+  // The repository a queued prune covers, so deletes share one.
+  "25_backup_task_maintenance_key": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const columns = yield* sql<{
+      name: string
+    }>`PRAGMA table_info(relay_backup_tasks)`
+    if (columns.some((column) => column.name === "maintenance_key")) return
+    yield* sql`ALTER TABLE relay_backup_tasks ADD COLUMN maintenance_key TEXT`
+  }),
 })
 
 function scrubBackupTaskInputJson(inputJson: string): string {
@@ -1434,6 +1477,7 @@ const makeRelayStateStore = Effect.gen(function* () {
         currentArtifactId: row.currentArtifactId,
         currentPath: row.currentPath,
         error: row.error,
+        errorCode: row.errorCode,
         finishedAt: row.finishedAt,
         input,
         inputRefreshRequired: row.inputRefreshRequired === 1,
@@ -1469,6 +1513,7 @@ const makeRelayStateStore = Effect.gen(function* () {
             current_artifact_id AS currentArtifactId,
             current_path AS currentPath,
             error,
+            error_code AS errorCode,
             created_at AS createdAt,
             started_at AS startedAt,
             finished_at AS finishedAt,
@@ -1493,6 +1538,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               current_artifact_id AS currentArtifactId,
               current_path AS currentPath,
               error,
+              error_code AS errorCode,
               created_at AS createdAt,
               started_at AS startedAt,
               finished_at AS finishedAt,
@@ -1515,6 +1561,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               current_artifact_id AS currentArtifactId,
               current_path AS currentPath,
               error,
+              error_code AS errorCode,
               created_at AS createdAt,
               started_at AS startedAt,
               finished_at AS finishedAt,
@@ -1617,6 +1664,39 @@ const makeRelayStateStore = Effect.gen(function* () {
   )
 
   const warnedUnparseableTaskIds = new Set<string>()
+  const insertBackupPrune = (prune: ScheduledBackupPrune, now: number) =>
+    Effect.gen(function* () {
+      const waiting = yield* sql`
+        SELECT task_id
+        FROM relay_backup_tasks
+        WHERE kind = 'prune'
+          AND status = 'queued'
+          AND maintenance_key = ${prune.repositoryKey}
+        LIMIT 1
+      `
+      if (waiting[0]) return
+      yield* sql`
+        INSERT INTO relay_backup_tasks (
+          task_id,
+          backup_id,
+          kind,
+          status,
+          input_json,
+          maintenance_key,
+          created_at,
+          updated_at
+        ) VALUES (
+          ${prune.input.taskId},
+          ${prune.input.backupId},
+          'prune',
+          'queued',
+          ${JSON.stringify(prune.input)},
+          ${prune.repositoryKey},
+          ${now},
+          ${now}
+        )
+      `
+    })
   const pruneSupersededExportTasks = () => sql`
     DELETE FROM relay_backup_tasks
     WHERE kind = 'export'
@@ -2014,6 +2094,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                   SET input_json = ${JSON.stringify(input)},
                       input_refresh_required = 0,
                       error = NULL,
+                      error_code = NULL,
                       phase = NULL,
                       current_artifact_id = NULL,
                       current_path = NULL,
@@ -2067,6 +2148,18 @@ const makeRelayStateStore = Effect.gen(function* () {
                 SELECT task_id AS taskId, input_json AS inputJson
                 FROM relay_backup_tasks
                 WHERE status = 'queued' AND input_refresh_required = 0
+                  -- A prune waits while deletes are queued, so a batch of
+                  -- them shares one; other work keeps its place in line.
+                  AND (
+                    kind <> 'prune'
+                    OR NOT EXISTS (
+                      SELECT 1
+                      FROM relay_backup_tasks AS deletion
+                      WHERE deletion.kind = 'delete'
+                        AND deletion.status = 'queued'
+                        AND deletion.input_refresh_required = 0
+                    )
+                  )
                 ORDER BY created_at ASC, task_id ASC
                 LIMIT 1
               `
@@ -2100,6 +2193,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                     started_at = COALESCE(started_at, ${now}),
                     updated_at = ${now},
                     error = NULL,
+                    error_code = NULL,
                     phase = 'preparing',
                     current_artifact_id = NULL,
                     current_path = NULL,
@@ -2209,7 +2303,12 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
-    cancelBackupTask: (taskId, now, reason = "Cancelled by user") =>
+    cancelBackupTask: (
+      taskId,
+      now,
+      reason = "Cancelled by user",
+      errorCode = null
+    ) =>
       run(
         "cancel_backup_task",
         sql.withTransaction(
@@ -2230,6 +2329,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                   result_json = NULL,
                   current_artifact_id = NULL,
                   error = ${reason.slice(0, 2_048)},
+                  error_code = ${errorCode},
                   finished_at = ${now},
                   updated_at = ${now}
               WHERE task_id = ${taskId}
@@ -2240,7 +2340,7 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
-    completeBackupTask: (taskId, result, now) =>
+    completeBackupTask: (taskId, result, now, prune) =>
       run(
         "complete_backup_task",
         sql.withTransaction(
@@ -2261,6 +2361,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                   bytes_completed = ${bytes},
                   bytes_total = ${bytes},
                   error = NULL,
+                  error_code = NULL,
                   phase = NULL,
                   current_artifact_id = NULL,
                   current_path = NULL,
@@ -2269,11 +2370,17 @@ const makeRelayStateStore = Effect.gen(function* () {
               WHERE task_id = ${taskId} AND status = 'running'
             `
             yield* pruneSupersededExportTasks()
+            if (prune) yield* insertBackupPrune(prune, now)
             return true
           })
         )
       ),
-    failBackupTask: (taskId, error, now) =>
+    scheduleBackupPrune: (prune, now) =>
+      run(
+        "schedule_backup_prune",
+        sql.withTransaction(insertBackupPrune(prune, now))
+      ),
+    failBackupTask: (taskId, error, now, errorCode = null) =>
       run(
         "fail_backup_task",
         sql.withTransaction(
@@ -2293,6 +2400,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                   result_json = NULL,
                   current_artifact_id = NULL,
                   error = ${error.slice(0, 4_096)},
+                  error_code = ${errorCode},
                   finished_at = ${now},
                   updated_at = ${now}
               WHERE task_id = ${taskId}

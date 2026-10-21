@@ -109,9 +109,11 @@ import {
   relaySystemUpdateSchema,
   RelayBrowserAuthorizationReviseSchema,
   relayBrowserAuthorizationReviseMaxItems,
+  relayBackupFailureCodesV1Feature,
 } from "@workspace/contracts"
 import { relayScheduleProjectionSchema } from "@workspace/contracts/schedules"
 import type {
+  RelayBackupTask,
   RelayControlOperation,
   RelayControlRequest,
   RelayDirectorySizes,
@@ -1426,9 +1428,14 @@ async function executeControlRequest(
     operation: RelayControlOperation,
     payload: unknown,
     timeoutMs: number
-  ) => Promise<unknown>
+  ) => Promise<unknown>,
+  hearthFeatures: ReadonlySet<string>
 ): Promise<unknown> {
   if (signal.aborted) throw new Error("Relay request was cancelled")
+  const sendBackupTask = (task: RelayBackupTask) =>
+    redactRelayBackupTask(task, {
+      failureCodes: hearthFeatures.has(relayBackupFailureCodesV1Feature),
+    })
   const payload = payloadRecord(request.payload)
   switch (request.operation) {
     case "relay.snapshot": {
@@ -2288,25 +2295,21 @@ async function executeControlRequest(
         "relay.backups.enqueue",
         backupManager
           .enqueue(backupTaskInputSchema.parse(request.payload))
-          .pipe(Effect.map(redactRelayBackupTask))
+          .pipe(Effect.map(sendBackupTask))
       )
     case "backup.task.cancel":
       return runRelayEffect(
         "relay.backups.cancel",
         backupManager
           .cancel(backupTaskIdSchema.parse(requiredString(payload, "taskId")))
-          .pipe(
-            Effect.map((task) => (task ? redactRelayBackupTask(task) : task))
-          )
+          .pipe(Effect.map((task) => (task ? sendBackupTask(task) : task)))
       )
     case "backup.task.get":
       return runRelayEffect(
         "relay.backups.get",
         backupManager
           .get(backupTaskIdSchema.parse(requiredString(payload, "taskId")))
-          .pipe(
-            Effect.map((task) => (task ? redactRelayBackupTask(task) : task))
-          )
+          .pipe(Effect.map((task) => (task ? sendBackupTask(task) : task)))
       )
     case "backup.task.list": {
       const updatedAfter = payload.updatedAfter
@@ -2320,7 +2323,7 @@ async function executeControlRequest(
         "relay.backups.list",
         backupManager
           .list(updatedAfter === undefined ? undefined : Number(updatedAfter))
-          .pipe(Effect.map((tasks) => tasks.map(redactRelayBackupTask)))
+          .pipe(Effect.map((tasks) => tasks.map(sendBackupTask)))
       )
     }
     case "schedule.apply":

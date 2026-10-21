@@ -23,6 +23,8 @@ import {
   resticS3ProxyToken,
   withResticS3Proxy,
 } from "./backups/destinations/s3/proxy.js"
+import { backupFailureCode } from "./backups/failure.js"
+import { traceResticCommand } from "./backups/telemetry.js"
 
 const RESTIC_BINARY = "restic"
 const MAX_JSON_LINE_BYTES = 64 * 1024
@@ -37,7 +39,10 @@ const RESTIC_ENV_ALLOWLIST = [
   "RESTIC_CACERT",
   "TMPDIR",
 ] as const
-const RESTIC_EXIT_REPOSITORY_MISSING = 10
+// restic saved the snapshot but couldn't read some of its source files.
+const RESTIC_EXIT_INCOMPLETE = 3
+const MAX_UNREADABLE_FILE_WARNINGS = 25
+export const RESTIC_EXIT_REPOSITORY_MISSING = 10
 const RESTIC_EXIT_WRONG_PASSWORD = 12
 
 export type ResticProgress = {
@@ -48,6 +53,8 @@ export type ResticProgress = {
 export type ResticSnapshotSummary = {
   snapshotId: string
   totalBytesProcessed: number
+  /** Files restic couldn't read, so the snapshot left out. */
+  warnings: Array<string>
 }
 
 export type TranslatedExcludes = {
@@ -210,12 +217,45 @@ function progressFromResticStatus(value: unknown): ResticProgress | null {
   }
 }
 
-function summaryFromResticJson(value: unknown): ResticSnapshotSummary | null {
+function summaryFromResticJson(
+  value: unknown
+): Omit<ResticSnapshotSummary, "warnings"> | null {
   if (!isRecord(value) || value.message_type !== "summary") return null
   const snapshotId = stringField(value, "snapshot_id")
   const totalBytesProcessed = integerField(value, "total_bytes_processed")
   if (!snapshotId || totalBytesProcessed === null) return null
   return { snapshotId, totalBytesProcessed }
+}
+
+/**
+ * The files a backup left out, from the JSON errors `restic backup --json`
+ * writes to stderr, such as `{"message_type":"error","item":"/srv/x",...}`.
+ */
+function unreadableFileWarnings(stderr: string): Array<string> {
+  const warnings: Array<string> = []
+  let skipped = 0
+  for (const line of stderr.split("\n")) {
+    const value = parseResticJsonLine(line)
+    if (!isRecord(value) || value.message_type !== "error") continue
+    skipped += 1
+    if (warnings.length >= MAX_UNREADABLE_FILE_WARNINGS) continue
+    const item = stringField(value, "item")
+    const error = isRecord(value.error)
+      ? stringField(value.error, "message")
+      : null
+    warnings.push(
+      `Skipped ${item ?? "a file"} because restic couldn't read it${error ? `: ${error}` : ""}`.slice(
+        0,
+        1_024
+      )
+    )
+  }
+  if (skipped > warnings.length) {
+    warnings.push(`Skipped ${skipped - warnings.length} more unreadable files`)
+  }
+  return warnings.length > 0
+    ? warnings
+    : ["restic couldn't read some files, so the snapshot leaves them out"]
 }
 
 export function createResticDriver(options?: {
@@ -232,11 +272,29 @@ export function createResticDriver(options?: {
       mutating?: boolean
       onJson?: (value: unknown) => void
       password: string
+      /**
+       * Only reads the repository, so it may read without a lock when
+       * storage refuses the lock file; see `readsWithoutLock`.
+       */
+      readOnly?: boolean
       retryable?: boolean
       signal: AbortSignal
       stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
+      /** Exit code 3 still saved a snapshot; see `RESTIC_EXIT_INCOMPLETE`. */
+      tolerateIncomplete?: boolean
     }
   ) => {
+    const spawnCommand = (commandArgs: ReadonlyArray<string>) =>
+      spawnResticCommand(spawnRestic, commandArgs, {
+        cacheDirectory,
+        cwd: input.cwd,
+        location: input.location,
+        onJson: input.onJson,
+        tolerateIncomplete: input.tolerateIncomplete,
+        password: input.password,
+        signal: input.signal,
+        stdoutPipe: input.stdoutPipe,
+      })
     const execute = async () => {
       if (input.mutating && input.location.kind === "s3") {
         await retryResticOperation(() =>
@@ -248,22 +306,17 @@ export function createResticDriver(options?: {
           })
         )
       }
-      return spawnResticCommand(spawnRestic, args, {
-        cacheDirectory,
-        cwd: input.cwd,
-        location: input.location,
-        onJson: input.onJson,
-        password: input.password,
-        signal: input.signal,
-        stdoutPipe: input.stdoutPipe,
-      })
+      return input.readOnly
+        ? readsWithoutLock(args, spawnCommand)
+        : spawnCommand(args)
     }
     return input.retryable ? retryResticOperation(execute) : execute()
   }
 
   return {
     backup: async (input) => {
-      let summary: ResticSnapshotSummary | null = null
+      // Set from a callback, which narrowing can't see.
+      let summary = null as Omit<ResticSnapshotSummary, "warnings"> | null
       const result = await run(
         [
           "backup",
@@ -278,6 +331,7 @@ export function createResticDriver(options?: {
           mutating: true,
           password: input.password,
           signal: input.signal,
+          tolerateIncomplete: true,
           onJson: (value) => {
             const progress = progressFromResticStatus(value)
             if (progress) input.onProgress?.(progress)
@@ -290,10 +344,17 @@ export function createResticDriver(options?: {
         throw resticError(
           "restic_backup_summary_missing",
           "create.restic",
-          result.stderr || "restic backup did not report a snapshot"
+          result.stderr || "restic backup did not report a snapshot",
+          result.exitCode
         )
       }
-      return summary
+      return {
+        ...summary,
+        warnings:
+          result.exitCode === RESTIC_EXIT_INCOMPLETE
+            ? unreadableFileWarnings(result.stderr)
+            : [],
+      }
     },
     cacheCleanup: async (input) => {
       if (input.location.kind !== "s3") return
@@ -308,6 +369,7 @@ export function createResticDriver(options?: {
         run(["cat", "config"], {
           location: input.location,
           password: input.password,
+          readOnly: true,
           retryable: true,
           signal: input.signal,
         })
@@ -335,40 +397,44 @@ export function createResticDriver(options?: {
     },
     dumpZip: async (input) => {
       await mkdir(dirname(input.destination), { recursive: true, mode: 0o700 })
-      await rm(input.destination, { force: true })
-      const digest = createHash("sha256")
-      let bytes = 0
-      const output = createWriteStream(input.destination, {
-        flags: "wx",
-        mode: 0o600,
-      })
-      const hasher = new Transform({
-        transform(chunk, _encoding, callback) {
-          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-          bytes += buffer.byteLength
-          digest.update(buffer)
-          input.onProgress?.(bytes)
-          callback(null, buffer)
-        },
-      })
-      const dumped = await resultOf(async () => {
-        await run(["dump", "-a", "zip", input.selector, "/"], {
-          location: input.location,
-          password: input.password,
-          signal: input.signal,
-          stdoutPipe: (stdout) => pipeline(stdout, hasher, output),
-        })
-        return { bytes, checksumSha256: digest.digest("hex") }
-      })
-      if (Result.isFailure(dumped)) {
-        output.destroy()
-        hasher.destroy()
-        // Destruction still waits for a pending file open; so must cleanup.
-        await resultOf(() => finished(output, { cleanup: true }))
+      // Each attempt writes a fresh file: the pipeline ends its output.
+      const attempt = async (args: ReadonlyArray<string>) => {
         await rm(input.destination, { force: true })
-        throw dumped.failure
+        const digest = createHash("sha256")
+        let bytes = 0
+        const output = createWriteStream(input.destination, {
+          flags: "wx",
+          mode: 0o600,
+        })
+        const hasher = new Transform({
+          transform(chunk, _encoding, callback) {
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            bytes += buffer.byteLength
+            digest.update(buffer)
+            input.onProgress?.(bytes)
+            callback(null, buffer)
+          },
+        })
+        const dumped = await resultOf(async () => {
+          await run(args, {
+            location: input.location,
+            password: input.password,
+            signal: input.signal,
+            stdoutPipe: (stdout) => pipeline(stdout, hasher, output),
+          })
+          return { bytes, checksumSha256: digest.digest("hex") }
+        })
+        if (Result.isFailure(dumped)) {
+          output.destroy()
+          hasher.destroy()
+          // Destruction still waits for a pending file open; so must cleanup.
+          await resultOf(() => finished(output, { cleanup: true }))
+          await rm(input.destination, { force: true })
+          throw dumped.failure
+        }
+        return dumped.success
       }
-      return dumped.success
+      return readsWithoutLock(["dump", "-a", "zip", input.selector, "/"], attempt)
     },
     forget: async (input) => {
       const result = await resultOf(() =>
@@ -414,6 +480,7 @@ export function createResticDriver(options?: {
           location: input.location,
           mutating: true,
           password: input.password,
+          readOnly: true,
           signal: input.signal,
           onJson: (value) => {
             const progress = progressFromResticStatus(value)
@@ -426,6 +493,7 @@ export function createResticDriver(options?: {
       const result = await run(["snapshots", "--json", "--tag", input.tag], {
         location: input.location,
         password: input.password,
+        readOnly: true,
         retryable: true,
         signal: input.signal,
       })
@@ -442,6 +510,7 @@ export function createResticDriver(options?: {
         {
           location: input.location,
           password: input.password,
+          readOnly: true,
           retryable: true,
           signal: input.signal,
         }
@@ -546,20 +615,30 @@ async function spawnResticCommand(
     password: string
     signal: AbortSignal
     stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
+    tolerateIncomplete?: boolean
   }
 ): Promise<SpawnedRestic> {
-  if (input.location.kind !== "s3") {
-    return spawnResticOnce(spawnRestic, args, input)
+  const location = input.location
+  const spawnCommand = () => {
+    if (location.kind !== "s3") {
+      return spawnResticOnce(spawnRestic, args, input)
+    }
+    const token = resticS3ProxyToken()
+    return withResticS3Proxy(
+      {
+        allowPrivateNetwork: location.allowPrivateNetwork,
+        allowedHosts: resticS3ProxyAllowedHosts(location),
+        endpointPort: resticDestinationEndpointPort(location) ?? 443,
+        token,
+      },
+      (proxyUrl) => spawnResticOnce(spawnRestic, args, { ...input, proxyUrl })
+    )
   }
-  const token = resticS3ProxyToken()
-  return withResticS3Proxy(
-    {
-      allowPrivateNetwork: input.location.allowPrivateNetwork,
-      allowedHosts: resticS3ProxyAllowedHosts(input.location),
-      endpointPort: resticDestinationEndpointPort(input.location) ?? 443,
-      token,
-    },
-    (proxyUrl) => spawnResticOnce(spawnRestic, args, { ...input, proxyUrl })
+  return traceResticCommand(
+    args[0] ?? "restic",
+    location.kind,
+    spawnCommand,
+    args.includes("--no-lock")
   )
 }
 
@@ -575,6 +654,7 @@ async function spawnResticOnce(
     proxyUrl?: string
     signal: AbortSignal
     stdoutPipe?: (stdout: NodeJS.ReadableStream) => Promise<void>
+    tolerateIncomplete?: boolean
   }
 ): Promise<SpawnedRestic> {
   input.signal.throwIfAborted()
@@ -686,7 +766,10 @@ async function spawnResticOnce(
       const parsed = parseResticJsonLine(stdoutBuffer)
       if (parsed !== null) input.onJson?.(parsed)
     }
-    if (exitCode !== 0) {
+    if (
+      exitCode !== 0 &&
+      !(exitCode === RESTIC_EXIT_INCOMPLETE && input.tolerateIncomplete)
+    ) {
       throw resticError(
         "restic_command_failed",
         args[0] ?? "restic",
@@ -763,6 +846,44 @@ function defaultSpawn(
     shell: false,
     stdio: options.stdio,
   })
+}
+
+/**
+ * Runs a command that only reads the repository. When storage refuses the
+ * lock file restic writes first, such as a bucket at its storage cap or a
+ * read-only key, it runs again without a lock so restores and downloads
+ * keep working. That's safe because the Relay's one backup worker is the
+ * only writer to its repositories, and it isn't writing while it reads.
+ */
+async function readsWithoutLock<T>(
+  args: ReadonlyArray<string>,
+  run: (args: ReadonlyArray<string>) => Promise<T>
+): Promise<T> {
+  const locked = await resultOf(() => run(args))
+  if (Result.isSuccess(locked)) return locked.success
+  if (!isLockRefusedByStorage(locked.failure)) throw locked.failure
+  await Effect.runPromise(
+    Effect.logWarning("Reading the restic repository without a lock", {
+      "backup.failure.code": backupFailureCode(locked.failure),
+      "restic.command": args[0],
+    })
+  )
+  return run([...args, "--no-lock"])
+}
+
+function isLockRefusedByStorage(cause: unknown): boolean {
+  if (
+    !(cause instanceof RelayBackupError) ||
+    !/unable to create lock in backend/iu.test(cause.reason)
+  ) {
+    return false
+  }
+  const code = backupFailureCode(cause)
+  return (
+    code === "storage_full" ||
+    code === "storage_limit_reached" ||
+    code === "storage_access_denied"
+  )
 }
 
 function isMissingSnapshotError(cause: unknown): boolean {
