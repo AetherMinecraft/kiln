@@ -12,8 +12,10 @@ import { useRelayWorkspace } from "@/components/relay/relay-workspace-context"
 import { canAccessRelayPermission } from "@/lib/navigation-destinations"
 import { accessCapabilitiesQueryOptions } from "@/lib/query-options"
 import type { FileWorkspaceInstance } from "@/lib/relay-selectors"
+import { warmFileWorkspaceModule } from "@/lib/workspace-module-preloads"
 
 export function RelayFilesPage() {
+  React.useEffect(warmFileWorkspaceModule, [])
   const { relay, routeId } = useRelayWorkspace()
   const { connected } = useRelayLiveStatus(relay)
   const filePath = useMatch({
@@ -45,7 +47,7 @@ export function RelayFilesPage() {
   return (
     <RelayHostFilesAccess>
       {(limitation) => (
-        <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           {limitation ? <HostFilesLimitation limitation={limitation} /> : null}
           <ResourceFilesPage
             instance={instance}

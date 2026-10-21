@@ -1,3 +1,4 @@
+import { DatabaseKindIcon } from "@/components/instance-kind-icon"
 import { instanceInventoryScope } from "@/lib/instance-inventory"
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
@@ -6,7 +7,6 @@ import { appTailscaleMemberId } from "@workspace/contracts"
 import type { AppPort, RelayAppWebRoute } from "@workspace/contracts"
 import {
   Cable,
-  Database,
   Globe2,
   LoaderCircle,
   Network,
@@ -44,6 +44,7 @@ import {
   showAppOperationError,
   type App,
 } from "@/components/app/app-presentation"
+import { useAppRunsCompose } from "@/components/app/app-compose"
 import { useAppWorkspace } from "@/components/app/app-workspace-context"
 import { CopyMetaRow, InfoCard, InfoCardHeader } from "@/components/info-card"
 import { TailscaleMembershipSection } from "@/components/tailscale-network-membership"
@@ -68,6 +69,11 @@ import {
 export function AppNetworkPage() {
   const { app } = useAppWorkspace()
   const config = useQuery(appConfigQueryOptions(app.relayId, app.id))
+  // A repository's Compose file publishes its own ports, like a pasted one.
+  const compose = useAppRunsCompose(
+    app,
+    config.data?.config.sourceType ?? "image"
+  )
   const canManage =
     appRelayAvailable(app) && app.permissions.includes("app.manage")
 
@@ -106,7 +112,7 @@ export function AppNetworkPage() {
             <AppWebRoutes
               app={app}
               canManage={canManage}
-              compose={config.data.config.sourceType === "compose"}
+              compose={compose}
             />
             <PublishedPorts
               // A fresh form when the saved ports change, and only then:
@@ -114,7 +120,7 @@ export function AppNetworkPage() {
               key={JSON.stringify(config.data.config.ports)}
               app={app}
               canManage={canManage}
-              compose={config.data.config.sourceType === "compose"}
+              compose={compose}
               saved={config.data.config.ports}
             />
             <ConnectedDatabases
@@ -124,7 +130,7 @@ export function AppNetworkPage() {
             />
             <AppTailscale
               app={app}
-              compose={config.data.config.sourceType === "compose"}
+              compose={compose}
             />
           </>
         ) : (
@@ -749,7 +755,7 @@ function ConnectedDatabases({
   return (
     <InfoCard>
       <InfoCardHeader
-        icon={<Database />}
+        icon={<DatabaseKindIcon />}
         title="Databases"
         action={
           canManage && connectable.length > 0 ? (
@@ -801,7 +807,7 @@ function ConnectedDatabases({
                 key={id}
                 className="flex items-center gap-3 border-b px-4 py-3 last:border-b-0"
               >
-                <Database className="size-4 shrink-0 text-muted-foreground" />
+                <DatabaseKindIcon className="size-4 shrink-0" />
                 <span className="min-w-0 flex-1">
                   {database ? (
                     <Link

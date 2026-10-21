@@ -1,11 +1,11 @@
 import type { AppTableInventory, InstanceInventory } from "@workspace/contracts"
+import { AppKindIcon } from "@/components/instance-kind-icon"
 import type { getAppDirectory } from "@/server/apps"
 import * as React from "react"
 import { useLiveSuspenseQuery } from "@tanstack/react-db"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { Link, useNavigate } from "@tanstack/react-router"
 import {
-  Boxes,
   Container,
   EllipsisVertical,
   LoaderCircle,
@@ -34,6 +34,7 @@ import {
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
+import { showToast } from "@workspace/ui/components/sonner"
 import {
   Select,
   SelectContent,
@@ -52,7 +53,13 @@ import {
   type App,
 } from "@/components/app/app-presentation"
 import { DeleteAppDialog } from "@/components/app/app-dialogs"
+import {
+  GitHubSourceFields,
+  emptyGitHubSourceDraft,
+  githubSourceDraftReady,
+} from "@/components/app/app-github-source-fields"
 import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
+import { GitHubMark } from "@/components/github-mark"
 import {
   DataTableActionGroup,
   DataTableEmptyState,
@@ -97,6 +104,8 @@ import {
 import type { DataTableSource } from "@/lib/data-table-source"
 import type { InstanceFavorite } from "@/lib/instance-favorites"
 import { queryKeys } from "@/lib/query-options"
+import { recoverPromise } from "@/effect/promise"
+import { saveAppGitHubSource } from "@/server/app-deployments"
 import { createApp, deployApp, runAppAction } from "@/server/apps"
 import type { getInfraRelayOptions } from "@/server/infra-directory"
 
@@ -398,7 +407,7 @@ const AppTable = React.memo(function AppTable({
       emptyState={({ searchActive }) =>
         favoritesFiltered ? (
           <FavoritesOnlyEmptyState
-            icon={<Boxes className="size-6 text-muted-foreground/45" />}
+            icon={<AppKindIcon className="size-6" />}
             searchActive={searchActive}
             table="apps"
           />
@@ -554,9 +563,15 @@ const AppActions = React.memo(function AppActions({
   )
 })
 
-// What an app can run as. Docker is the only kind for now; more arrive with
-// a richer catalog.
+// What an app can run as. GitHub builds a repository's Dockerfile or
+// Compose file; Docker takes an image, or a file pasted in later.
 const appKinds = [
+  {
+    description: "Builds a repository, and redeploys on push",
+    icon: GitHubMark,
+    id: "github",
+    label: "GitHub",
+  },
   {
     description: "An image, Dockerfile, or Compose file",
     icon: Container,
@@ -582,11 +597,38 @@ function CreateAppDialog({
   const [relayId, setRelayId] = React.useState(
     () => availableRelays.at(0)?.id ?? ""
   )
+  const [github, setGitHub] = React.useState(emptyGitHubSourceDraft)
   const relayLabelId = React.useId()
   const create = useMutation({
-    mutationFn: () => createApp({ data: { name: name.trim(), relayId } }),
-    onSuccess: async (created) => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.apps.all })
+    mutationFn: async () => {
+      const created = await createApp({ data: { name: name.trim(), relayId } })
+      if (kind !== "github") return { created, sourceError: null }
+      // The app exists by now; a source it can't save is set on its page.
+      const saved = await recoverPromise(
+        () =>
+          saveAppGitHubSource({
+            data: {
+              ...github,
+              appId: created.id,
+              deploy: true,
+              path: github.path.trim(),
+              relayId,
+            },
+          }).then(() => null),
+        (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
+      )
+      return { created, sourceError: saved }
+    },
+    onSuccess: async ({ created, sourceError }) => {
+      if (sourceError) {
+        showToast({
+          message: `App created, but its repository wasn't saved: ${sourceError.message}`,
+          type: "error",
+        })
+      }
+      // The app's page resolves it from the directory, so the directory has
+      // it before the page opens.
+      await queryClient.invalidateQueries({ queryKey: queryKeys.apps.all })
       // Leaving the list closes the dialog with it.
       await navigate({
         params: { appId: created.id },
@@ -594,15 +636,20 @@ function CreateAppDialog({
       })
     },
   })
+  const ready =
+    name.trim() !== "" &&
+    relayId !== "" &&
+    (kind !== "github" || githubSourceDraftReady(github))
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent className="max-h-[min(92dvh,56rem)] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Add app</DialogTitle>
           <DialogDescription>
-            Hearth creates the app with its own network and data directory.
-            Choose what it runs on the next page, then deploy it.
+            {kind === "github"
+              ? "Hearth creates the app with its own network and data directory, then deploys the branch."
+              : "Hearth creates the app with its own network and data directory. Choose what it runs on the next page, then deploy it."}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
@@ -643,9 +690,7 @@ function CreateAppDialog({
               value={name}
               onChange={(event) => setName(event.currentTarget.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && name.trim() && relayId) {
-                  create.mutate()
-                }
+                if (event.key === "Enter" && ready) create.mutate()
               }}
             />
           </label>
@@ -669,6 +714,9 @@ function CreateAppDialog({
               </SelectContent>
             </Select>
           </div>
+          {kind === "github" ? (
+            <GitHubSourceFields draft={github} onChange={setGitHub} />
+          ) : null}
           {create.error ? (
             <p className="text-xs text-destructive">{create.error.message}</p>
           ) : null}
@@ -682,16 +730,18 @@ function CreateAppDialog({
             Cancel
           </Button>
           <Button
-            disabled={create.isPending || !name.trim() || !relayId}
+            disabled={create.isPending || !ready}
             type="button"
             onClick={() => create.mutate()}
           >
             {create.isPending ? (
               <LoaderCircle className="animate-spin" />
+            ) : kind === "github" ? (
+              <Rocket />
             ) : (
               <Plus />
             )}
-            Create app
+            {kind === "github" ? "Create and deploy" : "Create app"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -726,7 +776,7 @@ function EmptyAppTable({
               : "No apps have been assigned to your account yet."}
         </span>
       }
-      icon={<Boxes className="size-6 text-muted-foreground/45" />}
+      icon={<AppKindIcon className="size-6" />}
       title={searchActive ? "No apps match your search" : "No apps"}
     />
   )

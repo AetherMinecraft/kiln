@@ -13,6 +13,8 @@ import {
   relayNetworkingSchema,
   relaySnapshotSchema,
   relayUpdateInstanceStartupSchema,
+  resolveResourceLimits,
+  resourceLimitsEqual,
 } from "@workspace/contracts"
 import { z } from "zod"
 
@@ -38,6 +40,11 @@ import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { listMcJarVersionsEffect } from "@/effect/mcjarfiles"
 import { promiseEffect } from "@/effect/promise"
+import {
+  claimPreparedProvisioning,
+  compensatePreparedProvisioning,
+  provisioningInstanceId,
+} from "@/lib/provisioning.server"
 import { forkAppEffect, runAppEffect } from "@/effect/runtime"
 import {
   registerPreparedInstance,
@@ -59,6 +66,7 @@ import {
 } from "@/server/bricks.server"
 import { provisionInstanceDomainBestEffort } from "@/server/domains.server"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
+import { relayResourceLimitsRequest } from "@/lib/resource-limits.server"
 import {
   startupPowerPermission,
   startupResourceLimitsChanged,
@@ -210,9 +218,18 @@ export const createBrickInstance = createServerFn({ method: "POST" })
       user,
       data.recipe
     )
-    const { idempotencyKey, relayId: _, ...createInput } = data
+    const { idempotencyKey, limits, relayId: _, ...createInput } = data
     const input = relayCreateInstanceSchema.parse({
       ...createInput,
+      ...relayResourceLimitsRequest(
+        relay.id,
+        {
+          cpuMillis: null,
+          diskBytes: createInput.diskLimitBytes,
+          memoryBytes: null,
+        },
+        limits
+      ),
       recipeDefinition,
     })
     const instanceId = provisioningInstanceId(idempotencyKey)
@@ -256,6 +273,8 @@ export const createBrickInstance = createServerFn({ method: "POST" })
     )
     await claimPreparedProvisioning({
       cancel,
+      unconfirmed:
+        "Retry the unchanged request to resume the same server.",
       claim: () =>
         requestRelay(
           relay,
@@ -278,61 +297,6 @@ export const createBrickInstance = createServerFn({ method: "POST" })
     })
     return instance
   })
-
-export function compensatePreparedProvisioning(
-  cancel: () => Promise<boolean>,
-  unregister: () => Promise<void>
-) {
-  return promiseEffect(cancel).pipe(
-    Effect.flatMap((cancelled) =>
-      cancelled ? promiseEffect(unregister) : Effect.void
-    ),
-    Effect.catch(() => Effect.void)
-  )
-}
-
-export function provisioningInstanceId(idempotencyKey: string): string {
-  const hex = idempotencyKey.replaceAll("-", "")
-  return `${hex}${hex.slice(0, 8)}`
-}
-
-export function claimPreparedProvisioning(input: {
-  cancel: () => Promise<boolean>
-  claim: () => Promise<unknown>
-  unregister: () => Promise<void>
-}): Promise<void> {
-  return Effect.runPromise(
-    promiseEffect(input.claim).pipe(
-      Effect.asVoid,
-      Effect.matchEffect({
-        onFailure: (claimFailure) =>
-          promiseEffect(input.cancel).pipe(
-            Effect.matchEffect({
-              onFailure: () =>
-                Effect.fail(
-                  new Error(
-                    `Kiln could not confirm whether Relay accepted provisioning. Retry the unchanged request to resume the same server. ${
-                      claimFailure instanceof Error
-                        ? claimFailure.message
-                        : "Relay claim failed"
-                    }`,
-                    { cause: claimFailure }
-                  )
-                ),
-              onSuccess: (cancelled) =>
-                cancelled
-                  ? promiseEffect(input.unregister).pipe(
-                      Effect.catch(() => Effect.void),
-                      Effect.andThen(Effect.fail(claimFailure))
-                    )
-                  : Effect.void,
-            })
-          ),
-        onSuccess: () => Effect.void,
-      })
-    )
-  )
-}
 
 export const getInstanceRecipe = createServerFn({ method: "GET" })
   .validator(instanceInputSchema)
@@ -405,10 +369,17 @@ export const updateInstanceStartup = createServerFn({ method: "POST" })
       : null
     const networkChanged = startupNetworkChanged(existing.tailscale, data)
     let configurationChanged = Boolean(data.reinstall || recipeChanged)
+    const requestedLimits =
+      data.limits ??
+      (data.diskLimitBytes === undefined
+        ? undefined
+        : { diskBytes: data.diskLimitBytes })
     let limitsChanged =
       !data.reinstall &&
-      data.diskLimitBytes !== undefined &&
-      data.diskLimitBytes !== existing.limits.diskBytes
+      !resourceLimitsEqual(
+        resolveResourceLimits(existing.limits, requestedLimits),
+        existing.limits
+      )
     if (!data.reinstall) {
       const { brick: previousRecipe } = await loadInstanceRecipe(
         relay,
@@ -445,10 +416,21 @@ export const updateInstanceStartup = createServerFn({ method: "POST" })
     }
     const powerPermission = startupPowerPermission(existing, data)
     if (powerPermission) authorization.require(powerPermission)
-    const { recipeDefinition: _untrustedRecipeDefinition, ...trustedData } =
-      data
+    const {
+      diskLimitBytes: _diskLimitBytes,
+      limits: _limits,
+      recipeDefinition: _untrustedRecipeDefinition,
+      ...trustedData
+    } = data
     const input = relayUpdateInstanceStartupSchema.parse({
       ...trustedData,
+      ...(data.reinstall
+        ? {}
+        : relayResourceLimitsRequest(
+            relay.id,
+            existing.limits,
+            requestedLimits
+          )),
       ...(recipeDefinition ? { recipeDefinition } : {}),
     })
     const instance = relayInstanceSchema.parse(

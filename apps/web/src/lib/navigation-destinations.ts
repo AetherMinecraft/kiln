@@ -1,27 +1,25 @@
 import type { ComponentType } from "react"
 import {
-  Boxes,
   CalendarDays,
   CircleUserRound,
   CreditCard,
-  Database,
   Folder,
   FolderDown,
+  FolderGit2,
+  FolderSync,
   Globe2,
+  HardDrive,
   History,
+  LayoutDashboard,
   ListTodo,
   Network,
   Palette,
-  RadioTower,
-  RefreshCw,
   Rocket,
   ScrollText,
-  Server,
   SlidersHorizontal,
   Table2,
   TerminalSquare,
   Waypoints,
-  Wrench,
 } from "lucide-react"
 import {
   builtinTailscaleBrickId,
@@ -29,6 +27,12 @@ import {
   type RelayInstance,
 } from "@workspace/contracts"
 
+import {
+  AppKindIcon,
+  DatabaseKindIcon,
+  RelayKindIcon,
+  ServerKindIcon,
+} from "@/components/instance-kind-icon"
 import type { AccessPermission } from "@/lib/permissions"
 import { grantHasPermission } from "@/lib/permissions"
 
@@ -47,6 +51,7 @@ export type InfrastructureDestinationAccess =
   | "instance-read"
   | "manage-relays"
   | "platform-admin"
+  | "sources"
 
 export interface NavigationAccessCapabilities {
   canManageAccess: boolean
@@ -66,23 +71,52 @@ export interface NavigationAccessCapabilities {
   isPlatformAdmin: boolean
 }
 
+// Tabs render in this order, with a divider wherever `group` changes.
 export const infrastructureDestinations = [
   {
     access: "manage-relays",
-    icon: Wrench,
-    keywords: ["infrastructure", "configure"],
-    label: "Setup",
-    to: "/infra/setup",
+    group: "overview",
+    icon: LayoutDashboard,
+    keywords: ["infrastructure", "summary", "setup"],
+    label: "Overview",
+    to: "/infra/overview",
   },
   {
     access: "manage-relays",
-    icon: RadioTower,
+    group: "resources",
+    icon: RelayKindIcon,
     keywords: ["infrastructure", "nodes"],
     label: "Relays",
     to: "/infra/relays",
   },
   {
+    access: "database-read",
+    group: "resources",
+    icon: DatabaseKindIcon,
+    keywords: ["infrastructure", "mysql"],
+    label: "Databases",
+    to: "/infra/databases",
+  },
+  {
+    access: "instance-read",
+    group: "resources",
+    icon: ServerKindIcon,
+    keywords: ["infrastructure", "instances", "servers"],
+    // Users see "Game Servers"; the code keeps "servers". See AGENTS.md Naming.
+    label: "Game Servers",
+    to: "/infra/servers",
+  },
+  {
+    access: "app-read",
+    group: "resources",
+    icon: AppKindIcon,
+    keywords: ["infrastructure", "docker", "compose", "containers"],
+    label: "Apps",
+    to: "/infra/apps",
+  },
+  {
     access: "platform-admin",
+    group: "network",
     icon: Waypoints,
     keywords: ["infrastructure", "network"],
     label: "Tailscale",
@@ -90,63 +124,68 @@ export const infrastructureDestinations = [
   },
   {
     access: "platform-admin",
+    group: "network",
     icon: Globe2,
     keywords: ["infrastructure", "cloudflare", "urls"],
     label: "Domains",
     to: "/infra/domains",
   },
   {
-    access: "instance-read",
-    icon: Server,
-    keywords: ["infrastructure", "instances", "servers"],
-    // Users see "Game Servers"; the code keeps "servers". See AGENTS.md Naming.
-    label: "Game Servers",
-    to: "/infra/servers",
-  },
-  {
-    access: "database-read",
-    icon: Database,
-    keywords: ["infrastructure", "mysql"],
-    label: "Databases",
-    to: "/infra/databases",
+    access: "sources",
+    group: "network",
+    icon: FolderGit2,
+    keywords: ["infrastructure", "github", "git", "repositories"],
+    label: "Sources",
+    to: "/infra/sources",
   },
   {
     access: "app-read",
-    icon: Boxes,
-    keywords: ["infrastructure", "docker", "compose", "containers"],
-    label: "Apps",
-    to: "/infra/apps",
+    group: "network",
+    icon: Rocket,
+    keywords: ["infrastructure", "deploys", "github", "commits", "releases"],
+    label: "Deployments",
+    to: "/infra/deployments",
   },
 ] as const satisfies ReadonlyArray<
-  NavigationDestination & { access: InfrastructureDestinationAccess }
+  NavigationDestination & {
+    access: InfrastructureDestinationAccess
+    group: "network" | "overview" | "resources"
+  }
 >
 
+// Tabs render in this order, with a divider wherever `group` changes.
 export const automationDestinations = [
   {
+    group: "calendar",
+    icon: CalendarDays,
+    keywords: ["automations", "dates"],
+    label: "Calendar",
+    to: "/automations/calendar",
+  },
+  {
+    group: "automations",
     icon: ListTodo,
     keywords: ["automations", "tasks"],
     label: "Schedules",
     to: "/automations/schedules",
   },
   {
-    icon: RefreshCw,
+    group: "automations",
+    icon: FolderSync,
     keywords: ["automations", "synchronize"],
     label: "Sync",
     to: "/automations/sync",
   },
   {
+    group: "history",
     icon: History,
     keywords: ["automations", "runs"],
     label: "History",
     to: "/automations/history",
   },
-  {
-    icon: CalendarDays,
-    keywords: ["automations", "dates"],
-    label: "Calendar",
-    to: "/automations/calendar",
-  },
-] as const satisfies ReadonlyArray<NavigationDestination>
+] as const satisfies ReadonlyArray<
+  NavigationDestination & { group: "automations" | "calendar" | "history" }
+>
 
 export const settingsDestinations = [
   {
@@ -492,7 +531,12 @@ export function appDestinationHref(
   return destination.to.replace("$appId", encodeURIComponent(routeId))
 }
 
-export type RelayDestinationId = "info" | "terminal" | "logs" | "files"
+export type RelayDestinationId =
+  | "info"
+  | "terminal"
+  | "volumes"
+  | "files"
+  | "logs"
 
 export interface RelayDestination extends NavigationDestination {
   id: RelayDestinationId
@@ -526,12 +570,12 @@ export const relayDestinations = [
     to: "/relay/$relayId/terminal",
   },
   {
-    icon: ScrollText,
-    id: "logs",
-    keywords: ["output", "container", "errors"],
-    label: "Logs",
-    permission: "relay.logs.read",
-    to: "/relay/$relayId/logs",
+    icon: HardDrive,
+    id: "volumes",
+    keywords: ["docker", "storage", "data", "persistent", "mounts"],
+    label: "Volumes",
+    permission: "relay.read",
+    to: "/relay/$relayId/volumes",
   },
   {
     icon: Folder,
@@ -540,6 +584,14 @@ export const relayDestinations = [
     label: "Files",
     permission: "relay.files.read",
     to: "/relay/$relayId/files",
+  },
+  {
+    icon: ScrollText,
+    id: "logs",
+    keywords: ["output", "container", "errors"],
+    label: "Logs",
+    permission: "relay.logs.read",
+    to: "/relay/$relayId/logs",
   },
 ] as const satisfies ReadonlyArray<RelayDestination>
 
@@ -602,6 +654,10 @@ export function canAccessInfrastructureDestination(
   if (destination.access === "platform-admin") {
     return capabilities.isPlatformAdmin
   }
+  if (destination.access === "sources") {
+    // Sources feed syncs. Each person's sources are their own.
+    return canUseSyncs(capabilities)
+  }
   if (destination.access === "app-read") {
     return hasScopedPermission(capabilities, "app.read", ["relay"])
   }
@@ -643,7 +699,24 @@ export function canAccessAccessManagement(
 export function canAccessAutomations(
   capabilities: NavigationAccessCapabilities
 ): boolean {
-  return hasScopedPermission(capabilities, "schedule.read")
+  return (
+    hasScopedPermission(capabilities, "schedule.read") ||
+    canUseSyncs(capabilities)
+  )
+}
+
+/** Syncs write files, so they're for whoever may edit files somewhere. */
+function canUseSyncs(capabilities: NavigationAccessCapabilities): boolean {
+  return (
+    capabilities.isPlatformAdmin ||
+    capabilities.canManageRelays ||
+    hasScopedPermission(capabilities, "instance.files.write", [
+      "instance",
+      "relay",
+    ]) ||
+    hasScopedPermission(capabilities, "app.files.write", ["relay"]) ||
+    hasScopedPermission(capabilities, "relay.files.write", ["relay"])
+  )
 }
 
 export function canAccessBackups(

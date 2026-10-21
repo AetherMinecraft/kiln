@@ -1,3 +1,4 @@
+import { DatabaseKindIcon } from "@/components/instance-kind-icon"
 import type { getManagedDatabaseDirectory } from "@/server/databases"
 import type { getInfraRelayOptions } from "@/server/infra-directory"
 import {
@@ -486,7 +487,7 @@ const DatabaseTable = React.memo(function DatabaseTable({
       emptyState={({ searchActive }) =>
         favoritesFiltered ? (
           <FavoritesOnlyEmptyState
-            icon={<Database className="size-6 text-muted-foreground/45" />}
+            icon={<DatabaseKindIcon className="size-6" />}
             searchActive={searchActive}
             table="databases"
           />
@@ -718,7 +719,11 @@ function CreateDatabaseDialog({
       await queryClient.invalidateQueries({
         queryKey: queryKeys.databases.all,
       })
-      showToast({ message: `${name.trim()} is ready`, type: "success" })
+      // A database the Relay provisions in the background opens on its
+      // provisioning page instead.
+      if (created.observedState !== "provisioning") {
+        showToast({ message: `${name.trim()} is ready`, type: "success" })
+      }
       onOpenChange(false)
       await navigate({
         params: { databaseId: created.id },
@@ -848,7 +853,7 @@ function EmptyDatabaseTable({
               : "No databases have been assigned to your account yet."}
         </span>
       }
-      icon={<Database className="size-6 text-muted-foreground/45" />}
+      icon={<DatabaseKindIcon className="size-6" />}
       title={
         searchActive ? "No databases match your search" : "No managed databases"
       }

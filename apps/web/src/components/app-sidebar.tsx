@@ -5,14 +5,11 @@ import {
   useSuspenseQuery,
 } from "@tanstack/react-query"
 import {
-  Boxes,
   CalendarClock,
   ChevronsUpDown,
-  Database,
   ListTodo,
   LoaderCircle,
   LogOut,
-  Server as ServerIcon,
   Settings,
   UserRoundCog,
 } from "lucide-react"
@@ -58,6 +55,12 @@ import {
   RouteCommandMenuTrigger,
 } from "@/components/route-command-menu"
 import { InstanceCard } from "@/components/instance-card"
+import {
+  AppKindIcon,
+  DatabaseKindIcon,
+  RelayKindIcon,
+  ServerKindIcon,
+} from "@/components/instance-kind-icon"
 import {
   InstancePickerContent,
   type InstancePickerItem,
@@ -176,7 +179,7 @@ const AppSidebarView = React.memo(function AppSidebarView({
                 className="h-11 min-w-0 flex-1 hover:bg-transparent active:bg-transparent data-[state=open]:bg-transparent"
                 tooltip="Kiln"
               >
-                <HearthMark className="group-data-[collapsible=icon]:size-[32px]!" />
+                <HearthMark className="group-data-[collapsible=icon]:size-[40px]!" />
                 <span className="min-w-0 flex-1 truncate font-heading text-2xl font-semibold tracking-[0.04em]">
                   KILN
                 </span>
@@ -235,6 +238,9 @@ function InfrastructureNavigation({
   relayConfigured: boolean
 }) {
   const destinations = accessibleInfrastructureDestinations(capabilities)
+  const showRelays = destinations.some(
+    (destination) => destination.to === "/infra/relays"
+  )
   const showServers = destinations.some(
     (destination) => destination.to === "/infra/servers"
   )
@@ -244,7 +250,7 @@ function InfrastructureNavigation({
   const showApps = destinations.some(
     (destination) => destination.to === "/infra/apps"
   )
-  if (!showServers && !showDatabases && !showApps) return null
+  if (!showRelays && !showServers && !showDatabases && !showApps) return null
 
   return (
     <SidebarGroup className="pt-2">
@@ -253,6 +259,9 @@ function InfrastructureNavigation({
       </SidebarGroupLabel>
       <SidebarGroupContent>
         <SidebarMenu>
+          {showRelays ? (
+            <RelaysNavigationItem relayConfigured={relayConfigured} />
+          ) : null}
           {showServers ? (
             <ServersNavigationItem
               initialSelectedInstanceRouteId={initialSelectedInstanceRouteId}
@@ -271,6 +280,41 @@ function InfrastructureNavigation({
   )
 }
 
+function RelaysNavigationItem({ relayConfigured }: { relayConfigured: boolean }) {
+  return (
+    <SidebarMenuItem>
+      <SidebarMenuButton asChild tooltip="Relays">
+        <Link
+          to="/infra/relays"
+          activeOptions={{ exact: true, includeSearch: false }}
+          activeProps={{ "data-active": true }}
+          preload="intent"
+        >
+          <RelayKindIcon />
+          <span>Relays</span>
+        </Link>
+      </SidebarMenuButton>
+      <SidebarMenuBadge className="text-sidebar-muted-foreground">
+        <RelayCount relayConfigured={relayConfigured} />
+      </SidebarMenuBadge>
+    </SidebarMenuItem>
+  )
+}
+
+const RelayCount = React.memo(function RelayCount({
+  relayConfigured,
+}: {
+  relayConfigured: boolean
+}) {
+  const { data: count = 0 } = useQuery({
+    ...relaysQueryOptions(),
+    enabled: relayConfigured,
+    select: (relays) => relays.length,
+  })
+
+  return count
+})
+
 function DatabasesNavigationItem({
   relayConfigured,
 }: {
@@ -285,7 +329,7 @@ function DatabasesNavigationItem({
           activeProps={{ "data-active": true }}
           preload="intent"
         >
-          <Database />
+          <DatabaseKindIcon />
           <span>Databases</span>
         </Link>
       </SidebarMenuButton>
@@ -320,7 +364,7 @@ function AppsNavigationItem({ relayConfigured }: { relayConfigured: boolean }) {
           activeProps={{ "data-active": true }}
           preload="intent"
         >
-          <Boxes />
+          <AppKindIcon />
           <span>Apps</span>
         </Link>
       </SidebarMenuButton>
@@ -361,7 +405,7 @@ function ServersNavigationItem({
           activeProps={{ "data-active": true }}
           preload="intent"
         >
-          <ServerIcon />
+          <ServerKindIcon />
           <span>Game Servers</span>
         </Link>
       </SidebarMenuButton>
@@ -525,7 +569,6 @@ function SidebarAppNavigation({
   return (
     <SidebarResourceGroup
       capabilities={capabilities}
-      label="App"
       selection={{ kind: "app", app }}
       selectionRouteId={appSelectionRouteId(routeId)}
     >
@@ -542,13 +585,11 @@ function SidebarAppNavigation({
 function SidebarResourceGroup({
   capabilities,
   children,
-  label,
   selection,
   selectionRouteId,
 }: {
   capabilities: NavigationAccessCapabilities
   children: React.ReactNode
-  label: string
   selection: InstanceSelection
   // Remembered so the sidebar reopens on this resource.
   selectionRouteId: string
@@ -558,9 +599,6 @@ function SidebarResourceGroup({
       <RememberSelectedInstance instanceRouteId={selectionRouteId} />
       <SidebarSeparator />
       <SidebarGroup>
-        <SidebarGroupLabel className="type-technical-label">
-          {label}
-        </SidebarGroupLabel>
         <SidebarGroupContent>
           <SidebarMenu>
             <InstanceSelector
@@ -649,7 +687,6 @@ function SidebarDatabaseNavigation({
   return (
     <SidebarResourceGroup
       capabilities={capabilities}
-      label="Database"
       selection={{ kind: "database", database }}
       selectionRouteId={databaseSelectionRouteId(routeId)}
     >
@@ -699,7 +736,6 @@ function SidebarRelayNavigation({
   return (
     <SidebarResourceGroup
       capabilities={capabilities}
-      label="Relay"
       selection={{ kind: "relay", relay }}
       selectionRouteId={relaySelectionRouteId(routeId)}
     >
@@ -749,6 +785,8 @@ function relayTabRoute(tab: RelayDestinationId) {
       return "/relay/$relayId/terminal"
     case "logs":
       return "/relay/$relayId/logs" as const
+    case "volumes":
+      return "/relay/$relayId/volumes" as const
   }
 }
 
@@ -897,9 +935,6 @@ const InstanceNavigation = React.memo(function InstanceNavigation({
 
   return (
     <SidebarGroup>
-      <SidebarGroupLabel className="type-technical-label">
-        Server
-      </SidebarGroupLabel>
       <SidebarGroupContent>
         <SidebarMenu>
           <InstanceSelector
@@ -951,7 +986,17 @@ const InstanceSelector = React.memo(function InstanceSelector({
   const handleOpenChange = React.useCallback((nextOpen: boolean) => {
     setOpen(nextOpen)
   }, [])
-  const closePicker = React.useCallback(() => setOpen(false), [])
+  // Picking an instance or link moves focus to the new page; returning it to
+  // the picker button would pop the button's tooltip over that page.
+  const navigatedRef = React.useRef(false)
+  const closePicker = React.useCallback(() => {
+    navigatedRef.current = true
+    setOpen(false)
+  }, [])
+  const handleCloseAutoFocus = React.useCallback((event: Event) => {
+    if (navigatedRef.current) event.preventDefault()
+    navigatedRef.current = false
+  }, [])
   // The picker lists every instance; fetch the lists as the pointer arrives
   // so it opens filled.
   const warmPicker = React.useCallback(() => {
@@ -959,7 +1004,7 @@ const InstanceSelector = React.memo(function InstanceSelector({
   }, [queryClient])
   const selectInstance = React.useCallback(
     (item: InstancePickerItem) => {
-      handleOpenChange(false)
+      closePicker()
       if (item.identity.kind === "database") {
         const databases = queryClient.getQueryData(
           managedDatabaseDirectoryQueryOptions().queryKey
@@ -1052,7 +1097,7 @@ const InstanceSelector = React.memo(function InstanceSelector({
         params: { serverId: routeIdentifier },
       })
     },
-    [handleOpenChange, navigate, navigateToTab, queryClient]
+    [closePicker, navigate, navigateToTab, queryClient]
   )
   const selectedKey =
     selection.kind === "server"
@@ -1098,7 +1143,7 @@ const InstanceSelector = React.memo(function InstanceSelector({
             }
             onFocus={warmPicker}
             onPointerEnter={warmPicker}
-            className="mb-1.5 h-auto border border-sidebar-border/75 bg-background/35 px-2 py-2 group-data-[collapsible=icon]:h-[32px]! group-data-[collapsible=icon]:overflow-visible group-data-[collapsible=icon]:bg-black/10 hover:border-sidebar-border hover:bg-sidebar-accent group-data-[collapsible=icon]:hover:bg-black/15 data-[state=open]:border-sidebar-border data-[state=open]:bg-sidebar-accent dark:group-data-[collapsible=icon]:bg-black/25 dark:group-data-[collapsible=icon]:hover:bg-black/35"
+            className="mb-1.5 h-auto border border-sidebar-border/75 bg-background/35 px-2 py-2 group-data-[collapsible=icon]:h-[40px]! group-data-[collapsible=icon]:overflow-visible group-data-[collapsible=icon]:bg-black/10 hover:border-sidebar-border hover:bg-sidebar-accent group-data-[collapsible=icon]:hover:bg-black/15 data-[state=open]:border-sidebar-border data-[state=open]:bg-sidebar-accent dark:group-data-[collapsible=icon]:bg-black/25 dark:group-data-[collapsible=icon]:hover:bg-black/35"
           >
             {instance ? (
               <SelectorInstanceName
@@ -1140,8 +1185,8 @@ const InstanceSelector = React.memo(function InstanceSelector({
             ) : (
               <>
                 <span className="relative grid size-8 shrink-0 place-items-center rounded-md border border-sidebar-border/70 bg-background/25 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent">
-                  <ServerIcon
-                    className="size-4 text-sidebar-foreground/85"
+                  <ServerKindIcon
+                    className="size-4"
                     aria-hidden="true"
                   />
                 </span>
@@ -1166,6 +1211,7 @@ const InstanceSelector = React.memo(function InstanceSelector({
           align="start"
           sideOffset={6}
           className="w-72 max-w-[calc(100vw-1rem)] overflow-hidden p-0"
+          onCloseAutoFocus={handleCloseAutoFocus}
         >
           <SidebarInstancePicker
             capabilities={capabilities}
@@ -1503,6 +1549,7 @@ function AccountNavigation({
     <SidebarFooter>
       {showManage ? (
         <>
+          <SidebarSeparator />
           <SidebarGroup className="p-0">
             <SidebarGroupLabel className="type-technical-label">
               Manage
@@ -1589,10 +1636,13 @@ function CollapsedAccountMenu({ user }: { user: AuthenticatedUser }) {
         <PopoverTrigger asChild>
           <button
             type="button"
-            className="relative grid size-[32px] place-items-center transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none data-[state=open]:bg-sidebar-accent"
+            className="relative grid size-[40px] place-items-center transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none data-[state=open]:bg-sidebar-accent"
             aria-label={`Open account menu for ${user.name}`}
           >
-            <AccountAvatar name={user.name} />
+            <AccountAvatar
+              className="data-[size=sm]:size-[30px]"
+              name={user.name}
+            />
             <UnreadNotificationsIndicator />
           </button>
         </PopoverTrigger>

@@ -33,12 +33,15 @@ import {
   type RelayScheduleState,
 } from "./effect/schedule-state.js"
 import { ensuringPromise, promiseEffect } from "./effect/promise.js"
+import { LaneRejectedError } from "./operation-lanes.js"
 
 type TargetScheduleAction = Exclude<RelayScheduleAction, { type: "wait" }>
 
 interface TargetExecutionState {
   readonly activeKey: string | null
   readonly attempts: Array<ScheduleActionAttempt>
+  /** The game server's power intent when the occurrence began. */
+  readonly powerIntent: string
   error: string | null
   failure: string | null
   missing: boolean
@@ -70,17 +73,31 @@ export interface ScheduleManagerOptions {
   ) => Fiber.Fiber<void, unknown>
   readonly getBackup: (taskId: string) => Promise<RelayBackupTask | null>
   readonly listDatabaseIds: () => Promise<ReadonlySet<string>>
-  readonly platformTargetId: string
+  // Read per run: Hearth can give the Relay its installation ID at any time.
+  readonly platformTargetId: () => string
   readonly reportError?: (message: string, cause: unknown) => void
   readonly relayId: string
   readonly runDatabasePower: (
     databaseId: string,
     action: "restart" | "start" | "stop"
   ) => Promise<void>
+  /**
+   * Runs a power step unless someone changed the server's power since
+   * `powerIntent` was read, in which case it rejects with a superseded
+   * LaneRejectedError.
+   */
   readonly runInstancePower: (
     instanceId: string,
-    action: "kill" | "restart" | "start" | "stop"
+    action: "kill" | "restart" | "start" | "stop",
+    powerIntent: string
   ) => Promise<void>
+  /**
+   * A token that changes whenever someone changes a game server's power or
+   * replaces it, read when an occurrence begins.
+   */
+  readonly instancePowerIntent: (instanceId: string) => string
+  /** A paused Relay runs no schedule actions; they're recorded as not run. */
+  readonly isPaused: () => boolean
   readonly sendConsoleCommand: (
     instanceId: string,
     command: string
@@ -286,6 +303,10 @@ export class ScheduleManager {
         return {
           activeKey: overlapping ? null : activeKey,
           attempts: [],
+          powerIntent:
+            target.kind === "instance"
+              ? this.#options.instancePowerIntent(target.id)
+              : "",
           error: null,
           failure: null,
           missing: false,
@@ -518,6 +539,20 @@ export class ScheduleManager {
       )
       return
     }
+    if (this.#options.isPaused()) {
+      state.attempts.push(
+        attempt({
+          action,
+          error: "Not run: the Relay is paused",
+          scheduledAt,
+          scheduleId: schedule.id,
+          startedAt: actionStartedAt,
+          status: "not_run",
+          target: state.target,
+        })
+      )
+      return
+    }
     if (!scheduleActionSupportsTarget(action, state.target)) {
       state.attempts.push(
         attempt({
@@ -554,11 +589,37 @@ export class ScheduleManager {
             action,
             state.target,
             scheduledAt,
+            state.powerIntent,
             signal
           )
         )
       )
     )
+    // Someone changed the server's power while the schedule ran, so its
+    // later power steps give way rather than undo that. Or the Relay was
+    // paused while the step waited its turn.
+    if (
+      Result.isFailure(executed) &&
+      executed.failure instanceof LaneRejectedError &&
+      (executed.failure.reason === "superseded" ||
+        executed.failure.reason === "paused")
+    ) {
+      state.attempts.push(
+        attempt({
+          action,
+          error:
+            executed.failure.reason === "paused"
+              ? "Not run: the Relay is paused"
+              : "Not run: the server's power was changed during the schedule",
+          scheduledAt,
+          scheduleId: schedule.id,
+          startedAt: actionStartedAt,
+          status: "not_run",
+          target: state.target,
+        })
+      )
+      return
+    }
     const failure = Result.isFailure(executed)
       ? errorMessage(executed.failure)
       : null
@@ -593,6 +654,7 @@ export class ScheduleManager {
     action: TargetScheduleAction,
     target: ScheduleTarget,
     scheduledAt: number,
+    powerIntent: string,
     signal?: AbortSignal
   ) {
     if (action.type === "console_command" && target.kind === "instance") {
@@ -601,7 +663,11 @@ export class ScheduleManager {
     }
     if (action.type === "power") {
       if (target.kind === "instance") {
-        await this.#options.runInstancePower(target.id, action.action)
+        await this.#options.runInstancePower(
+          target.id,
+          action.action,
+          powerIntent
+        )
         return
       }
       if (target.kind === "database") {
@@ -691,7 +757,7 @@ export class ScheduleManager {
         target: {
           id:
             targetKind === "platform"
-              ? this.#options.platformTargetId
+              ? this.#options.platformTargetId()
               : target.id,
           kind: targetKind,
         },

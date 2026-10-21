@@ -24,7 +24,8 @@ import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { delimiter, join, resolve } from "node:path"
 import { afterAll, assert, beforeAll, describe, it } from "@effect/vitest"
-import { Effect, Exit, Fiber, type Scope } from "effect"
+import { vi } from "vite-plus/test"
+import { Deferred, Effect, Exit, Fiber, type Scope } from "effect"
 import { TestClock } from "effect/testing"
 import { openPromise } from "yauzl"
 import ZipStream from "zip-stream"
@@ -53,6 +54,8 @@ import { BrickCatalog, brickSnapshotDirectory } from "./bricks.js"
 import type { RelayConfig, RelayInstanceConfig } from "./config.js"
 import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
 import { testInstance, testRelayConfig } from "./test/fixtures.js"
+import { exclusive, laneKeys, OperationLanes } from "./operation-lanes.js"
+import { instanceFileLocks } from "./operation-plans.js"
 
 // Restic is faked at its process boundary: a stateful `restic` executable first
 // on PATH keeps each repository's snapshots and stored data in `repos.json`.
@@ -119,6 +122,7 @@ describe("Relay archive backups", () => {
             brickSnapshotSha256: snapshotSha256,
             brickSupportsSrv: true,
             limits: {
+              cpuMillis: null,
               diskBytes: 25 * 1024 ** 3,
               memoryBytes: 4 * 1024 ** 3,
             },
@@ -197,7 +201,10 @@ describe("Relay archive backups", () => {
                 webRoutes,
               },
               startup: {
-                limits: instance.limits,
+                limits: {
+                  diskBytes: 25 * 1024 ** 3,
+                  memoryBytes: 4 * 1024 ** 3,
+                },
                 tailscale: instance.tailscale,
                 variables: instance.variables ?? {},
               },
@@ -228,6 +235,79 @@ describe("Relay archive backups", () => {
         )
         assert.isTrue(existsSync(backupArchivePath(config, first.backupId)))
         assert.isTrue(existsSync(backupArchivePath(config, second.backupId)))
+      })
+    )
+  )
+
+  it.effect("holds queued tasks while the Relay is paused, then runs them", () =>
+    withRelay("kiln-backup-paused-", ({ config, root }) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeFile(resolve(root, "server.txt"), "data")
+        )
+        const lanes = new OperationLanes()
+        const manager = yield* backupManager(
+          config,
+          async () => testInstance(),
+          lanes
+        )
+        const input = backupInput(9)
+        lanes.setPaused(true)
+        yield* manager.enqueue(input)
+        yield* manager.runPending()
+        assert.strictEqual((yield* manager.get(input.taskId))?.status, "queued")
+
+        lanes.setPaused(false)
+        yield* manager.runPending()
+        assert.strictEqual(
+          (yield* manager.get(input.taskId))?.status,
+          "succeeded"
+        )
+      })
+    )
+  )
+
+  it.effect("puts back a task a pause withdrew while it waited its turn", () =>
+    withRelay("kiln-backup-paused-waiting-", ({ config, root }) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeFile(resolve(root, "server.txt"), "data")
+        )
+        const lanes = new OperationLanes()
+        const manager = yield* backupManager(
+          config,
+          async () => testInstance(),
+          lanes
+        )
+        // A restore holds the server, so the backup waits behind it.
+        const restoring = Deferred.makeUnsafe<void>()
+        yield* Effect.forkChild(
+          lanes.run(
+            {
+              label: "restore",
+              locks: [exclusive(laneKeys.instance(testInstance().id))],
+            },
+            Deferred.await(restoring)
+          )
+        )
+        const input = backupInput(10)
+        yield* manager.enqueue(input)
+        const draining = yield* Effect.forkChild(manager.runPending())
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(lanes.pending.waiting, 1))
+        )
+
+        lanes.setPaused(true)
+        yield* Fiber.join(draining)
+        assert.strictEqual((yield* manager.get(input.taskId))?.status, "queued")
+
+        Deferred.doneUnsafe(restoring, Exit.void)
+        lanes.setPaused(false)
+        yield* manager.runPending()
+        assert.strictEqual(
+          (yield* manager.get(input.taskId))?.status,
+          "succeeded"
+        )
       })
     )
   )
@@ -515,6 +595,142 @@ describe("Relay archive restores", () => {
             ).recipe(instance.brickSource ?? "", instance.brickSnapshotSha256)
           ),
           testBrickRecipe()
+        )
+      })
+    )
+  )
+
+  it.effect("waits for a file change in progress before restoring", () =>
+    withRelay("kiln-backup-restore-wait-", ({ config, root }) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeFile(resolve(root, "server.txt"), "old")
+        )
+        const lanes = new OperationLanes()
+        const manager = yield* backupManager(
+          config,
+          async () => testInstance(),
+          lanes
+        )
+        const input = backupInput(7)
+        const created = archiveResult(yield* runTask(manager, input))
+
+        // A save is still writing when the restore comes up.
+        const release = yield* Deferred.make<void>()
+        const save = yield* lanes
+          .run(
+            { label: "save", locks: instanceFileLocks("instance-1") },
+            Deferred.await(release).pipe(
+              Effect.andThen(
+                Effect.promise(() =>
+                  writeFile(resolve(root, "server.txt"), "saved")
+                )
+              )
+            )
+          )
+          .pipe(Effect.forkChild({ startImmediately: true }))
+        const restoreTaskId = "20000000-0000-4000-8000-000000000007"
+        yield* manager.enqueue({
+          backupId: input.backupId,
+          kind: "restore",
+          source: {
+            bytes: created.bytes,
+            checksumSha256: created.checksumSha256,
+            kind: "local",
+          },
+          target: { id: "instance-1", kind: "instance" },
+          taskId: restoreTaskId,
+        })
+        const restoring = yield* manager
+          .runPending()
+          .pipe(Effect.forkChild({ startImmediately: true }))
+        // The restore waits its turn behind the save.
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(lanes.pending.waiting, 1))
+        )
+        assert.strictEqual(
+          (yield* manager.get(restoreTaskId))?.result,
+          null,
+          "the restore ran while the save held the server's files"
+        )
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(save)
+        yield* Fiber.join(restoring)
+        // The restore ran after the save, so its files win.
+        assert.strictEqual(
+          (yield* manager.get(restoreTaskId))?.status,
+          "succeeded"
+        )
+        assert.strictEqual(
+          yield* Effect.promise(() =>
+            readFile(resolve(root, "server.txt"), "utf8")
+          ),
+          "old"
+        )
+      })
+    )
+  )
+
+  it.effect("doesn't restore after timing out while it waited its turn", () =>
+    withRelay("kiln-backup-restore-expired-", ({ config, root }) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeFile(resolve(root, "server.txt"), "old")
+        )
+        const lanes = new OperationLanes()
+        const manager = yield* backupManager(
+          { ...config, backupTimeoutMs: 10 },
+          async () => testInstance(),
+          lanes
+        )
+        const input = backupInput(8)
+        const created = archiveResult(yield* runTask(manager, input))
+        yield* Effect.promise(() =>
+          writeFile(resolve(root, "server.txt"), "new")
+        )
+
+        const release = yield* Deferred.make<void>()
+        const save = yield* lanes
+          .run(
+            { label: "save", locks: instanceFileLocks("instance-1") },
+            Deferred.await(release)
+          )
+          .pipe(Effect.forkChild({ startImmediately: true }))
+        const restoreTaskId = "20000000-0000-4000-8000-000000000008"
+        yield* manager.enqueue({
+          backupId: input.backupId,
+          kind: "restore",
+          source: {
+            bytes: created.bytes,
+            checksumSha256: created.checksumSha256,
+            kind: "local",
+          },
+          target: { id: "instance-1", kind: "instance" },
+          taskId: restoreTaskId,
+        })
+        const restoring = yield* manager
+          .runPending()
+          .pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Effect.promise(() =>
+          vi.waitFor(() => assert.strictEqual(lanes.pending.waiting, 1))
+        )
+
+        // It times out still waiting, then its turn comes.
+        yield* TestClock.adjust("10 millis")
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(save)
+        yield* Fiber.join(restoring)
+
+        assert.strictEqual(
+          (yield* manager.get(restoreTaskId))?.status,
+          "failed"
+        )
+        assert.strictEqual(
+          yield* Effect.promise(() =>
+            readFile(resolve(root, "server.txt"), "utf8")
+          ),
+          "new"
         )
       })
     )
@@ -1083,12 +1299,14 @@ function scratchDirectory(prefix: string) {
 function backupManager(
   config: RelayConfig,
   findInstance: () => Promise<RelayInstanceConfig | null> = async () =>
-    testInstance()
+    testInstance(),
+  lanes = new OperationLanes()
 ) {
   return BackupManager.make({
     config,
     findInstance,
     isInstanceStopped: async () => true,
+    lanes,
   })
 }
 

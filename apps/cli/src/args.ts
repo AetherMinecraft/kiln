@@ -7,6 +7,7 @@ export interface CliArguments {
   brick?: string
   command: Array<string>
   confirm?: string
+  cpu?: string
   disk?: string
   deleteManaged: boolean
   excludes: Array<string>
@@ -40,6 +41,7 @@ export function parseArguments(argv: Array<string>): CliArguments {
   const command: Array<string> = []
   let brick: string | undefined
   let confirm: string | undefined
+  let cpu: string | undefined
   let disk: string | undefined
   let deleteManaged = false
   const excludes: Array<string> = []
@@ -87,6 +89,7 @@ export function parseArguments(argv: Array<string>): CliArguments {
     if (flag === "--atomic") atomic = true
     else if (flag === "--brick") brick = value()
     else if (flag === "--confirm") confirm = value()
+    else if (flag === "--cpu") cpu = value()
     else if (flag === "--disk") disk = value()
     else if (flag === "--delete-managed") deleteManaged = true
     else if (flag === "--exclude") excludes.push(value())
@@ -181,6 +184,7 @@ export function parseArguments(argv: Array<string>): CliArguments {
     ...(brick ? { brick } : {}),
     command,
     ...(confirm ? { confirm } : {}),
+    ...(cpu ? { cpu } : {}),
     ...(disk ? { disk } : {}),
     deleteManaged,
     excludes,

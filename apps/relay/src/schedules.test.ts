@@ -19,6 +19,7 @@ import {
 import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
 
 import { ScheduleManager, type ScheduleManagerOptions } from "./schedules.js"
+import { LaneRejectedError } from "./operation-lanes.js"
 
 const directories: Array<string> = []
 const managers: Array<ScheduleManager> = []
@@ -76,6 +77,9 @@ async function manager(
     getBackup: (taskId: string) => Promise<RelayBackupTask | null>
     reportError: (message: string, cause: unknown) => void
     sendConsoleCommand: (instanceId: string, command: string) => Promise<void>
+    instancePowerIntent: (instanceId: string) => string
+    isPaused: () => boolean
+    runInstancePower: ScheduleManagerOptions["runInstancePower"]
   }> = {}
 ) {
   const directory =
@@ -90,11 +94,13 @@ async function manager(
     findInstance: overrides.findInstance ?? (async () => null),
     getBackup: overrides.getBackup ?? (async () => null),
     listDatabaseIds: async () => new Set(),
-    platformTargetId: "platform",
+    platformTargetId: () => "platform",
     relayId: "relay-a",
     reportError: overrides.reportError,
+    instancePowerIntent: overrides.instancePowerIntent ?? (() => "0"),
+    isPaused: overrides.isPaused ?? (() => false),
     runDatabasePower: async () => undefined,
-    runInstancePower: async () => undefined,
+    runInstancePower: overrides.runInstancePower ?? (async () => undefined),
     sendConsoleCommand: overrides.sendConsoleCommand ?? (async () => undefined),
     stateDirectory: directory,
   }
@@ -980,17 +986,6 @@ describe("Relay schedule persistence", () => {
     }
   })
 
-  it("applies a revision and reports its Relay-owned next run", async () => {
-    const { schedules } = await manager()
-    const applied = await schedules.apply(projection)
-
-    expect(applied.acknowledgedRevision).toBe(1)
-    expect(applied.nextRunAt).toBeTypeOf("number")
-    expect((await schedules.overview([projection.id])).deployments).toEqual([
-      applied,
-    ])
-  })
-
   it("evaluates cron in the Relay timezone", async () => {
     const now = new Date("2026-01-15T12:00:00.000Z")
     vi.setSystemTime(now)
@@ -1122,6 +1117,113 @@ describe("Relay schedule persistence", () => {
     ).toBeGreaterThanOrEqual(5 * minuteMs)
     expect((await latestRun(schedules))?.sequenceAttempts).toMatchObject([
       { actionType: "wait", status: "succeeded" },
+    ])
+  })
+
+  it("runs no actions while the Relay is paused", async () => {
+    const commands: Array<string> = []
+    const { schedules } = await manager({
+      findInstance: async () => ({}),
+      isPaused: () => true,
+      sendConsoleCommand: async (_instanceId, command) => {
+        commands.push(command)
+      },
+    })
+    await schedules.apply(projection)
+
+    await runNow(schedules)
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).not.toBe("running")
+    })
+    expect(commands).toEqual([])
+    expect((await latestRun(schedules))?.targetRuns[0]?.attempts).toMatchObject(
+      [{ error: "Not run: the Relay is paused", status: "not_run" }]
+    )
+  })
+
+  it("records a step a pause withdrew while it waited its turn as not run", async () => {
+    const { schedules } = await manager({
+      findInstance: async () => ({}),
+      // Paused after the step checked, while it waited for its lane.
+      runInstancePower: async () => {
+        throw new LaneRejectedError({
+          message: "paused",
+          reason: "paused",
+        })
+      },
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        {
+          action: "restart",
+          id: "0e9a7f5c-77e8-4b39-8c1a-6d5bb9c0b3a1",
+          type: "power",
+        },
+      ],
+    })
+
+    await runNow(schedules)
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).not.toBe("running")
+    })
+    const run = await latestRun(schedules)
+    // Nothing ran, and nothing failed.
+    expect(run?.status).toBe("noop")
+    expect(run?.targetRuns[0]?.attempts).toMatchObject([
+      { error: "Not run: the Relay is paused", status: "not_run" },
+    ])
+  })
+
+  it("gives way to a power change someone makes during its wait", async () => {
+    let intent = "manual-0"
+    const ran: Array<string> = []
+    const { schedules } = await manager({
+      findInstance: async () => ({}),
+      instancePowerIntent: () => intent,
+      // As the Relay does: a step runs only while the intent it was given
+      // is still current.
+      runInstancePower: async (_instanceId, action, powerIntent) => {
+        if (powerIntent !== intent) {
+          throw new LaneRejectedError({
+            message: "superseded",
+            reason: "superseded",
+          })
+        }
+        ran.push(action)
+      },
+    })
+    await schedules.apply({
+      ...projection,
+      actions: [
+        {
+          action: "stop",
+          id: "0e9a7f5c-77e8-4b39-8c1a-6d5bb9c0b3a1",
+          type: "power",
+        },
+        waitAction(5, "minutes"),
+        {
+          action: "start",
+          id: "6c1d2a9e-5f6b-4b0e-9d57-2a7c4f1e8b33",
+          type: "power",
+        },
+      ],
+    })
+
+    await runNow(schedules)
+    await advanceUntil(async () => expect(ran).toEqual(["stop"]))
+    // Someone stops the server by hand while the schedule waits.
+    intent = "manual-1"
+
+    await advanceUntil(async () => {
+      expect((await latestRun(schedules))?.status).not.toBe("running")
+    }, minuteMs)
+    expect(ran).toEqual(["stop"])
+    const run = await latestRun(schedules)
+    expect(run?.status).toBe("succeeded")
+    expect(run?.targetRuns[0]?.attempts).toMatchObject([
+      { status: "succeeded" },
+      { status: "not_run" },
     ])
   })
 

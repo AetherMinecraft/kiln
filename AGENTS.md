@@ -51,15 +51,20 @@ Before editing files for a substantial task:
 - Hearth, Relays, and the browser export OpenTelemetry traces, logs, and
   metrics through Effect (`packages/telemetry`), configured by `OTEL_*`
   variables. Errors are error logs with `exception.*` attributes and an
-  `error.fingerprint` that groups occurrences. They currently go to Sentry
-  over OTLP: query them with `sentry log list` and
-  `sentry explore --dataset logs` (see the `sentry-cli` skill).
+  `error.fingerprint` that groups occurrences. They go to whichever OTLP
+  backend `OTEL_EXPORTER_OTLP_ENDPOINT` names; Kiln's maintainers read traces
+  in Tempo and logs in Loki through Grafana.
 - Name spans with `Effect.fn("Area.operation")` or `Effect.withSpan`, keep
   names stable and put IDs in attributes. Give long-lived loops and workers no
   span of their own, span each unit of work instead, and use metrics, not
   spans, for hot paths.
 - Avoid patching framework/library internals unless explicitly given permission.
 - Use Sonner for transient feedback and shared tooltips
+- Every change the Relay makes to a game server, App, or database runs in its
+  operation lanes. A new control operation declares the locks it takes in
+  `apps/relay/src/operation-plans.ts`, and Relay-initiated work admits itself
+  the same way, rather than adding a lock of its own. See
+  [Relay operations](docs/relay-operations.md).
 - The Relay drives Docker through its Engine API client
   (`apps/relay/src/docker-engine.ts`). Use the API for what the daemon does,
   run Docker's standalone binaries only for client-side work like Compose and

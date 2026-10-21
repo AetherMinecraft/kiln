@@ -1,20 +1,27 @@
+import { AppKindIcon } from "@/components/instance-kind-icon"
 import { instanceInventoryScope } from "@/lib/instance-inventory"
 import { instanceInventoryQueryOptions } from "@/lib/instance-inventory"
 import { inventoryInstanceState } from "@/lib/instance-state"
 import { instanceStatePresentation } from "@/lib/instance-state-presentation"
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { useNavigate } from "@tanstack/react-router"
-import { Boxes, Rocket } from "lucide-react"
+import { useHydrated, useNavigate } from "@tanstack/react-router"
+import { Rocket, Trash2 } from "lucide-react"
 
+import { Button } from "@workspace/ui/components/button"
+
+import { DeleteAppDialog } from "@/components/app/app-dialogs"
 import {
   appRelayAvailable,
   showAppOperationError,
+  type App,
 } from "@/components/app/app-presentation"
 import {
   AppWorkspaceContext,
+  useAppWorkspace,
   type AppWorkspaceApp,
 } from "@/components/app/app-workspace-context"
+import { ProvisioningGate } from "@/components/provisioning-progress"
 import {
   WorkspaceCopyValueButton,
   WorkspaceHeader,
@@ -51,17 +58,65 @@ export const AppWorkspaceShell = React.memo(function AppWorkspaceShell({
       <div data-slot="app-workspace-surface" className="contents">
         <ResourceWorkspaceBoundary
           context={AppWorkspaceContext}
-          icon={<Boxes />}
+          icon={<AppKindIcon />}
           list={{ label: "All apps", to: "/infra/apps" }}
           noun={{ one: "app", other: "apps" }}
           workspace={workspace}
         >
-          {children}
+          <AppProvisioningBoundary>{children}</AppProvisioningBoundary>
         </ResourceWorkspaceBoundary>
       </div>
     </WorkspaceFrame>
   )
 })
+
+// Until the Relay has created the app, every page shows how far it got,
+// and one that failed can be deleted from there.
+function AppProvisioningBoundary({ children }: { children: React.ReactNode }) {
+  const { app } = useAppWorkspace()
+  return (
+    <ProvisioningGate
+      failedActions={
+        app.permissions.includes("app.delete") ? (
+          <DeleteFailedApp app={app} />
+        ) : null
+      }
+      id={app.id}
+      kind="app"
+      name={app.name}
+      provisioning={app.provisioning}
+      relayId={app.relayId}
+    >
+      {children}
+    </ProvisioningGate>
+  )
+}
+
+function DeleteFailedApp({ app }: { app: App }) {
+  const navigate = useNavigate()
+  const [open, setOpen] = React.useState(false)
+  return (
+    <>
+      <Button
+        size="sm"
+        type="button"
+        variant="destructive"
+        onClick={() => setOpen(true)}
+      >
+        <Trash2 />
+        Delete app
+      </Button>
+      {open ? (
+        <DeleteAppDialog
+          app={app}
+          open
+          onDeleted={() => void navigate({ to: "/infra/apps", replace: true })}
+          onOpenChange={setOpen}
+        />
+      ) : null}
+    </>
+  )
+}
 
 function useAppWorkspaceQuery(
   routeId: string | undefined
@@ -83,6 +138,7 @@ function useAppWorkspaceQuery(
       },
     [routeId]
   )
+  const hydrated = useHydrated()
   const directory = useQuery({ ...appDirectoryQueryOptions(), select })
   const selected = directory.data
   const inventory = useQuery({
@@ -97,8 +153,12 @@ function useAppWorkspaceQuery(
     enabled: Boolean(selected),
   })
   const state = inventoryInstanceState(inventory)
+  // The details stream into a page while Hearth renders it, so they can
+  // arrive before the browser hydrates. Until then the workspace opens as
+  // Hearth rendered it, so the two renders match.
+  const inventoryPending = inventory.isPending || !hydrated
   const data = React.useMemo(() => {
-    if (!selected || inventory.isPending) return null
+    if (!selected || inventoryPending) return null
     const value = inventory.data
     const detail =
       value?.kind === "app" && value.view === "detail" ? value.data : null
@@ -113,6 +173,8 @@ function useAppWorkspaceQuery(
           containers: [],
           dataDirectory: "",
           deployment: null,
+          diskLimitBytes: null,
+          diskUsedBytes: null,
           hostname: `app-${directory.shortId}`,
           network: "",
           observedState: "failed" as const,
@@ -128,13 +190,14 @@ function useAppWorkspaceQuery(
             : ("unreachable" as const),
         relayUpdating: observation?.updating ?? false,
         status: instanceStatePresentation(state).label,
+        latestObservation: value?.observation,
       },
       routeId: selected.routeId,
     }
-  }, [selected, inventory.isPending, inventory.data, state])
+  }, [selected, inventoryPending, inventory.data, state])
   return useResourceWorkspaceQuery({
     data,
-    isPending: directory.isPending || Boolean(selected && inventory.isPending),
+    isPending: directory.isPending || Boolean(selected && inventoryPending),
     isError: directory.isError,
   })
 }
@@ -285,7 +348,11 @@ function AppPowerControls({
         pendingLabel: "Deploying",
         onClick: () => deploy.mutate(),
       }}
-      target={{ name: app.name, observedState: app.observedState }}
+      target={{
+        name: app.name,
+        observedState: app.observedState,
+        provisioning: app.provisioning ?? null,
+      }}
       relayConnected={relayConnected}
       onAction={handleAction}
     />

@@ -1,7 +1,6 @@
 import {
   brickSchema,
   brickVariableValuesSchema,
-  relayDiskAllocationAvailableBytes,
   relayInstanceSchema,
   relaySnapshotSchema,
 } from "@workspace/contracts"
@@ -15,11 +14,15 @@ import {
   requireRelayPermission,
 } from "@/lib/access-control"
 import type { AuthenticatedUser } from "@/lib/auth-session"
+import {
+  instanceCapacity,
+  relayAllocations,
+} from "@/lib/resource-limits.server"
 import { hydrateBrickIcon } from "@/lib/brick-catalog-source.server"
 import { hydrateBrickVariables } from "@/lib/brick-variables"
 import { relayJsonEffect } from "@/lib/relay-client"
 import type { PersistedRelay } from "@/lib/relay-registry"
-import { listPersistedRelays } from "@/lib/relay-registry"
+import { activeRelay } from "@/lib/relay-registry"
 
 // Server-side work behind the Brick server functions in ./bricks, which
 // authenticate the caller first.
@@ -44,41 +47,16 @@ export async function getInstanceStartupHandler(
   if (!instance) throw new Error("Instance not found")
   const { brick, brickSource } = await loadInstanceRecipe(relay, instance)
   const variables = hydrateBrickVariables(brick, instance.variables)
-  const otherInstances = snapshot.instances.filter(
-    (candidate) => candidate.id !== instance.id
-  )
-  const otherMemoryBytes = otherInstances.reduce(
-    (total, candidate) => total + candidate.limits.memoryBytes,
-    0
-  )
-  const otherDiskBytes = otherInstances.reduce(
-    (total, candidate) => total + candidate.limits.diskBytes,
-    0
-  )
   const grants = isPlatformAdmin(user)
     ? []
     : await listUserGrants(user.id, relay.id)
   return {
     allocation: canReadRelayNode(user, relay.id, grants)
-      ? {
-          memory: {
-            availableBytes: Math.max(
-              snapshot.node.memory.totalBytes - otherMemoryBytes,
-              instance.limits.memoryBytes
-            ),
-            nodeTotalBytes: snapshot.node.memory.totalBytes,
-            nodeUsedBytes: snapshot.node.memory.usedBytes,
-          },
-          storage: {
-            availableBytes: relayDiskAllocationAvailableBytes(
-              snapshot.node.storage.totalBytes,
-              otherDiskBytes,
-              instance.limits.diskBytes
-            ),
-            nodeTotalBytes: snapshot.node.storage.totalBytes,
-            nodeUsedBytes: snapshot.node.storage.usedBytes,
-          },
-        }
+      ? instanceCapacity(
+          snapshot.node,
+          await relayAllocations(relay, snapshot),
+          { id: instance.id, kind: "server" }
+        )
       : null,
     brick,
     brickSource,
@@ -111,11 +89,7 @@ export async function loadInstanceRecipe(
 }
 
 export async function requiredRelay(id: string): Promise<PersistedRelay> {
-  const relay = (await listPersistedRelays()).find(
-    (item) => item.enabled && item.id === id
-  )
-  if (!relay) throw new Error("Relay not found")
-  return relay
+  return activeRelay(id)
 }
 
 export async function requestRelay(

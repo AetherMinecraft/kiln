@@ -103,9 +103,10 @@ operation payloads, not inferred from names.
 | database.dump.export               | Export data; supported engines only.                                                                                                                 |
 | database.dump.import               | Import data; supported engines only.                                                                                                                 |
 | database.logs.read                 | Watch the database container's live output.                                                                                                          |
+| database.limits.write              | Change the database's memory, CPU, and disk limits.                                                                                                  |
 | app.read                           | View apps, their containers, and configuration (environment needs app.manage). Relay scope only.                                                     |
 | app.create                         | Relay-scoped app creation.                                                                                                                           |
-| app.manage                         | Configure, deploy, start/stop, and network apps.                                                                                                     |
+| app.manage                         | Configure, deploy, start/stop, network, and set limits for apps.                                                                                    |
 | app.delete                         | Delete apps, their containers, and data.                                                                                                             |
 | app.logs.read                      | Watch deployment logs and container output.                                                                                                          |
 | app.terminal                       | Open shells in app containers.                                                                                                                       |

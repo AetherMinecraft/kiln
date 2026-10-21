@@ -1,4 +1,5 @@
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node"
+import type { z } from "zod"
 import { Context, Effect, Layer, Result, Schema } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import type {
@@ -7,8 +8,6 @@ import type {
   BackupTaskResult,
   RelayBackupTask,
   RelayDesiredState,
-  RelayCreateInstance,
-  RelayInstance,
   RelayInstanceLifecycleEvent,
   RelayInstanceRecovery,
   RelayInstancePendingPrimaryPort,
@@ -23,8 +22,12 @@ import {
   backupTaskResultSchema,
   omitBackupSecrets,
   relayBackupTaskSchema,
+  relayAppSchema,
+  relayCreateAppSchema,
+  relayCreateDatabaseSchema,
   relayCreateInstanceSchema,
   relayInstanceSchema,
+  relayManagedDatabaseSchema,
   resticSnapshotIdSchema,
 } from "@workspace/contracts"
 
@@ -135,6 +138,14 @@ export interface RelayStoredInstanceName {
   readonly name: string
 }
 
+export interface RelayStoredVolumeName {
+  readonly name: string
+  readonly volumeId: string
+}
+
+/** Kinds of instance whose disk limit the Relay keeps here, not on Docker. */
+export type RelayDiskLimitKind = "app" | "database"
+
 export interface RelayStoredPendingPrimaryPort extends RelayInstancePendingPrimaryPort {
   readonly instanceId: string
 }
@@ -150,17 +161,37 @@ export type RelayProvisioningJobStatus =
   | "running"
   | "failed"
 
-export interface RelayProvisioningJob {
-  readonly attempt: number
-  readonly createdAt: number
-  readonly error: string | null
-  readonly idempotencyKey: string
-  readonly input: RelayCreateInstance
-  readonly instanceId: string
-  readonly placeholder: RelayInstance
-  readonly status: RelayProvisioningJobStatus
-  readonly updatedAt: number
+// What each kind of instance provisions from, and what it shows until it
+// exists: its create request and its placeholder.
+const provisioningSchemas = {
+  app: { input: relayCreateAppSchema, placeholder: relayAppSchema },
+  database: {
+    input: relayCreateDatabaseSchema,
+    placeholder: relayManagedDatabaseSchema,
+  },
+  server: { input: relayCreateInstanceSchema, placeholder: relayInstanceSchema },
 }
+
+export type RelayProvisioningKind = keyof typeof provisioningSchemas
+
+/** A job to provision one instance, of one kind. */
+export type RelayProvisioningJob<
+  Kind extends RelayProvisioningKind = RelayProvisioningKind,
+> = {
+  readonly [K in Kind]: {
+    readonly attempt: number
+    readonly createdAt: number
+    readonly error: string | null
+    readonly idempotencyKey: string
+    readonly input: z.infer<(typeof provisioningSchemas)[K]["input"]>
+    /** The ID of the instance it provisions. */
+    readonly instanceId: string
+    readonly kind: K
+    readonly placeholder: z.infer<(typeof provisioningSchemas)[K]["placeholder"]>
+    readonly status: RelayProvisioningJobStatus
+    readonly updatedAt: number
+  }
+}[Kind]
 
 export type RelayRuntimeRecoveryPhase =
   | "idle"
@@ -168,6 +199,23 @@ export type RelayRuntimeRecoveryPhase =
   | "restarting"
   | "monitoring"
   | "failed"
+
+/**
+ * A change Hearth sent under an `operationId`, kept to answer lookups. Only
+ * its outcome is kept, never its reply, which can carry secrets.
+ */
+export interface RelayOperationRecord {
+  readonly clientId: string
+  readonly errorCode: string | null
+  readonly errorMessage: string | null
+  readonly finishedAt: number | null
+  readonly operation: string
+  readonly operationId: string
+  readonly payloadSha256: string
+  readonly retryable: boolean
+  readonly startedAt: number
+  readonly status: "failed" | "interrupted" | "running" | "succeeded"
+}
 
 export interface RelayRuntimeRecoveryRecord {
   readonly attempts: number
@@ -345,6 +393,7 @@ const RelayProvisioningJobRowSchema = Schema.Struct({
   idempotencyKey: Schema.String,
   inputJson: Schema.String,
   instanceId: Schema.String,
+  kind: Schema.Literals(["server", "database", "app"]),
   placeholderJson: Schema.String,
   status: RelayProvisioningJobStatusSchema,
   updatedAt: Schema.Number,
@@ -376,6 +425,48 @@ export class RelayStateStore extends Context.Service<
     ) => Effect.Effect<void, RelayStateError>
     readonly appendAudit: (
       input: RelayAuditInput
+    ) => Effect.Effect<void, RelayStateError>
+    /**
+     * Records a change as accepted, before it does anything. Returns the
+     * record already kept under the same client and ID, if any, and records
+     * nothing then.
+     */
+    readonly startOperation: (input: {
+      readonly clientId: string
+      readonly operation: string
+      readonly operationId: string
+      readonly payloadSha256: string
+      readonly startedAt: number
+    }) => Effect.Effect<RelayOperationRecord | null, RelayStateError>
+    readonly finishOperation: (input: {
+      readonly clientId: string
+      readonly errorCode: string | null
+      readonly errorMessage: string | null
+      readonly finishedAt: number
+      readonly operationId: string
+      readonly retryable: boolean
+      readonly status: "failed" | "succeeded"
+    }) => Effect.Effect<void, RelayStateError>
+    readonly getOperation: (
+      clientId: string,
+      operationId: string
+    ) => Effect.Effect<RelayOperationRecord | null, RelayStateError>
+    /** Marks changes a Relay restart cut off, which may or may not have applied. */
+    readonly interruptRunningOperations: (
+      now: number
+    ) => Effect.Effect<void, RelayStateError>
+    readonly pruneOperations: (
+      finishedBefore: number
+    ) => Effect.Effect<void, RelayStateError>
+    /** The paired Hearths holding this Relay paused. */
+    readonly listPauseHolds: () => Effect.Effect<
+      ReadonlyArray<string>,
+      RelayStateError
+    >
+    readonly setPauseHold: (
+      clientId: string,
+      paused: boolean,
+      now: number
     ) => Effect.Effect<void, RelayStateError>
     readonly createInvitation: (
       input: RelayInvitationInput
@@ -419,6 +510,11 @@ export class RelayStateStore extends Context.Service<
     readonly claimNextBackupTask: (
       now: number
     ) => Effect.Effect<RelayBackupTask | null, RelayStateError>
+    /** Puts back a claimed task that never started, as when a pause withdrew it. */
+    readonly returnBackupTask: (
+      taskId: string,
+      now: number
+    ) => Effect.Effect<boolean, RelayStateError>
     readonly getBackupTask: (
       taskId: string
     ) => Effect.Effect<RelayBackupTask | null, RelayStateError>
@@ -459,28 +555,44 @@ export class RelayStateStore extends Context.Service<
       now: number
     ) => Effect.Effect<number, RelayStateError>
     readonly enqueueProvisioningJob: (
-      input: {
-        readonly idempotencyKey: string
-        readonly instanceId: string
-        readonly input: RelayCreateInstance
-        readonly placeholder: RelayInstance
-      },
+      input: Omit<
+        RelayProvisioningJob,
+        "attempt" | "createdAt" | "error" | "status" | "updatedAt"
+      >,
       now: number
     ) => Effect.Effect<RelayProvisioningJob, RelayStateError>
     readonly claimProvisioningJob: (
+      kind: RelayProvisioningKind,
       instanceId: string,
       now: number
     ) => Effect.Effect<RelayProvisioningJob | null, RelayStateError>
+    /**
+     * Takes the oldest queued job, passing over the kinds in `exceptKinds`,
+     * as one whose kind runs a job at a time while one is running.
+     */
     readonly claimNextProvisioningJob: (
-      now: number
+      now: number,
+      exceptKinds?: ReadonlyArray<RelayProvisioningKind>
     ) => Effect.Effect<RelayProvisioningJob | null, RelayStateError>
     readonly cancelProvisioningJob: (
+      kind: RelayProvisioningKind,
       instanceId: string
+    ) => Effect.Effect<boolean, RelayStateError>
+    /**
+     * Fails a job that hasn't started, so the worker never takes it, and
+     * answers whether the job is failed now. A running job is left alone.
+     */
+    readonly withdrawProvisioningJob: (
+      kind: RelayProvisioningKind,
+      instanceId: string,
+      error: string,
+      placeholder: RelayProvisioningJob["placeholder"],
+      now: number
     ) => Effect.Effect<boolean, RelayStateError>
     readonly failProvisioningJob: (
       instanceId: string,
       error: string,
-      placeholder: RelayInstance,
+      placeholder: RelayProvisioningJob["placeholder"],
       now: number
     ) => Effect.Effect<boolean, RelayStateError>
     readonly completeProvisioningJob: (
@@ -495,12 +607,17 @@ export class RelayStateStore extends Context.Service<
     >
     readonly updateProvisioningJobPlaceholder: (
       instanceId: string,
-      placeholder: RelayInstance,
+      placeholder: RelayProvisioningJob["placeholder"],
       now: number
     ) => Effect.Effect<boolean, RelayStateError>
     readonly requeueInterruptedProvisioningJobs: (
       now: number
     ) => Effect.Effect<number, RelayStateError>
+    /** Puts back a claimed job that never started, without using an attempt. */
+    readonly returnProvisioningJob: (
+      instanceId: string,
+      now: number
+    ) => Effect.Effect<boolean, RelayStateError>
     readonly listClients: () => Effect.Effect<
       ReadonlyArray<RelayClientRecord>,
       RelayStateError
@@ -515,6 +632,19 @@ export class RelayStateStore extends Context.Service<
       ReadonlyArray<RelayStoredInstanceName>,
       RelayStateError
     >
+    readonly listVolumeNames: () => Effect.Effect<
+      ReadonlyArray<RelayStoredVolumeName>,
+      RelayStateError
+    >
+    /** Disk limits by instance ID; one without a row has no limit. */
+    readonly listDiskLimits: (
+      kind: RelayDiskLimitKind
+    ) => Effect.Effect<ReadonlyMap<string, number>, RelayStateError>
+    readonly setDiskLimit: (
+      kind: RelayDiskLimitKind,
+      id: string,
+      bytes: number | null
+    ) => Effect.Effect<void, RelayStateError>
     readonly getRuntimeRecovery: (
       instanceId: string
     ) => Effect.Effect<RelayRuntimeRecoveryRecord | null, RelayStateError>
@@ -562,6 +692,10 @@ export class RelayStateStore extends Context.Service<
       instanceId: string,
       name: string
     ) => Effect.Effect<void, RelayStateError>
+    readonly setVolumeName: (
+      volumeId: string,
+      name: string
+    ) => Effect.Effect<void, RelayStateError>
     readonly setRuntimeRecovery: (
       recovery: RelayRuntimeRecoveryRecord
     ) => Effect.Effect<void, RelayStateError>
@@ -573,6 +707,9 @@ export class RelayStateStore extends Context.Service<
     ) => Effect.Effect<void, RelayStateError>
     readonly deleteInstanceName: (
       instanceId: string
+    ) => Effect.Effect<void, RelayStateError>
+    readonly deleteVolumeName: (
+      volumeId: string
     ) => Effect.Effect<void, RelayStateError>
     readonly deletePendingPrimaryPort: (
       instanceId: string
@@ -1047,6 +1184,65 @@ const migrations = SqliteMigrator.fromRecord({
       WHERE status <> 'running'`
     yield* sql`CREATE INDEX relay_schedule_runs_unfinished ON relay_schedule_runs (run_id) WHERE status = 'running'`
   }),
+  "19_operations": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE relay_operations (
+      client_id TEXT NOT NULL,
+      operation_id TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      payload_sha256 TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'interrupted')),
+      error_code TEXT,
+      error_message TEXT,
+      retryable INTEGER NOT NULL DEFAULT 0,
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      PRIMARY KEY (client_id, operation_id)
+    ) STRICT`
+    yield* sql`CREATE INDEX relay_operations_started ON relay_operations (started_at)`
+  }),
+  "20_pause_holds": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE relay_pause_holds (
+      client_id TEXT PRIMARY KEY NOT NULL,
+      paused_at INTEGER NOT NULL
+    ) STRICT`
+  }),
+  // Docker can't change a container's labels, so the disk limits of
+  // instances whose limits change in place live here.
+  "21_disk_limits": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE relay_disk_limits (
+      kind TEXT NOT NULL CHECK (kind IN ('app', 'database')),
+      resource_id TEXT NOT NULL,
+      disk_bytes INTEGER NOT NULL CHECK (disk_bytes > 0),
+      PRIMARY KEY (kind, resource_id)
+    ) STRICT`
+  }),
+  // Jobs provision any kind of instance; those before kinds are game
+  // servers'.
+  "22_provisioning_job_kinds": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const columns = yield* sql<{ name: string }>`
+      SELECT name FROM pragma_table_info('relay_instance_provisioning_jobs')
+    `
+    if (columns.some((column) => column.name === "kind")) return
+    yield* sql`
+      ALTER TABLE relay_instance_provisioning_jobs
+      ADD COLUMN kind TEXT NOT NULL DEFAULT 'server'
+        CHECK (kind IN ('server', 'database', 'app'))
+    `
+  }),
+  // Docker can't rename a volume or change its labels, so the names its
+  // volumes are shown by live here.
+  "23_volume_names": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE relay_volume_names (
+      volume_id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    ) STRICT`
+  }),
 })
 
 function scrubBackupTaskInputJson(inputJson: string): string {
@@ -1061,12 +1257,32 @@ function scrubBackupTaskInputJson(inputJson: string): string {
 
 const makeRelayStateStore = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
+  // In WAL mode, NORMAL commits without waiting for the disk: a Relay crash
+  // or restart loses nothing, and only a host power loss can roll back the
+  // last moments of commits. FULL cost about 2.5 ms a commit on a Relay.
+  yield* sql`PRAGMA synchronous = NORMAL`
   yield* SqliteMigrator.run({ loader: migrations })
 
   const run = <T>(operation: string, effect: Effect.Effect<T, unknown>) =>
     effect.pipe(
       Effect.mapError((cause) => RelayStateError.make({ operation, cause })),
       Effect.withSpan(`relay.state.${operation}`)
+    )
+
+  const selectOperation = (clientId: string, operationId: string) =>
+    sql<Omit<RelayOperationRecord, "retryable"> & { retryable: number }>`
+      SELECT client_id AS clientId, operation_id AS operationId,
+        operation, payload_sha256 AS payloadSha256, status,
+        error_code AS errorCode,
+        error_message AS errorMessage, retryable, started_at AS startedAt,
+        finished_at AS finishedAt
+      FROM relay_operations
+      WHERE client_id = ${clientId} AND operation_id = ${operationId}
+      LIMIT 1
+    `.pipe(
+      Effect.map((rows): RelayOperationRecord | null =>
+        rows[0] ? { ...rows[0], retryable: rows[0].retryable === 1 } : null
+      )
     )
 
   const decodeClientRows = Schema.decodeUnknownEffect(
@@ -1330,6 +1546,7 @@ const makeRelayStateStore = Effect.gen(function* () {
         ? "instanceId" in filter
           ? yield* sql<Record<string, unknown>>`
               SELECT instance_id AS instanceId,
+                     kind,
                      idempotency_key AS idempotencyKey,
                      status,
                      input_json AS inputJson,
@@ -1344,6 +1561,7 @@ const makeRelayStateStore = Effect.gen(function* () {
             `
           : yield* sql<Record<string, unknown>>`
               SELECT instance_id AS instanceId,
+                     kind,
                      idempotency_key AS idempotencyKey,
                      status,
                      input_json AS inputJson,
@@ -1358,6 +1576,7 @@ const makeRelayStateStore = Effect.gen(function* () {
             `
         : yield* sql<Record<string, unknown>>`
             SELECT instance_id AS instanceId,
+                   kind,
                    idempotency_key AS idempotencyKey,
                    status,
                    input_json AS inputJson,
@@ -1372,20 +1591,25 @@ const makeRelayStateStore = Effect.gen(function* () {
       const decoded = yield* decodeProvisioningJobRows(rows)
       return yield* Effect.forEach(decoded, (row) =>
         Effect.try({
-          try: () =>
-            ({
+          try: (): RelayProvisioningJob => {
+            const schemas = provisioningSchemas[row.kind]
+            // Each kind's input and placeholder parse with its own schemas,
+            // which TypeScript can't follow through the indexed lookup.
+            return {
               attempt: row.attempt,
               createdAt: row.createdAt,
               error: row.error,
               idempotencyKey: row.idempotencyKey,
-              input: relayCreateInstanceSchema.parse(JSON.parse(row.inputJson)),
+              input: schemas.input.parse(JSON.parse(row.inputJson)),
               instanceId: row.instanceId,
-              placeholder: relayInstanceSchema.parse(
+              kind: row.kind,
+              placeholder: schemas.placeholder.parse(
                 JSON.parse(row.placeholderJson)
               ),
               status: row.status,
               updatedAt: row.updatedAt,
-            }) satisfies RelayProvisioningJob,
+            } as RelayProvisioningJob
+          },
           catch: (cause) => cause,
         })
       )
@@ -1650,6 +1874,91 @@ const makeRelayStateStore = Effect.gen(function* () {
           WHERE relay_id = ${relayId} AND database_id = ${databaseId}
         `.pipe(Effect.asVoid)
       ),
+    startOperation: (input) =>
+      run(
+        "start_operation",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const existing = yield* selectOperation(
+              input.clientId,
+              input.operationId
+            )
+            if (existing) return existing
+            yield* sql`
+              INSERT INTO relay_operations (
+                client_id, operation_id, operation, payload_sha256, status,
+                started_at
+              ) VALUES (
+                ${input.clientId},
+                ${input.operationId},
+                ${input.operation},
+                ${input.payloadSha256},
+                'running',
+                ${input.startedAt}
+              )
+            `
+            return null
+          })
+        )
+      ),
+    finishOperation: (input) =>
+      run(
+        "finish_operation",
+        sql`
+          UPDATE relay_operations
+          SET status = ${input.status},
+              error_code = ${input.errorCode},
+              error_message = ${input.errorMessage},
+              retryable = ${input.retryable ? 1 : 0},
+              finished_at = ${input.finishedAt}
+          WHERE client_id = ${input.clientId}
+            AND operation_id = ${input.operationId}
+        `.pipe(Effect.asVoid)
+      ),
+    getOperation: (clientId, operationId) =>
+      run("get_operation", selectOperation(clientId, operationId)),
+    interruptRunningOperations: (now) =>
+      run(
+        "interrupt_running_operations",
+        sql`
+          UPDATE relay_operations
+          SET status = 'interrupted', finished_at = ${now}
+          WHERE status = 'running'
+        `.pipe(Effect.asVoid)
+      ),
+    pruneOperations: (finishedBefore) =>
+      run(
+        "prune_operations",
+        sql`
+          DELETE FROM relay_operations
+          WHERE status <> 'running' AND started_at < ${finishedBefore}
+        `.pipe(Effect.asVoid)
+      ),
+    listPauseHolds: () =>
+      run(
+        "list_pause_holds",
+        sql<{ clientId: string }>`
+          SELECT client_id AS clientId FROM relay_pause_holds
+        `.pipe(Effect.map((rows) => rows.map((row) => row.clientId)))
+      ),
+    setPauseHold: (clientId, paused, now) =>
+      run(
+        "set_pause_hold",
+        (paused
+          ? // Only while the Hearth is still paired: a pause that raced its
+            // revocation leaves no hold behind that nobody could lift.
+            sql`
+              INSERT INTO relay_pause_holds (client_id, paused_at)
+              SELECT ${clientId}, ${now}
+              WHERE EXISTS (
+                SELECT 1 FROM relay_clients
+                WHERE id = ${clientId} AND revoked_at IS NULL
+              )
+              ON CONFLICT (client_id) DO NOTHING
+            `
+          : sql`DELETE FROM relay_pause_holds WHERE client_id = ${clientId}`
+        ).pipe(Effect.asVoid)
+      ),
     appendAudit: (input) =>
       run(
         "append_audit",
@@ -1803,6 +2112,19 @@ const makeRelayStateStore = Effect.gen(function* () {
             }
           })
         )
+      ),
+    returnBackupTask: (taskId, now) =>
+      run(
+        "return_backup_task",
+        sql<{ taskId: string }>`
+          UPDATE relay_backup_tasks
+          SET status = 'queued',
+              started_at = NULL,
+              phase = NULL,
+              updated_at = ${now}
+          WHERE task_id = ${taskId} AND status = 'running'
+          RETURNING task_id AS taskId
+        `.pipe(Effect.map((rows) => rows.length > 0))
       ),
     getBackupTask: (taskId) =>
       run(
@@ -2064,10 +2386,11 @@ const makeRelayStateStore = Effect.gen(function* () {
             }
             yield* sql`
               INSERT INTO relay_instance_provisioning_jobs (
-                instance_id, idempotency_key, status, input_json,
+                instance_id, kind, idempotency_key, status, input_json,
                 placeholder_json, created_at, updated_at
               ) VALUES (
                 ${input.instanceId},
+                ${input.kind},
                 ${input.idempotencyKey},
                 'awaiting_claim',
                 ${JSON.stringify(input.input)},
@@ -2085,7 +2408,7 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
-    claimProvisioningJob: (instanceId, now) =>
+    claimProvisioningJob: (kind, instanceId, now) =>
       run(
         "claim_provisioning_job",
         sql.withTransaction(
@@ -2094,13 +2417,15 @@ const makeRelayStateStore = Effect.gen(function* () {
               UPDATE relay_instance_provisioning_jobs
               SET status = 'queued', updated_at = ${now}, error = NULL
               WHERE instance_id = ${instanceId}
+                AND kind = ${kind}
                 AND status = 'awaiting_claim'
             `
-            return (yield* provisioningJobs({ instanceId }))[0] ?? null
+            const job = (yield* provisioningJobs({ instanceId }))[0]
+            return job?.kind === kind ? job : null
           })
         )
       ),
-    claimNextProvisioningJob: (now) =>
+    claimNextProvisioningJob: (now, exceptKinds = []) =>
       run(
         "claim_next_provisioning_job",
         sql.withTransaction(
@@ -2115,6 +2440,7 @@ const makeRelayStateStore = Effect.gen(function* () {
                 SELECT instance_id
                 FROM relay_instance_provisioning_jobs
                 WHERE status = 'queued'
+                  ${exceptKinds.length > 0 ? sql`AND kind NOT IN ${sql.in(exceptKinds)}` : sql``}
                 ORDER BY created_at ASC, instance_id ASC
                 LIMIT 1
               )
@@ -2127,15 +2453,40 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
-    cancelProvisioningJob: (instanceId) =>
+    cancelProvisioningJob: (kind, instanceId) =>
       run(
         "cancel_provisioning_job",
         Effect.gen(function* () {
           const rows = yield* sql<{ instanceId: string }>`
             DELETE FROM relay_instance_provisioning_jobs
             WHERE instance_id = ${instanceId}
+              AND kind = ${kind}
               AND status IN ('awaiting_claim', 'queued', 'failed')
             RETURNING instance_id AS instanceId
+          `
+          return rows.length > 0
+        })
+      ),
+    withdrawProvisioningJob: (kind, instanceId, error, placeholder, now) =>
+      run(
+        "withdraw_provisioning_job",
+        Effect.gen(function* () {
+          yield* sql`
+            UPDATE relay_instance_provisioning_jobs
+            SET status = 'failed',
+                placeholder_json = ${JSON.stringify(placeholder)},
+                error = ${error.slice(0, 2_048)},
+                updated_at = ${now}
+            WHERE instance_id = ${instanceId}
+              AND kind = ${kind}
+              AND status IN ('awaiting_claim', 'queued')
+          `
+          const rows = yield* sql<{ instanceId: string }>`
+            SELECT instance_id AS instanceId
+            FROM relay_instance_provisioning_jobs
+            WHERE instance_id = ${instanceId}
+              AND kind = ${kind}
+              AND status = 'failed'
           `
           return rows.length > 0
         })
@@ -2212,6 +2563,18 @@ const makeRelayStateStore = Effect.gen(function* () {
           `
           return true
         })
+      ),
+    returnProvisioningJob: (instanceId, now) =>
+      run(
+        "return_provisioning_job",
+        sql<{ instanceId: string }>`
+          UPDATE relay_instance_provisioning_jobs
+          SET status = 'queued',
+              attempt = attempt - 1,
+              updated_at = ${now}
+          WHERE instance_id = ${instanceId} AND status = 'running'
+          RETURNING instance_id AS instanceId
+        `.pipe(Effect.map((rows) => rows.length > 0))
       ),
     requeueInterruptedProvisioningJobs: (now) =>
       run(
@@ -2591,8 +2954,44 @@ const makeRelayStateStore = Effect.gen(function* () {
           ORDER BY instance_id ASC
         `
       ),
+    listVolumeNames: () =>
+      run(
+        "list_volume_names",
+        sql<RelayStoredVolumeName>`
+          SELECT volume_id AS volumeId, name
+          FROM relay_volume_names
+          ORDER BY volume_id ASC
+        `
+      ),
     listRuntimeRecoveries: () =>
       run("list_runtime_recoveries", runtimeRecoveries()),
+    listDiskLimits: (kind) =>
+      run(
+        "list_disk_limits",
+        sql<{ id: string; bytes: number }>`
+          SELECT resource_id AS id, disk_bytes AS bytes
+          FROM relay_disk_limits
+          WHERE kind = ${kind}
+        `.pipe(
+          Effect.map((rows) => new Map(rows.map((row) => [row.id, row.bytes])))
+        )
+      ),
+    setDiskLimit: (kind, id, bytes) =>
+      run(
+        "set_disk_limit",
+        (bytes === null
+          ? sql`
+              DELETE FROM relay_disk_limits
+              WHERE kind = ${kind} AND resource_id = ${id}
+            `
+          : sql`
+              INSERT INTO relay_disk_limits (kind, resource_id, disk_bytes)
+              VALUES (${kind}, ${id}, ${bytes})
+              ON CONFLICT (kind, resource_id) DO UPDATE
+              SET disk_bytes = excluded.disk_bytes
+            `
+        ).pipe(Effect.asVoid)
+      ),
     getPendingPrimaryPort: (instanceId) =>
       run(
         "get_pending_primary_port",
@@ -2710,6 +3109,8 @@ const makeRelayStateStore = Effect.gen(function* () {
               SET revoked_at = ${revokedAt}
               WHERE id = ${clientId} AND revoked_at IS NULL
             `
+            // A revoked Hearth no longer holds the Relay paused.
+            yield* sql`DELETE FROM relay_pause_holds WHERE client_id = ${clientId}`
             return true
           })
         )
@@ -2755,6 +3156,16 @@ const makeRelayStateStore = Effect.gen(function* () {
           INSERT INTO relay_instance_names (instance_id, name, updated_at)
           VALUES (${instanceId}, ${name}, ${Date.now()})
           ON CONFLICT (instance_id) DO UPDATE
+          SET name = excluded.name, updated_at = excluded.updated_at
+        `.pipe(Effect.asVoid)
+      ),
+    setVolumeName: (volumeId, name) =>
+      run(
+        "set_volume_name",
+        sql`
+          INSERT INTO relay_volume_names (volume_id, name, updated_at)
+          VALUES (${volumeId}, ${name}, ${Date.now()})
+          ON CONFLICT (volume_id) DO UPDATE
           SET name = excluded.name, updated_at = excluded.updated_at
         `.pipe(Effect.asVoid)
       ),
@@ -2839,6 +3250,13 @@ const makeRelayStateStore = Effect.gen(function* () {
         "delete_instance_name",
         sql`
           DELETE FROM relay_instance_names WHERE instance_id = ${instanceId}
+        `.pipe(Effect.asVoid)
+      ),
+    deleteVolumeName: (volumeId) =>
+      run(
+        "delete_volume_name",
+        sql`
+          DELETE FROM relay_volume_names WHERE volume_id = ${volumeId}
         `.pipe(Effect.asVoid)
       ),
     deleteRuntimeRecovery: (instanceId) =>

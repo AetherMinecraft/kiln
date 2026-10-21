@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
 import {
@@ -7,6 +7,9 @@ import {
   appNameSchema,
   appServiceNameSchema,
   databaseIdSchema,
+  appServiceLimitsSchema,
+  relayAppLimitsV1Feature,
+  relayAppProvisioningV1Feature,
   relayAppSchema,
   relayAppTerminalClaimSchema,
   relayAppTerminalRestartSchema,
@@ -25,8 +28,9 @@ import {
   deleteAppRecordEffect,
   listAppRecordsEffect,
   renameAppRecordEffect,
-  saveAppConfigEffect,
+  updateAppConfigEffect,
 } from "@/effect/managed-apps"
+import { promiseEffect } from "@/effect/promise"
 import { runAppEffect } from "@/effect/runtime"
 import {
   isPlatformAdmin,
@@ -35,6 +39,10 @@ import {
 } from "@/lib/access-control"
 import { accessPermissions } from "@/lib/permissions"
 import type { AccessPermission } from "@/lib/permissions"
+import {
+  abandonPreparedProvisioning,
+  claimPreparedProvisioning,
+} from "@/lib/provisioning.server"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import {
@@ -58,9 +66,16 @@ const appActionInputSchema = appInputSchema.extend({
   action: z.enum(["start", "stop", "restart"]),
 })
 // Databases change through the network, which also connects running
-// containers; everything else waits for the next deployment.
+// containers, and limits through their own update, which applies them to
+// running ones; everything else waits for the next deployment.
 const appConfigInputSchema = appInputSchema.extend({
-  config: appConfigSchema.omit({ databaseIds: true }).partial(),
+  config: appConfigSchema
+    .omit({ databaseIds: true, diskLimitBytes: true, serviceLimits: true })
+    .partial(),
+})
+const appLimitsInputSchema = appInputSchema.extend({
+  diskLimitBytes: appConfigSchema.shape.diskLimitBytes.unwrap(),
+  serviceLimits: appServiceLimitsSchema,
 })
 const appRenameInputSchema = appInputSchema.extend({ name: appNameSchema })
 const appNetworkInputSchema = appInputSchema.extend({
@@ -162,6 +177,8 @@ export const getAppOwnerMinecraftProfileId = createServerFn({ method: "GET" })
     )
   )
 
+const cancelledSchema = z.object({ cancelled: z.boolean() })
+
 export const createApp = createServerFn({ method: "POST" })
   .validator(createAppInputSchema)
   .handler(async ({ data }) => {
@@ -182,16 +199,7 @@ export const createApp = createServerFn({ method: "POST" })
       )
     }
     const id = randomBytes(20).toString("hex")
-    const created = relayAppSchema.parse(
-      await databaseRpc(
-        relay,
-        "app.create",
-        { id, name: data.name },
-        60_000,
-        user.id
-      )
-    )
-    const persisted = await promiseResult(() =>
+    const register = () =>
       runAppEffect(
         "apps.record.create",
         createAppRecordEffect({
@@ -201,7 +209,67 @@ export const createApp = createServerFn({ method: "POST" })
           relayId: relay.id,
         })
       )
+    const { relayConnectionFeatures } = await import("@/lib/relay-connection")
+    if (relayConnectionFeatures(relay.id).has(relayAppProvisioningV1Feature)) {
+      // The Relay creates it in the background; it opens on its
+      // provisioning page at once.
+      const cancel = () =>
+        databaseRpc(
+          relay,
+          "app.provision.cancel",
+          { appId: id },
+          30_000,
+          user.id
+        ).then((result) => cancelledSchema.parse(result).cancelled)
+      const unregister = () =>
+        runAppEffect("apps.record.delete", deleteAppRecordEffect(relay.id, id))
+      // Recorded first, so a job the Relay holds always has an app in
+      // Hearth to show it and delete it from.
+      await register()
+      const placeholder = await Effect.runPromise(
+        promiseEffect(() =>
+          databaseRpc(
+            relay,
+            "app.provision.prepare",
+            { id, idempotencyKey: randomUUID(), name: data.name },
+            30_000,
+            user.id
+          )
+        ).pipe(
+          Effect.map((value) => relayAppSchema.parse(value)),
+          Effect.tapError(() => abandonPreparedProvisioning(cancel, unregister))
+        )
+      )
+      await claimPreparedProvisioning({
+        cancel,
+        claim: () =>
+          databaseRpc(
+            relay,
+            "app.provision.claim",
+            { appId: id },
+            30_000,
+            user.id
+          ),
+        unconfirmed: "If it stays waiting, delete it and create it again.",
+        unregister,
+      })
+      publishAppChange(relay.id, true)
+      return {
+        id: placeholder.id,
+        relayId: relay.id,
+        shortId: placeholder.shortId,
+      }
+    }
+    const created = relayAppSchema.parse(
+      await databaseRpc(
+        relay,
+        "app.create",
+        { id, name: data.name },
+        60_000,
+        user.id
+      )
     )
+    const persisted = await promiseResult(register)
     if (Result.isFailure(persisted)) {
       await ignorePromise(() =>
         databaseRpc(
@@ -221,11 +289,13 @@ export const createApp = createServerFn({ method: "POST" })
 export const updateAppConfig = createServerFn({ method: "POST" })
   .validator(appConfigInputSchema)
   .handler(async ({ data }) => {
-    const { app } = await authorizedApp(data, "app.manage")
-    const config = appConfigSchema.parse({ ...app.config, ...data.config })
-    await runAppEffect(
+    await authorizedApp(data, "app.manage")
+    // Only the fields this edit changes, into the config saved now.
+    const config = await runAppEffect(
       "apps.config.save",
-      saveAppConfigEffect(data.relayId, data.appId, config)
+      updateAppConfigEffect(data.relayId, data.appId, (current) =>
+        appConfigSchema.parse({ ...current, ...data.config })
+      )
     )
     publishAppChange(data.relayId, false)
     return { config }
@@ -245,23 +315,62 @@ export const renameApp = createServerFn({ method: "POST" })
     return { name: data.name }
   })
 
-// Deploys the saved configuration. The Relay answers once the deployment
-// starts; its log and the app's state follow it from there.
+// Deploys the saved configuration, a GitHub app its branch's head. The
+// Relay answers once the deployment starts; its log and the app's state
+// follow it from there, and Hearth records how it ends.
 export const deployApp = createServerFn({ method: "POST" })
   .validator(appInputSchema)
   .handler(async ({ data }) => {
-    const { app, relay, user } = await authorizedApp(data, "app.manage")
-    const deployed = relayAppSchema.parse(
+    const { relay, user } = await authorizedApp(data, "app.manage")
+    const { startAppDeploymentEffect } = await import(
+      "@/lib/app-deployments.server"
+    )
+    const started = await runAppEffect(
+      "apps.deploy",
+      startAppDeploymentEffect({
+        appId: data.appId,
+        relayId: relay.id,
+        trigger: "manual",
+        userId: user.id,
+      })
+    )
+    publishAppChange(relay.id, false)
+    return started!.app
+  })
+
+// Saves the app's limits and applies them to its running containers. A
+// removed memory or CPU limit applies when the app next deploys.
+export const updateAppLimits = createServerFn({ method: "POST" })
+  .validator(appLimitsInputSchema)
+  .handler(async ({ data }) => {
+    const { relay, user } = await authorizedApp(data, "app.manage")
+    if (!(await relayAppLimitsSupported(relay.id))) {
+      throw new Error("Update this Relay to set app limits")
+    }
+    const limits = appConfigSchema
+      .pick({ diskLimitBytes: true, serviceLimits: true })
+      .parse(data)
+    // Saved once the Relay applies them, so limits it refuses aren't used
+    // by the next deployment, and into the config saved by then, so other
+    // edits made meanwhile stay.
+    const updated = relayAppSchema.parse(
       await databaseRpc(
         relay,
-        "app.deploy",
-        { appId: data.appId, config: app.config, name: app.name },
-        30_000,
+        "app.limits.write",
+        { appId: data.appId, ...limits },
+        60_000,
         user.id
       )
     )
+    await runAppEffect(
+      "apps.limits.save",
+      updateAppConfigEffect(data.relayId, data.appId, (config) => ({
+        ...config,
+        ...limits,
+      }))
+    )
     publishAppChange(relay.id, false)
-    return deployed
+    return updated
   })
 
 export const runAppAction = createServerFn({ method: "POST" })
@@ -298,10 +407,12 @@ export const updateAppNetwork = createServerFn({ method: "POST" })
         user,
       })
     }
-    const config = { ...app.config, databaseIds: [...after] }
-    await runAppEffect(
+    const config = await runAppEffect(
       "apps.network.save",
-      saveAppConfigEffect(relay.id, data.appId, config)
+      updateAppConfigEffect(relay.id, data.appId, (current) => ({
+        ...current,
+        databaseIds: [...after],
+      }))
     )
     const updated = relayAppSchema.parse(
       await databaseRpc(
@@ -461,4 +572,9 @@ async function ignorePromise(run: () => Promise<unknown>): Promise<void> {
   await Effect.runPromise(
     Effect.tryPromise({ try: run, catch: (cause) => cause }).pipe(Effect.ignore)
   )
+}
+
+async function relayAppLimitsSupported(relayId: string): Promise<boolean> {
+  const { relayConnectionFeatures } = await import("@/lib/relay-connection")
+  return relayConnectionFeatures(relayId).has(relayAppLimitsV1Feature)
 }

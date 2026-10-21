@@ -1,13 +1,19 @@
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
+import { useHydrated } from "@tanstack/react-router"
 
-import type { RelayProxyDiagnostics } from "@workspace/contracts"
+import type {
+  InstanceInventory,
+  InstanceObservation,
+  RelayProxyDiagnostics,
+} from "@workspace/contracts"
 
 import {
   relayStatusPresentation,
   type InstanceStatusPresentation,
   type RelayIdentityStatus,
 } from "@/components/instance-name-presentation"
+import { instanceInventoryQueryOptions } from "@/lib/instance-inventory"
 import {
   relayConnectionQueryOptions,
   type RelayConnection,
@@ -21,13 +27,22 @@ export interface RelayLiveStatus {
 }
 
 // A Relay's status from its entry in the shared connection poll, or `missing`
-// while the poll has no entry for it.
+// while the poll has no entry for it. Whether it's paused comes from what the
+// Relay reports (`observed`): a Relay paused here is `pausing` until it has
+// the pause, and one another Hearth paused is paused too.
 export function relayLiveState(
   enabled: boolean,
   state: { status: string; updating?: boolean } | null | undefined,
-  missing: "checking" | "unknown"
+  missing: "checking" | "unknown",
+  observed?: InstanceObservation["reachability"]
 ): { relayStatus: RelayIdentityStatus; updating: boolean } {
-  if (!enabled) return { relayStatus: "paused", updating: false }
+  if (observed === "paused") return { relayStatus: "paused", updating: false }
+  if (!enabled) {
+    return {
+      relayStatus: observed === "pausing" ? "pausing" : "checking",
+      updating: false,
+    }
+  }
   const status = state?.status
   return {
     relayStatus:
@@ -58,12 +73,20 @@ export function useRelayLiveStatus(relay: {
     notifyOnChangeProps: ["data", "isPending"],
     select,
   })
+  const observed = useRelayPauseState(relay.id)
+  // The check streams into a page while Hearth renders it, so it can arrive
+  // before the browser hydrates. Until then it reads as Hearth rendered it,
+  // still checking, so the two renders match.
+  const hydrated = useHydrated()
+  const known = hydrated ? state : undefined
+  const checking = isPending || !hydrated
   // Structural sharing keeps `state` stable while the Relay's state is.
   return React.useMemo(() => {
     const { relayStatus, updating } = relayLiveState(
       relay.enabled,
-      state,
-      isPending ? "checking" : "unknown"
+      known,
+      checking ? "checking" : "unknown",
+      observed
     )
     return {
       connected: relayStatus === "connected",
@@ -76,7 +99,36 @@ export function useRelayLiveStatus(relay: {
       relayStatus,
       updating,
     }
-  }, [isPending, relay.enabled, relay.lastError, state])
+  }, [checking, known, observed, relay.enabled, relay.lastError])
+}
+
+/**
+ * Whether the Relay reports itself paused (`paused`), or is paused here but
+ * hasn't taken it yet (`pausing`). The connection poll leaves out paused
+ * Relays and doesn't say whether a Relay is paused; its inventory does.
+ */
+export function useRelayPauseState(
+  relayId: string
+): "paused" | "pausing" | undefined {
+  const { data } = useQuery({
+    ...instanceInventoryQueryOptions(
+      { id: relayId, kind: "relay", relayId },
+      "status"
+    ),
+    notifyOnChangeProps: ["data"],
+    select: selectPauseState,
+  })
+  return data
+}
+
+// Only the pause, so other inventory changes don't re-render.
+function selectPauseState(
+  inventory: InstanceInventory
+): "paused" | "pausing" | undefined {
+  const { reachability } = inventory.observation
+  return reachability === "paused" || reachability === "pausing"
+    ? reachability
+    : undefined
 }
 
 export const proxyModeLabels = {

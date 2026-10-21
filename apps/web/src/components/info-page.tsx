@@ -102,7 +102,7 @@ export function InfoSection({
           children != null && "border-b"
         )}
       >
-        <h3 className="flex shrink-0 items-center gap-2 text-sm font-semibold [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground">
+        <h3 className="flex shrink-0 items-center gap-2 text-sm font-semibold [&_svg]:size-4 [&_svg]:shrink-0 [&_svg:not([class*='text-'])]:text-muted-foreground">
           {icon}
           <span>{title}</span>
         </h3>
@@ -243,11 +243,14 @@ export function InfoDetailRow({
 }
 
 export function InfoCopyValue({
+  className,
   display,
   label,
   mono = true,
   value,
 }: {
+  // Such as a quieter hover where the value isn't a link-like accent.
+  className?: string
   // Shown in place of a value too long to read in the row, such as "Copy
   // path"; the value is still what's copied, and shows on hover.
   display?: string
@@ -267,7 +270,8 @@ export function InfoCopyValue({
           className={cn(
             "flex min-w-0 items-center gap-1.5 transition-colors",
             mono && "font-mono text-xs",
-            copied ? "text-emerald-400" : "hover:text-primary"
+            copied ? "text-emerald-400" : "hover:text-primary",
+            !copied && className
           )}
           onClick={() => void copy()}
         >
@@ -489,7 +493,7 @@ function InfoRailRowContent({
   const inCard = React.useContext(InfoRailInCardContext)
   return (
     <>
-      <span className="flex w-6 shrink-0 items-center font-semibold tabular-nums [&_svg]:size-3.5 [&_svg]:text-muted-foreground">
+      <span className="flex w-6 shrink-0 items-center font-semibold tabular-nums [&_svg]:size-3.5 [&_svg:not([class*='text-'])]:text-muted-foreground">
         {leading}
       </span>
       <span className="min-w-0 flex-1 truncate text-muted-foreground transition-colors group-hover:text-foreground">
@@ -602,22 +606,30 @@ export const InfoRailLink = createLink(InfoRailLinkAnchor)
 export function InfoRailCard({
   action,
   children,
+  className,
   icon,
+  sections,
   summary,
   title,
 }: {
   // At the end of the title row, such as a pager between containers.
   action?: React.ReactNode
   children: React.ReactNode
+  // Such as stretching the card to the rail's height.
+  className?: string
   icon: React.ReactNode
+  // Titled parts below the facts, such as an InfoRailCardSection.
+  sections?: React.ReactNode
   // Shown above the facts, such as usage bars.
   summary?: React.ReactNode
   title: string
 }) {
   return (
-    <section className="mt-6 border bg-background/45 first:mt-0">
+    <section
+      className={cn("mt-6 border bg-background/45 first:mt-0", className)}
+    >
       <div className="flex min-h-10 items-center gap-2 border-b px-3 py-1.5">
-        <h3 className="flex min-w-0 items-center gap-2 text-[0.8125rem] font-semibold [&_svg]:size-3.5 [&_svg]:shrink-0 [&_svg]:text-muted-foreground">
+        <h3 className="flex min-w-0 items-center gap-2 text-[0.8125rem] font-semibold [&_svg]:size-3.5 [&_svg]:shrink-0 [&_svg:not([class*='text-'])]:text-muted-foreground">
           {icon}
           <span className="truncate">{title}</span>
         </h3>
@@ -629,6 +641,42 @@ export function InfoRailCard({
         <div className="border-b border-border/60 px-3">{summary}</div>
       ) : null}
       <dl className="px-3">{children}</dl>
+      {sections}
+    </section>
+  )
+}
+
+// A titled part of a rail card below its facts, such as a list: a small-caps
+// label, then its content under a rule, inset by the card's padding.
+export function InfoRailCardSection({
+  action,
+  children,
+  className,
+  contentClassName,
+  title,
+}: {
+  // At the end of the label row, such as a count.
+  action?: React.ReactNode
+  // Its own markup, such as a list, rather than facts.
+  children: React.ReactNode
+  className?: string
+  // Such as a height cap that scrolls a long list.
+  contentClassName?: string
+  title: string
+}) {
+  return (
+    <section className={cn("border-t px-3 pb-3", className)}>
+      <div className="flex h-9 shrink-0 items-center gap-2">
+        <h4 className="type-technical-label text-muted-foreground/80">
+          {title}
+        </h4>
+        {action ? (
+          <div className="ml-auto flex shrink-0 items-center">{action}</div>
+        ) : null}
+      </div>
+      <div className={cn("border-t border-border/60", contentClassName)}>
+        {children}
+      </div>
     </section>
   )
 }

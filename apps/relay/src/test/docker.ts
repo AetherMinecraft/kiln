@@ -64,6 +64,7 @@ export interface FakeContainer {
   openStdin: boolean
   restartPolicy: string
   memoryBytes: number
+  nanoCpus: number
   mounts: Array<FakeMount>
   portBindings: PortBindings
   networkMode: string
@@ -138,6 +139,11 @@ export interface FakeNetwork {
 export interface FakeVolume {
   readonly name: string
   readonly labels: Record<string, string>
+  /**
+   * `local` unless set. Docker's disk usage leaves out volumes of other
+   * drivers, as it does local ones with mount options.
+   */
+  driver?: string
   /** File contents written into the volume, keyed by path inside it. */
   readonly files: Map<string, string>
 }
@@ -155,6 +161,7 @@ export interface ContainerSeed {
   restartPolicy?: string
   tty?: boolean
   memoryBytes?: number
+  nanoCpus?: number
   running?: boolean
   exitCode?: number
   oomKilled?: boolean
@@ -226,6 +233,14 @@ export class FakeDocker {
   readonly imageTags = new Map<string, string>()
   /** Images whose health check fails once they start. */
   readonly unhealthyImages = new Set<string>()
+  /**
+   * How a health-checked container of an image reports its health as it
+   * runs: each entry holds from `afterMs` past its start.
+   */
+  readonly healthTimelines = new Map<
+    string,
+    Array<{ afterMs: number; health: "healthy" | "starting" | "unhealthy" }>
+  >()
   /**
    * Images whose process exits as soon as it starts. Under a restart policy
    * Docker keeps restarting them, reporting them running and restarting.
@@ -299,6 +314,7 @@ export class FakeDocker {
     this.imageConfigs.clear()
     this.imageTags.clear()
     this.unhealthyImages.clear()
+    this.healthTimelines.clear()
     this.crashingImages.clear()
     this.programFailures.clear()
     this.streamErrors.clear()
@@ -355,6 +371,7 @@ export class FakeDocker {
       openStdin: seed.tty ?? false,
       restartPolicy: seed.restartPolicy ?? "no",
       memoryBytes: seed.memoryBytes ?? 0,
+      nanoCpus: seed.nanoCpus ?? 0,
       mounts: [...(seed.mounts ?? [])],
       portBindings: structuredClone(seed.portBindings ?? {}),
       networkMode: seed.networks?.[0] ?? "bridge",
@@ -582,7 +599,16 @@ export class FakeDocker {
       executable === "docker-compose" &&
       arguments_.slice(-4).join(" ") === "up --detach --build --remove-orphans"
     ) {
-      return this.#composeUp(arguments_, input ?? "")
+      return this.#composeUp(arguments_, input ?? "", true)
+    }
+    if (
+      executable === "docker-compose" &&
+      arguments_.slice(-4).join(" ") === "up --no-start --build --remove-orphans"
+    ) {
+      return this.#composeUp(arguments_, input ?? "", false)
+    }
+    if (executable === "docker-compose" && arguments_.at(-1) === "start") {
+      return this.#composeStart(arguments_)
     }
     return this.#unsupported(`${executable} ${arguments_.join(" ")}`)
   }
@@ -607,18 +633,33 @@ export class FakeDocker {
     }
   }
 
-  // `docker-compose … -p <project> … up --detach --build --remove-orphans`
-  // with the project on stdin: each service's container, replacing the
-  // project's previous ones.
-  #composeUp(arguments_: ReadonlyArray<string>, input: string): CommandResult {
+  // `docker-compose … -p <project> … up [--detach|--no-start] --build
+  // --remove-orphans` with the project on stdin: each service's container,
+  // replacing the project's previous ones, started unless `--no-start`.
+  #composeUp(
+    arguments_: ReadonlyArray<string>,
+    input: string,
+    start: boolean
+  ): CommandResult {
     const project = arguments_[arguments_.indexOf("-p") + 1] ?? ""
     const definition = JSON.parse(input) as {
+      networks?: Record<string, { external?: boolean; name?: string } | null>
       services: Record<
         string,
         {
           container_name?: string
+          cpus?: number
+          healthcheck?: { disable?: boolean; test?: unknown }
           image?: string
           labels?: Record<string, string>
+          mem_limit?: number
+          networks?: Record<string, { aliases?: Array<string> } | null>
+          volumes?: Array<{
+            read_only?: boolean
+            source?: string
+            target: string
+            type: string
+          }>
         }
       >
     }
@@ -630,18 +671,77 @@ export class FakeDocker {
     const lines: Array<string> = []
     for (const [service, settings] of Object.entries(definition.services)) {
       const name = settings.container_name ?? `${project}-${service}-1`
+      const image = settings.image ?? `${project}-${service}`
+      const imageConfig = this.imageConfigs.get(image) as
+        | { Healthcheck?: unknown; Volumes?: Record<string, object> }
+        | undefined
       this.addContainer({
-        image: settings.image ?? `${project}-${service}`,
+        image,
         labels: {
           ...settings.labels,
           "com.docker.compose.oneoff": "False",
           "com.docker.compose.project": project,
           "com.docker.compose.service": service,
         },
+        mounts: [
+          // Its binds, as the host path Docker gets.
+          ...(settings.volumes ?? []).flatMap((volume) =>
+            volume.type === "bind" && volume.source
+              ? [
+                  {
+                    destination: volume.target,
+                    readOnly: volume.read_only ?? false,
+                    source: volume.source,
+                    type: "bind" as const,
+                  },
+                ]
+              : []
+          ),
+          // Volumes its image declares, each new and empty.
+          ...Object.keys(imageConfig?.Volumes ?? {}).map((destination) => ({
+            anonymous: true,
+            destination,
+            source: randomBytes(32).toString("hex"),
+            type: "volume" as const,
+          })),
+        ],
         name,
-        running: true,
       })
-      lines.push(` Container ${name}  Started`)
+      // As Compose sets them on the container.
+      const created = this.container(name)
+      if (created) {
+        created.memoryBytes = settings.mem_limit ?? 0
+        created.nanoCpus = Math.round((settings.cpus ?? 0) * 1e9)
+        created.healthCheck = settings.healthcheck
+          ? !settings.healthcheck.disable
+          : imageConfig?.Healthcheck !== undefined
+        // The external networks it joins, under its aliases and, as Compose
+        // adds it, its service's name; the project's own networks aren't
+        // modelled.
+        for (const [key, endpoint] of Object.entries(settings.networks ?? {})) {
+          const network = definition.networks?.[key]
+          if (!network?.external || !network.name) continue
+          if (!this.networks.has(network.name)) continue
+          created.networks.set(network.name, {
+            aliases: [...(endpoint?.aliases ?? []), service, name],
+            ipAddress: "",
+          })
+        }
+        if (start) this.#start(created)
+      }
+      lines.push(` Container ${name}  ${start ? "Started" : "Created"}`)
+    }
+    return { stderr: `${lines.join("\n")}\n`, stdout: "" }
+  }
+
+  // `docker-compose … -p <project> … start`: the project's containers.
+  #composeStart(arguments_: ReadonlyArray<string>): CommandResult {
+    const project = arguments_[arguments_.indexOf("-p") + 1] ?? ""
+    const lines: Array<string> = []
+    for (const container of this.containers.values()) {
+      if (container.labels["com.docker.compose.project"] !== project) continue
+      if (!container.state.running) this.#start(container)
+      lines.push(` Container ${container.name}  Started`)
     }
     return { stderr: `${lines.join("\n")}\n`, stdout: "" }
   }
@@ -712,6 +812,14 @@ export class FakeDocker {
   // ------------------------------------------------------------- inspection
 
   #containerObject(reference: string): unknown {
+    const found = this.container(reference)
+    const timeline = found && this.healthTimelines.get(found.image)
+    if (found?.state.running && found.healthCheck && timeline) {
+      const running = Date.now() - Date.parse(found.state.startedAt)
+      found.state.health =
+        [...timeline].reverse().find((entry) => entry.afterMs <= running)
+          ?.health ?? "starting"
+    }
     const container = this.container(reference)
     if (!container) return undefined
     const binds = container.mounts
@@ -756,6 +864,7 @@ export class FakeDocker {
         Binds: binds,
         Memory: container.memoryBytes,
         Mounts: volumeMounts,
+        NanoCpus: container.nanoCpus,
         NetworkMode: container.networkMode,
         PortBindings: container.portBindings,
         VolumesFrom: container.volumesFrom.length ? container.volumesFrom : null,
@@ -893,6 +1002,7 @@ export class FakeDocker {
     memoryBytes: number
     mounts: Array<FakeMount>
     name: string | undefined
+    nanoCpus: number
     networkMode: string | undefined
     networks: Array<{ aliases: Array<string>; ipAddress: string; name: string }>
     portBindings: PortBindings
@@ -920,6 +1030,7 @@ export class FakeDocker {
       memoryBytes: input.memoryBytes,
       mounts: input.mounts,
       name,
+      nanoCpus: input.nanoCpus,
       portBindings: input.portBindings,
       restartPolicy: input.restartPolicy,
       tty: input.tty,
@@ -1441,10 +1552,25 @@ export class FakeDocker {
       method === "POST" &&
       (parameters = route(/^\/containers\/([^/]+)\/update$/u))
     ) {
-      const update = JSON.parse(body) as { RestartPolicy?: { Name?: string } }
+      const update = JSON.parse(body) as {
+        Memory?: number
+        MemorySwap?: number
+        NanoCpus?: number
+        RestartPolicy?: { Name?: string }
+      }
       const policy = update.RestartPolicy?.Name
-      if (policy === undefined) return this.#unsupported(`POST ${path} ${body}`)
-      await this.#setRestartPolicy(parameters[0] ?? "", policy)
+      if (policy !== undefined) {
+        await this.#setRestartPolicy(parameters[0] ?? "", policy)
+        return json(200, { Warnings: [] })
+      }
+      if (update.Memory === undefined && update.NanoCpus === undefined) {
+        return this.#unsupported(`POST ${path} ${body}`)
+      }
+      await this.#checkpoint("update", parameters[0] ?? "")
+      const container = this.#requiredContainer(parameters[0] ?? "")
+      // As Docker, 0 leaves a limit as it is.
+      if (update.Memory) container.memoryBytes = update.Memory
+      if (update.NanoCpus) container.nanoCpus = update.NanoCpus
       return json(200, { Warnings: [] })
     }
     if (
@@ -1591,14 +1717,18 @@ export class FakeDocker {
           .map((volume) => ({
             Driver: "local",
             Labels: volume.labels,
+            Mountpoint: `/var/lib/docker/volumes/${volume.name}/_data`,
             Name: volume.name,
           })),
       })
     }
     // Each volume is as big as the files written into it.
     if (method === "GET" && path === "/system/df") {
+      await this.#checkpoint("system df")
       return json(200, {
-        Volumes: [...this.volumes.values()].map((volume) => ({
+        Volumes: [...this.volumes.values()]
+          .filter((volume) => (volume.driver ?? "local") === "local")
+          .map((volume) => ({
           Name: volume.name,
           UsageData: {
             RefCount: 0,
@@ -1868,14 +1998,20 @@ export class FakeDocker {
           (entry) => splitOnce(entry, "=") as [string, string]
         )
       ),
+      // Its own, or its image's.
       healthCheck:
-        body.Healthcheck !== undefined && body.Healthcheck.Test?.[0] !== "NONE",
+        body.Healthcheck !== undefined
+          ? body.Healthcheck.Test?.[0] !== "NONE"
+          : this.#imageKey(body.Image) !== undefined &&
+            this.imageConfigs.get(this.#imageKey(body.Image)!)?.Healthcheck !==
+              undefined,
       image: body.Image,
       interactive: body.OpenStdin ?? false,
       labels: { ...body.Labels },
       memoryBytes: host.Memory ?? 0,
       mounts,
       name,
+      nanoCpus: host.NanoCpus ?? 0,
       networkMode: host.NetworkMode,
       networks: Object.entries(endpoints)
         .filter(([network]) => !isNetworkMode(network))
@@ -2188,6 +2324,7 @@ interface CreateBody {
     VolumesFrom?: Array<string> | null
     Binds?: Array<string> | null
     Memory?: number
+    NanoCpus?: number
     Mounts?: Array<{
       ReadOnly?: boolean
       Source?: string
@@ -2345,6 +2482,14 @@ function containerSummary(container: FakeContainer): unknown {
     Id: container.id,
     Image: container.image,
     Labels: container.labels,
+    // As `docker ps` reports them; anonymous volumes have hex names too.
+    Mounts: container.mounts.map((mount) => ({
+      Destination: mount.destination,
+      Name: mount.type === "volume" ? mount.source : undefined,
+      RW: !mount.readOnly,
+      Source: mount.source,
+      Type: mount.type,
+    })),
     Names: [`/${container.name}`],
     Ports: Object.entries(container.portBindings).flatMap(([port, hosts]) => {
       const [privatePort = "0", type = "tcp"] = port.split("/")

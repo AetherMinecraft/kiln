@@ -2,7 +2,11 @@ import type { RowDataPacket } from "mysql2/promise"
 import { Clock, Effect, Option, Schema } from "effect"
 
 import { Database } from "@/effect/database"
-import { CredentialError, ResourceNotFoundError } from "@/effect/errors"
+import {
+  CredentialError,
+  DomainConfigurationError,
+  ResourceNotFoundError,
+} from "@/effect/errors"
 import { databaseTable } from "@/lib/database-config"
 import { domainBlacklistPatternsSchema } from "@/lib/domain-schemas"
 import { betterAuthSecrets } from "@/lib/environment"
@@ -15,16 +19,31 @@ const decodeJsonString = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Unknown)
 )
 
+export type DomainAssignmentStrategy = "balanced" | "default" | "random"
+
+/** A domain Kiln can create `<vanity>.<domain>` names under. */
+export interface ManagedDomain {
+  domain: string
+  /**
+   * Offered to new game servers. A disabled domain still serves, syncs, and
+   * renames the game server domains already on it.
+   */
+  enabled: boolean
+  isDefault: boolean
+  zoneId: string
+  zoneName: string
+}
+
 export interface DomainIntegration {
   blacklistPatterns: Array<string>
-  domain: string
+  /** The default first, then enabled domains, each sorted by name. */
+  domains: Array<ManagedDomain>
   enabled: boolean
   id: string
   lastError: string | null
   lastVerifiedAt: string | null
   provider: "cloudflare"
-  zoneId: string
-  zoneName: string
+  strategy: DomainAssignmentStrategy
 }
 
 export interface CloudflareIntegrationCredential extends DomainIntegration {
@@ -35,29 +54,40 @@ export interface InstanceDomainAssignment {
   addressRecordId: string | null
   addressRecordType: "A" | "AAAA" | "CNAME" | null
   domain: string
+  id: string
   instanceId: string
   integrationId: string
   lastError: string | null
+  /** The domain Hearth advertises as the game server's connect address. */
+  primary: boolean
   publicHost: string
   publicPort: number
   relayId: string
   srvProtocol: "tcp" | "udp" | null
   srvRecordId: string | null
   srvService: string | null
-  status: "active" | "error" | "pending"
+  status: "active" | "error" | "pending" | "removing"
   supportsSrv: boolean
   vanityLabel: string
+  /** Null only if the domain is no longer configured. */
+  zoneId: string | null
 }
 
 interface DomainIntegrationRow extends RowDataPacket {
   api_token_ciphertext: string
+  assignment_strategy: DomainAssignmentStrategy
   blacklist_patterns: unknown
-  domain: string
   enabled: boolean | number
   id: string
   last_error: string | null
   last_verified_at: number | null
   provider: "cloudflare"
+}
+
+interface DomainZoneRow extends RowDataPacket {
+  domain: string
+  enabled: boolean | number
+  is_default: boolean | number
   zone_id: string
   zone_name: string
 }
@@ -66,8 +96,10 @@ interface InstanceDomainRow extends RowDataPacket {
   address_record_id: string | null
   address_record_type: "A" | "AAAA" | "CNAME" | null
   domain: string
+  id: string
   instance_id: string
   integration_id: string
+  is_primary: boolean | number
   last_error: string | null
   public_host: string
   public_port: number
@@ -75,49 +107,63 @@ interface InstanceDomainRow extends RowDataPacket {
   srv_protocol: "tcp" | "udp" | null
   srv_record_id: string | null
   srv_service: string | null
-  status: "active" | "error" | "pending"
+  status: "active" | "error" | "pending" | "removing"
   supports_srv: boolean | number
   vanity_label: string
+  zone_id: string | null
 }
+
+const loadIntegrationRowEffect = Effect.fnUntraced(function* (
+  operation: string
+) {
+  const database = yield* Database
+  const [rows, zones] = yield* Effect.all(
+    [
+      database.queryRows<DomainIntegrationRow>(
+        operation,
+        `SELECT id, provider, api_token_ciphertext, blacklist_patterns,
+                enabled, assignment_strategy, last_verified_at, last_error
+           FROM ${databaseTable("domain_integration")}
+          WHERE id = ?
+          LIMIT 1`,
+        [CLOUDFLARE_INTEGRATION_ID]
+      ),
+      database.queryRows<DomainZoneRow>(
+        `${operation}.domains`,
+        `SELECT domain, zone_id, zone_name, is_default, enabled
+           FROM ${databaseTable("domain_zone")}
+          WHERE integration_id = ?
+          ORDER BY is_default DESC, enabled DESC, domain`,
+        [CLOUDFLARE_INTEGRATION_ID]
+      ),
+    ],
+    { concurrency: 2 }
+  )
+  const row = rows[0]
+  return row ? { row, zones } : null
+})
 
 export const loadDomainIntegrationEffect = Effect.fn(
   "domains.integration.load"
 )(function* () {
-  const database = yield* Database
-  const rows = yield* database.queryRows<DomainIntegrationRow>(
-    "domains.integration.load",
-    `SELECT id, provider, domain, zone_id, zone_name, api_token_ciphertext,
-            blacklist_patterns, enabled, last_verified_at, last_error
-       FROM ${databaseTable("domain_integration")}
-      WHERE id = ?
-      LIMIT 1`,
-    [CLOUDFLARE_INTEGRATION_ID]
-  )
-  const row = rows[0]
-  return row ? publicIntegration(row) : null
+  const loaded = yield* loadIntegrationRowEffect("domains.integration.load")
+  return loaded ? publicIntegration(loaded.row, loaded.zones) : null
 })
 
 export const loadCloudflareIntegrationCredentialEffect = Effect.fn(
   "domains.integration.credential"
 )(function* () {
   const database = yield* Database
-  const rows = yield* database.queryRows<DomainIntegrationRow>(
-    "domains.integration.credential",
-    `SELECT id, provider, domain, zone_id, zone_name, api_token_ciphertext,
-            blacklist_patterns, enabled, last_verified_at, last_error
-       FROM ${databaseTable("domain_integration")}
-      WHERE id = ?
-      LIMIT 1`,
-    [CLOUDFLARE_INTEGRATION_ID]
+  const loaded = yield* loadIntegrationRowEffect(
+    "domains.integration.credential"
   )
-  const row = rows[0]
-  if (!row) {
+  if (!loaded) {
     return yield* ResourceNotFoundError.make({
       message: "Connect Cloudflare in Infrastructure → Domains first",
       resource: "cloudflare_integration",
     })
   }
-  const ciphertext = row.api_token_ciphertext
+  const ciphertext = loaded.row.api_token_ciphertext
   const decrypted = yield* Effect.try({
     try: () =>
       decryptWithKeyring(
@@ -143,80 +189,180 @@ export const loadCloudflareIntegrationCredentialEffect = Effect.fn(
     )
   }
   return {
-    ...publicIntegration(row),
+    ...publicIntegration(loaded.row, loaded.zones),
     apiToken: decrypted.plaintext,
   } satisfies CloudflareIntegrationCredential
 })
 
+/**
+ * Saves the integration and its enabled domains. A domain left out keeps a
+ * disabled row while game server domains are on it, since their records
+ * live in its zone; otherwise it goes. Decided under locks, so a game server
+ * domain reserved meanwhile can't lose its zone.
+ */
 export const saveCloudflareIntegrationEffect = Effect.fn(
   "domains.integration.save"
 )(function* (input: {
   apiToken: string
   blacklistPatterns: Array<string>
-  domain: string
+  /** The enabled domains, in zones the token reaches. */
+  domains: ReadonlyArray<ManagedDomain>
   enabled: boolean
-  zoneId: string
-  zoneName: string
+  /** Zones the token can manage; kept domains must be among them. */
+  reachableZoneIds: ReadonlySet<string>
+  strategy: DomainAssignmentStrategy
 }) {
   const database = yield* Database
   const ciphertext = yield* encryptApiToken(input.apiToken)
   const now = yield* Clock.currentTimeMillis
-  yield* database.execute(
-    "domains.integration.save",
-    `INSERT INTO ${databaseTable("domain_integration")}
-       (id, provider, domain, zone_id, zone_name, api_token_ciphertext,
-        blacklist_patterns, enabled, last_verified_at, last_error,
-        created_at, updated_at)
-     VALUES (?, 'cloudflare', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       domain = VALUES(domain),
-       zone_id = VALUES(zone_id),
-       zone_name = VALUES(zone_name),
-       api_token_ciphertext = VALUES(api_token_ciphertext),
-       blacklist_patterns = VALUES(blacklist_patterns),
-       enabled = VALUES(enabled),
-       last_verified_at = VALUES(last_verified_at),
-       last_error = NULL,
-       updated_at = VALUES(updated_at)`,
-    [
-      CLOUDFLARE_INTEGRATION_ID,
-      input.domain,
-      input.zoneId,
-      input.zoneName,
-      ciphertext,
-      JSON.stringify(input.blacklistPatterns),
-      input.enabled,
-      now,
-      now,
-      now,
-    ]
+  yield* database.transaction("domains.integration.save", (transaction) =>
+    Effect.gen(function* () {
+      yield* transaction.execute(
+        `INSERT INTO ${databaseTable("domain_integration")}
+           (id, provider, api_token_ciphertext, blacklist_patterns, enabled,
+            assignment_strategy, last_verified_at, last_error, created_at,
+            updated_at)
+         VALUES (?, 'cloudflare', ?, ?, ?, ?, ?, NULL, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           api_token_ciphertext = VALUES(api_token_ciphertext),
+           blacklist_patterns = VALUES(blacklist_patterns),
+           enabled = VALUES(enabled),
+           assignment_strategy = VALUES(assignment_strategy),
+           last_verified_at = VALUES(last_verified_at),
+           last_error = NULL,
+           updated_at = VALUES(updated_at)`,
+        [
+          CLOUDFLARE_INTEGRATION_ID,
+          ciphertext,
+          JSON.stringify(input.blacklistPatterns),
+          input.enabled,
+          input.strategy,
+          now,
+          now,
+          now,
+        ]
+      )
+      // Locking reads: a reservation waits for this save, or this save sees it.
+      const previous = yield* transaction.queryRows<DomainZoneRow>(
+        `SELECT domain, zone_id, zone_name, is_default, enabled
+           FROM ${databaseTable("domain_zone")}
+          WHERE integration_id = ?
+          FOR UPDATE`,
+        [CLOUDFLARE_INTEGRATION_ID]
+      )
+      const assigned = yield* transaction.queryRows<
+        RowDataPacket & { domain: string }
+      >(
+        `SELECT domain FROM ${databaseTable("instance_domain")} FOR SHARE`
+      )
+      const usage = new Map<string, number>()
+      for (const row of assigned) {
+        usage.set(row.domain, (usage.get(row.domain) ?? 0) + 1)
+      }
+      const requested = new Map(
+        input.domains.map((domain) => [domain.domain, domain])
+      )
+      const requestedZones = new Set(
+        input.domains.map((domain) => domain.zoneId)
+      )
+      const kept: Array<ManagedDomain> = []
+      for (const row of previous) {
+        const total = usage.get(row.domain) ?? 0
+        if (total === 0) continue
+        const count = `${total} game server ${total === 1 ? "domain" : "domains"}`
+        const next = requested.get(row.domain)
+        if (next) {
+          if (next.zoneId !== row.zone_id) {
+            return yield* DomainConfigurationError.make({
+              message: `Delete the ${count} on ${row.domain} before moving it to another zone`,
+            })
+          }
+          continue
+        }
+        if (!input.reachableZoneIds.has(row.zone_id)) {
+          return yield* DomainConfigurationError.make({
+            message: `This token can't manage ${row.domain}, which still has ${count}. Use a token that can, or delete them first.`,
+          })
+        }
+        if (requestedZones.has(row.zone_id)) {
+          return yield* DomainConfigurationError.make({
+            message: `Delete the ${count} on ${row.domain} before using another domain in its zone`,
+          })
+        }
+        kept.push({
+          domain: row.domain,
+          enabled: false,
+          isDefault: false,
+          zoneId: row.zone_id,
+          zoneName: row.zone_name,
+        })
+      }
+      yield* transaction.execute(
+        `DELETE FROM ${databaseTable("domain_zone")}
+          WHERE integration_id = ?`,
+        [CLOUDFLARE_INTEGRATION_ID]
+      )
+      for (const domain of [...input.domains, ...kept]) {
+        yield* transaction.execute(
+          `INSERT INTO ${databaseTable("domain_zone")}
+             (domain, integration_id, zone_id, zone_name, is_default,
+              enabled, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            domain.domain,
+            CLOUDFLARE_INTEGRATION_ID,
+            domain.zoneId,
+            domain.zoneName,
+            domain.isDefault,
+            domain.enabled,
+            now,
+            now,
+          ]
+        )
+      }
+    })
   )
 })
 
 export const loadInstanceDomainAssignmentEffect = Effect.fn(
   "domains.assignment.load"
-)(function* (relayId: string, instanceId: string) {
+)(function* (id: string) {
   const database = yield* Database
   const rows = yield* database.queryRows<InstanceDomainRow>(
     "domains.assignment.load",
     `${instanceDomainSelect}
-      WHERE relay_id = ? AND instance_id = ?
+      WHERE assignment.id = ?
       LIMIT 1`,
-    [relayId, instanceId]
+    [id]
   )
   const row = rows[0]
   return row ? domainAssignment(row) : null
 })
 
+/** A game server's domains, primary first. */
+export const loadInstanceDomainAssignmentsForInstanceEffect = Effect.fn(
+  "domains.assignments.instance"
+)(function* (relayId: string, instanceId: string) {
+  const database = yield* Database
+  const rows = yield* database.queryRows<InstanceDomainRow>(
+    "domains.assignments.instance",
+    `${instanceDomainSelect}
+      WHERE assignment.relay_id = ? AND assignment.instance_id = ?
+      ORDER BY assignment.is_primary DESC, assignment.created_at,
+               assignment.id`,
+    [relayId, instanceId]
+  )
+  return rows.map(domainAssignment)
+})
+
 export const deleteInstanceDomainAssignmentEffect = Effect.fn(
   "domains.assignment.delete"
-)(function* (relayId: string, instanceId: string) {
+)(function* (id: string) {
   const database = yield* Database
   yield* database.execute(
     "domains.assignment.delete",
-    `DELETE FROM ${databaseTable("instance_domain")}
-      WHERE relay_id = ? AND instance_id = ?`,
-    [relayId, instanceId]
+    `DELETE FROM ${databaseTable("instance_domain")} WHERE id = ?`,
+    [id]
   )
 })
 
@@ -229,7 +375,49 @@ export const deleteRelayInstanceDomainAssignmentsEffect = Effect.fn(
     `DELETE FROM ${databaseTable("instance_domain")} WHERE relay_id = ?`,
     [relayId]
   )
+  yield* database.execute(
+    "domains.optOuts.deleteRelay",
+    `DELETE FROM ${databaseTable("instance_domain_opt_out")} WHERE relay_id = ?`,
+    [relayId]
+  )
 })
+
+export const loadInstanceDomainOptOutEffect = Effect.fn(
+  "domains.optOut.load"
+)(function* (relayId: string, instanceId: string) {
+  const database = yield* Database
+  const rows = yield* database.queryRows<RowDataPacket>(
+    "domains.optOut.load",
+    `SELECT 1 FROM ${databaseTable("instance_domain_opt_out")}
+      WHERE relay_id = ? AND instance_id = ?
+      LIMIT 1`,
+    [relayId, instanceId]
+  )
+  return rows.length > 0
+})
+
+export const setInstanceDomainOptOutEffect = Effect.fn("domains.optOut.set")(
+  function* (relayId: string, instanceId: string, optedOut: boolean) {
+    const database = yield* Database
+    if (!optedOut) {
+      yield* database.execute(
+        "domains.optOut.clear",
+        `DELETE FROM ${databaseTable("instance_domain_opt_out")}
+          WHERE relay_id = ? AND instance_id = ?`,
+        [relayId, instanceId]
+      )
+      return
+    }
+    const now = yield* Clock.currentTimeMillis
+    yield* database.execute(
+      "domains.optOut.save",
+      `INSERT IGNORE INTO ${databaseTable("instance_domain_opt_out")}
+         (relay_id, instance_id, created_at)
+       VALUES (?, ?, ?)`,
+      [relayId, instanceId, now]
+    )
+  }
+)
 
 export const loadRelayInstanceDomainAssignmentsEffect = Effect.fn(
   "domains.assignments.relay"
@@ -237,12 +425,13 @@ export const loadRelayInstanceDomainAssignmentsEffect = Effect.fn(
   const database = yield* Database
   const rows = yield* database.queryRows<InstanceDomainRow>(
     "domains.assignments.relay",
-    `${instanceDomainSelect} WHERE relay_id = ?`,
+    `${instanceDomainSelect} WHERE assignment.relay_id = ?`,
     [relayId]
   )
   return rows.map(domainAssignment)
 })
 
+/** Active domains, each game server's primary before its other domains. */
 export const loadActiveInstanceDomainAssignmentsEffect = Effect.fn(
   "domains.assignments.active"
 )(function* () {
@@ -250,7 +439,9 @@ export const loadActiveInstanceDomainAssignmentsEffect = Effect.fn(
   const rows = yield* database.queryRows<InstanceDomainRow>(
     "domains.assignments.active",
     `${instanceDomainSelect}
-      WHERE status = 'active'`
+      WHERE assignment.status = 'active'
+      ORDER BY assignment.is_primary DESC, assignment.created_at,
+               assignment.id`
   )
   return rows.map(domainAssignment)
 })
@@ -262,17 +453,30 @@ export const loadInstanceDomainAssignmentsEffect = Effect.fn(
   const rows = yield* database.queryRows<InstanceDomainRow>(
     "domains.assignments.all",
     `${instanceDomainSelect}
-      ORDER BY domain, vanity_label`
+      ORDER BY assignment.domain, assignment.vanity_label`
   )
   return rows.map(domainAssignment)
 })
 
+/** How many game server domains each domain holds. */
+export const countInstanceDomainsByDomainEffect = Effect.fn(
+  "domains.assignments.countByDomain"
+)(function* () {
+  const database = yield* Database
+  const rows = yield* database.queryRows<
+    RowDataPacket & { domain: string; total: number }
+  >(
+    "domains.assignments.countByDomain",
+    `SELECT domain, COUNT(*) AS total
+       FROM ${databaseTable("instance_domain")}
+      GROUP BY domain`
+  )
+  return new Map(rows.map((row) => [row.domain, Number(row.total)]))
+})
+
 export const loadUsedVanityLabelsEffect = Effect.fn(
   "domains.assignments.usedLabels"
-)(function* (
-  domain: string,
-  exclude?: { instanceId: string; relayId: string }
-) {
+)(function* (domain: string, excludeId?: string) {
   const database = yield* Database
   const rows = yield* database.queryRows<
     RowDataPacket & { vanity_label: string }
@@ -280,19 +484,17 @@ export const loadUsedVanityLabelsEffect = Effect.fn(
     "domains.assignments.usedLabels",
     `SELECT vanity_label
        FROM ${databaseTable("instance_domain")}
-      WHERE domain = ?${
-        exclude ? "\n        AND NOT (relay_id = ? AND instance_id = ?)" : ""
-      }`,
-    exclude ? [domain, exclude.relayId, exclude.instanceId] : [domain]
+      WHERE domain = ?${excludeId ? " AND id <> ?" : ""}`,
+    excludeId ? [domain, excludeId] : [domain]
   )
   return new Set(rows.map((row) => row.vanity_label))
 })
 
-export const reserveInstanceDomainAssignmentEffect = Effect.fn(
-  "domains.assignment.reserve"
-)(function* (input: {
+interface DomainReservation {
   domain: string
+  id: string
   instanceId: string
+  primary: boolean
   publicHost: string
   publicPort: number
   relayId: string
@@ -300,31 +502,36 @@ export const reserveInstanceDomainAssignmentEffect = Effect.fn(
   srvService: string | null
   supportsSrv: boolean
   vanityLabel: string
-}) {
+  /** The zone its records go in, as the domain was loaded. */
+  zoneId: string
+}
+
+/**
+ * Holds a name for a new domain before its records exist. A name another row
+ * holds fails on the unique key rather than taking that row over.
+ */
+export const insertInstanceDomainAssignmentEffect = Effect.fn(
+  "domains.assignment.insert"
+)(function* (input: DomainReservation) {
   const database = yield* Database
   const now = yield* Clock.currentTimeMillis
-  yield* database.execute(
-    "domains.assignment.reserve",
+  // Only into an enabled domain still in the zone its records will go in: a
+  // save that removes or moves it either waits for this row or this insert
+  // finds nothing.
+  const result = yield* database.execute(
+    "domains.assignment.insert",
     `INSERT INTO ${databaseTable("instance_domain")}
-       (relay_id, instance_id, integration_id, vanity_label, domain,
-        public_host, public_port, supports_srv, srv_service, srv_protocol,
-        status, last_error, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       integration_id = VALUES(integration_id),
-       vanity_label = VALUES(vanity_label),
-       domain = VALUES(domain),
-       public_host = VALUES(public_host),
-       public_port = VALUES(public_port),
-       supports_srv = VALUES(supports_srv),
-       srv_service = VALUES(srv_service),
-       srv_protocol = VALUES(srv_protocol),
-       status = 'pending',
-       last_error = NULL,
-       updated_at = VALUES(updated_at)`,
+       (id, relay_id, instance_id, is_primary, integration_id, vanity_label,
+        domain, public_host, public_port, supports_srv, srv_service,
+        srv_protocol, status, last_error, created_at, updated_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?
+       FROM ${databaseTable("domain_zone")}
+      WHERE domain = ? AND zone_id = ? AND enabled = 1`,
     [
+      input.id,
       input.relayId,
       input.instanceId,
+      input.primary,
       CLOUDFLARE_INTEGRATION_ID,
       input.vanityLabel,
       input.domain,
@@ -335,7 +542,108 @@ export const reserveInstanceDomainAssignmentEffect = Effect.fn(
       input.srvProtocol,
       now,
       now,
+      input.domain,
+      input.zoneId,
     ]
+  )
+  if (result.affectedRows === 0) {
+    return yield* DomainConfigurationError.make({
+      message: `${input.domain} isn't taking new game server domains`,
+    })
+  }
+})
+
+/**
+ * Holds a new name for a domain whose records were released. Locks its
+ * domain's row before the assignment's, the order a save takes them in, and
+ * only while the domain is still in the zone its records will go in.
+ */
+export const reserveInstanceDomainAssignmentEffect = Effect.fn(
+  "domains.assignment.reserve"
+)(function* (
+  input: Omit<DomainReservation, "instanceId" | "primary" | "relayId">
+) {
+  const database = yield* Database
+  const now = yield* Clock.currentTimeMillis
+  yield* database.transaction("domains.assignment.reserve", (transaction) =>
+    Effect.gen(function* () {
+      const zones = yield* transaction.queryRows<RowDataPacket>(
+        `SELECT 1 FROM ${databaseTable("domain_zone")}
+          WHERE domain = ? AND zone_id = ?
+          FOR SHARE`,
+        [input.domain, input.zoneId]
+      )
+      if (zones.length === 0) {
+        return yield* DomainConfigurationError.make({
+          message: `${input.domain} is no longer a configured vanity domain`,
+        })
+      }
+      yield* transaction.execute(
+        `UPDATE ${databaseTable("instance_domain")}
+            SET vanity_label = ?,
+                domain = ?,
+                public_host = ?,
+                public_port = ?,
+                supports_srv = ?,
+                srv_service = ?,
+                srv_protocol = ?,
+                address_record_id = NULL,
+                address_record_type = NULL,
+                srv_record_id = NULL,
+                status = 'pending',
+                last_error = NULL,
+                updated_at = ?
+          WHERE id = ?`,
+        [
+          input.vanityLabel,
+          input.domain,
+          input.publicHost,
+          input.publicPort,
+          input.supportsSrv,
+          input.srvService,
+          input.srvProtocol,
+          now,
+          input.id,
+        ]
+      )
+    })
+  )
+})
+
+/**
+ * Marks a domain as being deleted. It keeps its row, and records Kiln
+ * couldn't delete yet, until a delete finishes, and nothing re-creates it.
+ */
+export const markInstanceDomainRemovingEffect = Effect.fn(
+  "domains.assignment.markRemoving"
+)(function* (id: string) {
+  const database = yield* Database
+  const now = yield* Clock.currentTimeMillis
+  yield* database.execute(
+    "domains.assignment.markRemoving",
+    `UPDATE ${databaseTable("instance_domain")}
+        SET status = 'removing', is_primary = 0, updated_at = ?
+      WHERE id = ?`,
+    [now, id]
+  )
+})
+
+/** Forgets records Kiln has deleted from Cloudflare. */
+export const clearInstanceDomainRecordsEffect = Effect.fn(
+  "domains.assignment.clearRecords"
+)(function* (id: string) {
+  const database = yield* Database
+  const now = yield* Clock.currentTimeMillis
+  yield* database.execute(
+    "domains.assignment.clearRecords",
+    `UPDATE ${databaseTable("instance_domain")}
+        SET address_record_id = NULL,
+            address_record_type = NULL,
+            srv_record_id = NULL,
+            status = IF(status = 'active', 'pending', status),
+            updated_at = ?
+      WHERE id = ?`,
+    [now, id]
   )
 })
 
@@ -344,8 +652,7 @@ export const activateInstanceDomainAssignmentEffect = Effect.fn(
 )(function* (input: {
   addressRecordId: string
   addressRecordType: "A" | "AAAA" | "CNAME"
-  instanceId: string
-  relayId: string
+  id: string
   srvRecordId: string | null
 }) {
   const database = yield* Database
@@ -359,34 +666,44 @@ export const activateInstanceDomainAssignmentEffect = Effect.fn(
             status = 'active',
             last_error = NULL,
             updated_at = ?
-      WHERE relay_id = ? AND instance_id = ?`,
+      WHERE id = ?`,
     [
       input.addressRecordId,
       input.addressRecordType,
       input.srvRecordId,
       now,
-      input.relayId,
-      input.instanceId,
+      input.id,
     ]
+  )
+})
+
+/** Makes one domain its game server's primary and demotes the rest. */
+export const setInstanceDomainPrimaryEffect = Effect.fn(
+  "domains.assignment.setPrimary"
+)(function* (input: { id: string; instanceId: string; relayId: string }) {
+  const database = yield* Database
+  const now = yield* Clock.currentTimeMillis
+  yield* database.execute(
+    "domains.assignment.setPrimary",
+    `UPDATE ${databaseTable("instance_domain")}
+        SET is_primary = (id = ?), updated_at = ?
+      WHERE relay_id = ? AND instance_id = ?`,
+    [input.id, now, input.relayId, input.instanceId]
   )
 })
 
 export const updateInstanceDomainLabelEffect = Effect.fn(
   "domains.assignment.updateLabel"
-)(function* (input: {
-  instanceId: string
-  relayId: string
-  vanityLabel: string
-}) {
+)(function* (input: { domain: string; id: string; vanityLabel: string }) {
   const database = yield* Database
   const now = yield* Clock.currentTimeMillis
   yield* database.execute(
     "domains.assignment.updateLabel",
     `UPDATE ${databaseTable("instance_domain")}
-        SET vanity_label = ?, status = 'active', last_error = NULL,
-            updated_at = ?
-      WHERE relay_id = ? AND instance_id = ?`,
-    [input.vanityLabel, now, input.relayId, input.instanceId]
+        SET vanity_label = ?, domain = ?, status = 'active',
+            last_error = NULL, updated_at = ?
+      WHERE id = ?`,
+    [input.vanityLabel, input.domain, now, input.id]
   )
 })
 
@@ -394,10 +711,9 @@ export const updateInstanceDomainEndpointEffect = Effect.fn(
   "domains.assignment.updateEndpoint"
 )(function* (input: {
   addressRecordType: "A" | "AAAA" | "CNAME"
-  instanceId: string
+  id: string
   publicHost: string
   publicPort: number
-  relayId: string
   srvProtocol: "tcp" | "udp" | null
   srvRecordId: string | null
   srvService: string | null
@@ -418,7 +734,7 @@ export const updateInstanceDomainEndpointEffect = Effect.fn(
             status = 'active',
             last_error = NULL,
             updated_at = ?
-      WHERE relay_id = ? AND instance_id = ?`,
+      WHERE id = ?`,
     [
       input.publicHost,
       input.publicPort,
@@ -428,8 +744,7 @@ export const updateInstanceDomainEndpointEffect = Effect.fn(
       input.srvProtocol,
       input.srvRecordId,
       now,
-      input.relayId,
-      input.instanceId,
+      input.id,
     ]
   )
 })
@@ -439,8 +754,7 @@ export const updateInstanceDomainAddressRecordEffect = Effect.fn(
 )(function* (input: {
   addressRecordId: string
   addressRecordType: "A" | "AAAA" | "CNAME"
-  instanceId: string
-  relayId: string
+  id: string
 }) {
   const database = yield* Database
   const now = yield* Clock.currentTimeMillis
@@ -451,62 +765,70 @@ export const updateInstanceDomainAddressRecordEffect = Effect.fn(
             address_record_type = ?,
             last_error = NULL,
             updated_at = ?
-      WHERE relay_id = ? AND instance_id = ?`,
-    [
-      input.addressRecordId,
-      input.addressRecordType,
-      now,
-      input.relayId,
-      input.instanceId,
-    ]
+      WHERE id = ?`,
+    [input.addressRecordId, input.addressRecordType, now, input.id]
   )
 })
 
 export const recordInstanceDomainSyncErrorEffect = Effect.fn(
   "domains.assignment.recordSyncError"
-)(function* (relayId: string, instanceId: string, message: string) {
+)(function* (id: string, message: string) {
   const database = yield* Database
   const now = yield* Clock.currentTimeMillis
   yield* database.execute(
     "domains.assignment.recordSyncError",
     `UPDATE ${databaseTable("instance_domain")}
         SET last_error = ?, updated_at = ?
-      WHERE relay_id = ? AND instance_id = ?`,
-    [message.slice(0, 512), now, relayId, instanceId]
+      WHERE id = ?`,
+    [message.slice(0, 512), now, id]
   )
 })
 
 export const recordInstanceDomainErrorEffect = Effect.fn(
   "domains.assignment.recordError"
-)(function* (relayId: string, instanceId: string, message: string) {
+)(function* (id: string, message: string) {
   const database = yield* Database
   const now = yield* Clock.currentTimeMillis
   yield* database.execute(
     "domains.assignment.recordError",
     `UPDATE ${databaseTable("instance_domain")}
         SET status = 'error', last_error = ?, updated_at = ?
-      WHERE relay_id = ? AND instance_id = ?`,
-    [message.slice(0, 512), now, relayId, instanceId]
+      WHERE id = ?`,
+    [message.slice(0, 512), now, id]
   )
 })
 
-const instanceDomainSelect = `SELECT relay_id, instance_id, integration_id,
-       vanity_label, domain, public_host, public_port, supports_srv,
-       srv_service, srv_protocol, address_record_id, address_record_type,
-       srv_record_id, status, last_error
-  FROM ${databaseTable("instance_domain")}`
+const instanceDomainSelect = `SELECT assignment.id, assignment.relay_id,
+       assignment.instance_id, assignment.is_primary,
+       assignment.integration_id, assignment.vanity_label, assignment.domain,
+       assignment.public_host, assignment.public_port, assignment.supports_srv,
+       assignment.srv_service, assignment.srv_protocol,
+       assignment.address_record_id, assignment.address_record_type,
+       assignment.srv_record_id, assignment.status, assignment.last_error,
+       zone.zone_id
+  FROM ${databaseTable("instance_domain")} assignment
+  LEFT JOIN ${databaseTable("domain_zone")} zone
+    ON zone.domain = assignment.domain`
 
-function publicIntegration(row: DomainIntegrationRow): DomainIntegration {
+function publicIntegration(
+  row: DomainIntegrationRow,
+  zones: ReadonlyArray<DomainZoneRow>
+): DomainIntegration {
   return {
     blacklistPatterns: parseBlacklistPatterns(row.blacklist_patterns),
-    domain: row.domain,
+    domains: zones.map((zone) => ({
+      domain: zone.domain,
+      enabled: Boolean(zone.enabled),
+      isDefault: Boolean(zone.is_default),
+      zoneId: zone.zone_id,
+      zoneName: zone.zone_name,
+    })),
     enabled: Boolean(row.enabled),
     id: row.id,
     lastError: row.last_error,
     lastVerifiedAt: timestamp(row.last_verified_at),
     provider: row.provider,
-    zoneId: row.zone_id,
-    zoneName: row.zone_name,
+    strategy: row.assignment_strategy,
   }
 }
 
@@ -515,9 +837,11 @@ function domainAssignment(row: InstanceDomainRow): InstanceDomainAssignment {
     addressRecordId: row.address_record_id,
     addressRecordType: row.address_record_type,
     domain: row.domain,
+    id: row.id,
     instanceId: row.instance_id,
     integrationId: row.integration_id,
     lastError: row.last_error,
+    primary: Boolean(row.is_primary),
     publicHost: row.public_host,
     publicPort: row.public_port,
     relayId: row.relay_id,
@@ -527,6 +851,7 @@ function domainAssignment(row: InstanceDomainRow): InstanceDomainAssignment {
     status: row.status,
     supportsSrv: Boolean(row.supports_srv),
     vanityLabel: row.vanity_label,
+    zoneId: row.zone_id,
   }
 }
 

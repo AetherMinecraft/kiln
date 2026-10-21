@@ -1,11 +1,11 @@
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
+import type { ResourceLimits } from "@workspace/contracts"
 import {
   ArrowRight,
   Cable,
   Check,
   Copy,
-  Database,
   Download,
   HardDriveDownload,
   KeyRound,
@@ -39,14 +39,20 @@ import {
   InfoSectionLink,
 } from "@/components/info-page"
 import { InstanceFavoriteButton } from "@/components/instance-favorite"
+import { DatabaseKindIcon } from "@/components/instance-kind-icon"
 import { RenameButton } from "@/components/rename-dialog"
 import { useCopyFeedback } from "@/components/workspace-header"
 import {
   backupUsageQueryOptions,
+  managedDatabaseCapacityQueryOptions,
   managedDatabaseCredentialQueryOptions,
   queryKeys,
 } from "@/lib/query-options"
-import { renameManagedDatabase } from "@/server/databases"
+import { ResourceLimitsSection } from "@/components/resource-limits-section"
+import {
+  renameManagedDatabase,
+  updateManagedDatabaseLimits,
+} from "@/server/databases"
 
 // The database's details on its Info page, one section per concern, each
 // with the actions that change it.
@@ -63,7 +69,7 @@ export function DatabaseGeneralSettings({
 }) {
   return (
     <InfoSection
-      icon={<Database />}
+      icon={<DatabaseKindIcon />}
       title="Database"
       action={
         <>
@@ -489,4 +495,58 @@ function databaseConnectionUrl(
   const path =
     scheme === "redis" ? "" : `/${encodeURIComponent(database.databaseName)}`
   return `${scheme}://${encodeURIComponent(username)}:${password}@${database.hostname}:${database.internalPort}${path}`
+}
+
+// Databases warn rather than stop at their disk limit, so a full disk never
+// takes one offline.
+export function DatabaseLimitsSection({
+  available,
+  database,
+  editable,
+}: {
+  available: boolean
+  database: ManagedDatabase
+  editable: boolean
+}) {
+  const queryClient = useQueryClient()
+  const { data: capacity = null } = useQuery({
+    ...managedDatabaseCapacityQueryOptions(database.relayId, database.id),
+    enabled: editable && available,
+  })
+  const groups = React.useMemo(
+    () => [{ key: "database", limits: database.limits }],
+    [database.limits]
+  )
+  const save = React.useCallback(
+    async (limits: Readonly<Record<string, ResourceLimits>>) => {
+      const next = limits.database
+      if (!next) return
+      await updateManagedDatabaseLimits({
+        data: {
+          databaseId: database.id,
+          limits: next,
+          relayId: database.relayId,
+        },
+      })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.databases.all }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.databases.capacity(database.relayId, database.id),
+        }),
+      ])
+    },
+    [database.id, database.relayId, queryClient]
+  )
+  return (
+    <ResourceLimitsSection
+      capacity={capacity}
+      disabledReason={
+        available ? undefined : "Reconnect this database's Relay first"
+      }
+      editable={editable}
+      groups={groups}
+      hint="Changing memory or CPU applies at once. Removing one restarts the database. Over its disk limit, the database keeps running and everyone with access is warned."
+      onSave={save}
+    />
+  )
 }

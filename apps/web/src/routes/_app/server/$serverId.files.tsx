@@ -15,12 +15,11 @@ import {
 } from "@/components/instance-workspace-context"
 import { pageTitle } from "@/lib/page-title"
 import { requireServerDestinationAccess } from "@/lib/route-access"
+import { filePageLocation, startFilePageReads } from "@/lib/file-page-reads"
 import {
-  relayFileActivityQueryOptions,
-  relayRootDirectoryQueryOptions,
-} from "@/lib/query-options"
-import { warmSyntaxCodeEditorModule } from "@/lib/syntax-editor-module-preload"
-import { loadFileWorkspaceModule } from "@/lib/workspace-module-preloads"
+  loadFileWorkspaceModule,
+  warmFilePreviewModule,
+} from "@/lib/workspace-module-preloads"
 
 export const Route = createFileRoute("/_app/server/$serverId/files")({
   beforeLoad: async ({ context, params }) => {
@@ -31,23 +30,16 @@ export const Route = createFileRoute("/_app/server/$serverId/files")({
       params.serverId
     )
   },
-  loader: async ({ context }) => {
+  loader: async ({ context, location, params }) => {
     const { instance, queryClient } = context
-    // Start data work with client-side route transitions without holding them
-    // open. Pending Relay requests cannot cross SSR hydration safely: if the
-    // Relay disappears mid-request, the dehydrated promise remains pending in
-    // the browser instead of reaching the bounded query error state.
-    if (typeof window === "undefined" || !instance) return
-
-    // FileWorkspace observes these same query keys and reuses the in-flight work.
-    void Promise.all([
-      queryClient.prefetchInfiniteQuery(
-        relayRootDirectoryQueryOptions(instance.relayId, instance.id)
-      ),
-      queryClient.prefetchQuery(
-        relayFileActivityQueryOptions(instance.relayId, instance.id)
-      ),
-    ])
+    if (!instance) return
+    // FileWorkspace observes these same query keys and reuses the work.
+    startFilePageReads(
+      queryClient,
+      { instanceId: instance.id, relayId: instance.relayId },
+      filePageLocation({ location, params })
+    )
+    if (typeof window === "undefined") return
     // Loaded with the route, or on hover, the workspace renders without
     // suspending behind its fallback.
     await loadFileWorkspaceModule()
@@ -66,7 +58,9 @@ function FilesRoute() {
   })
 
   React.useLayoutEffect(() => {
-    if (filePath) warmSyntaxCodeEditorModule()
+    if (filePath && !window.location.pathname.endsWith("/")) {
+      warmFilePreviewModule(filePath)
+    }
   }, [filePath])
 
   const fileTreePreferences = useFileTreePreferences()
@@ -75,7 +69,7 @@ function FilesRoute() {
   const relayConnected = useInstanceRelayConnected()
 
   return (
-    <React.Suspense
+    <LazyFileWorkspace
       fallback={
         <div className="flex min-h-0 flex-1 bg-card">
           <FileTreeLoadingPanel
@@ -112,21 +106,18 @@ function FilesRoute() {
           </div>
         </div>
       }
-    >
-      <LazyFileWorkspace
-        key={`${instance.relayId}:${instance.id}`}
-        instance={instance}
-        route={{ id: serverId, kind: "server" }}
-        active
-        routeFilePath={filePath}
-        canShare={permissions.shareLogs}
-        canWrite={permissions.filesWrite}
-        relayConnected={relayConnected}
-        openTreeOnEntry
-        initialTreeCollapsed={fileTreePreferences.collapsed}
-        initialTreeWidth={fileTreePreferences.width}
-      />
-    </React.Suspense>
+      key={`${instance.relayId}:${instance.id}`}
+      instance={instance}
+      route={{ id: serverId, kind: "server" }}
+      active
+      routeFilePath={filePath}
+      canShare={permissions.shareLogs}
+      canWrite={permissions.filesWrite}
+      relayConnected={relayConnected}
+      openTreeOnEntry
+      initialTreeCollapsed={fileTreePreferences.collapsed}
+      initialTreeWidth={fileTreePreferences.width}
+    />
   )
 }
 

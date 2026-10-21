@@ -2,6 +2,8 @@ import {
   relayCreateDatabaseSchema,
   relayUpdateInstanceStartupSchema,
 } from "@workspace/contracts"
+import { totalmem } from "node:os"
+
 import { describe, expect, it, vi } from "vite-plus/test"
 
 vi.mock("./command.js", () => import("./test/docker.js"))
@@ -53,6 +55,110 @@ describe("startup reinstall", () => {
     const container = serverContainer(harness)
     expect(container.image).toBe("registry.example.com/example/server:1.2.3")
     expect(container.state.running).toBe(true)
+  })
+
+  it("keeps a server's memory claimed while its container is replaced", async () => {
+    const harness = await relayHarness()
+    // Over half the node, so two such limits can't both fit.
+    const most = Math.ceil((totalmem() * 0.6) / 1024 ** 2) * 1024 ** 2
+    await harness.createServer({ id, limits: { memoryBytes: most } })
+    const databaseId = "d".repeat(40)
+    await harness.databases.create(
+      relayCreateDatabaseSchema.parse({
+        databaseName: "kiln_app",
+        engine: "postgres",
+        id: databaseId,
+        name: "Main",
+        password: "correct-horse-battery-staple-1",
+        username: "kiln_user",
+      })
+    )
+    // Docker holds the new container's creation, once the old one is gone.
+    const creation = fakeDocker.hold({ command: "create" })
+    const reconfiguring = reconfigure(harness, { start: false, variables: {} })
+    await creation.reached
+
+    await expect(
+      harness.databases.setLimits({ databaseId, limits: { memoryBytes: most } })
+    ).rejects.toThrow(/Memory limit exceeds/u)
+
+    creation.release()
+    await reconfiguring
+    expect(serverContainer(harness).memoryBytes).toBe(most)
+  })
+
+  it("keeps a server's larger memory claimed until its old container is gone", async () => {
+    const harness = await relayHarness()
+    const MIB = 1024 ** 2
+    const most = Math.ceil((totalmem() * 0.6) / MIB) * MIB
+    await harness.createServer({ id, limits: { memoryBytes: most } })
+    const databaseId = "d".repeat(40)
+    await harness.databases.create(
+      relayCreateDatabaseSchema.parse({
+        databaseName: "kiln_app",
+        engine: "postgres",
+        id: databaseId,
+        name: "Main",
+        password: "correct-horse-battery-staple-1",
+        username: "kiln_user",
+      })
+    )
+    // Lowering the limit, with Docker holding the old container's removal.
+    const removal = fakeDocker.hold({ command: "rm" })
+    const reconfiguring = reconfigure(harness, {
+      limits: { memoryBytes: 256 * MIB },
+      start: false,
+      variables: {},
+    })
+    await removal.reached
+
+    await expect(
+      harness.databases.setLimits({ databaseId, limits: { memoryBytes: most } })
+    ).rejects.toThrow(/Memory limit exceeds/u)
+
+    removal.release()
+    await reconfiguring
+    expect(serverContainer(harness).memoryBytes).toBe(256 * MIB)
+  })
+
+  it("keeps a server's limits across startup changes until they change", async () => {
+    const harness = await relayHarness()
+    await harness.createServer({
+      id,
+      limits: { cpuMillis: 1500, memoryBytes: null },
+    })
+    expect(serverContainer(harness)).toMatchObject({
+      memoryBytes: 0,
+      nanoCpus: 1.5e9,
+    })
+
+    const kept = await reconfigure(harness, {
+      start: false,
+      variables: { version: "2.0.0" },
+    })
+    expect(kept.limits).toEqual({
+      cpuMillis: 1500,
+      diskBytes: GIBIBYTE,
+      memoryBytes: null,
+    })
+
+    const changed = await reconfigure(harness, {
+      limits: { cpuMillis: null, diskBytes: null, memoryBytes: 512 * 1024 ** 2 },
+      start: false,
+      variables: { version: "2.0.0" },
+    })
+    expect(changed.limits).toEqual({
+      cpuMillis: null,
+      diskBytes: null,
+      memoryBytes: 512 * 1024 ** 2,
+    })
+    expect(serverContainer(harness)).toMatchObject({
+      memoryBytes: 512 * 1024 ** 2,
+      nanoCpus: 0,
+    })
+    // A Relay that restarts finds the same limits on the container.
+    const [rediscovered] = await harness.docker.inspectInstances()
+    expect(rediscovered?.limits).toEqual(changed.limits)
   })
 
   it("keeps a stopped server stopped even when the client asks to start", async () => {

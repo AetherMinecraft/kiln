@@ -1,4 +1,5 @@
 import { useFileRootPath } from "@/components/files/file-root-context"
+import { FilePageContent } from "@/components/files/file-page-content"
 import * as React from "react"
 import { useQuery } from "@tanstack/react-query"
 import type { RelayFileActivityEntry } from "@workspace/contracts"
@@ -166,7 +167,7 @@ export function FilesHome({
     relayFileActivityQueryOptions(instance.relayId, instance.id)
   )
   const activity = activityQuery.data?.files ?? []
-  const loading = fileTreeLoading || activityQuery.isFetching
+  const loading = fileTreeLoading || activityQuery.isPending
   const error = queryErrorMessage(
     activityQuery.error,
     "Could not load recent files"
@@ -180,6 +181,7 @@ export function FilesHome({
       className="group/drop relative flex min-h-[360px] min-w-0 flex-1 flex-col bg-card"
       {...dropTarget}
     >
+      <FilePageContent path="" reached={!loading} view="home" />
       <FileDropOverlay directory="" />
       <div className={fileEditorHeaderClassName}>
         {treeCollapsed ? <FileTreeRevealButton onClick={onTreeExpand} /> : null}

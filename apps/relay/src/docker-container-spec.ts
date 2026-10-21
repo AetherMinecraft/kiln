@@ -40,6 +40,11 @@ export interface ContainerHealthcheck {
   readonly intervalMs: number
   readonly timeoutMs: number
   readonly startPeriodMs: number
+  /**
+   * How often to check during the start period, until the first check
+   * passes. Docker 25 and later; earlier daemons check every `intervalMs`.
+   */
+  readonly startIntervalMs?: number
   readonly retries: number
 }
 
@@ -79,6 +84,8 @@ export interface ContainerSpec {
   readonly memory?: string
   readonly memoryReservation?: string
   readonly memorySwap?: string
+  /** Billionths of a CPU core: Docker's `--cpus` times 10^9. */
+  readonly nanoCpus?: number
   readonly readOnly?: boolean
   /** Keeps stdin open for the first attach: consoles and one-off runs. */
   readonly interactive?: boolean
@@ -120,6 +127,9 @@ function containerCreateBody(spec: ContainerSpec): unknown {
               Interval: healthcheck.intervalMs * 1e6,
               Retries: healthcheck.retries,
               StartPeriod: healthcheck.startPeriodMs * 1e6,
+              ...(healthcheck.startIntervalMs !== undefined && {
+                StartInterval: healthcheck.startIntervalMs * 1e6,
+              }),
               Test: ["CMD-SHELL", healthcheck.command],
               Timeout: healthcheck.timeoutMs * 1e6,
             },
@@ -162,6 +172,7 @@ function containerCreateBody(spec: ContainerSpec): unknown {
       ...(network && {
         NetworkMode: typeof network === "string" ? network : network.name,
       }),
+      ...(spec.nanoCpus && { NanoCpus: spec.nanoCpus }),
       ...(spec.pidsLimit && { PidsLimit: spec.pidsLimit }),
       ...(spec.ports?.length && { PortBindings: bindings }),
       ...(spec.readOnly && { ReadonlyRootfs: true }),
@@ -301,12 +312,13 @@ export function runWithInput(
  * optional binary unit, `b`, `k`, `m`, `g`, `t`, or `p`, case-insensitive,
  * optionally followed by `b` or `ib`.
  */
-function ramInBytes(value: string): number {
+export function ramInBytes(value: string): number {
   const match = /^(\d+(?:\.\d+)?) ?([kmgtp])?(?:i?b)?$/iu.exec(value.trim())
   const amount = Number(match?.[1])
   if (!match || !Number.isFinite(amount)) {
     throw new Error(`invalid size: '${value}'`)
   }
-  const exponent = "kmgtp".indexOf((match[2] ?? "").toLowerCase()) + 1
+  // Without a unit, the size is in bytes.
+  const exponent = match[2] ? "kmgtp".indexOf(match[2].toLowerCase()) + 1 : 0
   return Math.trunc(amount * 1024 ** exponent)
 }

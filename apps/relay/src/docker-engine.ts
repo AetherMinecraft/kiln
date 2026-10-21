@@ -63,6 +63,17 @@ export interface DockerContainerSummary {
     readonly Type: string
   }> | null
   readonly State: string
+  readonly Mounts?: ReadonlyArray<DockerMount>
+}
+
+/** A container's mount, as both container listing and inspection report it. */
+export interface DockerMount {
+  readonly Destination: string
+  // A volume's name; binds and tmpfs have none.
+  readonly Name?: string
+  readonly RW: boolean
+  readonly Source: string
+  readonly Type?: string
 }
 
 /** The parts of `GET /containers/{id}/json` Relay reads. */
@@ -85,11 +96,7 @@ export interface DockerContainerInspect {
     readonly RestartPolicy?: { readonly Name?: string }
   }
   readonly Id: string
-  readonly Mounts?: ReadonlyArray<{
-    readonly Destination: string
-    readonly RW: boolean
-    readonly Source: string
-  }>
+  readonly Mounts?: ReadonlyArray<DockerMount>
   readonly Name: string
   readonly NetworkSettings?: {
     readonly Networks?: Readonly<
@@ -125,6 +132,7 @@ export interface DockerNetwork {
 }
 
 export interface DockerVolume {
+  readonly CreatedAt?: string
   readonly Labels: Readonly<Record<string, string>> | null
   // The volume's folder on the host, as the daemon sees it.
   readonly Mountpoint?: string
@@ -346,11 +354,16 @@ export class DockerEngine {
    */
   removeContainer(
     reference: string,
-    options: { readonly force?: boolean; readonly timeout?: number } = {}
+    options: {
+      readonly force?: boolean
+      readonly timeout?: number
+      /** Its anonymous volumes too, as `docker rm --volumes`. */
+      readonly volumes?: boolean
+    } = {}
   ): Effect.Effect<void, DockerEngineError> {
     const removal = this.#empty({
       method: "DELETE",
-      path: `/containers/${segment(reference)}${query({ force: options.force })}`,
+      path: `/containers/${segment(reference)}${query({ force: options.force, v: options.volumes })}`,
       timeout: options.timeout,
     })
     return options.force
@@ -375,6 +388,29 @@ export class DockerEngine {
   ): Effect.Effect<void, DockerEngineError> {
     return this.#empty({
       body: { RestartPolicy: { Name: policy } },
+      method: "POST",
+      path: `/containers/${segment(reference)}/update`,
+    })
+  }
+
+  /**
+   * `docker update --memory --memory-swap --cpus`, without restarting the
+   * container. Docker can't remove a limit this way: 0 leaves it unchanged.
+   */
+  updateContainerResources(
+    reference: string,
+    resources: { readonly memoryBytes?: number; readonly nanoCpus?: number }
+  ): Effect.Effect<void, DockerEngineError> {
+    return this.#empty({
+      body: {
+        ...(resources.memoryBytes !== undefined && {
+          Memory: resources.memoryBytes,
+          MemorySwap: resources.memoryBytes,
+        }),
+        ...(resources.nanoCpus !== undefined && {
+          NanoCpus: resources.nanoCpus,
+        }),
+      },
       method: "POST",
       path: `/containers/${segment(reference)}/update`,
     })

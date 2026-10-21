@@ -49,8 +49,15 @@ const hearthRealtimeQueryScopes = {
     prefix(["users"]),
   ],
   activity: [prefix(["activity"])],
+  "app-deployments": [prefix(["app-deployments"])],
   "app-directory": [exact(queryKeys.apps.directory)],
-  apps: [prefix(["apps"]), prefix(["instance-inventory", "app"])],
+  apps: [
+    prefix(["apps"]),
+    prefix(["instance-inventory", "app"]),
+    prefix(["web-routes"]),
+    // Whether an app shows its repository follows its source type.
+    prefix(["app-deployments", "summary"]),
+  ],
   "backup-settings": [
     prefix(["backups", "policy"]),
     prefix(["backups", "usage"]),
@@ -70,6 +77,7 @@ const hearthRealtimeQueryScopes = {
   ],
   favorites: [exact(queryKeys.instanceFavorites)],
   "file-activity": [prefix(["file-activity"])],
+  "github-sync": [prefix(["github-sync"])],
   "instance-directory": [
     exact(queryKeys.servers.directory),
     prefix(queryKeys.servers.navigation),
@@ -82,7 +90,12 @@ const hearthRealtimeQueryScopes = {
     exact(queryKeys.relays),
     prefix(["instance-inventory", "relay"]),
   ],
-  "relay-proxy": [prefix(["relays", "proxy"])],
+  "relay-proxy": [
+    prefix(["relays", "proxy"]),
+    exact(queryKeys.relayProxyModes),
+    prefix(["web-routes"]),
+  ],
+  "relay-volumes": [prefix(["relays", "volumes"])],
   relays: [
     prefix(["infra-directory"]),
     prefix(["instance-inventory"]),
@@ -99,6 +112,7 @@ const hearthRealtimeQueryScopes = {
     exact(queryKeys.tailscaleStacks),
     prefix(["activity"]),
     prefix(["relays", "proxy"]),
+    exact(queryKeys.relayProxyModes),
   ],
   schedules: [exact(queryKeys.schedules.all)],
   tailscale: [
@@ -144,6 +158,7 @@ function queryScopes(
     return [
       exact(queryKeys.servers.directory),
       prefix(queryKeys.servers.navigation),
+      exact(queryKeys.domains.settings),
       exact(queryKeys.domains.instance(scope.relayId, scope.instanceId)),
     ]
   }
@@ -154,6 +169,7 @@ function queryScopes(
     return [
       prefix(["apps"]),
       prefix(instanceInventoryScope({ kind: "app", relayId: scope.relayId })),
+      exact(queryKeys.relayWebRoutes(scope.relayId)),
     ]
   }
   if (topic === "databases" && scope) {
@@ -164,11 +180,19 @@ function queryScopes(
     ]
   }
   if (topic === "instance-web-routes" && scope?.instanceId) {
-    return [exact(queryKeys.relay.webRoutes(scope.relayId, scope.instanceId))]
+    return [
+      exact(queryKeys.relay.webRoutes(scope.relayId, scope.instanceId)),
+      exact(queryKeys.relayWebRoutes(scope.relayId)),
+    ]
+  }
+  if (topic === "relay-volumes" && scope) {
+    return [exact(queryKeys.relayVolumes(scope.relayId))]
   }
   if (topic === "relay-proxy" && scope) {
     return [
       prefix(queryKeys.relayProxy(scope.relayId)),
+      exact(queryKeys.relayProxyModes),
+      exact(queryKeys.relayWebRoutes(scope.relayId)),
       // The Traefik config only exists in Bundled mode.
       prefix(queryKeys.relayHostFiles(scope.relayId)),
     ]
@@ -180,6 +204,8 @@ function queryScopes(
       ),
       exact(queryKeys.relays),
       prefix(queryKeys.relayProxy(scope.relayId)),
+      exact(queryKeys.relayProxyModes),
+      exact(queryKeys.relayWebRoutes(scope.relayId)),
       prefix(["databases", scope.relayId]),
     ]
   }

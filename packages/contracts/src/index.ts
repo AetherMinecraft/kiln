@@ -7,6 +7,12 @@ import {
   MINIMUM_INSTANCE_DISK_LIMIT_BYTES,
 } from "./instance-limits.js"
 import { relayInstanceLifecycleEventSchema } from "./instance-lifecycle.js"
+import {
+  NO_RESOURCE_LIMITS,
+  observedResourceLimitsSchema,
+  resourceLimitsInputSchema,
+  serviceResourceLimitsSchema,
+} from "./resource-limits.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
 import {
   databaseReadRequestSchema,
@@ -21,10 +27,12 @@ import {
 
 export * from "./access-permissions.js"
 export * from "./relay-protocol.js"
+export * from "./installation-id.js"
 export * from "./release-version.js"
 export * from "./minecraft-java.js"
 export * from "./cli.js"
 export * from "./instance-limits.js"
+export * from "./resource-limits.js"
 export * from "./instance-overview.js"
 export * from "./instance-state.js"
 export * from "./instance-inventory.js"
@@ -82,24 +90,35 @@ export const relayObservedStateSchema = z
 
 export const relayDesiredStateSchema = z.enum(["stopped", "running"])
 
-export const relayInstanceProvisioningSchema = z
+// Every kind of instance provisions through the same steps: it waits for
+// Hearth to claim it, waits its turn, prepares its storage and network,
+// pulls its image, creates its container, and finishes setting up.
+export const provisioningKindSchema = z.enum(["server", "database", "app"])
+
+export const provisioningWorkPhaseSchema = z.enum([
+  "preparing",
+  "pulling_image",
+  "creating_container",
+  "finalizing",
+])
+
+export const provisioningPhaseSchema = z.enum([
+  "awaiting_claim",
+  "queued",
+  ...provisioningWorkPhaseSchema.options,
+  "failed",
+])
+
+export const provisioningStateSchema = z
   .object({
     attempt: z.number().int().nonnegative(),
     error: z.string().max(2_048).nullable(),
-    failedPhase: z
-      .enum(["preparing", "pulling_image", "creating_container", "finalizing"])
-      .optional(),
-    phase: z.enum([
-      "awaiting_claim",
-      "queued",
-      "preparing",
-      "pulling_image",
-      "creating_container",
-      "finalizing",
-      "failed",
-    ]),
+    failedPhase: provisioningWorkPhaseSchema.optional(),
+    phase: provisioningPhaseSchema,
   })
   .strict()
+
+export const relayInstanceProvisioningSchema = provisioningStateSchema
 
 export const relayInstanceRecoverySchema = z
   .object({
@@ -142,8 +161,20 @@ export const relayManagedDatabaseSchema = z
     id: databaseIdSchema,
     image: z.string().min(1).max(512),
     internalPort: z.number().int().min(1).max(65_535),
+    // Relays before resource-limits-v1 report neither.
+    limits: observedResourceLimitsSchema.default(NO_RESOURCE_LIMITS),
+    /** The data volume's size when the Relay last measured it. */
+    diskUsedBytes: z.number().int().nonnegative().nullable().default(null),
     name: relayDatabaseNameSchema,
-    observedState: z.enum(["starting", "running", "stopped", "failed"]),
+    observedState: z.enum([
+      "provisioning",
+      "starting",
+      "running",
+      "stopped",
+      "failed",
+    ]),
+    /** Where its provisioning is, until the database exists. */
+    provisioning: provisioningStateSchema.optional(),
     shortId: z.string().regex(/^[a-f0-9]{8}$/u),
     status: z.string().min(1).max(280),
     supportsImportExport: z.boolean(),
@@ -161,10 +192,25 @@ export const relayCreateDatabaseSchema = z
   })
   .strict()
 
+export const relayPrepareDatabaseSchema = relayCreateDatabaseSchema.extend({
+  idempotencyKey: z.uuid(),
+})
+
+export const relayProvisionDatabaseSchema = z
+  .object({ databaseId: databaseIdSchema })
+  .strict()
+
 export const relayDatabaseActionSchema = z
   .object({
     action: z.enum(["start", "stop", "restart"]),
     databaseId: databaseIdSchema,
+  })
+  .strict()
+
+export const relayDatabaseLimitsSchema = z
+  .object({
+    databaseId: databaseIdSchema,
+    limits: resourceLimitsInputSchema,
   })
   .strict()
 
@@ -372,6 +418,69 @@ export const relayHostAccessSchema = z.object({
   dataDirectory: z.string().min(1).optional(),
 })
 
+// A Docker named volume on a Relay: one Kiln made, named
+// `kiln-<short ID>-<slug>` after its ID and the name it was made with, or the
+// Relay's own data volume, which it keeps.
+export const relayVolumeIdSchema = z.string().regex(/^[a-f0-9]{40}$/u)
+export const RELAY_VOLUME_NAME_MAX_LENGTH = 64
+export const relayVolumeNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(RELAY_VOLUME_NAME_MAX_LENGTH)
+// A container that mounts a volume, and the Kiln resource it belongs to, by
+// its labels.
+export const relayVolumeMountSchema = z.object({
+  container: z.string(),
+  destination: z.string(),
+  kind: z.enum(["app", "database", "instance", "relay", "other"]),
+  readOnly: z.boolean(),
+  // The app's, database's, or game server's ID, when the container names one.
+  resourceId: z.string().nullable(),
+  running: z.boolean(),
+})
+export const relayVolumeSchema = z.object({
+  createdAt: z.string().nullable(),
+  dockerName: z.string().min(1),
+  // Null for the Relay's own data volume, which Kiln didn't make.
+  id: relayVolumeIdSchema.nullable(),
+  kind: z.enum(["relay", "volume"]),
+  // Where its files are on the host.
+  mountpoint: z.string().nullable(),
+  mounts: z.array(relayVolumeMountSchema),
+  name: z.string(),
+  // Null until Docker has measured it.
+  sizeBytes: z.number().int().nonnegative().nullable(),
+})
+export const relayVolumesSchema = z.object({
+  // Whether Docker is measuring the volumes, so sizes are on their way.
+  measuring: z.boolean(),
+  volumes: z.array(relayVolumeSchema),
+})
+// The part of a volume's Docker name its name gives: lowercase letters,
+// digits, and dashes, as Docker allows.
+export function relayVolumeSlug(name: string): string {
+  return (
+    name
+      .normalize("NFKD")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gu, "-")
+      .replace(/^-+/u, "")
+      .slice(0, 40)
+      .replace(/-+$/u, "") || "volume"
+  )
+}
+export const relayVolumeCreateSchema = z.strictObject({
+  id: relayVolumeIdSchema,
+  name: relayVolumeNameSchema,
+})
+export const relayVolumeRenameSchema = relayVolumeCreateSchema
+export const relayVolumeDeleteSchema = z.strictObject({
+  id: relayVolumeIdSchema,
+})
+export type RelayVolume = z.infer<typeof relayVolumeSchema>
+export type RelayVolumeMount = z.infer<typeof relayVolumeMountSchema>
+
 // Relay to Hearth: output for one attachment, in order. `ended` arrives with
 // the session's last output. Not strict: a Relay newer than its Hearth may
 // send fields this Hearth doesn't know yet.
@@ -403,7 +512,53 @@ export const appServiceNameSchema = z
   .string()
   .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$/u)
 
-export const appSourceTypeSchema = z.enum(["image", "dockerfile", "compose"])
+// GitHub builds a Dockerfile or runs a Compose file from a repository. Hearth
+// keeps which repository; the Relay gets the commit to deploy with each
+// deployment.
+export const appSourceTypeSchema = z.enum([
+  "image",
+  "dockerfile",
+  "compose",
+  "github",
+])
+
+export const appGitHubBuildSchema = z.enum(["dockerfile", "compose"])
+
+// A file in a repository, from its root: no leading slash, no `..`.
+export const appRepositoryPathSchema = z
+  .string()
+  .min(1)
+  .max(1_024)
+  .refine(
+    (path) =>
+      !path.startsWith("/") &&
+      !path.includes("\\") &&
+      !path.includes("\0") &&
+      path
+        .split("/")
+        .every((segment) => segment !== "" && segment !== "." && segment !== ".."),
+    "Use a path inside the repository, like Dockerfile or deploy/compose.yaml"
+  )
+
+// owner/name, as GitHub spells them.
+export const githubRepositoryNameSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/u)
+
+export const gitCommitShaSchema = z.string().regex(/^[a-f0-9]{40}$/u)
+
+// What a GitHub deployment builds: one commit of one repository, read with a
+// token that only reads that repository and expires within the hour. The
+// Relay keeps neither once the deployment finishes.
+export const relayAppGitHubCheckoutSchema = z
+  .object({
+    build: appGitHubBuildSchema,
+    commit: gitCommitShaSchema,
+    path: appRepositoryPathSchema,
+    repository: githubRepositoryNameSchema,
+    token: z.string().min(1).max(1_024),
+  })
+  .strict()
 
 export const appPortSchema = z
   .object({
@@ -412,6 +567,12 @@ export const appPortSchema = z
     protocol: z.enum(["tcp", "udp"]),
   })
   .strict()
+
+// Memory and CPU limits by service name. A service without an entry has
+// none.
+export const appServiceLimitsSchema = z
+  .record(appServiceNameSchema, serviceResourceLimitsSchema)
+  .refine((limits) => Object.keys(limits).length <= 64, "Too many services")
 
 // Every source is kept, so switching between them loses nothing; only
 // `sourceType` deploys.
@@ -427,11 +588,20 @@ export const appConfigSchema = z
       .max(512)
       .regex(/^\/[^\0:]*$/u, "Use an absolute path inside the container"),
     databaseIds: z.array(databaseIdSchema).max(32),
+    // The data directory's limit; past it, the app is stopped. Configs saved
+    // before limits have none.
+    diskLimitBytes: z
+      .number()
+      .int()
+      .min(MINIMUM_INSTANCE_DISK_LIMIT_BYTES)
+      .nullable()
+      .default(null),
     dockerfile: z.string().max(200_000),
     // KEY=VALUE lines, as in an env file.
     environment: z.string().max(65_536),
     image: z.string().trim().max(512),
     ports: z.array(appPortSchema).max(32),
+    serviceLimits: appServiceLimitsSchema.default({}),
     sourceType: appSourceTypeSchema,
   })
   .strict()
@@ -441,10 +611,12 @@ export const defaultAppConfig: z.infer<typeof appConfigSchema> = {
   compose: "",
   dataMount: "/data",
   databaseIds: [],
+  diskLimitBytes: null,
   dockerfile: "",
   environment: "",
   image: "",
   ports: [],
+  serviceLimits: {},
   sourceType: "image",
 }
 
@@ -461,6 +633,8 @@ export const relayAppContainerSchema = z.object({
   id: z.string().min(1),
   image: z.string(),
   labels: z.record(z.string(), z.string()),
+  // The memory and CPU it runs with. Absent from older Relays.
+  limits: observedResourceLimitsSchema.optional(),
   name: z.string().min(1),
   networks: z.array(z.string()),
   ports: z.array(appPortSchema),
@@ -472,9 +646,15 @@ export const relayAppContainerSchema = z.object({
 })
 
 export const relayAppDeploymentSchema = z.object({
+  // The commit a GitHub deployment built. Absent from older Relays.
+  commit: gitCommitShaSchema.nullable().default(null),
   error: z.string().max(2_000).nullable(),
   finishedAt: z.string().datetime().nullable(),
   id: z.string().min(1).max(64),
+  // Whether the new containers started beside the old ones and took over
+  // once healthy, rather than replacing them stopped. Null until decided,
+  // and from older Relays.
+  rolling: z.boolean().nullable().default(null),
   sourceType: appSourceTypeSchema,
   startedAt: z.string().datetime(),
   state: appDeploymentStateSchema,
@@ -486,11 +666,23 @@ export const relayAppSchema = z.object({
   // The app's data directory on the Relay's host.
   dataDirectory: z.string(),
   deployment: relayAppDeploymentSchema.nullable(),
+  // The data directory's limit, and its size when last measured. Absent
+  // from older Relays.
+  diskLimitBytes: z.number().int().positive().nullable().default(null),
+  diskUsedBytes: z.number().int().nonnegative().nullable().default(null),
   // The name its containers answer to on the app's network.
   hostname: z.string(),
   id: appIdSchema,
   network: z.string(),
-  observedState: z.enum(["starting", "running", "stopped", "failed"]),
+  observedState: z.enum([
+    "provisioning",
+    "starting",
+    "running",
+    "stopped",
+    "failed",
+  ]),
+  /** Where its provisioning is, until the app exists. */
+  provisioning: provisioningStateSchema.optional(),
   shortId: z.string().regex(/^[a-f0-9]{8}$/u),
   status: z.string().min(1).max(280),
 })
@@ -499,8 +691,36 @@ export const relayCreateAppSchema = z
   .object({ id: appIdSchema, name: appNameSchema })
   .strict()
 
+export const relayPrepareAppSchema = relayCreateAppSchema.extend({
+  idempotencyKey: z.uuid(),
+})
+
+export const relayProvisionAppSchema = z
+  .object({ appId: appIdSchema })
+  .strict()
+
 export const relayDeployAppSchema = z
-  .object({ appId: appIdSchema, config: appConfigSchema, name: appNameSchema })
+  .object({
+    appId: appIdSchema,
+    config: appConfigSchema,
+    // Required when the config's source is GitHub.
+    github: relayAppGitHubCheckoutSchema.optional(),
+    name: appNameSchema,
+  })
+  .strict()
+
+// One of the app's recent deployments, with its log: the running one, or one
+// the Relay kept.
+export const relayAppDeploymentReadSchema = z
+  .object({ appId: appIdSchema, deploymentId: z.string().min(1).max(64) })
+  .strict()
+
+export const relayAppLimitsSchema = z
+  .object({
+    appId: appIdSchema,
+    diskLimitBytes: appConfigSchema.shape.diskLimitBytes,
+    serviceLimits: appServiceLimitsSchema,
+  })
   .strict()
 
 export const relayAppActionSchema = z
@@ -826,9 +1046,12 @@ export const relayInstanceTailscaleSchema = z
   })
 
 export const relayCreateInstanceSchema = z.object({
+  // Hearth sends `limits` to Relays with `resource-limits-v1`, and
+  // `diskLimitBytes` alone to older ones.
   diskLimitBytes: relayRequestedDiskLimitBytesSchema.default(
     DEFAULT_INSTANCE_DISK_LIMIT_BYTES
   ),
+  limits: resourceLimitsInputSchema.optional(),
   name: relayInstanceNameSchema.optional(),
   recipe: brickSourceSchema,
   recipeDefinition: brickRecipeSchema.optional(),
@@ -851,6 +1074,7 @@ export const relayProvisionInstanceSchema = z.object({
 export const relayUpdateInstanceStartupSchema = z
   .object({
     diskLimitBytes: relayRequestedDiskLimitBytesSchema.optional(),
+    limits: resourceLimitsInputSchema.optional(),
     recipe: brickSourceSchema.optional(),
     recipeDefinition: brickRecipeSchema.optional(),
     reinstall: z.boolean().optional(),
@@ -1230,12 +1454,18 @@ export const relayInstanceResourcesSchema = z.object({
     .optional(),
 })
 
-export const relayInstanceLimitsSchema = z
-  .object({
-    diskBytes: relayDiskLimitBytesSchema,
-    memoryBytes: z.number().int().nonnegative(),
-  })
-  .strict()
+// What the Relay applied; `null` means no limit. Relays before
+// `resource-limits-v1` send no CPU limit and 0 for no memory limit.
+export const relayInstanceLimitsSchema = z.object({
+  cpuMillis: z.number().int().positive().nullable().default(null),
+  diskBytes: relayDiskLimitBytesSchema.nullable(),
+  memoryBytes: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .transform((bytes) => (bytes === 0 ? null : bytes)),
+})
 
 export const relayInstancePortIdSchema = z
   .string()
@@ -1437,8 +1667,9 @@ export const relayInstanceSchema = z.object({
   variables: brickVariableValuesSchema.optional(),
   managedByRelay: z.boolean().default(false),
   limits: relayInstanceLimitsSchema.default({
+    cpuMillis: null,
     diskBytes: DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
-    memoryBytes: 0,
+    memoryBytes: null,
   }),
   resources: relayInstanceResourcesSchema.nullable().default(null),
   provisioning: relayInstanceProvisioningSchema.optional(),
@@ -1626,6 +1857,9 @@ const relaySnapshotRelaySchema = z.object({
   browserOrigin: relayProxyBrowserMetadataSchema.shape.browserOrigin.optional(),
   id: relayIdSchema,
   name: z.string().min(1).max(120),
+  // Held paused by a Hearth, so it runs no changes. See
+  // `relayControlOperationRefusedWhilePaused`.
+  paused: z.boolean().optional(),
   proxyMode: relayProxyModeSchema.optional(),
   sftp: relaySftpSnapshotSchema,
   tls: z
@@ -1790,6 +2024,48 @@ export const relayRemoteFileUploadResultSchema = z
   })
   .strict()
 
+export const relayFilePutInputSchema = z
+  .object({
+    instanceId: fileRootIdSchema,
+    path: relayFileMutationPathSchema,
+    /**
+     * The file's bytes, base64-encoded. 700 KiB of base64 (about 525 KiB of
+     * file) keeps the control frame under `relayControlMaxFrameBytes`.
+     */
+    contentBase64: z.base64().max(700 * 1024),
+    /**
+     * Write only if the file is unchanged: its modification time, in whole
+     * milliseconds, still matches, or null for a file that must not exist.
+     * Omitted to write regardless.
+     */
+    unlessModifiedSince: z.number().int().nonnegative().nullable().optional(),
+  })
+  .strict()
+
+/**
+ * A precondition that failed leaves the file alone and says what's there,
+ * so a caller can tell its own earlier write from someone else's.
+ */
+export const relayFilePutResultSchema = z.union([
+  relayRemoteFileUploadResultSchema.extend({ conflict: z.literal(false) }),
+  z
+    .object({
+      conflict: z.literal(true),
+      current: z
+        .object({
+          /** The content's Git blob ID; null for a file too large to hash. */
+          blob: z
+            .string()
+            .regex(/^[a-f0-9]{40}$/u)
+            .nullable(),
+          modifiedAt: z.number().int().nonnegative(),
+        })
+        .strict()
+        .nullable(),
+    })
+    .strict(),
+])
+
 export const relayFileMutationInputSchema = z.discriminatedUnion("operation", [
   z.object({
     operation: z.literal("rename"),
@@ -1876,6 +2152,16 @@ export const relayConsoleLineSchema = z.object({
   text: z.string(),
   segments: z.array(relayConsoleSegmentSchema).optional(),
 })
+
+// Null when the Relay no longer keeps that deployment.
+export const relayAppDeploymentLogSchema = z
+  .object({
+    deployment: relayAppDeploymentSchema,
+    // Lines dropped from the front once the log reached its limits.
+    dropped: z.number().int().nonnegative(),
+    lines: z.array(relayConsoleLineSchema),
+  })
+  .nullable()
 
 export const relayConsoleSchema = z.object({
   instanceId: z.string().min(1),
@@ -2042,6 +2328,7 @@ export function databaseEngineSupportsBrowsing(
 export type RelayManagedDatabase = z.infer<typeof relayManagedDatabaseSchema>
 export type RelayCreateDatabase = z.infer<typeof relayCreateDatabaseSchema>
 export type RelayDatabaseAction = z.infer<typeof relayDatabaseActionSchema>
+export type RelayDatabaseLimits = z.infer<typeof relayDatabaseLimitsSchema>
 export type RelayDeleteDatabase = z.infer<typeof relayDeleteDatabaseSchema>
 export type RelayRotateDatabaseCredentials = z.infer<
   typeof relayRotateDatabaseCredentialsSchema
@@ -2082,9 +2369,18 @@ export type AppPort = z.infer<typeof appPortSchema>
 export type AppDeploymentState = z.infer<typeof appDeploymentStateSchema>
 export type RelayApp = z.infer<typeof relayAppSchema>
 export type RelayAppContainer = z.infer<typeof relayAppContainerSchema>
+export type RelayAppLimits = z.infer<typeof relayAppLimitsSchema>
 export type RelayAppDeployment = z.infer<typeof relayAppDeploymentSchema>
 export type RelayCreateApp = z.infer<typeof relayCreateAppSchema>
 export type RelayDeployApp = z.infer<typeof relayDeployAppSchema>
+export type AppGitHubBuild = z.infer<typeof appGitHubBuildSchema>
+export type RelayAppGitHubCheckout = z.infer<
+  typeof relayAppGitHubCheckoutSchema
+>
+export type RelayAppDeploymentRead = z.infer<
+  typeof relayAppDeploymentReadSchema
+>
+export type RelayAppDeploymentLog = z.infer<typeof relayAppDeploymentLogSchema>
 export type RelayAppAction = z.infer<typeof relayAppActionSchema>
 export type RelayDeleteApp = z.infer<typeof relayDeleteAppSchema>
 export type RelayAppNetwork = z.infer<typeof relayAppNetworkSchema>
@@ -2110,6 +2406,10 @@ export type RelayProvisionInstance = z.infer<
 export type RelayInstanceProvisioning = z.infer<
   typeof relayInstanceProvisioningSchema
 >
+export type ProvisioningKind = z.infer<typeof provisioningKindSchema>
+export type ProvisioningPhase = z.infer<typeof provisioningPhaseSchema>
+export type ProvisioningWorkPhase = z.infer<typeof provisioningWorkPhaseSchema>
+export type ProvisioningState = z.infer<typeof provisioningStateSchema>
 export type RelayUpdateInstanceStartup = z.infer<
   typeof relayUpdateInstanceStartupSchema
 >
@@ -2381,6 +2681,8 @@ export type RelayRemoteFileUpload = z.infer<typeof relayRemoteFileUploadSchema>
 export type RelayRemoteFileUploadResult = z.infer<
   typeof relayRemoteFileUploadResultSchema
 >
+export type RelayFilePutInput = z.infer<typeof relayFilePutInputSchema>
+export type RelayFilePutResult = z.infer<typeof relayFilePutResultSchema>
 export type RelayFileActivityEntry = z.infer<
   typeof relayFileActivityEntrySchema
 >

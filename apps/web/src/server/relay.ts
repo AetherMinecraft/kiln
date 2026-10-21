@@ -79,7 +79,7 @@ import {
   ExternalServiceError,
   ResourceNotFoundError,
 } from "@/effect/errors"
-import { forkAppEffect, runAppEffect } from "@/effect/runtime"
+import { forkAppEffect, runAppEffect, traceAppPromise } from "@/effect/runtime"
 import {
   applyManagedDomainAddressesEffect,
   provisionInstanceDomainBestEffort,
@@ -107,12 +107,13 @@ import {
   type RelayReachability,
 } from "@/lib/relay-fleet"
 import type { PersistedRelay } from "@/lib/relay-registry"
-import { listPersistedRelays } from "@/lib/relay-registry"
+import { activeRelay, listPersistedRelays } from "@/lib/relay-registry"
 import { resolveMclogsApiUrl } from "@/lib/mclogs"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import {
   isRelayUpdating,
   relayConnectionNode,
+  relayConnectionProxyMode,
   relayConnectionFailing,
   relayConnectionSnapshot,
   relayConnectionState,
@@ -300,6 +301,26 @@ export const getRelayNodeReadings = createServerFn({
       : []
   })
 })
+
+/**
+ * Each readable Relay's proxy mode, from the snapshot its connection last
+ * pushed, so the infrastructure map can show which Relays run Traefik
+ * without a Relay round trip. Null while this process has no connection.
+ */
+export const getRelayProxyModes = createServerFn({ method: "GET" }).handler(
+  async () => {
+    const user = await requireEligibleResourceUser()
+    const { grants, relays } = await authorizedRelays(
+      user,
+      await listPersistedRelays()
+    )
+    return relays.flatMap((relay) =>
+      relay.enabled && canReadRelayNode(user, relay.id, grants)
+        ? [{ mode: relayConnectionProxyMode(relay.id), relayId: relay.id }]
+        : []
+    )
+  }
+)
 
 export const getFreshRelayConnectionState = createServerFn({
   method: "POST",
@@ -892,11 +913,13 @@ export const getRelayFile = createServerFn({ method: "GET" })
       data.instanceId,
       "instance.files.read"
     )
-    const response = await relayFetch(
-      relay,
-      `/v1/instances/${encodeURIComponent(data.instanceId)}/file?path=${encodeURIComponent(data.path)}`
-    )
-    return relayFileContentSchema.parse(await response.json())
+    return traceAppPromise("relay.file", async () => {
+      const response = await relayFetch(
+        relay,
+        `/v1/instances/${encodeURIComponent(data.instanceId)}/file?path=${encodeURIComponent(data.path)}`
+      )
+      return relayFileContentSchema.parse(await response.json())
+    })
   })
 
 export const recordRelayFileView = createServerFn({ method: "POST" })
@@ -1476,7 +1499,21 @@ async function authorize(
 
 // App data directories (`app:<appId>`) are served like a server's files and
 // checked against the app permissions granted on their Relay.
-async function requireFilePermission(
+function requireFilePermission(
+  user: AuthenticatedUser,
+  relayId: string,
+  instanceId: string,
+  permission:
+    | "instance.files.delete"
+    | "instance.files.read"
+    | "instance.files.write"
+) {
+  return traceAppPromise("files.permission", () =>
+    checkFilePermission(user, relayId, instanceId, permission)
+  )
+}
+
+async function checkFilePermission(
   user: AuthenticatedUser,
   relayId: string,
   instanceId: string,
@@ -1511,7 +1548,12 @@ async function requireFilePermission(
   await requireRelayPermission({ instanceId, permission, relayId, user })
 }
 
-async function instanceRelayAccess(relayId: string) {
+// The signed-in user and the Relay a request is for, checked before its work.
+function instanceRelayAccess(relayId: string) {
+  return traceAppPromise("relay.access", () => findInstanceRelay(relayId))
+}
+
+async function findInstanceRelay(relayId: string) {
   const user = await Effect.runPromise(
     Effect.tryPromise({
       try: requireEligibleResourceUser,
@@ -1522,15 +1564,12 @@ async function instanceRelayAccess(relayId: string) {
         }),
     })
   )
-  const relay = (await listPersistedRelays()).find(
-    (item) => item.enabled && item.id === relayId
-  )
-  if (!relay) {
-    throw ResourceNotFoundError.make({
+  const relay = await activeRelay(relayId, () =>
+    ResourceNotFoundError.make({
       resource: "relay",
       message: "No Relay owns this instance",
     })
-  }
+  )
   return { relay, user }
 }
 

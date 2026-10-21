@@ -1,6 +1,7 @@
 import { Option, Schema } from "effect"
 
 import {
+  isKilnInstallationId,
   kilnGitRepositoryRawUrl,
   resolveKilnGitRepository,
 } from "@workspace/contracts"
@@ -40,11 +41,16 @@ export function kilnBrickCatalogUrl(): string {
   )
 }
 
-export function kilnInstallationId(): string {
-  const configured = process.env.KILN_INSTALLATION_ID?.trim() || "kiln"
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/u.test(configured)) {
+/**
+ * The installation ID an operator set explicitly. Without one, Hearth
+ * generates and saves its own (see `effect/installation.ts`).
+ */
+export function configuredKilnInstallationId(): string | null {
+  const configured = process.env.KILN_INSTALLATION_ID?.trim()
+  if (!configured) return null
+  if (!isKilnInstallationId(configured)) {
     throw new Error(
-      "KILN_INSTALLATION_ID must use 1-128 letters, numbers, dots, underscores, or hyphens"
+      "KILN_INSTALLATION_ID must use 1-120 letters, numbers, dots, underscores, or hyphens"
     )
   }
   return configured

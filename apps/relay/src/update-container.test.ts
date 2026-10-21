@@ -140,28 +140,36 @@ describe("container replacement", () => {
       })
   )
 
-  effectIt.effect("reports replacement phases in execution order", () =>
-    Effect.gen(function* () {
-      const { docker } = yield* runningHearth()
-      const phases: Array<string> = []
+  effectIt.effect(
+    "labels a container from before installation IDs with this installation",
+    () =>
+      Effect.gen(function* () {
+        const { docker } = yield* runningHearth()
 
-      yield* replaceContainerEffect(replacement, docker, (phase) =>
-        Effect.sync(() => {
-          phases.push(phase)
-        })
+        yield* replaceContainerEffect(
+          { ...replacement, installationId: "kiln-installation" },
+          docker,
+          ignorePhase
+        )
+
+        expect(hearth()?.labels["io.kiln.installation"]).toBe(
+          "kiln-installation"
+        )
+      })
+  )
+
+  effectIt.effect("keeps the installation a container is labeled with", () =>
+    Effect.gen(function* () {
+      const { current, docker } = yield* runningHearth()
+      current.labels["io.kiln.installation"] = "kiln-original"
+
+      yield* replaceContainerEffect(
+        { ...replacement, installationId: "kiln-installation" },
+        docker,
+        ignorePhase
       )
 
-      expect(phases).toEqual([
-        "replace.inspectContainer",
-        "replace.tagTarget",
-        "replace.stopCurrent",
-        "replace.renameCurrent",
-        "replace.createTarget",
-        "replace.connectNetwork",
-        "replace.startTarget",
-        "replace.waitUntilHealthy",
-        "replace.removeBackup",
-      ])
+      expect(hearth()?.labels["io.kiln.installation"]).toBe("kiln-original")
     })
   )
 

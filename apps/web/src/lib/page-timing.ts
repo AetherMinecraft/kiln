@@ -24,6 +24,8 @@ type Navigation = "hard" | "client"
 interface PageOpen {
   id: number
   routeId: string
+  // The URL path the open is for.
+  path: string
   navigation: Navigation
   startedAt: number
   // The name was in the server's HTML, so it painted with the first paint.
@@ -34,6 +36,8 @@ interface PageOpen {
   chainStartedAt: number
   // Requested, and painted: a page can request several in one frame.
   marked: Set<PageMilestone>
+  // What a milestone found, such as which view the content was.
+  details: Map<PageMilestone, Record<string, unknown>>
   recorded: Set<PageMilestone>
   span: BrowserSpan
   timeout: ReturnType<typeof setTimeout> | undefined
@@ -43,7 +47,15 @@ const instanceRoute = /^\/_app\/(server|db|app|relay)\//u
 
 // Pages whose open ends at a page-specific "content" milestone. The rest end
 // once their route, name, and status are on screen.
-const contentRoutes = new Set(["/_app/server/$serverId/console"])
+const contentRoutes = new Set([
+  "/_app/server/$serverId/console",
+  "/_app/server/$serverId/files",
+  "/_app/server/$serverId/files/$",
+  "/_app/app/$appId/files",
+  "/_app/app/$appId/files/$",
+  "/_app/relay/$relayId/files",
+  "/_app/relay/$relayId/files/$",
+])
 
 // An open that never completes still ends, so its span is reported.
 const maximumOpenMs = 30_000
@@ -68,18 +80,25 @@ export function currentPageOpenId(): number {
   return current?.id ?? 0
 }
 
+/** The span of the open being timed, for work it waits on to nest under. */
+export function currentPageOpenSpan(): BrowserSpan | undefined {
+  return current?.span
+}
+
 /** Starts timing a page open; any open still running is replaced. */
 export function startPageOpen(
   routeId: string,
   navigation: Navigation,
   startedAt: number,
-  attributes: Record<string, unknown> = {}
+  attributes: Record<string, unknown> = {},
+  path = typeof window === "undefined" ? "" : window.location.pathname
 ): void {
   finishPageOpen("replaced")
   if (!isInstanceRoute(routeId)) return
   const open: PageOpen = {
     id: nextId++,
     routeId,
+    path,
     navigation,
     startedAt,
     identityServerRendered:
@@ -89,6 +108,7 @@ export function startPageOpen(
     contentSkipped: false,
     chainStartedAt: startedAt,
     marked: new Set(),
+    details: new Map(),
     recorded: new Set(),
     span: startBrowserSpan("Page open", {
       startedAt,
@@ -122,9 +142,13 @@ export function startClientNavigation(
     finishPageOpen("left")
     return
   }
-  startPageOpen(routeId, "client", startedAt, {
-    "kiln.page.chain_before_ms": Math.round(startedAt - chainStartedAt),
-  })
+  startPageOpen(
+    routeId,
+    "client",
+    startedAt,
+    { "kiln.page.chain_before_ms": Math.round(startedAt - chainStartedAt) },
+    path
+  )
   if (current) current.chainStartedAt = chainStartedAt
 }
 
@@ -153,11 +177,13 @@ export function resolveClientNavigation(path: string): void {
  */
 export function markPageMilestone(
   milestone: PageMilestone,
-  openId = currentPageOpenId()
+  openId = currentPageOpenId(),
+  details?: Record<string, unknown>
 ): void {
   const open = current
   if (!open || open.id !== openId || open.marked.has(milestone)) return
   open.marked.add(milestone)
+  if (details) open.details.set(milestone, details)
   requestAnimationFrame(() => {
     if (current !== open) return
     // The frame's own timestamp can precede the request in a busy frame;
@@ -197,6 +223,24 @@ export function usePageMilestone(milestone: PageMilestone, reached: boolean) {
   React.useEffect(() => {
     if (reached && openId) markPageMilestone(milestone, openId)
   }, [milestone, openId, reached])
+}
+
+/**
+ * Marks the open page's content once `reached`, as `view`, if the open is
+ * for a URL path the content `shows`. A view still on screen when an open
+ * for another path begins, such as the file being left, can't mark it.
+ */
+export function usePageContent(
+  reached: boolean,
+  view: string,
+  shows: (path: string) => boolean
+) {
+  const openId = usePageOpenId()
+  React.useEffect(() => {
+    if (!reached || !openId || current?.id !== openId) return
+    if (!shows(current.path)) return
+    markPageMilestone("content", openId, { "kiln.page.content_view": view })
+  }, [openId, reached, shows, view])
 }
 
 /** Declares, while `skipped`, that this page reports no content milestone. */
@@ -252,6 +296,7 @@ function paintedTime(
 
 function record(open: PageOpen, milestone: PageMilestone, at: number) {
   const end = Math.max(open.startedAt, at)
+  const details = open.details.get(milestone)
   performance.measure(`kiln:page:${milestone}`, {
     start: open.startedAt,
     end,
@@ -259,15 +304,19 @@ function record(open: PageOpen, milestone: PageMilestone, at: number) {
       route: open.routeId,
       navigation: open.navigation,
       chainStartedAt: open.chainStartedAt,
+      ...details,
     },
   })
   open.span.setAttribute(
     `kiln.page.${milestone}_ms`,
     Math.round(end - open.startedAt)
   )
+  for (const [key, value] of Object.entries(details ?? {})) {
+    open.span.setAttribute(key, value)
+  }
   startBrowserSpan(`Page ${milestone}`, {
     parent: open.span,
     startedAt: open.startedAt,
-    attributes: { "kiln.operation": `ui.page.${milestone}` },
+    attributes: { "kiln.operation": `ui.page.${milestone}`, ...details },
   }).end(undefined, end)
 }

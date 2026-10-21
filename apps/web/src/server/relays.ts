@@ -135,12 +135,8 @@ async function requireRelayAdministrator(
 }
 
 async function enabledRelay(relayId: string): Promise<PersistedRelay> {
-  const { listPersistedRelays } = await import("@/lib/relay-registry")
-  const relay = (await listPersistedRelays()).find(
-    (candidate) => candidate.enabled && candidate.id === relayId
-  )
-  if (!relay) throw new Error("Relay is not configured or is paused")
-  return relay
+  const { activeRelay } = await import("@/lib/relay-registry")
+  return activeRelay(relayId)
 }
 
 async function managedRelays(
@@ -396,6 +392,18 @@ export const getRelayProxy = createServerFn({ method: "GET" })
     return relayProxyResponseSchema.parse(
       await relayRpc(relay, "relay.proxy.read", {}, 15_000)
     )
+  })
+
+// Every web route the Relay's proxy serves that the user may see, for the
+// infrastructure map. Null from Relays that predate it.
+export const getRelayWebRoutes = createServerFn({ method: "GET" })
+  .validator(relayIdSchema)
+  .handler(async ({ data }) => {
+    const user = await requireEligibleResourceUser()
+    const { relayWebRoutesHandler } = await import(
+      "@/server/relay-web-routes.server"
+    )
+    return relayWebRoutesHandler(user, data.id)
   })
 
 // Files the Info page opens in the Relay's host files: its database, and the

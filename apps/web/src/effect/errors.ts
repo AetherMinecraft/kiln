@@ -122,6 +122,11 @@ export class RelayUnavailableError extends Schema.TaggedError<RelayUnavailableEr
     code: Schema.optional(Schema.String),
     requestId: Schema.optional(Schema.String),
     retryable: Schema.optional(Schema.Boolean),
+    /**
+     * For a change: `unknown` when the Relay may have applied it but its
+     * answer never came, so it mustn't simply be sent again.
+     */
+    outcome: Schema.optional(Schema.Literals(["unknown"])),
     cause: Schema.optional(Schema.Defect()),
   }
 ) {}
@@ -146,6 +151,12 @@ export class ResourceNotFoundError extends Schema.TaggedError<ResourceNotFoundEr
     resource: Schema.String,
     message: Schema.String,
   }
+) {}
+
+/** A vanity domain change that would strand game server domains' records. */
+export class DomainConfigurationError extends Schema.TaggedError<DomainConfigurationError>()(
+  "DomainConfigurationError",
+  { message: Schema.String }
 ) {}
 
 export class ExternalServiceError extends Schema.TaggedError<ExternalServiceError>()(
@@ -193,3 +204,12 @@ export type AppError =
   | RelayUnavailableError
   | ResourceNotFoundError
   | TailscaleOrchestrationError
+
+/**
+ * A read Hearth started while rendering a page and couldn't finish. The
+ * browser receives it in place of the result, so its message is shown.
+ */
+export class RenderReadError extends Schema.TaggedError<RenderReadError>()(
+  "RenderReadError",
+  { message: Schema.String }
+) {}

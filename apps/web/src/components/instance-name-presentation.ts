@@ -11,6 +11,8 @@ export type RelayIdentityStatus =
   | "checking"
   | "connected"
   | "paused"
+  // Paused in Hearth, but the Relay hasn't confirmed it holds the pause.
+  | "pausing"
   | "unknown"
   | "unreachable"
 
@@ -76,7 +78,18 @@ export function instanceStatusPresentation(
 export function relayStatusPresentation(
   relay: RelayStatusSource
 ): InstanceStatusPresentation {
-  if (relay.enabled === false || relay.relayStatus === "paused") {
+  if (relay.relayStatus === "pausing") {
+    return {
+      detail: "Waiting for the Relay to confirm it's paused",
+      label: "Pausing",
+      pulse: true,
+      tone: "warning",
+    }
+  }
+  if (
+    relay.relayStatus === "paused" ||
+    (relay.enabled === false && relay.relayStatus === undefined)
+  ) {
     return { label: "Paused", tone: "neutral" }
   }
   if (relay.updating) {

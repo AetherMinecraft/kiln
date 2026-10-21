@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
 import {
@@ -20,7 +20,10 @@ import {
   relayDatabaseTerminalWriteSchema,
   relayDatabaseContainerSchema,
   relayDatabaseDumpFormatSchema,
+  relayDatabaseLimitsV1Feature,
+  relayDatabaseProvisioningV1Feature,
   relayManagedDatabaseSchema,
+  resourceLimitsInputSchema,
 } from "@workspace/contracts"
 import type { RelayManagedDatabase } from "@workspace/contracts"
 import { Effect, Result } from "effect"
@@ -28,6 +31,7 @@ import { z } from "zod"
 
 import {
   createManagedDatabaseRecordEffect,
+  deleteManagedDatabaseRecordEffect,
   listManagedDatabaseDirectoryEffect,
   listManagedDatabaseRecordsEffect,
   loadManagedDatabaseCredentialEffect,
@@ -35,6 +39,7 @@ import {
   renameManagedDatabaseRecordEffect,
   rotateManagedDatabaseCredentialEffect,
 } from "@/effect/managed-databases"
+import { promiseEffect } from "@/effect/promise"
 import { runAppEffect } from "@/effect/runtime"
 import {
   isPlatformAdmin,
@@ -50,6 +55,10 @@ import {
 import { accessPermissions, grantHasPermission } from "@/lib/permissions"
 import type { AccessPermission } from "@/lib/permissions"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
+import {
+  abandonPreparedProvisioning,
+  claimPreparedProvisioning,
+} from "@/lib/provisioning.server"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { requireEligibleResourceUser } from "@/server/auth"
 import {
@@ -68,8 +77,12 @@ const databaseInputSchema = z.strictObject({
   databaseId: databaseIdSchema,
   relayId: relayIdSchema,
 })
+const cancelledSchema = z.object({ cancelled: z.boolean() })
 const databaseActionInputSchema = databaseInputSchema.extend({
   action: z.enum(["start", "stop", "restart"]),
+})
+const databaseLimitsInputSchema = databaseInputSchema.extend({
+  limits: resourceLimitsInputSchema,
 })
 const databaseRenameInputSchema = databaseInputSchema.extend({
   name: relayDatabaseNameSchema,
@@ -304,23 +317,15 @@ export const createManagedDatabase = createServerFn({ method: "POST" })
     const username = `kiln_${randomBytes(6).toString("hex")}`
     const password = randomBytes(36).toString("base64url")
     const databaseName = `kiln_${id.slice(0, 12)}`
-    const created = relayManagedDatabaseSchema.parse(
-      await databaseRpc(
-        relay,
-        "database.create",
-        {
-          databaseName,
-          engine: data.engine,
-          id,
-          name: data.name,
-          password,
-          username,
-        },
-        360_000,
-        user.id
-      )
-    )
-    const persisted = await promiseResult(() =>
+    const request = {
+      databaseName,
+      engine: data.engine,
+      id,
+      name: data.name,
+      password,
+      username,
+    }
+    const register = () =>
       runAppEffect(
         "managedDatabases.record.create",
         createManagedDatabaseRecordEffect({
@@ -334,7 +339,63 @@ export const createManagedDatabase = createServerFn({ method: "POST" })
           username,
         })
       )
+    const { relayConnectionFeatures } = await import("@/lib/relay-connection")
+    if (
+      relayConnectionFeatures(relay.id).has(relayDatabaseProvisioningV1Feature)
+    ) {
+      // The Relay creates it in the background; it opens on its
+      // provisioning page at once.
+      const cancel = () =>
+        databaseRpc(
+          relay,
+          "database.provision.cancel",
+          { databaseId: id },
+          30_000,
+          user.id
+        ).then((result) => cancelledSchema.parse(result).cancelled)
+      const unregister = () =>
+        runAppEffect(
+          "managedDatabases.record.delete",
+          deleteManagedDatabaseRecordEffect(relay.id, id)
+        )
+      // Recorded first, so a job the Relay holds always has a database in
+      // Hearth to show it and delete it from.
+      await register()
+      const placeholder = await Effect.runPromise(
+        promiseEffect(() =>
+          databaseRpc(
+            relay,
+            "database.provision.prepare",
+            { ...request, idempotencyKey: randomUUID() },
+            30_000,
+            user.id
+          )
+        ).pipe(
+          Effect.map((value) => relayManagedDatabaseSchema.parse(value)),
+          Effect.tapError(() => abandonPreparedProvisioning(cancel, unregister))
+        )
+      )
+      await claimPreparedProvisioning({
+        cancel,
+        claim: () =>
+          databaseRpc(
+            relay,
+            "database.provision.claim",
+            { databaseId: id },
+            30_000,
+            user.id
+          ),
+        unconfirmed:
+          "If it stays waiting, delete it and create it again.",
+        unregister,
+      })
+      publishDatabaseChange(relay.id, true)
+      return { ...placeholder, relayId: relay.id, relayName: relay.name }
+    }
+    const created = relayManagedDatabaseSchema.parse(
+      await databaseRpc(relay, "database.create", request, 360_000, user.id)
     )
+    const persisted = await promiseResult(register)
     if (Result.isFailure(persisted)) {
       await ignorePromise(() =>
         databaseRpc(
@@ -361,6 +422,30 @@ export const runManagedDatabaseAction = createServerFn({ method: "POST" })
         "database.action",
         { action: data.action, databaseId: data.databaseId },
         180_000,
+        user.id
+      )
+    )
+    publishDatabaseChange(relay.id, false)
+    return database
+  })
+
+export const updateManagedDatabaseLimits = createServerFn({ method: "POST" })
+  .validator(databaseLimitsInputSchema)
+  .handler(async ({ data }) => {
+    const { relay, user } = await authorizedDatabase(
+      data,
+      "database.limits.write"
+    )
+    const { relayConnectionFeatures } = await import("@/lib/relay-connection")
+    if (!relayConnectionFeatures(relay.id).has(relayDatabaseLimitsV1Feature)) {
+      throw new Error("Update this Relay to set database limits")
+    }
+    const database = relayManagedDatabaseSchema.parse(
+      await databaseRpc(
+        relay,
+        "database.limits.write",
+        { databaseId: data.databaseId, limits: data.limits },
+        240_000,
         user.id
       )
     )
@@ -664,7 +749,18 @@ export const deleteManagedDatabase = createServerFn({ method: "POST" })
       relay,
       requestedBy: user.id,
     }
-    if (databaseEngineSupportsLogicalBackups(database.engine)) {
+    const onRelay = await databaseOnRelay(relay, data.databaseId, user.id)
+    if (onRelay === "missing") {
+      // The Relay lists no container or job for it, as when an earlier
+      // delete stopped partway, so there's nothing to back up. The Relay
+      // removes what's left, keeping any data volume, which a database
+      // without a container can't be backed up from.
+      await deleteDatabaseWithoutFinalBackup({ ...deletion, deleteData: false })
+    } else if (
+      // One that never finished provisioning has no data to back up.
+      onRelay === "running" &&
+      databaseEngineSupportsLogicalBackups(database.engine)
+    ) {
       await deleteDatabaseWithFinalBackup({ ...deletion, user })
     } else {
       await deleteDatabaseWithoutFinalBackup(deletion)
@@ -672,6 +768,34 @@ export const deleteManagedDatabase = createServerFn({ method: "POST" })
     publishDatabaseChange(relay.id, true, data.databaseId)
     return { deleted: true }
   })
+
+// What the Relay has of the database: nothing, a provisioning job, or the
+// database itself.
+async function databaseOnRelay(
+  relay: Awaited<ReturnType<typeof requiredRelay>>,
+  databaseId: string,
+  userId: string
+): Promise<"missing" | "provisioning" | "running"> {
+  // Only this database. Its detail tells a failed provisioning job from a
+  // database that exists but failed, which share an observed state.
+  const [item] = z
+    .array(
+      z
+        .object({ database: relayManagedDatabaseSchema.optional() })
+        .loose()
+    )
+    .parse(
+      await databaseRpc(
+        relay,
+        "database.list",
+        { requests: [{ id: databaseId, view: "detail" }] },
+        30_000,
+        userId
+      )
+    )
+  if (!item) return "missing"
+  return item.database?.provisioning ? "provisioning" : "running"
+}
 
 function publishDatabaseChange(
   relayId: string,

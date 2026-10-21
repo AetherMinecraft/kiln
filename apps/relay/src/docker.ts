@@ -12,14 +12,18 @@ import {
   type DatabaseConnections,
   type DatabaseConnectionSnapshot,
 } from "./database-connections.js"
+import { LaneRejectedError, type OperationLanes } from "./operation-lanes.js"
+import { instanceLifecycleLocks } from "./operation-plans.js"
 import {
   DockerEngine,
   DockerEngineError,
+  type DockerContainerSummary,
   type DockerLogOptions,
 } from "./docker-engine.js"
 import type { BrickCatalog } from "./bricks.js"
 import { directoryApparentSizeEffect } from "./disk-usage.js"
 import { ensuringPromise, recoverPromise } from "./effect/promise.js"
+import { reportRelayError } from "./effect/runtime.js"
 import type {
   RelayStateStore,
   RelayStoredLifecycleSession,
@@ -37,9 +41,12 @@ import type {
   RelayInstanceLifecycleState,
   RelayInstanceResources,
   RelaySftpPublicationStatus,
+  ResourceLimits,
 } from "@workspace/contracts"
 import {
   builtinTailscaleBrickId,
+  CPU_LIMIT_MILLIS_PER_CORE,
+  NO_RESOURCE_LIMITS,
   brickConsoleSchema,
   brickReadinessSchema,
   brickVariableValuesSchema,
@@ -80,6 +87,11 @@ import {
 } from "./console-parsing.js"
 import { procNetTcpHasListener } from "./docker-port-parsing.js"
 import { legacyDiskLimitAssignments } from "./resource-quotas.js"
+import {
+  containerResourceLimits,
+  DISK_LIMIT_LABEL,
+  ResourceAllocations,
+} from "./resource-limits.js"
 import { WEB_ROUTE_LABEL_PREFIX } from "./web-route-labels.js"
 import type { RelayWebRouteLabelSnapshot } from "./web-route-labels.js"
 import type { RuntimeRecoveryManager } from "./runtime-recovery.js"
@@ -96,6 +108,7 @@ interface DockerInspect {
   Id: string
   HostConfig?: {
     Memory?: number
+    NanoCpus?: number
     PortBindings?: DockerPortBindings
     RestartPolicy?: {
       Name?: string
@@ -416,10 +429,10 @@ const DISCOVERY_TIMEOUT_MS = 30_000
 
 function diskQuotaExceeded(
   usedBytes: number,
-  limitBytes: number,
+  limitBytes: number | null,
   running: boolean
 ): boolean {
-  return running && usedBytes > limitBytes
+  return running && limitBytes !== null && usedBytes > limitBytes
 }
 
 function initialDiskUsageCacheEntry(): DiskUsageCacheEntry {
@@ -443,6 +456,8 @@ export class DockerDriver {
   readonly #consoleSizeStarts = new Map<string, string>()
   readonly #consoleSizePending = new Map<string, Promise<void>>()
   readonly #diskUsageCache = new Map<string, DiskUsageCacheEntry>()
+  // Servers with a quota stop waiting for or holding their lane.
+  readonly #quotaStops = new Set<string>()
   readonly #engine: DockerEngine
   readonly #powerTransitions = new Map<string, InstancePowerTransition>()
   readonly #runtimeRecovery: RuntimeRecoveryManager
@@ -462,21 +477,33 @@ export class DockerDriver {
   #relayProcessCpu: { at: number; usage: NodeJS.CpuUsage } | null = null
   #relayResourceHistory: Array<RelayInstanceResources> = []
   readonly #state: RelayStateStore["Service"]
+  readonly #lanes: OperationLanes
 
   constructor(
     config: RelayConfig,
     runtimeRecovery: RuntimeRecoveryManager,
     bricks: BrickCatalog,
     state: RelayStateStore["Service"],
-    readonly databaseConnections: DatabaseConnections
+    readonly databaseConnections: DatabaseConnections,
+    lanes: OperationLanes
   ) {
     this.#bricks = bricks
     this.#config = config
     this.#engine = new DockerEngine(config.dockerSocket)
+    this.#lanes = lanes
     this.#resources = relayResourceNames(config)
     this.#runtimeRecovery = runtimeRecovery
     this.#state = state
+    this.allocations.register("server", async () =>
+      (await this.#discover()).map(({ config }) => ({
+        id: config.id,
+        limits: config.limits,
+      }))
+    )
   }
+
+  /** Every instance's limits; other kinds of instance register theirs. */
+  readonly allocations = new ResourceAllocations()
 
   async inspectInstances(): Promise<Array<RelayInstance>> {
     await this.#initializeLifecycleSessions()
@@ -733,6 +760,47 @@ export class DockerDriver {
         { numeric: true }
       )
     )
+  }
+
+  /**
+   * Where a game server's files live. Inspects only its container when
+   * addressed by its full id, rather than every server the way
+   * `findInstance` does. Other ids, and a fleet whose labels discovery would
+   * reject as ambiguous, fall back to it.
+   */
+  async findFileRoot(
+    id: string
+  ): Promise<Pick<RelayInstanceConfig, "directory" | "id"> | null> {
+    if (/^[a-f0-9]{40}$/u.test(id)) {
+      const serverIdLabel = this.#config.serverIdLabel
+      const containers = await this.#inspectManaged((owned) => {
+        // Checked as discovery does, from the listing's labels: ids compare
+        // case-insensitively and must be unique in full and in short.
+        const ids = owned.map((container) =>
+          container.Labels?.[serverIdLabel]?.toLowerCase()
+        )
+        const valid = ids.filter(
+          (value): value is string =>
+            value !== undefined && /^[a-f0-9]{40}$/u.test(value)
+        )
+        const unambiguous =
+          valid.length === ids.length &&
+          new Set(valid).size === valid.length &&
+          new Set(valid.map((value) => value.slice(0, 8))).size === valid.length
+        const match = owned[ids.indexOf(id)]
+        return unambiguous && match ? [match.Id] : []
+      })
+      const [container] = containers
+      if (containers.length === 1 && container) {
+        // The disk limit is the fleet's to assign, and isn't needed here.
+        const config = this.#instanceConfig(
+          container,
+          DEFAULT_INSTANCE_DISK_LIMIT_BYTES
+        )
+        if (config.id === id) return { directory: config.directory, id }
+      }
+    }
+    return this.findInstance(id)
   }
 
   async findInstance(id: string): Promise<RelayInstanceConfig | null> {
@@ -1429,10 +1497,15 @@ export class DockerDriver {
     )
   }
 
+  /**
+   * Writes a line to the server's console. Reports whether it was one of the
+   * server's stop commands, which records the server as intentionally
+   * stopped.
+   */
   async sendCommand(
     instance: RelayInstanceConfig,
     input: string
-  ): Promise<void> {
+  ): Promise<{ readonly intentionalStop: boolean }> {
     const stopCommands = await this.#consoleStopCommands(instance)
     const intentionalStop = isIntentionalServerStopCommand(stopCommands, input)
     const previousRecovery = intentionalStop
@@ -1459,6 +1532,7 @@ export class DockerDriver {
         )
       )
     )
+    return { intentionalStop }
   }
 
   async #consoleStopCommands(
@@ -2018,12 +2092,13 @@ export class DockerDriver {
     const instanceStorageUsed = this.#directoryUsageFor(instance)
     const { cpu, memory } = containerCpuAndMemory(
       stats,
-      instance.config.limits.memoryBytes
+      instance.config.limits
     )
     const nodeStorageTotal = filesystem.blocks * filesystem.bsize
     const nodeStorageAvailable = filesystem.bavail * filesystem.bsize
     const nodeStorageUsed = Math.max(nodeStorageTotal - nodeStorageAvailable, 0)
-    const storageLimit = instance.config.limits.diskBytes
+    // Without a disk limit, the server can fill the node.
+    const storageLimit = instance.config.limits.diskBytes ?? nodeStorageTotal
     const network = Object.values(stats.networks ?? {}).reduce(
       (total, current) => ({
         receivedBytes: total.receivedBytes + (current.rx_bytes ?? 0),
@@ -2096,7 +2171,7 @@ export class DockerDriver {
     const dataUsed = this.#relayDataUsage()
     return {
       sampledAt: new Date().toISOString(),
-      ...(stats ? containerCpuAndMemory(stats, 0) : this.#relayProcessUsage()),
+      ...(stats ? containerCpuAndMemory(stats, NO_RESOURCE_LIMITS) : this.#relayProcessUsage()),
       storage: {
         totalBytes: nodeStorageTotal,
         usedBytes: dataUsed,
@@ -2231,6 +2306,67 @@ export class DockerDriver {
       cached.directory = directory
       const findCurrent = () => this.#findDiscovered(instance.config.id)
       const engine = this.#engine
+      const lanes = this.#lanes
+      const runtimeRecovery = this.#runtimeRecovery
+      const exceeded = (
+        current: DiscoveredInstance | null,
+        usedBytes: number
+      ): current is DiscoveredInstance =>
+        current !== null &&
+        diskQuotaExceeded(
+          usedBytes,
+          current.config.limits.diskBytes,
+          current.container.State.Running
+        )
+      const quotaStops = this.#quotaStops
+      // Stops in the server's power lane, so it can't interleave with a
+      // start or console input, and measures again once its turn comes.
+      const stopOverQuota = Effect.gen(function* () {
+        const usedBytes = yield* directoryApparentSizeEffect(directory)
+        cached.usedBytes = usedBytes
+        const current = yield* promiseEffect(findCurrent).pipe(
+          Effect.catch(() => Effect.succeed(null))
+        )
+        if (!exceeded(current, usedBytes)) return
+        yield* Effect.sync(() => {
+          console.warn(
+            `Stopping ${current.config.name}: disk usage exceeded its configured quota`
+          )
+        })
+        // Record the stop as intended so crash recovery doesn't start the
+        // server again while it's still over quota. Stopping matters more
+        // than the record, so a failed write doesn't prevent it.
+        const recorded = current.config.managedByRelay
+          ? yield* runtimeRecovery
+              .recordPowerAction(current.config.id, "stop")
+              .pipe(
+                Effect.map((previous) => ({ previous })),
+                Effect.catch((cause) =>
+                  Effect.sync(() => {
+                    reportRelayError(cause, {
+                      operation: "relay.quota.recordStop",
+                    })
+                    return null
+                  })
+                )
+              )
+          : null
+        yield* engine
+          .stopContainer(current.config.service, {
+            seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
+            timeout: (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000,
+          })
+          .pipe(
+            // A stop Docker refused leaves the server running as before.
+            Effect.onError(() =>
+              recorded
+                ? runtimeRecovery
+                    .restore(current.config.id, recorded.previous)
+                    .pipe(Effect.ignore)
+                : Effect.void
+            )
+          )
+      })
       const refresh = Effect.gen(function* () {
         const usedBytes = yield* directoryApparentSizeEffect(directory)
         cached.usedBytes = usedBytes
@@ -2238,22 +2374,40 @@ export class DockerDriver {
           Effect.catch(() => Effect.succeed(null))
         )
         if (
-          current &&
-          diskQuotaExceeded(
-            usedBytes,
-            current.config.limits.diskBytes,
-            current.container.State.Running
-          )
+          exceeded(current, usedBytes) &&
+          !quotaStops.has(current.config.id)
         ) {
-          yield* Effect.sync(() => {
-            console.warn(
-              `Stopping ${current.config.name}: disk usage exceeded its configured quota`
+          // Waits for its lane apart from the scan, so a server busy
+          // reinstalling doesn't hold up every other server's scan. One
+          // waits per server at a time.
+          const instanceId = current.config.id
+          quotaStops.add(instanceId)
+          yield* lanes
+            .run(
+              {
+                label: "quota.stop",
+                locks: instanceLifecycleLocks(instanceId),
+              },
+              stopOverQuota
             )
-          })
-          yield* engine.stopContainer(current.config.service, {
-            seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
-            timeout: (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000,
-          })
+            .pipe(
+              Effect.catch((cause) =>
+                // A paused Relay stops nothing; the next scan asks again.
+                cause instanceof LaneRejectedError
+                  ? Effect.void
+                  : Effect.sync(() => {
+                      reportRelayError(cause, {
+                        operation: "relay.quota.stop",
+                      })
+                    })
+              ),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  quotaStops.delete(instanceId)
+                })
+              ),
+              Effect.forkDetach
+            )
         }
       }).pipe(
         // Keep the last healthy value. Directory scans race with normal game
@@ -2330,22 +2484,30 @@ export class DockerDriver {
 
   // Runs on every snapshot: one listing, then one inspect per server, all on
   // the Docker socket.
-  async #discover(signal?: AbortSignal): Promise<Array<DiscoveredInstance>> {
+  /**
+   * Inspects the server containers this Relay owns that `select` picks from
+   * their listing, by container id.
+   */
+  #inspectManaged(
+    select: (
+      owned: ReadonlyArray<DockerContainerSummary>
+    ) => ReadonlyArray<string>,
+    signal?: AbortSignal
+  ): Promise<Array<DockerInspect>> {
     const engine = this.#engine
     const config = this.#config
-    const containers = await Effect.runPromise(
+    return Effect.runPromise(
       Effect.gen(function* () {
         const listed = yield* engine.listContainers({
           all: true,
           filters: { label: [config.managedLabel] },
         })
-        const ids = listed.flatMap((container) =>
-          container.Labels?.["kiln.resource.kind"] !== "database" &&
-          relayOwnsLabels(config, container.Labels)
-            ? [container.Id]
-            : []
+        const owned = listed.filter(
+          (container) =>
+            container.Labels?.["kiln.resource.kind"] !== "database" &&
+            relayOwnsLabels(config, container.Labels)
         )
-        return yield* engine.inspectContainers<DockerInspect>(ids)
+        return yield* engine.inspectContainers<DockerInspect>(select(owned))
       }).pipe(
         // One budget for the whole listing, as `docker inspect a b c` had.
         Effect.timeoutOrElse({
@@ -2361,15 +2523,34 @@ export class DockerDriver {
       ),
       { signal }
     )
+  }
+
+  async #discover(signal?: AbortSignal): Promise<Array<DiscoveredInstance>> {
+    const containers = await this.#inspectManaged(
+      (owned) => owned.map((container) => container.Id),
+      signal
+    )
     if (containers.length === 0) return []
-    const diskLimitCandidates = containers.map((container) => ({
-      configuredLimitBytes: optionalNonnegativeIntegerLabel(
-        container.Config.Labels?.["kiln.instance.disk-bytes"]
-      ),
-      id:
-        container.Config.Labels?.[this.#config.serverIdLabel]?.toLowerCase() ??
-        container.Id,
-    }))
+    // Servers created before disk limits were recorded take one from what
+    // the node has left. Servers without a disk limit take none.
+    const diskLimitCandidates = containers.flatMap((container) => {
+      const limits = containerResourceLimits(container)
+      const labeled = container.Config.Labels?.[DISK_LIMIT_LABEL] !== undefined
+      if (labeled && limits.diskBytes === null) return []
+      return [
+        {
+          configuredLimitBytes: labeled
+            ? limits.diskBytes
+            : optionalNonnegativeIntegerLabel(
+                container.Config.Labels?.["kiln.instance.disk-bytes"]
+              ),
+          id:
+            container.Config.Labels?.[
+              this.#config.serverIdLabel
+            ]?.toLowerCase() ?? container.Id,
+        },
+      ]
+    })
     const hasLegacyDiskLimit = diskLimitCandidates.some(
       ({ configuredLimitBytes }) =>
         configuredLimitBytes === null || configuredLimitBytes === 0
@@ -2554,13 +2735,7 @@ export class DockerDriver {
       service,
       tailscale,
       variables: parseBrickVariablesLabel(labels["kiln.brick.variables"]),
-      limits: {
-        diskBytes: diskLimitBytes,
-        memoryBytes: Math.max(
-          nonnegativeIntegerLabel(labels["kiln.instance.memory-bytes"]),
-          container.HostConfig?.Memory ?? 0
-        ),
-      },
+      limits: containerResourceLimits(container, diskLimitBytes),
       version,
       managedByRelay: owned,
     }
@@ -2776,7 +2951,7 @@ function parseBrickReadinessLabel(value: string | undefined) {
 // own limit (the host's memory when it has none).
 function containerCpuAndMemory(
   stats: DockerStats,
-  memoryLimitBytes: number
+  limits: ResourceLimits
 ): Pick<RelayInstanceResources, "cpu" | "memory"> {
   const cpuCurrent = stats.cpu_stats?.cpu_usage?.total_usage ?? 0
   const cpuPrevious = stats.precpu_stats?.cpu_usage?.total_usage ?? 0
@@ -2791,7 +2966,7 @@ function containerCpuAndMemory(
       : 0
 
   const memoryTotal = Math.max(
-    memoryLimitBytes || stats.memory_stats?.limit || 0,
+    limits.memoryBytes ?? stats.memory_stats?.limit ?? 0,
     0
   )
   const memoryCache = Math.max(
@@ -2806,7 +2981,11 @@ function containerCpuAndMemory(
   )
   return {
     cpu: {
-      capacityPercent: onlineCpus * 100,
+      // A CPU limit of 1.5 cores lets the server use up to 150%.
+      capacityPercent:
+        limits.cpuMillis === null
+          ? onlineCpus * 100
+          : limits.cpuMillis / (CPU_LIMIT_MILLIS_PER_CORE / 100),
       percent: roundPercent(cpuPercent),
     },
     memory: {
@@ -3117,10 +3296,6 @@ function titleCase(value: string): string {
     .split("-")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ")
-}
-
-function nonnegativeIntegerLabel(value: string | undefined): number {
-  return optionalNonnegativeIntegerLabel(value) ?? 0
 }
 
 function optionalNonnegativeIntegerLabel(

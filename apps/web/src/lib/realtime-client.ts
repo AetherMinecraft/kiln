@@ -485,6 +485,24 @@ export function recheckPushedState(queryClient: QueryClient): void {
     })
 }
 
+/**
+ * Rereads what the infrastructure map knows of each Relay's proxy. Recovery
+ * runs once a Relay's snapshot has landed, including after it reconnects,
+ * so a mode or route list read while it was away is replaced. A read still
+ * in flight may predate the snapshot, so it is cancelled rather than
+ * joined. Only mounted queries refetch.
+ */
+export function recheckRelayProxyState(queryClient: QueryClient): void {
+  void recheckInstanceObservations(queryClient, {
+    queryKey: queryKeys.relayProxyModes,
+    exact: true,
+  })
+  void recheckInstanceObservations(queryClient, {
+    predicate: ({ queryKey }) =>
+      queryKey.length === 2 && queryKey[0] === "web-routes",
+  })
+}
+
 function applyRealtimeRelayStatus(
   connection: RelayConnection | undefined,
   snapshot: RelayFleetSnapshot | undefined,

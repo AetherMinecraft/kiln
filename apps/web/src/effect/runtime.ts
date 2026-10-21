@@ -6,6 +6,7 @@ import type { AppCache } from "./cache"
 import { AppCacheLive } from "./cache"
 import type { Database } from "./database"
 import { DatabaseLive } from "./database"
+import { loadedKilnInstallationId } from "./installation"
 import { isExpectedAppError } from "../observability/error-policy"
 
 declare const __KILN_TELEMETRY_DEFAULTS__: Telemetry.TelemetryDefaults
@@ -18,15 +19,23 @@ export const telemetryDefaults: Telemetry.TelemetryDefaults =
     : __KILN_TELEMETRY_DEFAULTS__
 
 const sourceCommit = import.meta.env.VITE_KILN_SOURCE_SHA
-const TelemetryLive = Telemetry.layer(
-  {
-    serviceName: "hearth",
-    serviceVersion: import.meta.env.VITE_KILN_VERSION,
-    attributes: sourceCommit
-      ? { "vcs.ref.head.revision": sourceCommit }
-      : undefined,
-  },
-  telemetryDefaults
+// Built on first use, which startup holds back until the installation ID is
+// loaded.
+const TelemetryLive = Layer.unwrap(
+  Effect.sync(() => {
+    const installationId = loadedKilnInstallationId()
+    return Telemetry.layer(
+      {
+        serviceName: "hearth",
+        serviceVersion: import.meta.env.VITE_KILN_VERSION,
+        attributes: {
+          ...(sourceCommit ? { "vcs.ref.head.revision": sourceCommit } : {}),
+          ...(installationId ? { "kiln.installation_id": installationId } : {}),
+        },
+      },
+      telemetryDefaults
+    )
+  })
 )
 
 const AppLive = Layer.mergeAll(DatabaseLive, AppCacheLive, TelemetryLive)
@@ -55,6 +64,19 @@ export function forkAppEffect<TResult, TError>(
   effect: Effect.Effect<TResult, TError, AppCache | Database>
 ): Fiber.Fiber<TResult, unknown> {
   return runtime.runFork(effect.pipe(Effect.withSpan(name)))
+}
+
+/**
+ * Forks work a request starts but doesn't wait for, such as its audit
+ * writes, into that request's trace.
+ */
+export function forkAppEffectInTrace<TResult, TError>(
+  name: string,
+  effect: Effect.Effect<TResult, TError, AppCache | Database>
+): Fiber.Fiber<TResult, unknown> {
+  return runtime.runFork(
+    Telemetry.withActiveParent(effect.pipe(Effect.withSpan(name)))
+  )
 }
 
 /** Traces promise code; effects it runs become child spans. */

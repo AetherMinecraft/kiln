@@ -1,10 +1,12 @@
 import * as Telemetry from "@workspace/telemetry"
-import { Effect, Layer, ManagedRuntime } from "effect"
+import { Effect, Layer, ManagedRuntime, Option } from "effect"
 import type { Fiber, Tracer } from "effect"
+import { Headers, HttpTraceContext } from "effect/http"
 
 import { makeRelayStateLayer, RelayStateStore } from "./state.js"
 import { relayBuildCommit, relayBuildVersion } from "../build-info.js"
 import { relayStateDatabasePath, type RelayConfig } from "../config.js"
+import { savedInstallationId } from "../installation.js"
 
 declare const __KILN_TELEMETRY_DEFAULTS__: Telemetry.TelemetryDefaults
 
@@ -20,19 +22,35 @@ let runtime: ManagedRuntime.ManagedRuntime<RelayStateStore, unknown> | null =
 
 export function initializeRelayRuntime(config: RelayConfig): void {
   if (runtime) return
-  runtime = ManagedRuntime.make(
-    Layer.merge(
-      makeRelayStateLayer(relayStateDatabasePath(config)),
-      Telemetry.layer(
+  // The installation ID is the one saved when the Relay starts; one Hearth
+  // sends later is reported from the next start.
+  const telemetry = Layer.unwrap(
+    Effect.gen(function* () {
+      const installationId = config.installationIdConfigured
+        ? config.installationId
+        : yield* savedInstallationId(yield* RelayStateStore).pipe(
+            Effect.orElseSucceed(() => null)
+          )
+      return Telemetry.layer(
         {
           serviceName: "relay",
           serviceVersion: relayBuildVersion,
-          attributes: relayBuildCommit
-            ? { "vcs.ref.head.revision": relayBuildCommit }
-            : undefined,
+          attributes: {
+            ...(relayBuildCommit
+              ? { "vcs.ref.head.revision": relayBuildCommit }
+              : {}),
+            ...(installationId
+              ? { "kiln.installation_id": installationId }
+              : {}),
+          },
         },
         telemetryDefaults
       )
+    })
+  )
+  runtime = ManagedRuntime.make(
+    telemetry.pipe(
+      Layer.provideMerge(makeRelayStateLayer(relayStateDatabasePath(config)))
     )
   )
 }
@@ -73,6 +91,46 @@ export function traceRelayPromise<TResult>(
     ? Effect.withParentSpan(span, parent)
     : Telemetry.withActiveParent(span)
   return runtime ? runtime.runPromise(traced) : Effect.runPromise(traced)
+}
+
+/**
+ * Runs an effect in a span exported through the Relay runtime, so the
+ * effects and promise code it runs nest under it. Before the Relay runtime
+ * exists the span is created but not exported.
+ */
+export function traceRelayEffect<A, E, R>(
+  name: string,
+  effect: Effect.Effect<A, E, R>,
+  attributes?: Record<string, unknown>,
+  // A span to nest under instead of the active one, such as Hearth's.
+  parent?: Tracer.AnySpan
+): Effect.Effect<A, E, R> {
+  const span = Effect.withSpan(
+    effect,
+    name,
+    attributes ? { attributes } : undefined
+  )
+  const traced = parent
+    ? Effect.withParentSpan(span, parent)
+    : Telemetry.withActiveParent(span)
+  return runtime
+    ? Effect.withTracer(traced, runtime.runSync(Effect.tracer))
+    : traced
+}
+
+/**
+ * The span a W3C `traceparent` names, such as a browser's or Hearth's, so
+ * the Relay's work joins that trace and follows its sampling.
+ */
+export function traceParentSpan(
+  traceparent: unknown
+): Tracer.ExternalSpan | undefined {
+  if (typeof traceparent !== "string" || traceparent.length > 64) {
+    return undefined
+  }
+  return Option.getOrUndefined(
+    HttpTraceContext.w3c(Headers.fromInput({ traceparent }))
+  )
 }
 
 /**

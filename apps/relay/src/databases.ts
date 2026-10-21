@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto"
+import { statfs } from "node:fs/promises"
 
 import type {
   DatabaseEngine,
@@ -6,6 +7,7 @@ import type {
   RelayDatabaseAction,
   RelayDatabaseDump,
   RelayDatabaseExport,
+  RelayDatabaseLimits,
   RelayDatabaseNetwork,
   RelayDatabaseContainer,
   RelayDatabaseWipe,
@@ -13,18 +15,21 @@ import type {
   RelayManagedDatabase,
   RelayRotateDatabaseCredentials,
   InstanceObservedState,
+  ProvisioningWorkPhase,
   RelayInventoryLookup,
   RelayInventoryItem,
+  ResourceLimits,
 } from "@workspace/contracts"
 import {
   databaseEngineSupportsLogicalBackups,
   databaseEngineSchema,
+  NO_RESOURCE_LIMITS,
   relayManagedDatabaseSchema,
+  resolveResourceLimits,
 } from "@workspace/contracts"
-import { Effect, Option, Result, Semaphore } from "effect"
+import { Effect, Option, Result } from "effect"
 
-import { promiseEffect } from "./effect/promise.js"
-import { traceRelayPromise } from "./effect/runtime.js"
+import { traceRelayEffect, traceRelayPromise } from "./effect/runtime.js"
 import type { DatabaseConnections } from "./database-connections.js"
 import type { RelayConfig } from "./config.js"
 import type { DockerDriver } from "./docker.js"
@@ -36,10 +41,17 @@ import {
 import {
   DockerEngine,
   ensureImage,
+  isDockerNotFound,
   type DockerContainerSummary,
   type DockerExecProcess,
 } from "./docker-engine.js"
+import { provisioningStatus } from "./provisioning.js"
 import { relayOwnerLabel, relayOwnsLabels } from "./relay-resources.js"
+import {
+  assertResourceLimitsFit,
+  containerLimitSpec,
+  containerResourceLimits,
+} from "./resource-limits.js"
 
 function databaseObservedState(
   container: DatabaseContainerInspect
@@ -54,6 +66,15 @@ function databaseObservedState(
 const DATABASE_KIND_LABEL = "kiln.resource.kind"
 const DATABASE_KIND = "database"
 const MAX_DUMP_BYTES = 700_000
+// A container a limits change set aside. Discovery skips it, and Relay
+// startup finishes or undoes a replacement it interrupted.
+const REPLACED_MARKER = "-replaced-"
+// After the marker: whether the set-aside container was running.
+const RUNNING_MARKER = "running-"
+const STOPPED_MARKER = "stopped-"
+// Docker walks every volume to measure them, so sizes are measured at most
+// this often.
+const DISK_USAGE_REFRESH_MS = 5 * 60_000
 
 interface DatabaseEngineSpec {
   command?: ReadonlyArray<string>
@@ -106,9 +127,14 @@ const engineSpecs: Record<DatabaseEngine, DatabaseEngineSpec> = {
 
 interface DatabaseContainerInspect {
   Config: {
+    Env?: ReadonlyArray<string> | null
     Image: string
     Labels: Record<string, string | undefined> | null
   }
+  HostConfig?: {
+    Memory?: number
+    NanoCpus?: number
+  } | null
   Id: string
   Name: string
   State: {
@@ -148,35 +174,20 @@ function databaseRecoveryLabels(
   return labels
 }
 
+/**
+ * Callers hold the database's lane lock for each change (see
+ * operation-plans.ts), so these methods don't lock themselves.
+ */
 export class DatabaseDriver {
   readonly #config: RelayConfig
   readonly #docker: DockerDriver
   readonly #engine: DockerEngine
-
-  readonly #mutations = new Map<
-    string,
-    { semaphore: Semaphore.Semaphore; references: number }
-  >()
-
-  #serialize<T>(databaseId: string, run: () => Promise<T>): Promise<T> {
-    let entry = this.#mutations.get(databaseId)
-    if (!entry) {
-      entry = { semaphore: Semaphore.makeUnsafe(1), references: 0 }
-      this.#mutations.set(databaseId, entry)
-    }
-    entry.references += 1
-    const active = entry
-    return Effect.runPromise(
-      active.semaphore.withPermit(promiseEffect(run)).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            active.references -= 1
-            if (active.references === 0) this.#mutations.delete(databaseId)
-          })
-        )
-      )
-    )
+  // Data volume sizes by volume name, from Docker's last measurement.
+  #diskUsage: { measuredAt: number; sizes: ReadonlyMap<string, number> } = {
+    measuredAt: 0,
+    sizes: new Map(),
   }
+  #diskUsageRefresh: Promise<void> | null = null
 
   constructor(
     config: RelayConfig,
@@ -186,13 +197,68 @@ export class DatabaseDriver {
     this.#config = config
     this.#docker = docker
     this.#engine = new DockerEngine(config.dockerSocket)
+    docker.allocations.register(DATABASE_KIND, async () =>
+      (await this.#existing()).map(({ id, limits }) => ({ id, limits }))
+    )
   }
 
+  /** Every database, with the placeholders of those still provisioning. */
   async list(): Promise<Array<RelayManagedDatabase>> {
-    const containers = await this.#discover()
+    const [databases, provisioning] = await Promise.all([
+      this.#existing(),
+      this.#provisioning(),
+    ])
+    return withProvisioning(databases, provisioning)
+  }
+
+  // The databases that exist, as their containers report them.
+  async #existing(): Promise<Array<RelayManagedDatabase>> {
+    this.#refreshDiskUsage()
+    const [containers, diskLimits] = await Promise.all([
+      this.#discover(),
+      this.#diskLimits(),
+    ])
     return Promise.all(
-      containers.map((container) => this.#toManagedDatabase(container))
+      containers.map((container) =>
+        this.#toManagedDatabase(container, diskLimits)
+      )
     )
+  }
+
+  // Databases still provisioning, by ID: what each shows until it exists.
+  async #provisioning(): Promise<ReadonlyMap<string, RelayManagedDatabase>> {
+    const jobs = await Effect.runPromise(
+      this.connections.state.listProvisioningJobs()
+    )
+    return new Map(
+      jobs.flatMap((job) =>
+        job.kind === "database" ? [[job.instanceId, job.placeholder]] : []
+      )
+    )
+  }
+
+  /** What a database shows from its create request until it exists. */
+  placeholder(input: RelayCreateDatabase): RelayManagedDatabase {
+    const spec = engineSpecs[input.engine]
+    return relayManagedDatabaseSchema.parse({
+      connectedInstanceIds: [],
+      containerId: null,
+      createdAt: new Date().toISOString(),
+      databaseName: input.databaseName,
+      diskUsedBytes: null,
+      engine: input.engine,
+      hostname: databaseHostname(input.id),
+      id: input.id,
+      image: spec.image,
+      internalPort: spec.internalPort,
+      limits: NO_RESOURCE_LIMITS,
+      name: input.name,
+      observedState: "provisioning",
+      provisioning: { attempt: 0, error: null, phase: "awaiting_claim" },
+      shortId: input.id.slice(0, 8),
+      status: provisioningStatus("awaiting_claim", "database"),
+      supportsImportExport: databaseEngineSupportsLogicalBackups(input.engine),
+    })
   }
 
   /** Only the requested views of the requested databases. */
@@ -213,18 +279,43 @@ export class DatabaseDriver {
             container,
           ])
         )
+        const provisioning = await this.#provisioning()
         const items = await Promise.all(
           requests.map(async ({ id, view }) => {
             const container = byId.get(id)
-            if (!container) return []
+            const placeholder = provisioning.get(id)
+            if (!container) {
+              return placeholder
+                ? [
+                    {
+                      id,
+                      view,
+                      observedState: placeholder.observedState,
+                      ...(view === "detail" && { database: placeholder }),
+                    },
+                  ]
+                : []
+            }
             const item: RelayInventoryItem = {
               id,
               view,
-              observedState: databaseObservedState(container),
+              observedState:
+                placeholder?.observedState ?? databaseObservedState(container),
             }
             // Only the detail view needs the network's attached containers.
-            if (view === "detail")
-              item.database = await this.#toManagedDatabase(container, signal)
+            if (view === "detail") {
+              const [database] = withProvisioning(
+                [
+                  await this.#toManagedDatabase(
+                    container,
+                    await this.#diskLimits(),
+                    signal
+                  ),
+                ],
+                provisioning
+              )
+              item.database = database
+            }
             return [item]
           })
         )
@@ -257,6 +348,7 @@ export class DatabaseDriver {
         { concurrency: "unbounded" }
       )
     )
+    this.#recordDiskUsage(volumes)
     const size = volumes.find((candidate) => candidate.Name === volume)
       ?.UsageData?.Size
     return {
@@ -268,25 +360,23 @@ export class DatabaseDriver {
 
   // Deletes everything in the database and leaves it empty, with the same
   // name, login, and connections.
-  wipe(input: RelayDatabaseWipe): Promise<RelayManagedDatabase> {
-    return this.#serialize(input.databaseId, async () => {
-      const database = await this.#required(input.databaseId)
-      if (!database.observedState.match(/^(?:running|starting)$/u)) {
-        throw new Error("Start the database before wiping it")
-      }
-      const container = requiredContainerId(database)
-      const wipe = databaseWipeClient(database, input.username, input.password)
-      await Effect.runPromise(
-        this.#engine.execWithInput(container, wipe.command, {
-          env: wipe.env,
-          input: wipe.input,
-          maxOutputBytes: 64 * 1024,
-          overflow: "The database wipe printed more than expected",
-          timeout: 120_000,
-        })
-      )
-      return this.#required(input.databaseId)
-    })
+  async wipe(input: RelayDatabaseWipe): Promise<RelayManagedDatabase> {
+    const database = await this.#required(input.databaseId)
+    if (!database.observedState.match(/^(?:running|starting)$/u)) {
+      throw new Error("Start the database before wiping it")
+    }
+    const container = requiredContainerId(database)
+    const wipe = databaseWipeClient(database, input.username, input.password)
+    await Effect.runPromise(
+      this.#engine.execWithInput(container, wipe.command, {
+        env: wipe.env,
+        input: wipe.input,
+        maxOutputBytes: 64 * 1024,
+        overflow: "The database wipe printed more than expected",
+        timeout: 120_000,
+      })
+    )
+    return this.#required(input.databaseId)
   }
 
   async backupTarget(id: string): Promise<RelayManagedDatabase> {
@@ -304,8 +394,16 @@ export class DatabaseDriver {
     return database
   }
 
-  async create(input: RelayCreateDatabase): Promise<RelayManagedDatabase> {
-    if ((await this.list()).some((database) => database.id === input.id)) {
+  /**
+   * Creates a database and waits until it accepts connections, calling
+   * `onPhase` as each step starts. A failed create removes what it made.
+   */
+  async create(
+    input: RelayCreateDatabase,
+    onPhase: (phase: ProvisioningWorkPhase) => Promise<void> = async () => {}
+  ): Promise<RelayManagedDatabase> {
+    await onPhase("preparing")
+    if ((await this.#discover([input.id])).length > 0) {
       throw new Error("Database already exists")
     }
     const spec = engineSpecs[input.engine]
@@ -319,7 +417,9 @@ export class DatabaseDriver {
     let volumeCreated = false
 
     const created = await promiseResult(async () => {
+      await onPhase("pulling_image")
       await Effect.runPromise(ensureImage(this.#engine, spec.image))
+      await onPhase("creating_container")
       await Effect.runPromise(
         this.#engine.createVolume({ labels, name: volume })
       )
@@ -352,6 +452,7 @@ export class DatabaseDriver {
         })
       )
       containerCreated = true
+      await onPhase("finalizing")
       await Effect.runPromise(
         this.#engine.startContainer(container, { timeout: 120_000 })
       )
@@ -380,6 +481,222 @@ export class DatabaseDriver {
     return created.success
   }
 
+  /**
+   * Changes the database's limits. Docker changes memory and CPU limits in
+   * place, but can't remove one, so removing one recreates the container
+   * over the same data volume. The Relay keeps the disk limit.
+   */
+  async setLimits(input: RelayDatabaseLimits): Promise<RelayManagedDatabase> {
+    const container = await this.#container(input.databaseId)
+    const id = input.databaseId
+    const current = (
+      await this.#toManagedDatabase(container, await this.#diskLimits())
+    ).limits
+    const next = resolveResourceLimits(current, input.limits)
+    const [filesystem, others] = await Promise.all([
+      statfs(this.#config.rootDirectory),
+      this.#docker.allocations.others(DATABASE_KIND, id),
+    ])
+    assertResourceLimitsFit({
+      currentDiskBytes: current.diskBytes,
+      limits: next,
+      nodeDiskBytes: filesystem.blocks * filesystem.bsize,
+      others,
+    })
+    const removed = (key: "cpuMillis" | "memoryBytes") =>
+      current[key] !== null && next[key] === null
+    if (removed("cpuMillis") || removed("memoryBytes")) {
+      // The slow path: a new container over the same data, ready again.
+      await traceRelayPromise(
+        "relay.databases.replaceContainer",
+        () => this.#replaceContainer(container, next),
+        { "relay.database_id": input.databaseId }
+      )
+    } else if (
+      next.cpuMillis !== current.cpuMillis ||
+      next.memoryBytes !== current.memoryBytes
+    ) {
+      const spec = containerLimitSpec(next)
+      await Effect.runPromise(
+        this.#engine.updateContainerResources(container.Id, {
+          ...(next.memoryBytes !== null && { memoryBytes: next.memoryBytes }),
+          ...(spec.nanoCpus !== undefined && { nanoCpus: spec.nanoCpus }),
+        })
+      )
+    }
+    if (next.diskBytes !== current.diskBytes) {
+      await Effect.runPromise(
+        this.connections.state.setDiskLimit(DATABASE_KIND, id, next.diskBytes)
+      )
+    }
+    return this.#required(id)
+  }
+
+  // A new container over the old one's volume and network, with the same
+  // environment. The old one is set aside until the new one is ready, and
+  // put back if it never is.
+  async #replaceContainer(
+    container: DatabaseContainerInspect,
+    limits: ResourceLimits
+  ): Promise<void> {
+    const labels = container.Config.Labels ?? {}
+    const id = requiredLabel(labels, "kiln.database.id")
+    const engine = databaseEngineSchema.parse(
+      requiredLabel(labels, "kiln.database.engine")
+    )
+    const spec = engineSpecs[engine]
+    const name = container.Name.replace(/^\//u, "")
+    const running = container.State.Running
+    // The name says whether it was running, for recovery after a restart.
+    const aside = `${name}${REPLACED_MARKER}${running ? RUNNING_MARKER : STOPPED_MARKER}${randomBytes(4).toString("hex")}`
+    const docker = this.#engine
+    let setAside = false
+    let created = false
+    const replaced = await promiseResult(async () => {
+      // Set aside before it stops, so a restart at any later step finds it.
+      await Effect.runPromise(docker.renameContainer(container.Id, aside))
+      setAside = true
+      if (running) {
+        await Effect.runPromise(
+          docker.stopContainer(container.Id, { seconds: 30, timeout: 45_000 })
+        )
+      }
+      await Effect.runPromise(
+        createContainer(docker, {
+          command: spec.command ?? [],
+          env: Object.fromEntries(
+            (container.Config.Env ?? []).map((entry) => {
+              const separator = entry.indexOf("=")
+              return [entry.slice(0, separator), entry.slice(separator + 1)]
+            })
+          ),
+          healthcheck: databaseHealthcheck(engine),
+          hostname: databaseHostname(id),
+          image: labels["kiln.database.image"] ?? container.Config.Image,
+          labels: stringLabels(labels),
+          mounts: [
+            {
+              source: requiredLabel(labels, "kiln.database.volume"),
+              target: spec.dataMount,
+              type: "volume",
+            },
+          ],
+          name,
+          network: {
+            aliases: [databaseHostname(id)],
+            name: requiredLabel(labels, "kiln.database.network"),
+          },
+          restart: "unless-stopped",
+          ...containerLimitSpec(limits),
+        })
+      )
+      created = true
+      if (running) {
+        await Effect.runPromise(
+          docker.startContainer(name, { timeout: 120_000 })
+        )
+        await waitUntilReady(docker, name)
+      }
+    })
+    if (Result.isFailure(replaced)) {
+      // The old container comes back as it was, running if it was.
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          if (created) {
+            yield* docker
+              .removeContainer(name, { force: true })
+              .pipe(Effect.ignore)
+          }
+          if (setAside) yield* docker.renameContainer(container.Id, name)
+          if (running) {
+            yield* docker.startContainer(container.Id, { timeout: 120_000 })
+          }
+        }).pipe(Effect.ignore)
+      )
+      throw replaced.failure
+    }
+    // A container left behind is skipped, and removed when the Relay starts.
+    await Effect.runPromise(
+      docker.removeContainer(container.Id, { force: true }).pipe(Effect.ignore)
+    )
+  }
+
+  /**
+   * Finishes replacements a Relay restart interrupted. A set-aside container
+   * whose replacement exists goes once the replacement is ready, if the
+   * database was running; a replacement that won't get ready makes way for
+   * it again.
+   * One without a replacement goes back, running if it was.
+   */
+  async recoverReplacements(): Promise<void> {
+    const engine = this.#engine
+    const config = this.#config
+    const ready = (reference: string) =>
+      Effect.tryPromise({
+        try: () => waitUntilReady(engine, reference),
+        catch: (cause) => cause,
+      })
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const listed = (yield* engine.listContainers({
+          all: true,
+          filters: { label: [`${DATABASE_KIND_LABEL}=${DATABASE_KIND}`] },
+        })).filter((container) => relayOwnsLabels(config, container.Labels))
+        const byName = new Map(
+          listed.flatMap((container) =>
+            container.Names.map((name) => [name, container] as const)
+          )
+        )
+        for (const container of listed) {
+          const current = container.Names[0] ?? ""
+          const marker = current.lastIndexOf(REPLACED_MARKER)
+          if (marker === -1) continue
+          const original = current.slice(0, marker)
+          const wasRunning = !current
+            .slice(marker + REPLACED_MARKER.length)
+            .startsWith(STOPPED_MARKER)
+          const restore = Effect.gen(function* () {
+            yield* engine.renameContainer(container.Id, original.slice(1))
+            if (wasRunning) {
+              yield* engine.startContainer(container.Id, { timeout: 120_000 })
+            }
+          })
+          const replacement = byName.get(original)
+          if (!replacement) {
+            yield* restore
+            continue
+          }
+          // As an uninterrupted change would: the replacement of a running
+          // database must be ready, started if the restart caught it first.
+          if (wasRunning) {
+            const started = yield* Effect.result(
+              (replacement.State === "running"
+                ? Effect.void
+                : engine.startContainer(replacement.Id, { timeout: 120_000 })
+              ).pipe(Effect.andThen(ready(replacement.Id)))
+            )
+            if (started._tag === "Failure") {
+              yield* engine
+                .removeContainer(replacement.Id, { force: true })
+                .pipe(Effect.ignore)
+              yield* restore
+              continue
+            }
+          }
+          yield* engine
+            .removeContainer(container.Id, { force: true })
+            .pipe(Effect.ignore)
+        }
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Could not finish interrupted database changes", {
+            cause,
+          })
+        )
+      )
+    )
+  }
+
   async action(input: RelayDatabaseAction): Promise<RelayManagedDatabase> {
     const database = await this.#required(input.databaseId)
     const container = requiredContainerId(database)
@@ -405,11 +722,11 @@ export class DatabaseDriver {
   }
 
   delete(input: RelayDeleteDatabase) {
-    return this.#serialize(input.databaseId, () => this.#delete(input))
+    return this.#delete(input)
   }
 
   async #delete(input: RelayDeleteDatabase) {
-    const database = (await this.list()).find(
+    const database = (await this.#existing()).find(
       (candidate) => candidate.id === input.databaseId
     )
     const labels = database ? await this.#labels(input.databaseId) : {}
@@ -450,10 +767,19 @@ export class DatabaseDriver {
         engine.removeContainer(container, { force: true, timeout: 90_000 })
       )
     }
+    // A network that won't go fails the delete, so it can be retried
+    // rather than left behind unseen.
     if (network) {
-      await Effect.runPromise(engine.removeNetwork(network).pipe(Effect.ignore))
+      await Effect.runPromise(
+        engine
+          .removeNetwork(network)
+          .pipe(Effect.catchIf(isDockerNotFound, () => Effect.void))
+      )
     }
     await this.connections.forgetDatabase(input.databaseId)
+    await Effect.runPromise(
+      this.connections.state.setDiskLimit(DATABASE_KIND, input.databaseId, null)
+    )
     if (input.deleteData && volume) {
       await Effect.runPromise(engine.removeVolume(volume))
     }
@@ -510,10 +836,11 @@ export class DatabaseDriver {
     return this.#required(input.databaseId)
   }
 
+  // The caller holds the database's lock across lookup, saving intent, and
+  // attachment, so a queued connect can't recreate a row after deletion has
+  // cleared it.
   updateNetwork(input: RelayDatabaseNetwork): Promise<RelayManagedDatabase> {
-    // Hold the database lock across lookup, saving intent, and attachment so a
-    // queued connect cannot recreate a row after deletion has cleared it.
-    return this.#serialize(input.databaseId, () => this.#updateNetwork(input))
+    return this.#updateNetwork(input)
   }
 
   async #updateNetwork(
@@ -629,7 +956,7 @@ export class DatabaseDriver {
   }
 
   async #required(id: string): Promise<RelayManagedDatabase> {
-    const database = (await this.list()).find(
+    const database = (await this.#existing()).find(
       (candidate) => candidate.id === id
     )
     if (!database) throw new Error("Database not found")
@@ -663,6 +990,7 @@ export class DatabaseDriver {
         return yield* engine.inspectContainers<DatabaseContainerInspect>(
           listed.flatMap((container) =>
             relayOwnsLabels(config, container.Labels) &&
+            !container.Names.some((name) => name.includes(REPLACED_MARKER)) &&
             (!ids || ids.includes(container.Labels?.["kiln.database.id"] ?? ""))
               ? [container.Id]
               : []
@@ -673,8 +1001,59 @@ export class DatabaseDriver {
     )
   }
 
+  #diskLimits(): Promise<ReadonlyMap<string, number>> {
+    return Effect.runPromise(
+      this.connections.state.listDiskLimits(DATABASE_KIND)
+    )
+  }
+
+  // Measures the data volumes in the background when the last measurement
+  // is old, so listing never waits on Docker walking every volume.
+  #refreshDiskUsage(): void {
+    if (
+      this.#diskUsageRefresh ||
+      Date.now() - this.#diskUsage.measuredAt < DISK_USAGE_REFRESH_MS
+    ) {
+      return
+    }
+    // Docker walks every volume, so this is the slow part of reading
+    // databases' disk use.
+    this.#diskUsageRefresh = Effect.runPromise(
+      traceRelayEffect(
+        "relay.databases.diskUsage",
+        this.#engine.volumeUsage({ timeout: 60_000 })
+      ).pipe(
+        Effect.map((volumes) => this.#recordDiskUsage(volumes)),
+        Effect.ignore,
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#diskUsageRefresh = null
+          })
+        )
+      )
+    )
+  }
+
+  #recordDiskUsage(
+    volumes: ReadonlyArray<{
+      readonly Name: string
+      readonly UsageData?: { readonly Size?: number } | null
+    }>
+  ): void {
+    this.#diskUsage = {
+      measuredAt: Date.now(),
+      sizes: new Map(
+        volumes.flatMap((volume) => {
+          const size = volume.UsageData?.Size
+          return size !== undefined && size >= 0 ? [[volume.Name, size]] : []
+        })
+      ),
+    }
+  }
+
   async #toManagedDatabase(
     container: DatabaseContainerInspect,
+    diskLimits: ReadonlyMap<string, number>,
     signal?: AbortSignal
   ): Promise<RelayManagedDatabase> {
     const labels = container.Config.Labels ?? {}
@@ -711,6 +1090,14 @@ export class DatabaseDriver {
       id,
       image: labels["kiln.database.image"] ?? container.Config.Image,
       internalPort: engineSpecs[engine].internalPort,
+      limits: {
+        ...containerResourceLimits(container),
+        diskBytes: diskLimits.get(id) ?? null,
+      },
+      diskUsedBytes:
+        this.#diskUsage.sizes.get(
+          requiredLabel(labels, "kiln.database.volume")
+        ) ?? null,
       name: requiredLabel(labels, "kiln.database.name"),
       observedState,
       shortId: id.slice(0, 8),
@@ -757,7 +1144,13 @@ export class DatabaseDriver {
             : this.#engine.inspectVolume(name)
         )
       )
-      if (Result.isFailure(inspected)) continue
+      // Only Docker saying it doesn't exist counts as absent; any other
+      // failure fails the lookup, so a delete never reports the database
+      // gone while something of it remains.
+      if (Result.isFailure(inspected)) {
+        if (isDockerNotFound(inspected.failure)) continue
+        throw inspected.failure
+      }
       const labels = stringLabels(inspected.success.Labels)
       if (
         labels[DATABASE_KIND_LABEL] === DATABASE_KIND &&
@@ -825,6 +1218,14 @@ function databaseEnvironment(
         : {}
 }
 
+// Each check passes only once the database serves its network port. The
+// images first initialize on a temporary server that only listens on a local
+// socket, and checking that one would report ready before the restart.
+// Redis and Valkey answer any connection without a login with NOAUTH, which
+// is enough to know they're serving.
+//
+// Databases are checked twice a second while they start, so they're ready as
+// soon as they serve, and every five seconds after the first check passes.
 function databaseHealthcheck(engine: DatabaseEngine): ContainerHealthcheck {
   return {
     command:
@@ -833,11 +1234,12 @@ function databaseHealthcheck(engine: DatabaseEngine): ContainerHealthcheck {
         : engine === "mariadb"
           ? "healthcheck.sh --connect --innodb_initialized"
           : engine === "postgres"
-            ? 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-            : "kill -0 1",
+            ? 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+            : `${engine === "redis" ? "redis-cli" : "valkey-cli"} ping | grep -qE '^(PONG|NOAUTH)'`,
     intervalMs: 5_000,
     retries: 24,
-    startPeriodMs: 10_000,
+    startIntervalMs: 500,
+    startPeriodMs: 60_000,
     timeoutMs: 3_000,
   }
 }
@@ -923,19 +1325,20 @@ function databaseWipeClient(
   }
   if (database.engine === "mysql" || database.engine === "mariadb") {
     const root =
-      database.engine === "mysql" ? "MYSQL_ROOT_PASSWORD" : "MARIADB_ROOT_PASSWORD"
+      database.engine === "mysql"
+        ? "MYSQL_ROOT_PASSWORD"
+        : "MARIADB_ROOT_PASSWORD"
     const client = database.engine === "mysql" ? "mysql" : "mariadb"
     return {
-      command: [
-        "sh",
-        "-ec",
-        `MYSQL_PWD="$${root}" exec ${client} --user=root`,
-      ],
+      command: ["sh", "-ec", `MYSQL_PWD="$${root}" exec ${client} --user=root`],
       env: [],
       input: `DROP DATABASE IF EXISTS \`${name}\`;\nCREATE DATABASE \`${name}\`;\n`,
     }
   }
-  return { ...keyValueClient(database.engine, username, password, ["FLUSHALL"]), input: "" }
+  return {
+    ...keyValueClient(database.engine, username, password, ["FLUSHALL"]),
+    input: "",
+  }
 }
 
 // Redis and Valkey's clients both read the password from REDISCLI_AUTH, and
@@ -1036,6 +1439,10 @@ async function writeAclFile(
   )
 }
 
+// Half the start interval of the health check, so a passing check is seen
+// soon after it lands. Inspecting a container is a cheap local request.
+const READY_POLL_MS = 250
+
 async function waitUntilReady(
   engine: DockerEngine,
   container: string
@@ -1054,7 +1461,7 @@ async function waitUntilReady(
     if (state.Health.Status === "unhealthy") {
       throw new Error("Database failed its startup health check")
     }
-    await new Promise((resolve) => setTimeout(resolve, 2_000))
+    await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS))
   }
   throw new Error("Database did not become ready within 3 minutes")
 }
@@ -1090,4 +1497,26 @@ function safeFileName(name: string): string {
       .replace(/[^a-z0-9]+/gu, "-")
       .replace(/^-+|-+$/gu, "") || "database"
   )
+}
+
+// Databases with the state of any still provisioning: one whose container
+// exists shows its provisioning until the job finishes, and one without a
+// container yet shows its placeholder.
+function withProvisioning(
+  databases: ReadonlyArray<RelayManagedDatabase>,
+  placeholders: ReadonlyMap<string, RelayManagedDatabase>
+): Array<RelayManagedDatabase> {
+  const pending = new Map(placeholders)
+  const listed = databases.map((database) => {
+    const placeholder = pending.get(database.id)
+    if (!placeholder) return database
+    pending.delete(database.id)
+    return {
+      ...database,
+      observedState: placeholder.observedState,
+      provisioning: placeholder.provisioning,
+      status: placeholder.status,
+    }
+  })
+  return [...listed, ...pending.values()]
 }

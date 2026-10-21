@@ -25,6 +25,7 @@ import type { RelayIdentity } from "./effect/identity.js"
 import type { DockerConsoleSession, DockerDriver } from "./docker.js"
 import type { FilesystemDriver } from "./files.js"
 import type { RelaySnapshotSample } from "./snapshot-hub.js"
+import { OperationLanes } from "./operation-lanes.js"
 
 const origin = "https://hearth.test"
 const relayId = "relay-test-fingerprint"
@@ -391,6 +392,29 @@ describe("relay browser socket integration", () => {
 
     expect(received).toBe(largeHistoryLines)
     expect(closedEarly).toBe(false)
+  })
+
+  it("sends a console's newest lines first, in a frame that arrives in one round trip", async () => {
+    const live = new LiveConsole("first-frame-console")
+    live.start("2026-01-01T00:00:00.000Z", 200, 100)
+    const relay = await startRelay({}, [live])
+    const { messages, socket } = await authenticate(relay, {
+      instanceId: live.id,
+    })
+
+    socket.send(
+      JSON.stringify({ instanceId: live.id, type: "console.subscribe", v: 1 })
+    )
+    const reset = await messages.next("reset")
+    const shown = lineTexts(reset)
+    while (shown.length < live.lines.length) {
+      shown.unshift(...lineTexts(await messages.next("history")))
+    }
+
+    // What a new connection sends before the browser first acknowledges.
+    expect(Buffer.byteLength(JSON.stringify(reset))).toBeLessThan(14_000)
+    expect(lineTexts(reset).at(-1)).toBe(live.lines.at(-1)?.text)
+    expect(shown).toEqual(live.lines.map((line) => line.text))
   })
 
   it("gives every browser joining a busy console its whole log", async () => {
@@ -760,6 +784,8 @@ async function startRelay(
     docker: {} as DockerDriver,
     filesystem: {} as FilesystemDriver,
     identity: { fingerprint: relayId } as RelayIdentity,
+    lanes: new OperationLanes(),
+    onConsoleStop: () => undefined,
     runEffect: (effect) => Effect.runPromise(effect),
     server,
     state,

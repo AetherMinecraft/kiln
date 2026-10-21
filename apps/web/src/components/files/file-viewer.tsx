@@ -1,4 +1,5 @@
 import { useFileRootPath } from "@/components/files/file-root-context"
+import { FilePageContent } from "@/components/files/file-page-content"
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { HardDriveDownload } from "lucide-react"
@@ -25,20 +26,42 @@ import {
 } from "@/components/files/file-viewer-toolbar"
 import {
   queryKeys,
+  readsFileWithEntry,
   relayFileEntryQueryOptions,
   relayFileQueryOptions,
 } from "@/lib/query-options"
 import { isDatabaseFilePath } from "@/lib/database-files"
 import type { FileWorkspaceInstance } from "@/lib/relay-selectors"
-import { warmSyntaxCodeEditorModule } from "@/lib/syntax-editor-module-preload"
 import { recordRelayFileView } from "@/server/relay"
+import { usePreloadedModule } from "@/lib/use-preloaded-module"
+import {
+  loadFileDatabaseViewerModule,
+  loadedFileDatabaseViewerModule,
+  warmFilePreviewModule,
+} from "@/lib/workspace-module-preloads"
 
 const activeFileRevisionPollDelayMs = 30_000
 
-const FileDatabaseViewer = React.lazy(async () => {
-  const module = await import("@/components/files/file-database-viewer")
-  return { default: module.FileDatabaseViewer }
-})
+function FileDatabasePreview({
+  fallback,
+  ...props
+}: React.ComponentProps<
+  typeof import("@/components/files/file-database-viewer").FileDatabaseViewer
+> & { fallback: React.ReactNode }) {
+  const module = usePreloadedModule(
+    loadFileDatabaseViewerModule,
+    loadedFileDatabaseViewerModule
+  )
+  if (!module) return fallback
+  const Viewer = module.FileDatabaseViewer
+  return (
+    <>
+      <Viewer {...props} />
+      {/* The viewer is on screen; its tables load after. */}
+      <FilePageContent path={props.displayPath} view="database" />
+    </>
+  )
+}
 
 const UnavailablePreviewToolbar = React.memo(
   function UnavailablePreviewToolbar({
@@ -114,6 +137,7 @@ function UnavailablePreview({
         treeCollapsed={treeCollapsed}
         onTreeExpand={onTreeExpand}
       />
+      <FilePageContent path={path} reached={!loading} view="unavailable" />
       {loading ? (
         <div className="flex min-h-0 flex-1">
           <div
@@ -227,12 +251,26 @@ export function FileViewer({
     selectedPathIsDirectory,
   ])
   React.useEffect(() => {
-    if (selectedPath) warmSyntaxCodeEditorModule()
-  }, [selectedPath])
+    if (selectedPathIsReadable) warmFilePreviewModule(selectedPath)
+  }, [selectedPath, selectedPathIsReadable])
+  // Read alongside the entry rather than after it; the entry still decides
+  // whether the path is shown as a file. The router can trim a directory's
+  // trailing slash from its path, but not from the URL.
+  const readWithEntry =
+    entryQuery.isPending &&
+    readsFileWithEntry(
+      selectedPath,
+      fileIndex.entryKind(selectedPath) ??
+        (typeof window !== "undefined" && window.location.pathname.endsWith("/")
+          ? "directory"
+          : undefined)
+    )
   const fileQuery = useQuery({
     ...relayFileQueryOptions(instance.relayId, instance.id, selectedPath),
     enabled:
-      selectedPathIsReadable && !selectedPathIsDatabase && relayConnected,
+      (selectedPathIsReadable || readWithEntry) &&
+      !selectedPathIsDatabase &&
+      relayConnected,
     refetchInterval: activeFileRevisionPollDelayMs,
     refetchIntervalInBackground: false,
     refetchOnReconnect: "always",
@@ -243,8 +281,9 @@ export function FileViewer({
     fileTreeLoading ||
     (Boolean(selectedPath) && relayConnected && entryQuery.isPending) ||
     (selectedPathIsReadable && !selectedPathIsDatabase && fileQuery.isPending)
+  // A read that failed while the Relay was away says nothing of the path.
   const routeError =
-    selectedPath && entryQuery.isError
+    selectedPath && relayConnected && entryQuery.isError
       ? queryErrorMessage(
           entryQuery.error,
           `Could not find ${rootPath}/${selectedPath}`
@@ -352,17 +391,16 @@ export function FileViewer({
           revision="database"
           enabled={relayConnected}
         />
-        <React.Suspense fallback={fallback}>
-          <FileDatabaseViewer
-            key={`${instance.id}:${selectedPath}`}
-            canWrite={canWrite}
-            displayPath={selectedPath}
-            instance={instance}
-            treeCollapsed={treeCollapsed}
-            onNotDatabase={() => setTextFallbackPath(selectedPath)}
-            onTreeExpand={onTreeExpand}
-          />
-        </React.Suspense>
+        <FileDatabasePreview
+          fallback={fallback}
+          key={`${instance.id}:${selectedPath}`}
+          canWrite={canWrite}
+          displayPath={selectedPath}
+          instance={instance}
+          treeCollapsed={treeCollapsed}
+          onNotDatabase={() => setTextFallbackPath(selectedPath)}
+          onTreeExpand={onTreeExpand}
+        />
       </>
     )
   }

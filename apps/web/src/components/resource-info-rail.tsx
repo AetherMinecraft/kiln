@@ -7,7 +7,6 @@ import {
   Container,
   Copy,
   LoaderCircle,
-  RadioTower,
   Users,
 } from "lucide-react"
 
@@ -21,6 +20,7 @@ import {
   InfoRailLink,
   InfoRailRow,
 } from "@/components/info-page"
+import { RelayKindIcon } from "@/components/instance-kind-icon"
 import { OwnerCard } from "@/components/owner-card"
 import { useCopyFeedback } from "@/components/workspace-header"
 import {
@@ -121,7 +121,6 @@ export function InfoContainerCard({
   pending = false,
 }: {
   containerId: string | null
-  // Instances have no CPU limit yet.
   cpu?: React.ReactNode
   // The instance's folder on the Relay's host; null when the Relay doesn't
   // say.
@@ -203,7 +202,7 @@ export function InfoRailRelayLink({
   const copyId = <CopyRelayIdButton relayId={relayId} />
   if (!data) {
     return (
-      <InfoRailRow action={copyId} leading={<RadioTower />}>
+      <InfoRailRow action={copyId} leading={<RelayKindIcon />}>
         {name}
       </InfoRailRow>
     )
@@ -213,7 +212,7 @@ export function InfoRailRelayLink({
       to="/relay/$relayId/info"
       params={{ relayId: data.routeId }}
       action={copyId}
-      leading={<RadioTower />}
+      leading={<RelayKindIcon />}
     >
       {data.name}
     </InfoRailLink>

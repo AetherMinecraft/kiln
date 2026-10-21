@@ -14,6 +14,47 @@ import { makeRelayStateLayer, RelayStateStore } from "./state.js"
 import { BROWSER_AUTHORIZATION_FLOOR_RETENTION_MS } from "../browser-security.js"
 
 describe("Relay state", () => {
+  stateTest("keeps the Relay paused while any Hearth holds it", () =>
+    Effect.gen(function* () {
+      const store = yield* RelayStateStore
+      const now = Date.UTC(2026, 0, 1)
+      for (const id of ["hearth-a", "hearth-b"]) {
+        yield* store.createInvitation({
+          actions: ["*"],
+          createdAt: now,
+          expiresAt: now + 60_000,
+          id: `invitation-${id}`,
+          role: "full_access",
+          tokenHash: `hash-${id}`,
+        })
+        yield* store.pairClient({
+          actions: ["*"],
+          id,
+          invitationId: `invitation-${id}`,
+          name: id,
+          origins: [],
+          pairedAt: now,
+          publicKey: `key-${id}`,
+          role: "full_access",
+          sourceCidrs: [],
+        })
+      }
+      yield* store.setPauseHold("hearth-a", true, now)
+      yield* store.setPauseHold("hearth-b", true, now)
+      // Holding again changes nothing.
+      yield* store.setPauseHold("hearth-a", true, now + 1)
+      yield* store.setPauseHold("hearth-a", false, now + 2)
+      assert.deepStrictEqual(yield* store.listPauseHolds(), ["hearth-b"])
+
+      // A revoked Hearth no longer holds it.
+      yield* store.revokeClient("hearth-b", now + 3)
+      assert.deepStrictEqual(yield* store.listPauseHolds(), [])
+      // Nor can a pause that raced its revocation hold it afterwards.
+      yield* store.setPauseHold("hearth-b", true, now + 4)
+      assert.deepStrictEqual(yield* store.listPauseHolds(), [])
+    })
+  )
+
   stateTest("pairs a client exactly once and persists its grant", () =>
     Effect.gen(function* () {
       const store = yield* RelayStateStore
@@ -1140,6 +1181,7 @@ describe("Relay state", () => {
 
       const enqueued = yield* store.enqueueProvisioningJob(
         {
+          kind: "server",
           idempotencyKey: "55000000-0000-4000-8000-000000000001",
           input,
           instanceId,
@@ -1150,6 +1192,7 @@ describe("Relay state", () => {
       assert.strictEqual(enqueued.status, "awaiting_claim")
       const duplicate = yield* store.enqueueProvisioningJob(
         {
+          kind: "server",
           idempotencyKey: enqueued.idempotencyKey,
           input,
           instanceId: "b".repeat(40),
@@ -1160,7 +1203,7 @@ describe("Relay state", () => {
       assert.strictEqual(duplicate.instanceId, instanceId)
 
       assert.strictEqual(
-        (yield* store.claimProvisioningJob(instanceId, 1_010))?.status,
+        (yield* store.claimProvisioningJob("server", instanceId, 1_010))?.status,
         "queued"
       )
       const running = yield* store.claimNextProvisioningJob(1_020)
@@ -1177,7 +1220,7 @@ describe("Relay state", () => {
         failed?.placeholder.provisioning?.failedPhase,
         "preparing"
       )
-      assert.isTrue(yield* store.cancelProvisioningJob(instanceId))
+      assert.isTrue(yield* store.cancelProvisioningJob("server", instanceId))
       assert.isNull(yield* store.getProvisioningJob(instanceId))
     })
   )
@@ -1222,6 +1265,7 @@ describe("Relay state", () => {
         })
       yield* store.enqueueProvisioningJob(
         {
+          kind: "server",
           idempotencyKey: "55000000-0000-4000-8000-000000000002",
           input,
           instanceId: firstId,
@@ -1231,6 +1275,7 @@ describe("Relay state", () => {
       )
       yield* store.enqueueProvisioningJob(
         {
+          kind: "server",
           idempotencyKey: "55000000-0000-4000-8000-000000000003",
           input,
           instanceId: secondId,
@@ -1238,12 +1283,12 @@ describe("Relay state", () => {
         },
         2_001
       )
-      yield* store.claimProvisioningJob(firstId, 2_010)
-      yield* store.claimProvisioningJob(secondId, 2_011)
+      yield* store.claimProvisioningJob("server", firstId, 2_010)
+      yield* store.claimProvisioningJob("server", secondId, 2_011)
 
       const [cancelled, claimed] = yield* Effect.all(
         [
-          store.cancelProvisioningJob(firstId),
+          store.cancelProvisioningJob("server", firstId),
           store.claimNextProvisioningJob(2_020),
         ],
         { concurrency: "unbounded" }
@@ -1280,9 +1325,13 @@ describe("legacy machine mutation migration", () => {
             const database = new DatabaseSync(filename)
             try {
               database.exec(
-                `DROP TABLE relay_schedule_runs;
+                `DROP TABLE relay_disk_limits;
+                 DROP TABLE relay_pause_holds;
+                 DROP TABLE relay_operations;
+                 DROP TABLE relay_schedule_runs;
                  DROP TABLE relay_schedule_tombstones;
                  DROP TABLE relay_schedules;
+                 DROP TABLE relay_volume_names;
                  DELETE FROM effect_sql_migrations WHERE migration_id >= 16`
               )
               database

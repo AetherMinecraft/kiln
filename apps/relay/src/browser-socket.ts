@@ -17,7 +17,6 @@ import {
 } from "node:zlib"
 import { Effect, Fiber, Option, Result, Schema } from "effect"
 import type { Tracer } from "effect"
-import { Headers, HttpTraceContext } from "effect/http"
 import { WebSocket, WebSocketServer } from "ws"
 import ZipStream from "zip-stream"
 
@@ -51,7 +50,11 @@ import {
   relayConsoleCompletionInputSchema,
 } from "@workspace/contracts"
 
-import { reportRelayError, traceRelayPromise } from "./effect/runtime.js"
+import {
+  reportRelayError,
+  traceParentSpan,
+  traceRelayPromise,
+} from "./effect/runtime.js"
 import {
   MAX_CONSOLE_HISTORY_CHARACTERS,
   MAX_CONSOLE_HISTORY_LINES,
@@ -72,8 +75,17 @@ import type {
   FileRoot,
   FilesystemDriver,
 } from "./files.js"
+import type { LaneTicket, OperationLanes } from "./operation-lanes.js"
+import {
+  fileRootTransferLocks,
+  instanceLifecycleLocks,
+} from "./operation-plans.js"
 import type { RelayIdentity } from "./effect/identity.js"
-import { ensuringPromise, forkPromise } from "./effect/promise.js"
+import {
+  ensuringPromise,
+  forkPromise,
+  recoverPromise,
+} from "./effect/promise.js"
 import type { RelayClientGrant, RelayStateStore } from "./effect/state.js"
 import type { RelaySnapshotSample } from "./snapshot-hub.js"
 import type { RelayConfig } from "./config.js"
@@ -207,6 +219,10 @@ export interface BrowserSocketOptions {
     readonly root: (appId: string) => Promise<FileRoot>
   }
   readonly identity: RelayIdentity
+  /** The lanes console input and uploads wait in, with Hearth's requests. */
+  readonly lanes: OperationLanes
+  /** Notes a stop typed into a server's console as someone's power change. */
+  readonly onConsoleStop: (instanceId: string) => void
   readonly runEffect: <T, E>(effect: Effect.Effect<T, E>) => Promise<T>
   readonly server: Server
   readonly state: RelayStateStore["Service"]
@@ -216,6 +232,8 @@ export interface BrowserSocketOptions {
 }
 
 export interface BrowserSocketServer {
+  /** Direct file transfers running, across every Hearth. */
+  readonly activeTransfers: () => number
   readonly close: () => Promise<void>
   readonly handleRequest: (
     request: IncomingMessage,
@@ -354,6 +372,7 @@ export function attachBrowserSocket(
   )
 
   return {
+    activeTransfers: () => transfers.active,
     close: async () => {
       heartbeatFiber.interruptUnsafe()
       registry.close()
@@ -561,15 +580,17 @@ function authenticateBrowser(
       }
       executeBoundedConsoleOperation(
         request.requestId,
+        request.instanceId,
         "console_write_capacity_reached",
         "Too many console operations are pending",
-        () =>
+        (ticket) =>
           executeConsoleWrite(
             socket,
             request,
             options,
             capability!,
             outbox,
+            ticket,
             () => registry.isActive(socket, "instance.console.write")
           )
       )
@@ -589,14 +610,16 @@ function authenticateBrowser(
       }
       executeBoundedConsoleOperation(
         request.requestId,
+        request.instanceId,
         "console_completion_capacity_reached",
         "Too many completions are pending",
-        () =>
+        (ticket) =>
           executeConsoleCompletion(
             socket,
             request,
             options.docker,
             outbox,
+            ticket,
             () => registry.isActive(socket, "instance.console.write")
           )
       )
@@ -605,15 +628,19 @@ function authenticateBrowser(
     socket.close(4400, "Invalid browser operation")
   }
 
+  // Console input still waiting its turn is withdrawn when the browser goes.
+  const consoleTickets = new Set<LaneTicket>()
   socket.once("close", () => {
     clearTimeout(timer)
+    for (const ticket of consoleTickets) ticket.cancel()
   })
 
   function executeBoundedConsoleOperation(
     requestId: string,
+    instanceId: string,
     code: string,
     message: string,
-    operation: () => Promise<void>
+    operation: (ticket: LaneTicket) => Promise<void>
   ): void {
     if (pendingConsoleOperations >= MAX_PENDING_CONSOLE_OPERATIONS_PER_SOCKET) {
       outbox.send(
@@ -624,11 +651,29 @@ function authenticateBrowser(
       return
     }
     pendingConsoleOperations += 1
+    // Input takes its place in the server's power lane as it arrives, so it
+    // stays in order with power changes and other consoles.
+    const ticket = options.lanes.admit({
+      label: "browser.console",
+      locks: /^[a-f0-9]{40}$/u.test(instanceId)
+        ? instanceLifecycleLocks(instanceId)
+        : recoverPromise(
+            async () =>
+              (await options.docker.findInstance(instanceId))?.id ?? instanceId,
+            () => instanceId
+          ).then(instanceLifecycleLocks),
+    })
+    consoleTickets.add(ticket)
     forkPromise(
       () =>
-        ensuringPromise(operation, () => {
-          pendingConsoleOperations -= 1
-        }),
+        ensuringPromise(
+          () => operation(ticket),
+          () => {
+            ticket.cancel()
+            consoleTickets.delete(ticket)
+            pendingConsoleOperations -= 1
+          }
+        ),
       () => undefined
     )
   }
@@ -828,48 +873,59 @@ async function executeConsoleWrite(
   options: BrowserSocketOptions,
   capability: RelayBrowserCapability,
   outbox: BrowserOutbox,
+  ticket: LaneTicket,
   authorize: () => boolean
 ): Promise<void> {
   await runBrowser(
-    timedBrowserOperation(
-      "Execute browser console write",
-      "relay.browser.console.write",
-      async () => {
-        const instance = await options.docker.findInstance(request.instanceId)
-        if (!instance) throw new Error("Instance not found")
-        if (!authorize()) throw new Error("Browser authorization changed")
-        const input = relayConsoleCommandSchema.parse({
-          command: request.command,
-        })
-        await options.docker.sendCommand(instance, input.command)
-        void auditBrowserConsoleWrite(options, capability, instance.id)
-        outbox.send(
-          JSON.stringify({
-            operation: "console.write",
-            payload: { accepted: true, command: input.command },
-            requestId: request.requestId,
-            type: "operation.result",
-          }),
-          "priority",
-          "instance.console.write"
+    ticket
+      .run(
+        timedBrowserOperation(
+          "Execute browser console write",
+          "relay.browser.console.write",
+          async () => {
+            const instance = await options.docker.findInstance(
+              request.instanceId
+            )
+            if (!instance) throw new Error("Instance not found")
+            if (!authorize()) throw new Error("Browser authorization changed")
+            const input = relayConsoleCommandSchema.parse({
+              command: request.command,
+            })
+            const { intentionalStop } = await options.docker.sendCommand(
+              instance,
+              input.command
+            )
+            if (intentionalStop) options.onConsoleStop(instance.id)
+            void auditBrowserConsoleWrite(options, capability, instance.id)
+            outbox.send(
+              JSON.stringify({
+                operation: "console.write",
+                payload: { accepted: true, command: input.command },
+                requestId: request.requestId,
+                type: "operation.result",
+              }),
+              "priority",
+              "instance.console.write"
+            )
+          }
         )
-      }
-    ).pipe(
-      Effect.catch(() =>
-        Effect.sync(() => {
-          outbox.send(
-            JSON.stringify({
-              code: "console_write_failed",
-              message: "Command could not be sent",
-              requestId: request.requestId,
-              type: "operation.error",
-            }),
-            "priority",
-            "instance.console.write"
-          )
-        })
       )
-    )
+      .pipe(
+        Effect.catch(() =>
+          Effect.sync(() => {
+            outbox.send(
+              JSON.stringify({
+                code: "console_write_failed",
+                message: "Command could not be sent",
+                requestId: request.requestId,
+                type: "operation.error",
+              }),
+              "priority",
+              "instance.console.write"
+            )
+          })
+        )
+      )
   )
 }
 
@@ -909,49 +965,54 @@ async function executeConsoleCompletion(
   request: typeof BrowserConsoleCompleteSchema.Type,
   docker: DockerDriver,
   outbox: BrowserOutbox,
+  ticket: LaneTicket,
   authorize: () => boolean
 ): Promise<void> {
   await runBrowser(
-    timedBrowserOperation(
-      "Execute browser console completion",
-      "relay.browser.console.complete",
-      async () => {
-        const instance = await docker.findInstance(request.instanceId)
-        if (!instance) throw new Error("Instance not found")
-        if (!authorize()) throw new Error("Browser authorization changed")
-        const input = relayConsoleCompletionInputSchema.parse(request)
-        const payload = await docker.completeCommand(
-          instance,
-          input.input,
-          input.cursor
+    ticket
+      .run(
+        timedBrowserOperation(
+          "Execute browser console completion",
+          "relay.browser.console.complete",
+          async () => {
+            const instance = await docker.findInstance(request.instanceId)
+            if (!instance) throw new Error("Instance not found")
+            if (!authorize()) throw new Error("Browser authorization changed")
+            const input = relayConsoleCompletionInputSchema.parse(request)
+            const payload = await docker.completeCommand(
+              instance,
+              input.input,
+              input.cursor
+            )
+            outbox.send(
+              JSON.stringify({
+                operation: "console.complete",
+                payload,
+                requestId: request.requestId,
+                type: "operation.result",
+              }),
+              "priority",
+              "instance.console.write"
+            )
+          }
         )
-        outbox.send(
-          JSON.stringify({
-            operation: "console.complete",
-            payload,
-            requestId: request.requestId,
-            type: "operation.result",
-          }),
-          "priority",
-          "instance.console.write"
-        )
-      }
-    ).pipe(
-      Effect.catch(() =>
-        Effect.sync(() => {
-          outbox.send(
-            JSON.stringify({
-              code: "console_completion_failed",
-              message: "Completions are unavailable",
-              requestId: request.requestId,
-              type: "operation.error",
-            }),
-            "priority",
-            "instance.console.write"
-          )
-        })
       )
-    )
+      .pipe(
+        Effect.catch(() =>
+          Effect.sync(() => {
+            outbox.send(
+              JSON.stringify({
+                code: "console_completion_failed",
+                message: "Completions are unavailable",
+                requestId: request.requestId,
+                type: "operation.error",
+              }),
+              "priority",
+              "instance.console.write"
+            )
+          })
+        )
+      )
   )
 }
 
@@ -1329,7 +1390,17 @@ async function handleBrowserFileRequest(
       }
       if (method === "PUT") {
         const uploaded = await options.runEffect(
-          filesystem.upload(instance, path, request, transfer.active)
+          options.lanes.run(
+            {
+              label: "browser.file.upload",
+              // An App or host root is addressed by its root ID; a game
+              // server by the full ID it was found under.
+              locks: fileRootTransferLocks(
+                host || appId ? instanceId : instance.id
+              ),
+            },
+            filesystem.upload(instance, path, request, transfer.active)
+          )
         )
         void auditBrowserTransfer(
           options,
@@ -2822,13 +2893,16 @@ class ConsoleHub {
       return
     }
 
-    const reset = encodeNewestConsoleBatch({
-      type: "reset",
-      instanceId: this.#resourceId,
-      lifecycle,
-      lines: this.#recent.slice(snapshotStart),
-      truncated: this.#truncated || snapshotStart > 0,
-    })
+    const reset = encodeNewestConsoleBatch(
+      {
+        type: "reset",
+        instanceId: this.#resourceId,
+        lifecycle,
+        lines: this.#recent.slice(snapshotStart),
+        truncated: this.#truncated || snapshotStart > 0,
+      },
+      RESET_FRAME_BYTES
+    )
     this.#deliver(socket, reset.encoded, "console", this.#source.readAction)
     this.#deliver(
       socket,
@@ -2941,6 +3015,11 @@ class ConsoleHub {
     this.#historyFrameCharacters = 0
   }
 }
+
+// The most a console's first frame holds, in bytes. A new connection sends
+// about 14 KB before the browser's first acknowledgement, so a larger frame
+// takes a round trip more to arrive; older lines follow it as history.
+const RESET_FRAME_BYTES = 10 * 1024
 
 // Recently encoded history frames a console keeps for browsers being sent
 // the same history, in characters: up to 32 full frames.
@@ -3055,20 +3134,9 @@ function timedBrowserOperation<TResult>(
 // The browser span a message continues, from its W3C `traceparent`, so the
 // Relay's work joins the browser's trace and follows its sampling.
 function browserTraceParent(value: unknown): Tracer.ExternalSpan | undefined {
-  if (
-    !value ||
-    typeof value !== "object" ||
-    !("traceparent" in value) ||
-    typeof value.traceparent !== "string" ||
-    value.traceparent.length > 64
-  ) {
-    return undefined
-  }
-  return Option.getOrUndefined(
-    HttpTraceContext.w3c(
-      Headers.fromInput({ traceparent: value.traceparent })
-    )
-  )
+  return value && typeof value === "object" && "traceparent" in value
+    ? traceParentSpan(value.traceparent)
+    : undefined
 }
 
 function asError(cause: unknown): Error {

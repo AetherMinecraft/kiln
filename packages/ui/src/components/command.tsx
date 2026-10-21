@@ -37,6 +37,7 @@ function CommandDialog({
   children,
   className,
   showCloseButton = false,
+  finalFocus,
   ...props
 }: Omit<React.ComponentProps<typeof Dialog>, "children"> & {
   children: React.ReactNode
@@ -44,6 +45,7 @@ function CommandDialog({
   description?: string
   className?: string
   showCloseButton?: boolean
+  finalFocus?: React.ComponentProps<typeof DialogContent>["finalFocus"]
 }) {
   return (
     <Dialog {...props}>
@@ -57,6 +59,7 @@ function CommandDialog({
           className
         )}
         showCloseButton={showCloseButton}
+        finalFocus={finalFocus}
       >
         {children}
       </DialogContent>
@@ -85,6 +88,13 @@ function CommandInput({
       </InputGroup>
     </div>
   )
+}
+
+/** The bare cmdk input, for callers that draw their own field around it. */
+function CommandBareInput(
+  props: React.ComponentProps<typeof CommandPrimitive.Input>
+) {
+  return <CommandPrimitive.Input data-slot="command-input" {...props} />
 }
 
 function CommandList({
@@ -188,6 +198,7 @@ export {
   Command,
   CommandDialog,
   CommandInput,
+  CommandBareInput,
   CommandList,
   CommandEmpty,
   CommandGroup,

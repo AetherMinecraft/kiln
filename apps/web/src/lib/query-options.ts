@@ -7,6 +7,7 @@ import type { QueryClient } from "@tanstack/react-query"
 import type {
   BackupTarget,
   RelayConsoleResource,
+  RelayFileEntry,
   RelayInstance,
 } from "@workspace/contracts"
 
@@ -29,7 +30,18 @@ import {
   getBrickCatalogDetails,
   listBrickCatalogs,
 } from "@/server/brick-catalogs"
+import {
+  getGitHubSourceRepositoryCount,
+  getGitHubSources,
+  getGitHubSyncOverview,
+  getGitHubSyncRuns,
+  listGitHubBranches,
+  listGitHubFolders,
+  listGitHubRepositories,
+} from "@/server/github-sync"
 import { getDomainSettings, getInstanceDomain } from "@/server/domains"
+import { getHearthEdge } from "@/server/hearth-edge"
+import { getResourceLimitsCapacity } from "@/server/resource-limits"
 import {
   getManagedDatabaseCredential,
   getManagedDatabaseContainer,
@@ -50,6 +62,9 @@ import {
 } from "@/lib/instance-favorites"
 import { getMinecraftProfile } from "@/server/minecraft"
 import { getRelayResources } from "@/server/relay-host"
+import { getRelayVolumes } from "@/server/relay-volumes"
+import { isDatabaseFilePath } from "@/lib/database-files"
+import { traceFileWork } from "@/lib/file-timing"
 import { reconcilePendingPowerSnapshot } from "@/lib/instance-power-state"
 import { systemUpdateOverviewRefetchPolicy } from "@/lib/system-update-presence"
 import {
@@ -61,12 +76,14 @@ import {
   getRelayFileActivity,
   getInstanceWebRoutes,
   getRelayNodeReadings,
+  getRelayProxyModes,
   getRelaySnapshot,
   getRelayTree,
 } from "@/server/relay"
 import {
   getRelayOwnerMinecraftProfiles,
   getRelayProxy,
+  getRelayWebRoutes,
   getRelayHostFiles,
   getRelayTailscale,
   getRelays,
@@ -92,6 +109,11 @@ import {
   getInfraServerDirectory,
   getServerNavigation,
 } from "@/server/infra-directory"
+import {
+  getAppDeploymentLog,
+  getAppDeployments,
+  getAppDeploymentSummary,
+} from "@/server/app-deployments"
 import {
   getAppConfig,
   getAppDirectory,
@@ -153,9 +175,31 @@ export const queryKeys = {
       ["domains", "instances", relayId, instanceId] as const,
     settings: ["domains", "settings"] as const,
   },
+  github: {
+    branches: (connectionId: string, repository: string) =>
+      ["github-sync", "branches", connectionId, repository] as const,
+    folders: (connectionId: string, repository: string, branch: string) =>
+      ["github-sync", "folders", connectionId, repository, branch] as const,
+    overview: ["github-sync", "overview"] as const,
+    repositories: (connectionId: string) =>
+      ["github-sync", "repositories", connectionId] as const,
+    repositoryCount: (connectionId: string) =>
+      ["github-sync", "repository-count", connectionId] as const,
+    runs: ["github-sync", "runs"] as const,
+    sources: ["github-sync", "sources"] as const,
+  },
+  hearthEdge: ["hearth", "edge"] as const,
   servers: {
     directory: ["servers", "directory"] as const,
     navigation: ["servers", "navigation"] as const,
+  },
+  appDeployments: {
+    list: (scope: { appId?: string; relayId?: string }) =>
+      ["app-deployments", "list", scope] as const,
+    log: (deploymentId: string) =>
+      ["app-deployments", "log", deploymentId] as const,
+    summary: (relayId: string, appId: string) =>
+      ["app-deployments", "summary", relayId, appId] as const,
   },
   apps: {
     all: ["apps"] as const,
@@ -173,6 +217,9 @@ export const queryKeys = {
     // Outside "databases", so list refreshes don't measure the volume again.
     container: (relayId: string, databaseId: string) =>
       ["database-container", relayId, databaseId] as const,
+    // Outside "databases": it asks the Relay for every instance's limits.
+    capacity: (relayId: string, databaseId: string) =>
+      resourceLimitsCapacityKey(relayId, "database", databaseId),
   },
   fileActivity: (relayId: string, instanceId: string) =>
     ["file-activity", relayId, instanceId] as const,
@@ -219,6 +266,10 @@ export const queryKeys = {
   },
   relays: ["relays"] as const,
   relayProxy: (relayId: string) => ["relays", "proxy", relayId] as const,
+  relayVolumes: (relayId: string) => ["relays", "volumes", relayId] as const,
+  relayProxyModes: ["relays", "proxy-modes"] as const,
+  // Beside each game server's own routes, so route changes refresh both.
+  relayWebRoutes: (relayId: string) => ["web-routes", relayId] as const,
   relayHostFiles: (relayId: string) =>
     ["relays", "host-files", relayId] as const,
   tailscale: (relayId: string) => ["tailscale", "relays", relayId] as const,
@@ -695,6 +746,36 @@ export function managedDatabaseContainerQueryOptions(
   })
 }
 
+function resourceLimitsCapacityKey(
+  relayId: string,
+  kind: "app" | "database",
+  id: string
+) {
+  return ["resource-limits-capacity", relayId, kind, id] as const
+}
+
+// What the node can still give an app or database, for its limits editor;
+// null for those who can't see the node.
+export function resourceLimitsCapacityQueryOptions(
+  relayId: string,
+  kind: "app" | "database",
+  id: string
+) {
+  return queryOptions({
+    queryKey: resourceLimitsCapacityKey(relayId, kind, id),
+    queryFn: () => getResourceLimitsCapacity({ data: { id, kind, relayId } }),
+    retry: false,
+    staleTime: 30_000,
+  })
+}
+
+export function managedDatabaseCapacityQueryOptions(
+  relayId: string,
+  databaseId: string
+) {
+  return resourceLimitsCapacityQueryOptions(relayId, "database", databaseId)
+}
+
 export function accessCapabilitiesQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.access.capabilities,
@@ -801,6 +882,38 @@ export function relaysQueryOptions() {
     queryKey: queryKeys.relays,
     queryFn: () => getRelays(),
     staleTime: Infinity,
+  })
+}
+
+/** Which readable Relays run which proxy, read from Hearth's connections. */
+export function relayProxyModesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.relayProxyModes,
+    queryFn: () => getRelayProxyModes(),
+    staleTime: 30_000,
+  })
+}
+
+/** The web routes a Relay's proxy serves, with the resource each reaches. */
+export function relayWebRoutesQueryOptions(relayId: string) {
+  return queryOptions({
+    queryKey: queryKeys.relayWebRoutes(relayId),
+    queryFn: () => getRelayWebRoutes({ data: { id: relayId } }),
+    retry: false,
+    staleTime: 15_000,
+  })
+}
+
+// Sizes are Docker's last measure, taken in the background; changes
+// refresh the list through the `relay-volumes` topic.
+export function relayVolumesQueryOptions(relayId: string) {
+  return queryOptions({
+    queryFn: () => getRelayVolumes({ data: { relayId } }),
+    queryKey: queryKeys.relayVolumes(relayId),
+    // Docker measures sizes in the background; check back until it's done.
+    refetchInterval: (query) => (query.state.data?.measuring ? 2_000 : false),
+    retry: false,
+    staleTime: 30_000,
   })
 }
 
@@ -926,6 +1039,117 @@ export function domainSettingsQueryOptions() {
   })
 }
 
+export function githubSyncOverviewQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.github.overview,
+    queryFn: () => getGitHubSyncOverview(),
+  })
+}
+
+export function githubSyncRunsQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.github.runs,
+    queryFn: () => getGitHubSyncRuns(),
+  })
+}
+
+export function appDeploymentsQueryOptions(scope: {
+  appId?: string
+  relayId?: string
+}) {
+  return infiniteQueryOptions({
+    queryKey: queryKeys.appDeployments.list(scope),
+    queryFn: ({ pageParam }) =>
+      getAppDeployments({
+        data: { ...scope, ...(pageParam && { before: pageParam }) },
+      }),
+    initialPageParam: null as { id: string; startedAt: string } | null,
+    getNextPageParam: (page) => page.nextCursor,
+  })
+}
+
+export function appDeploymentSummaryQueryOptions(
+  relayId: string,
+  appId: string
+) {
+  return queryOptions({
+    queryKey: queryKeys.appDeployments.summary(relayId, appId),
+    queryFn: () => getAppDeploymentSummary({ data: { appId, relayId } }),
+  })
+}
+
+export function appDeploymentLogQueryOptions(deploymentId: string) {
+  return queryOptions({
+    queryKey: queryKeys.appDeployments.log(deploymentId),
+    queryFn: () => getAppDeploymentLog({ data: { deploymentId } }),
+    retry: false,
+  })
+}
+
+export function githubSourcesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.github.sources,
+    queryFn: () => getGitHubSources(),
+  })
+}
+
+export function githubSourceRepositoryCountQueryOptions(connectionId: string) {
+  return queryOptions({
+    queryKey: queryKeys.github.repositoryCount(connectionId),
+    queryFn: () =>
+      getGitHubSourceRepositoryCount({ data: { id: connectionId } }),
+    retry: false,
+    staleTime: 60_000,
+  })
+}
+
+// What a connection can reach on GitHub changes rarely; a minute keeps the
+// sync dialog's pickers from refetching as it reopens.
+export function githubRepositoriesQueryOptions(connectionId: string) {
+  return queryOptions({
+    queryKey: queryKeys.github.repositories(connectionId),
+    queryFn: () => listGitHubRepositories({ data: { connectionId } }),
+    retry: false,
+    staleTime: 60_000,
+  })
+}
+
+export function githubBranchesQueryOptions(
+  connectionId: string,
+  repository: string
+) {
+  return queryOptions({
+    queryKey: queryKeys.github.branches(connectionId, repository),
+    queryFn: () => listGitHubBranches({ data: { connectionId, repository } }),
+    retry: false,
+    staleTime: 60_000,
+  })
+}
+
+export function githubFoldersQueryOptions(
+  connectionId: string,
+  repository: string,
+  branch: string
+) {
+  return queryOptions({
+    queryKey: queryKeys.github.folders(connectionId, repository, branch),
+    queryFn: () =>
+      listGitHubFolders({ data: { branch, connectionId, repository } }),
+    retry: false,
+    staleTime: 60_000,
+  })
+}
+
+// Fixed for the life of the page: the address comes from Hearth's
+// configuration and the edge from the request path.
+export function hearthEdgeQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.hearthEdge,
+    queryFn: () => getHearthEdge(),
+    staleTime: Infinity,
+  })
+}
+
 export function instanceDomainQueryOptions(
   relayId: string,
   instanceId: string
@@ -982,10 +1206,25 @@ export function relayDirectoryQueryOptions(
     ] as const,
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam, signal }) =>
-      getRelayDirectoryPage({
-        data: { instanceId, path, relayId, cursor: pageParam },
-        signal,
-      }),
+      traceFileWork(
+        "directory",
+        {
+          attributes: {
+            "kiln.files.continued": pageParam !== undefined,
+            "kiln.files.depth": path ? path.split("/").length : 0,
+          },
+          signal,
+          describe: (page) => ({
+            "kiln.files.entries": page.entries.length,
+            "kiln.files.has_more": page.cursor !== null,
+          }),
+        },
+        () =>
+          getRelayDirectoryPage({
+            data: { instanceId, path, relayId, cursor: pageParam },
+            signal,
+          })
+      ),
     getNextPageParam: (page) => page.cursor ?? undefined,
     retry: 3,
     retryDelay: (attempt) => Math.min(500 * 2 ** attempt, 2_000),
@@ -1010,9 +1249,36 @@ export function relayFileQueryOptions(
   return queryOptions({
     queryKey: queryKeys.relay.file(relayId, instanceId, path),
     queryFn: ({ signal }) =>
-      getRelayFile({ data: { instanceId, path, relayId }, signal }),
+      traceFileWork(
+        "file",
+        {
+          signal,
+          describe: (file) => ({
+            "kiln.files.bytes": file.size,
+            "kiln.files.encoding": file.encoding,
+          }),
+        },
+        () => getRelayFile({ data: { instanceId, path, relayId }, signal })
+      ),
     staleTime: 15_000,
   })
+}
+
+/**
+ * Whether to read a file alongside its entry rather than after it, saving a
+ * round trip. The entry still decides what the path is; this skips paths the
+ * read would fail on or go unused for: directories and database files.
+ */
+export function readsFileWithEntry(
+  path: string,
+  kind: RelayFileEntry["kind"] | undefined
+) {
+  if (!path || path.endsWith("/") || isDatabaseFilePath(path)) return false
+  if (kind) return kind === "file"
+  // An unlisted path, as on a direct load: a name with an extension is
+  // almost always a file.
+  const name = path.slice(path.lastIndexOf("/") + 1)
+  return name.lastIndexOf(".") > 0
 }
 
 export function relayFileEntryQueryOptions(
@@ -1023,7 +1289,9 @@ export function relayFileEntryQueryOptions(
   return queryOptions({
     queryKey: [...queryKeys.relay.file(relayId, instanceId, path), "stat"],
     queryFn: ({ signal }) =>
-      getRelayFileEntry({ data: { instanceId, path, relayId }, signal }),
+      traceFileWork("entry", { signal }, () =>
+        getRelayFileEntry({ data: { instanceId, path, relayId }, signal })
+      ),
     retry: false,
     staleTime: 15_000,
   })
@@ -1047,7 +1315,9 @@ export function relayFileActivityQueryOptions(
   return queryOptions({
     queryKey: queryKeys.fileActivity(relayId, instanceId),
     queryFn: ({ signal }) =>
-      getRelayFileActivity({ data: { instanceId, relayId }, signal }),
+      traceFileWork("activity", { signal }, () =>
+        getRelayFileActivity({ data: { instanceId, relayId }, signal })
+      ),
     staleTime: 15_000,
   })
 }

@@ -6,7 +6,7 @@ const notificationResourceSchema = z.object({
   id: z.string(),
   name: z.string(),
   relayId: z.string(),
-  type: z.enum(["relay", "instance", "database"]),
+  type: z.enum(["relay", "instance", "database", "app"]),
 })
 
 /**
@@ -44,6 +44,14 @@ export const notificationContentSchema = z.discriminatedUnion("kind", [
     actorName: z.string(),
     kind: z.literal("access.removed"),
     resource: notificationResourceSchema,
+  }),
+  // An instance's data outgrew its disk limit. Instances that keep running
+  // past it, such as databases, warn this way.
+  z.object({
+    kind: z.literal("resource.disk-limit"),
+    limitBytes: z.number(),
+    resource: notificationResourceSchema,
+    usedBytes: z.number(),
   }),
 ])
 

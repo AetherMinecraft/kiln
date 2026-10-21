@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto"
-
 import {
   relayCreateDatabaseSchema,
   type DatabaseEngine,
 } from "@workspace/contracts"
+import { randomUUID } from "node:crypto"
+
 import { Effect } from "effect"
 import { describe, expect, it, vi } from "vite-plus/test"
 
@@ -11,10 +12,13 @@ vi.mock("./command.js", () => import("./test/docker.js"))
 
 import { fakeDocker } from "./test/docker.js"
 import {
+  provisioningWorker,
   relayHarness,
   TEST_NAMESPACE,
   type RelayHarness,
 } from "./test/relay.js"
+import { DockerEngine } from "./docker-engine.js"
+import { controlRequestLocks, databaseLocks } from "./operation-plans.js"
 
 const serverId = "a".repeat(40)
 const password = "correct-horse-battery-staple-1"
@@ -38,7 +42,9 @@ function createDatabase(
 }
 
 function databaseContainer(id: string) {
-  const container = fakeDocker.container(`${TEST_NAMESPACE}-kiln-db-${id}-database`)
+  const container = fakeDocker.container(
+    `${TEST_NAMESPACE}-kiln-db-${id}-database`
+  )
   if (!container) throw new Error(`Database ${id} has no container`)
   return container
 }
@@ -119,6 +125,405 @@ describe("managed database recovery metadata", () => {
   })
 })
 
+describe("managed database provisioning", () => {
+  function input(id: string) {
+    return relayCreateDatabaseSchema.parse({
+      databaseName: "kiln_app",
+      engine: "postgres",
+      id,
+      name: "Main database",
+      password,
+      username: "kiln_user",
+    })
+  }
+
+  async function settled(harness: RelayHarness, id: string) {
+    for (let tries = 0; tries < 10_000; tries += 1) {
+      const database = (await harness.databases.list()).find(
+        (candidate) => candidate.id === id
+      )
+      if (database && database.observedState !== "provisioning") {
+        return database
+      }
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    throw new Error("The database never finished provisioning")
+  }
+
+  it("shows a placeholder at once, then creates the database once Hearth claims it", async () => {
+    const harness = await relayHarness()
+    const manager = await provisioningWorker(harness)
+    const id = "c".repeat(40)
+    const job = {
+      idempotencyKey: randomUUID(),
+      input: input(id),
+      instanceId: id,
+      kind: "database" as const,
+      placeholder: harness.databases.placeholder(input(id)),
+    }
+
+    await Effect.runPromise(manager.prepare(job))
+    // A retried prepare answers the same job.
+    await Effect.runPromise(manager.prepare(job))
+    expect(await harness.databases.list()).toEqual([
+      expect.objectContaining({
+        containerId: null,
+        id,
+        observedState: "provisioning",
+        provisioning: expect.objectContaining({ phase: "awaiting_claim" }),
+      }),
+    ])
+    expect(
+      await harness.databases.inventory(
+        [{ id, view: "status" }],
+        new AbortController().signal
+      )
+    ).toEqual([{ id, view: "status", observedState: "provisioning" }])
+
+    await Effect.runPromise(manager.claim("database", id))
+    const database = await settled(harness, id)
+
+    expect(database).toMatchObject({ id, observedState: "running" })
+    expect(database.provisioning).toBeUndefined()
+    expect(databaseContainer(id).state.running).toBe(true)
+  })
+
+  it("shows where a failed create stopped and leaves nothing behind", async () => {
+    const harness = await relayHarness()
+    const manager = await provisioningWorker(harness)
+    const id = "c".repeat(40)
+    fakeDocker.failNext({ command: "start" }, "port is already allocated")
+
+    await Effect.runPromise(
+      manager.prepare({
+        idempotencyKey: randomUUID(),
+        input: input(id),
+        instanceId: id,
+        kind: "database",
+        placeholder: harness.databases.placeholder(input(id)),
+      })
+    )
+    await Effect.runPromise(manager.claim("database", id))
+    const database = await settled(harness, id)
+
+    expect(database).toMatchObject({
+      containerId: null,
+      observedState: "failed",
+      provisioning: { failedPhase: "finalizing", phase: "failed" },
+    })
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(false)
+    expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
+  })
+
+  it("keeps a deleted job visible until what it made is gone, and never runs it", async () => {
+    const harness = await relayHarness()
+    const manager = await provisioningWorker(harness)
+    const id = "c".repeat(40)
+    await Effect.runPromise(
+      manager.prepare({
+        idempotencyKey: randomUUID(),
+        input: input(id),
+        instanceId: id,
+        kind: "database",
+        placeholder: harness.databases.placeholder(input(id)),
+      })
+    )
+
+    await expect(
+      Effect.runPromise(
+        manager.discard("database", id, async () => {
+          throw new Error("Docker unavailable")
+        })
+      )
+    ).rejects.toThrow("Docker unavailable")
+    expect(await harness.databases.list()).toEqual([
+      expect.objectContaining({ id, observedState: "failed" }),
+    ])
+    // Hearth's claim no longer starts it.
+    await expect(
+      Effect.runPromise(manager.claim("database", id))
+    ).resolves.toMatchObject({ observedState: "failed" })
+
+    await Effect.runPromise(manager.discard("database", id, async () => {}))
+    expect(await harness.databases.list()).toEqual([])
+    expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
+  })
+
+  it("refuses to delete a job the worker has taken", async () => {
+    const harness = await relayHarness()
+    const manager = await provisioningWorker(harness)
+    const id = "c".repeat(40)
+    // Another change to the database holds its lanes, so the worker takes
+    // the job and waits its turn.
+    let release: () => void = () => undefined
+    const held = Effect.runPromise(
+      harness.lanes.run(
+        { label: "database.action", locks: databaseLocks(id) },
+        Effect.promise(
+          () =>
+            new Promise<void>((resolve) => {
+              release = resolve
+            })
+        )
+      )
+    )
+    await Effect.runPromise(
+      manager.prepare({
+        idempotencyKey: randomUUID(),
+        input: input(id),
+        instanceId: id,
+        kind: "database",
+        placeholder: harness.databases.placeholder(input(id)),
+      })
+    )
+    await Effect.runPromise(manager.claim("database", id))
+    for (let tries = 0; tries < 10_000; tries += 1) {
+      const job = await Effect.runPromise(harness.state.getProvisioningJob(id))
+      if (job?.status === "running") break
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+
+    await expect(
+      Effect.runPromise(manager.discard("database", id, async () => {}))
+    ).rejects.toThrow("Wait for the database to finish provisioning")
+
+    release()
+    await held
+    expect(await settled(harness, id)).toMatchObject({ observedState: "running" })
+  })
+})
+
+describe("managed database limits", () => {
+  const MIB = 1024 ** 2
+
+  it("changes memory and CPU in place and keeps the disk limit", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    const before = databaseContainer(id).id
+
+    const limited = await harness.databases.setLimits({
+      databaseId: id,
+      limits: { cpuMillis: 500, diskBytes: 1024 * MIB, memoryBytes: 512 * MIB },
+    })
+
+    expect(limited.limits).toEqual({
+      cpuMillis: 500,
+      diskBytes: 1024 * MIB,
+      memoryBytes: 512 * MIB,
+    })
+    expect(databaseContainer(id)).toMatchObject({
+      id: before,
+      memoryBytes: 512 * MIB,
+      nanoCpus: 5e8,
+    })
+    // A Relay that restarts reads the same limits back.
+    const [listed] = await harness.databases.list()
+    expect(listed?.limits).toEqual(limited.limits)
+  })
+
+  it("recreates the container over the same data to remove a limit", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.databases.setLimits({
+      databaseId: id,
+      limits: { cpuMillis: 500, memoryBytes: 512 * MIB },
+    })
+    const before = databaseContainer(id)
+
+    const unlimited = await harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: null },
+    })
+
+    expect(unlimited.limits).toEqual({
+      cpuMillis: 500,
+      diskBytes: null,
+      memoryBytes: null,
+    })
+    const after = databaseContainer(id)
+    expect(after.id).not.toBe(before.id)
+    expect(after).toMatchObject({ memoryBytes: 0, nanoCpus: 5e8 })
+    expect(after.state.running).toBe(true)
+    expect(after.env).toEqual(before.env)
+    expect(after.mounts).toContainEqual(
+      expect.objectContaining({ source: volumeOf(id) })
+    )
+    expect(fakeDocker.containers.size).toBe(1)
+  })
+
+  it("keeps the old container when its replacement can't be created", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: 512 * MIB },
+    })
+    const before = databaseContainer(id).id
+    fakeDocker.failNext({ command: "create" }, "no space left on device")
+
+    await expect(
+      harness.databases.setLimits({
+        databaseId: id,
+        limits: { memoryBytes: null },
+      })
+    ).rejects.toThrow("no space left on device")
+
+    expect(databaseContainer(id)).toMatchObject({
+      id: before,
+      memoryBytes: 512 * MIB,
+    })
+    expect(databaseContainer(id).state.running).toBe(true)
+  })
+})
+
+describe("managed database replacement recovery", () => {
+  const MIB = 1024 ** 2
+
+  it("never lists a database twice when the old container outlives its replacement", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: 512 * MIB },
+    })
+    const before = databaseContainer(id).id
+    fakeDocker.failNext({ command: "rm", target: before }, "device busy")
+
+    await harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: null },
+    })
+
+    expect(fakeDocker.containers.size).toBe(2)
+    expect(await harness.databases.list()).toHaveLength(1)
+    await harness.databases.recoverReplacements()
+    expect([...fakeDocker.containers.values()]).toEqual([
+      expect.objectContaining({ id: databaseContainer(id).id }),
+    ])
+    expect(databaseContainer(id).id).not.toBe(before)
+  })
+
+  it("starts a replacement a restart caught before it started", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: 512 * MIB },
+    })
+    const original = databaseContainer(id).id
+    // The Relay stops while Docker starts the replacement.
+    const start = fakeDocker.hold({ command: "start" })
+    void harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: null },
+    })
+    await start.reached
+    const restarted = await harness.restart()
+
+    await restarted.databases.recoverReplacements()
+
+    expect([...fakeDocker.containers.values()]).toEqual([
+      expect.objectContaining({ id: databaseContainer(id).id }),
+    ])
+    expect(databaseContainer(id).id).not.toBe(original)
+    expect(databaseContainer(id).state.running).toBe(true)
+    expect(databaseContainer(id).memoryBytes).toBe(0)
+  })
+
+  it("goes back to the old container when a restart caught a replacement that never got ready", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: 512 * MIB },
+    })
+    const original = databaseContainer(id).id
+    // The Relay stops as Docker starts the replacement, which comes up
+    // running but fails its health check.
+    fakeDocker.unhealthyImages.add("postgres:17")
+    const start = fakeDocker.hold({ command: "start" })
+    void harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: null },
+    })
+    await start.reached
+    const replacement = `${TEST_NAMESPACE}-kiln-db-${id}-database`
+    await Effect.runPromise(
+      new DockerEngine(harness.config.dockerSocket).startContainer(replacement, {
+        timeout: 5_000,
+      })
+    )
+    expect(fakeDocker.container(replacement)?.state.health).toBe("unhealthy")
+    const restarted = await harness.restart()
+
+    await restarted.databases.recoverReplacements()
+
+    expect([...fakeDocker.containers.values()]).toEqual([
+      expect.objectContaining({ id: original }),
+    ])
+    expect(databaseContainer(id).memoryBytes).toBe(512 * MIB)
+  })
+
+  it("leaves a stopped database stopped when a restart caught its replacement", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: 512 * MIB },
+    })
+    await harness.databases.action({ action: "stop", databaseId: id })
+    const original = databaseContainer(id).id
+    // The Relay stops while Docker creates the replacement.
+    const creation = fakeDocker.hold({ command: "create" })
+    void harness.databases.setLimits({
+      databaseId: id,
+      limits: { memoryBytes: null },
+    })
+    await creation.reached
+    const restarted = await harness.restart()
+
+    await restarted.databases.recoverReplacements()
+
+    expect(databaseContainer(id)).toMatchObject({ id: original })
+    expect(databaseContainer(id).state.running).toBe(false)
+  })
+
+  it("puts back a database a restart caught set aside", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    const original = databaseContainer(id)
+    const engine = new DockerEngine(harness.config.dockerSocket)
+    // As a Relay that stopped right after setting the old container aside.
+    await Effect.runPromise(
+      engine.stopContainer(original.id, {
+        seconds: 1,
+        timeout: 5_000,
+      })
+    )
+    await Effect.runPromise(
+      engine.renameContainer(
+        original.id,
+        `${original.name}-replaced-0000`
+      )
+    )
+    expect(await harness.databases.list()).toHaveLength(0)
+
+    await harness.databases.recoverReplacements()
+
+    expect(databaseContainer(id)).toMatchObject({ id: original.id })
+    expect(databaseContainer(id).state.running).toBe(true)
+    expect(await harness.databases.list()).toHaveLength(1)
+  })
+})
+
 describe("managed database credential rotation", () => {
   it.each([
     // Valkey's client reads the same variable as Redis's.
@@ -139,7 +544,9 @@ describe("managed database credential rotation", () => {
       })
 
       const acl = fakeDocker.volumes.get(volumeOf(id))?.files.get("users.acl")
-      expect(acl).toContain(createHash("sha256").update(nextPassword).digest("hex"))
+      expect(acl).toContain(
+        createHash("sha256").update(nextPassword).digest("hex")
+      )
       expect(acl).not.toContain(nextPassword)
       const processes = databaseContainer(id).processes
       expect(processes).toHaveLength(1)
@@ -295,6 +702,51 @@ describe("managed database deletion", () => {
     expect(server.state.running).toBe(true)
   })
 
+  it("fails a delete whose network won't go, so it can be retried", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    fakeDocker.failNext(
+      { command: "network rm", target: networkOf(id) },
+      "network has active endpoints"
+    )
+
+    await expect(
+      harness.databases.delete({ databaseId: id, deleteData: true })
+    ).rejects.toThrow("network has active endpoints")
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(true)
+
+    await harness.databases.delete({ databaseId: id, deleteData: true })
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(false)
+    expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
+  })
+
+  it("doesn't call a database gone when Docker can't say what's left of it", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    // An earlier delete stopped after removing the container.
+    await Effect.runPromise(
+      new DockerEngine(harness.config.dockerSocket).removeContainer(
+        databaseContainer(id).id,
+        { force: true }
+      )
+    )
+    fakeDocker.failNext(
+      { command: "network inspect", target: networkOf(id) },
+      "Docker unavailable"
+    )
+
+    await expect(
+      harness.databases.delete({ databaseId: id, deleteData: true })
+    ).rejects.toThrow("Docker unavailable")
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(true)
+
+    await harness.databases.delete({ databaseId: id, deleteData: true })
+    expect(fakeDocker.networks.has(networkOf(id))).toBe(false)
+    expect(fakeDocker.volumes.has(volumeOf(id))).toBe(false)
+  })
+
   it("finishes when the container disappears before Docker removes it", async () => {
     const harness = await relayHarness()
     const id = "d".repeat(40)
@@ -365,7 +817,9 @@ describe("explicit database connections", () => {
       })
     ).rejects.toThrow("Database not found")
     expect(
-      await Effect.runPromise(harness.state.listInstanceDatabaseConnections(serverId))
+      await Effect.runPromise(
+        harness.state.listInstanceDatabaseConnections(serverId)
+      )
     ).toEqual([])
   })
 })
@@ -381,31 +835,51 @@ describe("database mutation serialization", () => {
       target: databaseContainer(id).id,
     })
 
-    const deleting = harness.databases.delete({
-      databaseId: id,
-      deleteData: true,
-    })
+    // As the control socket runs them: each in its turn in the lanes.
+    const inLane = <T>(
+      operation: "database.delete" | "database.network.write",
+      payload: Record<string, unknown>,
+      run: () => Promise<T>
+    ) =>
+      Effect.runPromise(
+        harness.lanes.run(
+          {
+            label: operation,
+            locks: controlRequestLocks(operation, payload, (ref) => ref)!,
+          },
+          Effect.promise(run)
+        )
+      )
+    const deleting = inLane("database.delete", { databaseId: id }, () =>
+      harness.databases.delete({ databaseId: id, deleteData: true })
+    )
     await removal.reached
-    const connecting = harness.databases.updateNetwork({
+    const connect = {
       connected: true,
       databaseId: id,
       instanceId: serverId,
-    })
+    } as const
+    const connecting = inLane("database.network.write", connect, () =>
+      harness.databases.updateNetwork(connect)
+    ).then(
+      () => null,
+      (error: unknown) => error
+    )
     removal.release()
 
     await expect(deleting).resolves.toMatchObject({ deleted: true })
-    await expect(connecting).rejects.toThrow("Database not found")
+    expect(await connecting).toMatchObject({ message: "Database not found" })
     expect(
-      await Effect.runPromise(harness.state.listInstanceDatabaseConnections(serverId))
+      await Effect.runPromise(
+        harness.state.listInstanceDatabaseConnections(serverId)
+      )
     ).toEqual([])
     expect([...server.networks.keys()]).toEqual([harness.resources.gameNetwork])
     // The failed connect released its lock for later operations.
     await expect(
-      harness.databases.updateNetwork({
-        connected: true,
-        databaseId: id,
-        instanceId: serverId,
-      })
+      inLane("database.network.write", connect, () =>
+        harness.databases.updateNetwork(connect)
+      )
     ).rejects.toThrow("Database not found")
   })
 })

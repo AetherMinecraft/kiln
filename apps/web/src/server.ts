@@ -3,6 +3,7 @@ import { createServerEntry } from "@tanstack/react-start/server-entry"
 import { Effect } from "effect"
 
 import { hearthStreamHandler } from "./app-server-handler"
+import { loadInstallationId } from "./effect/installation"
 import { migrateDatabase } from "./effect/migrations"
 import { disposeAppRuntime, reportAppError } from "./effect/runtime"
 import { forkPromise } from "./effect/promise"
@@ -16,14 +17,31 @@ import {
   startInstanceDirectorySync,
   stopInstanceDirectorySync,
 } from "./lib/instance-directory-sync"
+import {
+  startGitHubSyncPolling,
+  stopGitHubSyncPolling,
+} from "./lib/github-sync.server"
+import {
+  startAppDeploymentPolling,
+  stopAppDeploymentPolling,
+} from "./lib/app-deployments.server"
 import { scheduleTailscaleCleanupProcessing } from "./lib/tailscale-cleanup.server"
+import { startDiskLimitWarnings } from "./lib/disk-limit-warnings.server"
 import {
   initializeRelayFromEnvironment,
   maintainPersistedRelayConnections,
 } from "./lib/relay-registry"
+import { relayConnectionsCapacity } from "./lib/relay-connection"
+import { startRelayMetrics, stopRelayMetrics } from "./lib/relay-metrics"
 
 await migrateDatabase()
+// Before the app runtime starts, so telemetry carries the ID, and before
+// Relays connect, since Hearth sends it to them.
+await loadInstallationId()
 startInstanceDirectorySync()
+startGitHubSyncPolling()
+startAppDeploymentPolling()
+startRelayMetrics(relayConnectionsCapacity)
 
 await Effect.runPromise(
   Effect.tryPromise({
@@ -62,6 +80,7 @@ scheduleBackupCopyProcessing()
 scheduleInstancePostProvisionProcessing()
 scheduleTailscaleCleanupProcessing()
 startKilnUpdateNotifications()
+startDiskLimitWarnings()
 forkPromise(wakePendingAuthorizationDelivery, (cause) => {
   reportAppError(cause, { operation: "authorization.delivery.recover" })
 })
@@ -72,7 +91,12 @@ let shutdownPromise: Promise<void> | undefined
 
 export function shutdownHearth(): Promise<void> {
   // Disposing the runtime also flushes pending telemetry.
-  shutdownPromise ??= stopInstanceDirectorySync()
+  shutdownPromise ??= Promise.all([
+    stopInstanceDirectorySync(),
+    stopGitHubSyncPolling(),
+    stopAppDeploymentPolling(),
+    stopRelayMetrics(),
+  ])
     .then(() => Effect.runPromise(stopWarmCacheRefreshes))
     .then(disposeAppRuntime)
   return shutdownPromise

@@ -4,7 +4,6 @@ import type { RelayHostFiles } from "@workspace/contracts"
 import {
   HardDrive,
   LoaderCircle,
-  RadioTower,
   TriangleAlert,
 } from "lucide-react"
 
@@ -19,6 +18,8 @@ import {
 } from "@workspace/ui/components/dialog"
 import { showToast } from "@workspace/ui/components/sonner"
 
+import { FilePageContent } from "@/components/files/file-page-content"
+import { RelayKindIcon } from "@/components/instance-kind-icon"
 import { useRelayLiveStatus } from "@/components/relay/relay-presentation"
 import { useRelayWorkspace } from "@/components/relay/relay-workspace-context"
 import { canAccessRelayPermission } from "@/lib/navigation-destinations"
@@ -39,7 +40,7 @@ export function relayHostAccessQueryOptions(relayId: string) {
 
 function useRelayHostAccess() {
   const { relay } = useRelayWorkspace()
-  const { connected } = useRelayLiveStatus(relay)
+  const { connected, relayStatus } = useRelayLiveStatus(relay)
   const access = useQuery({
     ...relayHostAccessQueryOptions(relay.id),
     enabled: connected,
@@ -49,7 +50,7 @@ function useRelayHostAccess() {
     refetchInterval: (query) =>
       query.state.data?.files.status === "mounting" ? 2_000 : false,
   })
-  return { access, connected, relayId: relay.id }
+  return { access, connected, relayId: relay.id, relayStatus }
 }
 
 export function RelayHostTerminalAccess({
@@ -63,7 +64,7 @@ export function RelayHostTerminalAccess({
   if (access.data?.terminal) return children
   return (
     <HostUnavailable
-      icon={<RadioTower />}
+      icon={<RelayKindIcon />}
       title="Host terminal unavailable"
       description={
         access.error?.message ??
@@ -78,27 +79,41 @@ export function RelayHostFilesAccess({
 }: {
   children: (limitation: RelayHostFiles["limitation"]) => React.ReactNode
 }) {
-  const { access, connected, relayId } = useRelayHostAccess()
+  const { access, connected, relayId, relayStatus } = useRelayHostAccess()
   const files = access.data?.files
   // Still mounting while the Relay is away restarting.
   if (files?.status === "mounting") {
     return (
-      <HostUnavailable
-        icon={<LoaderCircle className="animate-spin" />}
-        title="Mounting host files"
-        description="The Relay is restarting with its host's filesystem mounted. Servers keep running, and this page opens when the Relay is back."
-      />
+      <>
+        <FilePageContent view="waiting" />
+        <HostUnavailable
+          icon={<LoaderCircle className="animate-spin" />}
+          title="Mounting host files"
+          description="The Relay is restarting with its host's filesystem mounted. Servers keep running, and this page opens when the Relay is back."
+        />
+      </>
     )
   }
-  if (!connected) return <WaitingForRelay />
+  if (!connected) {
+    return (
+      <>
+        {/* Not while Hearth is still checking whether the Relay is there. */}
+        <FilePageContent reached={relayStatus !== "checking"} view="waiting" />
+        <WaitingForRelay />
+      </>
+    )
+  }
   if (access.isPending) return <div className="min-h-0 flex-1 bg-card" />
   if (!files) {
     return (
-      <HostUnavailable
-        icon={<RadioTower />}
-        title="Host filesystem unavailable"
-        description={access.error?.message ?? "Update this Relay."}
-      />
+      <>
+        <FilePageContent view="unavailable" />
+        <HostUnavailable
+          icon={<RelayKindIcon />}
+          title="Host filesystem unavailable"
+          description={access.error?.message ?? "Update this Relay."}
+        />
+      </>
     )
   }
   switch (files.status) {
@@ -106,14 +121,22 @@ export function RelayHostFilesAccess({
       return children(files.limitation)
     case "disabled":
       return (
-        <HostUnavailable
-          icon={<RadioTower />}
-          title="Host access is off"
-          description="Set KILN_RELAY_HOST_ACCESS=true on the Relay to browse its host's files."
-        />
+        <>
+          <FilePageContent view="unavailable" />
+          <HostUnavailable
+            icon={<RelayKindIcon />}
+            title="Host access is off"
+            description="Set KILN_RELAY_HOST_ACCESS=true on the Relay to browse its host's files."
+          />
+        </>
       )
     case "unmounted":
-      return <MountHostFiles relayId={relayId} mountError={files.mountError} />
+      return (
+        <>
+          <FilePageContent view="unavailable" />
+          <MountHostFiles relayId={relayId} mountError={files.mountError} />
+        </>
+      )
   }
 }
 
@@ -247,7 +270,7 @@ export function HostFilesLimitation({
 function WaitingForRelay() {
   return (
     <HostUnavailable
-      icon={<RadioTower />}
+      icon={<RelayKindIcon />}
       title="Waiting for the Relay"
       description="This page will open when the Relay reconnects."
     />

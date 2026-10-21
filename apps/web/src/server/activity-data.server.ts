@@ -1,8 +1,12 @@
 import {
+  appIdFromFileRoot,
+  appTailscaleMember,
+  isRelayFileRoot,
   relayAuditRecordSchema,
   relayIdSchema,
   relaySnapshotSchema,
 } from "@workspace/contracts"
+import type { RelayAuditRecord } from "@workspace/contracts"
 import type { RowDataPacket } from "mysql2/promise"
 import { z } from "zod"
 
@@ -11,6 +15,7 @@ import {
   activityPermissionForAudit,
   activitySourceForAudit,
   activityTypeForAudit,
+  auditAppId,
   auditDatabaseId,
   auditInstanceId,
   auditUserId,
@@ -35,6 +40,12 @@ interface ActivityInstance {
   displayName: string | null
   instanceId: string
   relayId: string
+}
+
+interface ResourceNameRow extends RowDataPacket {
+  id: string
+  name: string
+  relay_id: string
 }
 
 interface UserRow extends RowDataPacket {
@@ -139,15 +150,20 @@ export async function getActivityForUser(
     )
   })
 
-  const [instanceRows, userRows] = await Promise.all([
-    listActivityInstances(visibleRelays.map((relay) => relay.id)),
+  const visibleRelayIds = visibleRelays.map((relay) => relay.id)
+  const [instanceRows, userRows, appRows, databaseRows] = await Promise.all([
+    listActivityInstances(visibleRelayIds),
     listActivityUsers(
       visibleAudits.flatMap(({ record }) => {
         const userId = auditUserId(record)
         return userId ? [userId] : []
       })
     ),
+    listActivityResourceNames("app", visibleRelayIds),
+    listActivityResourceNames("database", visibleRelayIds),
   ])
+  const appNames = resourceNames(appRows)
+  const databaseNames = resourceNames(databaseRows)
   const instanceByKey = new Map<string, ActivityInstance>(
     instanceRows.map((instance) => [
       instanceKey(instance.relay_id, instance.instance_id),
@@ -166,12 +182,55 @@ export async function getActivityForUser(
   }
   const userById = new Map(userRows.map((actor) => [actor.id, actor]))
 
+  // What an event acted on. Apps and Relays can take a game server's place:
+  // an app runs as a Relay instance, its files are `app:<id>`, and its
+  // Tailscale members `app:<id>:<service>`; a Relay's host files use its
+  // fingerprint. A game server wins over a database it was linked to.
+  const activityTarget = (relayId: string, record: RelayAuditRecord) => {
+    const recordedId = auditInstanceId(record)
+    const instanceAppId = recordedId
+      ? (appIdFromFileRoot(recordedId) ??
+        appTailscaleMember(recordedId)?.appId ??
+        (appNames.has(instanceKey(relayId, recordedId)) ? recordedId : null))
+      : null
+    const instanceId =
+      recordedId && !instanceAppId && !isRelayFileRoot(recordedId)
+        ? recordedId
+        : null
+    const appId = auditAppId(record) ?? instanceAppId
+    if (appId) {
+      return {
+        id: appId,
+        kind: "app" as const,
+        name:
+          appNames.get(instanceKey(relayId, appId)) ??
+          `App ${appId.slice(0, 8)}`,
+      }
+    }
+    if (instanceId) {
+      return {
+        id: instanceId,
+        kind: "server" as const,
+        name:
+          instanceByKey.get(instanceKey(relayId, instanceId))?.displayName ??
+          `Server ${instanceId.slice(0, 8)}`,
+      }
+    }
+    const databaseId = auditDatabaseId(record)
+    if (databaseId) {
+      return {
+        id: databaseId,
+        kind: "database" as const,
+        name:
+          databaseNames.get(instanceKey(relayId, databaseId)) ??
+          `Database ${databaseId.slice(0, 8)}`,
+      }
+    }
+    return null
+  }
+
   const entries = visibleAudits
     .map(({ record, relay }) => {
-      const instanceId = auditInstanceId(record)
-      const instance = instanceId
-        ? instanceByKey.get(instanceKey(relay.id, instanceId))
-        : undefined
       const actorId = auditUserId(record)
       const actor = actorId ? userById.get(actorId) : undefined
       return {
@@ -186,6 +245,8 @@ export async function getActivityForUser(
               id: systemActorId,
               name: "Kiln system",
             },
+        // Kept beside the target: connecting a database to a game server
+        // targets the server but belongs in the database's activity too.
         databaseId: auditDatabaseId(record),
         id: `${relay.id}:${record.id}`,
         label: activityLabelForAudit(record),
@@ -197,13 +258,8 @@ export async function getActivityForUser(
           name: relay.name,
           unavailable: unavailableRelayIds.has(relay.id),
         },
-        server: instanceId
-          ? {
-              id: instanceId,
-              name: instance?.displayName ?? `Server ${instanceId.slice(0, 8)}`,
-            }
-          : null,
         source: activitySourceForAudit(record),
+        target: activityTarget(relay.id, record),
         type: activityTypeForAudit(record),
       }
     })
@@ -216,25 +272,6 @@ export async function getActivityForUser(
       name: relay.name,
       unavailable: unavailableRelayIds.has(relay.id),
     })),
-    servers: [...instanceByKey.values()]
-      .flatMap((instance) => {
-        const scope = scopes.get(instance.relayId)
-        const visible =
-          scope?.allInstances === true ||
-          scope?.instanceIds.has(instance.instanceId) === true
-        return visible
-          ? [
-              {
-                id: instance.instanceId,
-                name:
-                  instance.displayName ??
-                  `Server ${instance.instanceId.slice(0, 8)}`,
-                relayId: instance.relayId,
-              },
-            ]
-          : []
-      })
-      .sort((left, right) => left.name.localeCompare(right.name)),
     truncatedRelayIds: available.flatMap(({ records, relay }) =>
       records.length === 2_000 ? [relay.id] : []
     ),
@@ -253,6 +290,24 @@ async function listActivityInstances(
     [relayIds]
   )
   return rows
+}
+
+async function listActivityResourceNames(
+  table: "app" | "database",
+  relayIds: Array<z.infer<typeof relayIdSchema>>
+): Promise<Array<ResourceNameRow>> {
+  if (relayIds.length === 0) return []
+  const [rows] = await databasePool.query<Array<ResourceNameRow>>(
+    `SELECT relay_id, ${table}_id AS id, name
+       FROM ${databaseTable(table)}
+      WHERE relay_id IN (?)`,
+    [relayIds]
+  )
+  return rows
+}
+
+function resourceNames(rows: Array<ResourceNameRow>): Map<string, string> {
+  return new Map(rows.map((row) => [instanceKey(row.relay_id, row.id), row.name]))
 }
 
 async function listActivityUsers(

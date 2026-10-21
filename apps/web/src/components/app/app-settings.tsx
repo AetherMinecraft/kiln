@@ -1,8 +1,12 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import type { RelayAppWebRoute } from "@workspace/contracts"
 import {
-  Boxes,
+  NO_RESOURCE_LIMITS,
+  type AppConfig,
+  type RelayAppWebRoute,
+  type ResourceLimits,
+} from "@workspace/contracts"
+import {
   Cable,
   FileCode2,
   Globe2,
@@ -22,6 +26,7 @@ import {
   type AppDocumentKind,
   type EditableAppConfig,
 } from "@/components/app/app-config-dialogs"
+import { useAppRunsCompose } from "@/components/app/app-compose"
 import { useAppContainerSelection } from "@/components/app/app-container-selection"
 import {
   appAddresses,
@@ -42,12 +47,23 @@ import {
   InfoSectionLink,
 } from "@/components/info-page"
 import { InstanceFavoriteButton } from "@/components/instance-favorite"
+import { AppKindIcon } from "@/components/instance-kind-icon"
 import { RelativeTime } from "@/components/relative-time"
 import { RenameButton } from "@/components/rename-dialog"
 import { StatusIndicator } from "@/components/status-indicator"
-import { appWebRoutesQueryOptions, queryKeys } from "@/lib/query-options"
+import {
+  ResourceLimitsSection,
+  type ResourceLimitsGroup,
+} from "@/components/resource-limits-section"
+import {
+  appDeploymentSummaryQueryOptions,
+  appWebRoutesQueryOptions,
+  queryKeys,
+  resourceLimitsCapacityQueryOptions,
+} from "@/lib/query-options"
+import type { AppGitHubSourceView } from "@/server/app-deployments.server"
 import { warmSyntaxCodeEditorModule } from "@/lib/syntax-editor-module-preload"
-import { deployApp, renameApp } from "@/server/apps"
+import { deployApp, renameApp, updateAppLimits } from "@/server/apps"
 
 // The app's details on its Info page, one section per concern, each with
 // the actions that change it. What runs where is tagged with the service
@@ -66,7 +82,7 @@ export function AppGeneralSettings({
   const available = appRelayAvailable(app)
   return (
     <InfoSection
-      icon={<Boxes />}
+      icon={<AppKindIcon />}
       title="App"
       action={
         <>
@@ -141,8 +157,19 @@ export function AppSourceSettings({
   const [configuring, setConfiguring] = React.useState(false)
   const deploying =
     appRelayAvailable(app) && app.deployment?.state === "running"
-  const kind = config.sourceType === "image" ? null : config.sourceType
-  const singleContainer = config.sourceType !== "compose"
+  const kind =
+    config.sourceType === "image" || config.sourceType === "github"
+      ? null
+      : config.sourceType
+  const github = useQuery({
+    ...appDeploymentSummaryQueryOptions(app.relayId, app.id),
+    enabled: config.sourceType === "github",
+    select: (summary) => summary.source,
+  })
+  const singleContainer =
+    config.sourceType === "github"
+      ? github.data?.build !== "compose"
+      : config.sourceType !== "compose"
   const services = appServices(app)
 
   return (
@@ -187,7 +214,9 @@ export function AppSourceSettings({
       }
     >
       <InfoFact label="Type">{sourceTypeLabels[config.sourceType]}</InfoFact>
-      {kind ? (
+      {config.sourceType === "github" ? (
+        <AppGitHubSourceFacts source={github.data} />
+      ) : kind ? (
         <InfoFact label="File">
           <span className="font-mono text-xs">{appDocuments[kind].path}</span>
           <span className="text-xs text-muted-foreground tabular-nums">
@@ -228,6 +257,60 @@ export function AppSourceSettings({
         </>
       ) : null}
     </InfoSection>
+  )
+}
+
+// The repository a GitHub app builds, and which file in it.
+function AppGitHubSourceFacts({
+  source,
+}: {
+  source: AppGitHubSourceView | null | undefined
+}) {
+  if (source === undefined) {
+    return (
+      <InfoFact label="Repository">
+        <span className="text-muted-foreground">Loading…</span>
+      </InfoFact>
+    )
+  }
+  if (source === null) {
+    return (
+      <InfoFact label="Repository">
+        <span className="text-muted-foreground">Not chosen</span>
+      </InfoFact>
+    )
+  }
+  return (
+    <>
+      <InfoFact label="Repository">
+        <a
+          className="truncate font-mono text-xs hover:text-primary"
+          href={source.repositoryUrl}
+          rel="noreferrer"
+          target="_blank"
+        >
+          {source.repository}
+        </a>
+      </InfoFact>
+      <InfoFact label="Branch">
+        <span className="truncate font-mono text-xs">{source.branch}</span>
+      </InfoFact>
+      <InfoFact label={source.build === "compose" ? "Compose file" : "Dockerfile"}>
+        <span className="truncate font-mono text-xs">{source.path}</span>
+      </InfoFact>
+      <InfoFact label="Deploy on push">
+        <span
+          className={source.autoDeploy ? undefined : "text-muted-foreground"}
+        >
+          {source.autoDeploy ? "On" : "Off"}
+        </span>
+      </InfoFact>
+      {source.connectionId === null ? (
+        <InfoFact label="Source">
+          <span className="text-destructive">Removed; choose another</span>
+        </InfoFact>
+      ) : null}
+    </>
   )
 }
 
@@ -730,4 +813,108 @@ function environmentVariableNames(environment: string): Array<string> {
       ?.trim()
     return name ? [name] : []
   })
+}
+
+const APP_DISK_GROUP = "app-data"
+
+// An app's disk limit covers its data directory, which its services share;
+// memory and CPU are each service's own. Services are those it runs and
+// those with saved limits, or its one container before a first deploy.
+export function AppLimitsSection({
+  app,
+  available,
+  config,
+  editable,
+}: {
+  app: App
+  available: boolean
+  config: AppConfig
+  editable: boolean
+}) {
+  const queryClient = useQueryClient()
+  const compose = useAppRunsCompose(app, config.sourceType)
+  const { data: capacity = null } = useQuery({
+    ...resourceLimitsCapacityQueryOptions(app.relayId, "app", app.id),
+    enabled: editable && available,
+  })
+  const services = React.useMemo(() => {
+    const names = new Set([
+      ...app.containers.map((container) => container.service),
+      ...Object.keys(config.serviceLimits),
+    ])
+    if (names.size === 0 && !compose) names.add("app")
+    return [...names].sort()
+  }, [app.containers, compose, config.serviceLimits])
+  const groups = React.useMemo<Array<ResourceLimitsGroup>>(
+    () => [
+      {
+        fields: ["disk"],
+        key: APP_DISK_GROUP,
+        label: "App data",
+        limits: { ...NO_RESOURCE_LIMITS, diskBytes: config.diskLimitBytes },
+      },
+      ...services.map((service) => ({
+        fields: ["memory", "cpu"] as const,
+        key: `service:${service}`,
+        label: compose ? `Service ${service}` : "Container",
+        limits: { ...NO_RESOURCE_LIMITS, ...config.serviceLimits[service] },
+      })),
+    ],
+    [compose, config.diskLimitBytes, config.serviceLimits, services]
+  )
+  const save = React.useCallback(
+    async (limits: Readonly<Record<string, ResourceLimits>>) => {
+      await updateAppLimits({
+        data: {
+          appId: app.id,
+          diskLimitBytes: limits[APP_DISK_GROUP]?.diskBytes ?? null,
+          relayId: app.relayId,
+          serviceLimits: Object.fromEntries(
+            services.flatMap((service) => {
+              const next = limits[`service:${service}`]
+              return next &&
+                (next.cpuMillis !== null || next.memoryBytes !== null)
+                ? [
+                    [
+                      service,
+                      {
+                        cpuMillis: next.cpuMillis,
+                        memoryBytes: next.memoryBytes,
+                      },
+                    ],
+                  ]
+                : []
+            })
+          ),
+        },
+      })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.apps.all }),
+        queryClient.invalidateQueries({
+          queryKey: resourceLimitsCapacityQueryOptions(
+            app.relayId,
+            "app",
+            app.id
+          ).queryKey,
+        }),
+      ])
+    },
+    [app.id, app.relayId, queryClient, services]
+  )
+  return (
+    <ResourceLimitsSection
+      capacity={capacity}
+      disabledReason={
+        available ? undefined : "Reconnect this app's Relay first"
+      }
+      editable={editable}
+      groups={groups}
+      hint={
+        compose && services.length === 0
+          ? "Deploy the app once to set each service's memory and CPU."
+          : "Memory and CPU apply to running containers at once; removing one applies on the next deploy. Past its disk limit, the app is stopped."
+      }
+      onSave={save}
+    />
+  )
 }

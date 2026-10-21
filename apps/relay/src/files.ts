@@ -2,6 +2,7 @@ import {
   chmod,
   chown,
   cp,
+  link,
   lstat,
   mkdir,
   open,
@@ -77,8 +78,10 @@ import { directoryApparentSizeEffect } from "./disk-usage.js"
 import { RelayFilesystemError } from "./effect/errors.js"
 import { ensuringPromise, promiseEffect } from "./effect/promise.js"
 import { decodeNbt, encodeNbt } from "./nbt.js"
+import type { FilesystemCapacity } from "./relay-capacity.js"
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024
+const MAX_FINGERPRINT_BYTES = 8 * 1024 * 1024
 const MAX_LOG_SHARE_BYTES = 10 * 1024 * 1024
 const MAX_TREE_ITEMS = 5_000
 const MAX_TREE_DEPTH = 10
@@ -119,6 +122,16 @@ export class FilesystemDriver {
   ) {
     this.#config = config
     this.#saveInPlace = options.saveInPlace ?? false
+  }
+
+  /** What this driver's shared scan and cursor limits hold right now. */
+  capacity(): FilesystemCapacity {
+    return {
+      directorySizeScans: this.#activeDirectorySizeScans.size,
+      directorySizePending: this.#directorySizeQueue.length,
+      directoryCursors: this.#directoryScans.size + this.#openingDirectoryScans,
+      searchCursors: this.#searchScans.size,
+    }
   }
 
   /**
@@ -232,6 +245,10 @@ export class FilesystemDriver {
 
   directory(instance: FileRoot, input: RelayDirectoryPageInput) {
     return Effect.gen({ self: this }, function* () {
+      yield* Effect.annotateCurrentSpan(
+        "kiln.files.continued",
+        Boolean(input.cursor)
+      )
       const root = yield* this.#instanceRoot(instance)
       const requestedDirectory = normalizeDirectoryPath(input.path)
       let scan: DirectoryScan
@@ -280,6 +297,7 @@ export class FilesystemDriver {
           this.#armDirectoryScan(opened)
           return opened
         }).pipe(
+          Effect.withSpan("relay.files.directory.open"),
           Effect.ensuring(
             Effect.sync(() => {
               this.#openingDirectoryScans -= 1
@@ -298,9 +316,25 @@ export class FilesystemDriver {
       scan.busy = true
       this.#armDirectoryScan(scan)
 
-      return yield* filesystemOperation("directory.read", () =>
-        readDirectoryScanPage(scan)
-      ).pipe(
+      return yield* Effect.gen(function* () {
+        const { complete, entries } = yield* filesystemOperation(
+          "directory.read",
+          () => readDirectoryScanEntries(scan)
+        ).pipe(Effect.withSpan("relay.files.directory.read"))
+        const resolved = yield* filesystemOperation("directory.read", () =>
+          resolveDirectoryScanEntries(scan, entries)
+        ).pipe(Effect.withSpan("relay.files.directory.stat"))
+        yield* Effect.annotateCurrentSpan({
+          "kiln.files.entries": resolved.length,
+          "kiln.files.has_more": !complete,
+        })
+        return {
+          cursor: complete ? null : scan.id,
+          directory: scan.directory,
+          entries: resolved,
+          instanceId: scan.instanceId,
+        } satisfies RelayDirectoryPage
+      }).pipe(
         Effect.tap((page) =>
           Effect.sync(() => {
             if (!page.cursor) this.#finishDirectoryScan(scan)
@@ -477,6 +511,7 @@ export class FilesystemDriver {
     return Effect.gen({ self: this }, function* () {
       const path = yield* this.#existingFile(instance, requestedPath)
       const metadata = yield* filesystemOperation("read.stat", () => stat(path))
+      yield* Effect.annotateCurrentSpan("kiln.files.bytes", metadata.size)
       if (metadata.size > MAX_FILE_BYTES) {
         return yield* filesystemFailure(
           "file_too_large",
@@ -791,7 +826,13 @@ export class FilesystemDriver {
     instance: FileRoot,
     requestedPath: string,
     source: AsyncIterable<Uint8Array>,
-    authorizeCommit: () => boolean = () => true
+    authorizeCommit: () => boolean = () => true,
+    /**
+     * Replace the file only if it's unchanged: its modification time in whole
+     * milliseconds still matches, or null for a file that must not exist.
+     * Otherwise the upload fails with `file_changed`.
+     */
+    unchangedSince?: number | null
   ) {
     return Effect.gen({ self: this }, function* () {
       yield* requireLinuxDescriptorAnchoring()
@@ -817,7 +858,8 @@ export class FilesystemDriver {
               name,
               requestedPath,
               source,
-              authorizeCommit
+              authorizeCommit,
+              unchangedSince
             )
           )
         )
@@ -1097,6 +1139,37 @@ export class FilesystemDriver {
     return this.#existingFile(instance, requestedPath)
   }
 
+  /**
+   * A file's Git blob ID, as Git hashes its content, and its modification
+   * time in whole milliseconds; null when it doesn't exist or isn't a
+   * regular file. Files over 8 MiB aren't hashed.
+   */
+  fingerprint(instance: FileRoot, requestedPath: string) {
+    return this.#existingFile(instance, requestedPath).pipe(
+      Effect.flatMap((path) =>
+        filesystemOperation("fingerprint.read", async () => {
+          const metadata = await stat(path)
+          const content =
+            metadata.size > MAX_FINGERPRINT_BYTES ? null : await readFile(path)
+          return {
+            blob: content
+              ? createHash("sha1")
+                  .update(`blob ${content.byteLength}\0`)
+                  .update(content)
+                  .digest("hex")
+              : null,
+            modifiedAt: Math.floor(metadata.mtimeMs),
+          }
+        })
+      ),
+      Effect.catchIf(
+        (error) => error.code === "not_a_file" || isMissingFile(error.cause),
+        () => Effect.succeed(null)
+      ),
+      Effect.withSpan("relay.files.fingerprint")
+    )
+  }
+
   #existingFile(instance: FileRoot, requestedPath: string) {
     return Effect.gen({ self: this }, function* () {
       yield* validateRelativePath(requestedPath)
@@ -1300,9 +1373,10 @@ function estimatedFileEntryBytes(path: string): number {
   return Buffer.byteLength(path) + 96
 }
 
-async function readDirectoryScanPage(
+// A page of the scan's entries, stopping before one that would overflow it.
+async function readDirectoryScanEntries(
   scan: DirectoryScan
-): Promise<RelayDirectoryPage> {
+): Promise<{ complete: boolean; entries: Array<Dirent> }> {
   const entries: Array<Dirent> = []
   let estimatedBytes = 0
   let complete = false
@@ -1328,7 +1402,13 @@ async function readDirectoryScanPage(
     entries.push(entry)
     estimatedBytes += nextBytes
   }
+  return { complete, entries }
+}
 
+async function resolveDirectoryScanEntries(
+  scan: DirectoryScan,
+  entries: ReadonlyArray<Dirent>
+): Promise<Array<RelayFileEntry>> {
   const resolved: Array<RelayFileEntry> = []
   for (let offset = 0; offset < entries.length; offset += 16) {
     resolved.push(
@@ -1339,12 +1419,7 @@ async function readDirectoryScanPage(
       ))
     )
   }
-  return {
-    cursor: complete ? null : scan.id,
-    directory: scan.directory,
-    entries: resolved,
-    instanceId: scan.instanceId,
-  }
+  return resolved
 }
 
 async function readSearchScanPage(
@@ -1522,7 +1597,8 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
   name: string,
   requestedPath: string,
   source: AsyncIterable<Uint8Array>,
-  authorizeCommit: () => boolean
+  authorizeCommit: () => boolean,
+  unchangedSince: number | null | undefined
 ) {
   const anchoredParent = fileDescriptorPath(parentHandle)
   const resolvedParent = yield* filesystemOperation(
@@ -1573,6 +1649,17 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
             })
           )
         )
+        if (existing) {
+          // A replacement keeps the file's owner and mode, as saving does: a
+          // root Relay would otherwise hand the file to root, and the umask
+          // would narrow its mode.
+          yield* filesystemOperation("upload.keepOwnership", async () => {
+            if (process.getuid?.() === 0) {
+              await file.chown(existing.uid, existing.gid)
+            }
+            await file.chmod(existing.mode & 0o7777)
+          })
+        }
         yield* filesystemOperation("upload.sync", () => file.sync()).pipe(
           Effect.uninterruptible
         )
@@ -1587,6 +1674,28 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
             "upload.authorizeCommit",
             "Upload authorization changed before commit"
           )
+        }
+        if (unchangedSince === null) {
+          // Linking fails if the file appeared meanwhile, so nothing the
+          // instance created is replaced.
+          yield* filesystemOperation("upload.create", () =>
+            link(temporary, target)
+          ).pipe(
+            Effect.catchIf(
+              (error) => isAlreadyExists(error.cause),
+              () => uploadChangedFailure()
+            ),
+            Effect.uninterruptible
+          )
+          return
+        }
+        if (unchangedSince !== undefined) {
+          // POSIX has no compare-and-swap rename; checking last leaves only
+          // the instant between this check and the rename.
+          const current = yield* optionalFileMetadata(target)
+          if (!current || Math.floor(current.mtimeMs) !== unchangedSince) {
+            return yield* uploadChangedFailure()
+          }
         }
         yield* filesystemOperation("upload.replace", () =>
           rename(temporary, target)
@@ -1606,6 +1715,14 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
     size,
   }
 })
+
+function uploadChangedFailure() {
+  return filesystemFailure(
+    "file_changed",
+    "upload",
+    "The file changed on disk before the upload finished"
+  )
+}
 
 function requireLinuxDescriptorAnchoring() {
   return process.platform === "linux"
