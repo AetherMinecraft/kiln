@@ -239,6 +239,11 @@ export class FakeDocker {
    */
   readonly danglingVolumes = new Set<string>()
   /**
+   * Named volumes a container was created on without `nocopy`, which Docker
+   * fills with the image's files at that path while they're empty.
+   */
+  readonly filledVolumes = new Set<string>()
+  /**
    * How a health-checked container of an image reports its health as it
    * runs: each entry holds from `afterMs` past its start.
    */
@@ -320,6 +325,7 @@ export class FakeDocker {
     this.imageTags.clear()
     this.unhealthyImages.clear()
     this.danglingVolumes.clear()
+    this.filledVolumes.clear()
     this.healthTimelines.clear()
     this.crashingImages.clear()
     this.programFailures.clear()
@@ -650,6 +656,7 @@ export class FakeDocker {
     const project = arguments_[arguments_.indexOf("-p") + 1] ?? ""
     const definition = JSON.parse(input) as {
       networks?: Record<string, { external?: boolean; name?: string } | null>
+      volumes?: Record<string, { name?: string } | null>
       services: Record<
         string,
         {
@@ -665,6 +672,7 @@ export class FakeDocker {
             source?: string
             target: string
             type: string
+            volume?: { nocopy?: boolean }
           }>
         }
       >
@@ -681,6 +689,18 @@ export class FakeDocker {
       const imageConfig = this.imageConfigs.get(image) as
         | { Healthcheck?: unknown; Volumes?: Record<string, object> }
         | undefined
+      for (const volume of settings.volumes ?? []) {
+        if (
+          volume.type === "volume" &&
+          volume.source &&
+          !volume.volume?.nocopy
+        ) {
+          this.filledVolumes.add(
+            definition.volumes?.[volume.source]?.name ??
+              `${project}_${volume.source}`
+          )
+        }
+      }
       this.addContainer({
         image,
         labels: {
@@ -690,15 +710,21 @@ export class FakeDocker {
           "com.docker.compose.service": service,
         },
         mounts: [
-          // Its binds, as the host path Docker gets.
+          // Its binds, as the host path Docker gets, and its named
+          // volumes, by the name the file gives them.
           ...(settings.volumes ?? []).flatMap((volume) =>
-            volume.type === "bind" && volume.source
+            (volume.type === "bind" || volume.type === "volume") &&
+            volume.source
               ? [
                   {
                     destination: volume.target,
                     readOnly: volume.read_only ?? false,
-                    source: volume.source,
-                    type: "bind" as const,
+                    source:
+                      volume.type === "volume"
+                        ? (definition.volumes?.[volume.source]?.name ??
+                          `${project}_${volume.source}`)
+                        : volume.source,
+                    type: volume.type as FakeMount["type"],
                   },
                 ]
               : []
@@ -1974,6 +2000,15 @@ export class FakeDocker {
 
   #createFromApi(name: string | undefined, body: CreateBody): FakeContainer {
     const host = body.HostConfig ?? {}
+    for (const mount of host.Mounts ?? []) {
+      if (
+        mount.Type === "volume" &&
+        mount.Source &&
+        !mount.VolumeOptions?.NoCopy
+      ) {
+        this.filledVolumes.add(mount.Source)
+      }
+    }
     const mounts: Array<FakeMount> = [
       ...(host.Binds ?? []).map((bind) => parseVolume(bind)),
       ...(host.Mounts ?? []).map((mount) => ({
@@ -2354,6 +2389,7 @@ interface CreateBody {
       Source?: string
       Target: string
       Type: string
+      VolumeOptions?: { NoCopy?: boolean }
     }>
     NetworkMode?: string
     PortBindings?: Record<
