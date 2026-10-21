@@ -574,6 +574,53 @@ export const appServiceLimitsSchema = z
   .record(appServiceNameSchema, serviceResourceLimitsSchema)
   .refine((limits) => Object.keys(limits).length <= 64, "Too many services")
 
+const appContainerPathSchema = z
+  .string()
+  .max(512)
+  .regex(/^\/[^\0:]*$/u, "Use an absolute path inside the container")
+
+// The largest file an app can mount from its config.
+export const APP_MOUNT_FILE_MAX_LENGTH = 100_000
+
+// What an app mounts besides its data directory: one of the Relay's named
+// volumes, a path on the node, or a file kept in the config.
+export const appMountSourceSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("volume"), volumeId: relayVolumeIdSchema }),
+  z.strictObject({
+    path: z
+      .string()
+      .max(1_024)
+      .regex(/^\/[^\0]*$/u, "Use an absolute path on the node"),
+    type: z.literal("host"),
+  }),
+  z.strictObject({
+    content: z.string().max(APP_MOUNT_FILE_MAX_LENGTH),
+    type: z.literal("file"),
+  }),
+])
+
+export const appMountSchema = z.strictObject({
+  // Stable across edits; a file mount is kept on the Relay under it.
+  id: z.string().regex(/^[a-z0-9]{8,32}$/u),
+  readOnly: z.boolean(),
+  // The Compose service it's mounted in, or null for every service and for
+  // an image's or Dockerfile's one container.
+  service: appServiceNameSchema.nullable(),
+  source: appMountSourceSchema,
+  target: appContainerPathSchema,
+})
+
+export const appMountsSchema = z
+  .array(appMountSchema)
+  .max(32)
+  .refine(
+    (mounts) =>
+      new Set(mounts.map((mount) => mount.id)).size === mounts.length &&
+      new Set(mounts.map((mount) => `${mount.service ?? ""}:${mount.target}`))
+        .size === mounts.length,
+    "Mount each path once"
+  )
+
 // Every source is kept, so switching between them loses nothing; only
 // `sourceType` deploys.
 export const appConfigSchema = z
@@ -583,10 +630,7 @@ export const appConfigSchema = z
     compose: z.string().max(400_000),
     // Where the app's data directory is mounted, for images and Dockerfiles.
     // Compose files mount it themselves through `${KILN_DATA}`.
-    dataMount: z
-      .string()
-      .max(512)
-      .regex(/^\/[^\0:]*$/u, "Use an absolute path inside the container"),
+    dataMount: appContainerPathSchema,
     databaseIds: z.array(databaseIdSchema).max(32),
     // The data directory's limit; past it, the app is stopped. Configs saved
     // before limits have none.
@@ -600,6 +644,8 @@ export const appConfigSchema = z
     // KEY=VALUE lines, as in an env file.
     environment: z.string().max(65_536),
     image: z.string().trim().max(512),
+    // Configs saved before mounts have none.
+    mounts: appMountsSchema.default([]),
     ports: z.array(appPortSchema).max(32),
     serviceLimits: appServiceLimitsSchema.default({}),
     sourceType: appSourceTypeSchema,
@@ -615,6 +661,7 @@ export const defaultAppConfig: z.infer<typeof appConfigSchema> = {
   dockerfile: "",
   environment: "",
   image: "",
+  mounts: [],
   ports: [],
   serviceLimits: {},
   sourceType: "image",
@@ -627,6 +674,15 @@ export const appDeploymentStateSchema = z.enum([
 ])
 
 // Not strict: a newer Relay may report more about its containers.
+// One thing a container mounts: a named volume by its name, a bind by its
+// path on the node, or a tmpfs, which has no source.
+export const relayAppContainerMountSchema = z.object({
+  destination: z.string(),
+  readOnly: z.boolean(),
+  source: z.string(),
+  type: z.string(),
+})
+
 export const relayAppContainerSchema = z.object({
   createdAt: z.string().datetime().nullable(),
   exitCode: z.number().int().nullable(),
@@ -635,6 +691,8 @@ export const relayAppContainerSchema = z.object({
   labels: z.record(z.string(), z.string()),
   // The memory and CPU it runs with. Absent from older Relays.
   limits: observedResourceLimitsSchema.optional(),
+  // What it mounts. Absent from older Relays.
+  mounts: z.array(relayAppContainerMountSchema).optional(),
   name: z.string().min(1),
   networks: z.array(z.string()),
   ports: z.array(appPortSchema),
@@ -2366,6 +2424,8 @@ export type RelayDatabaseDataWrite = z.infer<
 export type AppConfig = z.infer<typeof appConfigSchema>
 export type AppSourceType = z.infer<typeof appSourceTypeSchema>
 export type AppPort = z.infer<typeof appPortSchema>
+export type AppMount = z.infer<typeof appMountSchema>
+export type AppMountSource = z.infer<typeof appMountSourceSchema>
 export type AppDeploymentState = z.infer<typeof appDeploymentStateSchema>
 export type RelayApp = z.infer<typeof relayAppSchema>
 export type RelayAppContainer = z.infer<typeof relayAppContainerSchema>

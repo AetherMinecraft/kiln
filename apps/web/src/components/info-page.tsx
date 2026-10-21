@@ -85,8 +85,9 @@ export function InfoSection({
   action?: React.ReactNode
   // Left out when the header says it all, such as actions alone.
   children?: React.ReactNode
-  // Holds something other than facts, such as a drop zone.
-  content?: boolean
+  // Holds something other than facts, such as a drop zone; "flush" runs it
+  // to the section's edges, such as a table.
+  content?: boolean | "flush"
   icon?: React.ReactNode
   // Beside the title, such as a status indicator.
   status?: React.ReactNode
@@ -113,10 +114,12 @@ export function InfoSection({
           </div>
         ) : null}
       </header>
-      {children == null ? null : content ? (
+      {children == null ? null : content === "flush" ? (
+        <div className="min-w-0">{children}</div>
+      ) : content ? (
         <div className="p-4">{children}</div>
       ) : (
-        <dl className="px-4">{children}</dl>
+        <dl className="@container px-4">{children}</dl>
       )}
     </section>
   )
@@ -160,6 +163,16 @@ export function InfoFact({
       <dd className="flex min-w-0 flex-1 items-center justify-end gap-1.5 text-right">
         {children}
       </dd>
+    </div>
+  )
+}
+
+// Two InfoFacts side by side when their section has room, stacked when it
+// doesn't.
+export function InfoFactPair({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="border-b border-border/60 last:border-b-0 @lg:grid @lg:grid-cols-2 @lg:gap-x-8 [&>div]:border-b-0 @lg:[&>div]:min-w-0 @max-lg:[&>div:first-child]:border-b">
+      {children}
     </div>
   )
 }
@@ -602,6 +615,37 @@ const InfoRailLinkAnchor = React.forwardRef<
 })
 
 export const InfoRailLink = createLink(InfoRailLinkAnchor)
+
+// A rail row that opens something in place, such as a dialog, rather than a
+// page.
+export function InfoRailButton({
+  children,
+  className,
+  detail,
+  leading,
+  ...props
+}: Omit<React.ComponentPropsWithoutRef<"button">, "type"> & {
+  detail?: React.ReactNode
+  leading: React.ReactNode
+}) {
+  return (
+    <button
+      {...props}
+      type="button"
+      className={cn(
+        useInfoRailRowClassName(),
+        infoRailLinkClassName,
+        "w-full text-left",
+        className
+      )}
+    >
+      <InfoRailRowContent detail={detail} leading={leading}>
+        {children}
+      </InfoRailRowContent>
+      <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/70 transition-transform group-hover:translate-x-0.5" />
+    </button>
+  )
+}
 
 export function InfoRailCard({
   action,

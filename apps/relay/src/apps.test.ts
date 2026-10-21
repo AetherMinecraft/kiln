@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
   rm,
   truncate,
   writeFile,
@@ -29,10 +30,16 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 
 vi.mock("./command.js", () => import("./test/docker.js"))
 
+import { DockerEngine } from "./docker-engine.js"
 import { exclusive } from "./operation-lanes.js"
-import { appLifecycleLocks, appReplaceLocks } from "./operation-plans.js"
+import {
+  appLifecycleLocks,
+  appReplaceLocks,
+  controlRequestLocks,
+} from "./operation-plans.js"
 import { appRouteOwner } from "./relay-resources.js"
 import { fakeDocker } from "./test/docker.js"
+import { RelayVolumes } from "./volumes.js"
 import {
   provisioningWorker,
   relayHarness,
@@ -285,6 +292,279 @@ describe("apps", () => {
         source: join(harness.config.dataDirectory, "apps", appId),
       })
     )
+  })
+
+  it("reports what each container mounts", async () => {
+    const harness = await createdApp()
+    const image = await deploy(harness, {})
+
+    expect(image.containers[0]?.mounts).toEqual([
+      {
+        destination: "/data",
+        readOnly: false,
+        source: join(harness.config.dataDirectory, "apps", appId),
+        type: "bind",
+      },
+    ])
+
+    // A volume, by the name Docker gives it.
+    const removeCompose = await composeConfigCommand()
+    fakeDocker.images.set("redis:alpine", {})
+    fakeDocker.imageConfigs.set("redis:alpine", { Volumes: { "/data": {} } })
+    const compose = await deploy(harness, {
+      compose: "services:\n  cache:\n    image: redis:alpine\n",
+      sourceType: "compose",
+    })
+
+    expect(compose.containers[0]?.mounts).toEqual([
+      {
+        destination: "/data",
+        readOnly: false,
+        source: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        type: "volume",
+      },
+    ])
+    await removeCompose()
+  })
+
+  it("mounts the config's volumes, node paths, and files, each in the services it names", async () => {
+    const harness = await createdApp()
+    const volumeId = "3f9a21c4".padEnd(40, "0")
+    const volume = `${TEST_NAMESPACE}-kiln-3f9a21c4-media`
+    fakeDocker.addVolume({
+      labels: {
+        "kiln.relay.owner": TEST_NAMESPACE,
+        "kiln.resource.kind": "volume",
+        "kiln.volume.id": volumeId,
+      },
+      name: volume,
+    })
+    const files = join(harness.config.dataDirectory, "app-mounts", appId)
+    const mounts: AppConfig["mounts"] = [
+      {
+        id: "media0001",
+        readOnly: false,
+        service: null,
+        source: { type: "volume", volumeId },
+        target: "/media",
+      },
+      {
+        id: "certs0001",
+        readOnly: true,
+        service: null,
+        source: { path: "/etc/ssl/certs", type: "host" },
+        target: "/certs",
+      },
+      {
+        id: "config001",
+        readOnly: true,
+        service: "app",
+        source: { content: "port = 80\n", type: "file" },
+        target: "/etc/app.toml",
+      },
+    ]
+
+    const app = await deploy(harness, { mounts })
+
+    expect(app.deployment).toMatchObject({ state: "succeeded" })
+    expect(appContainers()[0]?.mounts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          destination: "/media",
+          source: volume,
+          type: "volume",
+        }),
+        expect.objectContaining({
+          destination: "/certs",
+          readOnly: true,
+          source: "/etc/ssl/certs",
+        }),
+        expect.objectContaining({
+          destination: "/etc/app.toml",
+          readOnly: true,
+          source: join(files, app.deployment!.id, "config001"),
+        }),
+      ])
+    )
+    expect(
+      await readFile(join(files, app.deployment!.id, "config001"), "utf8")
+    ).toBe("port = 80\n")
+
+    // A Compose app's mount goes only in the service it names, and the
+    // files no container mounts any longer are removed.
+    const removeCompose = await composeConfigCommand()
+    const compose = await deploy(harness, {
+      compose:
+        "services:\n  web:\n    image: nginx:alpine\n  worker:\n    image: nginx:alpine\n",
+      mounts: [{ ...mounts[1]!, service: "worker" }],
+      sourceType: "compose",
+    })
+
+    expect(compose.deployment).toMatchObject({ state: "succeeded" })
+    const mounted = (service: string) =>
+      appContainers()
+        .find((container) => container.labels["kiln.app.service"] === service)
+        ?.mounts.map((mount) => mount.destination)
+    expect(mounted("worker")).toContain("/certs")
+    expect(mounted("web")).not.toContain("/certs")
+    expect(await readdir(files)).toEqual([])
+    await removeCompose()
+  })
+
+  it("leaves the running container's files as they are until a deployment replaces it", async () => {
+    const harness = await createdApp()
+    const files = join(harness.config.dataDirectory, "app-mounts", appId)
+    const mount = (content: string) => ({
+      id: "config001",
+      readOnly: true,
+      service: null,
+      source: { content, type: "file" as const },
+      target: "/etc/app.toml",
+    })
+    const first = await deploy(harness, { mounts: [mount("port = 80\n")] })
+    const [running] = appContainers()
+    const mounted = join(files, first.deployment!.id, "config001")
+
+    // One that changes the file, and one that stops mounting it, each
+    // failing before they replace the container.
+    for (const mounts of [[mount("port = 81\n")], []]) {
+      const pull = fakeDocker.hold({ command: "pull" })
+      const deploying = deploy(harness, { mounts })
+      await pull.reached
+      expect(await readFile(mounted, "utf8")).toBe("port = 80\n")
+      pull.fail("pull access denied")
+      expect((await deploying).deployment).toMatchObject({ state: "failed" })
+      expect(appContainers().map((container) => container.id)).toEqual([
+        running!.id,
+      ])
+      expect(await readFile(mounted, "utf8")).toBe("port = 80\n")
+    }
+
+    const replaced = await deploy(harness, { mounts: [mount("port = 81\n")] })
+    expect(await readdir(files)).toEqual([replaced.deployment!.id])
+  })
+
+  it("gives a deployment within a second of the last its own name and files", async () => {
+    const harness = await createdApp()
+    const files = join(harness.config.dataDirectory, "app-mounts", appId)
+    const mount = (content: string) => ({
+      id: "config001",
+      readOnly: true,
+      service: null,
+      source: { content, type: "file" as const },
+      target: "/etc/app.toml",
+    })
+    const first = await deploy(harness, { mounts: [mount("port = 80\n")] })
+    const mounted = join(files, first.deployment!.id, "config001")
+
+    // The same second the first started in.
+    vi.useFakeTimers({
+      now: Date.parse(first.deployment!.startedAt),
+      toFake: ["Date", "setTimeout", "clearTimeout"],
+    })
+    const pull = fakeDocker.hold({ command: "pull" })
+    await harness.apps.deploy(deployment({ mounts: [mount("port = 81\n")] }))
+    await pull.reached
+    expect(await readFile(mounted, "utf8")).toBe("port = 80\n")
+    pull.fail("pull access denied")
+    const retried = await settledDeployment(harness)
+
+    expect(retried.deployment!.id > first.deployment!.id).toBe(true)
+    expect(await readFile(mounted, "utf8")).toBe("port = 80\n")
+  })
+
+  it("removes the volumes an image declares with the containers that had them", async () => {
+    const harness = await createdApp()
+    fakeDocker.images.set("redis:alpine", {})
+    fakeDocker.imageConfigs.set("redis:alpine", { Volumes: { "/data": {} } })
+
+    await deploy(harness, { image: "redis:alpine" })
+    await deploy(harness, {
+      command: "redis-server --save 60 1",
+      image: "redis:alpine",
+    })
+    expect(fakeDocker.danglingVolumes.size).toBe(0)
+
+    await harness.apps.delete({ appId, deleteData: true })
+    expect(fakeDocker.danglingVolumes.size).toBe(0)
+  })
+
+  it("keeps a volume from being deleted while a deployment that mounts it starts", async () => {
+    const harness = await createdApp()
+    const volumeId = "3f9a21c4".padEnd(40, "0")
+    const volume = `${TEST_NAMESPACE}-kiln-3f9a21c4-media`
+    fakeDocker.addVolume({
+      labels: {
+        "kiln.relay.owner": TEST_NAMESPACE,
+        "kiln.resource.kind": "volume",
+        "kiln.volume.id": volumeId,
+      },
+      name: volume,
+    })
+    const volumes = new RelayVolumes(
+      harness.config,
+      new DockerEngine(harness.config.dockerSocket),
+      harness.state
+    )
+    const pull = fakeDocker.hold({ command: "pull" })
+    const deploying = deploy(harness, {
+      mounts: [
+        {
+          id: "media0001",
+          readOnly: false,
+          service: null,
+          source: { type: "volume", volumeId },
+          target: "/media",
+        },
+      ],
+    })
+    await pull.reached
+
+    // As the control socket deletes one, in the volume's lane.
+    const locks = await controlRequestLocks(
+      "relay.volumes.delete",
+      { id: volumeId },
+      (reference) => reference
+    )
+    const deleting = Effect.runPromise(
+      harness.lanes.run(
+        { label: "relay.volumes.delete", locks: locks ?? [] },
+        volumes.delete(volumeId)
+      )
+    ).then(
+      () => null,
+      (error: unknown) => error
+    )
+    pull.release()
+
+    expect((await deploying).deployment).toMatchObject({ state: "succeeded" })
+    expect(await deleting).toBeInstanceOf(Error)
+    expect(fakeDocker.volumes.has(volume)).toBe(true)
+    expect(appContainers()[0]?.mounts).toContainEqual(
+      expect.objectContaining({ destination: "/media", source: volume })
+    )
+  })
+
+  it("fails a deployment that mounts a volume no longer on the Relay", async () => {
+    const harness = await createdApp()
+
+    const app = await deploy(harness, {
+      mounts: [
+        {
+          id: "media0001",
+          readOnly: false,
+          service: null,
+          source: { type: "volume", volumeId: "a".repeat(40) },
+          target: "/media",
+        },
+      ],
+    })
+
+    expect(app.deployment).toMatchObject({
+      error: expect.stringContaining("no longer exists"),
+      state: "failed",
+    })
+    expect(appContainers()).toEqual([])
   })
 
   it("refuses a second deployment sent while the first is starting", async () => {
