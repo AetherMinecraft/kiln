@@ -9,6 +9,7 @@ import {
 } from "better-auth/api"
 import { admin } from "better-auth/plugins/admin"
 import { emailOTP } from "better-auth/plugins/email-otp"
+import { multiSession } from "better-auth/plugins/multi-session"
 import { twoFactor } from "better-auth/plugins/two-factor"
 import { tanstackStartCookies } from "better-auth/tanstack-start"
 import { Resend } from "resend"
@@ -19,6 +20,7 @@ import { isAccountVerified } from "@/lib/account-policy"
 import { AuthCodeEmail } from "@/emails/auth-code-email"
 import { databasePool } from "@/lib/database"
 import { databaseTable, databaseTableName } from "@/lib/database-config"
+import { developmentBypassUserId } from "@/lib/development-bypass"
 import { parseDisplayName } from "@/lib/display-name"
 import {
   betterAuthSecrets,
@@ -29,6 +31,12 @@ import {
   publicSignupEnabled,
 } from "@/lib/environment"
 import { passwordConfirmation } from "@/lib/password-confirmation"
+import { browserAccountMemory } from "@/lib/browser-account-memory"
+import {
+  accountChangedMessage,
+  maximumBrowserAccounts,
+  renderedAccountHeader,
+} from "@/lib/browser-accounts"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 
 const publicUrl = kilnPublicUrl()
@@ -236,6 +244,32 @@ export const auth = betterAuth({
           message: "Use Kiln user management.",
         })
       }
+      // Browser accounts go through Kiln's server functions, which never hand
+      // another account's session token to page scripts.
+      if (context.path.startsWith("/multi-session/") && context.request) {
+        throw new APIError("NOT_FOUND")
+      }
+      // Passkey sign-in options name only the signed-in user's passkeys when
+      // a session is present, which would stop adding another account by
+      // passkey. Signing in never needs the current session, so leave it out
+      // before any check below loads and caches it.
+      if (context.path === "/passkey/generate-authenticate-options") {
+        // Better Auth merges hook headers into the request's, so blank the
+        // cookie rather than deleting it.
+        return { context: { headers: new Headers({ cookie: "" }) } }
+      }
+      // A tab that has not yet followed an account switch must not act as
+      // the account the shared cookie now belongs to.
+      const renderedAccount = context.request?.headers.get(
+        renderedAccountHeader
+      )
+      if (
+        renderedAccount &&
+        renderedAccount !== developmentBypassUserId &&
+        ((await getSessionFromCtx(context))?.user.id ?? "") !== renderedAccount
+      ) {
+        throw new APIError("CONFLICT", { message: accountChangedMessage })
+      }
 
       const onboardingPaths = new Set([
         "/get-session",
@@ -250,6 +284,11 @@ export const auth = betterAuth({
         "/email-otp/reset-password",
         "/request-password-reset",
         "/reset-password",
+        // A disabled or unverified account can still switch to another.
+        "/multi-session/list-device-sessions",
+        "/multi-session/set-active",
+        "/multi-session/revoke",
+        "/multi-session/remember-active",
       ])
       if (!onboardingPaths.has(context.path)) {
         const session = await getSessionFromCtx(context)
@@ -365,6 +404,8 @@ export const auth = betterAuth({
       },
     }),
     passwordConfirmation(),
+    multiSession({ maximumSessions: maximumBrowserAccounts }),
+    browserAccountMemory(),
     tanstackStartCookies(),
   ],
 })
