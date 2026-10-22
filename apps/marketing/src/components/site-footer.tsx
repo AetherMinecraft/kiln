@@ -1,5 +1,6 @@
 import type * as React from "react"
 import { Link } from "@tanstack/react-router"
+import { DEFAULT_KILN_GIT_REPO } from "@workspace/contracts"
 
 import { socialLinks } from "@/lib/social-links"
 
@@ -22,7 +23,17 @@ export function SiteFooter() {
             <span className="font-semibold tracking-[-0.04em]">Kiln</span>
           </div>
           <p className="type-support mt-3 text-muted-foreground">
-            Free and open source under AGPL-3.0. Made by QuartzDev.
+            Free and open source under{" "}
+            <a
+              href={`${DEFAULT_KILN_GIT_REPO}/blob/main/LICENSE`}
+              className="underline underline-offset-4 transition-colors hover:text-foreground"
+              {...newTab}
+            >
+              AGPL-3.0
+            </a>
+            .
+            <br />
+            Made by QuartzDev.
           </p>
         </div>
 
@@ -61,10 +72,10 @@ export function SiteFooter() {
           </FooterGroup>
           <FooterGroup title="Legal">
             <FooterLink>
-              <a href={new URL("/terms", hearthUrl).toString()}>Terms</a>
+              <Link to="/terms">Terms</Link>
             </FooterLink>
             <FooterLink>
-              <a href={new URL("/privacy", hearthUrl).toString()}>Privacy</a>
+              <Link to="/privacy">Privacy</Link>
             </FooterLink>
           </FooterGroup>
         </div>
