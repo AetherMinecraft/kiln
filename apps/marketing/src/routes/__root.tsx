@@ -16,6 +16,7 @@ import { SiteFooter } from "~/components/site-footer"
 import { SiteHeader } from "~/components/site-header"
 import { siteName } from "~/lib/seo"
 import { getSiteConfig } from "~/lib/site-config"
+import { useSiteConfig } from "~/lib/use-site-config"
 
 export const Route = createRootRoute({
   loader: () => getSiteConfig(),
@@ -56,10 +57,19 @@ export const Route = createRootRoute({
 })
 
 function RootDocument({ children }: { children: ReactNode }) {
+  const { analytics } = useSiteConfig()
+
   return (
     <html lang="en" className="dark">
       <head>
         <HeadContent />
+        {analytics && (
+          <script
+            defer
+            src={analytics.scriptUrl}
+            data-website-id={analytics.websiteId}
+          />
+        )}
       </head>
       <body className="min-h-dvh antialiased">
         {children}
