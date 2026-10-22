@@ -22,6 +22,12 @@ import {
   PopoverTrigger,
 } from "@workspace/ui/components/popover"
 import {
+  Drawer,
+  DrawerContent,
+  DrawerTitle,
+  DrawerTrigger,
+} from "@workspace/ui/components/drawer"
+import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
@@ -1122,11 +1128,14 @@ const InstanceSelector = React.memo(function InstanceSelector({
     [selectedKey]
   )
   const instance = selection.kind === "server" ? selection.instance : null
+  // On phones the picker opens as a drawer from the bottom instead.
+  const PickerRoot = isMobile ? Drawer : Popover
+  const PickerTrigger = isMobile ? DrawerTrigger : PopoverTrigger
 
   return (
     <SidebarMenuItem>
-      <Popover open={open} onOpenChange={handleOpenChange}>
-        <PopoverTrigger asChild>
+      <PickerRoot open={open} onOpenChange={handleOpenChange}>
+        <PickerTrigger asChild>
           <SidebarMenuButton
             size="lg"
             tooltip={
@@ -1204,23 +1213,36 @@ const InstanceSelector = React.memo(function InstanceSelector({
             )}
             <ChevronsUpDown className="ml-auto size-3.5! text-sidebar-foreground/60 group-data-[collapsible=icon]:hidden" />
           </SidebarMenuButton>
-        </PopoverTrigger>
-        <PopoverContent
-          aria-label="Instances"
-          side={isMobile ? "bottom" : "right"}
-          align="start"
-          sideOffset={6}
-          className="w-72 max-w-[calc(100vw-1rem)] overflow-hidden p-0"
-          onCloseAutoFocus={handleCloseAutoFocus}
-        >
-          <SidebarInstancePicker
-            capabilities={capabilities}
-            selectedKeys={selectedKeys}
-            onNavigate={closePicker}
-            onSelect={selectInstance}
-          />
-        </PopoverContent>
-      </Popover>
+        </PickerTrigger>
+        {isMobile ? (
+          <DrawerContent onCloseAutoFocus={handleCloseAutoFocus}>
+            <DrawerTitle className="sr-only">Switch instance</DrawerTitle>
+            <SidebarInstancePicker
+              capabilities={capabilities}
+              searchPlacement="bottom"
+              selectedKeys={selectedKeys}
+              onNavigate={closePicker}
+              onSelect={selectInstance}
+            />
+          </DrawerContent>
+        ) : (
+          <PopoverContent
+            aria-label="Instances"
+            side="right"
+            align="start"
+            sideOffset={6}
+            className="w-72 max-w-[calc(100vw-1rem)] overflow-hidden p-0"
+            onCloseAutoFocus={handleCloseAutoFocus}
+          >
+            <SidebarInstancePicker
+              capabilities={capabilities}
+              selectedKeys={selectedKeys}
+              onNavigate={closePicker}
+              onSelect={selectInstance}
+            />
+          </PopoverContent>
+        )}
+      </PickerRoot>
     </SidebarMenuItem>
   )
 })
@@ -1278,11 +1300,13 @@ const SidebarInstancePicker = React.memo(function SidebarInstancePicker({
   capabilities,
   onNavigate,
   onSelect,
+  searchPlacement,
   selectedKeys,
 }: {
   capabilities: NavigationAccessCapabilities
   onNavigate: () => void
   onSelect: (item: InstancePickerItem) => void
+  searchPlacement?: "bottom" | "top"
   selectedKeys: ReadonlySet<string>
 }) {
   const destinations = accessibleInfrastructureDestinations(capabilities)
@@ -1342,6 +1366,7 @@ const SidebarInstancePicker = React.memo(function SidebarInstancePicker({
       ariaLabel="Instances"
       emptyMessage="No managed instances"
       items={items}
+      searchPlacement={searchPlacement}
       selectedKeys={selectedKeys}
       viewAll
       onNavigate={onNavigate}
