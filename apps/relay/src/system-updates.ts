@@ -114,13 +114,23 @@ export class SystemUpdateManager {
   // so `status` doesn't take its absence for a helper that stopped.
   readonly #starting = new Set<string>()
 
-  constructor(config: {
-    dataDirectory: string
-    dockerSocket?: string
-    gitRepository?: string
-    installationId?: string | null
-    installationIdConfigured?: boolean
-  }) {
+  // Why a container may not be updated now, such as a Hearth held stopped
+  // for an offline restore; null when it may.
+  readonly #refuseTarget: (container: string) => Effect.Effect<string | null>
+
+  constructor(
+    config: {
+      dataDirectory: string
+      dockerSocket?: string
+      gitRepository?: string
+      installationId?: string | null
+      installationIdConfigured?: boolean
+    },
+    options: {
+      refuseTarget?: (container: string) => Effect.Effect<string | null>
+    } = {}
+  ) {
+    this.#refuseTarget = options.refuseTarget ?? (() => Effect.succeed(null))
     this.#engine = new DockerEngine(
       config.dockerSocket ?? "/var/run/docker.sock"
     )
@@ -231,6 +241,14 @@ export class SystemUpdateManager {
             ),
           { concurrency: "unbounded" }
         )
+        for (const target of preparedTargets) {
+          const refusal = yield* this.#refuseTarget(
+            target.operation.targetContainer
+          )
+          if (refusal) {
+            return yield* systemUpdateFailure("start.validate", refusal)
+          }
+        }
         const prepared = preparedTargets.sort((left, right) =>
           left.operation.component === right.operation.component
             ? 0
@@ -252,6 +270,14 @@ export class SystemUpdateManager {
           )
 
         return yield* Effect.gen({ self: this }, function* () {
+          // Again now the targets are locked: maintenance may have begun
+          // since the check above, and it takes the same locks to hold Hearth.
+          for (const operation of operations) {
+            const refusal = yield* this.#refuseTarget(operation.targetContainer)
+            if (refusal) {
+              return yield* systemUpdateFailure("start.validate", refusal)
+            }
+          }
           // Recorded before the images are pulled, which can take minutes,
           // so a Relay restarted meanwhile still knows about them.
           yield* Effect.forEach(
@@ -1058,9 +1084,14 @@ function releaseImageComponent(
   return null
 }
 
-function acquireTargetLockEffect(
+/**
+ * Takes `updates/<container>.lock` for `operation`. A Relay in platform mode
+ * takes the same lock, by the same protocol, while it changes one of Kiln's
+ * services (platform.ts), so the two never act on a container at once.
+ */
+export function acquireTargetLockEffect(
   directory: string,
-  operation: UpdateOperation
+  operation: Pick<UpdateOperation, "id" | "targetContainer">
 ): Effect.Effect<void, RelaySystemUpdateError> {
   const path = targetLockPath(directory, operation.targetContainer)
   return Effect.suspend(() => {
@@ -1099,7 +1130,11 @@ function acquireTargetLockEffect(
               }
               return yield* systemUpdateFailure(
                 "lock.acquire",
-                `An update is starting for ${operation.targetContainer}`
+                // A Relay in platform mode holds it while it repairs or
+                // restarts one of Kiln's services (platform.ts).
+                existingId.startsWith("platform-")
+                  ? `Kiln is repairing ${operation.targetContainer}; try again in a moment`
+                  : `An update is starting for ${operation.targetContainer}`
               )
             }
             if (existing.status === "running") {
@@ -1143,7 +1178,7 @@ function lockIsOrphanedEffect(
   )
 }
 
-function releaseTargetLockEffect(
+export function releaseTargetLockEffect(
   directory: string,
   targetContainer: string,
   operationId: string
