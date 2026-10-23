@@ -1,5 +1,6 @@
 import { assert, layer } from "@effect/vitest"
 import { Effect } from "effect"
+import { SqlClient } from "effect/sql"
 import * as TestClock from "effect/testing/TestClock"
 
 import {
@@ -12,6 +13,7 @@ import {
   updateInstanceSourceNameEffect,
   updateInstanceDirectoryEffect,
 } from "@/lib/instance-registry"
+import { databaseTableName } from "@/lib/database-config"
 import type { DirectoryInstance } from "@/lib/instance-directory"
 import { listInstanceDirectoryEffect } from "@/lib/instance-directory"
 import { TestDatabase, describeMysql, resetDatabase } from "@/test/database"
@@ -279,13 +281,109 @@ describeMysql("instance registry", () => {
         yield* seedRelay
         yield* recordCreatedInstanceEffect(
           "relay-one",
-          server({ id: "cli-server", name: "From the CLI" })
+          server({ id: "cli-server", name: "From the CLI" }),
+          "user-one"
         )
         assert.deepStrictEqual(
           (yield* listInstanceDirectoryEffect()).map((row) => row.name),
           ["From the CLI"]
         )
       })
+    )
+
+    it.effect(
+      "gives a server to the person who created it even if a snapshot recorded it first",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertRelay("relay-race", { created_by: "relay-owner" })
+          const created = server({ id: "cli-server", name: "From the CLI" })
+          // A snapshot read after the create lands first: the Relay's owner
+          // holds it until Hearth records who made it.
+          yield* syncInstanceRegistryEffect("relay-race", [created])
+          assert.strictEqual(
+            (yield* instances)["cli-server"]?.ownerId,
+            "relay-owner"
+          )
+
+          yield* recordCreatedInstanceEffect("relay-race", created, "user-one")
+
+          assert.strictEqual(
+            (yield* instances)["cli-server"]?.ownerId,
+            "user-one"
+          )
+          // The stand-in's sessions on it end: their Relay hears of it.
+          const deliveries = yield* selectRows<{
+            subject_id: string
+            scope_id: string
+          }>("authorization_delivery")
+          assert.deepEqual(
+            deliveries.map(({ subject_id, scope_id }) => [subject_id, scope_id]),
+            [["relay-owner", "cli-server"]]
+          )
+        })
+    )
+
+    it.effect("reserves servers being provisioned at the same time", () =>
+      Effect.gen(function* () {
+        yield* seedRelay
+        yield* Effect.all(
+          ["a", "b", "c", "d"].map((id) =>
+            reservePreparedInstanceEffect(
+              "relay-one",
+              { id: id.repeat(40) },
+              `user-${id}`
+            )
+          ),
+          { concurrency: "unbounded" }
+        )
+        const owners = yield* instances
+        for (const id of ["a", "b", "c", "d"])
+          assert.strictEqual(owners[id.repeat(40)]?.ownerId, `user-${id}`)
+      })
+    )
+
+    it.effect(
+      "gives a server to its creator even if its Relay changed hands first",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertRelay("relay-race", { created_by: "relay-owner" })
+          const created = server({ id: "cli-server", name: "From the CLI" })
+          yield* syncInstanceRegistryEffect("relay-race", [created])
+          const sql = yield* SqlClient.SqlClient
+          yield* sql`UPDATE ${sql(databaseTableName("relay"))} SET created_by = 'next-owner' WHERE id = 'relay-race'`
+
+          yield* recordCreatedInstanceEffect("relay-race", created, "user-one")
+
+          assert.strictEqual(
+            (yield* instances)["cli-server"]?.ownerId,
+            "user-one"
+          )
+        })
+    )
+
+    it.effect(
+      "keeps an owner the server was transferred to before its creator was recorded",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertRelay("relay-race", { created_by: "relay-owner" })
+          const created = server({ id: "cli-server", name: "From the CLI" })
+          yield* syncInstanceRegistryEffect("relay-race", [created])
+          const sql = yield* SqlClient.SqlClient
+          // As a transfer writes it.
+          yield* sql`UPDATE ${sql(databaseTableName("instance"))} SET owner_id = 'recipient', owner_provisional = 0 WHERE instance_id = 'cli-server'`
+
+          yield* recordCreatedInstanceEffect("relay-race", created, "user-one")
+          // A retried record changes nothing either.
+          yield* recordCreatedInstanceEffect("relay-race", created, "user-one")
+
+          assert.strictEqual(
+            (yield* instances)["cli-server"]?.ownerId,
+            "recipient"
+          )
+        })
     )
 
     it.effect(
@@ -324,7 +422,8 @@ describeMysql("instance registry", () => {
           const lobby = server({ id: "lobby", name: "Lobby" })
           yield* recordCreatedInstanceEffect(
             "relay-startup-create",
-            server({ id: "fresh", name: "Fresh" })
+            server({ id: "fresh", name: "Fresh" }),
+            "user-one"
           )
           yield* syncInstanceRegistryEffect("relay-startup-create", [lobby])
           assert.deepStrictEqual(Object.keys(yield* instances).sort(), [
@@ -355,7 +454,8 @@ describeMysql("instance registry", () => {
           )
           yield* recordCreatedInstanceEffect(
             "relay-notify",
-            server({ id: "cli-server", name: "From the CLI" })
+            server({ id: "cli-server", name: "From the CLI" }),
+            "user-one"
           )
           yield* removeDeletedInstanceEffect("relay-notify", "cli-server")
           assert.deepStrictEqual(changed, ["relay-notify", "relay-notify"])

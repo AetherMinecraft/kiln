@@ -1,7 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
-import { relayAuditRecordSchema, relayIdSchema } from "@workspace/contracts"
+import {
+  appIdSchema,
+  permissionScopeTypeSchema,
+  relayAuditRecordSchema,
+  relayIdSchema,
+} from "@workspace/contracts"
 import { Effect } from "effect"
 import type { RowDataPacket } from "mysql2/promise"
 import { Resend } from "resend"
@@ -29,9 +34,12 @@ import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { getCurrentUser, requireEligibleResourceUser } from "@/server/auth"
 import {
-  instanceScope,
-  resolveScopeAuthorization,
-} from "@/lib/scope-authorization.server"
+  claimInstanceOwner,
+  claimInstanceOwnerEffect,
+  wakeDisplacedOwnerDelivery,
+} from "@/lib/instance-registry"
+import { resolveScopeAuthorization } from "@/lib/scope-authorization.server"
+import { transferAppOwnershipHandler } from "@/server/app-access"
 import {
   isAccountEnabled,
   isAccountVerified,
@@ -43,16 +51,15 @@ import {
   cancelPlatformInvitationEffect,
   assignPlatformAccessEffect,
   removePlatformAccessEffect,
-  transferInstanceOwnershipEffect,
+  transferResourceOwnershipEffect,
 } from "@/lib/platform-access"
 
 const tokenSchema = z.object({ token: z.string().min(32).max(256) })
 const accessTypeSchema = z.enum(["platform_admin", "relay_creator", "scoped"])
-const instanceScopeSchema = z.object({
-  instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+const transferResourceOwnershipSchema = z.object({
   relayId: relayIdSchema,
-})
-const transferInstanceOwnershipSchema = instanceScopeSchema.extend({
+  resourceType: permissionScopeTypeSchema,
+  resourceId: z.string().min(1).max(64),
   userId: z.string().min(1).max(36),
 })
 const accessAssignmentSchema = z.discriminatedUnion("accessType", [
@@ -132,6 +139,7 @@ interface ExistingAccessUserRow extends RowDataPacket {
 
 interface InstanceOwnerRow extends RowDataPacket {
   owner_id: string | null
+  owner_provisional?: number
 }
 
 export const getAccessCapabilities = createServerFn({ method: "GET" }).handler(
@@ -501,23 +509,30 @@ export const removePlatformAccess = createServerFn({ method: "POST" })
     return result
   })
 
-export const transferInstanceOwnership = createServerFn({ method: "POST" })
-  .validator(transferInstanceOwnershipSchema)
+export const transferResourceOwnership = createServerFn({ method: "POST" })
+  .validator(transferResourceOwnershipSchema)
   .handler(async ({ data }) => {
     const user = await requireEligibleResourceUser()
     const relay = await requiredRelay(data.relayId)
+    if (data.resourceType === "relay" && data.resourceId !== relay.id)
+      throw new Error("Resource not found")
     // Authorize before resolving ownership: that lookup may call the Relay
     // and backfill owner_id, which no unprivileged caller should trigger.
-    const authorization = await resolveScopeAuthorization({
-      user,
-      scope: instanceScope(relay.id, data.instanceId),
-    })
-    authorization.require("access.manage")
-    await instanceOwnerId(relay, data.instanceId)
+    // Apps have no people of their own; the transfer itself admits only an
+    // administrator or the app's owner.
+    if (data.resourceType !== "app") {
+      const authorization = await resolveScopeAuthorization({
+        user,
+        scope: data,
+      })
+      authorization.require("access.manage")
+    }
+    if (data.resourceType === "instance")
+      await instanceOwnerId(relay, data.resourceId)
 
     const result = await runAppEffect(
-      "access.instance.transferOwnership",
-      transferInstanceOwnershipEffect(user, data)
+      "access.resource.transferOwnership",
+      transferResourceOwnershipEffect(user, data)
     )
     publishAccessPolicyChange(
       [result.previousOwnerId, data.userId].filter(
@@ -527,6 +542,28 @@ export const transferInstanceOwnership = createServerFn({ method: "POST" })
       relay.id
     )
     return { transferred: result.transferred }
+  })
+
+const transferAppOwnershipSchema = z.object({
+  appId: appIdSchema,
+  email: z.email().transform((value) => value.trim().toLowerCase()),
+  relayId: relayIdSchema,
+})
+
+export const transferAppOwnership = createServerFn({ method: "POST" })
+  .validator(transferAppOwnershipSchema)
+  .handler(async ({ data }) => {
+    const user = await requireEligibleResourceUser()
+    await requiredRelay(data.relayId)
+    const result = await transferAppOwnershipHandler(user, data)
+    publishAccessPolicyChange(
+      [result.previousOwnerId, result.userId].filter(
+        (userId): userId is string => userId !== null
+      ),
+      false,
+      data.relayId
+    )
+    return { transferred: true }
   })
 
 export const revokeAccessInvitation = createServerFn({ method: "POST" })
@@ -623,24 +660,41 @@ async function instanceOwnerId(
   instanceId: string
 ): Promise<string | null> {
   const [persistedRows] = await databasePool.query<Array<InstanceOwnerRow>>(
-    `SELECT owner_id FROM ${databaseTable("instance")}
+    `SELECT owner_id, owner_provisional FROM ${databaseTable("instance")}
       WHERE relay_id = ? AND instance_id = ? LIMIT 1`,
     [relay.id, instanceId]
   )
-  const persistedOwnerId = persistedRows[0]?.owner_id
-  if (persistedOwnerId) return persistedOwnerId
+  const persisted = persistedRows[0]
+  // The Relay's owner stands in until its audit log names who made it.
+  if (persisted?.owner_id && !persisted.owner_provisional)
+    return persisted.owner_id
 
   const initialOwnerId = await instanceInitialOwnerId(relay, instanceId)
-  if (!initialOwnerId) return null
+  if (!initialOwnerId) return persisted?.owner_id ?? null
 
   const now = Date.now()
-  await databasePool.execute(
-    `INSERT INTO ${databaseTable("instance")}
-       (relay_id, instance_id, display_name, owner_id, created_at, updated_at)
-     VALUES (?, ?, NULL, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE owner_id = COALESCE(owner_id, VALUES(owner_id)),
-       updated_at = VALUES(updated_at)`,
-    [relay.id, instanceId, initialOwnerId, now, now]
+  await runAppEffect(
+    "access.instance.claimOwner",
+    Effect.gen(function* () {
+      const database = yield* Database
+      const displaced = yield* database.transaction(
+        "access.instance.claimOwner",
+        (tx) =>
+          claimInstanceOwnerEffect(
+            tx,
+            { instanceId, ownerId: initialOwnerId, relayId: relay.id },
+            tx.execute(
+              `INSERT INTO ${databaseTable("instance")}
+                 (relay_id, instance_id, display_name, owner_id, created_at, updated_at)
+               VALUES (?, ?, NULL, ?, ?, ?)
+               ON DUPLICATE KEY UPDATE ${claimInstanceOwner},
+                 updated_at = VALUES(updated_at)`,
+              [relay.id, instanceId, initialOwnerId, now, now]
+            )
+          )
+      )
+      yield* wakeDisplacedOwnerDelivery(displaced)
+    })
   )
   const [resolvedRows] = await databasePool.query<Array<InstanceOwnerRow>>(
     `SELECT owner_id FROM ${databaseTable("instance")}
