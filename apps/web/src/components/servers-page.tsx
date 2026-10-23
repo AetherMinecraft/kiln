@@ -63,6 +63,10 @@ import {
   DataTableToolbar,
   DataTableWorkspace,
 } from "@/components/data-table-workspace"
+import {
+  AddFirstRelayButton,
+  useAwaitingFirstRelay,
+} from "@/components/relay/pair-first-relay"
 import { DataTable } from "@/components/data-table-view"
 import { InstanceCard, InstanceStatus } from "@/components/instance-card"
 import { statusColumnWidth } from "@/components/instance-name-presentation"
@@ -715,10 +719,13 @@ function EmptyServerTable({
   dialogStore: AddServerDialogStore
   searchActive: boolean
 }) {
+  const awaitingFirstRelay = useAwaitingFirstRelay()
   return (
     <DataTableEmptyState
       action={
-        !searchActive && canProvision ? (
+        searchActive ? null : awaitingFirstRelay ? (
+          <AddFirstRelayButton />
+        ) : canProvision ? (
           <Button type="button" size="sm" onClick={dialogStore.open}>
             <Plus /> Add Game Server
           </Button>
@@ -728,9 +735,11 @@ function EmptyServerTable({
         <span className="block max-w-sm">
           {searchActive
             ? "Try a game server name, short ID, Relay, address, game, implementation, or version."
-            : canProvision
-              ? "Provision the first game server managed by Hearth."
-              : "No game servers have been assigned to your account yet."}
+            : awaitingFirstRelay
+              ? "Pair a Relay to start hosting game servers."
+              : canProvision
+                ? "Provision the first game server managed by Hearth."
+                : "No game servers have been assigned to your account yet."}
         </span>
       }
       icon={<ServerKindIcon className="size-6" />}
