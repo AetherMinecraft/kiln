@@ -1,8 +1,11 @@
 import { RelayKindIcon } from "@/components/instance-kind-icon"
 import {
+  PendingInvitationCard,
   PendingResourceInvitations,
   PendingResourceInvitationBadge,
+  pendingRowDetailClassName,
   resourceInvitationScopeKey,
+  type PendingInvitationCells,
 } from "@/components/pending-resource-invitations"
 import * as React from "react"
 import { useLiveSuspenseQuery } from "@tanstack/react-db"
@@ -96,8 +99,11 @@ import {
 import { IdentityName } from "@/components/identity-name"
 import { InstanceCard, InstanceStatus } from "@/components/instance-card"
 import { statusColumnWidth } from "@/components/instance-name-presentation"
-import { RelayMemoryCell } from "@/components/relay-memory-cell"
-import { UserAvatar } from "@/components/account-avatar"
+import {
+  RelayMemoryCell,
+  RelayMemoryValue,
+} from "@/components/relay-memory-cell"
+import { UserIdentity } from "@/components/user-identity"
 import { relaysCollectionOptions } from "@/lib/collections/relays"
 import {
   minecraftUsernameKey,
@@ -105,6 +111,10 @@ import {
   selectOwnerProfileIds,
 } from "@/lib/minecraft-profile"
 import { relayAddress } from "@/lib/relay-route"
+import {
+  myInvitationsQueryOptions,
+  type ResourceInvitation,
+} from "@/lib/resource-invitation-query"
 import {
   accessCapabilitiesQueryOptions,
   queryKeys,
@@ -402,7 +412,14 @@ const FilteredRelayTable = React.memo(function FilteredRelayTable({
           useTls: relay.useTls,
         })),
   })
-  const ownerNames = React.useMemo(() => relayOwnerNamesKey(data), [data])
+  const { data: invitedOwners = noInvitedOwners } = useQuery({
+    ...myInvitationsQueryOptions(),
+    select: selectInvitedOwners,
+  })
+  const ownerNames = React.useMemo(
+    () => relayOwnerNamesKey([...data, ...invitedOwners]),
+    [data, invitedOwners]
+  )
   const source = useInfraTableSource({ rows: data, reference: relayReference })
 
   return (
@@ -677,6 +694,8 @@ function RelayTable({
     <DataTable
       leadingBody={
         <PendingResourceInvitations
+          cells={relayPendingCells}
+          columns={definition.columns}
           resourceType="relay"
           visibleResourceKeys={visibleResourceKeys}
           searchStore={searchStore}
@@ -771,26 +790,58 @@ const RelayEditButton = React.memo(function RelayEditButton({
   )
 })
 
+const noInvitedOwners: ReadonlyArray<{ ownerName: string | null }> = []
+// Owners only, so a pending Relay's new memory reading doesn't re-render the
+// table.
+const selectInvitedOwners = (invitations: Array<ResourceInvitation>) =>
+  invitations.flatMap((invitation) =>
+    invitation.relay ? [{ ownerName: invitation.relay.ownerName }] : []
+  )
+
+// A pending Relay shows what its row will once accepted.
+const relayPendingCells: PendingInvitationCells = {
+  relay: (invitation) => <PendingInvitationCard invitation={invitation} />,
+  memory: (invitation) => (
+    <span className={pendingRowDetailClassName}>
+      <RelayMemoryValue memory={invitation.relay?.memory} />
+    </span>
+  ),
+  host: ({ relay }) =>
+    relay ? (
+      <DataTableTextCell
+        className={pendingRowDetailClassName}
+        monospace
+        title={relayAddress(relay)}
+        value={relay.hostname}
+      />
+    ) : null,
+  owner: ({ relay }) =>
+    relay ? (
+      <RelayOwnerCell
+        ownerEmail={relay.ownerEmail}
+        ownerName={relay.ownerName}
+      />
+    ) : null,
+}
+
 const RelayOwnerCell = React.memo(function RelayOwnerCell({
   ownerEmail,
   ownerName,
 }: Pick<RelayTableItem, "ownerEmail" | "ownerName">) {
   const profileIds = React.useContext(RelayOwnerProfileIdsContext)
-  return (
+  return ownerName ? (
+    <UserIdentity
+      className="w-full"
+      emailClassName={pendingRowDetailClassName}
+      email={ownerEmail}
+      name={ownerName}
+      profileId={profileIds.get(minecraftUsernameKey(ownerName))}
+    />
+  ) : (
     <IdentityName
-      icon={
-        ownerName ? (
-          <UserAvatar
-            name={ownerName}
-            profileId={profileIds.get(minecraftUsernameKey(ownerName))}
-          />
-        ) : (
-          <UserRound className="size-4" aria-hidden="true" />
-        )
-      }
+      icon={<UserRound className="size-4" aria-hidden="true" />}
       iconClassName="border-0 bg-transparent"
-      meta={ownerEmail}
-      name={ownerName ?? "Unassigned"}
+      name="Unassigned"
     />
   )
 })
