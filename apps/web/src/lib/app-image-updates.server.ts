@@ -1,3 +1,4 @@
+import type { RowDataPacket } from "mysql2/promise"
 import {
   relayAppImageCheckResultsSchema,
   relayAppImageUpdatesV1Feature,
@@ -13,6 +14,7 @@ import {
   recordAppImageCheckEffect,
   type AppImageUpdate,
 } from "@/effect/app-image-updates"
+import { Database } from "@/effect/database"
 import { ExternalServiceError } from "@/effect/errors"
 import {
   listRelayAppConfigsEffect,
@@ -20,9 +22,12 @@ import {
 } from "@/effect/managed-apps"
 import {
   notifyUsersEffect,
+  openSourceKeysEffect,
   publishNotificationChange,
+  resolveNotificationsEffect,
 } from "@/effect/notifications"
 import { forkAppWorker } from "@/effect/runtime"
+import { databaseTable } from "@/lib/database-config"
 import {
   enqueueAppDeployment,
   publishAppDeploymentChange,
@@ -93,11 +98,12 @@ const stillChecked = Effect.fnUntraced(function* (
 })
 
 // Tells everyone who can deploy the app about an image they haven't heard
-// of, unless it was skipped.
+// of, unless it was skipped. Whoever asked for the check sees what it found.
 const announce = Effect.fnUntraced(function* (
   relay: PersistedRelay,
   name: string,
-  update: AppImageUpdate
+  update: AppImageUpdate,
+  actorUserId: string | null
 ) {
   const digest = update.latestDigest
   if (
@@ -125,9 +131,66 @@ const announce = Effect.fnUntraced(function* (
         relayId: relay.id,
         type: "app",
       },
-    }
+    },
+    { actorUserId }
   )
   if (delivered > 0) publishNotificationChange(recipients)
+})
+
+function imageUpdateSourceKeyPrefix(appId: string) {
+  return `app.image-update:${appId}:`
+}
+
+/**
+ * Clears an app's update notifications that no longer offer anything: all
+ * but the update Kiln has on offer now, read under the lock its checks take,
+ * so a check that finished first can't clear a newer one another Hearth just
+ * announced. `installedDigest` was just deployed, so it's no longer on offer;
+ * `unchecked` means the app no longer checks for updates, so none is.
+ */
+export const resolveAppImageUpdateNotificationsEffect = Effect.fn(
+  "Apps.imageUpdates.resolveNotifications"
+)(function* (
+  appId: string,
+  settled: { installedDigest?: string; unchecked?: boolean } = {}
+) {
+  const database = yield* Database
+  const prefix = imageUpdateSourceKeyPrefix(appId)
+  const resolved = yield* database.transaction(
+    "Apps.imageUpdates.resolveNotifications",
+    () =>
+      Effect.gen(function* () {
+        const [offer] = yield* database.queryRows<
+          RowDataPacket & {
+            latest_digest: string | null
+            mode: string
+            skipped_digest: string | null
+            state: string | null
+          }
+        >(
+          "Apps.imageUpdates.offer",
+          `SELECT state, mode, latest_digest, skipped_digest
+             FROM ${databaseTable("app_image_update")}
+            WHERE app_id = ?
+              FOR UPDATE`,
+          [appId]
+        )
+        const offered =
+          !settled.unchecked &&
+          offer?.state === "available" &&
+          offer.mode !== "off" &&
+          offer.latest_digest !== offer.skipped_digest &&
+          offer.latest_digest !== settled.installedDigest
+            ? offer.latest_digest
+            : null
+        const open = yield* openSourceKeysEffect("app.image-update", prefix)
+        return yield* resolveNotificationsEffect(
+          "app.image-update",
+          open.filter((key) => key !== `${prefix}${offered}`)
+        )
+      })
+  )
+  publishNotificationChange(resolved)
 })
 
 // A registry that keeps failing fails every hour, so only a new failure
@@ -158,7 +221,8 @@ const reportFailure = (
 // off.
 const checkAppImagesEffect = Effect.fnUntraced(function* (
   relay: PersistedRelay,
-  onlyAppId?: string
+  onlyAppId?: string,
+  actorUserId: string | null = null
 ) {
   const lock = locks.get(relay.id) ?? Semaphore.makeUnsafe(1)
   locks.set(relay.id, lock)
@@ -179,6 +243,15 @@ const checkAppImagesEffect = Effect.fnUntraced(function* (
           (updates.get(app.appId)?.mode ?? defaultAppImageUpdatePolicy.mode) !==
           "off"
       )
+      // An app checked on its own that no longer checks, as one now pinned
+      // to a digest or deployed from elsewhere, has no update on offer.
+      if (
+        onlyAppId !== undefined &&
+        !due.some((app) => app.appId === onlyAppId)
+      )
+        yield* resolveAppImageUpdateNotificationsEffect(onlyAppId, {
+          unchecked: true,
+        })
       let changed = false
       for (let start = 0; start < due.length; start += batchSize) {
         const batch = due.slice(start, start + batchSize)
@@ -231,8 +304,11 @@ const checkAppImagesEffect = Effect.fnUntraced(function* (
           changed ||= recorded.changed
           yield* reportFailure(relay.id, app.appId, recorded.update)
           if (recorded.newlySeen) {
-            yield* announce(relay, app.name, recorded.update)
+            yield* announce(relay, app.name, recorded.update, actorUserId)
           }
+          // An update that's gone, skipped, or replaced by a newer image no
+          // longer needs anyone's attention.
+          yield* resolveAppImageUpdateNotificationsEffect(app.appId)
           const at = autoUpdateAt(recorded.update)
           if (at !== null && at <= (yield* Clock.currentTimeMillis)) {
             enqueueAppDeployment(app.appId, relay.id, "update")
@@ -298,26 +374,33 @@ function checksImages(relay: PersistedRelay): boolean {
  * answers what Kiln knows of its updates after.
  */
 export const checkAppImageEffect = Effect.fn("Apps.imageUpdates.checkApp")(
-  function* (relay: PersistedRelay, appId: string) {
+  function* (relay: PersistedRelay, appId: string, actorUserId: string | null) {
     if (!checksImages(relay)) {
       return yield* Effect.fail(
         new Error("Update this Relay to check apps for image updates")
       )
     }
-    yield* checkAppImagesEffect(relay, appId)
+    yield* checkAppImagesEffect(relay, appId, actorUserId)
     const updates = yield* loadAppImageUpdatesEffect([appId])
     return updates.get(appId) ?? null
   }
 )
 
-/** Checks again after an image app deploys, so it shows what it runs. */
-export function recheckAppImage(relayId: string, appId: string): void {
+/**
+ * Checks again after an image app deploys, so it shows what it runs, or
+ * after someone (`actorUserId`) changed how it updates.
+ */
+export function recheckAppImage(
+  relayId: string,
+  appId: string,
+  actorUserId: string | null
+): void {
   forkAppWorker(
     Effect.gen(function* () {
       const relays = yield* listPersistedRelaysEffect()
       const relay = relays.find((item) => item.id === relayId)
       if (relay && checksImages(relay)) {
-        yield* checkAppImagesEffect(relay, appId)
+        yield* checkAppImagesEffect(relay, appId, actorUserId)
       }
     }).pipe(
       Effect.catchCause((cause) =>

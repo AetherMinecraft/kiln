@@ -20,6 +20,7 @@ import {
   loadAutoDeployGitHubSourcesEffect,
   loadRunningAppDeploymentsEffect,
   type AppDeploymentRecord,
+  type AppDeploymentStatus,
   type AppDeploymentTrigger,
 } from "@/effect/app-deployments"
 import {
@@ -35,6 +36,10 @@ import {
 } from "@/effect/github-api"
 import { loadGitHubConnectionCredentialEffect } from "@/effect/github-sync"
 import { loadAppConfigEffect } from "@/effect/managed-apps"
+import {
+  notifyUsersEffect,
+  publishNotificationChange,
+} from "@/effect/notifications"
 import { forkAppWorker } from "@/effect/runtime"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { relayConnectionFeatures, relayRpc } from "@/lib/relay-connection"
@@ -42,6 +47,7 @@ import {
   listPersistedRelaysEffect,
   type PersistedRelay,
 } from "@/lib/relay-registry"
+import { resourceAudienceEffect } from "@/lib/resource-audience.server"
 
 // Deploys apps and records each deployment: Hearth resolves what a GitHub
 // app builds, sends it to the app's Relay, and follows the deployment there
@@ -217,6 +223,7 @@ export const startAppDeploymentEffect = Effect.fn("Apps.deploy")(function* (
             Effect.andThen(
               Effect.sync(() => publishAppDeploymentChange(relay.id))
             ),
+            Effect.andThen(announceDeploymentEffect(base, "failed")),
             Effect.ignore
           )
         : Effect.void
@@ -226,9 +233,7 @@ export const startAppDeploymentEffect = Effect.fn("Apps.deploy")(function* (
   const record: AppDeploymentRecord = {
     ...base,
     // A Relay that answers without its deployment can't be followed.
-    error: relayDeploymentId
-      ? null
-      : "The Relay didn't report this deployment",
+    error: relayDeploymentId ? null : "The Relay didn't report this deployment",
     finishedAt: relayDeploymentId ? null : startedAt,
     relayDeploymentId,
     rolling: null,
@@ -247,31 +252,106 @@ const recordRefusal = (
   cause: unknown
 ) =>
   Clock.currentTimeMillis.pipe(
-    Effect.flatMap((now) =>
-      insertAppDeploymentEffect({
-        appId: request.appId,
-        branch: null,
-        commitAuthor: null,
-        commitMessage: null,
-        commitSha: null,
-        error: cause instanceof Error ? cause.message : String(cause),
-        finishedAt: new Date(now).toISOString(),
-        id: randomUUID(),
-        imageDigest: null,
-        relayDeploymentId: null,
-        relayId,
-        repository: null,
-        rolling: null,
-        sourceType: "github",
-        startedAt: new Date(now).toISOString(),
-        status: "failed",
-        trigger: request.trigger,
-        triggeredBy: request.userId,
-      })
+    Effect.map(
+      (now) =>
+        ({
+          appId: request.appId,
+          branch: null,
+          commitAuthor: null,
+          commitMessage: null,
+          commitSha: null,
+          error: cause instanceof Error ? cause.message : String(cause),
+          finishedAt: new Date(now).toISOString(),
+          id: randomUUID(),
+          imageDigest: null,
+          relayDeploymentId: null,
+          relayId,
+          repository: null,
+          rolling: null,
+          sourceType: "github",
+          startedAt: new Date(now).toISOString(),
+          status: "failed",
+          trigger: request.trigger,
+          triggeredBy: request.userId,
+        }) satisfies AppDeploymentRecord
     ),
-    Effect.andThen(Effect.sync(() => publishAppDeploymentChange(relayId))),
+    Effect.tap(insertAppDeploymentEffect),
+    Effect.tap(() => Effect.sync(() => publishAppDeploymentChange(relayId))),
+    Effect.flatMap((record) => announceDeploymentEffect(record, "failed")),
     Effect.ignore
   )
+
+/**
+ * Tells everyone who can deploy the app how a deployment ended, unless they
+ * started it. An image update that deployed answers the app's update
+ * notifications: the app runs the newest image now. Other deployments leave
+ * them to the check that follows, since a rollback runs an older image.
+ */
+const announceDeploymentEffect = Effect.fnUntraced(
+  function* (
+    record: Pick<
+      AppDeploymentRecord,
+      "appId" | "id" | "imageDigest" | "relayId" | "trigger" | "triggeredBy"
+    >,
+    status: AppDeploymentStatus
+  ) {
+    if (status !== "succeeded" && status !== "failed") return
+    const [app, recipients] = yield* Effect.all([
+      loadAppConfigEffect(record.relayId, record.appId),
+      resourceAudienceEffect(
+        {
+          relayId: record.relayId,
+          resourceId: record.appId,
+          resourceType: "app",
+        },
+        "app.manage"
+      ),
+    ])
+    if (!app) return
+    const delivered = yield* notifyUsersEffect(
+      recipients,
+      `app.deployed:${record.id}`,
+      {
+        deploymentId: record.id,
+        kind: "app.deployed",
+        resource: {
+          id: record.appId,
+          name: app.name,
+          relayId: record.relayId,
+          type: "app",
+        },
+        status,
+        update: record.trigger === "update",
+      },
+      { actorUserId: record.triggeredBy }
+    )
+    if (delivered > 0) publishNotificationChange(recipients)
+    // The update it deployed is installed. Other deployments are settled
+    // by the check that follows them.
+    if (
+      status === "succeeded" &&
+      record.trigger === "update" &&
+      record.imageDigest !== null
+    ) {
+      // Imported here, since image updates deploy through this module.
+      const { resolveAppImageUpdateNotificationsEffect } =
+        yield* Effect.promise(() => import("@/lib/app-image-updates.server"))
+      yield* resolveAppImageUpdateNotificationsEffect(record.appId, {
+        installedDigest: record.imageDigest,
+      })
+    }
+  },
+  // The deployment is recorded either way; its notification is best effort.
+  (effect, record) =>
+    effect.pipe(
+      Effect.catchCause((cause) =>
+        logException(Cause.squash(cause), {
+          operation: "Apps.deployment.announce",
+          attributes: { "app.deployment.id": record.id },
+        })
+      )
+    )
+)
 
 // What a GitHub app deploys: its branch's head, or the commit asked for,
 // and how to get a token that reads only its repository.
@@ -416,7 +496,10 @@ const checkAppDeploymentEffect = Effect.fn("Apps.deployment.check")(function* (
       rolling: deployment.rolling,
       status: deployment.state,
     })
-    if (finished) publishAppDeploymentChange(record.relayId)
+    if (finished) {
+      publishAppDeploymentChange(record.relayId)
+      yield* announceDeploymentEffect(record, deployment.state)
+    }
     return true
   }
   // The Relay moved on to another deployment; its log of this one says
@@ -432,7 +515,10 @@ const checkAppDeploymentEffect = Effect.fn("Apps.deployment.check")(function* (
       rolling: kept.rolling,
       status: kept.state,
     })
-    if (finished) publishAppDeploymentChange(record.relayId)
+    if (finished) {
+      publishAppDeploymentChange(record.relayId)
+      yield* announceDeploymentEffect(record, kept.state)
+    }
     return true
   }
   const finished = yield* finishAppDeploymentEffect(record.id, {
@@ -529,14 +615,13 @@ export function followAppDeployment(record: AppDeploymentRecord): void {
           Effect.catch(() => Effect.succeed(false))
         )
         if (!settled) continue
-        // An image app's updates follow what it runs now. Imported here,
-        // since image updates deploy through this module.
-        if (record.sourceType === "image") {
-          const { recheckAppImage } = yield* Effect.promise(
-            () => import("@/lib/app-image-updates.server")
-          )
-          recheckAppImage(record.relayId, record.appId)
-        }
+        // An app's updates follow what it runs now, by its current config:
+        // one that deploys from elsewhere now has none on offer. Imported
+        // here, since image updates deploy through this module.
+        const { recheckAppImage } = yield* Effect.promise(
+          () => import("@/lib/app-image-updates.server")
+        )
+        recheckAppImage(record.relayId, record.appId, record.triggeredBy)
         return
       }
     }).pipe(
