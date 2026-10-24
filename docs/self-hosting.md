@@ -283,7 +283,16 @@ Platform administrators open Kiln itself from the **Kiln** button beside
 
 - **Info** shows Hearth, its database, its cache, and the Traefik in front of
   them, with Repair, a Restart for each, and the `kiln-relay platform`
-  commands to run on the host when Hearth itself is down.
+  commands to run on the host when Hearth itself is down. Its **Data** section
+  exports Hearth's database as SQL, imports such an export back, and opens its
+  backups; the rail's **Backups** line counts them. An import puts back
+  every table's rows in one transaction, so it takes effect whole or not at
+  all, and requests wait on it meanwhile. It takes only a whole, unchanged
+  export (Kiln seals each with a SHA-256 of its contents; up to 32 MB) from the same version of Kiln, whose tables have the
+  same shape, and only when a Kiln backup from the last day exists to come
+  back to.
+- **Viewer** browses and edits Hearth's tables through the Relay, with the
+  login Hearth itself uses. It needs a Relay with `relay-platform-database-v1`.
 - **Logs** follows each container's output live.
 - **Terminal** opens a shell in the database, the cache, or the Traefik the
   Relay runs. Hearth's image has no shell.

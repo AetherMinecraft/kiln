@@ -1,4 +1,4 @@
-import { useSuspenseQuery } from "@tanstack/react-query"
+import { useQuery, useSuspenseQuery } from "@tanstack/react-query"
 import type {
   RelayPlatformProxy,
   RelayPlatformService,
@@ -7,6 +7,7 @@ import type {
 } from "@workspace/contracts"
 
 import type { IdentityStatusPresentation } from "@/components/identity-name"
+import { selectKilnHost, type KilnPlatform } from "@/lib/kiln-host"
 import { kilnPlatformQueryOptions } from "@/lib/query-options"
 import type { KilnPlatformHost } from "@/server/platform"
 
@@ -59,27 +60,39 @@ export const kilnCopy: Record<
   },
 }
 
-/**
- * The host this Hearth runs on: the Relay that installed it, or else one that
- * installed some Kiln, or else the first that reports its services.
- */
-export function selectKilnHost(
-  hosts: ReadonlyArray<KilnPlatformHost>
-): KilnPlatformHost | null {
-  return (
-    hosts.find((host) => host.status?.canManage === true) ??
-    hosts.find((host) => host.status?.management === "relay") ??
-    hosts.find((host) => host.status !== null) ??
-    hosts[0] ??
-    null
-  )
-}
-
 export function useKilnHost(): KilnPlatformHost | null {
   return useSuspenseQuery({
     ...kilnPlatformQueryOptions(),
-    select: (data) => selectKilnHost(data.hosts),
+    select: selectKilnHost,
   }).data
+}
+
+export interface KilnBackupHost {
+  relayId: string
+  relayName: string
+}
+
+/**
+ * The Relay Kiln is backed up on, for pages that offer Kiln beside game
+ * servers and databases. Only platform administrators can back Kiln up, so
+ * only they ask; null until known. These pages don't follow its services, so
+ * they don't poll for them.
+ */
+export function useKilnBackupHost(enabled: boolean): KilnBackupHost | null {
+  return (
+    useQuery({
+      ...kilnPlatformQueryOptions(),
+      enabled,
+      refetchInterval: false,
+      select: selectKilnBackupHost,
+      staleTime: 60_000,
+    }).data ?? null
+  )
+}
+
+function selectKilnBackupHost(data: KilnPlatform): KilnBackupHost | null {
+  const host = selectKilnHost(data)
+  return host ? { relayId: host.relayId, relayName: host.relayName } : null
 }
 
 /** Kiln's containers in order, the proxy last when there is one. */
@@ -188,3 +201,5 @@ export const kilnPhaseLabels: Record<RelayPlatformStatus["phase"], string> = {
   maintenance: "Hearth held stopped",
   ready: "Running",
 }
+
+export { selectKilnHost }
