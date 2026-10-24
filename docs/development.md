@@ -49,8 +49,19 @@ to be unique across running stacks.
 | `pnpm dev:docker:destroy` | Delete a worktree's stack, data, and Relay resources |
 | `pnpm dev:docker:test` | Run web tests against the stack's MySQL |
 
-Run relevant checks with `vp check`, `vp run -r typecheck`, or targeted
+Run relevant checks with `vp check`, `vp run typecheck`, or targeted
 `vp test run` suites. Validate user-visible changes in the browser.
+
+`vp run typecheck` uses the pinned tsrs compiler with two checkers per package
+and checks packages one at a time to leave resources for parallel work. Package
+tasks remain cached by Vite+; use `vp run --filter web typecheck` for Hearth-only
+work. tsrs is experimental and follows TypeScript 7; keep its exact version
+pinned and validate upgrades against the package checks. TypeScript remains
+installed for editor support and declaration builds. If tsrs cannot start (for
+example on Windows or Intel macOS), the task falls back to Vite+'s built-in
+typechecker, without formatting or linting. A type error from an available tsrs
+compiler fails the task directly; it never triggers the fallback. Ordinary
+`vp check` still runs type-aware lint rules without a second compiler check.
 
 ## Marketing site
 
