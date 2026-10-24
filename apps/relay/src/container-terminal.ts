@@ -10,6 +10,11 @@ import type {
   RelayDatabaseTerminalAttached,
   RelayManagedDatabase,
 } from "@workspace/contracts"
+import {
+  terminalColorQuery,
+  terminalColors,
+  terminalCursor,
+} from "@workspace/contracts"
 import type { ITerminalAddon, Terminal } from "@xterm/headless"
 import { Effect } from "effect"
 
@@ -262,6 +267,7 @@ export class ContainerTerminals {
       sessionId: session.id,
       snapshot: snapshot.content,
       startedAt: session.startedAt,
+      answersQueries: true,
     }
   }
 
@@ -400,6 +406,9 @@ export class ContainerTerminals {
     )
     const screen = new HeadlessTerminal({
       allowProposedApi: true,
+      // Reported to clients that ask, as Hearth shows it.
+      cursorBlink: terminalCursor.blink,
+      cursorStyle: terminalCursor.style,
       cols: input.cols,
       rows: input.rows,
       scrollback: SCROLLBACK_LINES,
@@ -438,6 +447,10 @@ export class ContainerTerminals {
       startedAt: new Date().toISOString(),
       viewers: new Map(),
     }
+    answerQueries(screen, (reply) => {
+      // Not into a session that is ending or a connection already closed.
+      if (!session.ending && socket.writable) socket.write(reply)
+    })
     const boundary = new SequenceBoundary()
     socket.on("data", (chunk: Buffer) => {
       const start = session.historyStart + session.history.length
@@ -700,6 +713,69 @@ function serializeScreen(session: TerminalSession) {
       })
     })
   })
+}
+
+// A `#rrggbb` color as xterm reports it: `rgb:rrrr/gggg/bbbb`.
+function colorSpec(color: string) {
+  const channels = [1, 3, 5].map((start) => color.slice(start, start + 2))
+  return `rgb:${channels.map((channel) => channel.repeat(2)).join("/")}`
+}
+
+function hexColor(...channels: Array<number>) {
+  return `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`
+}
+
+// The 256 colors of Hearth's terminal: its own 16, then xterm's color cube
+// and grays.
+const CUBE_LEVELS = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff]
+const PALETTE = [
+  ...terminalColors.ansi,
+  ...Array.from({ length: 216 }, (_, index) =>
+    hexColor(
+      ...[36, 6, 1].map((step) => CUBE_LEVELS[Math.floor(index / step) % 6]!)
+    )
+  ),
+  ...Array.from({ length: 24 }, (_, index) =>
+    hexColor(...Array<number>(3).fill(8 + index * 10))
+  ),
+]
+// The foreground, background, and cursor, by OSC number.
+const SPECIAL_COLORS: Record<number, string> = {
+  10: terminalColors.foreground,
+  11: terminalColors.background,
+  12: terminalColors.cursor,
+}
+
+// Answers what the client asks the terminal (where the cursor is, what
+// terminal this is, which modes are on, its colors) from the session's own
+// screen. The client gets one answer, right away, however many pages show the
+// session, or none; pages leave these queries to the Relay.
+function answerQueries(screen: Terminal, reply: (data: string) => void) {
+  screen.onData(reply)
+  // The secondary device attributes reply (`CSI > 0 ; 276 ; 0 c`) reads as
+  // the same query to xterm. A TTY that echoes it back would have the screen
+  // answer its own answer forever, so only the query, with at most one
+  // parameter, is answered.
+  screen.parser.registerCsiHandler(
+    { final: "c", prefix: ">" },
+    (params) => params.length > 1
+  )
+  // The headless terminal has no colors of its own to report. Setting a
+  // color changes nothing here, so a sequence that does is left to the page.
+  for (const ident of [4, 10, 11, 12]) {
+    screen.parser.registerOscHandler(ident, (data) => {
+      const asked = terminalColorQuery(ident, data)
+      if (!asked) return false
+      for (const color of asked) {
+        reply(
+          ident === 4
+            ? `\u001b]4;${color};${colorSpec(PALETTE[color]!)}\u001b\\`
+            : `\u001b]${color};${colorSpec(SPECIAL_COLORS[color]!)}\u001b\\`
+        )
+      }
+      return true
+    })
+  }
 }
 
 function controlFor(

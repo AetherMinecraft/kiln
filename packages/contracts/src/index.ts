@@ -346,7 +346,95 @@ export const relayDatabaseTerminalAttachedSchema = z.object({
   seq: z.number().int().nonnegative(),
   sessionId: databaseTerminalIdSchema,
   startedAt: z.string().datetime(),
+  // The Relay answers the client's queries to the terminal (cursor position,
+  // device attributes, the colors `terminalColorQuery` reads), so pages
+  // don't. Older Relays leave them to the pages.
+  answersQueries: z.boolean().optional(),
 })
+
+// The colors Hearth's terminal shows, as `#rrggbb`: its 16 ANSI colors, and
+// the foreground, background, and cursor with the default accent. The Relay
+// reports them to clients that ask. The terminal is dark in every theme.
+export const terminalColors = {
+  ansi: [
+    // black, red, green, yellow, blue, magenta, cyan, white
+    "#1c1917",
+    "#f87171",
+    "#4ade80",
+    "#facc15",
+    "#60a5fa",
+    "#e879f9",
+    "#22d3ee",
+    "#d6d3d1",
+    // The same, bright.
+    "#78716c",
+    "#fca5a5",
+    "#86efac",
+    "#fde68a",
+    "#93c5fd",
+    "#f0abfc",
+    "#67e8f9",
+    "#fafaf9",
+  ],
+  background: "#000000",
+  cursor: "#fa822e",
+  foreground: "#eceae9",
+} as const
+
+// The cursor Hearth's terminal shows, which the Relay reports to clients
+// that ask.
+export const terminalCursor = { blink: true, style: "bar" } as const
+
+// The colors an `OSC <ident> ; <data>` sequence asks for, read the way xterm
+// reads it: palette indices for 4, or 10, 11, and 12 for the foreground,
+// background, and cursor (each slot after the first asks for the next, up to
+// the cursor). Null when it also sets a color, which only a page can do, so
+// it is left whole to the pages. The Relay answers the rest, and pages
+// ignore them.
+export function terminalColorQuery(
+  ident: number,
+  data: string
+): Array<number> | null {
+  const slots = data.split(";")
+  const asked: Array<number> = []
+  if (ident === 4) {
+    // Index and color pairs; xterm skips a pair with an index out of range
+    // and a slot left over.
+    for (let slot = 0; slot + 1 < slots.length; slot += 2) {
+      const index = /^\d+$/.test(slots[slot]!)
+        ? Number.parseInt(slots[slot]!, 10)
+        : 256
+      if (index > 255) continue
+      if (slots[slot + 1] === "?") asked.push(index)
+      else if (isTerminalColor(slots[slot + 1]!)) return null
+    }
+    return asked
+  }
+  if (ident < 10 || ident > 12) return null
+  for (let slot = 0; slot < slots.length && ident + slot <= 12; slot += 1) {
+    if (slots[slot] === "?") asked.push(ident + slot)
+    else if (isTerminalColor(slots[slot]!)) return null
+  }
+  return asked
+}
+
+// A color xterm sets: `rgb:` with 1-4 hex digits per channel, or `#` with
+// 3, 6, 9, or 12. It ignores anything else.
+function isTerminalColor(spec: string) {
+  const value = spec.toLowerCase()
+  if (value.startsWith("rgb:")) {
+    const channels = value.slice(4).split("/")
+    return (
+      channels.length === 3 &&
+      channels.every(
+        (channel) =>
+          /^[\da-f]{1,4}$/.test(channel) &&
+          channel.length === channels[0]!.length
+      )
+    )
+  }
+  return /^#(?:[\da-f]{3}){1,4}$/.test(value)
+}
 
 export const relayDatabaseTerminalHeartbeatSchema = z
   .object({ attachmentIds: z.array(databaseTerminalIdSchema).max(1_000) })
