@@ -269,13 +269,16 @@ function AccessForm({
           relayName: resource.relayName,
         }),
         status: { label: "Owner", tone: "neutral" },
-        locked: `Owners hold every permission on their ${
-          resource.scope.resourceType === "instance"
-            ? "game server"
-            : resource.scope.resourceType === "database"
-              ? "database"
-              : "Relay"
-        }. Transfer ownership to change this.`,
+        locked:
+          resource.scope.resourceType === "app"
+            ? "An app's owner can see it and its logs, delete it, and transfer it. Configuring it takes app permissions on its Relay. Transfer ownership to change this."
+            : `Owners hold every permission on their ${
+                resource.scope.resourceType === "instance"
+                  ? "game server"
+                  : resource.scope.resourceType === "database"
+                    ? "database"
+                    : "Relay"
+              }. Transfer ownership to change this.`,
         selections: [],
         presetIds: [],
         builtinKeys: [],
@@ -705,7 +708,7 @@ export const UserBadges = memo(function UserBadges({
       variant="outline"
       className={cn(
         "shrink-0",
-        user.role === "admin" && "border-primary/40 text-primary"
+        user.role === "admin" && "border-primary/40 text-primary-ink"
       )}
     >
       {role}

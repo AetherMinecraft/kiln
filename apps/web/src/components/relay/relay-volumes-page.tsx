@@ -23,11 +23,6 @@ import {
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@workspace/ui/components/popover"
-import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
@@ -47,6 +42,11 @@ import {
 import { IdentityName } from "@/components/identity-name"
 import { InfoCopyValue } from "@/components/info-page"
 import { InfraSyncButton } from "@/components/infra-sync-button"
+import {
+  DrawerPopover,
+  DrawerPopoverContent,
+  DrawerPopoverTrigger,
+} from "@/components/drawer-popover"
 import { InstancePickerContent } from "@/components/instance-picker"
 import { AppKindIcon, RelayKindIcon } from "@/components/instance-kind-icon"
 import { relayHostAccessQueryOptions } from "@/components/relay/relay-host-access"
@@ -328,7 +328,9 @@ function VolumesTable({
               ? "Volumes keep data across deployments, and apps on this Relay can share them."
               : "Update this Relay to manage its volumes from Hearth."
         }
-        icon={<HardDrive className="size-6 text-muted-foreground/45" />}
+        icon={
+          <HardDrive className="size-6 text-muted-foreground/45 light:text-muted-foreground/72" />
+        }
         title={
           searchActive
             ? "No volumes match your search"
@@ -441,8 +443,8 @@ const VolumeMounts = React.memo(function VolumeMounts({
   ).size
   const containers = volume.mounts.length
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
+    <DrawerPopover open={open} onOpenChange={setOpen}>
+      <DrawerPopoverTrigger asChild>
         <button
           type="button"
           aria-label={`${apps} ${apps === 1 ? "app" : "apps"}, ${containers} ${containers === 1 ? "container" : "containers"} mount ${volume.name}`}
@@ -456,8 +458,9 @@ const VolumeMounts = React.memo(function VolumeMounts({
             other="containers"
           />
         </button>
-      </PopoverTrigger>
-      <PopoverContent
+      </DrawerPopoverTrigger>
+      <DrawerPopoverContent
+        title="Mounts"
         aria-label="Mounts"
         align="start"
         sideOffset={6}
@@ -469,8 +472,8 @@ const VolumeMounts = React.memo(function VolumeMounts({
           volume={volume}
           onNavigate={close}
         />
-      </PopoverContent>
-    </Popover>
+      </DrawerPopoverContent>
+    </DrawerPopover>
   )
 })
 
@@ -656,7 +659,7 @@ const VolumeActions = React.memo(function VolumeActions({
           {canBrowse && volume.mountpoint ? (
             <Button
               asChild
-              className="text-muted-foreground hover:text-primary"
+              className="text-muted-foreground hover:text-primary-ink"
               size="icon-sm"
               variant="ghost"
             >
@@ -700,7 +703,7 @@ const VolumeActions = React.memo(function VolumeActions({
             >
               <Button
                 aria-label={`Delete ${volume.name}`}
-                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
                 disabled={deleteBlocked !== null}
                 size="icon-sm"
                 type="button"

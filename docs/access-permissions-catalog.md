@@ -47,7 +47,7 @@ block may also have an explicit All checkbox.
 | App configuration    | Configure and deploy                                  | Relay-scoped: covers every app on the Relay. Changing sources and deploying runs arbitrary containers, so it is not in the Operator preset.                                                                  |
 | App logs             | View logs                                             | Deployment logs and container output.                                                                                                                                                                        |
 | App shell            | Open shells                                           | A shell inside the app's containers.                                                                                                                                                                         |
-| App files            | View; Edit                                            | The app's data directory, served as `app:<appId>` by the file operations.                                                                                                                                    |
+| App files            | View; Edit                                            | The app's folder on the Relay, served as `app:<appId>` by the file operations: a Dockerfile's build context and a pasted Compose file's project directory.                                                                                                                                    |
 | Resource deletion    | Delete resource                                       | Includes basic visibility; protected owner rules and confirmation remain separate. Deleting is not implied by routine configuration.                                                                         |
 | Relay configuration  | View; Configure; Update; Pause/resume                 | Mutation capabilities include Relay visibility. Available only through Relay/platform scope.                                                                                                                 |
 | Relay connections    | View clients/pairings; Manage clients/pairings        | Manage includes view and must not create a client with authority beyond the actor's delegation scope.                                                                                                        |
@@ -104,13 +104,13 @@ operation payloads, not inferred from names.
 | database.dump.import               | Import data; supported engines only.                                                                                                                 |
 | database.logs.read                 | Watch the database container's live output.                                                                                                          |
 | database.limits.write              | Change the database's memory, CPU, and disk limits.                                                                                                  |
-| app.read                           | View apps, their containers, and configuration (environment needs app.manage). Relay scope only.                                                     |
+| app.read                           | View apps, their containers, and configuration (environment needs app.manage). Granted at Relay scope; an app's owner holds it on that app.        |
 | app.create                         | Relay-scoped app creation.                                                                                                                           |
 | app.manage                         | Configure, deploy, start/stop, network, and set limits for apps.                                                                                    |
 | app.delete                         | Delete apps, their containers, and data.                                                                                                             |
 | app.logs.read                      | Watch deployment logs and container output.                                                                                                          |
 | app.terminal                       | Open shells in app containers.                                                                                                                       |
-| app.files.read, app.files.write    | Browse/download and edit an app's data directory.                                                                                                    |
+| app.files.read, app.files.write    | Browse/download and edit an app's folder on the Relay.                                                                                                    |
 | backup.read                        | View backup metadata/status. Existing forget behavior mutates under this permission and needs explicit review.                                       |
 | backup.create                      | Create/manage backups; review existing cancel/rename/exclusions/copy mappings.                                                                       |
 | backup.download                    | Export/download; use for data copy to another destination as well.                                                                                   |
@@ -137,7 +137,7 @@ additional. The lists below cover every current action.
 | brick.read                                                                                                           | Available Brick metadata for supported resource workflows; not platform catalog administration.                             |
 | database.read, database.create, database.delete, database.power                                                      | Database overview/creation/deletion/power with resource scope.                                                              |
 | database.credentials.rotate, database.network.write                                                                  | Credential/network operations; Hearth handles credential reads separately.                                                  |
-| database.dump.export, database.dump.import                                                                           | Data export/import.                                                                                                         |
+| database.dump.export, database.dump.import                                                                           | Data export/import, and browser transfers of the dump files (`database:<id>`).                                              |
 | database.logs.read                                                                                                   | Browser console capabilities for a database container's output.                                                             |
 | app.read, app.create, app.manage, app.delete, app.logs.read, app.terminal                                            | Apps: inventory, deploys, power, networking, logs, and shells.                                                              |
 | app.files.read, app.files.write, app.files.download, app.files.upload                                                | File operations and direct transfers on `app:<appId>` file roots; server file actions never reach them.                     |
@@ -180,7 +180,25 @@ They must not disappear merely because the new catalog replaces accessRoles.
 
 Platform-admin acceptance, verification, disable/enable, and platform role changes
 are not granted by an instance/Relay ALL. Resource owners are protected separately;
-a full preset does not transfer ownership. New permission collections do not
+a full preset does not transfer ownership.
+
+Every Relay, game server, database, and app has an owner: the person who
+paired the Relay or created the resource. Ownership is its own source of
+authority, so it survives narrowed or revoked Relay grants. Owners of a Relay,
+game server, or database hold ALL on it. Apps have no grants of their own, so
+ownership is the only app-scoped authority, and it is narrower: an app's owner
+can view it and its logs, delete it, and transfer it. Configuring and
+deploying an app, its shell, and its files can reach the Relay's node (a
+Compose file, its environment and included files, other apps' volumes), so
+those still take app permissions on the Relay until apps are confined to
+themselves. App ownership never covers people, presets, backups, or schedules.
+Only the owner or an administrator transfers ownership, to someone
+who already has access there: a grant on the Relay or the resource, or Relay
+ownership. Someone who owns anything can't be removed until it is transferred.
+Tailscale networks record the administrator who added them; they stay
+administrator-only. Resources from before owners existed went to their creator
+when that was an administrator or the Relay's owner, and otherwise to the
+Relay's owner, so nobody gained access. New permission collections do not
 bypass resource limits, storage-destination checks, or platform policy.
 
 ## 6. Implication graph and operation conditions

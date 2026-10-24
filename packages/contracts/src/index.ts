@@ -28,6 +28,7 @@ import {
 export * from "./access-permissions.js"
 export * from "./relay-protocol.js"
 export * from "./installation-id.js"
+export * from "./container-identity.js"
 export * from "./release-version.js"
 export * from "./minecraft-java.js"
 export * from "./cli.js"
@@ -239,23 +240,25 @@ export const relayDatabaseNetworkSchema = z
   })
   .strict()
 
-// A text SQL dump, or a PostgreSQL custom-format dump (pg_dump -Fc) in
-// base64. Either holds at most 700 KB of dump; base64 makes that ~933 KB.
-export const relayDatabaseDumpFormatSchema = z.enum(["sql", "postgres-custom"])
-
-export const relayDatabaseDumpSchema = z
+// A database's login, for the Relay to act on the database as its own user.
+// Dumps themselves travel as files (see `databaseFileRootId`): an export
+// writes one for the browser to download, and an import reads the one the
+// browser uploaded.
+export const relayDatabaseExportSchema = z
   .object({
-    content: z.string().max(940_000),
-    format: relayDatabaseDumpFormatSchema.optional(),
     databaseId: databaseIdSchema,
     password: z.string().min(24).max(256),
     username: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/u),
   })
   .strict()
 
-export const relayDatabaseExportSchema = relayDatabaseDumpSchema.omit({
-  content: true,
-  format: true,
+// The upload an import runs, which only that import names.
+export const relayDatabaseImportFileSchema = z
+  .string()
+  .regex(/^import-[A-Za-z0-9-]{16,64}$/u)
+
+export const relayDatabaseImportSchema = relayDatabaseExportSchema.extend({
+  fileName: relayDatabaseImportFileSchema,
 })
 
 export const relayDatabaseInspectRequestSchema = z
@@ -300,7 +303,8 @@ export const databaseTerminalEndReasonSchema = z.enum([
   "timed-out",
   // Someone asked for a fresh session.
   "restarted",
-  // The client could not be started or its connection failed.
+  // The client could not be started, as when the container has no shell, or
+  // its connection failed.
   "failed",
 ])
 
@@ -346,7 +350,95 @@ export const relayDatabaseTerminalAttachedSchema = z.object({
   seq: z.number().int().nonnegative(),
   sessionId: databaseTerminalIdSchema,
   startedAt: z.string().datetime(),
+  // The Relay answers the client's queries to the terminal (cursor position,
+  // device attributes, the colors `terminalColorQuery` reads), so pages
+  // don't. Older Relays leave them to the pages.
+  answersQueries: z.boolean().optional(),
 })
+
+// The colors Hearth's terminal shows, as `#rrggbb`: its 16 ANSI colors, and
+// the foreground, background, and cursor with the default accent. The Relay
+// reports them to clients that ask. The terminal is dark in every theme.
+export const terminalColors = {
+  ansi: [
+    // black, red, green, yellow, blue, magenta, cyan, white
+    "#1c1917",
+    "#f87171",
+    "#4ade80",
+    "#facc15",
+    "#60a5fa",
+    "#e879f9",
+    "#22d3ee",
+    "#d6d3d1",
+    // The same, bright.
+    "#78716c",
+    "#fca5a5",
+    "#86efac",
+    "#fde68a",
+    "#93c5fd",
+    "#f0abfc",
+    "#67e8f9",
+    "#fafaf9",
+  ],
+  background: "#000000",
+  cursor: "#fa822e",
+  foreground: "#eceae9",
+} as const
+
+// The cursor Hearth's terminal shows, which the Relay reports to clients
+// that ask.
+export const terminalCursor = { blink: true, style: "bar" } as const
+
+// The colors an `OSC <ident> ; <data>` sequence asks for, read the way xterm
+// reads it: palette indices for 4, or 10, 11, and 12 for the foreground,
+// background, and cursor (each slot after the first asks for the next, up to
+// the cursor). Null when it also sets a color, which only a page can do, so
+// it is left whole to the pages. The Relay answers the rest, and pages
+// ignore them.
+export function terminalColorQuery(
+  ident: number,
+  data: string
+): Array<number> | null {
+  const slots = data.split(";")
+  const asked: Array<number> = []
+  if (ident === 4) {
+    // Index and color pairs; xterm skips a pair with an index out of range
+    // and a slot left over.
+    for (let slot = 0; slot + 1 < slots.length; slot += 2) {
+      const index = /^\d+$/.test(slots[slot]!)
+        ? Number.parseInt(slots[slot]!, 10)
+        : 256
+      if (index > 255) continue
+      if (slots[slot + 1] === "?") asked.push(index)
+      else if (isTerminalColor(slots[slot + 1]!)) return null
+    }
+    return asked
+  }
+  if (ident < 10 || ident > 12) return null
+  for (let slot = 0; slot < slots.length && ident + slot <= 12; slot += 1) {
+    if (slots[slot] === "?") asked.push(ident + slot)
+    else if (isTerminalColor(slots[slot]!)) return null
+  }
+  return asked
+}
+
+// A color xterm sets: `rgb:` with 1-4 hex digits per channel, or `#` with
+// 3, 6, 9, or 12. It ignores anything else.
+function isTerminalColor(spec: string) {
+  const value = spec.toLowerCase()
+  if (value.startsWith("rgb:")) {
+    const channels = value.slice(4).split("/")
+    return (
+      channels.length === 3 &&
+      channels.every(
+        (channel) =>
+          /^[\da-f]{1,4}$/.test(channel) &&
+          channel.length === channels[0]!.length
+      )
+    )
+  }
+  return /^#(?:[\da-f]{3}){1,4}$/.test(value)
+}
 
 export const relayDatabaseTerminalHeartbeatSchema = z
   .object({ attachmentIds: z.array(databaseTerminalIdSchema).max(1_000) })
@@ -575,6 +667,54 @@ export const appServiceLimitsSchema = z
   .record(appServiceNameSchema, serviceResourceLimitsSchema)
   .refine((limits) => Object.keys(limits).length <= 64, "Too many services")
 
+const appContainerPathSchema = z
+  .string()
+  .max(512)
+  .regex(/^\/[^\0:]*$/u, "Use an absolute path inside the container")
+
+// The largest file an app can mount from its config.
+export const APP_MOUNT_FILE_MAX_LENGTH = 100_000
+
+// What an app mounts into its containers, which keep nothing else across
+// deploys: one of the Relay's named volumes, a path on the node, or a file
+// kept in the config.
+export const appMountSourceSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("volume"), volumeId: relayVolumeIdSchema }),
+  z.strictObject({
+    path: z
+      .string()
+      .max(1_024)
+      .regex(/^\/[^\0]*$/u, "Use an absolute path on the node"),
+    type: z.literal("host"),
+  }),
+  z.strictObject({
+    content: z.string().max(APP_MOUNT_FILE_MAX_LENGTH),
+    type: z.literal("file"),
+  }),
+])
+
+export const appMountSchema = z.strictObject({
+  // Stable across edits; a file mount is kept on the Relay under it.
+  id: z.string().regex(/^[a-z0-9]{8,32}$/u),
+  readOnly: z.boolean(),
+  // The Compose service it's mounted in, or null for every service and for
+  // an image's or Dockerfile's one container.
+  service: appServiceNameSchema.nullable(),
+  source: appMountSourceSchema,
+  target: appContainerPathSchema,
+})
+
+export const appMountsSchema = z
+  .array(appMountSchema)
+  .max(32)
+  .refine(
+    (mounts) =>
+      new Set(mounts.map((mount) => mount.id)).size === mounts.length &&
+      new Set(mounts.map((mount) => `${mount.service ?? ""}:${mount.target}`))
+        .size === mounts.length,
+    "Mount each path once"
+  )
+
 // Every source is kept, so switching between them loses nothing; only
 // `sourceType` deploys.
 export const appConfigSchema = z
@@ -582,25 +722,13 @@ export const appConfigSchema = z
     // Replaces the image's command, for images and Dockerfiles.
     command: z.string().max(4_000),
     compose: z.string().max(400_000),
-    // Where the app's data directory is mounted, for images and Dockerfiles.
-    // Compose files mount it themselves through `${KILN_DATA}`.
-    dataMount: z
-      .string()
-      .max(512)
-      .regex(/^\/[^\0:]*$/u, "Use an absolute path inside the container"),
     databaseIds: z.array(databaseIdSchema).max(32),
-    // The data directory's limit; past it, the app is stopped. Configs saved
-    // before limits have none.
-    diskLimitBytes: z
-      .number()
-      .int()
-      .min(MINIMUM_INSTANCE_DISK_LIMIT_BYTES)
-      .nullable()
-      .default(null),
     dockerfile: z.string().max(200_000),
     // KEY=VALUE lines, as in an env file.
     environment: z.string().max(65_536),
     image: z.string().trim().max(512),
+    // Configs saved before mounts have none.
+    mounts: appMountsSchema.default([]),
     ports: z.array(appPortSchema).max(32),
     serviceLimits: appServiceLimitsSchema.default({}),
     sourceType: appSourceTypeSchema,
@@ -610,12 +738,11 @@ export const appConfigSchema = z
 export const defaultAppConfig: z.infer<typeof appConfigSchema> = {
   command: "",
   compose: "",
-  dataMount: "/data",
   databaseIds: [],
-  diskLimitBytes: null,
   dockerfile: "",
   environment: "",
   image: "",
+  mounts: [],
   ports: [],
   serviceLimits: {},
   sourceType: "image",
@@ -628,6 +755,15 @@ export const appDeploymentStateSchema = z.enum([
 ])
 
 // Not strict: a newer Relay may report more about its containers.
+// One thing a container mounts: a named volume by its name, a bind by its
+// path on the node, or a tmpfs, which has no source.
+export const relayAppContainerMountSchema = z.object({
+  destination: z.string(),
+  readOnly: z.boolean(),
+  source: z.string(),
+  type: z.string(),
+})
+
 export const relayAppContainerSchema = z.object({
   createdAt: z.string().datetime().nullable(),
   exitCode: z.number().int().nullable(),
@@ -636,6 +772,8 @@ export const relayAppContainerSchema = z.object({
   labels: z.record(z.string(), z.string()),
   // The memory and CPU it runs with. Absent from older Relays.
   limits: observedResourceLimitsSchema.optional(),
+  // What it mounts. Absent from older Relays.
+  mounts: z.array(relayAppContainerMountSchema).optional(),
   name: z.string().min(1),
   networks: z.array(z.string()),
   ports: z.array(appPortSchema),
@@ -664,13 +802,10 @@ export const relayAppDeploymentSchema = z.object({
 export const relayAppSchema = z.object({
   connectedDatabaseIds: z.array(databaseIdSchema),
   containers: z.array(relayAppContainerSchema),
-  // The app's data directory on the Relay's host.
+  // The app's folder on the Relay's host: a pasted Compose file's project
+  // directory and a Dockerfile's build context.
   dataDirectory: z.string(),
   deployment: relayAppDeploymentSchema.nullable(),
-  // The data directory's limit, and its size when last measured. Absent
-  // from older Relays.
-  diskLimitBytes: z.number().int().positive().nullable().default(null),
-  diskUsedBytes: z.number().int().nonnegative().nullable().default(null),
   // The name its containers answer to on the app's network.
   hostname: z.string(),
   id: appIdSchema,
@@ -700,15 +835,63 @@ export const relayProvisionAppSchema = z
   .object({ appId: appIdSchema })
   .strict()
 
+/** A manifest digest, as registries name an image's exact content. */
+export const imageDigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/u)
+
 export const relayDeployAppSchema = z
   .object({
     appId: appIdSchema,
     config: appConfigSchema,
     // Required when the config's source is GitHub.
     github: relayAppGitHubCheckoutSchema.optional(),
+    // For an image source, the digest to deploy in place of whatever its
+    // tag names when the deployment pulls it.
+    imageDigest: imageDigestSchema.optional(),
     name: appNameSchema,
   })
   .strict()
+
+// What image apps' tags name in their registries now, against the images
+// their containers run. Each app names the image its saved config deploys.
+export const relayAppImageCheckSchema = z
+  .object({
+    apps: z
+      .array(
+        z
+          .object({ appId: appIdSchema, image: z.string().trim().min(1).max(512) })
+          .strict()
+      )
+      .min(1)
+      .max(16),
+  })
+  .strict()
+
+export const relayAppImageCheckResultSchema = z.discriminatedUnion("status", [
+  // The tag's digest now, and the digest the app runs: the one it
+  // deployed, or for a container deployed before Kiln labelled that, the
+  // digests its image was pulled as.
+  z.object({
+    appId: appIdSchema,
+    latestDigest: imageDigestSchema,
+    runningDigests: z.array(imageDigestSchema),
+    status: z.literal("checked"),
+  }),
+  // The app's container runs another image than the one named, as when
+  // its config changed since it deployed.
+  z.object({ appId: appIdSchema, status: z.literal("changed") }),
+  z.object({ appId: appIdSchema, status: z.literal("not_deployed") }),
+  // A deployment is running; its outcome decides what runs.
+  z.object({ appId: appIdSchema, status: z.literal("deploying") }),
+  z.object({
+    appId: appIdSchema,
+    error: z.string().max(500),
+    status: z.literal("error"),
+  }),
+])
+
+export const relayAppImageCheckResultsSchema = z.array(
+  relayAppImageCheckResultSchema
+)
 
 // One of the app's recent deployments, with its log: the running one, or one
 // the Relay kept.
@@ -719,7 +902,6 @@ export const relayAppDeploymentReadSchema = z
 export const relayAppLimitsSchema = z
   .object({
     appId: appIdSchema,
-    diskLimitBytes: appConfigSchema.shape.diskLimitBytes,
     serviceLimits: appServiceLimitsSchema,
   })
   .strict()
@@ -1854,6 +2036,189 @@ export const relaySftpSnapshotSchema = z.object({
   publication: relaySftpPublicationStatusSchema.default("unknown"),
 })
 
+/**
+ * Kiln's own services on a Relay's Docker host: Hearth, its MySQL database,
+ * and its cache. A Relay in platform mode installed them and manages them
+ * (`relay`); otherwise they were deployed some other way, such as Compose or
+ * Coolify, and the Relay only reports them (`external`).
+ */
+export const relayPlatformManagementSchema = z.enum(["relay", "external"])
+
+export const relayPlatformServiceRoleSchema = z.enum([
+  "hearth",
+  "database",
+  "cache",
+])
+
+/**
+ * Which of Kiln's containers a v2 request is for: a service, or the Traefik
+ * in front of Hearth (`proxy`).
+ */
+export const relayPlatformTargetSchema = z.enum([
+  "hearth",
+  "database",
+  "cache",
+  "proxy",
+])
+
+export const relayPlatformServiceSchema = z.object({
+  /** Actions this Hearth may take on it. Empty for external services. */
+  actions: z.array(z.enum(["restart"])).max(4),
+  /**
+   * Who runs it: this Relay (`kiln`), Coolify, Docker Compose, or something
+   * else. Absent from older Relays.
+   */
+  managedBy: z.enum(["kiln", "coolify", "compose", "external"]).optional(),
+  container: z.string().min(1).max(255).nullable(),
+  health: z.enum(["healthy", "starting", "unhealthy"]).nullable(),
+  image: z.string().min(1).max(500).nullable(),
+  role: relayPlatformServiceRoleSchema,
+  startedAt: z.string().datetime().nullable(),
+  state: z.enum([
+    "running",
+    "starting",
+    "unhealthy",
+    "restarting",
+    "stopped",
+    "missing",
+    "updating",
+  ]),
+  /**
+   * Whether it has a shell to open a terminal in; Hearth's image doesn't.
+   * From Relays with `relay-platform-v2`, and null until checked.
+   */
+  shell: z.boolean().nullable().optional(),
+  version: z.string().min(1).max(100).nullable(),
+})
+
+export const relayPlatformProxySchema = relayPlatformServiceSchema
+  .omit({ role: true })
+  .extend({ managedBy: z.enum(["kiln", "coolify", "external"]) })
+
+export const relayPlatformStatusSchema = z.object({
+  /** Whether this Hearth may restart and repair them. */
+  canManage: z.boolean(),
+  checkedAt: z.string().datetime(),
+  hearthUrl: z.string().max(2_000).nullable(),
+  installationId: z.string().min(1).max(120).nullable(),
+  /** Why the Relay is holding off, such as a missing database volume. */
+  issue: z.string().max(2_000).nullable(),
+  management: relayPlatformManagementSchema,
+  /**
+   * `installing` until Hearth first starts, `maintenance` while an operator
+   * holds Hearth stopped from the Relay's command line, `blocked` when the
+   * Relay won't continue without one.
+   */
+  phase: z.enum(["installing", "ready", "maintenance", "blocked"]),
+  /**
+   * The Traefik in front of Hearth, from Relays with `relay-platform-v2`:
+   * the one this Relay runs (`kiln`), Coolify's, or another found on ports
+   * 80 and 443 (`external`). Only Kiln's own can be restarted from here.
+   */
+  proxy: relayPlatformProxySchema.nullable().optional(),
+  services: z.array(relayPlatformServiceSchema).max(8),
+})
+
+// `proxy` needs `relay-platform-v2`.
+export const relayPlatformLogsInputSchema = z.object({
+  lines: z.number().int().min(1).max(2_000).default(500),
+  role: relayPlatformTargetSchema,
+})
+
+export const relayPlatformLogsSchema = z.object({
+  lines: z.array(z.string()).max(2_000),
+  role: relayPlatformTargetSchema,
+})
+
+export const relayPlatformActionInputSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("restart"),
+    role: relayPlatformTargetSchema,
+  }),
+  // Recreates whatever is missing and starts whatever stopped.
+  z.object({ action: z.literal("repair") }),
+])
+
+export type RelayPlatformManagement = z.infer<
+  typeof relayPlatformManagementSchema
+>
+export type RelayPlatformStatus = z.infer<typeof relayPlatformStatusSchema>
+export type RelayPlatformService = z.infer<typeof relayPlatformServiceSchema>
+export type RelayPlatformServiceRole = z.infer<
+  typeof relayPlatformServiceRoleSchema
+>
+export type RelayPlatformActionInput = z.infer<
+  typeof relayPlatformActionInputSchema
+>
+export type RelayPlatformProxy = z.infer<typeof relayPlatformProxySchema>
+export type RelayPlatformTarget = z.infer<typeof relayPlatformTargetSchema>
+
+// A shell in one of Kiln's containers, kept like an app's: one per person
+// per container. Needs `relay-platform-v2`.
+const platformTerminalTargetShape = { role: relayPlatformTargetSchema }
+
+export const relayPlatformTerminalAttachSchema = z
+  .object({
+    ...platformTerminalTargetShape,
+    ...databaseTerminalSizeShape,
+    attachmentId: databaseTerminalIdSchema,
+    idleTimeoutMs: z
+      .number()
+      .int()
+      .min(60_000)
+      .max(24 * 60 * 60_000),
+  })
+  .strict()
+
+export const relayPlatformTerminalRestartSchema = z
+  .object(platformTerminalTargetShape)
+  .strict()
+
+export const relayPlatformTerminalWriteSchema = z
+  .object({
+    ...platformTerminalTargetShape,
+    data: z.string().min(1).max(DATABASE_TERMINAL_WRITE_MAX_CHARACTERS),
+    sessionId: databaseTerminalIdSchema,
+  })
+  .strict()
+
+export const relayPlatformTerminalClaimSchema = z
+  .object({
+    ...platformTerminalTargetShape,
+    ...databaseTerminalSizeShape,
+    attachmentId: databaseTerminalIdSchema,
+    sessionId: databaseTerminalIdSchema,
+  })
+  .strict()
+
+// Hearth's own database, browsed through its MySQL container with the login
+// Hearth itself uses. Needs `relay-platform-database-v1`.
+const platformDatabaseLoginShape = {
+  databaseName: z.string().regex(/^[A-Za-z0-9_$]{1,64}$/u),
+  password: z.string().min(1).max(512),
+  username: z.string().min(1).max(128),
+}
+
+export const relayPlatformDatabaseReadSchema = z
+  .object({ ...platformDatabaseLoginShape, request: databaseReadRequestSchema })
+  .strict()
+
+export const relayPlatformDatabaseWriteSchema = z
+  .object({
+    ...platformDatabaseLoginShape,
+    // As `relayDatabaseDataWriteSchema`'s: a guard against mistakes.
+    readOnly: z.boolean().optional(),
+    request: databaseWriteRequestSchema,
+  })
+  .strict()
+
+export type RelayPlatformDatabaseRead = z.infer<
+  typeof relayPlatformDatabaseReadSchema
+>
+export type RelayPlatformDatabaseWrite = z.infer<
+  typeof relayPlatformDatabaseWriteSchema
+>
+
 const relaySnapshotRelaySchema = z.object({
   browserOrigin: relayProxyBrowserMetadataSchema.shape.browserOrigin.optional(),
   id: relayIdSchema,
@@ -1861,6 +2226,13 @@ const relaySnapshotRelaySchema = z.object({
   // Held paused by a Hearth, so it runs no changes. See
   // `relayControlOperationRefusedWhilePaused`.
   paused: z.boolean().optional(),
+  /**
+   * Present when Kiln's own services run on this Relay's Docker host. See
+   * `relay.platform.read`.
+   */
+  platform: z
+    .object({ management: relayPlatformManagementSchema })
+    .optional(),
   proxyMode: relayProxyModeSchema.optional(),
   sftp: relaySftpSnapshotSchema,
   tls: z
@@ -2335,11 +2707,8 @@ export type RelayRotateDatabaseCredentials = z.infer<
   typeof relayRotateDatabaseCredentialsSchema
 >
 export type RelayDatabaseNetwork = z.infer<typeof relayDatabaseNetworkSchema>
-export type RelayDatabaseDump = z.infer<typeof relayDatabaseDumpSchema>
-export type RelayDatabaseDumpFormat = z.infer<
-  typeof relayDatabaseDumpFormatSchema
->
 export type RelayDatabaseExport = z.infer<typeof relayDatabaseExportSchema>
+export type RelayDatabaseImport = z.infer<typeof relayDatabaseImportSchema>
 export type RelayDatabaseContainer = z.infer<
   typeof relayDatabaseContainerSchema
 >
@@ -2367,6 +2736,8 @@ export type RelayDatabaseDataWrite = z.infer<
 export type AppConfig = z.infer<typeof appConfigSchema>
 export type AppSourceType = z.infer<typeof appSourceTypeSchema>
 export type AppPort = z.infer<typeof appPortSchema>
+export type AppMount = z.infer<typeof appMountSchema>
+export type AppMountSource = z.infer<typeof appMountSourceSchema>
 export type AppDeploymentState = z.infer<typeof appDeploymentStateSchema>
 export type RelayApp = z.infer<typeof relayAppSchema>
 export type RelayAppContainer = z.infer<typeof relayAppContainerSchema>
@@ -2382,6 +2753,10 @@ export type RelayAppDeploymentRead = z.infer<
   typeof relayAppDeploymentReadSchema
 >
 export type RelayAppDeploymentLog = z.infer<typeof relayAppDeploymentLogSchema>
+export type RelayAppImageCheck = z.infer<typeof relayAppImageCheckSchema>
+export type RelayAppImageCheckResult = z.infer<
+  typeof relayAppImageCheckResultSchema
+>
 export type RelayAppAction = z.infer<typeof relayAppActionSchema>
 export type RelayDeleteApp = z.infer<typeof relayDeleteAppSchema>
 export type RelayAppNetwork = z.infer<typeof relayAppNetworkSchema>

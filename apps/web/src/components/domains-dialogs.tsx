@@ -31,11 +31,6 @@ import {
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@workspace/ui/components/popover"
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -59,6 +54,11 @@ import {
   type DirectoryServer,
 } from "@/components/domains-shared"
 import { InstanceCard } from "@/components/instance-card"
+import {
+  DrawerPopover,
+  DrawerPopoverContent,
+  DrawerPopoverTrigger,
+} from "@/components/drawer-popover"
 import {
   InstancePickerContent,
   type InstancePickerItem,
@@ -281,8 +281,8 @@ const GameServerPicker = React.memo(function GameServerPicker({
   )
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
+    <DrawerPopover open={open} onOpenChange={setOpen}>
+      <DrawerPopoverTrigger asChild>
         <Button
           aria-expanded={open}
           aria-labelledby="new-domain-server"
@@ -310,8 +310,9 @@ const GameServerPicker = React.memo(function GameServerPicker({
           )}
           <ChevronsUpDown className="size-3.5 shrink-0 text-muted-foreground" />
         </Button>
-      </PopoverTrigger>
-      <PopoverContent
+      </DrawerPopoverTrigger>
+      <DrawerPopoverContent
+        title="Game servers"
         align="start"
         className="z-[70] w-(--radix-popover-trigger-width) min-w-72 overflow-hidden p-0"
       >
@@ -322,8 +323,8 @@ const GameServerPicker = React.memo(function GameServerPicker({
           selectedKeys={selectedKeys}
           onSelect={selectItem}
         />
-      </PopoverContent>
-    </Popover>
+      </DrawerPopoverContent>
+    </DrawerPopover>
   )
 })
 
@@ -860,7 +861,7 @@ export function DomainConfigurationDialog({
                   Cloudflare API token
                 </label>
                 <a
-                  className="type-label inline-flex items-center gap-1 text-primary hover:underline"
+                  className="type-label inline-flex items-center gap-1 text-primary-ink hover:underline"
                   href="https://dash.cloudflare.com/profile/api-tokens"
                   rel="noreferrer"
                   target="_blank"
@@ -1146,8 +1147,9 @@ const DomainZoneRow = React.memo(function DomainZoneRow({
                 </span>
               </TooltipTrigger>
               <TooltipContent side="top">
-                Its {usage} game server {usage === 1 ? "domain keeps" : "domains keep"}{" "}
-                working. New game servers won&apos;t get it.
+                Its {usage} game server{" "}
+                {usage === 1 ? "domain keeps" : "domains keep"} working. New
+                game servers won&apos;t get it.
               </TooltipContent>
             </Tooltip>
           ) : null}
@@ -1233,12 +1235,12 @@ function CloudflarePermissionsPreview({ domain }: { domain: string }) {
     <div className="space-y-4">
       <CloudflarePermissionPolicy domain={domain} />
 
-      <div className="flex gap-2 border border-amber-500/25 bg-amber-400/8 p-3 text-amber-950/85 dark:border-amber-400/20 dark:bg-amber-400/5 dark:text-amber-100/85">
+      <div className="flex gap-2 border border-amber-500/25 bg-amber-400/8 p-3 text-amber-950/85 dark:border-amber-400/20 dark:bg-amber-400/5 dark:text-amber-100/85 light:bg-amber-400/16">
         <KeyRound className="mt-0.5 size-3.5 shrink-0 text-amber-700 dark:text-amber-300" />
         <p className="type-meta">
-          Add every zone Kiln should use to the token, or choose all zones.
-          Kiln encrypts the token at rest, never returns it to the browser, and
-          keeps every managed record DNS-only.
+          Add every zone Kiln should use to the token, or choose all zones. Kiln
+          encrypts the token at rest, never returns it to the browser, and keeps
+          every managed record DNS-only.
         </p>
       </div>
     </div>
@@ -1398,7 +1400,7 @@ function PermissionAccess({
 
 function ConfigurationError({ error }: { error: Error }) {
   return (
-    <p className="border border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+    <p className="border border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive light:bg-destructive/10">
       {errorMessage(error)}
     </p>
   )

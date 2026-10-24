@@ -22,7 +22,7 @@ jobs:
         include:
           - name: Static checks
             command: |
-              vp run -r typecheck
+              vp run typecheck
               vp check
           - name: Tests
             # Every package's test task except Hearth's, plus scripts/ tests.
@@ -46,8 +46,14 @@ jobs:
                 DB_NAME=kiln_migration_test DB_USERNAME=root DB_PASSWORD=root \
                 vp test run src/effect/migrations.test.ts --maxWorkers 1 --no-file-parallelism
           - name: Build
+            # vp fails a task when it can't forward its output fast enough
+            # ("Resource temporarily unavailable"), which the web build's
+            # long asset list sometimes trips. A file always takes it.
             command: |
-              vp run -r build
+              status=0
+              vp run -r build > "$RUNNER_TEMP/build.log" 2>&1 || status=$?
+              cat "$RUNNER_TEMP/build.log"
+              test "$status" -eq 0
               git diff --exit-code -- apps/web/src/routeTree.gen.ts
     steps:
       # Backs the real-MySQL suites (apps/web/src/test/database.ts). Pulled

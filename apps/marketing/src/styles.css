@@ -1,0 +1,89 @@
+@import "@workspace/ui/globals.css";
+/*
+ * Builds without a git checkout, like the Docker image, don't read
+ * .gitignore, so the server build would scan the client build's output and
+ * name its stylesheet differently from the one the client ships.
+ */
+@source not "../dist";
+/* The demos render these Hearth components, so their classes must exist. */
+@source "../../web/src/components/console";
+@source "../../web/src/components/database-viewer";
+@source "../../web/src/components/file-tree-loading-panel.tsx";
+@source "../../web/src/components/files";
+@source "../../web/src/components/hearth-mark.tsx";
+@source "../../web/src/components/identity-name.tsx";
+@source "../../web/src/components/infra-map-canvas.tsx";
+@source "../../web/src/components/instance-kind-icon.tsx";
+@source "../../web/src/components/overlay-notice.tsx";
+@source "../../web/src/components/panel-resize-handle.tsx";
+@source "../../web/src/components/resource-history-chart.tsx";
+@source "../../web/src/components/resource-meters.tsx";
+@source "../../web/src/components/status-indicator.tsx";
+@source "../../web/src/components/syntax-code-editor.tsx";
+@source "../../web/src/components/workspace-frame.tsx";
+@source "../../web/src/components/workspace-line-wrap-button.tsx";
+@source "../../web/src/components/workspace-power-controls.tsx";
+@source "../../web/src/components/workspace-toolbar-tooltip.tsx";
+
+/* Sections reached by a link clear the sticky header. */
+@layer base {
+  html {
+    scroll-padding-top: 5rem;
+  }
+}
+
+/*
+ * The site shares Hearth's palette, flat corners, and type roles. These add
+ * the few marketing-only scales Hearth has no use for.
+ */
+@layer components {
+  .site-display {
+    font-family: var(--font-heading);
+    font-size: clamp(2.5rem, 1.6rem + 4.4vw, 5.25rem);
+    font-weight: 600;
+    letter-spacing: -0.055em;
+    line-height: 0.98;
+    text-wrap: balance;
+  }
+
+  .site-title {
+    font-family: var(--font-heading);
+    font-size: clamp(1.75rem, 1.35rem + 1.6vw, 2.625rem);
+    font-weight: 600;
+    letter-spacing: -0.045em;
+    line-height: 1.08;
+    text-wrap: balance;
+  }
+
+  .site-lede {
+    font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.25rem);
+    line-height: 1.5;
+    letter-spacing: -0.01em;
+    text-wrap: pretty;
+  }
+
+  .site-copy {
+    font-size: 1rem;
+    line-height: 1.6;
+    text-wrap: pretty;
+  }
+}
+
+@layer utilities {
+  .site-container {
+    margin-inline: auto;
+    width: 100%;
+    max-width: 76rem;
+    padding-inline: clamp(1.25rem, 4vw, 2.5rem);
+  }
+}
+
+/* A pulse travelling along a line, left to right. */
+@keyframes site-flow {
+  from {
+    background-position: -60% 0;
+  }
+  to {
+    background-position: 160% 0;
+  }
+}

@@ -41,6 +41,7 @@ import type {
   RelayControlOperation,
   RelayControlRequest,
   RelayNode,
+  RelayPlatformManagement,
   RelayProxyBrowserMetadata,
   RelayProxyMode,
   RelaySnapshot,
@@ -68,6 +69,7 @@ import {
   runAppEffect,
 } from "@/effect/runtime"
 import { ensuringPromise, forkPromise, promiseEffect } from "@/effect/promise"
+import { hearthContainerClaim } from "@/lib/hearth-container"
 import type { RelayCredentials } from "@/lib/relay-registry"
 import { resolveSftpAuthorization } from "@/lib/sftp-authorization"
 import { relayControlFailureError } from "@/lib/relay-control-errors"
@@ -371,6 +373,20 @@ export function relayConnectionProxyMode(
 }
 
 /**
+ * How Kiln's own services run on the Relay's host, from its last snapshot:
+ * `relay` when the Relay installed them, `external` when it only reports
+ * them. Null when they aren't there, or this process isn't connected.
+ */
+export function relayConnectionPlatform(
+  relayId: string
+): RelayPlatformManagement | null {
+  return (
+    connections.get(relayId)?.pushedSnapshot?.relay?.platform?.management ??
+    null
+  )
+}
+
+/**
  * Whether the Relay reports itself paused, by this Hearth or another, as of
  * its last snapshot here. False while this process isn't connected to it.
  */
@@ -480,6 +496,9 @@ class RelayConnection {
   #relay: RelayEndpoint
   #reconnectFiber: Fiber.Fiber<void, unknown> | null = null
   #auditFiber: Fiber.Fiber<void, unknown> | null = null
+  #livenessFiber: Fiber.Fiber<void, unknown> | null = null
+  // The socket the liveness check dropped, so its close names why.
+  #unresponsiveSocket: WebSocket | null = null
   // Whether this Hearth wants the Relay paused, and what the Relay last
   // took from it, so the pause loop knows when to tell it again.
   #wantsPaused: boolean | null = null
@@ -824,6 +843,8 @@ class RelayConnection {
     this.#reconnectFiber = null
     this.#auditFiber?.interruptUnsafe()
     this.#auditFiber = null
+    this.#livenessFiber?.interruptUnsafe()
+    this.#livenessFiber = null
     this.#pauseFiber?.interruptUnsafe()
     this.#pauseFiber = null
     this.#socket?.close(1000, "Hearth connection closed")
@@ -1021,6 +1042,7 @@ class RelayConnection {
           this.#features = new Set(message.features ?? [])
           this.#browserAuthorizationReadiness = browserAuthorizationReadiness()
           this.#setState("authenticated", null)
+          this.#watchLiveness(activeSocket)
           const synchronizeBrowserAuthorization = () => {
             if (
               this.#socket !== activeSocket ||
@@ -1197,11 +1219,16 @@ class RelayConnection {
       })
       activeSocket.once("close", (code, reason) => {
         const error = new Error(
-          `Relay connection closed (${code}${reason.length ? `: ${reason.toString()}` : ""})`
+          this.#unresponsiveSocket === activeSocket
+            ? "Relay stopped responding"
+            : `Relay connection closed (${code}${reason.length ? `: ${reason.toString()}` : ""})`
         )
         this.#socket = null
+        this.#unresponsiveSocket = null
         this.#auditFiber?.interruptUnsafe()
         this.#auditFiber = null
+        this.#livenessFiber?.interruptUnsafe()
+        this.#livenessFiber = null
         this.#pauseFiber?.interruptUnsafe()
         this.#pauseFiber = null
         this.#rejectBrowserAuthorizationReadiness(error)
@@ -1226,6 +1253,40 @@ class RelayConnection {
         }
       })
     })
+  }
+
+  // A Relay that stalls (out of memory, swapping, a frozen network path) can
+  // hold its socket open without answering, which would read as connected
+  // indefinitely. Anything it sends shows it's alive; past a few silent
+  // intervals the socket is dropped so it reads as unreachable and
+  // reconnects. Counting intervals rather than elapsed time keeps a pause in
+  // Hearth itself from dropping a Relay that did answer.
+  #watchLiveness(socket: WebSocket): void {
+    let silentIntervals = 0
+    const heard = () => {
+      silentIntervals = 0
+    }
+    socket.on("message", heard)
+    socket.on("ping", heard)
+    socket.on("pong", heard)
+    this.#livenessFiber?.interruptUnsafe()
+    this.#livenessFiber = Effect.runFork(
+      Effect.sleep(LIVENESS_INTERVAL_MS).pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            if (socket.readyState !== WebSocket.OPEN) return
+            silentIntervals += 1
+            if (silentIntervals < LIVENESS_SILENT_INTERVALS) {
+              socket.ping()
+              return
+            }
+            this.#unresponsiveSocket = socket
+            socket.terminate()
+          })
+        ),
+        Effect.forever
+      )
+    )
   }
 
   #rejectBrowserAuthorizationReadiness(
@@ -1254,6 +1315,10 @@ class RelayConnection {
     }
     // Relays save it, so the whole installation shares Hearth's ID.
     const installationId = loadedKilnInstallationId()
+    const hearthContainer = hearthContainerClaim(
+      challenge,
+      credentials.clientId
+    )
     socket.send(
       JSON.stringify({
         clientId: credentials.clientId,
@@ -1275,6 +1340,7 @@ class RelayConnection {
         type: "auth.response",
         v: 1,
         ...(installationId ? { installationId } : {}),
+        ...(hearthContainer ? { hearthContainer } : {}),
       })
     )
   }
@@ -1922,6 +1988,11 @@ const AUDIT_RECONCILE_PASSES = 6
 // How often a connection checks that the Relay has the pause it was told.
 const PAUSE_RECHECK_MS = 30_000
 const AUDIT_START_WAIT_MS = 2_000
+// Hearth pings each Relay this often, and the Relay pings Hearth as often.
+const LIVENESS_INTERVAL_MS = 15_000
+// Intervals without a frame from the Relay before its socket is dropped, so a
+// stalled Relay reads as unreachable within 30-45 seconds.
+const LIVENESS_SILENT_INTERVALS = 3
 
 function unknownOutcome(
   message: string

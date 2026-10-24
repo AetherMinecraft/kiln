@@ -7,6 +7,12 @@ import {
 } from "@workspace/contracts"
 
 import {
+  autoUpdateAt,
+  defaultAppImageUpdatePolicy,
+  loadAppImageUpdateEffect,
+  type AppImageUpdate,
+} from "@/effect/app-image-updates"
+import {
   latestAppDeploymentsEffect,
   listAppDeploymentsEffect,
   loadAppDeploymentEffect,
@@ -15,8 +21,15 @@ import {
   type AppDeploymentRecord,
   type AppGitHubSource,
 } from "@/effect/app-deployments"
-import { getGitHubRepositoryEffect } from "@/effect/github-api"
-import { loadGitHubConnectionsEffect } from "@/effect/github-sync"
+import {
+  getGitHubFileEffect,
+  getGitHubRepositoryEffect,
+  githubInstallationTokenEffect,
+} from "@/effect/github-api"
+import {
+  loadGitHubConnectionCredentialEffect,
+  loadGitHubConnectionsEffect,
+} from "@/effect/github-sync"
 import { listAppRecordsEffect, updateAppConfigEffect } from "@/effect/managed-apps"
 import { attachRelayOwnersEffect } from "@/effect/relay-owners"
 import { runAppEffect } from "@/effect/runtime"
@@ -78,20 +91,29 @@ export async function getAppDeploymentsHandler(data: {
   const relayNames = new Map(
     relays
       .filter(
-        (relay) =>
-          relay.enabled &&
-          (!data.relayId || relay.id === data.relayId) &&
-          hasAppPermission(user, grants, relay.id, "app.read")
+        (relay) => relay.enabled && (!data.relayId || relay.id === data.relayId)
       )
       .map((relay) => [relay.id, relay.name])
+  )
+  // Every app on a Relay the person reads apps on, and the apps they own
+  // elsewhere.
+  const relayIds = [...relayNames.keys()].filter((relayId) =>
+    hasAppPermission(user, grants, { relayId }, "app.read")
   )
   const records = await runAppEffect(
     "apps.deployments.list",
     listAppDeploymentsEffect({
       appId: data.appId,
+      appIds: apps.flatMap((app) =>
+        relayNames.has(app.relayId) &&
+        !relayIds.includes(app.relayId) &&
+        hasAppPermission(user, grants, app, "app.read")
+          ? [app.appId]
+          : []
+      ),
       before: data.before,
       limit: deploymentPageSize + 1,
-      relayIds: [...relayNames.keys()],
+      relayIds,
     })
   )
   const page = records.slice(0, deploymentPageSize)
@@ -109,18 +131,8 @@ export async function getAppDeploymentsHandler(data: {
       (record, index): AppDeploymentView => ({
         ...record,
         appName: appNames.get(record.appId) ?? record.appId.slice(0, 8),
-        canManage: hasAppPermission(
-          user,
-          grants,
-          record.relayId,
-          "app.manage"
-        ),
-        canReadLogs: hasAppPermission(
-          user,
-          grants,
-          record.relayId,
-          "app.logs.read"
-        ),
+        canManage: hasAppPermission(user, grants, record, "app.manage"),
+        canReadLogs: hasAppPermission(user, grants, record, "app.logs.read"),
         commitUrl: commitUrl(record),
         relayName: relayNames.get(record.relayId) ?? "Relay",
         triggeredByName: record.triggeredBy
@@ -143,7 +155,7 @@ export async function getAppDeploymentSummaryHandler(data: {
   relayId: string
 }) {
   const { app, user } = await authorizedApp(data, "app.read")
-  const [source, latest] = await Promise.all([
+  const [source, latest, imageUpdate] = await Promise.all([
     runAppEffect(
       "apps.github.source",
       loadAppGitHubSourceEffect(data.appId)
@@ -152,6 +164,12 @@ export async function getAppDeploymentSummaryHandler(data: {
       "apps.deployments.latest",
       latestAppDeploymentsEffect(data.appId)
     ),
+    app.config.sourceType === "image"
+      ? runAppEffect(
+          "apps.imageUpdates.load",
+          loadAppImageUpdateEffect(data.appId)
+        )
+      : null,
   ])
   const view = source ? await sourceView(user, source) : null
   return {
@@ -169,7 +187,103 @@ export async function getAppDeploymentSummaryHandler(data: {
     source: app.config.sourceType === "github" ? view : null,
     // What the app deploys from now, which its last deployment may not show.
     sourceType: app.config.sourceType,
+    // Nothing to check until it names an image.
+    imageUpdates:
+      app.config.sourceType === "image" && app.config.image !== ""
+        ? imageUpdatesView(app.config.image, imageUpdate)
+        : null,
   }
+}
+
+/**
+ * What an image app's Deployment card shows of its updates. Only what the
+ * last check found for the image its config names now; one saved since
+ * hasn't been checked.
+ */
+function imageUpdatesView(image: string, update: AppImageUpdate | null) {
+  const policy = {
+    delayHours: update?.delayHours ?? defaultAppImageUpdatePolicy.delayHours,
+    mode: update?.mode ?? defaultAppImageUpdatePolicy.mode,
+  }
+  // A digest never moves, so there's nothing to check.
+  const pinned = image.includes("@")
+  const current = update && update.image === image ? update : null
+  return {
+    ...policy,
+    autoUpdateAt: current && autoUpdateAt(current),
+    checkError: current?.checkError ?? null,
+    checkedAt: current?.checkedAt ?? null,
+    image,
+    latestDigest: current?.latestDigest ?? null,
+    latestSeenAt: current?.latestSeenAt ?? null,
+    pinned,
+    runningDigest: current?.runningDigest ?? null,
+    skippedDigest: current?.skippedDigest ?? null,
+    state: pinned ? null : (current?.state ?? null),
+  }
+}
+
+/**
+ * The Dockerfile or Compose file a GitHub app deploys, at its branch's
+ * head, for anyone who can read the app. Only that file: the path comes
+ * from the app's source, never the request.
+ */
+export async function getAppGitHubSourceFileHandler(data: {
+  appId: string
+  relayId: string
+}) {
+  const { app } = await authorizedApp(data, "app.read")
+  const source =
+    app.config.sourceType === "github"
+      ? await runAppEffect(
+          "apps.github.source",
+          loadAppGitHubSourceEffect(data.appId)
+        )
+      : null
+  if (!source) throw new Error("This app doesn't deploy from GitHub")
+  if (!source.connectionId) {
+    throw new Error("The app's GitHub source was removed; choose another")
+  }
+  const connection = await runAppEffect(
+    "github.connection.credential",
+    loadGitHubConnectionCredentialEffect({ id: source.connectionId })
+  )
+  const installation = connection.installation
+  if (!installation || installation.suspended) {
+    throw new Error("The GitHub App can't read this repository")
+  }
+  const token = await runAppEffect(
+    "github.app.installationToken",
+    githubInstallationTokenEffect(
+      { appId: connection.appId, privateKey: connection.privateKey },
+      installation.id
+    )
+  )
+  const content = await runAppEffect(
+    "github.file.get",
+    getGitHubFileEffect(
+      token,
+      source.repository,
+      source.path,
+      source.branch,
+      appSourceFileMaxBytes[source.build]
+    )
+  )
+  return {
+    branch: source.branch,
+    content,
+    path: source.path,
+    url: `https://github.com/${source.repository}/blob/${source.branch
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}/${source.path.split("/").map(encodeURIComponent).join("/")}`,
+  }
+}
+
+// As large as the app's own Dockerfile and Compose file may be.
+const appSourceFileMaxBytes: Record<AppGitHubBuild, number> = {
+  compose: 400_000,
+  dockerfile: 200_000,
 }
 
 /**
@@ -255,6 +369,7 @@ export async function redeployAppDeploymentHandler(data: {
     startAppDeploymentEffect({
       appId: record.appId,
       commit: record.commitSha ?? undefined,
+      imageDigest: record.imageDigest ?? undefined,
       relayId: relay.id,
       trigger: "redeploy",
       userId: user.id,

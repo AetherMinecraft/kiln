@@ -227,10 +227,10 @@ function CopyRelayIdButton({ relayId }: { relayId: string }) {
       aria-label={`Copy Relay ID ${relayId}`}
       title={relayId}
       className={cn(
-        "flex items-center gap-1.5 px-2 text-xs transition-colors outline-none focus-visible:text-primary",
+        "flex items-center gap-1.5 px-2 text-xs transition-colors outline-none focus-visible:text-primary-ink",
         copied
-          ? "text-emerald-400"
-          : "text-muted-foreground/80 hover:text-primary"
+          ? "text-emerald-400 light:text-emerald-700"
+          : "text-muted-foreground/80 hover:text-primary-ink light:text-muted-foreground/90"
       )}
       onClick={() => void copy()}
     >
@@ -309,22 +309,34 @@ function InfoRailActivityLink({ resource }: { resource: RailResource }) {
   )
 }
 
+// What has backups: an instance, or Kiln itself, kept by the Relay on its
+// host (`id` is that Relay's).
+type BackupsResource =
+  | RailResource
+  | { id: string; kind: "platform"; relayId: string }
+
 // Opens the instance's backups on the Backups page, with how many it keeps.
-function InfoRailBackupsLink({ resource }: { resource: RailResource }) {
+export function InfoRailBackupsLink({
+  resource,
+}: {
+  resource: BackupsResource
+}) {
   const { id, kind, relayId } = resource
   const select = React.useCallback(
     (capabilities: NavigationAccessCapabilities) =>
-      kind === "database"
-        ? canAccessDatabasePermission(
-            capabilities,
-            { id, relayId },
-            "backup.read"
-          )
-        : canAccessInstancePermission(
-            capabilities,
-            { id, relayId },
-            "backup.read"
-          ),
+      kind === "platform"
+        ? capabilities.isPlatformAdmin
+        : kind === "database"
+          ? canAccessDatabasePermission(
+              capabilities,
+              { id, relayId },
+              "backup.read"
+            )
+          : canAccessInstancePermission(
+              capabilities,
+              { id, relayId },
+              "backup.read"
+            ),
     [id, kind, relayId]
   )
   const { data: canReadBackups } = useQuery({
@@ -336,7 +348,12 @@ function InfoRailBackupsLink({ resource }: { resource: RailResource }) {
     <InfoRailLink
       to="/backups/runs"
       search={{
-        kind: resource.kind === "database" ? "database" : "server",
+        kind:
+          resource.kind === "database"
+            ? "database"
+            : resource.kind === "platform"
+              ? "relay"
+              : "server",
         relay: resource.relayId,
         server: resource.id,
       }}
@@ -348,8 +365,8 @@ function InfoRailBackupsLink({ resource }: { resource: RailResource }) {
   )
 }
 
-// "3/10" against a limit, or just "3" without one.
-function BackupCount({ resource }: { resource: RailResource }) {
+// "3/10" against the newest kept, or just "3" without that limit.
+function BackupCount({ resource }: { resource: BackupsResource }) {
   const { data } = useQuery(
     backupUsageQueryOptions(resource.relayId, {
       id: resource.id,
@@ -357,17 +374,13 @@ function BackupCount({ resource }: { resource: RailResource }) {
     })
   )
   if (!data) return null
-  const full =
-    data.quantityLimit !== null && data.quantityUsed >= data.quantityLimit
   return (
     <span
-      className={cn("tabular-nums", full && "text-amber-300")}
+      className="tabular-nums"
       title={
         data.quantityLimit === null
-          ? "Backups kept, with no limit"
-          : full
-            ? "At the backup limit; delete one to make another"
-            : `Backups kept, of ${data.quantityLimit} allowed`
+          ? "Backups kept"
+          : `Backups kept, of the newest ${data.quantityLimit}`
       }
     >
       {data.quantityLimit === null

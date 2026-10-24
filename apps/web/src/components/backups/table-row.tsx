@@ -82,7 +82,7 @@ type BackupAvailabilityState =
   | "working"
 type BackupTargetPresentation = {
   id: string
-  kindLabel: "Database" | "Relay" | "Game Server"
+  kindLabel: "Database" | "Game Server" | "Kiln"
   name: string
 }
 const activeStatuses = new Set(["queued", "running", "deleting"])
@@ -200,8 +200,8 @@ function BackupFailureDetails({
       <p>{failure.detail}</p>
       {failure.external ? (
         <p className="text-muted-foreground">
-          This isn't a Kiln error: the storage provider refused the request,
-          so it's fixed in the provider's account.
+          This isn't a Kiln error: the storage provider refused the request, so
+          it's fixed in the provider's account.
         </p>
       ) : null}
       <p className="font-mono text-[0.6875rem] break-all text-muted-foreground">
@@ -412,7 +412,11 @@ export const BackupRowActions = React.memo(function BackupRowActions({
     backup.status === "available" &&
     !backupSourceIsActive(backup) &&
     targetAvailable &&
-    (backup.targetKind === "instance" || backup.targetKind === "database")
+    // Kiln's restore runs on its Relay's host; the dialog says how.
+    (backup.targetKind === "instance" ||
+      backup.targetKind === "database" ||
+      (backup.targetKind === "platform" &&
+        backup.artifactKind === "platform_bundle"))
   const restore = (
     <Button
       aria-label={`Restore ${backup.name}`}
@@ -918,25 +922,22 @@ export const BackupTargetLink = React.memo(function BackupTargetLink({
   targetId: string
   targetKind: Backup["targetKind"]
 }) {
+  const fallback: InstanceNameInstance =
+    targetKind === "platform"
+      ? { id: relayId, kind: "relay", platform: true, relayId }
+      : {
+          id: targetId,
+          kind: targetKind === "database" ? "database" : "server",
+          relayId,
+        }
   const identity = (
     <InstanceCard
       className="w-full"
-      instance={
-        instance ?? {
-          id: targetKind === "platform" ? relayId : targetId,
-          kind:
-            targetKind === "database"
-              ? "database"
-              : targetKind === "platform"
-                ? "relay"
-                : "server",
-          relayId,
-        }
-      }
+      instance={instance ?? fallback}
       name={name}
       nameClassName={
         available
-          ? "transition-colors group-hover/target-link:text-primary"
+          ? "transition-colors group-hover/target-link:text-primary-ink"
           : "text-muted-foreground"
       }
       meta={`${kindLabel} · ${displayId.slice(0, 8)}`}
@@ -1015,7 +1016,7 @@ const BackupTargetAnchor = React.memo(function BackupTargetAnchor({
   }
 
   return (
-    <Link className={className} preload="intent" to="/infra/relays">
+    <Link className={className} preload="intent" to="/kiln/info">
       {children}
     </Link>
   )
@@ -1179,7 +1180,7 @@ export function backupTargetName(
   backup: Backup,
   targetNames: ReadonlyMap<string, string>
 ): string {
-  if (backup.targetKind === "platform") return "Kiln platform"
+  if (backup.targetKind === "platform") return "Kiln"
   return (
     targetNames.get(
       targetKey(backup.targetKind, backup.relayId, backup.targetId)
@@ -1189,14 +1190,13 @@ export function backupTargetName(
 
 export function backupTargetPresentation(
   backup: Backup,
-  relayName: string,
   targetName: string
 ): BackupTargetPresentation {
   if (backup.targetKind === "platform") {
     return {
       id: backup.relayId,
-      kindLabel: "Relay",
-      name: relayName,
+      kindLabel: "Kiln",
+      name: "Kiln",
     }
   }
   const shortId = backup.targetId.slice(0, 8)
@@ -1209,7 +1209,7 @@ export function backupTargetPresentation(
 
 function missingTargetMessage(kind: Backup["targetKind"]): string {
   if (kind === "database") return "This database no longer exists"
-  if (kind === "platform") return "This Relay no longer exists"
+  if (kind === "platform") return "The Relay Kiln was backed up on is gone"
   return "This game server no longer exists"
 }
 
@@ -1394,16 +1394,16 @@ function artifactAvailabilityState(
 
 function availabilityTagClassName(state: BackupAvailabilityState): string {
   if (state === "available") {
-    return "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+    return "border-emerald-500/30 bg-emerald-500/10 light:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300"
   }
   if (state === "working") {
-    return "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
+    return "border-sky-500/30 bg-sky-500/10 light:bg-sky-500/20 text-sky-700 dark:text-sky-300"
   }
   if (state === "deleting") {
-    return "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+    return "border-amber-500/35 bg-amber-500/10 light:bg-amber-500/20 text-amber-700 dark:text-amber-300"
   }
   if (state === "failed" || state === "cancelled") {
-    return "border-destructive/30 bg-destructive/10 text-destructive"
+    return "border-destructive/30 bg-destructive/10 light:bg-destructive/20 text-destructive"
   }
   return "border-border/70 bg-muted/40 text-muted-foreground"
 }

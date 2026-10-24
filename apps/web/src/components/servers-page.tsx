@@ -5,9 +5,11 @@ import {
   type InfraInstanceRow,
 } from "@/lib/infra-table-source"
 import {
+  PendingInvitationCard,
   PendingResourceInvitations,
   PendingResourceInvitationBadge,
   resourceInvitationScopeKey,
+  type PendingInvitationCells,
 } from "@/components/pending-resource-invitations"
 import * as React from "react"
 import { useLiveSuspenseQuery } from "@tanstack/react-db"
@@ -63,6 +65,10 @@ import {
   DataTableToolbar,
   DataTableWorkspace,
 } from "@/components/data-table-workspace"
+import {
+  AddFirstRelayButton,
+  useAwaitingFirstRelay,
+} from "@/components/relay/pair-first-relay"
 import { DataTable } from "@/components/data-table-view"
 import { InstanceCard, InstanceStatus } from "@/components/instance-card"
 import { statusColumnWidth } from "@/components/instance-name-presentation"
@@ -424,7 +430,7 @@ const ServerDataTable = React.memo(function ServerDataTable({
                     relayId: server.relayId,
                   }}
                   name={server.name}
-                  nameClassName="transition-colors group-hover/server-link:text-primary"
+                  nameClassName="transition-colors group-hover/server-link:text-primary-ink"
                   meta={
                     [server.game, server.implementation]
                       .filter(Boolean)
@@ -527,6 +533,8 @@ const ServerDataTable = React.memo(function ServerDataTable({
     <DataTable
       leadingBody={
         <PendingResourceInvitations
+          cells={serverPendingCells}
+          columns={definition.columns}
           resourceType="instance"
           visibleResourceKeys={visibleResourceKeys}
           searchStore={searchStore}
@@ -592,7 +600,7 @@ const ServerActions = React.memo(function ServerActions({
               size="icon-sm"
               variant="ghost"
               aria-label={`Delete ${server.name}`}
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
               disabled={!deleteEnabled}
               onClick={() =>
                 onDelete({
@@ -682,7 +690,7 @@ const ServerActionLink = React.memo(function ServerActionLink({
           asChild
           size="icon-sm"
           variant="ghost"
-          className="text-muted-foreground hover:text-primary"
+          className="text-muted-foreground hover:text-primary-ink"
         >
           {link}
         </Button>
@@ -715,10 +723,13 @@ function EmptyServerTable({
   dialogStore: AddServerDialogStore
   searchActive: boolean
 }) {
+  const awaitingFirstRelay = useAwaitingFirstRelay()
   return (
     <DataTableEmptyState
       action={
-        !searchActive && canProvision ? (
+        searchActive ? null : awaitingFirstRelay ? (
+          <AddFirstRelayButton />
+        ) : canProvision ? (
           <Button type="button" size="sm" onClick={dialogStore.open}>
             <Plus /> Add Game Server
           </Button>
@@ -728,9 +739,11 @@ function EmptyServerTable({
         <span className="block max-w-sm">
           {searchActive
             ? "Try a game server name, short ID, Relay, address, game, implementation, or version."
-            : canProvision
-              ? "Provision the first game server managed by Hearth."
-              : "No game servers have been assigned to your account yet."}
+            : awaitingFirstRelay
+              ? "Pair a Relay to start hosting game servers."
+              : canProvision
+                ? "Provision the first game server managed by Hearth."
+                : "No game servers have been assigned to your account yet."}
         </span>
       }
       icon={<ServerKindIcon className="size-6" />}
@@ -778,4 +791,16 @@ function createServerTableItems(
     serverTableItemCache.set(server, item)
     return item
   })
+}
+
+// A pending game server shows what its row will once accepted, except its
+// address, which the invitation doesn't carry yet.
+const serverPendingCells: PendingInvitationCells = {
+  server: (invitation) => (
+    <div className="flex w-full min-w-0 items-center px-3">
+      <PendingInvitationCard invitation={invitation} />
+    </div>
+  ),
+  relay: (invitation) => <DataTableTextCell value={invitation.relayName} />,
+  address: () => <DataTableTextCell monospace value="—" />,
 }

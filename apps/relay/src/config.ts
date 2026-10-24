@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
 import { Resolver } from "node:dns/promises"
+import { isIP } from "node:net"
 import { hostname } from "node:os"
 import { Effect, Result } from "effect"
 
@@ -49,8 +50,58 @@ export interface RelayInstanceConfig {
 }
 
 export type RelayTlsMode = "development" | "external" | "managed"
+/**
+ * `node` runs game servers, Apps, and databases for a Hearth. `platform` also
+ * installs and runs Kiln itself on this host: Hearth, its database, and its
+ * cache. See platform.ts.
+ */
+export type RelayMode = "node" | "platform"
 export type RelayProxyMode = "coolify" | "hearth" | "none" | "traefik"
+/**
+ * What serves Hearth in platform mode, beside its own published port:
+ * bundled Traefik with HTTPS, Coolify's Traefik, or nothing.
+ */
+export type RelayPlatformProxy = "coolify" | "none" | "traefik"
+
+export interface RelayPlatformEdge {
+  /** The host in `KILN_URL`: a domain, or an IP address. */
+  readonly host: string
+  /** Kiln's network, which Traefik joins to reach Hearth. */
+  readonly network: string
+  readonly upstream: string
+}
 export type RelayGameHostSource = "configured" | "public_ip" | "relay"
+
+/**
+ * A Hearth that proved the container it runs in, and what it found beside
+ * it then: the database and cache its DB_HOST and CACHE_HOST reached, the
+ * database it uses (DB_NAME), and a digest of each secret in its
+ * BETTER_AUTH_SECRETS. Coolify removes Hearth's container when it stops
+ * Hearth and recreates it under a new ID, so these find Kiln's services,
+ * and a Hearth that hasn't connected yet, without it.
+ */
+export interface ProvenHearth {
+  readonly cache: ProvenContainer | null
+  readonly containerId: string
+  readonly database: ProvenContainer | null
+  readonly databaseName: string | null
+  readonly installationId: string
+  readonly secretDigests: ReadonlyArray<string>
+}
+
+/**
+ * A container by name, and where it keeps its data: each volume
+ * (`volume:<name>`) or host folder (`bind:<path>`) and the path it's
+ * mounted at. One recreated under the name is only taken for it with the
+ * same data in the same places.
+ */
+export interface ProvenContainer {
+  readonly mounts: ReadonlyArray<{
+    readonly destination: string
+    readonly source: string
+  }>
+  readonly name: string
+}
 
 export interface RelayConfig {
   advertisedHost: string
@@ -101,13 +152,32 @@ export interface RelayConfig {
   installationId: string | null
   // Whether KILN_INSTALLATION_ID set it, so Hearth's ID doesn't replace it.
   installationIdConfigured: boolean
+  /**
+   * The Hearth that last proved the container it runs in, which the Relay
+   * saves and loads at startup. While it's for this installation, Kiln's
+   * services deployed without Kiln's labels, as Coolify does, are found
+   * from it.
+   */
+  provenHearth: ProvenHearth | null
   managedLabel: string
   mclogsApiUrl: string
+  mode: RelayMode
+  /**
+   * The Relay's own container, from KILN_RELAY_CONTAINER, for when platform
+   * mode can't identify it from its mounts (Podman, Docker in Docker).
+   */
+  selfContainer: string | null
   serverIdLabel: string
   nodeId: string
   nodeName: string
   port: number
   platformBackupKey: string | null
+  /**
+   * Hearth behind bundled Traefik, by the host people open it at; set from
+   * the installation record once platform mode starts.
+   */
+  platformEdge: RelayPlatformEdge | null
+  platformProxy: RelayPlatformProxy
   publicPort: number
   proxyMode: RelayProxyMode
   resourceNamespace: string | null
@@ -122,13 +192,20 @@ export interface RelayConfig {
   tlsCertificatePath: string | null
   tlsKeyPath: string | null
   tlsMode: RelayTlsMode
+  /** An ACME directory other than Let's Encrypt's, such as its staging one. */
+  traefikAcmeCaServer: string | null
   traefikAcmeEmail: string | null
   traefikImage: string
 }
 
 export function loadConfig(
-  environment: NodeJS.ProcessEnv = process.env
+  configuredEnvironment: NodeJS.ProcessEnv = process.env
 ): RelayConfig {
+  const mode = relayMode(configuredEnvironment)
+  const environment =
+    mode === "platform"
+      ? platformEnvironment(configuredEnvironment)
+      : configuredEnvironment
   const dataDirectory = environment.KILN_RELAY_DATA_DIR?.trim() || "/data"
   const proxyMode = relayProxyMode(environment)
   const port = parsePort(environment, "KILN_RELAY_PORT", 4100)
@@ -240,13 +317,18 @@ export function loadConfig(
     host: environment.KILN_RELAY_BIND_HOST?.trim() || "0.0.0.0",
     installationId,
     installationIdConfigured: installationId !== null,
+    provenHearth: null,
     managedLabel: "kiln.relay.managed=true",
     mclogsApiUrl:
       environment.MCLOGS_API_URL?.trim() || "https://api.mclo.gs/1/log",
+    mode,
+    selfContainer: environment.KILN_RELAY_CONTAINER?.trim() || null,
     nodeId: "kiln-relay",
     nodeName: environment.KILN_RELAY_NAME?.trim() || "",
     port,
     platformBackupKey: optionalPlatformBackupKey(environment),
+    platformEdge: null,
+    platformProxy: mode === "platform" ? platformProxy(environment) : "none",
     publicPort,
     proxyMode,
     resourceNamespace,
@@ -282,8 +364,38 @@ export function loadConfig(
     tlsCertificatePath: environment.KILN_RELAY_TLS_CERT_FILE?.trim() || null,
     tlsKeyPath: environment.KILN_RELAY_TLS_KEY_FILE?.trim() || null,
     tlsMode,
+    traefikAcmeCaServer: acmeCaServer(environment),
     traefikAcmeEmail: environment.KILN_RELAY_ACME_EMAIL?.trim() || null,
     traefikImage: traefikImage(environment),
+  }
+}
+
+function relayMode(environment: NodeJS.ProcessEnv): RelayMode {
+  const value = environment.KILN_RELAY_MODE?.trim() || "node"
+  if (value === "node" || value === "platform") return value
+  throw new Error("KILN_RELAY_MODE must be node or platform")
+}
+
+/**
+ * A Relay that hosts Kiln is reached by Hearth on Kiln's own Docker network,
+ * under this name, which its certificate is issued for. Browsers reach it
+ * through Hearth, so it needs no public address of its own.
+ */
+export const PLATFORM_RELAY_HOST = "kiln-relay"
+
+function platformEnvironment(
+  environment: NodeJS.ProcessEnv
+): NodeJS.ProcessEnv {
+  const host = environment.KILN_RELAY_HOST?.trim() || PLATFORM_RELAY_HOST
+  if (isIP(host)) {
+    throw new Error(
+      "With KILN_RELAY_MODE=platform, KILN_RELAY_HOST must be a hostname: Hearth reaches the Relay by that name on Kiln's network"
+    )
+  }
+  return {
+    ...environment,
+    KILN_RELAY_HOST: host,
+    KILN_RELAY_PROXY: environment.KILN_RELAY_PROXY?.trim() || "hearth",
   }
 }
 
@@ -418,6 +530,24 @@ function relayProxyMode(environment: NodeJS.ProcessEnv): RelayProxyMode {
     return value
   }
   throw new Error("KILN_RELAY_PROXY must be none, hearth, traefik, or coolify")
+}
+
+function platformProxy(environment: NodeJS.ProcessEnv): RelayPlatformProxy {
+  const value = environment.KILN_PLATFORM_PROXY?.trim() || "none"
+  if (value === "none" || value === "traefik" || value === "coolify") {
+    return value
+  }
+  throw new Error("KILN_PLATFORM_PROXY must be none, traefik, or coolify")
+}
+
+function acmeCaServer(environment: NodeJS.ProcessEnv): string | null {
+  const value = environment.KILN_RELAY_ACME_CA_SERVER?.trim()
+  if (!value) return null
+  const url = Result.getOrNull(Result.try(() => new URL(value)))
+  if (url?.protocol !== "https:") {
+    throw new Error("KILN_RELAY_ACME_CA_SERVER must be an https URL")
+  }
+  return url.href
 }
 
 function relayCoolifyPublicOrigin(

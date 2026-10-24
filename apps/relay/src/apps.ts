@@ -15,6 +15,8 @@ import type {
   RelayApp,
   RelayAppDeploymentLog,
   RelayAppDeploymentRead,
+  RelayAppImageCheck,
+  RelayAppImageCheckResult,
   RelayAppAction,
   RelayAppContainer,
   RelayAppDeployment,
@@ -40,6 +42,12 @@ import {
 import { Effect, Predicate, Result } from "effect"
 
 import { commandLines } from "./command.js"
+import {
+  normalizedReference,
+  parseImageReference,
+  repositoryName,
+  type ImageReference,
+} from "./docker-reference.js"
 import type { RelayConfig } from "./config.js"
 import { consoleLineCharacters } from "./console-frames.js"
 import { parseConsoleLine } from "./console-parsing.js"
@@ -60,16 +68,12 @@ import {
   promiseEffect,
   recoverPromise,
 } from "./effect/promise.js"
-import {
-  reportRelayError,
-  traceRelayEffect,
-  traceRelayPromise,
-} from "./effect/runtime.js"
+import { traceRelayEffect, traceRelayPromise } from "./effect/runtime.js"
 import type { RelayStateStore } from "./effect/state.js"
-import { directoryApparentSizeEffect } from "./disk-usage.js"
 import {
   exclusive,
   laneKeys,
+  shared,
   type OperationLanes,
 } from "./operation-lanes.js"
 import { appLifecycleLocks } from "./operation-plans.js"
@@ -93,6 +97,7 @@ import {
   relayResourceNames,
   type RelayResourceNames,
 } from "./relay-resources.js"
+import { relayVolumeDockerName } from "./volumes.js"
 
 // Apps are found by their labels, like databases: the Relay keeps nothing
 // about them besides their data directory and the logs of their recent
@@ -104,6 +109,10 @@ const SERVICE_LABEL = "kiln.app.service"
 const DEPLOYMENT_LABEL = "kiln.app.deployment"
 // The commit a GitHub deployment built.
 const COMMIT_LABEL = "kiln.app.commit"
+// An image app's container runs its image by digest; these keep the
+// reference its config names and the digest that reference named then.
+const IMAGE_LABEL = "kiln.app.image"
+const IMAGE_DIGEST_LABEL = "kiln.app.image.digest"
 const COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 // The console stream that follows an app's deployments; its services'
 // streams are `service:<name>`.
@@ -135,7 +144,15 @@ interface ContainerInspect {
   Created: string
   HostConfig?: { Memory?: number; NanoCpus?: number; NetworkMode?: string }
   Id: string
-  Mounts?: Array<{ Destination?: string; Name?: string; Type: string }>
+  // The image's ID, whatever name `Config.Image` gave it.
+  Image?: string
+  Mounts?: Array<{
+    Destination?: string
+    Name?: string
+    RW?: boolean
+    Source?: string
+    Type: string
+  }>
   Name: string
   // Times Docker restarted it under its restart policy.
   RestartCount?: number
@@ -157,8 +174,12 @@ interface ContainerInspect {
 interface AppContainer extends RelayAppContainer {
   appId: string
   limits: NonNullable<RelayAppContainer["limits"]>
+  mounts: NonNullable<RelayAppContainer["mounts"]>
   deploymentId: string | null
   health: string | null
+  // The digest an image app deployed, from its label.
+  imageDigest: string | null
+  imageId: string | null
   networkMode: string | null
   oomKilled: boolean
   // Exited since it started, and Docker restarted it or is about to.
@@ -218,8 +239,6 @@ export class AppDriver {
   readonly #waiters = new Map<string, Set<() => void>>()
   readonly #lanes: OperationLanes
   readonly #limits: AppLimitStores
-  // Data directory sizes of apps with a disk limit, from the last check.
-  readonly #diskUsage = new Map<string, number>()
 
   /**
    * Callers hold the App's lane locks for each change; a deployment's build
@@ -239,14 +258,10 @@ export class AppDriver {
     this.#lanes = lanes
     this.#limits = limits
     this.#networking = networking
-    // Every container counts its memory and CPU, and the app its disk.
+    // Every container counts its memory and CPU.
     limits.allocations.register(APP_KIND, async () =>
-      (await this.#existing()).flatMap((app) => [
-        {
-          id: app.id,
-          limits: { ...NO_RESOURCE_LIMITS, diskBytes: app.diskLimitBytes },
-        },
-        ...app.containers.map((container) => ({
+      (await this.#existing()).flatMap((app) =>
+        app.containers.map((container) => ({
           id: app.id,
           limits: {
             ...NO_RESOURCE_LIMITS,
@@ -255,8 +270,8 @@ export class AppDriver {
               memoryBytes: container.limits.memoryBytes,
             }),
           },
-        })),
-      ])
+        }))
+      )
     )
   }
 
@@ -305,11 +320,10 @@ export class AppDriver {
 
   // The apps that exist, as their networks and containers report them.
   async #existing(): Promise<Array<RelayApp>> {
-    const [containers, networks, host, diskLimits] = await Promise.all([
+    const [containers, networks, host] = await Promise.all([
       this.#containers(),
       this.#networks(),
       this.#hostDataDirectory(),
-      this.#diskLimits(),
     ])
     const ids = new Set([
       ...networks,
@@ -320,8 +334,7 @@ export class AppDriver {
       this.#toApp(
         id,
         containers.filter((container) => container.appId === id),
-        host,
-        diskLimits
+        host
       )
     )
   }
@@ -336,11 +349,10 @@ export class AppDriver {
       async () => {
         const ids = [...new Set(requests.map((request) => request.id))]
         const detail = requests.some((request) => request.view === "detail")
-        const [containers, networks, host, diskLimits] = await Promise.all([
+        const [containers, networks, host] = await Promise.all([
           this.#containers(undefined, ids, signal),
           this.#networks(signal),
           detail ? this.#hostDataDirectory() : "",
-          detail ? this.#diskLimits() : new Map<string, number>(),
           Promise.all(ids.map((id) => this.#restoreDeployment(id))),
         ])
         const provisioning = await this.#provisioning()
@@ -355,7 +367,7 @@ export class AppDriver {
           const common = { id, view, observedState }
           if (view === "detail") {
             const [app] = withProvisioning(
-              exists ? [this.#toApp(id, owned, host, diskLimits)] : [],
+              exists ? [this.#toApp(id, owned, host)] : [],
               placeholder ? new Map([[id, placeholder]]) : new Map()
             )
             return [{ ...common, app }]
@@ -406,7 +418,7 @@ export class AppDriver {
   async deploy(input: RelayDeployApp): Promise<RelayApp> {
     const problem = sourceProblem(input)
     if (problem) throw new Error(problem)
-    await this.get(input.appId)
+    const app = await this.get(input.appId)
     // Check after the await, so two deploys sent together can't both pass.
     if (this.#deployments.get(input.appId)?.state === "running") {
       throw new Error("A deployment is already running")
@@ -418,7 +430,14 @@ export class AppDriver {
       dropped: 0,
       error: null,
       finishedAt: null,
-      id: deploymentStamp(),
+      // Later than any the app had, so a deployment within a second of
+      // the last doesn't take the name or files its containers still use.
+      id: deploymentStamp([
+        this.#deployments.get(input.appId)?.id,
+        ...app.containers.map(
+          (container) => container.labels[DEPLOYMENT_LABEL]
+        ),
+      ]),
       lines: [],
       rolling: null,
       sourceType: input.config.sourceType,
@@ -433,7 +452,20 @@ export class AppDriver {
           .run(
             {
               label: "app.deployment",
-              locks: appLifecycleLocks(input.appId),
+              // The volumes it mounts can't be deleted before its containers
+              // mount them.
+              locks: [
+                ...appLifecycleLocks(input.appId),
+                ...[
+                  ...new Set(
+                    input.config.mounts.flatMap((mount) =>
+                      mount.source.type === "volume"
+                        ? [mount.source.volumeId]
+                        : []
+                    )
+                  ),
+                ].map((id) => shared(laneKeys.volume(id))),
+              ],
             },
             promiseEffect(() => this.#runDeployment(input, deployment))
           )
@@ -512,7 +544,6 @@ export class AppDriver {
     const engine = this.#engine
     await this.#reserving(
       input.appId,
-      input.diskLimitBytes,
       containers.map((container) => {
         const next = input.serviceLimits[container.service]
         return {
@@ -568,88 +599,9 @@ export class AppDriver {
   }
 
   /**
-   * Measures the data directories of apps with a disk limit and stops a
-   * running app that's past its limit, in its lifecycle lane so it can't
-   * interleave with a deploy or a start. Once its turn comes it reads the
-   * limit and the containers again, and measures again. Docker leaves a
-   * stopped container stopped under its `unless-stopped` policy.
-   */
-  async enforceDiskLimits(): Promise<void> {
-    const diskLimits = await this.#diskLimits()
-    for (const appId of this.#diskUsage.keys()) {
-      if (!diskLimits.has(appId)) this.#diskUsage.delete(appId)
-    }
-    for (const [appId, limitBytes] of diskLimits) {
-      // One app that can't be measured doesn't keep the rest unchecked.
-      await Effect.runPromise(
-        traceRelayEffect(
-          "relay.apps.diskLimit.check",
-          this.#enforceDiskLimit(appId, limitBytes),
-          { "relay.app_id": appId, "relay.disk.limit_bytes": limitBytes }
-        ).pipe(
-          Effect.catch((cause) =>
-            Effect.sync(() =>
-              reportRelayError(cause, {
-                operation: "relay.apps.diskLimitStop",
-              })
-            )
-          )
-        )
-      )
-    }
-  }
-
-  #enforceDiskLimit(appId: string, limitBytes: number) {
-    const measure = directoryApparentSizeEffect(this.#appDirectory(appId))
-    const diskUsage = this.#diskUsage
-    const engine = this.#engine
-    const current = () =>
-      Effect.all([
-        promiseEffect(() => this.#diskLimits()).pipe(
-          Effect.map((limits) => limits.get(appId) ?? null)
-        ),
-        promiseEffect(() => this.#appContainers(appId)).pipe(
-          Effect.map((containers) =>
-            containers.filter((container) => container.running)
-          )
-        ),
-      ])
-    const wake = () => this.#wake(appId)
-    return Effect.gen({ self: this }, function* () {
-      const usedBytes = yield* measure
-      diskUsage.set(appId, usedBytes)
-      yield* Effect.annotateCurrentSpan("relay.disk.used_bytes", usedBytes)
-      if (usedBytes <= limitBytes) return
-      const [, running] = yield* current()
-      if (running.length === 0) return
-      yield* this.#lanes.run(
-        { label: "app.disk-limit.stop", locks: appLifecycleLocks(appId) },
-        Effect.gen(function* () {
-          const [limit, running] = yield* current()
-          if (limit === null || running.length === 0) return
-          const measured = yield* measure
-          diskUsage.set(appId, measured)
-          if (measured <= limit) return
-          yield* Effect.annotateCurrentSpan("relay.disk.stopped", true)
-          yield* Effect.logWarning(
-            `Stopping app ${appId}: its data exceeded its disk limit`
-          )
-          yield* Effect.forEach(
-            running,
-            ({ id }) =>
-              engine.stopContainer(id, { seconds: 30, timeout: 90_000 }),
-            { concurrency: "unbounded", discard: true }
-          )
-        })
-      )
-      wake()
-    })
-  }
-
-  /**
    * Checks an app's limits against every instance's and reserves them,
-   * holding the node's allocations only that long, then runs `apply` and
-   * saves its disk limit. The reservation stands in for the app's
+   * holding the node's allocations only that long, then runs `apply`. The
+   * reservation stands in for the app's
    * containers until `apply` ends, so no other change claims the same
    * capacity meanwhile, and a deployment waiting on health checks doesn't
    * hold up every other change on the node. Callers hold the app's
@@ -659,7 +611,6 @@ export class AppDriver {
    */
   async #reserving<A>(
     appId: string,
-    diskLimitBytes: number | null,
     services: ReadonlyArray<ServiceResourceLimits>,
     apply: (surge: boolean) => Promise<A>,
     options: {
@@ -679,11 +630,8 @@ export class AppDriver {
             locks: [exclusive(laneKeys.allocations)],
           },
           promiseEffect(async () => {
-            await this.#assertLimitsFit(appId, diskLimitBytes, services)
-            const [containers, diskLimits] = await Promise.all([
-              this.#appContainers(appId),
-              this.#diskLimits(),
-            ])
+            await this.#assertLimitsFit(appId, services)
+            const containers = await this.#appContainers(appId)
             const running = containers
               .filter((container) => container.running)
               .map((container) => container.limits)
@@ -692,19 +640,15 @@ export class AppDriver {
               running.length > 0 &&
               (await recoverPromise(
                 () =>
-                  this.#assertLimitsFit(
-                    appId,
-                    diskLimitBytes,
-                    services,
-                    running
-                  ).then(() => true),
+                  this.#assertLimitsFit(appId, services, running).then(
+                    () => true
+                  ),
                 () => false
               ))
             const current = combinedLimits(
-              containers.map((container) => container.limits),
-              diskLimits.get(appId) ?? null
+              containers.map((container) => container.limits)
             )
-            const requested = combinedLimits(services, diskLimitBytes)
+            const requested = combinedLimits(services)
             // Beside the running containers, both sets of memory count; a
             // smaller limit isn't free until it applies, and may not, so
             // otherwise the wider of the two does.
@@ -728,34 +672,20 @@ export class AppDriver {
         { "relay.app_id": appId, "relay.app.services": services.length }
       )
     )
-    return ensuringPromise(async () => {
-      const applied = await apply(surge)
-      await Effect.runPromise(
-        this.#limits.state.setDiskLimit(APP_KIND, appId, diskLimitBytes)
-      )
-      return applied
-    }, release)
+    return ensuringPromise(() => apply(surge), release)
   }
 
   async #assertLimitsFit(
     appId: string,
-    diskLimitBytes: number | null,
     services: ReadonlyArray<ServiceResourceLimits>,
     // Containers that keep running beside the new ones.
     alongside: ReadonlyArray<ServiceResourceLimits> = []
   ): Promise<void> {
-    const [filesystem, others, current] = await Promise.all([
+    const [filesystem, others] = await Promise.all([
       statfs(this.#config.rootDirectory),
       this.#limits.allocations.others(APP_KIND, appId),
-      this.#diskLimits().then((limits) => limits.get(appId) ?? null),
     ])
     const nodeDiskBytes = filesystem.blocks * filesystem.bsize
-    assertResourceLimitsFit({
-      currentDiskBytes: current,
-      limits: { ...NO_RESOURCE_LIMITS, diskBytes: diskLimitBytes },
-      nodeDiskBytes,
-      others,
-    })
     // Each service's memory counts against the node, with the others'.
     const allocated: Array<typeof NO_RESOURCE_LIMITS> = [
       ...others,
@@ -771,10 +701,6 @@ export class AppDriver {
       })
       allocated.push(limits)
     }
-  }
-
-  #diskLimits(): Promise<ReadonlyMap<string, number>> {
-    return Effect.runPromise(this.#limits.state.listDiskLimits(APP_KIND))
   }
 
   /**
@@ -807,7 +733,11 @@ export class AppDriver {
       Effect.forEach(
         containers,
         ({ id }) =>
-          engine.removeContainer(id, { force: true, timeout: 90_000 }),
+          engine.removeContainer(id, {
+            force: true,
+            timeout: 90_000,
+            volumes: input.deleteData,
+          }),
         { concurrency: "unbounded", discard: true }
       )
     )
@@ -841,6 +771,10 @@ export class AppDriver {
         )
     )
     await rm(this.#dockerfilePath(input.appId), { force: true })
+    await rm(this.#mountDirectory(input.appId), {
+      force: true,
+      recursive: true,
+    })
     if (input.deleteData) {
       await rm(this.#appDirectory(input.appId), {
         force: true,
@@ -855,10 +789,6 @@ export class AppDriver {
       force: true,
       recursive: true,
     })
-    await Effect.runPromise(
-      this.#limits.state.setDiskLimit(APP_KIND, input.appId, null)
-    )
-    this.#diskUsage.delete(input.appId)
     this.#deployments.delete(input.appId)
     this.#wake(input.appId)
     return { appId: input.appId, deleted: true }
@@ -1055,6 +985,7 @@ export class AppDriver {
           log(`Source: ${describeSource(input)}`)
           await this.#ensureResources(input.appId)
           const host = await this.#hostDataDirectory()
+          const mounts = await this.#configMounts(input, deployment, host)
           const checkout =
             config.sourceType === "github" && input.github
               ? await traceRelayPromise(
@@ -1066,7 +997,7 @@ export class AppDriver {
             config.sourceType === "compose" ||
             input.github?.build === "compose"
           ) {
-            await this.#deployCompose(input, deployment, host, checkout)
+            await this.#deployCompose(input, deployment, host, checkout, mounts)
           } else {
             const image =
               config.sourceType === "image"
@@ -1075,11 +1006,10 @@ export class AppDriver {
                   )
                 : await traceRelayPromise("relay.apps.deployment.build", () =>
                     this.#buildImage(input, deployment, checkout)
-                  )
+                  ).then((reference) => ({ labels: {}, reference }))
             // Its one service's limits count once the image is ready.
             await this.#reserving(
               input.appId,
-              config.diskLimitBytes,
               [
                 config.serviceLimits[APP_SERVICE] ?? {
                   cpuMillis: null,
@@ -1088,7 +1018,17 @@ export class AppDriver {
               ],
               (surge) =>
                 traceRelayPromise("relay.apps.deployment.replace", () =>
-                  this.#replaceContainer(input, deployment, image, host, surge)
+                  this.#replaceContainer(
+                    input,
+                    deployment,
+                    image,
+                    host,
+                    mounts.filter(
+                      (mount) =>
+                        mount.service === null || mount.service === APP_SERVICE
+                    ),
+                    surge
+                  )
                 ),
               { surge: true }
             )
@@ -1097,6 +1037,7 @@ export class AppDriver {
       )
     )
     await this.#cleanCheckouts(input.appId)
+    await this.#cleanMountFiles(input.appId)
     const seconds = ((Date.now() - startedAt) / 1_000).toFixed(1)
     const message = Result.isSuccess(outcome)
       ? null
@@ -1232,6 +1173,141 @@ export class AppDriver {
     }
   }
 
+  /**
+   * What each image app's tag names in its registry now, against the
+   * digest its container runs. Apps naming the same image share one lookup,
+   * and an app mid-deployment, or whose container runs another image than
+   * the one named, needs none.
+   */
+  async checkImages(
+    input: RelayAppImageCheck,
+    signal: AbortSignal
+  ): Promise<Array<RelayAppImageCheckResult>> {
+    const containers = await this.#containers(
+      undefined,
+      input.apps.map((app) => app.appId),
+      signal
+    )
+    const checks = input.apps.map(({ appId, image }) => {
+      const reference = Result.try(() => parseImageReference(image))
+      // The container serving the app: a deployment's replacement only
+      // takes over once it's healthy, and no check runs during one.
+      const container = containers
+        .filter(
+          (candidate) =>
+            candidate.appId === appId && candidate.service === APP_SERVICE
+        )
+        .sort(
+          (left, right) =>
+            Number(right.running) - Number(left.running) ||
+            newestFirst(left, right)
+        )[0]
+      const deploying = this.#deployments.get(appId)?.state === "running"
+      // The name to look up, while the container runs the image its config
+      // names by tag: another image, or a digest, which never moves, has
+      // nothing to compare.
+      const lookup =
+        !deploying &&
+        container &&
+        Result.isSuccess(reference) &&
+        reference.success.digest === undefined &&
+        sameImage(container.image, reference.success)
+          ? normalizedReference(reference.success)
+          : null
+      return { appId, container, deploying, lookup, reference }
+    })
+    const wanted = new Set(
+      checks.flatMap(({ lookup }) => (lookup === null ? [] : [lookup]))
+    )
+    const latest = new Map(
+      await docker(
+        Effect.forEach(
+          [...wanted],
+          (name) =>
+            this.#engine.distributionDigest(name).pipe(
+              Effect.result,
+              Effect.map((result) => [name, result] as const)
+            ),
+          { concurrency: 4 }
+        ),
+        signal
+      )
+    )
+    return Promise.all(
+      checks.map(
+        async ({
+          appId,
+          container,
+          deploying,
+          lookup,
+          reference,
+        }): Promise<RelayAppImageCheckResult> => {
+          if (Result.isFailure(reference)) {
+            return {
+              appId,
+              error: "The image isn't a valid reference",
+              status: "error",
+            }
+          }
+          if (deploying) return { appId, status: "deploying" }
+          if (!container) return { appId, status: "not_deployed" }
+          // Its own lookup only: another app naming the same image says
+          // nothing of what this one runs.
+          const found = lookup === null ? undefined : latest.get(lookup)
+          if (!found) return { appId, status: "changed" }
+          if (Result.isFailure(found)) {
+            return {
+              appId,
+              error: found.failure.reason.slice(0, 500),
+              status: "error",
+            }
+          }
+          return {
+            appId,
+            latestDigest: found.success,
+            runningDigests: container.imageDigest
+              ? [container.imageDigest]
+              : await this.#repositoryDigests(
+                  container,
+                  reference.success,
+                  signal
+                ),
+            status: "checked",
+          }
+        }
+      )
+    )
+  }
+
+  /**
+   * The digests a container's image was pulled as from its repository, for
+   * one deployed before Kiln labelled the digest it runs.
+   */
+  async #repositoryDigests(
+    container: AppContainer,
+    reference: ImageReference,
+    signal: AbortSignal
+  ): Promise<Array<string>> {
+    if (!container.imageId) return []
+    const image = await docker(
+      this.#engine
+        .inspectImage<{
+          RepoDigests?: Array<string> | null
+        } | null>(container.imageId)
+        .pipe(Effect.catchIf(isDockerNotFound, () => Effect.succeed(null))),
+      signal
+    )
+    const repository = repositoryName(reference)
+    return (image?.RepoDigests ?? []).flatMap((entry) => {
+      const parsed = Result.try(() => parseImageReference(entry))
+      return Result.isSuccess(parsed) &&
+        parsed.success.digest !== undefined &&
+        repositoryName(parsed.success) === repository
+        ? [parsed.success.digest]
+        : []
+    })
+  }
+
   #deploymentDirectory(appId: string): string {
     return join(this.#config.dataDirectory, "app-deployments", appId)
   }
@@ -1291,17 +1367,81 @@ export class AppDriver {
     )
   }
 
-  async #pullImage(input: RelayDeployApp, deployment: Deployment) {
-    const image = input.config.image
-    this.#log(input.appId, deployment, `Pulling ${image}`)
+  // Keeps the files each deployment whose containers are left mounts,
+  // whether it succeeded or failed with the earlier ones kept; removes every
+  // other.
+  async #cleanMountFiles(appId: string) {
+    const root = this.#mountDirectory(appId)
     await Effect.runPromise(
-      this.#engine.pullImage(image, {
-        onLine: (line) => this.#logOutput(input.appId, deployment, line),
-        timeout: PULL_TIMEOUT_MS,
-      }),
-      { signal: deployment.abort.signal }
+      promiseEffect(async () => {
+        const inUse = new Set(
+          (await this.#appContainers(appId)).flatMap((container) =>
+            container.deploymentId ? [container.deploymentId] : []
+          )
+        )
+        for (const entry of await readdir(root)) {
+          if (inUse.has(entry)) continue
+          await rm(join(root, entry), { force: true, recursive: true })
+        }
+      }).pipe(Effect.ignore)
     )
-    return image
+  }
+
+  /**
+   * Pulls the image app's image at the digest its tag names now, or the
+   * one the deployment names, and runs it by that digest, so another app
+   * pulling the same tag meanwhile can't change what this one starts.
+   */
+  async #pullImage(
+    input: RelayDeployApp,
+    deployment: Deployment
+  ): Promise<DeployedImage> {
+    const image = input.config.image
+    const log = (text: string, level: RelayConsoleLevel = "info") =>
+      this.#log(input.appId, deployment, text, level)
+    const signal = deployment.abort.signal
+    const reference = parseImageReference(image)
+    const pull = (name: string) =>
+      docker(
+        this.#engine.pullImage(name, {
+          onLine: (line) => this.#logOutput(input.appId, deployment, line),
+          timeout: PULL_TIMEOUT_MS,
+        }),
+        signal
+      )
+    // A reference that names its digest already runs as it is.
+    if (reference.digest !== undefined) {
+      log(`Pulling ${image}`)
+      await pull(image)
+      return { labels: {}, reference: image }
+    }
+    const digest =
+      input.imageDigest ??
+      (await docker(
+        this.#engine.distributionDigest(image).pipe(
+          Effect.catch((cause) =>
+            Effect.sync(() => {
+              log(`Could not read ${image}'s digest: ${cause.reason}`, "warn")
+              return null
+            })
+          )
+        ),
+        signal
+      ))
+    // A registry that can't say leaves the tag to name it, untracked.
+    if (digest === null) {
+      log(`Pulling ${image}`)
+      await pull(image)
+      return { labels: {}, reference: image }
+    }
+    const pinned = `${repositoryName(reference)}@${digest}`
+    log(`Pulling ${image}`)
+    log(`Digest: ${digest}`)
+    await pull(pinned)
+    return {
+      labels: { [IMAGE_DIGEST_LABEL]: digest, [IMAGE_LABEL]: image },
+      reference: pinned,
+    }
   }
 
   // Builds a pasted Dockerfile with the app's data directory as the
@@ -1357,8 +1497,9 @@ export class AppDriver {
   async #replaceContainer(
     input: RelayDeployApp,
     deployment: Deployment,
-    image: string,
+    image: DeployedImage,
     host: string,
+    mounts: ReadonlyArray<ConfigMount>,
     // Whether the node holds the new container beside the running one.
     surge: boolean
   ) {
@@ -1380,15 +1521,14 @@ export class AppDriver {
     )
     const running = previous.some((container) => container.running)
     // Two containers can't hold the same host port or Tailscale address,
-    // or memory the node doesn't have for both.
+    // share a volume's data, or take memory the node doesn't have for both.
     const blocker =
       config.ports.length > 0
         ? "it publishes ports on the Relay"
         : tailscale.length > 0
           ? "it has a Tailscale address"
-          : !surge
-            ? "the node can't hold both copies at once"
-            : null
+          : (mountsRollingBlocker(mounts) ??
+            (!surge ? "the node can't hold both copies at once" : null))
     const rolling = running && blocker === null
     deployment.rolling = rolling
     if (running && blocker) {
@@ -1399,13 +1539,14 @@ export class AppDriver {
         command: shellWords(config.command),
         env: environment,
         hostname,
-        image,
+        image: image.reference,
         ...containerLimitSpec({
           ...NO_RESOURCE_LIMITS,
           ...config.serviceLimits[APP_SERVICE],
         }),
         labels: {
           ...routes.labels(APP_SERVICE),
+          ...image.labels,
           ...this.#containerLabels(
             input.appId,
             APP_SERVICE,
@@ -1413,13 +1554,15 @@ export class AppDriver {
             deployment.commit
           ),
         },
-        mounts: [
-          {
-            source: join(host, "apps", input.appId),
-            target: config.dataMount,
-            type: "bind",
-          },
-        ],
+        mounts: mounts.map((mount) => ({
+          // Docker leaves a volume it only reads as it is, even empty, so a
+          // new container beside the running one writes nothing to it.
+          noCopy: mount.type === "volume" && mount.readOnly,
+          readOnly: mount.readOnly,
+          source: mount.source,
+          target: mount.target,
+          type: mount.type,
+        })),
         name,
         // Beside the running container, the new one takes the app's name
         // on its network only once it's healthy, so bundled Traefik sends it
@@ -1654,10 +1797,16 @@ export class AppDriver {
     }
   }
 
+  // With its anonymous volumes, such as those its image declares: a
+  // container keeps nothing past its replacement but what the config mounts.
   async #removeContainer(container: string) {
     await docker(
       this.#engine
-        .removeContainer(container, { force: true, timeout: 90_000 })
+        .removeContainer(container, {
+          force: true,
+          timeout: 90_000,
+          volumes: true,
+        })
         .pipe(Effect.ignore)
     )
   }
@@ -1701,15 +1850,16 @@ export class AppDriver {
     input: RelayDeployApp,
     deployment: Deployment,
     host: string,
-    checkout: string | null
+    checkout: string | null,
+    mounts: ReadonlyArray<ConfigMount>
   ) {
     const log = (text: string, level: RelayConsoleLevel = "info") =>
       this.#log(input.appId, deployment, text, level)
     const base = this.#composeProject(input.appId)
     const directory = this.#appDirectory(input.appId)
     const hostDirectory = join(host, "apps", input.appId)
-    // A pasted Compose file's relative paths are in the app's data
-    // directory; a repository's in its own folder of the checkout, so its
+    // A pasted Compose file's relative paths are in the app's own folder on
+    // the Relay; a repository's in its own folder of the checkout, so its
     // builds and binds read the repository's files.
     let file = input.config.compose
     let projectDirectory = directory
@@ -1730,7 +1880,6 @@ export class AppDriver {
       ...process.env,
       ...this.#environment(input.appId, deployment, input.config),
       KILN_APP_ID: input.appId,
-      KILN_DATA: hostDirectory,
     }
     // The standalone Compose binary, which `docker compose` runs.
     const composeArguments = (project: string) => [
@@ -1768,13 +1917,16 @@ export class AppDriver {
       commit: deployment.commit,
       databases,
       deploymentId: deployment.id,
+      mounts,
       routes,
       serviceLimits: input.config.serviceLimits,
       tailscale,
     }
     const previous = await this.#appContainers(input.appId)
     const running = previous.some((container) => container.running)
-    const blocker = composeRollingBlocker(normalized, tailscale)
+    const blocker =
+      mountsRollingBlocker(mounts) ??
+      composeRollingBlocker(normalized, tailscale)
     if (running && blocker) {
       log(`Stopping the running containers first, since ${blocker}`)
     }
@@ -1787,7 +1939,6 @@ export class AppDriver {
     ) =>
       this.#reserving(
         input.appId,
-        input.config.diskLimitBytes,
         Object.values(prepared.services).map(composeServiceLimits),
         (fits) =>
           traceRelayPromise("relay.apps.deployment.composeUp", () =>
@@ -2012,7 +2163,13 @@ export class AppDriver {
       const inspected = await docker(
         this.#engine.inspectContainer<ContainerInspect>(container.id)
       )
-      if (inspected.Mounts?.some((mount) => mount.Type === "volume")) {
+      // Kiln mounts a volume a service only reads without the image's
+      // files, so two copies can share it; one either writes is shared.
+      if (
+        inspected.Mounts?.some(
+          (mount) => mount.Type === "volume" && mount.RW !== false
+        )
+      ) {
         return container.service
       }
     }
@@ -2065,6 +2222,8 @@ export class AppDriver {
       databases: ReadonlyArray<string>
       deferAliases: boolean
       deploymentId: string
+      // The config's mounts, beside the Compose file's own.
+      mounts: ReadonlyArray<ConfigMount>
       routes: AppRoutePlan
       serviceLimits: AppConfig["serviceLimits"]
       tailscale: ReadonlyArray<{
@@ -2087,12 +2246,29 @@ export class AppDriver {
       )
       return bind ? `${bind.host}${source.slice(bind.relay.length)}` : null
     }
+    for (const mount of options.mounts) {
+      if (mount.service !== null && !normalized.services?.[mount.service]) {
+        throw new Error(
+          `The Compose file has no "${mount.service}" service to mount ${mount.target} in`
+        )
+      }
+    }
     const services: Record<string, ComposeService> = {}
     for (const [name, service] of Object.entries(normalized.services ?? {})) {
       if (!appServiceNameSchema.safeParse(name).success) {
         throw new Error(`Rename the "${name}" service: use letters and digits`)
       }
       const mounts = fileMounts(service, normalized, hostPath)
+      const configured = options.mounts
+        .filter((mount) => mount.service === null || mount.service === name)
+        .map((mount) => ({
+          read_only: mount.readOnly,
+          source: mount.source,
+          target: mount.target,
+          type: mount.type,
+          ...(mount.type === "volume" &&
+            mount.readOnly && { volume: { nocopy: true } }),
+        }))
       const networks: Record<string, unknown> = service.network_mode
         ? {}
         : {
@@ -2146,7 +2322,7 @@ export class AppDriver {
         restart: service.restart ?? "unless-stopped",
         ...(service.network_mode ? {} : { networks }),
         ...mounts,
-        ...(service.volumes || mounts.volumes
+        ...(service.volumes || mounts.volumes || configured.length > 0
           ? {
               volumes: [
                 ...(service.volumes ?? []).map((volume) => {
@@ -2160,6 +2336,7 @@ export class AppDriver {
                   return host ? { ...volume, source: host } : volume
                 }),
                 ...(mounts.volumes ?? []),
+                ...configured,
               ],
             }
           : {}),
@@ -2168,8 +2345,21 @@ export class AppDriver {
     if (Object.keys(services).length === 0) {
       throw new Error("The Compose file has no services")
     }
+    const volumes = options.mounts.filter((mount) => mount.type === "volume")
     return {
       ...normalized,
+      ...(volumes.length > 0 && {
+        // Kiln's volumes exist already, outside the project.
+        volumes: {
+          ...normalized.volumes,
+          ...Object.fromEntries(
+            volumes.map((mount) => [
+              mount.source,
+              { external: true, name: mount.source },
+            ])
+          ),
+        },
+      }),
       networks: {
         ...normalized.networks,
         kiln_app: { external: true, name: this.#networkName(options.appId) },
@@ -2350,8 +2540,7 @@ export class AppDriver {
   #toApp(
     id: string,
     containers: ReadonlyArray<AppContainer>,
-    host: string,
-    diskLimits: ReadonlyMap<string, number>
+    host: string
   ): RelayApp {
     const deployment = this.#deployments.get(id) ?? null
     const { observedState, status } = this.#runtimeState(id, containers)
@@ -2383,6 +2572,7 @@ export class AppDriver {
           image: container.image,
           labels: container.labels,
           limits: container.limits,
+          mounts: container.mounts,
           name: container.name,
           networks: container.networks,
           ports: container.ports,
@@ -2393,8 +2583,6 @@ export class AppDriver {
           status: container.status,
         })),
       dataDirectory: join(host, "apps", id),
-      diskLimitBytes: diskLimits.get(id) ?? null,
-      diskUsedBytes: this.#diskUsage.get(id) ?? null,
       deployment: deployment ? deploymentSummary(deployment) : null,
       hostname: this.#hostname(id),
       id,
@@ -2465,13 +2653,22 @@ export class AppDriver {
         exitCode: state.Running ? null : state.ExitCode,
         health: state.Health?.Status ?? null,
         id: container.Id,
-        image: container.Config.Image,
+        image: labels[IMAGE_LABEL] ?? container.Config.Image,
+        imageDigest: labels[IMAGE_DIGEST_LABEL] ?? null,
+        imageId: container.Image ?? null,
         labels: Object.fromEntries(
           Object.entries(labels).flatMap(([key, value]) =>
             value === undefined ? [] : [[key, value]]
           )
         ),
         limits: containerResourceLimits(container),
+        mounts: (container.Mounts ?? []).map((mount) => ({
+          destination: mount.Destination ?? "",
+          readOnly: mount.RW === false,
+          source:
+            (mount.Type === "volume" ? mount.Name : mount.Source) ?? "",
+          type: mount.Type,
+        })),
         name: container.Name.replace(/^\//u, ""),
         networkMode: container.HostConfig?.NetworkMode ?? null,
         networks: Object.keys(container.NetworkSettings?.Networks ?? {}),
@@ -2558,6 +2755,78 @@ export class AppDriver {
     return join(this.#config.dataDirectory, "app-builds", `${appId}.Dockerfile`)
   }
 
+  // Where the files an app's config mounts are written, apart from its data
+  // directory so the app can't reach them there.
+  #mountDirectory(appId: string): string {
+    return join(this.#config.dataDirectory, "app-mounts", appId)
+  }
+
+  // The config's mounts as Docker takes them: volumes by their Docker name,
+  // and files written where the host can bind them, in a folder of the
+  // deployment's own, so the running containers' files stay as they are
+  // until it replaces them.
+  async #configMounts(
+    input: RelayDeployApp,
+    deployment: Deployment,
+    host: string
+  ): Promise<Array<ConfigMount>> {
+    const directory = join(this.#mountDirectory(input.appId), deployment.id)
+    const mounts: Array<ConfigMount> = []
+    for (const mount of input.config.mounts) {
+      const { readOnly, service, source, target } = mount
+      switch (source.type) {
+        case "volume": {
+          const name = await docker(
+            relayVolumeDockerName(this.#config, this.#engine, source.volumeId)
+          )
+          if (!name) {
+            throw new Error(
+              `The volume mounted at ${target} no longer exists; choose another`
+            )
+          }
+          mounts.push({
+            kind: "volume",
+            readOnly,
+            service,
+            source: name,
+            target,
+            type: "volume",
+          })
+          break
+        }
+        case "host":
+          mounts.push({
+            kind: "host",
+            readOnly,
+            service,
+            source: source.path,
+            target,
+            type: "bind",
+          })
+          break
+        case "file":
+          await mkdir(directory, { recursive: true })
+          await writeFile(join(directory, mount.id), source.content)
+          mounts.push({
+            kind: "file",
+            readOnly,
+            service,
+            source: join(
+              host,
+              "app-mounts",
+              input.appId,
+              deployment.id,
+              mount.id
+            ),
+            target,
+            type: "bind",
+          })
+          break
+      }
+    }
+    return mounts
+  }
+
   #resourceLabels(appId: string): Record<string, string> {
     const labels: Record<string, string> = {
       [ID_LABEL]: appId,
@@ -2591,6 +2860,23 @@ export class AppDriver {
   }
 }
 
+// What a deployment runs its container from, and the labels that say so.
+interface DeployedImage {
+  labels: Record<string, string>
+  reference: string
+}
+
+// One of the config's mounts, resolved for Docker.
+interface ConfigMount {
+  // Where it comes from in the config.
+  kind: "file" | "host" | "volume"
+  readOnly: boolean
+  service: string | null
+  source: string
+  target: string
+  type: "bind" | "volume"
+}
+
 interface ComposeFileReference {
   source: string
   target?: string
@@ -2613,6 +2899,7 @@ interface ComposeService {
 interface ComposeProject {
   configs?: Record<string, { file?: unknown; [key: string]: unknown }>
   networks?: Record<string, unknown>
+  volumes?: Record<string, unknown>
   secrets?: Record<string, { file?: unknown; [key: string]: unknown }>
   services: Record<string, ComposeService>
   [key: string]: unknown
@@ -2712,6 +2999,7 @@ function composeRollingBlocker(
   tailscale: ReadonlyArray<{ service: string }>
 ): string | null {
   for (const [name, service] of Object.entries(project.services ?? {})) {
+    // Even read-only: a rolled project names its own volumes anew.
     if (service.volumes?.some((volume) => volume.type === "volume")) {
       return `${name} keeps data in a volume`
     }
@@ -2726,14 +3014,31 @@ function composeRollingBlocker(
   return null
 }
 
+// Two copies can't both write to a volume or a path on the node. A file is
+// written again for each deployment.
+function mountsRollingBlocker(
+  mounts: ReadonlyArray<ConfigMount>
+): string | null {
+  const written = mounts.filter((mount) => !mount.readOnly)
+  return written.some((mount) => mount.kind === "volume")
+    ? "it keeps data in a volume"
+    : written.some((mount) => mount.kind === "host")
+      ? "it writes to a path on the node"
+      : null
+}
+
 // A missing or invalid source fails before anything is deployed.
 function sourceProblem(input: RelayDeployApp): string | null {
   const { config } = input
   switch (config.sourceType) {
     case "image":
-      return /^[a-zA-Z0-9][a-zA-Z0-9._\-/:@]*$/u.test(config.image)
-        ? null
-        : "Enter an image to deploy, like nginx:latest"
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._\-/:@]*$/u.test(config.image)) {
+        return "Enter an image to deploy, like nginx:latest"
+      }
+      // A digest to deploy stands in for the image's tag.
+      return input.imageDigest && config.image.includes("@")
+        ? "The image already names a digest"
+        : null
     case "dockerfile":
       return config.dockerfile.trim() ? null : "Add a Dockerfile to build"
     case "compose":
@@ -2846,6 +3151,16 @@ function joinsNetworks(container: AppContainer): boolean {
   )
 }
 
+// Whether a container's image is the one `reference` names, as Docker
+// reads both.
+function sameImage(image: string, reference: ImageReference): boolean {
+  const parsed = Result.try(() => parseImageReference(image))
+  return (
+    Result.isSuccess(parsed) &&
+    normalizedReference(parsed.success) === normalizedReference(reference)
+  )
+}
+
 function newestFirst(
   left: Pick<RelayAppContainer, "createdAt">,
   right: Pick<RelayAppContainer, "createdAt">
@@ -2862,8 +3177,7 @@ function isoTime(value: string | undefined): string | null {
 // One app's containers' limits as one allocation: their memory adds up,
 // and CPU, shared, is its widest.
 function combinedLimits(
-  services: ReadonlyArray<Pick<ServiceResourceLimits, "cpuMillis" | "memoryBytes">>,
-  diskBytes: number | null
+  services: ReadonlyArray<Pick<ServiceResourceLimits, "cpuMillis" | "memoryBytes">>
 ): ResourceLimits {
   return {
     cpuMillis: services.reduce<number | null>(
@@ -2873,7 +3187,7 @@ function combinedLimits(
           : Math.max(widest ?? 0, service.cpuMillis),
       null
     ),
-    diskBytes,
+    diskBytes: null,
     memoryBytes: services.reduce<number | null>(
       (total, service) =>
         service.memoryBytes === null
@@ -2899,8 +3213,24 @@ function deploymentSummary(deployment: Deployment): RelayAppDeployment {
 }
 
 // UTC time to the second, as in kiln-<shortid>-20261009093012.
-function deploymentStamp(): string {
-  return new Date().toISOString().replace(/[-:T]/gu, "").slice(0, 14)
+// The UTC time to the second, as YYYYMMDDHHMMSS, or the second after the
+// latest of `earlier` if that isn't past it yet.
+function deploymentStamp(earlier: ReadonlyArray<string | undefined>): string {
+  const stamp = (time: number) =>
+    new Date(time).toISOString().replace(/[-:T]/gu, "").slice(0, 14)
+  const now = stamp(Date.now())
+  const latest = earlier
+    .filter((id): id is string => id !== undefined && /^\d{14}$/u.test(id))
+    .sort()
+    .at(-1)
+  if (latest === undefined || now > latest) return now
+  const [year, month, day, hour, minute, second] = latest
+    .match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/u)!
+    .slice(1)
+    .map(Number)
+  return stamp(
+    Date.UTC(year!, month! - 1, day, hour, minute, second! + 1)
+  )
 }
 
 // A directory's deployment logs, newest first: their names are their UTC

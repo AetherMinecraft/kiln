@@ -1,12 +1,18 @@
 import type { RowDataPacket } from "mysql2/promise"
 import { relaySnapshotSchema } from "@workspace/contracts"
 import { Clock, Effect } from "effect"
+import type { Tracer } from "effect"
 
 import { Database } from "@/effect/database"
 import { promiseEffect } from "@/effect/promise"
-import { runAppEffect } from "@/effect/runtime"
+import {
+  runAppEffect,
+  runAppEffectUntraced,
+  traceAppPromise,
+} from "@/effect/runtime"
 import { databaseTable } from "@/lib/database-config"
 import { relayRpc } from "@/lib/relay-connection"
+import { startPollingWorker, type WorkerPass } from "@/lib/polling-worker"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { provisionInstanceDomain } from "@/server/domains.server"
 
@@ -16,26 +22,37 @@ interface PostProvisionRow extends RowDataPacket {
   relay_id: string
 }
 
-const POLL_INTERVAL_MS = 2_000
-let workerStarted = false
+interface NextAttemptRow extends RowDataPacket {
+  next_attempt_at: number | string | null
+}
 
 export function scheduleInstancePostProvisionProcessing(): void {
-  if (workerStarted) return
-  workerStarted = true
-  Effect.runFork(
-    promiseEffect(processInstancePostProvisionJobs).pipe(
-      Effect.catch((cause) =>
-        Effect.sync(() =>
-          console.warn("[Kiln] Deferred server setup pass failed:", cause)
-        )
-      ),
-      Effect.andThen(Effect.sleep(POLL_INTERVAL_MS)),
-      Effect.forever
-    )
+  startPollingWorker(
+    "Instances.postProvision",
+    processInstancePostProvisionJobs
   )
 }
 
-async function processInstancePostProvisionJobs(): Promise<void> {
+async function processInstancePostProvisionJobs(): Promise<WorkerPass> {
+  const nextAttemptAt = await runAppEffectUntraced(
+    Effect.gen(function* () {
+      const database = yield* Database
+      const [row] = yield* database.queryRows<NextAttemptRow>(
+        "instances.postProvision.nextAttempt",
+        `SELECT MIN(next_attempt_at) AS next_attempt_at
+           FROM ${databaseTable("instance_post_provision")}`
+      )
+      return row?.next_attempt_at == null ? null : Number(row.next_attempt_at)
+    })
+  )
+  if (nextAttemptAt === null || nextAttemptAt > Date.now()) {
+    return { outcome: "idle", nextAttemptAt }
+  }
+  await traceAppPromise("Instances.postProvision.pass", processDueJobs)
+  return { outcome: "worked" }
+}
+
+async function processDueJobs(span: Tracer.Span): Promise<void> {
   const rows = await runAppEffect(
     "instances.postProvision.list",
     Effect.gen(function* () {
@@ -52,8 +69,13 @@ async function processInstancePostProvisionJobs(): Promise<void> {
       )
     })
   )
-  if (rows.length === 0) return
+  span.attribute("instance.count", rows.length)
+  if (rows.length > 0) await processRows(rows)
+}
 
+async function processRows(
+  rows: ReadonlyArray<PostProvisionRow>
+): Promise<void> {
   const relays = new Map(
     (await listPersistedRelays()).map((relay) => [relay.id, relay])
   )

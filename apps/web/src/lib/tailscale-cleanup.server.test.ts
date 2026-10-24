@@ -119,7 +119,8 @@ const seedNetworkBeingDeleted = Effect.gen(function* () {
   yield* createTailscaleNetworkDefinitionEffect(
     { domain, id: networkId, name: "Private Network" },
     { clientId: "tailscale-client", scopes: [], tags: ["tag:kiln"] },
-    fake.tailnetSecret
+    fake.tailnetSecret,
+    "user-one"
   )
   yield* requestTailscaleNetworkCleanupEffect(networkId, "user-one", [
     deployment(),
@@ -196,6 +197,42 @@ describeMysql("Tailscale cleanup worker", () => {
     }
 
     it.effect(
+      "finishes deleting a network with no Relays left once its retry is due",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* createTailscaleNetworkDefinitionEffect(
+            { domain, id: networkId, name: "Private Network" },
+            { clientId: "tailscale-client", scopes: [], tags: ["tag:kiln"] },
+            fake.tailnetSecret,
+            "user-one"
+          )
+          yield* requestTailscaleNetworkCleanupEffect(networkId, "user-one", [])
+          fake.tailnetDown = false
+          fake.tailnetDns.clear()
+          fake.tailnetDns.set(domain, ["100.64.0.10"])
+          vi.useFakeTimers({ now: Date.now(), toFake: ["Date"] })
+          yield* recordTailscaleCleanupFinalizationFailureEffect(
+            networkId,
+            60,
+            "Tailscale timed out"
+          )
+
+          yield* Effect.promise(processTailscaleCleanupJobs)
+
+          assert.lengthOf(yield* networkRows, 1)
+          assert.isTrue(fake.tailnetDns.has(domain))
+
+          vi.setSystemTime(Date.now() + 61_000)
+
+          yield* Effect.promise(processTailscaleCleanupJobs)
+
+          assert.isFalse(fake.tailnetDns.has(domain))
+          assert.deepStrictEqual(yield* networkRows, [])
+        }).pipe(Effect.ensuring(Effect.sync(() => vi.useRealTimers())))
+    )
+
+    it.effect(
       "tells admins to refresh when every due cleanup row is corrupt",
       () =>
         Effect.gen(function* () {
@@ -206,7 +243,7 @@ describeMysql("Tailscale cleanup worker", () => {
             id: networkId,
             integration: null,
             name: "Private Network",
-          })
+          }, "user-one")
           yield* requestTailscaleNetworkCleanupEffect(networkId, "user-one", [])
           yield* insertRows("tailscale_network_deployment", {
             network_id: networkId,

@@ -100,7 +100,7 @@ export function GitHubSourceFields({
         <Link
           to="/infra/sources"
           search={{ add: true }}
-          className="text-primary hover:underline"
+          className="text-primary-ink hover:underline"
         >
           Add a source
         </Link>
@@ -148,8 +148,9 @@ export function GitHubSourceFields({
             onChange={(repository) =>
               update({
                 branch:
-                  repositories.data?.find((item) => item.fullName === repository)
-                    ?.defaultBranch ?? "",
+                  repositories.data?.find(
+                    (item) => item.fullName === repository
+                  )?.defaultBranch ?? "",
                 repository,
               })
             }
@@ -237,7 +238,7 @@ export function GitHubSourceFields({
       </Field>
       <p className="type-meta text-muted-foreground">
         {draft.build === "compose"
-          ? "Paths in the file are relative to its folder. Mount the app’s data with ${KILN_DATA}."
+          ? "Paths in the file are relative to its folder."
           : "Built with the whole repository as its context."}
       </p>
       <SwitchRow

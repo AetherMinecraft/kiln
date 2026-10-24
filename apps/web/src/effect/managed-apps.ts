@@ -71,14 +71,15 @@ export const createAppRecordEffect = Effect.fn("apps.create")(
     yield* database.execute(
       "app_create",
       `INSERT INTO ${databaseTable("app")}
-      (app_id, relay_id, name, config_ciphertext, created_by, created_at,
-       updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      (app_id, relay_id, name, config_ciphertext, created_by, owner_id,
+       created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         input.appId,
         input.relayId,
         input.name,
         ciphertext,
+        input.createdBy,
         input.createdBy,
         now,
         now,
@@ -103,6 +104,29 @@ export const loadAppConfigEffect = Effect.fn("apps.config")(function* (
   const row = rows.at(0)
   if (!row) return null
   return { ...toRecord(row), config: yield* decryptConfig(row) }
+})
+
+/**
+ * Every app on a Relay with its config. One that can't be read, as when
+ * the secret it was saved with is gone, is left out.
+ */
+export const listRelayAppConfigsEffect = Effect.fn("apps.configs")(function* (
+  relayId: string
+) {
+  const database = yield* Database
+  const rows = yield* database.queryRows<AppConfigRow>(
+    "app_configs",
+    `SELECT app_id, relay_id, name, config_ciphertext, created_by, created_at
+       FROM ${databaseTable("app")}
+      WHERE relay_id = ?`,
+    [relayId]
+  )
+  return yield* Effect.forEach(rows, (row) =>
+    decryptConfig(row).pipe(
+      Effect.map((config) => [{ ...toRecord(row), config }]),
+      Effect.catchCause(() => Effect.succeed([]))
+    )
+  ).pipe(Effect.map((apps) => apps.flat()))
 })
 
 /**
@@ -151,8 +175,10 @@ function decryptConfig(row: AppConfigRow) {
     catch: (cause) =>
       CredentialError.make({ operation: "decrypt_app_config", cause }),
   }).pipe(
+    // Fields apps no longer have, like the data mount and disk limit, are
+    // dropped from configs saved before.
     Effect.map((decrypted) =>
-      appConfigSchema.parse({
+      appConfigSchema.strip().parse({
         ...defaultAppConfig,
         ...(JSON.parse(decrypted.plaintext) as object),
       })

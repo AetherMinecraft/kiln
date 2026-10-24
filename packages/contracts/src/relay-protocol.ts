@@ -3,7 +3,7 @@ import { Schema } from "effect"
 export const relayControlProtocol = "kiln-relay.v1" as const
 // Release compatibility level for response-shape changes. Keep this separate
 // from the WebSocket subprotocol so Hearth can be upgraded before Relay.
-export const relayControlProtocolVersion = 7 as const
+export const relayControlProtocolVersion = 8 as const
 export const relayBrowserProtocol = "kiln-relay-browser.v1" as const
 export const relayBrowserConsoleProtocol = "kiln-relay-browser.v2" as const
 export const relayBrowserConsoleProtocols = [
@@ -46,7 +46,7 @@ export const relayFilePutV1Feature = "files-put-v1"
 export const relayResourceLimitsV1Feature = "resource-limits-v1"
 // The Relay answers `database.limits.write` and reports databases' limits.
 export const relayDatabaseLimitsV1Feature = "database-limits-v1"
-// The Relay applies app configs' `serviceLimits` and `diskLimitBytes`, and
+// The Relay applies app configs' `serviceLimits`, and
 // answers `app.limits.write`.
 export const relayAppLimitsV1Feature = "app-limits-v1"
 // The Relay provisions databases in the background through
@@ -61,6 +61,26 @@ export const relayAppGitHubV1Feature = "app-github-v1"
 // The Relay lists, creates, renames, and deletes its Docker named volumes
 // through `relay.volumes.*`.
 export const relayVolumesV1Feature = "relay-volumes-v1"
+// The Relay answers `app.image.check`, and deploys an image app at the
+// digest `app.deploy`'s `imageDigest` names.
+export const relayAppImageUpdatesV1Feature = "app-image-updates-v1"
+// The Relay reports the Kiln services on its Docker host (Hearth, its
+// database, and its cache) through `relay.platform.*`, and, when it installed
+// them itself, restarts and repairs them.
+export const relayPlatformV1Feature = "relay-platform-v1"
+// The Relay also reports the Traefik in front of Hearth, follows each of
+// Kiln's containers' output as browser resource `platform`, opens shells in
+// them through `relay.platform.terminal.*`, and restarts its own Traefik.
+export const relayPlatformV2Feature = "relay-platform-v2"
+// The Relay browses and edits Hearth's own database through
+// `relay.platform.database.*`, with the credentials Hearth sends.
+export const relayPlatformDatabaseV1Feature = "relay-platform-database-v1"
+// Database dumps travel as files under the database's file root
+// (`database:<id>`): `database.dump.export` writes `export` there for the
+// browser to download, and `database.dump.import` runs the file the browser
+// uploaded, which each import names for itself (`import-<random>`).
+export const relayDatabaseDumpFilesV1Feature = "database-dump-files-v1"
+export const relayDatabaseDumpExportFile = "export"
 export const relayBrowserAuthorizationReviseMaxItems = 256
 
 export const relayControlOperations = [
@@ -91,6 +111,12 @@ export const relayControlOperations = [
   "relay.terminal.write",
   "relay.terminal.claim",
   "relay.terminal.restart",
+  "relay.platform.terminal.attach",
+  "relay.platform.terminal.heartbeat",
+  "relay.platform.terminal.detach",
+  "relay.platform.terminal.write",
+  "relay.platform.terminal.claim",
+  "relay.platform.terminal.restart",
   "relay.proxy.read",
   "relay.proxy.config.read",
   "relay.proxy.write",
@@ -104,6 +130,11 @@ export const relayControlOperations = [
   "relay.clients.list",
   "relay.clients.update",
   "relay.clients.revoke",
+  "relay.platform.read",
+  "relay.platform.logs",
+  "relay.platform.action",
+  "relay.platform.database.read",
+  "relay.platform.database.write",
   "browser.authorization.revise",
   "brick.catalog",
   "brick.recipe",
@@ -141,6 +172,7 @@ export const relayControlOperations = [
   "app.network.write",
   "app.network.routes.read",
   "app.deployment.read",
+  "app.image.check",
   "app.network.routes.write",
   "app.terminal.attach",
   "app.terminal.heartbeat",
@@ -220,8 +252,12 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.tailscale.stack.remove",
   "relay.tailscale.write",
   "relay.proxy.write",
+  "relay.platform.action",
   "relay.terminal.attach",
   "relay.terminal.restart",
+  "relay.platform.terminal.attach",
+  "relay.platform.terminal.restart",
+  "relay.platform.database.write",
   "instance.create",
   "instance.provision.prepare",
   "instance.provision.claim",
@@ -304,6 +340,9 @@ export function relayControlOperationChanges(
     case "relay.volumes.read":
     case "relay.pairing.list":
     case "relay.clients.list":
+    case "relay.platform.read":
+    case "relay.platform.logs":
+    case "relay.platform.database.read":
     case "brick.catalog":
     case "brick.recipe":
     case "database.list":
@@ -313,6 +352,7 @@ export function relayControlOperationChanges(
     case "app.list":
     case "app.network.routes.read":
     case "app.deployment.read":
+    case "app.image.check":
     case "backup.task.get":
     case "backup.task.list":
     case "schedule.overview":
@@ -333,6 +373,12 @@ export function relayControlOperationChanges(
     case "relay.terminal.write":
     case "relay.terminal.claim":
     case "relay.terminal.restart":
+    case "relay.platform.terminal.attach":
+    case "relay.platform.terminal.heartbeat":
+    case "relay.platform.terminal.detach":
+    case "relay.platform.terminal.write":
+    case "relay.platform.terminal.claim":
+    case "relay.platform.terminal.restart":
     case "database.terminal.attach":
     case "database.terminal.heartbeat":
     case "database.terminal.detach":
@@ -370,6 +416,8 @@ export function relayControlOperationChanges(
     case "relay.pairing.revoke":
     case "relay.clients.update":
     case "relay.clients.revoke":
+    case "relay.platform.action":
+    case "relay.platform.database.write":
     case "browser.authorization.revise":
     case "database.create":
     case "database.provision.prepare":
@@ -487,6 +535,8 @@ export function relayControlDeadlineMs(
   if (operation === "relay.networking.write") return 240_000
   if (operation === "relay.tailscale.write") return 90_000
   if (operation === "relay.host.files.mount") return 60_000
+  // A repair can wait for MySQL to become healthy.
+  if (operation === "relay.platform.action") return 240_000
   if (operation === "hearth.tailscale.instance.detach") return 60_000
   if (operation === "instance.delete") return 360_000
   if (operation === "database.create") return 360_000
@@ -494,15 +544,19 @@ export function relayControlDeadlineMs(
   if (operation === "app.delete") return 180_000
   if (operation === "app.action") return 180_000
   if (operation === "app.create") return 60_000
+  // Up to four registry lookups at a time, each up to 20 seconds; Hearth
+  // sends at most 16 apps per request.
+  if (operation === "app.image.check") return 120_000
   if (operation === "database.action") return 180_000
   // Removing a limit recreates the container and waits for it to be ready.
   if (operation === "database.limits.write") return 240_000
   if (operation === "database.credentials.rotate") return 180_000
-  if (operation === "database.dump.export") return 120_000
+  // Dumps take as long as the database's data does.
+  if (operation === "database.dump.export") return 60 * 60_000
   // Docker walks every volume to measure them.
   if (operation === "database.inspect") return 75_000
   if (operation === "database.wipe") return 120_000
-  if (operation === "database.dump.import") return 120_000
+  if (operation === "database.dump.import") return 60 * 60_000
   if (operation === "instance.action") return 180_000
   if (
     operation === "schedule.apply" ||
@@ -556,6 +610,13 @@ export const RelayAuthResponseSchema = Schema.Struct({
   // Hearth's installation ID, which the Relay saves as its own. Relays
   // validate it themselves so an ID they can't use never fails authentication.
   installationId: Schema.optionalKey(Schema.String),
+  // The container Hearth runs in, and an HMAC of
+  // `relayHearthContainerTranscript` keyed by its BETTER_AUTH_SECRETS, which
+  // a Relay on the same host checks against that container's environment.
+  // It then finds Kiln's services without Kiln's labels, as under Coolify.
+  hearthContainer: Schema.optionalKey(
+    Schema.Struct({ id: Schema.String, proof: Schema.String })
+  ),
   signature: Schema.String,
   type: Schema.Literal("auth.response"),
   v: Schema.Literal(1),
@@ -582,13 +643,14 @@ export const RelayBrowserOperationKindSchema = Schema.Literals([
 ])
 
 // The kinds of resource a browser capability can be for. Its `instanceId` is
-// the resource's ID (a Relay's own ID for `relay`); capabilities without
-// `resourceKind` are for servers.
+// the resource's ID (a Relay's own ID for `relay` and `platform`, Kiln's
+// services on its host); capabilities without `resourceKind` are for servers.
 export const relayBrowserResourceKinds = [
   "instance",
   "database",
   "app",
   "relay",
+  "platform",
 ] as const
 
 export const RelayBrowserResourceKindSchema = Schema.Literals(
@@ -602,7 +664,8 @@ export interface RelayConsoleResource {
   readonly id: string
   readonly kind: RelayBrowserResourceKind
   // Which of the resource's outputs to follow, for kinds with more than one:
-  // an app's deployment log or one of its services.
+  // an app's deployment log or one of its services, or one of Kiln's
+  // containers.
   readonly stream?: string
 }
 
@@ -612,6 +675,8 @@ export const relayConsoleReadActions = {
   app: "app.logs.read",
   database: "database.logs.read",
   instance: "instance.console.read",
+  // Hearth issues these only to platform administrators.
+  platform: "relay.logs.read",
   relay: "relay.logs.read",
 } as const satisfies Record<RelayBrowserResourceKind, string>
 
@@ -846,6 +911,22 @@ export function relayAuthResponseTranscript(
     challenge.sessionId,
     challenge.nonce,
     challenge.expiresAt,
+  ])
+}
+
+export function relayHearthContainerTranscript(
+  challenge: Omit<RelayAuthChallenge, "signature">,
+  clientId: string,
+  containerId: string
+): string {
+  return JSON.stringify([
+    relayControlProtocol,
+    "hearth-container",
+    challenge.relayId,
+    clientId,
+    challenge.sessionId,
+    challenge.nonce,
+    containerId,
   ])
 }
 

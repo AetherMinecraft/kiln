@@ -4,6 +4,7 @@ import {
   databaseEngineSupportsLogicalBackups,
   relayBackupTaskSchema,
   relaySnapshotSchema,
+  type AccessGrantScopeType,
   type BackupTarget,
 } from "@workspace/contracts"
 
@@ -38,6 +39,7 @@ import {
   isPlatformAdmin,
   listUserGrants,
   requireRelayPermission,
+  type AccessGrant,
 } from "@/lib/access-control"
 import {
   instanceScope,
@@ -50,6 +52,7 @@ import {
 } from "@/lib/backup-storage-selection.server"
 import { grantHasPermission } from "@/lib/permissions"
 import { scheduleBackupCopyProcessing } from "@/lib/backup-copy"
+import { requestBackupRetention } from "@/lib/backup-maintenance.server"
 import { selectBackupCopySource } from "@/lib/backup-copy-source"
 import {
   publishBackupChange,
@@ -274,9 +277,7 @@ export async function getBackupRunsPageHandler(
     listBackupCatalogPageEffect({
       allowedScopes: isPlatformAdmin(user)
         ? []
-        : (await listUserGrants(user.id)).filter((grant) =>
-            grantHasPermission(grant, "backup.read")
-          ),
+        : backupReadableGrants(await listUserGrants(user.id)),
       cursor,
       direction: query.direction,
       isAdmin: isPlatformAdmin(user),
@@ -315,9 +316,7 @@ export async function getBackupRunForQueryHandler(
     listBackupCatalogPageEffect({
       allowedScopes: isPlatformAdmin(user)
         ? []
-        : (await listUserGrants(user.id)).filter((grant) =>
-            grantHasPermission(grant, "backup.read")
-          ),
+        : backupReadableGrants(await listUserGrants(user.id)),
       backupId: data.backupId,
       cursor: null,
       direction: query.direction,
@@ -847,18 +846,31 @@ export async function updateBackupLimitsHandler(
   ) {
     throw new Error("Platform backup limits require administrator access")
   }
+  // Retention deletes the backups it no longer keeps.
+  if (data.target.kind !== "platform") {
+    await requireRelayPermission({
+      ...(data.target.kind === "database"
+        ? { databaseId: data.target.id }
+        : { instanceId: data.target.id }),
+      permission: "backup.delete",
+      relayId: data.relayId,
+      user,
+    })
+  }
   await runAppEffect(
     "backups.updateLimits",
     updateBackupLimitsEffect({
       admin: data.scope === "platform",
       quantityLimit: data.quantityLimit,
       relayId: data.relayId,
+      retentionDays: data.retentionDays,
       sizeLimitBytes: data.sizeLimitBytes,
       targetId: target.id,
       targetKind: target.kind,
     })
   )
   publishBackupSettingsChange(data.relayId)
+  requestBackupRetention()
   return { updated: true }
 }
 
@@ -1009,4 +1021,12 @@ async function validateRequestedStorage(
 
 async function requireBackupRelay(relayId: string): Promise<PersistedRelay> {
   return activeRelay(relayId)
+}
+
+// Backups live on Relays, game servers and databases, never on one app.
+function backupReadableGrants(grants: ReadonlyArray<AccessGrant>) {
+  return grants.filter(
+    (grant): grant is AccessGrant & { resourceType: AccessGrantScopeType } =>
+      grant.resourceType !== "app" && grantHasPermission(grant, "backup.read")
+  )
 }

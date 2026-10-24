@@ -19,6 +19,12 @@ import { githubSync } from "./0016_github_sync"
 import { auditEvents } from "./0017_audit_events"
 import { appDeployments } from "./0018_app_deployments"
 import { backupErrorCodes } from "./0019_backup_error_codes"
+import { appImageUpdates } from "./0020_app_image_updates"
+import { pushSubscriptions } from "./0021_push_subscriptions"
+import { resourceOwners } from "./0022_resource_owners"
+import { notificationDelivery } from "./0023_notification_delivery"
+import { defaultKilnBackups } from "./0024_default_kiln_backups"
+import { backupRetentionDays } from "./0025_backup_retention_days"
 
 // Append new migrations with the next id. Never edit or reorder applied ones.
 export const migrations: ReadonlyArray<Migration> = [
@@ -41,4 +47,10 @@ export const migrations: ReadonlyArray<Migration> = [
   auditEvents,
   appDeployments,
   backupErrorCodes,
+  appImageUpdates,
+  pushSubscriptions,
+  resourceOwners,
+  notificationDelivery,
+  defaultKilnBackups,
+  backupRetentionDays,
 ]

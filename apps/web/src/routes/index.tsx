@@ -21,18 +21,39 @@ import {
 } from "@/lib/relay-selectors"
 import { getInvitationPreview } from "@/server/access"
 import { getAuthState } from "@/server/auth"
+import {
+  rememberActiveBrowserAccountSession,
+  resumeBrowserAccountSession,
+} from "@/server/browser-accounts"
 import { getUiPreferences } from "@/server/preferences"
 
 export const Route = createFileRoute("/")({
   validateSearch: z.object({
+    addAccount: z.union([z.literal(true), z.literal("true")]).optional(),
     email: z.string().optional(),
     forgot: z.union([z.literal(true), z.literal("true")]).optional(),
     redirect: z.string().optional(),
+    // The setup code from a Relay-installed Hearth's setup link.
+    setup: z.string().max(256).optional(),
     signup: z.union([z.literal(true), z.literal("true")]).optional(),
     verified: z.union([z.literal(true), z.literal("true")]).optional(),
   }),
   beforeLoad: async ({ context, search }) => {
     const state = await getAuthState()
+    // A sign-in abandoned at two-factor, or a revoked session, can leave
+    // other accounts signed in on this browser with none active.
+    if (!state.user && (await resumeBrowserAccountSession())) {
+      throw redirect({ href: search.redirect?.startsWith("/") ? search.redirect : "/" })
+    }
+    if (state.user && search.addAccount && !state.user.isDevelopmentBypass) {
+      await rememberActiveBrowserAccountSession()
+      return {
+        ...state,
+        addingAccount: true,
+        invitationEmail: undefined,
+        invitationSignup: false,
+      }
+    }
     if (!state.user) {
       const reference = invitationReferenceFromRedirect(search.redirect)
       const invitation = reference
@@ -44,6 +65,7 @@ export const Route = createFileRoute("/")({
       const invitationSignup = Boolean(invitation && !invitation.accountExists)
       return {
         ...state,
+        addingAccount: false,
         invitationEmail: invitation?.email,
         invitationSignup,
       }
@@ -141,7 +163,11 @@ export const Route = createFileRoute("/")({
     meta: [
       {
         title: pageTitle(
-          match.context.invitationSignup ? "Create Account" : "Sign In"
+          match.context.invitationSignup
+            ? "Create Account"
+            : match.context.addingAccount
+              ? "Add Account"
+              : "Sign In"
         ),
       },
     ],
@@ -152,17 +178,20 @@ export const Route = createFileRoute("/")({
 function LoginRoute() {
   const search = Route.useSearch()
   const {
+    addingAccount,
     developmentBypassEnabled,
     emailDeliveryEnabled,
     invitationEmail,
     invitationSignup,
     setupRequired,
+    setupTokenRequired,
     signupEnabled,
   } = Route.useRouteContext()
   return (
     <AuthPage
+      addingAccount={addingAccount}
       key={`${invitationEmail ?? ""}:${invitationSignup ? "signup" : "signin"}:${search.forgot ? "forgot" : ""}`}
-      developmentBypassEnabled={developmentBypassEnabled}
+      developmentBypassEnabled={developmentBypassEnabled && !addingAccount}
       emailDeliveryEnabled={emailDeliveryEnabled}
       initialEmail={invitationEmail ?? search.email}
       lockedEmail={invitationSignup ? invitationEmail : undefined}
@@ -170,6 +199,8 @@ function LoginRoute() {
       forgotPassword={Boolean(search.forgot)}
       redirectPath={search.redirect}
       setupRequired={setupRequired}
+      setupToken={search.setup}
+      setupTokenRequired={setupTokenRequired}
       signupEnabled={signupEnabled || invitationSignup}
       verified={Boolean(search.verified)}
     />

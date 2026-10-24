@@ -48,6 +48,7 @@ import { isPlatformAdmin } from "@/lib/access-control"
 import { invalidateRelayCache, relayCachePolicy } from "@/lib/relay-client"
 import { relayRpc } from "@/lib/relay-connection"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
+import { wakePollingWorker } from "@/lib/polling-worker"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { requireEligibleResourceUser } from "@/server/auth"
@@ -161,7 +162,7 @@ export const getTailscaleStacks = createServerFn({ method: "GET" }).handler(
 export const createTailscaleNetwork = createServerFn({ method: "POST" })
   .validator(createTailscaleNetworkSchema)
   .handler(async ({ data }) => {
-    await requireTailscaleAdministrator()
+    const user = await requireTailscaleAdministrator()
     const definitions = await loadTailscaleNetworkDefinitions()
     const domainOwner = definitions.find(
       (definition) => definition.domain === data.domain
@@ -186,7 +187,8 @@ export const createTailscaleNetwork = createServerFn({ method: "POST" })
           name: data.name,
         },
         verified,
-        data.clientSecret
+        data.clientSecret,
+        user.id
       )
     )
     publishTailscaleChange()
@@ -534,7 +536,7 @@ export const saveTailscaleStack = createServerFn({ method: "POST" })
           }
           await Effect.runPromise(
             promiseEffect(() =>
-              saveTailscaleNetworkDefinition(nextDefinition)
+              saveTailscaleNetworkDefinition(nextDefinition, user.id)
             ).pipe(
               Effect.catch((cause) =>
                 Effect.gen(function* () {
@@ -633,6 +635,7 @@ export const removeTailscaleStack = createServerFn({ method: "POST" })
       "tailscale.cleanup.request",
       requestTailscaleNetworkCleanupEffect(data.id, user.id, deployments)
     )
+    wakePollingWorker("TailscaleCleanup")
     publishTailscaleChange()
     return loadTailscaleStacks()
   })
@@ -671,6 +674,9 @@ async function loadTailscaleStacks(): Promise<TailscaleStacksResult> {
           observeTailscaleDeploymentsEffect(observed)
         )
       ).pipe(
+        Effect.map((added) => {
+          if (added > 0) wakePollingWorker("TailscaleCleanup")
+        }),
         Effect.catch((cause) =>
           Effect.sync(() =>
             console.warn(
@@ -925,11 +931,12 @@ function loadTailscaleNetworkDefinitions() {
 }
 
 function saveTailscaleNetworkDefinition(
-  definition: TailscaleNetworkDefinition
+  definition: TailscaleNetworkDefinition,
+  ownerId: string
 ) {
   return runAppEffect(
     "tailscale.networks.save",
-    saveTailscaleNetworkDefinitionEffect(definition)
+    saveTailscaleNetworkDefinitionEffect(definition, ownerId)
   )
 }
 

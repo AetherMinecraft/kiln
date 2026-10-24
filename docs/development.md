@@ -49,8 +49,89 @@ to be unique across running stacks.
 | `pnpm dev:docker:destroy` | Delete a worktree's stack, data, and Relay resources |
 | `pnpm dev:docker:test` | Run web tests against the stack's MySQL |
 
-Run relevant checks with `vp check`, `vp run -r typecheck`, or targeted
+Run relevant checks with `vp check`, `vp run typecheck`, or targeted
 `vp test run` suites. Validate user-visible changes in the browser.
+
+`vp run typecheck` uses the pinned tsrs compiler with two checkers per package
+and checks packages one at a time to leave resources for parallel work. Package
+tasks remain cached by Vite+; use `vp run --filter web typecheck` for Hearth-only
+work. tsrs is experimental and follows TypeScript 7; keep its exact version
+pinned and validate upgrades against the package checks. TypeScript remains
+installed for editor support and declaration builds. If tsrs cannot start (for
+example on Windows or Intel macOS), the task falls back to Vite+'s built-in
+typechecker, without formatting or linting. A type error from an available tsrs
+compiler fails the task directly; it never triggers the fallback. Ordinary
+`vp check` still runs type-aware lint rules without a second compiler check.
+
+## Marketing site
+
+`apps/marketing` is the public site at kiln.site, a separate TanStack Start app
+with no database or Relay. It needs no Docker stack:
+
+```sh
+pnpm --filter marketing dev
+```
+
+It serves `http://localhost:3100`. `KILN_HEARTH_URL` (default
+`https://panel.kiln.site`) is where Log in, Sign up, and plan buttons point, and
+`KILN_DOCS_URL` (default `https://docs.kiln.site`) is where docs links point,
+and `KILN_SITE_URL` (default `https://kiln.site`) is the site's own address for
+canonical links and link previews. All three are read when the site serves a
+request, not at build time. `robots.txt`, `sitemap.xml`, and `llms.txt` in
+`apps/marketing/public` name `https://kiln.site` directly.
+
+Optional Umami tracking uses two runtime environment variables on the marketing
+app (see `.env.marketing.example`):
+
+```sh
+KILN_WEB_ANALYTICS_URL=https://stats.example.com/script.js
+KILN_WEB_ANALYTICS_WEBSITE_ID=your-umami-website-id
+```
+
+Use the full tracker script URL from Umami's website settings, including any
+custom `TRACKER_SCRIPT_NAME`, and that website's ID. Both values are public.
+The script loads with `defer` and Umami tracks client-side page navigations
+automatically. Leaving either variable unset disables tracking; invalid or
+non-HTTP(S) URLs also disable it. No rebuild is needed when changing these
+variables; restart the marketing app. Umami's database URL and authentication
+secrets belong on the Umami app, not the marketing app.
+
+`/install` serves `apps/marketing/install.sh` as plain text, for
+`curl -fsSL https://kiln.site/install | sh` (see [Self-hosting](self-hosting.md)).
+It's bundled when the site builds, so kiln.site serves the script from the
+commit it deployed. Edit it there; the Marketing image workflow already runs for
+changes under `apps/marketing`.
+
+The site serves the Terms of Use and Privacy Policy at `/terms` and `/privacy`.
+Hearth's footer links to them, and Hearth's own `/terms` and `/privacy`
+redirect there, on any panel running Kiln's official images, since those send
+QuartzDev telemetry. A fork's panel (one whose repository, `KILN_GIT_REPO` or the
+one built into its image, isn't `kiln-site/kiln`) links to `/forks-legal`
+instead: an unindexed page saying Kiln doesn't run that panel, with `from` set
+to the panel's `KILN_URL`. `KILN_MARKETING_URL` overrides both with another
+site's `/terms` and `/privacy`. Choosing a
+paid plan opens Hearth's sign-up with `plan` and `interval` parameters and a
+`redirect` to `/settings/billing` carrying the same choice.
+
+Its console and editor demos render Hearth's own components from
+`apps/web/src`, which the site resolves through the `@/` alias; site code uses
+`~/`. Build with `vp run marketing#build` and serve with
+`pnpm --filter marketing start`.
+
+The **Marketing image** workflow builds `ghcr.io/kiln-site/marketing` on PRs
+that touch the site or the Hearth code it renders, and publishes `latest` and
+`sha-<commit>` from `main`. It isn't part of a Kiln release, so self-hosted
+installs never pull it. The image listens on port 3000 and takes the same two
+URLs:
+
+```sh
+docker run -p 3000:3000 -e KILN_HEARTH_URL=https://panel.kiln.site \
+  ghcr.io/kiln-site/marketing:latest
+```
+
+The first publish creates the GHCR package as private. Make it public in the
+package's settings, as with the other images (see [Forking](forking.md)). Run
+the workflow by hand to publish without a change.
 
 ## PR titles
 

@@ -33,6 +33,9 @@ type ToasterStyle = React.CSSProperties & { "--width": string }
 
 const defaultToasterStyle: ToasterStyle = { "--width": "25rem" }
 
+/** How many toasts show at once; newer ones push older ones out of view. */
+export const visibleToastLimit = 4
+
 const Toaster = React.memo(function Toaster({
   className,
   style,
@@ -45,17 +48,23 @@ const Toaster = React.memo(function Toaster({
       offset={{ top: 12 }}
       mobileOffset={{ top: 8, left: 8, right: 8 }}
       gap={8}
-      visibleToasts={4}
+      visibleToasts={visibleToastLimit}
       closeButton
       className={cn("kiln-toaster", className)}
       style={{ ...defaultToasterStyle, ...style }}
       containerAriaLabel="Notifications"
       icons={{
-        success: <CircleCheckIcon className="size-4 text-emerald-400" />,
-        info: <InfoIcon className="size-4 text-sky-400" />,
-        warning: <TriangleAlertIcon className="size-4 text-amber-300" />,
+        success: (
+          <CircleCheckIcon className="size-4 text-emerald-400 light:text-emerald-700" />
+        ),
+        info: <InfoIcon className="size-4 text-sky-400 light:text-sky-700" />,
+        warning: (
+          <TriangleAlertIcon className="size-4 text-amber-300 light:text-amber-700" />
+        ),
         error: <OctagonXIcon className="size-4 text-destructive" />,
-        loading: <Loader2Icon className="size-4 animate-spin text-primary" />,
+        loading: (
+          <Loader2Icon className="size-4 animate-spin text-primary-ink" />
+        ),
         close: <XIcon className="size-4" />,
       }}
       {...props}

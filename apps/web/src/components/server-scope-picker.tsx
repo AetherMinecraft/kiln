@@ -4,11 +4,6 @@ import { ArrowLeftRight, Layers } from "lucide-react"
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@workspace/ui/components/popover"
-import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
@@ -20,6 +15,12 @@ import {
   RelayKindIcon,
   ServerKindIcon,
 } from "@/components/instance-kind-icon"
+import { HearthMark } from "@/components/hearth-mark"
+import {
+  DrawerPopover,
+  DrawerPopoverContent,
+  DrawerPopoverTrigger,
+} from "@/components/drawer-popover"
 import {
   InstancePickerContent,
   type InstancePickerGroup,
@@ -41,6 +42,8 @@ export interface ServerPickerOption<
   id: string
   kind?: K
   name: string
+  /** A Relay option that stands for Kiln itself, on that Relay's host. */
+  platform?: boolean
   relayId: string
   relayName: string
 }
@@ -171,10 +174,11 @@ function ServerScopePickerView<K extends ScopeKind>({
       : `${servers.length} accessible ${servers.length === 1 ? "instance" : "instances"}`
   const scopeKind = selectedServer?.kind ?? selectedKind
   const ScopeIcon = scopeKind ? scopeKindPresentation[scopeKind].Icon : Layers
+  const kilnSelected = selectedServer?.platform === true
 
   return (
     <div className="mb-3">
-      <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
+      <DrawerPopover open={pickerOpen} onOpenChange={setPickerOpen}>
         <WorkspaceSummaryCard
           action={
             <div className="flex shrink-0 items-center gap-2">
@@ -188,7 +192,7 @@ function ServerScopePickerView<K extends ScopeKind>({
                   </TooltipContent>
                 </Tooltip>
               ) : null}
-              <PopoverTrigger asChild>
+              <DrawerPopoverTrigger asChild>
                 <Button
                   type="button"
                   variant="outline"
@@ -198,18 +202,26 @@ function ServerScopePickerView<K extends ScopeKind>({
                   <ArrowLeftRight />
                   {selectedServer || kindScope ? changeLabel : chooseLabel}
                 </Button>
-              </PopoverTrigger>
+              </DrawerPopoverTrigger>
             </div>
           }
-          icon={<ScopeIcon className="size-5" />}
+          icon={
+            kilnSelected ? (
+              <HearthMark className="size-5" />
+            ) : (
+              <ScopeIcon className="size-5" />
+            )
+          }
           title={selectedServer?.name ?? kindScope?.label ?? allLabel}
           titleAccessory={
             <Badge variant="outline" className="type-meta font-mono">
-              {selectedServer?.kind === "relay"
-                ? "Relay"
-                : (selectedServer?.relayName ??
-                  selectedRelayName ??
-                  "All Relays")}
+              {kilnSelected
+                ? `On ${selectedServer?.relayName ?? ""}`
+                : selectedServer?.kind === "relay"
+                  ? "Relay"
+                  : (selectedServer?.relayName ??
+                    selectedRelayName ??
+                    "All Relays")}
             </Badge>
           }
         >
@@ -217,7 +229,8 @@ function ServerScopePickerView<K extends ScopeKind>({
             {selectionMetadata}
           </p>
         </WorkspaceSummaryCard>
-        <PopoverContent
+        <DrawerPopoverContent
+          title={ariaLabel}
           align="end"
           className="w-[min(32rem,calc(100vw-2rem))] overflow-hidden p-0"
         >
@@ -232,8 +245,8 @@ function ServerScopePickerView<K extends ScopeKind>({
             onSelect={selectServer}
             onSelectGroup={allowAll || onSelectKind ? selectGroup : undefined}
           />
-        </PopoverContent>
-      </Popover>
+        </DrawerPopoverContent>
+      </DrawerPopover>
     </div>
   )
 }
@@ -249,13 +262,15 @@ function serverScopePickerItem(
         ? {
             id: server.relayId,
             kind,
+            platform: server.platform,
             relayId: server.relayId,
             source: "fleet",
           }
         : { id: server.id, kind, relayId: server.relayId },
     key: serverPickerOptionKey(server),
-    meta:
-      kind === "relay"
+    meta: server.platform
+      ? `On ${server.relayName}`
+      : kind === "relay"
         ? server.relayId.slice(0, 8)
         : `${server.relayName} · ${server.id.slice(0, 8)}`,
     name: server.name,

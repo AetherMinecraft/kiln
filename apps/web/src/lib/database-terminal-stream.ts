@@ -1,3 +1,4 @@
+import { withRenderedAccount } from "@/lib/browser-accounts"
 import type {
   DatabaseTerminalControl,
   DatabaseTerminalEnd,
@@ -46,7 +47,9 @@ export function databaseTerminalStreamUrl(input: {
     relayId: input.relayId,
     rows: String(input.rows),
   })
-  return `/api/database-terminal/${encodeURIComponent(input.databaseId)}?${search}`
+  return withRenderedAccount(
+    `/api/database-terminal/${encodeURIComponent(input.databaseId)}?${search}`
+  )
 }
 
 export function appTerminalStreamUrl(input: {
@@ -62,7 +65,9 @@ export function appTerminalStreamUrl(input: {
     rows: String(input.rows),
     service: input.service,
   })
-  return `/api/app-terminal/${encodeURIComponent(input.appId)}?${search}`
+  return withRenderedAccount(
+    `/api/app-terminal/${encodeURIComponent(input.appId)}?${search}`
+  )
 }
 
 export function relayTerminalStreamUrl(input: {
@@ -74,5 +79,23 @@ export function relayTerminalStreamUrl(input: {
     cols: String(input.cols),
     rows: String(input.rows),
   })
-  return `/api/relay-terminal/${encodeURIComponent(input.relayId)}?${search}`
+  return withRenderedAccount(
+    `/api/relay-terminal/${encodeURIComponent(input.relayId)}?${search}`
+  )
+}
+
+export function platformTerminalStreamUrl(input: {
+  cols: number
+  rows: number
+  relayId: string
+  role: string
+}) {
+  const search = new URLSearchParams({
+    cols: String(input.cols),
+    rows: String(input.rows),
+    service: input.role,
+  })
+  return withRenderedAccount(
+    `/api/platform-terminal/${encodeURIComponent(input.relayId)}?${search}`
+  )
 }

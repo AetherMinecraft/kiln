@@ -35,9 +35,12 @@ function useRefreshVolumes(relayId: string) {
 export function CreateVolumeDialog({
   relayId,
   onClose,
+  onCreated,
 }: {
   relayId: string
   onClose: () => void
+  // Such as choosing it for what asked for it.
+  onCreated?: (volume: RelayVolume) => void
 }) {
   const refresh = useRefreshVolumes(relayId)
   const [name, setName] = React.useState("")
@@ -47,6 +50,7 @@ export function CreateVolumeDialog({
     onSuccess: async (volume) => {
       await refresh()
       showToast({ message: `${volume.name} created`, type: "success" })
+      onCreated?.(volume)
       onClose()
     },
   })
@@ -230,7 +234,7 @@ export function DeleteVolumeDialog({
             and every file in it will be permanently removed.
           </DialogDescription>
         </DialogHeader>
-        <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs">
+        <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs light:bg-destructive/10">
           <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
           This action cannot be undone.
         </div>

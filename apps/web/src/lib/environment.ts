@@ -1,6 +1,7 @@
 import { Option, Schema } from "effect"
 
 import {
+  DEFAULT_KILN_GIT_REPO,
   isKilnInstallationId,
   kilnGitRepositoryRawUrl,
   resolveKilnGitRepository,
@@ -32,6 +33,39 @@ export function kilnGitRepository(): string {
   return resolveKilnGitRepository(
     process.env.KILN_GIT_REPO || process.env.KILN_DEFAULT_GIT_REPO
   )
+}
+
+export interface KilnLegalUrls {
+  privacy: string
+  terms: string
+}
+
+/**
+ * Where the panel's Terms of Use and Privacy Policy links go: the site
+ * KILN_MARKETING_URL names, or Kiln's website on official images, since
+ * they send QuartzDev telemetry. A fork's panel links to a page saying Kiln
+ * doesn't run it, naming the panel it came from.
+ */
+export function kilnLegalUrls(): KilnLegalUrls {
+  const configured = webUrl(process.env.KILN_MARKETING_URL)
+  const site = configured
+    ? configured.href.replace(/\/+$/u, "")
+    : kilnGitRepository() === DEFAULT_KILN_GIT_REPO
+      ? "https://kiln.site"
+      : null
+  if (site) return { privacy: `${site}/privacy`, terms: `${site}/terms` }
+  const notice = new URL("https://kiln.site/forks-legal")
+  const panel = webUrl(process.env.KILN_URL)
+  if (panel) notice.searchParams.set("from", panel.origin)
+  return { privacy: notice.href, terms: notice.href }
+}
+
+// An http or https address, so a link built from it can't run script.
+function webUrl(value: string | undefined): URL | null {
+  const trimmed = value?.trim()
+  if (!trimmed || !URL.canParse(trimmed)) return null
+  const url = new URL(trimmed)
+  return url.protocol === "https:" || url.protocol === "http:" ? url : null
 }
 
 export function kilnBrickCatalogUrl(): string {

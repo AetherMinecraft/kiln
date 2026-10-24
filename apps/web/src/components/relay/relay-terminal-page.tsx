@@ -5,6 +5,10 @@ import { useRelayWorkspace } from "@/components/relay/relay-workspace-context"
 import type { TerminalBackend } from "@/components/terminal-session"
 import { relayTerminalStreamUrl } from "@/lib/database-terminal-stream"
 import {
+  relayTerminalInputKey,
+  takeTerminalInput,
+} from "@/lib/terminal-prefill"
+import {
   claimRelayTerminal,
   restartRelayTerminal,
   writeRelayTerminal,
@@ -31,6 +35,10 @@ function RelayTerminalSession({ relayId }: { relayId: string }) {
     () => ({
       claim: (input) => claimRelayTerminal({ data: { relayId, ...input } }),
       noun: "host shell",
+      startFailure: {
+        title: "Host shell couldn't start",
+        detail: "The Relay couldn't start a shell on its node.",
+      },
       restart: () => restartRelayTerminal({ data: { relayId } }),
       streamUrl: (size) => relayTerminalStreamUrl({ relayId, ...size }),
       write: (sessionId, data) =>
@@ -38,5 +46,11 @@ function RelayTerminalSession({ relayId }: { relayId: string }) {
     }),
     [relayId]
   )
-  return <TerminalSession backend={backend} />
+  const takeInitialInput = React.useCallback(
+    () => takeTerminalInput(relayTerminalInputKey(relayId)),
+    [relayId]
+  )
+  return (
+    <TerminalSession backend={backend} takeInitialInput={takeInitialInput} />
+  )
 }

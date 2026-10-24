@@ -4,6 +4,7 @@ import {
   completeTailscaleCleanupEffect,
   deferTailscaleCleanupEffect,
   loadPendingTailscaleCleanupsEffect,
+  nextTailscaleCleanupAttemptEffect,
   recordTailscaleCleanupFinalizationFailureEffect,
   tailscaleCleanupRetryDelaySeconds,
   type PendingTailscaleCleanup,
@@ -19,34 +20,34 @@ import {
   type TailscaleNetworkDefinition,
   type TailscaleOAuthCredential,
 } from "@/effect/tailscale-networks"
-import { runAppEffect } from "@/effect/runtime"
+import {
+  runAppEffect,
+  runAppEffectUntraced,
+  traceAppPromise,
+} from "@/effect/runtime"
 import { invalidateRelayCache, relayCachePolicy } from "@/lib/relay-client"
 import { relayRpc } from "@/lib/relay-connection"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
+import { startPollingWorker, type WorkerPass } from "@/lib/polling-worker"
 import { listPersistedRelays, type PersistedRelay } from "@/lib/relay-registry"
 
-const TAILSCALE_CLEANUP_POLL_INTERVAL_MS = 2_000
-const workerState = globalThis as typeof globalThis & {
-  __kilnTailscaleCleanupWorkerStarted?: boolean
-}
-
 export function scheduleTailscaleCleanupProcessing(): void {
-  if (workerState.__kilnTailscaleCleanupWorkerStarted) return
-  workerState.__kilnTailscaleCleanupWorkerStarted = true
-  Effect.runFork(
-    promiseEffect(processTailscaleCleanupJobs).pipe(
-      Effect.catch((cause) =>
-        Effect.sync(() =>
-          console.warn("[Kiln] Tailscale cleanup pass failed:", cause)
-        )
-      ),
-      Effect.andThen(Effect.sleep(TAILSCALE_CLEANUP_POLL_INTERVAL_MS)),
-      Effect.forever
-    )
-  )
+  startPollingWorker("TailscaleCleanup", processTailscaleCleanupJobs)
 }
 
-export async function processTailscaleCleanupJobs(): Promise<void> {
+/** Cleans up what's due for networks being deleted, if anything is. */
+export async function processTailscaleCleanupJobs(): Promise<WorkerPass> {
+  const nextAttemptAt = await runAppEffectUntraced(
+    nextTailscaleCleanupAttemptEffect()
+  )
+  if (nextAttemptAt === null || nextAttemptAt > Date.now()) {
+    return { outcome: "idle", nextAttemptAt }
+  }
+  await traceAppPromise("TailscaleCleanup.pass", processDueCleanups)
+  return { outcome: "worked" }
+}
+
+async function processDueCleanups(): Promise<void> {
   const [pendingBatch, definitions, relays] = await Promise.all([
     runAppEffect(
       "tailscale.cleanup.pending",

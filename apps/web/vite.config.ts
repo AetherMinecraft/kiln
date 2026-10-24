@@ -9,6 +9,8 @@ import { tanstackStart } from "@tanstack/react-start/plugin/vite"
 import viteReact from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
 
+import { emailTheme } from "./scripts/email-theme"
+
 const repositoryRoot = resolve(import.meta.dirname, "../..")
 const release = JSON.parse(
   readFileSync(resolve(repositoryRoot, "release.json"), "utf8")
@@ -16,6 +18,10 @@ const release = JSON.parse(
 const contractsSource = resolve(
   repositoryRoot,
   "packages/contracts/src/index.ts"
+)
+const hearthStylesheet = resolve(
+  repositoryRoot,
+  "packages/ui/src/styles/globals.css"
 )
 const brandingDirectory = resolve(import.meta.dirname, "src/assets/branding")
 const reactScanProductionShim = resolve(
@@ -63,7 +69,7 @@ const config = defineConfig(({ command }) => {
           },
         },
         typecheck: {
-          command: "tsc --noEmit",
+          command: "node ../../scripts/typecheck.mjs",
           dependsOn: [{ task: "build", from: "dependencies" }],
         },
       },
@@ -74,6 +80,8 @@ const config = defineConfig(({ command }) => {
       "import.meta.env.VITE_KILN_VERSION": JSON.stringify(
         process.env.KILN_VERSION?.trim() || release.releaseLine
       ),
+      // Hearth's colors as hex for emails; see scripts/email-theme.ts.
+      __KILN_EMAIL_THEME__: JSON.stringify(emailTheme(hearthStylesheet)),
       // Not under import.meta.env: that object reaches browser bundles.
       __KILN_TELEMETRY_DEFAULTS__: JSON.stringify(
         Object.fromEntries(
@@ -183,21 +191,28 @@ function resolveBuildCommit(): string {
 
 // Emits /manifest.json with content-hashed icon URLs so installed apps and
 // mobile browsers pick up logo changes instead of keeping a cached icon path.
+// Maskable icons keep the logo inside the safe zone, so launchers that crop
+// to a circle or squircle don't clip it; the others fill the whole square.
 function webAppManifest(): Plugin {
   const icons = [
-    { file: "app-icon-192.png", sizes: "192x192", type: "image/png" },
-    { file: "app-icon-512.png", sizes: "512x512", type: "image/png" },
+    { file: "app-icon-192.png", sizes: "192x192", purpose: "any" },
+    { file: "app-icon-512.png", sizes: "512x512", purpose: "any" },
+    { file: "app-icon-maskable-192.png", sizes: "192x192", purpose: "maskable" },
+    { file: "app-icon-maskable-512.png", sizes: "512x512", purpose: "maskable" },
   ]
   const manifest = (iconUrl: (file: string) => string) =>
     JSON.stringify({
+      id: "/",
       short_name: "Kiln",
-      name: "Kiln — Minecraft Control Plane",
+      name: "Kiln — The panel for everything.",
+      description: "Run game servers, apps, and databases on your own Relays.",
       icons: icons.map(({ file, ...icon }) => ({
         src: iconUrl(file),
+        type: "image/png",
         ...icon,
-        purpose: "any maskable",
       })),
       start_url: "/",
+      scope: "/",
       display: "standalone",
       theme_color: "#e9842b",
       background_color: "#181515",

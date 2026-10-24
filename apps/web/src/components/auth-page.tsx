@@ -37,6 +37,7 @@ type VerificationState = {
 }
 
 export function AuthPage({
+  addingAccount = false,
   redirectPath,
   developmentBypassEnabled = false,
   emailDeliveryEnabled = false,
@@ -45,10 +46,13 @@ export function AuthPage({
   initialMode,
   lockedEmail,
   setupRequired = false,
+  setupToken,
+  setupTokenRequired = false,
   signupEnabled = false,
   startWithSignup,
   verified,
 }: {
+  addingAccount?: boolean
   redirectPath?: string
   developmentBypassEnabled?: boolean
   emailDeliveryEnabled?: boolean
@@ -57,6 +61,8 @@ export function AuthPage({
   initialMode?: "claim"
   lockedEmail?: string
   setupRequired?: boolean
+  setupToken?: string
+  setupTokenRequired?: boolean
   signupEnabled?: boolean
   startWithSignup?: boolean
   verified?: boolean
@@ -128,7 +134,14 @@ export function AuthPage({
 
             if (mode === "setup") {
               const result = await createInitialAdministrator({
-                data: { displayName, email, password },
+                data: {
+                  displayName,
+                  email,
+                  password,
+                  setupToken: setupTokenRequired
+                    ? String(form.get("setupToken") ?? "")
+                    : undefined,
+                },
               })
               if (result.verificationRequired) {
                 setVerification({
@@ -463,6 +476,7 @@ export function AuthPage({
       ) : (
         <>
           <AuthHeading
+            addingAccount={addingAccount}
             lockedEmail={lockedEmail}
             mode={mode}
             signupEnabled={signupEnabled}
@@ -505,6 +519,30 @@ export function AuthPage({
             method="post"
             onSubmit={handleSubmit}
           >
+            {mode === "setup" && setupTokenRequired ? (
+              setupToken ? (
+                <input type="hidden" name="setupToken" value={setupToken} />
+              ) : (
+                <Field label="Setup code" htmlFor="setup-token">
+                  <Input
+                    id="setup-token"
+                    name="setupToken"
+                    type="password"
+                    autoComplete="off"
+                    placeholder="From the installer"
+                    required
+                    className="h-11 bg-card/60 font-mono"
+                  />
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    The installer printed a setup link. To see it again, run{" "}
+                    <code className="font-mono">
+                      docker exec kiln-relay kiln-relay platform setup-url
+                    </code>{" "}
+                    on the Relay's host.
+                  </p>
+                </Field>
+              )
+            ) : null}
             {mode === "setup" || mode === "sign-up" ? (
               <Field label="Display Name" htmlFor="display-name">
                 <Input
@@ -710,6 +748,15 @@ export function AuthPage({
             </p>
           ) : null}
 
+          {addingAccount ? (
+            <a
+              href="/"
+              className="mt-3 block text-center text-xs text-muted-foreground transition-colors hover:text-foreground"
+            >
+              Cancel
+            </a>
+          ) : null}
+
           {developmentBypassEnabled && mode !== "forgot-password" ? (
             <>
               <div className="my-6 flex items-center gap-3">
@@ -740,10 +787,12 @@ export function AuthPage({
 }
 
 function AuthHeading({
+  addingAccount,
   lockedEmail,
   mode,
   signupEnabled,
 }: {
+  addingAccount: boolean
   lockedEmail?: string
   mode: AuthMode
   signupEnabled: boolean
@@ -758,12 +807,18 @@ function AuthHeading({
       description: "Create the first administrator account.",
     },
     "sign-in": {
-      title: lockedEmail ? "Sign in to continue" : "Welcome to Kiln",
-      description: lockedEmail
-        ? "Sign in to your account to continue."
-        : signupEnabled
-          ? "Sign in or create a new account."
-          : "Sign in to your control plane.",
+      title: addingAccount
+        ? "Add another account"
+        : lockedEmail
+          ? "Sign in to continue"
+          : "Welcome to Kiln",
+      description: addingAccount
+        ? "Your other accounts stay signed in on this browser."
+        : lockedEmail
+          ? "Sign in to your account to continue."
+          : signupEnabled
+            ? "Sign in or create a new account."
+            : "Sign in to your control plane.",
     },
     "sign-up": {
       title: "Create your Kiln account",
@@ -1017,10 +1072,10 @@ function StateHeading({
 }) {
   return (
     <div>
-      <div className="grid size-11 place-items-center rounded-xl border border-primary/25 bg-primary/8 text-primary">
+      <div className="grid size-11 place-items-center rounded-xl border border-primary/25 bg-primary/8 text-primary-ink">
         <Icon className="size-5" />
       </div>
-      <p className="type-technical-label mt-7 text-primary">{eyebrow}</p>
+      <p className="type-technical-label mt-7 text-primary-ink">{eyebrow}</p>
       <h2 className="mt-2 font-heading text-3xl font-semibold tracking-[-0.045em]">
         {title}
       </h2>
@@ -1067,7 +1122,7 @@ function Notice({
   return (
     <div
       role={destructive ? "alert" : "status"}
-      className={`flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs leading-5 ${destructive ? "border-destructive/30 bg-destructive/8 text-red-300" : "border-emerald-400/20 bg-emerald-400/7 text-emerald-300"}`}
+      className={`flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs leading-5 ${destructive ? "border-destructive/30 bg-destructive/8 text-red-300 light:bg-destructive/16 light:text-red-700" : "border-emerald-400/20 bg-emerald-400/7 text-emerald-300 light:bg-emerald-400/14 light:text-emerald-700"}`}
     >
       {Icon ? <Icon className="mt-0.5 size-3.5 shrink-0" /> : null}
       {children}

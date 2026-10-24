@@ -6,6 +6,7 @@ import {
   databaseEngineSupportsBrowsing,
   databaseEngineSupportsLogicalBackups,
   expandPermissionSelections,
+  type AccessGrantScopeType,
   type AccessPermission,
   type DatabaseEngine,
   type PermissionScopeType,
@@ -19,6 +20,11 @@ export interface ResourceScope {
   relayId: string
   resourceType: PermissionScopeType
   resourceId: string
+}
+
+/** A scope people can be invited to and managed on: not a single app. */
+export interface AccessGrantScope extends ResourceScope {
+  resourceType: AccessGrantScopeType
 }
 
 export interface ResolvedAccessGrant extends ResourceScope {
@@ -40,6 +46,17 @@ interface SelectionRow extends RowDataPacket {
   selection_kind: "permission" | "collection" | "builtin"
   selection_key: string
 }
+
+// What an app's owner holds on it. Configuring and deploying an app, its
+// shell, and its files can reach the Relay's node (a Compose file, its
+// environment and the files it includes, other apps' volumes), so those
+// still take app permissions on the Relay until apps are confined to
+// themselves.
+const appOwnerSelections: ReadonlyArray<PermissionSelection> = [
+  { kind: "permission", key: "app.read" },
+  { kind: "permission", key: "app.logs.read" },
+  { kind: "permission", key: "app.delete" },
+]
 
 /** Load live selections in batches; never turn an empty selection into a role. */
 export const loadResourceGrantsEffect = Effect.fn("access.resolveGrants")(
@@ -119,23 +136,34 @@ export const loadResourceGrantsEffect = Effect.fn("access.resolveGrants")(
       source: "access",
     }))
     // Ownership is authority in its own right, independent of invitations and
-    // presets. Relays are owned by their creator and instances by owner_id.
-    // Databases have no owner: their creator acts through Relay-scope grants,
-    // as before this model, so revoking Relay access revokes database access.
+    // presets. Relays are owned by their creator; game servers, databases and
+    // apps by owner_id.
+    const relayFilter = relayId ? " AND relay_id = ?" : ""
+    const owned = (resourceType: PermissionScopeType) => [
+      userId,
+      ...(relayId ? [relayId] : []),
+      ...(scope
+        ? [scope.resourceType === resourceType ? scope.resourceId : ""]
+        : []),
+    ]
     const ownerRows = yield* query<GrantRow>(
       `SELECT id, id AS relay_id, 'relay' AS resource_type, id AS resource_id, NULL AS engine
          FROM ${databaseTable("relay")} WHERE created_by = ?${relayId ? " AND id = ?" : ""}
        UNION ALL
        SELECT instance_id AS id, relay_id, 'instance', instance_id, NULL
-         FROM ${databaseTable("instance")} WHERE owner_id = ?${relayId ? " AND relay_id = ?" : ""}${scope ? " AND instance_id = ?" : ""}`,
+         FROM ${databaseTable("instance")} WHERE owner_id = ?${relayFilter}${scope ? " AND instance_id = ?" : ""}
+       UNION ALL
+       SELECT database_id AS id, relay_id, 'database', database_id, engine
+         FROM ${databaseTable("database")} WHERE owner_id = ?${relayFilter}${scope ? " AND database_id = ?" : ""}
+       UNION ALL
+       SELECT app_id AS id, relay_id, 'app', app_id, NULL
+         FROM ${databaseTable("app")} WHERE owner_id = ?${relayFilter}${scope ? " AND app_id = ?" : ""}`,
       [
         userId,
         ...(relayId ? [relayId] : []),
-        userId,
-        ...(relayId ? [relayId] : []),
-        ...(scope
-          ? [scope.resourceType === "instance" ? scope.resourceId : ""]
-          : []),
+        ...owned("instance"),
+        ...owned("database"),
+        ...owned("app"),
       ]
     )
     for (const row of ownerRows) {
@@ -144,9 +172,12 @@ export const loadResourceGrantsEffect = Effect.fn("access.resolveGrants")(
         relayId: row.relay_id,
         resourceId: row.resource_id,
         resourceType: row.resource_type,
-        permissions: expandResourceGrantPermissions(row, [
-          { kind: "collection", key: "all" },
-        ]),
+        permissions: expandResourceGrantPermissions(
+          row,
+          row.resource_type === "app"
+            ? appOwnerSelections
+            : [{ kind: "collection", key: "all" }]
+        ),
         source: "owner",
       })
     }

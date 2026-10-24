@@ -42,6 +42,11 @@ import {
   TooltipTrigger,
 } from "@workspace/ui/components/tooltip"
 import { AccountAvatar } from "@/components/account-avatar"
+import {
+  AccountSwitcherSection,
+  signOutAllAccounts,
+  useBrowserAccountsPrefetch,
+} from "@/components/account-switcher"
 import { HearthMark } from "@/components/hearth-mark"
 import {
   CollapsedNotificationsAnchor,
@@ -54,7 +59,13 @@ import {
   RouteCommandMenuProvider,
   RouteCommandMenuTrigger,
 } from "@/components/route-command-menu"
+import { IdentityName } from "@/components/identity-name"
 import { InstanceCard } from "@/components/instance-card"
+import {
+  kilnPresentation,
+  kilnVersion,
+  selectKilnHost,
+} from "@/components/kiln/kiln-presentation"
 import {
   AppKindIcon,
   DatabaseKindIcon,
@@ -62,15 +73,20 @@ import {
   ServerKindIcon,
 } from "@/components/instance-kind-icon"
 import {
+  DrawerPopover,
+  DrawerPopoverContent,
+  DrawerPopoverTrigger,
+} from "@/components/drawer-popover"
+import {
   InstancePickerContent,
   type InstancePickerItem,
 } from "@/components/instance-picker"
-import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { clearAppearanceCache } from "@/lib/appearance"
 import {
   accessCapabilitiesQueryOptions,
   appDirectoryQueryOptions,
+  kilnPlatformQueryOptions,
   managedDatabaseDirectoryQueryOptions,
   relaysQueryOptions,
   serverDirectoryQueryOptions,
@@ -113,6 +129,7 @@ import {
   canAccessActivity,
   canAccessAutomations,
   canAccessBackups,
+  kilnDestinations,
   relayDestinations,
   serverDestinations,
   type AppDestinationId,
@@ -220,12 +237,7 @@ const AppSidebarView = React.memo(function AppSidebarView({
 function HeaderNotificationsBell() {
   const { isMobile, state } = useSidebar()
   if (state === "collapsed" && !isMobile) return null
-  return (
-    <NotificationsBell
-      className="mr-1"
-      tooltipHidden={isMobile}
-    />
-  )
+  return <NotificationsBell className="mr-1" tooltipHidden={isMobile} />
 }
 
 function InfrastructureNavigation({
@@ -280,7 +292,11 @@ function InfrastructureNavigation({
   )
 }
 
-function RelaysNavigationItem({ relayConfigured }: { relayConfigured: boolean }) {
+function RelaysNavigationItem({
+  relayConfigured,
+}: {
+  relayConfigured: boolean
+}) {
   return (
     <SidebarMenuItem>
       <SidebarMenuButton asChild tooltip="Relays">
@@ -448,6 +464,10 @@ function SidebarInstanceNavigation({
   // "server", a database selection ("db:<id>"), an app selection
   // ("app:<id>"), a Relay selection ("relay:<id>"), or null off instance
   // routes.
+  const kilnRoute = useRouterState({
+    select: (state) =>
+      state.matches.at(-1)?.routeId.startsWith("/_app/kiln") === true,
+  })
   const routeSelection = useRouterState({
     select: (state) => {
       const params = state.matches.at(-1)?.params as
@@ -516,6 +536,7 @@ function SidebarInstanceNavigation({
     />
   )
 
+  if (kilnRoute) return <SidebarKilnNavigation capabilities={capabilities} />
   return databaseRouteId ? (
     <SidebarDatabaseNavigation
       capabilities={capabilities}
@@ -536,6 +557,49 @@ function SidebarInstanceNavigation({
     />
   ) : (
     serverNavigation
+  )
+}
+
+// Kiln itself: Hearth and the services beside it, while one of its pages
+// is open.
+function SidebarKilnNavigation({
+  capabilities,
+}: {
+  capabilities: NavigationAccessCapabilities
+}) {
+  const { data: host = null } = useQuery({
+    ...kilnPlatformQueryOptions(),
+    select: selectKilnHost,
+  })
+  return (
+    <>
+      <SidebarSeparator />
+      <SidebarGroup>
+        <SidebarGroupContent>
+          <SidebarMenu>
+            <InstanceSelector
+              capabilities={capabilities}
+              selection={{ kind: "kiln", host }}
+            />
+            {kilnDestinations.map((item) => (
+              <SidebarMenuItem key={item.id}>
+                <SidebarMenuButton asChild tooltip={item.label}>
+                  <Link
+                    to={item.to}
+                    activeOptions={{ exact: true, includeSearch: false }}
+                    activeProps={{ "data-active": true }}
+                    preload="intent"
+                  >
+                    <item.icon />
+                    <span>{item.label}</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            ))}
+          </SidebarMenu>
+        </SidebarGroupContent>
+      </SidebarGroup>
+    </>
   )
 }
 
@@ -843,8 +907,7 @@ function SidebarServerNavigation({
 }) {
   const { data, isPending, selectedRouteId, serverId } =
     useSidebarServerNavigation(initialSelectedInstanceRouteId, relayConfigured)
-  if (!data || data.serverCount === 0)
-    return isPending ? null : emptyFallback
+  if (!data || data.serverCount === 0) return isPending ? null : emptyFallback
   const { instance, routeId: instanceRouteId } = data
 
   return (
@@ -967,6 +1030,10 @@ type InstanceSelection =
   | { kind: "database"; database: ManagedDatabaseDirectoryEntry }
   | { kind: "app"; app: AppDirectoryEntry }
   | { kind: "relay"; relay: RelayDirectoryEntry }
+  | {
+      kind: "kiln"
+      host: ReturnType<typeof selectKilnHost>
+    }
   | { kind: "none"; serverCount: number }
 
 const InstanceSelector = React.memo(function InstanceSelector({
@@ -979,7 +1046,6 @@ const InstanceSelector = React.memo(function InstanceSelector({
   navigateToTab?: (tab: InstanceTab, serverId: string) => void
   selection: InstanceSelection
 }) {
-  const { isMobile } = useSidebar()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [open, setOpen] = React.useState(false)
@@ -1125,8 +1191,8 @@ const InstanceSelector = React.memo(function InstanceSelector({
 
   return (
     <SidebarMenuItem>
-      <Popover open={open} onOpenChange={handleOpenChange}>
-        <PopoverTrigger asChild>
+      <DrawerPopover open={open} onOpenChange={handleOpenChange}>
+        <DrawerPopoverTrigger asChild>
           <SidebarMenuButton
             size="lg"
             tooltip={
@@ -1136,14 +1202,16 @@ const InstanceSelector = React.memo(function InstanceSelector({
                   ? "Switch app"
                   : selection.kind === "relay"
                     ? "Switch Relay"
-                    : "Switch game server"
+                    : selection.kind === "kiln"
+                      ? "Switch instance"
+                      : "Switch game server"
             }
             aria-label={
               selection.kind === "none" ? "Choose a game server" : undefined
             }
             onFocus={warmPicker}
             onPointerEnter={warmPicker}
-            className="mb-1.5 h-auto border border-sidebar-border/75 bg-background/35 px-2 py-2 group-data-[collapsible=icon]:h-[40px]! group-data-[collapsible=icon]:overflow-visible group-data-[collapsible=icon]:bg-black/10 hover:border-sidebar-border hover:bg-sidebar-accent group-data-[collapsible=icon]:hover:bg-black/15 data-[state=open]:border-sidebar-border data-[state=open]:bg-sidebar-accent dark:group-data-[collapsible=icon]:bg-black/25 dark:group-data-[collapsible=icon]:hover:bg-black/35"
+            className="mb-1.5 h-auto border border-sidebar-border/75 bg-background/35 px-2 py-2 group-data-[collapsible=icon]:h-[40px]! group-data-[collapsible=icon]:overflow-visible group-data-[collapsible=icon]:bg-card hover:border-sidebar-border hover:bg-sidebar-accent group-data-[collapsible=icon]:hover:bg-sidebar-accent data-[state=open]:border-sidebar-border data-[state=open]:bg-sidebar-accent dark:group-data-[collapsible=icon]:bg-black/25 dark:group-data-[collapsible=icon]:hover:bg-black/35"
           >
             {instance ? (
               <SelectorInstanceName
@@ -1182,13 +1250,12 @@ const InstanceSelector = React.memo(function InstanceSelector({
               />
             ) : selection.kind === "relay" ? (
               <SelectorRelayName relay={selection.relay} />
+            ) : selection.kind === "kiln" ? (
+              <SelectorKilnName host={selection.host} />
             ) : (
               <>
                 <span className="relative grid size-8 shrink-0 place-items-center rounded-md border border-sidebar-border/70 bg-background/25 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent">
-                  <ServerKindIcon
-                    className="size-4"
-                    aria-hidden="true"
-                  />
+                  <ServerKindIcon className="size-4" aria-hidden="true" />
                 </span>
                 <span className="flex min-w-0 flex-1 flex-col items-start group-data-[collapsible=icon]:hidden">
                   <span className="type-control-sm w-full truncate">
@@ -1202,12 +1269,13 @@ const InstanceSelector = React.memo(function InstanceSelector({
                 </span>
               </>
             )}
-            <ChevronsUpDown className="ml-auto size-3.5! text-sidebar-foreground/60 group-data-[collapsible=icon]:hidden" />
+            <ChevronsUpDown className="ml-auto size-3.5! text-sidebar-foreground/60 group-data-[collapsible=icon]:hidden light:text-sidebar-foreground/80" />
           </SidebarMenuButton>
-        </PopoverTrigger>
-        <PopoverContent
+        </DrawerPopoverTrigger>
+        <DrawerPopoverContent
+          title="Switch instance"
           aria-label="Instances"
-          side={isMobile ? "bottom" : "right"}
+          side="right"
           align="start"
           sideOffset={6}
           className="w-72 max-w-[calc(100vw-1rem)] overflow-hidden p-0"
@@ -1219,8 +1287,8 @@ const InstanceSelector = React.memo(function InstanceSelector({
             onNavigate={closePicker}
             onSelect={selectInstance}
           />
-        </PopoverContent>
-      </Popover>
+        </DrawerPopoverContent>
+      </DrawerPopover>
     </SidebarMenuItem>
   )
 })
@@ -1244,7 +1312,7 @@ function SelectorInstanceName({
       <span className="sr-only">{label} </span>
       <InstanceCard
         className="min-w-0 flex-1 gap-2 group-data-[collapsible=icon]:gap-0"
-        iconClassName="border-sidebar-border/70 bg-background/25 text-sidebar-foreground/85 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent"
+        iconClassName="border-sidebar-border/70 bg-background/25 text-sidebar-foreground/85 light:text-sidebar-foreground/92 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent"
         iconSizeClassName="group-data-[collapsible=icon]:size-5!"
         instance={instance}
         meta={meta}
@@ -1252,6 +1320,37 @@ function SelectorInstanceName({
         name={name}
         nameClassName="type-control-sm text-sidebar-foreground"
         showFavorite={false}
+        statusClassName="ring-popover"
+        textClassName="group-data-[collapsible=icon]:sr-only"
+      />
+    </>
+  )
+}
+
+// Kiln, with its own logo: the panel itself and the services beside it.
+function SelectorKilnName({
+  host,
+}: {
+  host: ReturnType<typeof selectKilnHost>
+}) {
+  const version = kilnVersion(host?.status ?? null)
+  return (
+    <>
+      <span className="sr-only">Switch instance. </span>
+      <IdentityName
+        className="min-w-0 flex-1 gap-2 group-data-[collapsible=icon]:gap-0"
+        icon={<HearthMark className="size-4.5 group-data-[collapsible=icon]:size-5" />}
+        iconClassName="border-sidebar-border/70 bg-background/25 group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:inset-0 group-data-[collapsible=icon]:size-full group-data-[collapsible=icon]:rounded-none group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent"
+        meta={[
+          version ? kilnReleaseLabel(version) : null,
+          host?.relayName,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
+        metaClassName="text-sidebar-muted-foreground"
+        name="Kiln"
+        nameClassName="type-control-sm text-sidebar-foreground"
+        status={kilnPresentation(host)}
         statusClassName="ring-popover"
         textClassName="group-data-[collapsible=icon]:sr-only"
       />
@@ -1385,7 +1484,9 @@ function selectSidebarRelayPickerItems(
     identity: { id: relay.id, kind: "relay", relayId: relay.id },
     key: sidebarPickerKey("relay", relay.id, relay.id),
     meta: `${relay.nodeArch ?? "unknown"} · ${
-      relay.nodeVersion ? kilnReleaseLabel(relay.nodeVersion) : relay.id.slice(0, 8)
+      relay.nodeVersion
+        ? kilnReleaseLabel(relay.nodeVersion)
+        : relay.id.slice(0, 8)
     }`,
     name: relay.name,
     searchText: `${relay.id} ${relay.nodeVersion ?? ""}`,
@@ -1627,6 +1728,7 @@ function AccountNavigation({
 
 function CollapsedAccountMenu({ user }: { user: AuthenticatedUser }) {
   const [open, setOpen] = React.useState(false)
+  const prefetchAccounts = useBrowserAccountsPrefetch(!user.isDevelopmentBypass)
   const [signingOut, setSigningOut] = React.useState(false)
   const closeMenu = React.useCallback(() => setOpen(false), [])
 
@@ -1638,6 +1740,7 @@ function CollapsedAccountMenu({ user }: { user: AuthenticatedUser }) {
             type="button"
             className="relative grid size-[40px] place-items-center transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none data-[state=open]:bg-sidebar-accent"
             aria-label={`Open account menu for ${user.name}`}
+            {...prefetchAccounts}
           >
             <AccountAvatar
               className="data-[size=sm]:size-[30px]"
@@ -1650,12 +1753,10 @@ function CollapsedAccountMenu({ user }: { user: AuthenticatedUser }) {
           aria-label="Account menu"
           side="right"
           align="end"
-          className="w-48 p-1"
+          className="w-64 p-1"
         >
-          <p className="truncate px-2 py-2 text-xs text-muted-foreground">
-            {user.name}
-          </p>
-          <div className="-mx-1 mb-1 h-px bg-border" />
+          <AccountSwitcherSection user={user} onNavigate={closeMenu} />
+          <div className="-mx-1 my-1 h-px bg-border" />
           <NotificationsMenuItem onSelect={closeMenu} />
           <Link
             to="/settings/account"
@@ -1699,18 +1800,35 @@ function ExpandedAccountRow({
   isMobile: boolean
   user: AuthenticatedUser
 }) {
+  const [open, setOpen] = React.useState(false)
+  const closeMenu = React.useCallback(() => setOpen(false), [])
+  const prefetchAccounts = useBrowserAccountsPrefetch(!user.isDevelopmentBypass)
   return (
     <div className="flex h-11 items-center gap-1 px-2">
-      <Link
-        to="/settings/account"
-        preload="intent"
-        className="flex min-w-0 flex-1 items-center gap-2 text-sidebar-foreground transition-colors hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none"
-      >
-        <AccountAvatar name={user.name} />
-        <span className="min-w-0 flex-1 truncate text-xs font-semibold">
-          {user.name}
-        </span>
-      </Link>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="-ml-1 flex h-9 min-w-0 flex-1 items-center gap-2 px-1 text-left text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none data-[state=open]:bg-sidebar-accent"
+            aria-label={`Open account menu for ${user.name}`}
+            {...prefetchAccounts}
+          >
+            <AccountAvatar name={user.name} />
+            <span className="min-w-0 flex-1 truncate text-xs font-semibold">
+              {user.name}
+            </span>
+            <ChevronsUpDown className="size-3.5 shrink-0 text-sidebar-foreground/55 light:text-sidebar-foreground/78" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          aria-label="Account menu"
+          side="top"
+          align="start"
+          className="w-64 p-1"
+        >
+          <AccountSwitcherSection user={user} onNavigate={closeMenu} />
+        </PopoverContent>
+      </Popover>
       <SettingsIconButton tooltipHidden={isMobile} />
       <SignOutButton
         developmentBypass={user.isDevelopmentBypass}
@@ -1727,7 +1845,7 @@ function SettingsIconButton({ tooltipHidden }: { tooltipHidden: boolean }) {
         <Link
           to="/settings/account"
           preload="intent"
-          className="grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none"
+          className="grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none light:text-sidebar-foreground/78"
           aria-label="Settings"
         >
           <Settings className="size-4" />
@@ -1754,7 +1872,7 @@ function SignOutButton({
       <TooltipTrigger asChild>
         <button
           type="button"
-          className="ml-auto grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45"
+          className="ml-auto grid size-7 shrink-0 place-items-center text-sidebar-foreground/55 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring/45 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45 light:text-sidebar-foreground/78"
           aria-label={signingOut ? "Signing out" : "Sign out"}
           disabled={signingOut}
           onClick={() => {
@@ -1799,8 +1917,8 @@ function AccessNavigationButton() {
 }
 
 async function signOut(isDevelopmentBypass: boolean) {
-  if (isDevelopmentBypass) await disableDevelopmentBypass()
-  else await authClient.signOut()
+  if (!isDevelopmentBypass) return signOutAllAccounts()
+  await disableDevelopmentBypass()
   clearAppearanceCache()
   window.location.assign("/")
 }
@@ -1833,9 +1951,7 @@ function instanceTabFromPathname(pathname: string): InstanceTab | null {
 
 function appTabFromPathname(pathname: string): AppDestinationId | null {
   const match =
-    /^\/app\/[^/]+\/(files|info|logs|network|terminal)(?:\/|$)/.exec(
-      pathname
-    )
+    /^\/app\/[^/]+\/(files|info|logs|network|terminal)(?:\/|$)/.exec(pathname)
   return match ? (match[1] as AppDestinationId) : null
 }
 

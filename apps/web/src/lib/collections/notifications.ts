@@ -8,13 +8,19 @@ import type { QueryClient } from "@tanstack/react-query"
 import { queryCollectionOptions } from "@tanstack/query-db-collection"
 
 import { forkPromise } from "@/effect/promise"
+import type {
+  NotificationPreferences,
+  NotificationPreferencesUpdate,
+} from "@/lib/notification-preferences"
 import type { InvitationOutcome, KilnNotification } from "@/lib/notifications"
 import { queryKeys } from "@/lib/query-options"
 import {
   clearNotifications,
   dismissNotification,
+  getNotificationPreferences,
   getNotifications,
   markNotificationsRead,
+  saveNotificationPreferences,
 } from "@/server/notifications"
 
 // The user's whole (capped) inbox. The bell, popover, and notifications page
@@ -183,4 +189,82 @@ function newestFirst(left: KilnNotification, right: KilnNotification) {
     return right.createdAt - left.createdAt
   }
   return left.id < right.id ? 1 : left.id > right.id ? -1 : 0
+}
+
+/** What the user hears about, and how; the toasts and settings read it. */
+export function notificationPreferencesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.notificationPreferences,
+    queryFn: () => getNotificationPreferences(),
+    staleTime: Infinity,
+  })
+}
+
+const saveKey = ["notification-preferences", "save"] as const
+
+/** Saves a change to the preferences, showing it at once. */
+export function saveNotificationPreferencesMutationOptions(
+  queryClient: QueryClient,
+  onFailure: (error: Error) => void
+) {
+  const { queryKey } = notificationPreferencesQueryOptions()
+  return mutationOptions({
+    mutationKey: saveKey,
+    // One save at a time, so each answer is newer than the last.
+    scope: { id: "notification-preferences" },
+    mutationFn: (update: NotificationPreferencesUpdate) =>
+      saveNotificationPreferences({ data: update }),
+    onMutate: async (update) => {
+      await queryClient.cancelQueries({ queryKey })
+      const previous = queryClient.getQueryData(queryKey)
+      if (previous)
+        queryClient.setQueryData(queryKey, applyPreferences(previous, update))
+      return { previous }
+    },
+    onError: (error, _update, context) => {
+      if (context?.previous)
+        queryClient.setQueryData(queryKey, context.previous)
+      onFailure(error)
+    },
+    // Saves still waiting are shown already; keep them over this answer.
+    onSuccess: (saved, update) =>
+      queryClient.setQueryData(
+        queryKey,
+        otherPendingSaves(queryClient, update).reduce(applyPreferences, saved)
+      ),
+    // Once the last save is done, what's shown is what's stored, even after
+    // saves that failed rolled back over one another.
+    onSettled: (_saved, _error, update) => {
+      if (!otherPendingSaves(queryClient, update).length)
+        void queryClient.invalidateQueries({ queryKey })
+    },
+  })
+}
+
+// The changes of saves still waiting their turn, oldest first.
+function otherPendingSaves(
+  queryClient: QueryClient,
+  update: NotificationPreferencesUpdate
+) {
+  return queryClient
+    .getMutationCache()
+    .findAll({ mutationKey: saveKey, status: "pending" })
+    .flatMap((mutation) => {
+      const variables: unknown = mutation.state.variables
+      return variables === update || variables === undefined
+        ? []
+        : [variables as NotificationPreferencesUpdate]
+    })
+}
+
+function applyPreferences(
+  preferences: NotificationPreferences,
+  update: NotificationPreferencesUpdate
+): NotificationPreferences {
+  return {
+    idleMinutes: update.idleMinutes ?? preferences.idleMinutes,
+    kinds: { ...preferences.kinds, ...update.kinds },
+    skipPushWhileActive:
+      update.skipPushWhileActive ?? preferences.skipPushWhileActive,
+  }
 }

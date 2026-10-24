@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as AccountStatusRouteImport } from './routes/account-status'
+import { Route as AccountsRouteImport } from './routes/accounts'
 import { Route as ClaimRouteImport } from './routes/claim'
 import { Route as ConsoleRouteImport } from './routes/console'
 import { Route as DiscordRouteImport } from './routes/discord'
@@ -31,6 +32,7 @@ import { Route as AppActivityRouteImport } from './routes/_app.activity'
 import { Route as AppAutomationsRouteImport } from './routes/_app.automations'
 import { Route as AppBackupsRouteImport } from './routes/_app.backups'
 import { Route as AppInfraRouteImport } from './routes/_app.infra'
+import { Route as AppKilnRouteImport } from './routes/_app/kiln'
 import { Route as AppNotificationsRouteImport } from './routes/_app.notifications'
 import { Route as AppOperationsRouteImport } from './routes/_app.operations'
 import { Route as AppServersRouteImport } from './routes/_app.servers'
@@ -57,10 +59,16 @@ import { Route as AppInfraDatabasesRouteImport } from './routes/_app.infra.datab
 import { Route as AppInfraDeploymentsRouteImport } from './routes/_app.infra.deployments'
 import { Route as AppInfraDomainsRouteImport } from './routes/_app.infra.domains'
 import { Route as AppInfraOverviewRouteImport } from './routes/_app.infra.overview'
+import { Route as AppInfraPlatformRouteImport } from './routes/_app.infra.platform'
 import { Route as AppInfraRelaysRouteImport } from './routes/_app.infra.relays'
 import { Route as AppInfraServersRouteImport } from './routes/_app.infra.servers'
 import { Route as AppInfraSourcesRouteImport } from './routes/_app.infra.sources'
 import { Route as AppInfraTailscaleRouteImport } from './routes/_app.infra.tailscale'
+import { Route as AppKilnIndexRouteImport } from './routes/_app/kiln.index'
+import { Route as AppKilnInfoRouteImport } from './routes/_app/kiln.info'
+import { Route as AppKilnLogsRouteImport } from './routes/_app/kiln.logs'
+import { Route as AppKilnTerminalRouteImport } from './routes/_app/kiln.terminal'
+import { Route as AppKilnViewerRouteImport } from './routes/_app/kiln.viewer'
 import { Route as AppRelayRelayIdRouteImport } from './routes/_app/relay/$relayId'
 import { Route as AppServerServerIdRouteImport } from './routes/_app/server/$serverId'
 import { Route as AppSettingsIndexRouteImport } from './routes/_app.settings.index'
@@ -68,6 +76,7 @@ import { Route as AppSettingsAccountRouteImport } from './routes/_app.settings.a
 import { Route as AppSettingsAppearanceRouteImport } from './routes/_app.settings.appearance'
 import { Route as AppSettingsBillingRouteImport } from './routes/_app.settings.billing'
 import { Route as AppSettingsFilesRouteImport } from './routes/_app.settings.files'
+import { Route as AppSettingsNotificationsRouteImport } from './routes/_app.settings.notifications'
 import { Route as AppSettingsRelaysRouteImport } from './routes/_app.settings.relays'
 import { Route as ApiAppTerminalAppIdRouteImport } from './routes/api.app-terminal.$appId'
 import { Route as ApiAuthSplatRouteImport } from './routes/api.auth.$'
@@ -76,6 +85,8 @@ import { Route as ApiDatabaseTerminalDatabaseIdRouteImport } from './routes/api.
 import { Route as ApiGithubManifestRouteImport } from './routes/api.github.manifest'
 import { Route as ApiGithubSetupRouteImport } from './routes/api.github.setup'
 import { Route as ApiGithubWebhookRouteImport } from './routes/api.github.webhook'
+import { Route as ApiKilnDatabaseExportRouteImport } from './routes/api.kiln.database-export'
+import { Route as ApiPlatformTerminalRelayIdRouteImport } from './routes/api.platform-terminal.$relayId'
 import { Route as ApiRelayTerminalRelayIdRouteImport } from './routes/api.relay-terminal.$relayId'
 import { Route as AppAppAppIdIndexRouteImport } from './routes/_app/app/$appId.index'
 import { Route as AppAppAppIdSplatRouteImport } from './routes/_app/app/$appId.$'
@@ -130,6 +141,11 @@ const AppRoute = AppRouteImport.update({
 const AccountStatusRoute = AccountStatusRouteImport.update({
   id: '/account-status',
   path: '/account-status',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AccountsRoute = AccountsRouteImport.update({
+  id: '/accounts',
+  path: '/accounts',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ClaimRoute = ClaimRouteImport.update({
@@ -225,6 +241,11 @@ const AppBackupsRoute = AppBackupsRouteImport.update({
 const AppInfraRoute = AppInfraRouteImport.update({
   id: '/infra',
   path: '/infra',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppKilnRoute = AppKilnRouteImport.update({
+  id: '/kiln',
+  path: '/kiln',
   getParentRoute: () => AppRoute,
 } as any)
 const AppNotificationsRoute = AppNotificationsRouteImport.update({
@@ -357,6 +378,11 @@ const AppInfraOverviewRoute = AppInfraOverviewRouteImport.update({
   path: '/overview',
   getParentRoute: () => AppInfraRoute,
 } as any)
+const AppInfraPlatformRoute = AppInfraPlatformRouteImport.update({
+  id: '/platform',
+  path: '/platform',
+  getParentRoute: () => AppInfraRoute,
+} as any)
 const AppInfraRelaysRoute = AppInfraRelaysRouteImport.update({
   id: '/relays',
   path: '/relays',
@@ -376,6 +402,31 @@ const AppInfraTailscaleRoute = AppInfraTailscaleRouteImport.update({
   id: '/tailscale',
   path: '/tailscale',
   getParentRoute: () => AppInfraRoute,
+} as any)
+const AppKilnIndexRoute = AppKilnIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppKilnRoute,
+} as any)
+const AppKilnInfoRoute = AppKilnInfoRouteImport.update({
+  id: '/info',
+  path: '/info',
+  getParentRoute: () => AppKilnRoute,
+} as any)
+const AppKilnLogsRoute = AppKilnLogsRouteImport.update({
+  id: '/logs',
+  path: '/logs',
+  getParentRoute: () => AppKilnRoute,
+} as any)
+const AppKilnTerminalRoute = AppKilnTerminalRouteImport.update({
+  id: '/terminal',
+  path: '/terminal',
+  getParentRoute: () => AppKilnRoute,
+} as any)
+const AppKilnViewerRoute = AppKilnViewerRouteImport.update({
+  id: '/viewer',
+  path: '/viewer',
+  getParentRoute: () => AppKilnRoute,
 } as any)
 const AppRelayRelayIdRoute = AppRelayRelayIdRouteImport.update({
   id: '/relay/$relayId',
@@ -412,6 +463,12 @@ const AppSettingsFilesRoute = AppSettingsFilesRouteImport.update({
   path: '/files',
   getParentRoute: () => AppSettingsRoute,
 } as any)
+const AppSettingsNotificationsRoute =
+  AppSettingsNotificationsRouteImport.update({
+    id: '/notifications',
+    path: '/notifications',
+    getParentRoute: () => AppSettingsRoute,
+  } as any)
 const AppSettingsRelaysRoute = AppSettingsRelaysRouteImport.update({
   id: '/relays',
   path: '/relays',
@@ -453,6 +510,17 @@ const ApiGithubWebhookRoute = ApiGithubWebhookRouteImport.update({
   path: '/api/github/webhook',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiKilnDatabaseExportRoute = ApiKilnDatabaseExportRouteImport.update({
+  id: '/api/kiln/database-export',
+  path: '/api/kiln/database-export',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiPlatformTerminalRelayIdRoute =
+  ApiPlatformTerminalRelayIdRouteImport.update({
+    id: '/api/platform-terminal/$relayId',
+    path: '/api/platform-terminal/$relayId',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiRelayTerminalRelayIdRoute = ApiRelayTerminalRelayIdRouteImport.update({
   id: '/api/relay-terminal/$relayId',
   path: '/api/relay-terminal/$relayId',
@@ -668,6 +736,7 @@ const AppServerServerIdFilesSplatRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/account-status': typeof AccountStatusRoute
+  '/accounts': typeof AccountsRoute
   '/claim': typeof ClaimRoute
   '/console': typeof ConsoleRoute
   '/discord': typeof DiscordRoute
@@ -687,6 +756,7 @@ export interface FileRoutesByFullPath {
   '/automations': typeof AppAutomationsRouteWithChildren
   '/backups': typeof AppBackupsRouteWithChildren
   '/infra': typeof AppInfraRouteWithChildren
+  '/kiln': typeof AppKilnRouteWithChildren
   '/notifications': typeof AppNotificationsRoute
   '/operations': typeof AppOperationsRoute
   '/servers': typeof AppServersRoute
@@ -710,16 +780,22 @@ export interface FileRoutesByFullPath {
   '/infra/deployments': typeof AppInfraDeploymentsRoute
   '/infra/domains': typeof AppInfraDomainsRoute
   '/infra/overview': typeof AppInfraOverviewRoute
+  '/infra/platform': typeof AppInfraPlatformRoute
   '/infra/relays': typeof AppInfraRelaysRoute
   '/infra/servers': typeof AppInfraServersRoute
   '/infra/sources': typeof AppInfraSourcesRoute
   '/infra/tailscale': typeof AppInfraTailscaleRoute
+  '/kiln/info': typeof AppKilnInfoRoute
+  '/kiln/logs': typeof AppKilnLogsRoute
+  '/kiln/terminal': typeof AppKilnTerminalRoute
+  '/kiln/viewer': typeof AppKilnViewerRoute
   '/relay/$relayId': typeof AppRelayRelayIdRouteWithChildren
   '/server/$serverId': typeof AppServerServerIdRouteWithChildren
   '/settings/account': typeof AppSettingsAccountRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
   '/settings/billing': typeof AppSettingsBillingRoute
   '/settings/files': typeof AppSettingsFilesRoute
+  '/settings/notifications': typeof AppSettingsNotificationsRoute
   '/settings/relays': typeof AppSettingsRelaysRoute
   '/api/app-terminal/$appId': typeof ApiAppTerminalAppIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
@@ -728,10 +804,13 @@ export interface FileRoutesByFullPath {
   '/api/github/manifest': typeof ApiGithubManifestRoute
   '/api/github/setup': typeof ApiGithubSetupRoute
   '/api/github/webhook': typeof ApiGithubWebhookRoute
+  '/api/kiln/database-export': typeof ApiKilnDatabaseExportRoute
+  '/api/platform-terminal/$relayId': typeof ApiPlatformTerminalRelayIdRoute
   '/api/relay-terminal/$relayId': typeof ApiRelayTerminalRelayIdRoute
   '/automations/': typeof AppAutomationsIndexRoute
   '/backups/': typeof AppBackupsIndexRoute
   '/infra/': typeof AppInfraIndexRoute
+  '/kiln/': typeof AppKilnIndexRoute
   '/settings/': typeof AppSettingsIndexRoute
   '/app/$appId/$': typeof AppAppAppIdSplatRoute
   '/app/$appId/files': typeof AppAppAppIdFilesRouteWithChildren
@@ -777,6 +856,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/account-status': typeof AccountStatusRoute
+  '/accounts': typeof AccountsRoute
   '/claim': typeof ClaimRoute
   '/console': typeof ConsoleRoute
   '/discord': typeof DiscordRoute
@@ -813,14 +893,20 @@ export interface FileRoutesByTo {
   '/infra/deployments': typeof AppInfraDeploymentsRoute
   '/infra/domains': typeof AppInfraDomainsRoute
   '/infra/overview': typeof AppInfraOverviewRoute
+  '/infra/platform': typeof AppInfraPlatformRoute
   '/infra/relays': typeof AppInfraRelaysRoute
   '/infra/servers': typeof AppInfraServersRoute
   '/infra/sources': typeof AppInfraSourcesRoute
   '/infra/tailscale': typeof AppInfraTailscaleRoute
+  '/kiln/info': typeof AppKilnInfoRoute
+  '/kiln/logs': typeof AppKilnLogsRoute
+  '/kiln/terminal': typeof AppKilnTerminalRoute
+  '/kiln/viewer': typeof AppKilnViewerRoute
   '/settings/account': typeof AppSettingsAccountRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
   '/settings/billing': typeof AppSettingsBillingRoute
   '/settings/files': typeof AppSettingsFilesRoute
+  '/settings/notifications': typeof AppSettingsNotificationsRoute
   '/settings/relays': typeof AppSettingsRelaysRoute
   '/api/app-terminal/$appId': typeof ApiAppTerminalAppIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
@@ -829,10 +915,13 @@ export interface FileRoutesByTo {
   '/api/github/manifest': typeof ApiGithubManifestRoute
   '/api/github/setup': typeof ApiGithubSetupRoute
   '/api/github/webhook': typeof ApiGithubWebhookRoute
+  '/api/kiln/database-export': typeof ApiKilnDatabaseExportRoute
+  '/api/platform-terminal/$relayId': typeof ApiPlatformTerminalRelayIdRoute
   '/api/relay-terminal/$relayId': typeof ApiRelayTerminalRelayIdRoute
   '/automations': typeof AppAutomationsIndexRoute
   '/backups': typeof AppBackupsIndexRoute
   '/infra': typeof AppInfraIndexRoute
+  '/kiln': typeof AppKilnIndexRoute
   '/settings': typeof AppSettingsIndexRoute
   '/app/$appId/$': typeof AppAppAppIdSplatRoute
   '/app/$appId/files': typeof AppAppAppIdFilesRouteWithChildren
@@ -880,6 +969,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/_app': typeof AppRouteWithChildren
   '/account-status': typeof AccountStatusRoute
+  '/accounts': typeof AccountsRoute
   '/claim': typeof ClaimRoute
   '/console': typeof ConsoleRoute
   '/discord': typeof DiscordRoute
@@ -899,6 +989,7 @@ export interface FileRoutesById {
   '/_app/automations': typeof AppAutomationsRouteWithChildren
   '/_app/backups': typeof AppBackupsRouteWithChildren
   '/_app/infra': typeof AppInfraRouteWithChildren
+  '/_app/kiln': typeof AppKilnRouteWithChildren
   '/_app/notifications': typeof AppNotificationsRoute
   '/_app/operations': typeof AppOperationsRoute
   '/_app/servers': typeof AppServersRoute
@@ -922,16 +1013,22 @@ export interface FileRoutesById {
   '/_app/infra/deployments': typeof AppInfraDeploymentsRoute
   '/_app/infra/domains': typeof AppInfraDomainsRoute
   '/_app/infra/overview': typeof AppInfraOverviewRoute
+  '/_app/infra/platform': typeof AppInfraPlatformRoute
   '/_app/infra/relays': typeof AppInfraRelaysRoute
   '/_app/infra/servers': typeof AppInfraServersRoute
   '/_app/infra/sources': typeof AppInfraSourcesRoute
   '/_app/infra/tailscale': typeof AppInfraTailscaleRoute
+  '/_app/kiln/info': typeof AppKilnInfoRoute
+  '/_app/kiln/logs': typeof AppKilnLogsRoute
+  '/_app/kiln/terminal': typeof AppKilnTerminalRoute
+  '/_app/kiln/viewer': typeof AppKilnViewerRoute
   '/_app/relay/$relayId': typeof AppRelayRelayIdRouteWithChildren
   '/_app/server/$serverId': typeof AppServerServerIdRouteWithChildren
   '/_app/settings/account': typeof AppSettingsAccountRoute
   '/_app/settings/appearance': typeof AppSettingsAppearanceRoute
   '/_app/settings/billing': typeof AppSettingsBillingRoute
   '/_app/settings/files': typeof AppSettingsFilesRoute
+  '/_app/settings/notifications': typeof AppSettingsNotificationsRoute
   '/_app/settings/relays': typeof AppSettingsRelaysRoute
   '/api/app-terminal/$appId': typeof ApiAppTerminalAppIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
@@ -940,10 +1037,13 @@ export interface FileRoutesById {
   '/api/github/manifest': typeof ApiGithubManifestRoute
   '/api/github/setup': typeof ApiGithubSetupRoute
   '/api/github/webhook': typeof ApiGithubWebhookRoute
+  '/api/kiln/database-export': typeof ApiKilnDatabaseExportRoute
+  '/api/platform-terminal/$relayId': typeof ApiPlatformTerminalRelayIdRoute
   '/api/relay-terminal/$relayId': typeof ApiRelayTerminalRelayIdRoute
   '/_app/automations/': typeof AppAutomationsIndexRoute
   '/_app/backups/': typeof AppBackupsIndexRoute
   '/_app/infra/': typeof AppInfraIndexRoute
+  '/_app/kiln/': typeof AppKilnIndexRoute
   '/_app/settings/': typeof AppSettingsIndexRoute
   '/_app/app/$appId/$': typeof AppAppAppIdSplatRoute
   '/_app/app/$appId/files': typeof AppAppAppIdFilesRouteWithChildren
@@ -991,6 +1091,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/account-status'
+    | '/accounts'
     | '/claim'
     | '/console'
     | '/discord'
@@ -1010,6 +1111,7 @@ export interface FileRouteTypes {
     | '/automations'
     | '/backups'
     | '/infra'
+    | '/kiln'
     | '/notifications'
     | '/operations'
     | '/servers'
@@ -1033,16 +1135,22 @@ export interface FileRouteTypes {
     | '/infra/deployments'
     | '/infra/domains'
     | '/infra/overview'
+    | '/infra/platform'
     | '/infra/relays'
     | '/infra/servers'
     | '/infra/sources'
     | '/infra/tailscale'
+    | '/kiln/info'
+    | '/kiln/logs'
+    | '/kiln/terminal'
+    | '/kiln/viewer'
     | '/relay/$relayId'
     | '/server/$serverId'
     | '/settings/account'
     | '/settings/appearance'
     | '/settings/billing'
     | '/settings/files'
+    | '/settings/notifications'
     | '/settings/relays'
     | '/api/app-terminal/$appId'
     | '/api/auth/$'
@@ -1051,10 +1159,13 @@ export interface FileRouteTypes {
     | '/api/github/manifest'
     | '/api/github/setup'
     | '/api/github/webhook'
+    | '/api/kiln/database-export'
+    | '/api/platform-terminal/$relayId'
     | '/api/relay-terminal/$relayId'
     | '/automations/'
     | '/backups/'
     | '/infra/'
+    | '/kiln/'
     | '/settings/'
     | '/app/$appId/$'
     | '/app/$appId/files'
@@ -1100,6 +1211,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/account-status'
+    | '/accounts'
     | '/claim'
     | '/console'
     | '/discord'
@@ -1136,14 +1248,20 @@ export interface FileRouteTypes {
     | '/infra/deployments'
     | '/infra/domains'
     | '/infra/overview'
+    | '/infra/platform'
     | '/infra/relays'
     | '/infra/servers'
     | '/infra/sources'
     | '/infra/tailscale'
+    | '/kiln/info'
+    | '/kiln/logs'
+    | '/kiln/terminal'
+    | '/kiln/viewer'
     | '/settings/account'
     | '/settings/appearance'
     | '/settings/billing'
     | '/settings/files'
+    | '/settings/notifications'
     | '/settings/relays'
     | '/api/app-terminal/$appId'
     | '/api/auth/$'
@@ -1152,10 +1270,13 @@ export interface FileRouteTypes {
     | '/api/github/manifest'
     | '/api/github/setup'
     | '/api/github/webhook'
+    | '/api/kiln/database-export'
+    | '/api/platform-terminal/$relayId'
     | '/api/relay-terminal/$relayId'
     | '/automations'
     | '/backups'
     | '/infra'
+    | '/kiln'
     | '/settings'
     | '/app/$appId/$'
     | '/app/$appId/files'
@@ -1202,6 +1323,7 @@ export interface FileRouteTypes {
     | '/'
     | '/_app'
     | '/account-status'
+    | '/accounts'
     | '/claim'
     | '/console'
     | '/discord'
@@ -1221,6 +1343,7 @@ export interface FileRouteTypes {
     | '/_app/automations'
     | '/_app/backups'
     | '/_app/infra'
+    | '/_app/kiln'
     | '/_app/notifications'
     | '/_app/operations'
     | '/_app/servers'
@@ -1244,16 +1367,22 @@ export interface FileRouteTypes {
     | '/_app/infra/deployments'
     | '/_app/infra/domains'
     | '/_app/infra/overview'
+    | '/_app/infra/platform'
     | '/_app/infra/relays'
     | '/_app/infra/servers'
     | '/_app/infra/sources'
     | '/_app/infra/tailscale'
+    | '/_app/kiln/info'
+    | '/_app/kiln/logs'
+    | '/_app/kiln/terminal'
+    | '/_app/kiln/viewer'
     | '/_app/relay/$relayId'
     | '/_app/server/$serverId'
     | '/_app/settings/account'
     | '/_app/settings/appearance'
     | '/_app/settings/billing'
     | '/_app/settings/files'
+    | '/_app/settings/notifications'
     | '/_app/settings/relays'
     | '/api/app-terminal/$appId'
     | '/api/auth/$'
@@ -1262,10 +1391,13 @@ export interface FileRouteTypes {
     | '/api/github/manifest'
     | '/api/github/setup'
     | '/api/github/webhook'
+    | '/api/kiln/database-export'
+    | '/api/platform-terminal/$relayId'
     | '/api/relay-terminal/$relayId'
     | '/_app/automations/'
     | '/_app/backups/'
     | '/_app/infra/'
+    | '/_app/kiln/'
     | '/_app/settings/'
     | '/_app/app/$appId/$'
     | '/_app/app/$appId/files'
@@ -1313,6 +1445,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AppRoute: typeof AppRouteWithChildren
   AccountStatusRoute: typeof AccountStatusRoute
+  AccountsRoute: typeof AccountsRoute
   ClaimRoute: typeof ClaimRoute
   ConsoleRoute: typeof ConsoleRoute
   DiscordRoute: typeof DiscordRoute
@@ -1338,6 +1471,8 @@ export interface RootRouteChildren {
   ApiGithubManifestRoute: typeof ApiGithubManifestRoute
   ApiGithubSetupRoute: typeof ApiGithubSetupRoute
   ApiGithubWebhookRoute: typeof ApiGithubWebhookRoute
+  ApiKilnDatabaseExportRoute: typeof ApiKilnDatabaseExportRoute
+  ApiPlatformTerminalRelayIdRoute: typeof ApiPlatformTerminalRelayIdRoute
   ApiRelayTerminalRelayIdRoute: typeof ApiRelayTerminalRelayIdRoute
   ApiCliAuthDeviceRoute: typeof ApiCliAuthDeviceRoute
   ApiCliAuthTokenRoute: typeof ApiCliAuthTokenRoute
@@ -1366,6 +1501,13 @@ declare module '@tanstack/react-router' {
       path: '/account-status'
       fullPath: '/account-status'
       preLoaderRoute: typeof AccountStatusRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/accounts': {
+      id: '/accounts'
+      path: '/accounts'
+      fullPath: '/accounts'
+      preLoaderRoute: typeof AccountsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/claim': {
@@ -1499,6 +1641,13 @@ declare module '@tanstack/react-router' {
       path: '/infra'
       fullPath: '/infra'
       preLoaderRoute: typeof AppInfraRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/kiln': {
+      id: '/_app/kiln'
+      path: '/kiln'
+      fullPath: '/kiln'
+      preLoaderRoute: typeof AppKilnRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/notifications': {
@@ -1683,6 +1832,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppInfraOverviewRouteImport
       parentRoute: typeof AppInfraRoute
     }
+    '/_app/infra/platform': {
+      id: '/_app/infra/platform'
+      path: '/platform'
+      fullPath: '/infra/platform'
+      preLoaderRoute: typeof AppInfraPlatformRouteImport
+      parentRoute: typeof AppInfraRoute
+    }
     '/_app/infra/relays': {
       id: '/_app/infra/relays'
       path: '/relays'
@@ -1710,6 +1866,41 @@ declare module '@tanstack/react-router' {
       fullPath: '/infra/tailscale'
       preLoaderRoute: typeof AppInfraTailscaleRouteImport
       parentRoute: typeof AppInfraRoute
+    }
+    '/_app/kiln/': {
+      id: '/_app/kiln/'
+      path: '/'
+      fullPath: '/kiln/'
+      preLoaderRoute: typeof AppKilnIndexRouteImport
+      parentRoute: typeof AppKilnRoute
+    }
+    '/_app/kiln/info': {
+      id: '/_app/kiln/info'
+      path: '/info'
+      fullPath: '/kiln/info'
+      preLoaderRoute: typeof AppKilnInfoRouteImport
+      parentRoute: typeof AppKilnRoute
+    }
+    '/_app/kiln/logs': {
+      id: '/_app/kiln/logs'
+      path: '/logs'
+      fullPath: '/kiln/logs'
+      preLoaderRoute: typeof AppKilnLogsRouteImport
+      parentRoute: typeof AppKilnRoute
+    }
+    '/_app/kiln/terminal': {
+      id: '/_app/kiln/terminal'
+      path: '/terminal'
+      fullPath: '/kiln/terminal'
+      preLoaderRoute: typeof AppKilnTerminalRouteImport
+      parentRoute: typeof AppKilnRoute
+    }
+    '/_app/kiln/viewer': {
+      id: '/_app/kiln/viewer'
+      path: '/viewer'
+      fullPath: '/kiln/viewer'
+      preLoaderRoute: typeof AppKilnViewerRouteImport
+      parentRoute: typeof AppKilnRoute
     }
     '/_app/relay/$relayId': {
       id: '/_app/relay/$relayId'
@@ -1758,6 +1949,13 @@ declare module '@tanstack/react-router' {
       path: '/files'
       fullPath: '/settings/files'
       preLoaderRoute: typeof AppSettingsFilesRouteImport
+      parentRoute: typeof AppSettingsRoute
+    }
+    '/_app/settings/notifications': {
+      id: '/_app/settings/notifications'
+      path: '/notifications'
+      fullPath: '/settings/notifications'
+      preLoaderRoute: typeof AppSettingsNotificationsRouteImport
       parentRoute: typeof AppSettingsRoute
     }
     '/_app/settings/relays': {
@@ -1814,6 +2012,20 @@ declare module '@tanstack/react-router' {
       path: '/api/github/webhook'
       fullPath: '/api/github/webhook'
       preLoaderRoute: typeof ApiGithubWebhookRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/kiln/database-export': {
+      id: '/api/kiln/database-export'
+      path: '/api/kiln/database-export'
+      fullPath: '/api/kiln/database-export'
+      preLoaderRoute: typeof ApiKilnDatabaseExportRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/platform-terminal/$relayId': {
+      id: '/api/platform-terminal/$relayId'
+      path: '/api/platform-terminal/$relayId'
+      fullPath: '/api/platform-terminal/$relayId'
+      preLoaderRoute: typeof ApiPlatformTerminalRelayIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/relay-terminal/$relayId': {
@@ -2150,6 +2362,7 @@ interface AppInfraRouteChildren {
   AppInfraDeploymentsRoute: typeof AppInfraDeploymentsRoute
   AppInfraDomainsRoute: typeof AppInfraDomainsRoute
   AppInfraOverviewRoute: typeof AppInfraOverviewRoute
+  AppInfraPlatformRoute: typeof AppInfraPlatformRoute
   AppInfraRelaysRoute: typeof AppInfraRelaysRoute
   AppInfraServersRoute: typeof AppInfraServersRoute
   AppInfraSourcesRoute: typeof AppInfraSourcesRoute
@@ -2165,6 +2378,7 @@ const AppInfraRouteChildren: AppInfraRouteChildren = {
   AppInfraDeploymentsRoute: AppInfraDeploymentsRoute,
   AppInfraDomainsRoute: AppInfraDomainsRoute,
   AppInfraOverviewRoute: AppInfraOverviewRoute,
+  AppInfraPlatformRoute: AppInfraPlatformRoute,
   AppInfraRelaysRoute: AppInfraRelaysRoute,
   AppInfraServersRoute: AppInfraServersRoute,
   AppInfraSourcesRoute: AppInfraSourcesRoute,
@@ -2178,11 +2392,31 @@ const AppInfraRouteWithChildren = AppInfraRoute._addFileChildren(
   AppInfraRouteChildren,
 )
 
+interface AppKilnRouteChildren {
+  AppKilnInfoRoute: typeof AppKilnInfoRoute
+  AppKilnLogsRoute: typeof AppKilnLogsRoute
+  AppKilnTerminalRoute: typeof AppKilnTerminalRoute
+  AppKilnViewerRoute: typeof AppKilnViewerRoute
+  AppKilnIndexRoute: typeof AppKilnIndexRoute
+}
+
+const AppKilnRouteChildren: AppKilnRouteChildren = {
+  AppKilnInfoRoute: AppKilnInfoRoute,
+  AppKilnLogsRoute: AppKilnLogsRoute,
+  AppKilnTerminalRoute: AppKilnTerminalRoute,
+  AppKilnViewerRoute: AppKilnViewerRoute,
+  AppKilnIndexRoute: AppKilnIndexRoute,
+}
+
+const AppKilnRouteWithChildren =
+  AppKilnRoute._addFileChildren(AppKilnRouteChildren)
+
 interface AppSettingsRouteChildren {
   AppSettingsAccountRoute: typeof AppSettingsAccountRoute
   AppSettingsAppearanceRoute: typeof AppSettingsAppearanceRoute
   AppSettingsBillingRoute: typeof AppSettingsBillingRoute
   AppSettingsFilesRoute: typeof AppSettingsFilesRoute
+  AppSettingsNotificationsRoute: typeof AppSettingsNotificationsRoute
   AppSettingsRelaysRoute: typeof AppSettingsRelaysRoute
   AppSettingsIndexRoute: typeof AppSettingsIndexRoute
 }
@@ -2192,6 +2426,7 @@ const AppSettingsRouteChildren: AppSettingsRouteChildren = {
   AppSettingsAppearanceRoute: AppSettingsAppearanceRoute,
   AppSettingsBillingRoute: AppSettingsBillingRoute,
   AppSettingsFilesRoute: AppSettingsFilesRoute,
+  AppSettingsNotificationsRoute: AppSettingsNotificationsRoute,
   AppSettingsRelaysRoute: AppSettingsRelaysRoute,
   AppSettingsIndexRoute: AppSettingsIndexRoute,
 }
@@ -2344,6 +2579,7 @@ interface AppRouteChildren {
   AppAutomationsRoute: typeof AppAutomationsRouteWithChildren
   AppBackupsRoute: typeof AppBackupsRouteWithChildren
   AppInfraRoute: typeof AppInfraRouteWithChildren
+  AppKilnRoute: typeof AppKilnRouteWithChildren
   AppNotificationsRoute: typeof AppNotificationsRoute
   AppOperationsRoute: typeof AppOperationsRoute
   AppServersRoute: typeof AppServersRoute
@@ -2361,6 +2597,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppAutomationsRoute: AppAutomationsRouteWithChildren,
   AppBackupsRoute: AppBackupsRouteWithChildren,
   AppInfraRoute: AppInfraRouteWithChildren,
+  AppKilnRoute: AppKilnRouteWithChildren,
   AppNotificationsRoute: AppNotificationsRoute,
   AppOperationsRoute: AppOperationsRoute,
   AppServersRoute: AppServersRoute,
@@ -2377,6 +2614,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AppRoute: AppRouteWithChildren,
   AccountStatusRoute: AccountStatusRoute,
+  AccountsRoute: AccountsRoute,
   ClaimRoute: ClaimRoute,
   ConsoleRoute: ConsoleRoute,
   DiscordRoute: DiscordRoute,
@@ -2402,6 +2640,8 @@ const rootRouteChildren: RootRouteChildren = {
   ApiGithubManifestRoute: ApiGithubManifestRoute,
   ApiGithubSetupRoute: ApiGithubSetupRoute,
   ApiGithubWebhookRoute: ApiGithubWebhookRoute,
+  ApiKilnDatabaseExportRoute: ApiKilnDatabaseExportRoute,
+  ApiPlatformTerminalRelayIdRoute: ApiPlatformTerminalRelayIdRoute,
   ApiRelayTerminalRelayIdRoute: ApiRelayTerminalRelayIdRoute,
   ApiCliAuthDeviceRoute: ApiCliAuthDeviceRoute,
   ApiCliAuthTokenRoute: ApiCliAuthTokenRoute,

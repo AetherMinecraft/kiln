@@ -71,11 +71,6 @@ import {
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@workspace/ui/components/popover"
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -112,6 +107,10 @@ import { IdentityName } from "@/components/identity-name"
 import type { IdentityStatusPresentation } from "@/components/identity-name"
 import { InstanceCard } from "@/components/instance-card"
 import {
+  useKilnBackupHost,
+  type KilnBackupHost,
+} from "@/components/kiln/kiln-presentation"
+import {
   ServerKindIcon,
   instanceKindIcons,
 } from "@/components/instance-kind-icon"
@@ -123,6 +122,11 @@ import {
   type BackupConfigurationTarget,
 } from "@/components/backup-configuration-dialog"
 import { BackupIcon } from "@/components/backup-icon"
+import {
+  DrawerPopover,
+  DrawerPopoverContent,
+  DrawerPopoverTrigger,
+} from "@/components/drawer-popover"
 import {
   InstancePickerContent,
   type InstancePickerItem,
@@ -149,6 +153,7 @@ import {
   upsertScheduleCache,
 } from "@/lib/collections/schedules"
 import {
+  accessCapabilitiesQueryOptions,
   backupStorageQueryOptions,
   githubSyncRunsQueryOptions,
   queryKeys,
@@ -213,9 +218,19 @@ export const SchedulesPage = React.memo(function SchedulesPage() {
   const [searchStore] = React.useState(() => createDataTableSearchStore())
   const [editor, setEditor] = React.useState<EditorMode | null>(null)
   const [deleting, setDeleting] = React.useState<Schedule | null>(null)
+  const { data: isPlatformAdmin = false } = useQuery({
+    ...accessCapabilitiesQueryOptions(),
+    select: selectIsPlatformAdmin,
+  })
+  const kiln = useKilnBackupHost(isPlatformAdmin)
   const options = React.useMemo(
-    () => scheduleOptionsWithInstanceNames(scheduleOptions, instances),
-    [instances, scheduleOptions]
+    () =>
+      kilnScheduleOptions(
+        scheduleOptionsWithInstanceNames(scheduleOptions, instances),
+        kiln,
+        schedules
+      ),
+    [instances, kiln, scheduleOptions, schedules]
   )
   const canCreate = options.some((option) => option.canCreate)
   const optionMap = React.useMemo(
@@ -572,7 +587,9 @@ const ScheduleTable = React.memo(function ScheduleTable({
                 : "Create Relay-owned automation that keeps running when Hearth is offline."}
           </span>
         }
-        icon={<Play className="size-6 text-muted-foreground/45" />}
+        icon={
+          <Play className="size-6 text-muted-foreground/45 light:text-muted-foreground/72" />
+        }
         title={
           searchActive
             ? "No schedules match your search"
@@ -636,7 +653,7 @@ const ScheduleName = React.memo(function ScheduleName({
       name={schedule.name}
       nameClassName={
         canEdit
-          ? "transition-colors group-hover/schedule-name:text-primary"
+          ? "transition-colors group-hover/schedule-name:text-primary-ink"
           : undefined
       }
     />
@@ -764,11 +781,7 @@ const ScheduleActions = React.memo(function ScheduleActions({
           disabled={running}
           onClick={() => runMutation.mutate()}
         >
-          {running ? (
-            <LoaderCircle className="animate-spin" />
-          ) : (
-            <Play />
-          )}
+          {running ? <LoaderCircle className="animate-spin" /> : <Play />}
           Run now
         </Button>
       ) : null}
@@ -797,7 +810,7 @@ const ScheduleActions = React.memo(function ScheduleActions({
               type="button"
               size="icon-sm"
               variant="ghost"
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
               aria-label={`Delete ${schedule.name}`}
               onClick={() => onDelete(schedule)}
             >
@@ -1188,6 +1201,8 @@ interface HistoryTarget {
   id: string
   kind: InstancePickerKind
   name: string
+  /** A schedule's Relay target: Kiln, backed up on that Relay. */
+  platform?: boolean
   relayId: string
   /** Falls back to the Relay that ran it. */
   relayName?: string
@@ -1288,7 +1303,8 @@ function scheduleHistoryTarget(
   return {
     id: target.kind === "relay" ? target.relayId : target.id,
     kind: target.kind === "instance" ? "server" : target.kind,
-    name: target.name,
+    name: target.kind === "relay" ? "Kiln" : target.name,
+    platform: target.kind === "relay",
     relayId: target.relayId,
     relayName,
   }
@@ -1527,7 +1543,9 @@ const ScheduleHistoryTable = React.memo(function ScheduleHistoryTable({
                 : "Completed and attempted automation runs will appear here."}
             </span>
           }
-          icon={<Play className="size-6 text-muted-foreground/45" />}
+          icon={
+            <Play className="size-6 text-muted-foreground/45 light:text-muted-foreground/72" />
+          }
           title={
             searchActive
               ? "No runs match your search"
@@ -1603,7 +1621,7 @@ const HistoryAutomation = React.memo(function HistoryAutomation({
         icon={<Icon className="size-4" aria-hidden="true" />}
         meta={meta}
         name={entry.name}
-        nameClassName="transition-colors group-hover/automation-link:text-primary"
+        nameClassName="transition-colors group-hover/automation-link:text-primary-ink"
       />
     </Link>
   )
@@ -1627,7 +1645,7 @@ const HistoryRelay = React.memo(function HistoryRelay({
         meta={relayId.slice(0, 8)}
         metaClassName="font-mono"
         name={relayName}
-        nameClassName="transition-colors group-hover/relay-link:text-primary"
+        nameClassName="transition-colors group-hover/relay-link:text-primary-ink"
         showFavorite={false}
       />
     </Link>
@@ -1700,8 +1718,8 @@ const HistoryTargets = React.memo(function HistoryTargets({
   const [open, setOpen] = React.useState(false)
   const close = React.useCallback(() => setOpen(false), [])
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
+    <DrawerPopover open={open} onOpenChange={setOpen}>
+      <DrawerPopoverTrigger asChild>
         <button
           type="button"
           aria-label={`${targets.length} ${targets.length === 1 ? "target" : "targets"} for ${name}`}
@@ -1709,8 +1727,9 @@ const HistoryTargets = React.memo(function HistoryTargets({
         >
           <InstanceKindCounts counts={counts} />
         </button>
-      </PopoverTrigger>
-      <PopoverContent
+      </DrawerPopoverTrigger>
+      <DrawerPopoverContent
+        title="Targets"
         aria-label="Targets"
         align="start"
         sideOffset={6}
@@ -1721,8 +1740,8 @@ const HistoryTargets = React.memo(function HistoryTargets({
           targets={targets}
           onNavigate={close}
         />
-      </PopoverContent>
-    </Popover>
+      </DrawerPopoverContent>
+    </DrawerPopover>
   )
 })
 
@@ -1787,7 +1806,9 @@ function historyTargetPickerItem(
         ? "Database"
         : target.kind === "app"
           ? "App"
-          : "Relay"
+          : target.platform
+            ? "Kiln"
+            : "Relay"
   return {
     identity:
       target.kind === "server"
@@ -1802,13 +1823,15 @@ function historyTargetPickerItem(
           ? {
               id: target.relayId,
               kind: "relay",
+              platform: target.platform,
               relayId: target.relayId,
               source: "fleet",
             }
           : { id: target.id, kind: target.kind, relayId: target.relayId },
     key: `${target.kind}:${target.relayId}:${target.id}`,
-    meta:
-      target.kind === "relay"
+    meta: target.platform
+      ? `On ${relayName}`
+      : target.kind === "relay"
         ? "Relay"
         : `${server?.implementation ?? kindLabel} · ${relayName}`,
     name: server?.name ?? target.name,
@@ -1826,6 +1849,7 @@ function historyTargetHref(identity: InstancePickerItem["identity"]) {
     return `/db/${encodeURIComponent(identity.id)}`
   }
   if (identity.kind === "app") return `/app/${encodeURIComponent(identity.id)}`
+  if (identity.platform) return "/kiln/info"
   return `/relay/${encodeURIComponent(identity.relayId)}`
 }
 
@@ -2099,7 +2123,7 @@ function TargetRunAudit({
         <RunResultIcon status={run.status} className="size-4 shrink-0" />
       </header>
       {run.error ? (
-        <p className="type-meta border-b border-destructive/20 bg-destructive/5 px-3 py-2 text-destructive">
+        <p className="type-meta border-b border-destructive/20 bg-destructive/5 px-3 py-2 text-destructive light:bg-destructive/10">
           {run.error}
         </p>
       ) : null}
@@ -2138,7 +2162,7 @@ function ActionAttemptAudit({
             </span>
             <ActionIcon
               type={attempt.actionType}
-              className="mt-1 size-3.5 shrink-0 text-primary"
+              className="mt-1 size-3.5 shrink-0 text-primary-ink"
             />
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -2155,7 +2179,7 @@ function ActionAttemptAudit({
                 {durationLabel(attempt.finishedAt - attempt.startedAt)}
               </p>
               {attempt.error ? (
-                <p className="type-meta mt-2 rounded-md border border-destructive/20 bg-destructive/5 px-2.5 py-2 text-destructive">
+                <p className="type-meta mt-2 rounded-md border border-destructive/20 bg-destructive/5 px-2.5 py-2 text-destructive light:bg-destructive/10">
                   {attempt.error}
                 </p>
               ) : null}
@@ -2404,7 +2428,7 @@ function ScheduleEditorDialog({
             <Button
               aria-label={`Schedule is ${enabled ? "enabled" : "disabled"}. Click to ${enabled ? "disable" : "enable"}.`}
               aria-pressed={enabled}
-              className={`mr-auto ${enabled ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15 hover:text-emerald-300" : "text-muted-foreground"}`}
+              className={`mr-auto ${enabled ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15 hover:text-emerald-300 light:bg-emerald-500/20 light:text-emerald-700 light:hover:bg-emerald-500/30 light:hover:text-emerald-700" : "text-muted-foreground"}`}
               size="sm"
               type="button"
               variant="outline"
@@ -2658,7 +2682,7 @@ const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
           />
         </Field>
         <div
-          className={`flex min-h-8 items-center rounded-lg border px-3 py-1 text-xs leading-5 ${cronSummary !== null ? "bg-muted/25 text-foreground" : "border-destructive/35 bg-destructive/5 text-destructive"}`}
+          className={`flex min-h-8 items-center rounded-lg border px-3 py-1 text-xs leading-5 ${cronSummary !== null ? "bg-muted/25 text-foreground" : "border-destructive/35 bg-destructive/5 text-destructive light:bg-destructive/10"}`}
           role={cronSummary === null ? "alert" : undefined}
         >
           {cronSummary ?? "Enter a valid five-part cron expression."}
@@ -2701,7 +2725,8 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
   const selectedNames = React.useMemo(() => {
     const names: Array<string> = []
     for (const option of options) {
-      if (selectedTargets.has(targetKey(option))) names.push(option.name)
+      if (selectedTargets.has(targetKey(option)))
+        names.push(option.kind === "relay" ? "Kiln" : option.name)
     }
     return names
   }, [options, selectedTargets])
@@ -2718,7 +2743,8 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
           <div>
             <h3 className="text-sm font-semibold">Targets</h3>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Select every server, database, or Relay this schedule applies to.
+              Select every game server, database, or Kiln this schedule applies
+              to.
             </p>
           </div>
           <span className="type-code text-muted-foreground">
@@ -2726,8 +2752,8 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
           </span>
         </div>
       )}
-      <Popover open={open} onOpenChange={setOpen}>
-        <PopoverTrigger asChild>
+      <DrawerPopover open={open} onOpenChange={setOpen}>
+        <DrawerPopoverTrigger asChild>
           <Button
             type="button"
             variant="outline"
@@ -2743,8 +2769,9 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
             </span>
             <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
           </Button>
-        </PopoverTrigger>
-        <PopoverContent
+        </DrawerPopoverTrigger>
+        <DrawerPopoverContent
+          title="Targets"
           align="start"
           className="z-[70] w-[min(34rem,calc(100vw-2rem))] overflow-hidden p-0"
         >
@@ -2757,8 +2784,8 @@ const ScheduleTargetSelector = React.memo(function ScheduleTargetSelector({
             onSelect={selectTarget}
             onSelectMany={onToggle}
           />
-        </PopoverContent>
-      </Popover>
+        </DrawerPopoverContent>
+      </DrawerPopover>
     </div>
   )
 })
@@ -3196,10 +3223,10 @@ const ScheduleActionTargetsButton = React.memo(
     )
 
     return (
-      <Popover open={open} onOpenChange={setOpen}>
+      <DrawerPopover open={open} onOpenChange={setOpen}>
         <Tooltip>
           <TooltipTrigger asChild>
-            <PopoverTrigger asChild>
+            <DrawerPopoverTrigger asChild>
               <Button
                 aria-expanded={open}
                 aria-label={`${selectedTargets.length} targets for ${actionLabel(action.type)}`}
@@ -3209,13 +3236,14 @@ const ScheduleActionTargetsButton = React.memo(
               >
                 <Server className="size-3.5" />
               </Button>
-            </PopoverTrigger>
+            </DrawerPopoverTrigger>
           </TooltipTrigger>
           <TooltipContent side="top">
             {selectedTargets.length} action targets
           </TooltipContent>
         </Tooltip>
-        <PopoverContent
+        <DrawerPopoverContent
+          title="Action targets"
           align="end"
           className="z-[70] w-[min(28rem,calc(100vw-2rem))] overflow-hidden p-0"
         >
@@ -3231,19 +3259,20 @@ const ScheduleActionTargetsButton = React.memo(
             onSelect={toggleTarget}
             onSelectMany={onToggle}
           />
-        </PopoverContent>
-      </Popover>
+        </DrawerPopoverContent>
+      </DrawerPopover>
     )
   }
 )
 
+// A Relay target is Kiln itself, backed up on that Relay.
 function scheduleTargetPickerItem(option: ScheduleOption): InstancePickerItem {
   const kind =
     option.kind === "instance"
       ? "Game Server"
       : option.kind === "database"
         ? "Database"
-        : "Relay"
+        : "Kiln"
   return {
     identity:
       option.kind === "instance"
@@ -3253,16 +3282,17 @@ function scheduleTargetPickerItem(option: ScheduleOption): InstancePickerItem {
           : {
               id: option.relayId,
               kind: "relay",
+              platform: true,
               relayId: option.relayId,
               source: "fleet",
             },
     key: targetKey(option),
     meta: option.available
       ? option.kind === "relay"
-        ? "Relay"
+        ? `On ${option.relayName}`
         : `${option.relayName} · ${option.id.slice(0, 8)}`
       : `Unavailable · ${kind} · ${option.relayName}`,
-    name: option.name,
+    name: option.kind === "relay" ? "Kiln" : option.name,
     searchText: `${kind} ${option.relayName} ${option.id}`,
   }
 }
@@ -3274,7 +3304,7 @@ function scheduleBackupTarget(
     id: target.id,
     key: targetKey(target),
     kind: target.kind === "relay" ? "platform" : target.kind,
-    name: target.name,
+    name: target.kind === "relay" ? "Kiln" : target.name,
     relayId: target.relayId,
     relayName: target.relayName,
   }
@@ -3332,7 +3362,7 @@ function ActionCompatibilityWarning({
       <TooltipTrigger asChild>
         <button
           aria-label="Action compatibility warning"
-          className="grid size-7 shrink-0 place-items-center rounded-md text-amber-400 outline-none hover:bg-amber-400/10 focus-visible:ring-2 focus-visible:ring-ring/40"
+          className="grid size-7 shrink-0 place-items-center rounded-md text-amber-400 outline-none hover:bg-amber-400/10 focus-visible:ring-2 focus-visible:ring-ring/40 light:text-amber-700 light:hover:bg-amber-400/20"
           type="button"
         >
           <TriangleAlert className="size-4" />
@@ -3384,7 +3414,7 @@ const ScheduleActionTypeSelect = React.memo(function ScheduleActionTypeSelect({
           <>
             <ActionIcon
               type={action.type}
-              className="size-4 shrink-0 text-primary"
+              className="size-4 shrink-0 text-primary-ink"
             />
             <SelectValue>{actionLabel(action.type)}</SelectValue>
           </>
@@ -3614,17 +3644,25 @@ function RunResultIcon({
   className?: string
 }) {
   if (status === "succeeded") {
-    return <CircleCheck className={`${className ?? ""} text-emerald-400`} />
+    return (
+      <CircleCheck
+        className={`${className ?? ""} text-emerald-400 light:text-emerald-700`}
+      />
+    )
   }
   if (status === "running") {
     return (
       <LoaderCircle
-        className={`${className ?? ""} animate-spin text-amber-300`}
+        className={`${className ?? ""} animate-spin text-amber-300 light:text-amber-700`}
       />
     )
   }
   if (status === "partial") {
-    return <CircleX className={`${className ?? ""} text-amber-300`} />
+    return (
+      <CircleX
+        className={`${className ?? ""} text-amber-300 light:text-amber-700`}
+      />
+    )
   }
   if (status === "noop" || status.startsWith("skipped")) {
     return (
@@ -3713,6 +3751,33 @@ function scheduleOptionsWithInstanceNames(
       ? { ...option, name: instance.name, relayName: instance.relayName }
       : option
   })
+}
+
+// A Relay target backs Kiln up, which only the Relay on Kiln's host can do.
+// Others stay listed only where a schedule already names them, so it can be
+// fixed.
+function kilnScheduleOptions(
+  options: ReadonlyArray<ScheduleOption>,
+  kiln: KilnBackupHost | null,
+  schedules: ReadonlyArray<Pick<Schedule, "targets">>
+): Array<ScheduleOption> {
+  const named = new Set(
+    schedules.flatMap((schedule) =>
+      schedule.targets.flatMap((target) =>
+        target.kind === "relay" ? [target.relayId] : []
+      )
+    )
+  )
+  return options.filter(
+    (option) =>
+      option.kind !== "relay" ||
+      option.relayId === kiln?.relayId ||
+      named.has(option.relayId)
+  )
+}
+
+function selectIsPlatformAdmin(capabilities: { isPlatformAdmin: boolean }) {
+  return capabilities.isPlatformAdmin
 }
 
 function selectScheduleTargetInstances(snapshot: RelaySnapshot) {

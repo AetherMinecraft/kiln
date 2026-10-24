@@ -19,12 +19,12 @@ import {
   DialogTitle,
 } from "@workspace/ui/components/dialog"
 import { Input } from "@workspace/ui/components/input"
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@workspace/ui/components/popover"
 
+import {
+  DrawerPopover,
+  DrawerPopoverContent,
+  DrawerPopoverTrigger,
+} from "@/components/drawer-popover"
 import {
   InstancePickerContent,
   type InstancePickerItem,
@@ -374,7 +374,7 @@ function BackupDestinationChoices({
           : singleDestination
             ? "Choose one destination. Full archives can stay on this Relay or use S3."
             : targetKind === "platform"
-              ? "Platform bundles can use Relay-local and platform-owned S3 destinations."
+              ? "Kiln's backups can stay on this Relay or use platform-owned S3."
               : targetKind === "instance"
                 ? "Choose one or more copies. Default uses this server’s preferred destination."
                 : "Choose one or more copies. Default uses Relay-local storage."}
@@ -418,7 +418,7 @@ function BackupDestinationChoice({
       <span
         className={`grid size-8 shrink-0 place-items-center rounded-md border ${
           checked
-            ? "border-primary/30 bg-primary/10 text-primary"
+            ? "border-primary/30 bg-primary/10 text-primary-ink"
             : "text-muted-foreground"
         }`}
       >
@@ -471,8 +471,8 @@ const BackupTargetPicker = React.memo(function BackupTargetPicker({
   )
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
+    <DrawerPopover open={open} onOpenChange={setOpen}>
+      <DrawerPopoverTrigger asChild>
         <Button
           type="button"
           variant="outline"
@@ -500,8 +500,9 @@ const BackupTargetPicker = React.memo(function BackupTargetPicker({
           )}
           <ChevronsUpDown className="size-3.5 shrink-0 text-muted-foreground" />
         </Button>
-      </PopoverTrigger>
-      <PopoverContent
+      </DrawerPopoverTrigger>
+      <DrawerPopoverContent
+        title="Backup targets"
         align="start"
         className="z-[70] w-(--radix-popover-trigger-width) min-w-72 overflow-hidden p-0"
       >
@@ -512,8 +513,8 @@ const BackupTargetPicker = React.memo(function BackupTargetPicker({
           selectedKeys={selectedKeys}
           onSelect={selectItem}
         />
-      </PopoverContent>
-    </Popover>
+      </DrawerPopoverContent>
+    </DrawerPopover>
   )
 })
 
@@ -525,13 +526,14 @@ function backupTargetItem(
       identity: {
         id: target.relayId,
         kind: "relay",
+        platform: true,
         relayId: target.relayId,
         source: "fleet",
       },
       key: target.key,
-      meta: "Kiln platform",
-      name: target.relayName,
-      searchText: `${target.relayId} platform`,
+      meta: `On ${target.relayName}`,
+      name: "Kiln",
+      searchText: `kiln hearth platform ${target.relayName} ${target.relayId}`,
     }
   }
   return {

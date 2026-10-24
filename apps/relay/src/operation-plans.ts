@@ -5,6 +5,7 @@
  */
 import {
   appIdFromFileRoot,
+  databaseIdFromFileRoot,
   isRelayFileRoot,
   type BackupTaskInput,
   type RelayControlOperation,
@@ -122,6 +123,10 @@ export function backupTaskLocks(
  */
 export function fileRootTransferLocks(rootId: string): Array<LaneLock> {
   if (isRelayFileRoot(rootId)) return [shared(laneKeys.hostFiles)]
+  // A database's dumps transfer beside reads of it, such as backups, and an
+  // import, which reads the uploaded dump, waits for them.
+  const databaseId = databaseIdFromFileRoot(rootId)
+  if (databaseId) return databaseReadLocks(databaseId)
   const appId = appIdFromFileRoot(rootId)
   return [shared(appId ? laneKeys.app(appId) : laneKeys.instance(rootId))]
 }
@@ -190,6 +195,9 @@ export function controlRequestLocks(
     case "relay.clients.list":
     case "relay.clients.update":
     case "relay.clients.revoke":
+    case "relay.platform.read":
+    case "relay.platform.logs":
+    case "relay.platform.database.read":
     case "browser.authorization.revise":
     case "brick.catalog":
     case "brick.recipe":
@@ -199,6 +207,7 @@ export function controlRequestLocks(
     case "app.list":
     case "app.network.routes.read":
     case "app.deployment.read":
+    case "app.image.check":
     case "instance.resources.read":
     case "instance.files.list":
     case "instance.files.directory.list":
@@ -223,6 +232,12 @@ export function controlRequestLocks(
     case "relay.terminal.write":
     case "relay.terminal.claim":
     case "relay.terminal.restart":
+    case "relay.platform.terminal.attach":
+    case "relay.platform.terminal.heartbeat":
+    case "relay.platform.terminal.detach":
+    case "relay.platform.terminal.write":
+    case "relay.platform.terminal.claim":
+    case "relay.platform.terminal.restart":
     case "database.terminal.attach":
     case "database.terminal.heartbeat":
     case "database.terminal.detach":
@@ -236,6 +251,14 @@ export function controlRequestLocks(
     case "app.terminal.claim":
     case "app.terminal.restart":
       return null
+
+    // Restarting or repairing Kiln's services, one change at a time, as the
+    // Relay's own passes over them run.
+    case "relay.platform.action":
+      return [exclusive(laneKeys.platform)]
+    // Writing Hearth's database waits out a restart or repair of it.
+    case "relay.platform.database.write":
+      return [shared(laneKeys.platform)]
 
     // Updates and restarts replace the Relay itself and reserve themselves.
     case "relay.update.apply":

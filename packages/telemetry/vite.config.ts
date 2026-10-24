@@ -18,7 +18,7 @@ export default defineConfig({
   run: {
     tasks: {
       build: "vp pack",
-      typecheck: "tsc --noEmit",
+      typecheck: "node ../../scripts/typecheck.mjs",
     },
   },
 })

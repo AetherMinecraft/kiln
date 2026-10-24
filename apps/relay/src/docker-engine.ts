@@ -81,6 +81,7 @@ export interface DockerContainerInspect {
   readonly Config: {
     readonly AttachStdin?: boolean
     readonly AttachStdout?: boolean
+    readonly Env?: ReadonlyArray<string> | null
     readonly Hostname?: string
     readonly Image: string
     readonly Labels: Readonly<Record<string, string>> | null
@@ -104,6 +105,8 @@ export interface DockerContainerInspect {
         string,
         {
           readonly Aliases?: ReadonlyArray<string> | null
+          // Docker 26 and later: its name, short ID, and aliases.
+          readonly DNSNames?: ReadonlyArray<string> | null
           readonly IPAddress?: string
         }
       >
@@ -439,6 +442,26 @@ export class DockerEngine {
     })
   }
 
+  /**
+   * Whether a path exists in the container's filesystem, as Docker sees it
+   * (`GET /containers/{id}/archive`). Answers false when the container or
+   * the path doesn't exist.
+   */
+  containerPathExists(
+    reference: string,
+    path: string
+  ): Effect.Effect<boolean, DockerEngineError> {
+    return this.#exchange({
+      maxBytes: 1024 * 1024,
+      method: "GET",
+      path: `/containers/${segment(reference)}/archive${query({ path })}`,
+      timeout: 10_000,
+    }).pipe(
+      Effect.as(true),
+      Effect.catchIf(isDockerNotFound, () => Effect.succeed(false))
+    )
+  }
+
   /** `docker logs --timestamps`, read whole into stdout and stderr. */
   containerLogs(
     reference: string,
@@ -729,6 +752,23 @@ export class DockerEngine {
     })
   }
 
+  // `Pid` stays 0 for an exec Docker couldn't start, such as one whose
+  // program the container doesn't have.
+  inspectExec(id: string): Effect.Effect<
+    {
+      readonly ExitCode: number | null
+      readonly Pid: number
+      readonly Running: boolean
+    },
+    DockerEngineError
+  > {
+    return this.#json({
+      method: "GET",
+      path: `/exec/${segment(id)}/json`,
+      timeout: 10_000,
+    })
+  }
+
   // The output ends as the process exits; Docker records its code just
   // after, which can take a while on a busy host.
   #execExitCode(id: string): Effect.Effect<number, DockerEngineError> {
@@ -948,6 +988,44 @@ export class DockerEngine {
         })
       }
       options.onLine?.(normalizedReference(reference))
+    })
+  }
+
+  /**
+   * What `image`'s tag names in its registry now, without pulling it: the
+   * digest of its manifest, or its index's for a multi-platform image, as
+   * the daemon reads it from the registry with the same credentials a pull
+   * sends. Docker Hub doesn't count this against its pull limits.
+   */
+  distributionDigest(image: string): Effect.Effect<string, DockerEngineError> {
+    const operation = "GET /distribution/{name}/json"
+    return Effect.gen({ self: this }, function* () {
+      const reference = yield* Effect.try({
+        try: () => parseImageReference(image),
+        catch: (cause) =>
+          new DockerEngineError({
+            cause,
+            operation,
+            reason: cause instanceof Error ? cause.message : String(cause),
+          }),
+      })
+      const auth = yield* registryAuthHeader(reference)
+      const answer = yield* this.#json<{
+        Descriptor?: { digest?: unknown }
+      } | null>({
+        ...(auth && { headers: { "X-Registry-Auth": auth } }),
+        method: "GET",
+        path: `/distribution/${imageSegment(normalizedReference(reference))}/json`,
+        timeout: 20_000,
+      })
+      const digest = answer?.Descriptor?.digest
+      if (!Predicate.isString(digest) || !IMAGE_DIGEST.test(digest)) {
+        return yield* new DockerEngineError({
+          operation,
+          reason: `The registry didn't name a digest for ${image}`,
+        })
+      }
+      return digest
     })
   }
 
@@ -1609,6 +1687,8 @@ function segment(value: string): string {
 }
 
 // Image references keep their registry path, tag, and digest separators.
+const IMAGE_DIGEST = /^sha256:[a-f0-9]{64}$/u
+
 function imageSegment(value: string): string {
   return encodeURIComponent(value)
     .replaceAll("%2F", "/")

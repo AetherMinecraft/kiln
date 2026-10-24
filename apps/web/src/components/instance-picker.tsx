@@ -23,10 +23,17 @@ import {
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import { Input } from "@workspace/ui/components/input"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@workspace/ui/components/popover"
 import { cn } from "@workspace/ui/lib/utils"
 
+import { useDrawerPopoverIsDrawer } from "@/components/drawer-popover"
 import { useInstanceFavoriteKeys } from "@/components/instance-favorite"
-import { InstanceCard } from "@/components/instance-card"
+import { HearthMark } from "@/components/hearth-mark"
+import { InstanceCard, isKilnIdentity } from "@/components/instance-card"
 import {
   AppKindIcon,
   DatabaseKindIcon,
@@ -283,59 +290,78 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
       ? (activeTypeFilters[0]?.id as InstancePickerKind)
       : undefined
   const activeItem = visibleItems[activeItemIndex]
+  // In a phone drawer the search field sits last, next to the keyboard, and
+  // the list fills the drawer.
+  const searchAtBottom = useDrawerPopoverIsDrawer()
+
+  const searchBar = (
+    <div
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 border-border/70 p-2",
+        searchAtBottom ? "border-t" : "border-b"
+      )}
+    >
+      <div className="relative min-w-0 flex-1">
+        <Search
+          className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
+          aria-hidden="true"
+        />
+        <Input
+          // On phones, wait for a tap so the keyboard doesn't cover the list.
+          autoFocus={!searchAtBottom}
+          type="search"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-controls={listId}
+          aria-expanded="true"
+          aria-activedescendant={
+            activeItem
+              ? instancePickerOptionId(listId, activeItem.key)
+              : undefined
+          }
+          value={search}
+          onChange={handleSearchChange}
+          onKeyDown={handleSearchKeyDown}
+          placeholder={`Search ${ariaLabel.toLocaleLowerCase()}`}
+          aria-label={`Search ${ariaLabel.toLocaleLowerCase()}`}
+          className={cn(
+            "bg-input/14 pr-2 pl-8",
+            searchAtBottom ? "h-10" : "h-8 text-sm"
+          )}
+        />
+      </div>
+      {favoritesFilter ? (
+        <InstancePickerToolButton
+          active={favoritesOnly}
+          label="Show favorites only"
+          touch={searchAtBottom}
+          onClick={toggleFavorites}
+        >
+          <Star
+            className={cn(
+              "size-3.5",
+              favoritesOnly &&
+                "fill-amber-400 text-amber-400 light:text-amber-500"
+            )}
+            aria-hidden="true"
+          />
+        </InstancePickerToolButton>
+      ) : null}
+      {typeFilters.length > 0 ? (
+        <InstancePickerTypeMenu
+          activeFilters={activeTypeFilters}
+          filters={typeFilters}
+          touch={searchAtBottom}
+          onShowAll={showAllTypes}
+          onToggle={toggleFilter}
+        />
+      ) : null}
+    </div>
+  )
 
   return (
     <>
-      <div className="flex items-center gap-1.5 border-b border-border/70 p-2">
-        <div className="relative min-w-0 flex-1">
-          <Search
-            className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
-            aria-hidden="true"
-          />
-          <Input
-            autoFocus
-            type="search"
-            role="combobox"
-            aria-autocomplete="list"
-            aria-controls={listId}
-            aria-expanded="true"
-            aria-activedescendant={
-              activeItem
-                ? instancePickerOptionId(listId, activeItem.key)
-                : undefined
-            }
-            value={search}
-            onChange={handleSearchChange}
-            onKeyDown={handleSearchKeyDown}
-            placeholder={`Search ${ariaLabel.toLocaleLowerCase()}`}
-            aria-label={`Search ${ariaLabel.toLocaleLowerCase()}`}
-            className="h-8 bg-input/14 pr-2 pl-8 text-sm"
-          />
-        </div>
-        {favoritesFilter ? (
-          <InstancePickerToolButton
-            active={favoritesOnly}
-            label="Show favorites only"
-            onClick={toggleFavorites}
-          >
-            <Star
-              className={cn(
-                "size-3.5",
-                favoritesOnly && "fill-amber-400 text-amber-400"
-              )}
-              aria-hidden="true"
-            />
-          </InstancePickerToolButton>
-        ) : null}
-        {typeFilters.length > 0 ? (
-          <InstancePickerTypeMenu
-            activeFilters={activeTypeFilters}
-            filters={typeFilters}
-            onShowAll={showAllTypes}
-            onToggle={toggleFilter}
-          />
-        ) : null}
-      </div>
+      {searchAtBottom ? null : searchBar}
       {multiple && onSelectMany ? (
         <InstancePickerBulkBar
           itemKeys={selectableVisibleKeys}
@@ -358,7 +384,10 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
           role="listbox"
           aria-label={ariaLabel}
           aria-multiselectable={multiple || undefined}
-          className="max-h-72 overflow-y-auto overscroll-contain p-1.5"
+          className={cn(
+            "overflow-y-auto overscroll-contain p-1.5",
+            searchAtBottom ? "min-h-0" : "max-h-72"
+          )}
         >
           <div
             className="relative w-full"
@@ -412,6 +441,7 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
           onNavigate={onNavigate}
         />
       ) : null}
+      {searchAtBottom ? searchBar : null}
     </>
   )
 })
@@ -460,19 +490,33 @@ function instancePickerOptionId(listId: string, key: string) {
 }
 
 const toolButtonClassName =
-  "relative grid size-8 shrink-0 place-items-center rounded-md border border-border/70 text-muted-foreground transition-colors outline-none hover:bg-muted/55 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 data-[state=open]:bg-muted/55 data-[state=open]:text-foreground"
-const activeToolButtonClassName = "border-primary/45 bg-primary/8 text-primary"
+  "relative grid shrink-0 place-items-center rounded-md border border-border/70 text-muted-foreground transition-colors outline-none hover:bg-muted/55 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 data-[state=open]:bg-muted/55 data-[state=open]:text-foreground"
+const activeToolButtonClassName =
+  "border-primary/45 bg-primary/8 text-primary-ink"
+const toolButtonSize = (touch: boolean) => (touch ? "size-10" : "size-8")
+// A tap moves focus to what it lands on, closing a phone's keyboard; cancelling
+// it keeps the search field focused while filtering.
+const keepSearchFocus = (event: React.SyntheticEvent | Event) =>
+  event.preventDefault()
+// Closing returns focus to the trigger; skip that while the search field still
+// has it, but let a keyboard user who moved into the popover get it back.
+const keepTypingFocus = (event: Event) => {
+  if (document.activeElement instanceof HTMLInputElement) event.preventDefault()
+}
 
 const InstancePickerToolButton = React.memo(function InstancePickerToolButton({
   active,
   children,
   label,
   onClick,
+  touch,
 }: {
   active: boolean
   children: React.ReactNode
   label: string
   onClick: () => void
+  /** Touch-sized, and leaves the search field focused. */
+  touch: boolean
 }) {
   return (
     <button
@@ -480,8 +524,13 @@ const InstancePickerToolButton = React.memo(function InstancePickerToolButton({
       aria-label={label}
       aria-pressed={active}
       title={label}
-      className={cn(toolButtonClassName, active && activeToolButtonClassName)}
+      className={cn(
+        toolButtonClassName,
+        toolButtonSize(touch),
+        active && activeToolButtonClassName
+      )}
       onClick={onClick}
+      onMouseDown={touch ? keepSearchFocus : undefined}
     >
       {children}
     </button>
@@ -493,35 +542,99 @@ const InstancePickerTypeMenu = React.memo(function InstancePickerTypeMenu({
   filters,
   onShowAll,
   onToggle,
+  touch,
 }: {
   activeFilters: ReadonlyArray<InstancePickerFilter>
   filters: ReadonlyArray<InstancePickerFilter>
   onShowAll: () => void
   onToggle: (filterId: string, checked: boolean) => void
+  /**
+   * For a search bar above a phone's keyboard: touch-sized, opens upward, and
+   * leaves the search field focused so the keyboard stays open.
+   */
+  touch: boolean
 }) {
   const filtered = activeFilters.length > 0
+  const trigger = (
+    <button
+      type="button"
+      aria-label={
+        filtered
+          ? `Filter by type, showing ${activeFilters
+              .map((filter) => filter.label.toLocaleLowerCase())
+              .join(" and ")}`
+          : "Filter by type"
+      }
+      title="Filter by type"
+      className={cn(
+        toolButtonClassName,
+        toolButtonSize(touch),
+        filtered && activeToolButtonClassName
+      )}
+      onMouseDown={touch ? keepSearchFocus : undefined}
+    >
+      <ListFilter className="size-3.5" aria-hidden="true" />
+    </button>
+  )
+
+  // A menu moves focus into itself, which would close the keyboard; a popover
+  // can open without taking focus.
+  if (touch) {
+    return (
+      <Popover>
+        <PopoverTrigger asChild>{trigger}</PopoverTrigger>
+        <PopoverContent
+          align="end"
+          side="top"
+          aria-label="Filter by type"
+          className="z-[80] w-48 p-1"
+          onCloseAutoFocus={keepTypingFocus}
+          onOpenAutoFocus={keepSearchFocus}
+        >
+          {filters.map((filter) => {
+            const { Icon } = kindPresentation[filter.id as InstancePickerKind]
+            const checked = activeFilters.includes(filter)
+            return (
+              <button
+                key={filter.id}
+                type="button"
+                aria-pressed={checked}
+                className={touchMenuItemClassName}
+                onClick={() => onToggle(filter.id, !checked)}
+                onMouseDown={keepSearchFocus}
+              >
+                <Icon className="size-4" aria-hidden="true" />
+                {filter.label}
+                {checked ? (
+                  <Check
+                    className="absolute right-2.5 size-4"
+                    aria-hidden="true"
+                  />
+                ) : null}
+              </button>
+            )
+          })}
+          {filtered ? (
+            <>
+              <div className="-mx-1 my-1 h-px bg-border" />
+              <button
+                type="button"
+                className={cn(touchMenuItemClassName, "text-muted-foreground")}
+                onClick={onShowAll}
+                onMouseDown={keepSearchFocus}
+              >
+                Show all types
+              </button>
+            </>
+          ) : null}
+        </PopoverContent>
+      </Popover>
+    )
+  }
 
   return (
     <DropdownMenu modal={false}>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label={
-            filtered
-              ? `Filter by type, showing ${activeFilters
-                  .map((filter) => filter.label.toLocaleLowerCase())
-                  .join(" and ")}`
-              : "Filter by type"
-          }
-          title="Filter by type"
-          className={cn(
-            toolButtonClassName,
-            filtered && activeToolButtonClassName
-          )}
-        >
-          <ListFilter className="size-3.5" aria-hidden="true" />
-        </button>
-      </DropdownMenuTrigger>
+      <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="z-[80] w-44 p-1">
         {filters.map((filter) => {
           const { Icon } = kindPresentation[filter.id as InstancePickerKind]
@@ -555,6 +668,9 @@ const InstancePickerTypeMenu = React.memo(function InstancePickerTypeMenu({
     </DropdownMenu>
   )
 })
+
+const touchMenuItemClassName =
+  "type-menu relative flex h-10 w-full items-center gap-2 rounded-md pr-9 pl-2.5 text-left outline-none select-none active:bg-popover-accent active:text-popover-accent-foreground focus-visible:bg-popover-accent"
 
 const InstancePickerBulkBar = React.memo(function InstancePickerBulkBar({
   itemKeys,
@@ -662,13 +778,19 @@ const InstancePickerRowButton = React.memo(function InstancePickerRowButton({
       />
       {pending ? (
         <LoaderCircle
-          className="size-3.5 shrink-0 animate-spin text-primary"
+          className="size-3.5 shrink-0 animate-spin text-primary-ink"
           aria-hidden="true"
         />
       ) : showKind ? (
-        <span className="shrink-0 text-muted-foreground/70">
-          <kind.Icon className="size-3.5" aria-hidden="true" />
-          <span className="sr-only">{kind.label}</span>
+        <span className="shrink-0 text-muted-foreground/70 light:text-muted-foreground/85">
+          {isKilnIdentity(item.identity) ? (
+            <HearthMark className="size-3.5 text-current" />
+          ) : (
+            <kind.Icon className="size-3.5" aria-hidden="true" />
+          )}
+          <span className="sr-only">
+            {isKilnIdentity(item.identity) ? "Kiln" : kind.label}
+          </span>
         </span>
       ) : null}
     </button>
@@ -684,7 +806,7 @@ function InstancePickerCheckbox({ state }: { state: "all" | "none" | "some" }) {
         state === "all"
           ? "border-primary bg-primary text-primary-foreground"
           : state === "some"
-            ? "border-primary text-primary"
+            ? "border-primary text-primary-ink"
             : "border-input"
       )}
     >

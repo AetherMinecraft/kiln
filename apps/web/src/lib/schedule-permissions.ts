@@ -87,6 +87,11 @@ export function scheduleAuthorizationFailure(input: {
   user: AuthenticatedUser
 }): string | null {
   for (const target of input.targets) {
+    // A Relay target backs Kiln itself up, which only a platform
+    // administrator may do, as with Kiln's other backups.
+    if (target.kind === "relay" && !isPlatformAdmin(input.user)) {
+      return "Only a platform administrator can schedule Kiln's backups"
+    }
     if (
       !hasScheduleTargetPermission({
         grants: input.grants,

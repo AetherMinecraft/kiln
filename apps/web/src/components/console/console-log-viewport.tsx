@@ -303,7 +303,7 @@ function ConsoleLogViewport({
       {loading && !consoleData ? (
         <div className="absolute inset-0 grid place-items-center bg-card/70 backdrop-blur-[2px]">
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <LoaderCircle className="size-4 animate-spin text-primary" />
+            <LoaderCircle className="size-4 animate-spin text-primary-ink" />
             Opening live {copy.stream}
           </div>
         </div>
@@ -362,7 +362,10 @@ const ConsoleConnectionNotice = React.memo(function ConsoleConnectionNotice({
     connection === "reconnecting"
       ? "RECONNECTING · OUTPUT MAY BE DELAYED"
       : connection === "live"
-        ? "CONNECTED THROUGH HEARTH · DIRECT RELAY UNAVAILABLE"
+        ? // TODO(platform): with KILN_RELAY_PROXY=hearth, as a Relay that
+          // installed Kiln runs, going through Hearth is normal, not a
+          // fallback, but this reads like a warning. Revisit the copy.
+          "CONNECTED THROUGH HEARTH · DIRECT RELAY UNAVAILABLE"
         : "LIVE OUTPUT PAUSED"
 
   return <ConsoleConnectionNoticeContent message={message} />

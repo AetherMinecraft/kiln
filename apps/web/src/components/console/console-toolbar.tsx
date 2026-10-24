@@ -7,7 +7,7 @@ import {
 import {
   ConsoleLevelMenu,
   ConsoleSearchControl,
-  TailscaleConsoleFilterMenus,
+  consoleToolbarClassName,
 } from "@/components/console/console-filters"
 import { consoleRuntimeReasonDelayRemaining } from "@/components/console/console-lifecycle"
 import type {
@@ -17,10 +17,11 @@ import type {
 import {
   ConsoleRedactButton,
   ConsoleSelectionControl,
-  ConsoleShareButton,
   ConsoleTimestampButton,
   ConsoleWrapButton,
 } from "@/components/console/console-toolbar-actions"
+import { ConsoleShareButton } from "@/components/console/console-share-button"
+import { TailscaleConsoleFilterMenus } from "@/components/console/console-tailscale-filters"
 import { ConsoleWarning } from "@/components/console/console-warning"
 import { ConsoleRetryButton } from "@/components/console/console-retry-button"
 import { useServerSnapshot } from "@/lib/use-server-workspace"
@@ -46,7 +47,7 @@ export const ConsoleToolbar = React.memo(function ConsoleToolbar({
   uiStore,
 }: ConsoleToolbarProps) {
   return (
-    <div className="flex min-h-14 shrink-0 flex-wrap items-center gap-2 border-b px-3 py-2.5 sm:px-4">
+    <div className={consoleToolbarClassName}>
       <ConsoleSearchControl uiStore={uiStore} />
       <ConsoleLevelMenu uiStore={uiStore} />
       <ConsoleRetryButton streamStore={streamStore} />

@@ -4,8 +4,8 @@ import {
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
   rm,
-  truncate,
   writeFile,
 } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
@@ -29,10 +29,16 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 
 vi.mock("./command.js", () => import("./test/docker.js"))
 
+import { DockerEngine } from "./docker-engine.js"
 import { exclusive } from "./operation-lanes.js"
-import { appLifecycleLocks, appReplaceLocks } from "./operation-plans.js"
+import {
+  appLifecycleLocks,
+  appReplaceLocks,
+  controlRequestLocks,
+} from "./operation-plans.js"
 import { appRouteOwner } from "./relay-resources.js"
 import { fakeDocker } from "./test/docker.js"
+import { RelayVolumes } from "./volumes.js"
 import {
   provisioningWorker,
   relayHarness,
@@ -279,12 +285,274 @@ describe("apps", () => {
       "kiln.relay.owner": TEST_NAMESPACE,
       "kiln.resource.kind": "app",
     })
-    expect(container!.mounts).toContainEqual(
-      expect.objectContaining({
+    // Nothing outlives the container unless the config mounts it.
+    expect(container!.mounts).toEqual([])
+  })
+
+  it("reports what each container mounts", async () => {
+    const harness = await createdApp()
+    const image = await deploy(harness, {})
+
+    expect(image.containers[0]?.mounts).toEqual([])
+
+    // A volume, by the name Docker gives it.
+    const removeCompose = await composeConfigCommand()
+    fakeDocker.images.set("redis:alpine", {})
+    fakeDocker.imageConfigs.set("redis:alpine", { Volumes: { "/data": {} } })
+    const compose = await deploy(harness, {
+      compose: "services:\n  cache:\n    image: redis:alpine\n",
+      sourceType: "compose",
+    })
+
+    expect(compose.containers[0]?.mounts).toEqual([
+      {
         destination: "/data",
-        source: join(harness.config.dataDirectory, "apps", appId),
-      })
+        readOnly: false,
+        source: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        type: "volume",
+      },
+    ])
+    await removeCompose()
+  })
+
+  it("mounts the config's volumes, node paths, and files, each in the services it names", async () => {
+    const harness = await createdApp()
+    const volumeId = "3f9a21c4".padEnd(40, "0")
+    const volume = `${TEST_NAMESPACE}-kiln-3f9a21c4-media`
+    fakeDocker.addVolume({
+      labels: {
+        "kiln.relay.owner": TEST_NAMESPACE,
+        "kiln.resource.kind": "volume",
+        "kiln.volume.id": volumeId,
+      },
+      name: volume,
+    })
+    const files = join(harness.config.dataDirectory, "app-mounts", appId)
+    const mounts: AppConfig["mounts"] = [
+      {
+        id: "media0001",
+        readOnly: false,
+        service: null,
+        source: { type: "volume", volumeId },
+        target: "/media",
+      },
+      {
+        id: "certs0001",
+        readOnly: true,
+        service: null,
+        source: { path: "/etc/ssl/certs", type: "host" },
+        target: "/certs",
+      },
+      {
+        id: "config001",
+        readOnly: true,
+        service: "app",
+        source: { content: "port = 80\n", type: "file" },
+        target: "/etc/app.toml",
+      },
+    ]
+
+    const app = await deploy(harness, { mounts })
+
+    expect(app.deployment).toMatchObject({ state: "succeeded" })
+    expect(appContainers()[0]?.mounts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          destination: "/media",
+          source: volume,
+          type: "volume",
+        }),
+        expect.objectContaining({
+          destination: "/certs",
+          readOnly: true,
+          source: "/etc/ssl/certs",
+        }),
+        expect.objectContaining({
+          destination: "/etc/app.toml",
+          readOnly: true,
+          source: join(files, app.deployment!.id, "config001"),
+        }),
+      ])
     )
+    expect(
+      await readFile(join(files, app.deployment!.id, "config001"), "utf8")
+    ).toBe("port = 80\n")
+
+    // A Compose app's mount goes only in the service it names, and the
+    // files no container mounts any longer are removed.
+    const removeCompose = await composeConfigCommand()
+    const compose = await deploy(harness, {
+      compose:
+        "services:\n  web:\n    image: nginx:alpine\n  worker:\n    image: nginx:alpine\n",
+      mounts: [{ ...mounts[1]!, service: "worker" }],
+      sourceType: "compose",
+    })
+
+    expect(compose.deployment).toMatchObject({ state: "succeeded" })
+    const mounted = (service: string) =>
+      appContainers()
+        .find((container) => container.labels["kiln.app.service"] === service)
+        ?.mounts.map((mount) => mount.destination)
+    expect(mounted("worker")).toContain("/certs")
+    expect(mounted("web")).not.toContain("/certs")
+    expect(await readdir(files)).toEqual([])
+    await removeCompose()
+  })
+
+  it("leaves the running container's files as they are until a deployment replaces it", async () => {
+    const harness = await createdApp()
+    const files = join(harness.config.dataDirectory, "app-mounts", appId)
+    const mount = (content: string) => ({
+      id: "config001",
+      readOnly: true,
+      service: null,
+      source: { content, type: "file" as const },
+      target: "/etc/app.toml",
+    })
+    const first = await deploy(harness, { mounts: [mount("port = 80\n")] })
+    const [running] = appContainers()
+    const mounted = join(files, first.deployment!.id, "config001")
+
+    // One that changes the file, and one that stops mounting it, each
+    // failing before they replace the container.
+    for (const mounts of [[mount("port = 81\n")], []]) {
+      const pull = fakeDocker.hold({ command: "pull" })
+      const deploying = deploy(harness, { mounts })
+      await pull.reached
+      expect(await readFile(mounted, "utf8")).toBe("port = 80\n")
+      pull.fail("pull access denied")
+      expect((await deploying).deployment).toMatchObject({ state: "failed" })
+      expect(appContainers().map((container) => container.id)).toEqual([
+        running!.id,
+      ])
+      expect(await readFile(mounted, "utf8")).toBe("port = 80\n")
+    }
+
+    const replaced = await deploy(harness, { mounts: [mount("port = 81\n")] })
+    expect(await readdir(files)).toEqual([replaced.deployment!.id])
+  })
+
+  it("gives a deployment within a second of the last its own name and files", async () => {
+    const harness = await createdApp()
+    const files = join(harness.config.dataDirectory, "app-mounts", appId)
+    const mount = (content: string) => ({
+      id: "config001",
+      readOnly: true,
+      service: null,
+      source: { content, type: "file" as const },
+      target: "/etc/app.toml",
+    })
+    const first = await deploy(harness, { mounts: [mount("port = 80\n")] })
+    const mounted = join(files, first.deployment!.id, "config001")
+
+    // The same second the first started in.
+    vi.useFakeTimers({
+      now: Date.parse(first.deployment!.startedAt),
+      toFake: ["Date", "setTimeout", "clearTimeout"],
+    })
+    const pull = fakeDocker.hold({ command: "pull" })
+    await harness.apps.deploy(deployment({ mounts: [mount("port = 81\n")] }))
+    await pull.reached
+    expect(await readFile(mounted, "utf8")).toBe("port = 80\n")
+    pull.fail("pull access denied")
+    const retried = await settledDeployment(harness)
+
+    expect(retried.deployment!.id > first.deployment!.id).toBe(true)
+    expect(await readFile(mounted, "utf8")).toBe("port = 80\n")
+  })
+
+  it("removes the volumes an image declares with the containers that had them", async () => {
+    const harness = await createdApp()
+    fakeDocker.images.set("redis:alpine", {})
+    fakeDocker.imageConfigs.set("redis:alpine", { Volumes: { "/data": {} } })
+
+    await deploy(harness, { image: "redis:alpine" })
+    await deploy(harness, {
+      command: "redis-server --save 60 1",
+      image: "redis:alpine",
+    })
+    expect(fakeDocker.danglingVolumes.size).toBe(0)
+
+    await harness.apps.delete({ appId, deleteData: true })
+    expect(fakeDocker.danglingVolumes.size).toBe(0)
+  })
+
+  it("keeps a volume from being deleted while a deployment that mounts it starts", async () => {
+    const harness = await createdApp()
+    const volumeId = "3f9a21c4".padEnd(40, "0")
+    const volume = `${TEST_NAMESPACE}-kiln-3f9a21c4-media`
+    fakeDocker.addVolume({
+      labels: {
+        "kiln.relay.owner": TEST_NAMESPACE,
+        "kiln.resource.kind": "volume",
+        "kiln.volume.id": volumeId,
+      },
+      name: volume,
+    })
+    const volumes = new RelayVolumes(
+      harness.config,
+      new DockerEngine(harness.config.dockerSocket),
+      harness.state
+    )
+    const pull = fakeDocker.hold({ command: "pull" })
+    const deploying = deploy(harness, {
+      mounts: [
+        {
+          id: "media0001",
+          readOnly: false,
+          service: null,
+          source: { type: "volume", volumeId },
+          target: "/media",
+        },
+      ],
+    })
+    await pull.reached
+
+    // As the control socket deletes one, in the volume's lane.
+    const locks = await controlRequestLocks(
+      "relay.volumes.delete",
+      { id: volumeId },
+      (reference) => reference
+    )
+    const deleting = Effect.runPromise(
+      harness.lanes.run(
+        { label: "relay.volumes.delete", locks: locks ?? [] },
+        volumes.delete(volumeId)
+      )
+    ).then(
+      () => null,
+      (error: unknown) => error
+    )
+    pull.release()
+
+    expect((await deploying).deployment).toMatchObject({ state: "succeeded" })
+    expect(await deleting).toBeInstanceOf(Error)
+    expect(fakeDocker.volumes.has(volume)).toBe(true)
+    expect(appContainers()[0]?.mounts).toContainEqual(
+      expect.objectContaining({ destination: "/media", source: volume })
+    )
+  })
+
+  it("fails a deployment that mounts a volume no longer on the Relay", async () => {
+    const harness = await createdApp()
+
+    const app = await deploy(harness, {
+      mounts: [
+        {
+          id: "media0001",
+          readOnly: false,
+          service: null,
+          source: { type: "volume", volumeId: "a".repeat(40) },
+          target: "/media",
+        },
+      ],
+    })
+
+    expect(app.deployment).toMatchObject({
+      error: expect.stringContaining("no longer exists"),
+      state: "failed",
+    })
+    expect(appContainers()).toEqual([])
   })
 
   it("refuses a second deployment sent while the first is starting", async () => {
@@ -573,7 +841,6 @@ describe("apps", () => {
 
     const limited = await harness.apps.setLimits({
       appId,
-      diskLimitBytes: 1024 * MIB,
       serviceLimits: { app: { cpuMillis: 500, memoryBytes: 512 * MIB } },
     })
 
@@ -586,33 +853,6 @@ describe("apps", () => {
           limits: { cpuMillis: 500, diskBytes: null, memoryBytes: 512 * MIB },
         },
       ],
-      diskLimitBytes: 1024 * MIB,
-    })
-  })
-
-  it("stops an app whose data outgrows its disk limit", async () => {
-    const harness = await createdApp()
-    await deploy(harness, {})
-    await harness.apps.setLimits({
-      appId,
-      diskLimitBytes: 128 * MIB,
-      serviceLimits: {},
-    })
-    const data = join(harness.config.dataDirectory, "apps", appId, "big.bin")
-
-    await harness.apps.enforceDiskLimits()
-    expect(appContainers()[0]?.state.running).toBe(true)
-
-    // A sparse file: its apparent size counts, without filling the disk.
-    await writeFile(data, "")
-    await truncate(data, 200 * MIB)
-    await harness.apps.enforceDiskLimits()
-
-    expect(appContainers()[0]?.state.running).toBe(false)
-    expect(await harness.apps.get(appId)).toMatchObject({
-      diskLimitBytes: 128 * MIB,
-      diskUsedBytes: 200 * MIB,
-      observedState: "stopped",
     })
   })
 
@@ -656,7 +896,6 @@ describe("apps", () => {
     await expect(
       harness.apps.setLimits({
         appId,
-        diskLimitBytes: null,
         serviceLimits: {
           web: { cpuMillis: null, memoryBytes: most },
           worker: { cpuMillis: null, memoryBytes: null },
@@ -700,7 +939,6 @@ describe("apps", () => {
     await expect(
       harness.apps.setLimits({
         appId,
-        diskLimitBytes: null,
         serviceLimits: {
           web: { cpuMillis: null, memoryBytes: 64 * MIB },
           worker: { cpuMillis: null, memoryBytes: most },
@@ -749,7 +987,6 @@ describe("apps", () => {
 
     const shrinking = harness.apps.setLimits({
       appId,
-      diskLimitBytes: null,
       serviceLimits: { app: { cpuMillis: null, memoryBytes: 64 * MIB } },
     })
     await update.reached
@@ -819,66 +1056,6 @@ describe("apps", () => {
       expect.objectContaining({ memoryBytes: 256 * MIB }),
     ])
     harness.lanes.setPaused(false)
-  })
-
-  it("keeps checking disk limits after a limited app is deleted", async () => {
-    const harness = await createdApp()
-    const otherId = "e".repeat(40)
-    await harness.apps.create({ id: otherId, name: "Other" })
-    await deploy(harness, {})
-    await deploy(harness, {}, otherId)
-    for (const id of [appId, otherId]) {
-      await harness.apps.setLimits({
-        appId: id,
-        diskLimitBytes: 128 * MIB,
-        serviceLimits: {},
-      })
-    }
-    await harness.apps.delete({ appId, deleteData: true })
-    const data = join(harness.config.dataDirectory, "apps", otherId, "big.bin")
-    await writeFile(data, "")
-    await truncate(data, 200 * MIB)
-
-    await harness.apps.enforceDiskLimits()
-
-    expect(appContainers(otherId)[0]?.state.running).toBe(false)
-  })
-
-  it("doesn't stop an app whose disk limit was raised while its stop waited", async () => {
-    const harness = await createdApp()
-    await deploy(harness, {})
-    await harness.apps.setLimits({
-      appId,
-      diskLimitBytes: 128 * MIB,
-      serviceLimits: {},
-    })
-    const data = join(harness.config.dataDirectory, "apps", appId, "big.bin")
-    await writeFile(data, "")
-    await truncate(data, 200 * MIB)
-    let release: () => void = () => undefined
-    const held = Effect.runPromise(
-      harness.lanes.run(
-        { label: "app.action", locks: appLifecycleLocks(appId) },
-        Effect.promise(
-          () =>
-            new Promise<void>((resolve) => {
-              release = resolve
-            })
-        )
-      )
-    )
-
-    const enforcing = harness.apps.enforceDiskLimits()
-    await harness.apps.setLimits({
-      appId,
-      diskLimitBytes: 1024 * MIB,
-      serviceLimits: {},
-    })
-    release()
-    await held
-    await enforcing
-
-    expect(appContainers()[0]?.state.running).toBe(true)
   })
 
   it("doesn't recreate an App deleted while its deployment waited", async () => {
@@ -1101,6 +1278,39 @@ describe("rolling deployments", () => {
     const app = await deploy(harness, { command: "serve --v2", ports })
 
     expect(app.deployment).toMatchObject({ rolling: false, state: "succeeded" })
+    expect(appContainers()).toHaveLength(1)
+  })
+
+  it("stops the running container first when it writes to a mounted path, but not when it only reads one", async () => {
+    const harness = await createdApp()
+    const mounts = (readOnly: boolean) => [
+      {
+        id: "nodepath1",
+        readOnly,
+        service: null,
+        source: { path: "/srv/shared", type: "host" as const },
+        target: "/shared",
+      },
+    ]
+    await deploy(harness, { mounts: mounts(false) })
+
+    const writing = await deploy(harness, {
+      command: "serve --v2",
+      mounts: mounts(false),
+    })
+    expect(writing.deployment).toMatchObject({
+      rolling: false,
+      state: "succeeded",
+    })
+
+    const reading = await deploy(harness, {
+      command: "serve --v3",
+      mounts: mounts(true),
+    })
+    expect(reading.deployment).toMatchObject({
+      rolling: true,
+      state: "succeeded",
+    })
     expect(appContainers()).toHaveLength(1)
   })
 
@@ -1330,6 +1540,85 @@ describe("rolling deployments", () => {
     await removeCompose()
   })
 
+  it("rolls an image over beside a volume it only reads, without filling the volume", async () => {
+    const harness = await createdApp()
+    const volumeId = "3f9a21c4".padEnd(40, "0")
+    const volume = `${TEST_NAMESPACE}-kiln-3f9a21c4-media`
+    fakeDocker.addVolume({
+      labels: {
+        "kiln.relay.owner": TEST_NAMESPACE,
+        "kiln.resource.kind": "volume",
+        "kiln.volume.id": volumeId,
+      },
+      name: volume,
+    })
+    const mounts = [
+      {
+        id: "media0001",
+        readOnly: true,
+        service: null,
+        source: { type: "volume" as const, volumeId },
+        target: "/media",
+      },
+    ]
+    await deploy(harness, { mounts })
+
+    const app = await deploy(harness, { command: "serve --v2", mounts })
+
+    expect(app.deployment).toMatchObject({ rolling: true, state: "succeeded" })
+    expect(fakeDocker.filledVolumes.has(volume)).toBe(false)
+  })
+
+  it("replaces a Compose project whose file declares a volume, even read-only", async () => {
+    const removeCompose = await composeConfigCommand()
+    const harness = await createdApp()
+    // A rolled project would name the volume anew, without its data.
+    const compose =
+      "services:\n  web:\n    image: nginx:alpine\n    volumes:\n      - type: volume\n        source: data\n        target: /data\n        read_only: true\nvolumes:\n  data: {}\n"
+    await deploy(harness, { compose, sourceType: "compose" })
+
+    const app = await deploy(harness, { compose, sourceType: "compose" })
+
+    expect(app.deployment).toMatchObject({ rolling: false, state: "succeeded" })
+    await removeCompose()
+  })
+
+  it("rolls a Compose project over when the volumes it mounts are read-only", async () => {
+    const removeCompose = await composeConfigCommand()
+    const harness = await createdApp()
+    const volumeId = "3f9a21c4".padEnd(40, "0")
+    const volume = `${TEST_NAMESPACE}-kiln-3f9a21c4-media`
+    fakeDocker.addVolume({
+      labels: {
+        "kiln.relay.owner": TEST_NAMESPACE,
+        "kiln.resource.kind": "volume",
+        "kiln.volume.id": volumeId,
+      },
+      name: volume,
+    })
+    const config = {
+      compose: "services:\n  web:\n    image: nginx:alpine\n",
+      mounts: [
+        {
+          id: "media0001",
+          readOnly: true,
+          service: null,
+          source: { type: "volume" as const, volumeId },
+          target: "/media",
+        },
+      ],
+      sourceType: "compose" as const,
+    }
+    await deploy(harness, config)
+
+    const app = await deploy(harness, config)
+
+    expect(app.deployment).toMatchObject({ rolling: true, state: "succeeded" })
+    // Nothing the new copy's image holds is copied into it.
+    expect(fakeDocker.filledVolumes.has(volume)).toBe(false)
+    await removeCompose()
+  })
+
   it("replaces a Compose project that keeps data in a volume instead of running two copies", async () => {
     const removeCompose = await composeConfigCommand()
     const harness = await createdApp()
@@ -1547,5 +1836,112 @@ describe("deployment logs", () => {
         deploymentId: "../../relay",
       })
     ).toBeNull()
+  })
+})
+
+describe("image updates", () => {
+  const nginx = "docker.io/library/nginx:alpine"
+  const first = `sha256:${"1".repeat(64)}`
+  const second = `sha256:${"2".repeat(64)}`
+  const check = (harness: RelayHarness, apps: Array<{ appId: string; image: string }>) =>
+    harness.apps.checkImages({ apps }, new AbortController().signal)
+
+  it("runs an image app at the digest its tag names, labelled with the image its config gave", async () => {
+    const harness = await createdApp()
+    fakeDocker.registryDigests.set(nginx, first)
+
+    const app = await deploy(harness, {})
+
+    const [container] = appContainers()
+    expect(container!.image).toBe(`docker.io/library/nginx@${first}`)
+    expect(container!.labels).toMatchObject({
+      "kiln.app.image": "nginx:alpine",
+      "kiln.app.image.digest": first,
+    })
+    // The app still shows the image its config names.
+    expect(app.containers[0]?.image).toBe("nginx:alpine")
+  })
+
+  it("finds a newer image once the tag moves, and asks no registry for an app that runs another image", async () => {
+    const harness = await createdApp()
+    await harness.apps.create({ id: "d".repeat(40), name: "Other" })
+    fakeDocker.registryDigests.set(nginx, first)
+    await deploy(harness, {})
+
+    expect(await check(harness, [{ appId, image: "nginx:alpine" }])).toEqual([
+      { appId, latestDigest: first, runningDigests: [first], status: "checked" },
+    ])
+
+    fakeDocker.registryDigests.set(nginx, second)
+    expect(
+      await check(harness, [
+        { appId, image: "nginx:alpine" },
+        { appId: "d".repeat(40), image: "nginx:alpine" },
+      ])
+    ).toEqual([
+      { appId, latestDigest: second, runningDigests: [first], status: "checked" },
+      { appId: "d".repeat(40), status: "not_deployed" },
+    ])
+    // Its config names another image since it deployed.
+    expect(await check(harness, [{ appId, image: "nginx:1.27" }])).toEqual([
+      { appId, status: "changed" },
+    ])
+
+    // One running another image than its config names learns nothing from
+    // an app that runs that image, checked beside it.
+    await deploy(harness, { image: "redis:7" }, "d".repeat(40))
+    expect(
+      await check(harness, [
+        { appId, image: "nginx:alpine" },
+        { appId: "d".repeat(40), image: "nginx:alpine" },
+      ])
+    ).toEqual([
+      { appId, latestDigest: second, runningDigests: [first], status: "checked" },
+      { appId: "d".repeat(40), status: "changed" },
+    ])
+
+    fakeDocker.unreachableImages.add("nginx:alpine")
+    expect(await check(harness, [{ appId, image: "nginx:alpine" }])).toEqual([
+      expect.objectContaining({ appId, status: "error" }),
+    ])
+  })
+
+  it("deploys the digest an update names, though its tag has moved on since", async () => {
+    const harness = await createdApp()
+    fakeDocker.registryDigests.set(nginx, first)
+    await deploy(harness, {})
+    fakeDocker.registryDigests.set(nginx, second)
+    // Another app pulls the tag meanwhile.
+    await harness.apps.create({ id: "d".repeat(40), name: "Other" })
+    await deploy(harness, {}, "d".repeat(40))
+
+    useDeploymentClock()
+    await harness.apps.deploy({ ...deployment({}), imageDigest: first })
+    await settledDeployment(harness)
+
+    const [container] = appContainers().filter(
+      (candidate) => candidate.state.running
+    )
+    expect(container!.image).toBe(`docker.io/library/nginx@${first}`)
+    expect(container!.labels["kiln.app.image.digest"]).toBe(first)
+    expect(await check(harness, [{ appId, image: "nginx:alpine" }])).toEqual([
+      { appId, latestDigest: second, runningDigests: [first], status: "checked" },
+    ])
+  })
+
+  it("deploys by tag when the registry can't name a digest, and checks it by the digests it was pulled as", async () => {
+    const harness = await createdApp()
+    fakeDocker.registryDigests.set(nginx, first)
+    fakeDocker.failNext({ command: "distribution" }, "registry unavailable")
+
+    const app = await deploy(harness, {})
+
+    expect(app.deployment?.state).toBe("succeeded")
+    const [container] = appContainers()
+    expect(container!.image).toBe("nginx:alpine")
+    expect(container!.labels["kiln.app.image.digest"]).toBeUndefined()
+    expect(await check(harness, [{ appId, image: "nginx:alpine" }])).toEqual([
+      { appId, latestDigest: first, runningDigests: [first], status: "checked" },
+    ])
   })
 })

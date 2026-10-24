@@ -7,8 +7,11 @@ import {
   relayConsoleResourcesV1Feature,
   relayAppsV1Feature,
   relayLogsV1Feature,
+  relayPlatformV2Feature,
   appIdFromFileRoot,
+  databaseIdFromFileRoot,
   isRelayFileRoot,
+  relayDatabaseDumpFilesV1Feature,
   relayHostFilesV1Feature,
   relayFileRequestReplayV1Feature,
   relayProxyBrowserMetadataSchema,
@@ -24,6 +27,7 @@ import type {
 import { Clock, Effect, Result } from "effect"
 
 import {
+  isPlatformAdmin,
   refreshRelayAuthorizationUserEffect,
   requireRelayPermissionsEffect,
 } from "@/lib/access-control"
@@ -58,6 +62,8 @@ type BrowserAction =
   | "app.files.download"
   | "app.files.upload"
   | "app.logs.read"
+  | "database.dump.export"
+  | "database.dump.import"
   | "database.logs.read"
   | "instance.console.read"
   | "instance.console.write"
@@ -316,22 +322,29 @@ export function issueFileCapabilityForRequest(input: {
   optInV2: boolean
 }): Promise<IssuedBrowserCapability> {
   // An app's data directory (`app:<appId>`) is transferred with the app's
-  // own file actions.
+  // own file actions, and a database's dumps (`database:<databaseId>`) with
+  // its dump actions.
   const host = isRelayFileRoot(input.instanceId)
   const app = appIdFromFileRoot(input.instanceId) !== null
+  const database = databaseIdFromFileRoot(input.instanceId) !== null
+  const upload = input.action === "instance.files.upload"
   return runAppEffect(
     "file.capability.issue",
     prepareBrowserCapabilityEffect({
       actions: [
         host
-          ? input.action === "instance.files.upload"
+          ? upload
             ? "relay.files.upload"
             : "relay.files.download"
           : app
-            ? input.action === "instance.files.upload"
+            ? upload
               ? "app.files.upload"
               : "app.files.download"
-            : input.action,
+            : database
+              ? upload
+                ? "database.dump.import"
+                : "database.dump.export"
+              : input.action,
       ],
       path: input.path,
       publicKeyJwk: input.publicKeyJwk,
@@ -339,7 +352,7 @@ export function issueFileCapabilityForRequest(input: {
       resolveBrowserMetadata: true,
       resource: {
         id: input.instanceId,
-        kind: host ? "relay" : app ? "app" : "instance",
+        kind: host ? "relay" : app ? "app" : database ? "database" : "instance",
       },
       identity: authenticatedIdentityEffect(input.authenticate),
       optInV2: input.optInV2,
@@ -391,7 +404,8 @@ const prepareBrowserCapabilityEffect = Effect.fn("relay.capability.prepare")(
       (action) =>
         action.startsWith("instance.files.") ||
         action.startsWith("app.files.") ||
-        action.startsWith("relay.files.")
+        action.startsWith("relay.files.") ||
+        action.startsWith("database.dump.")
     )
       ? "file"
       : input.actions.includes("instance.read")
@@ -484,8 +498,12 @@ const authorizeBrowserCapabilityEffect = Effect.fn(
   relayId: string
   resource: RelayConsoleResource
 }) {
-  // A Relay's own output is only ever the Relay the capability is for.
-  if (input.resource.kind === "relay" && input.resource.id !== input.relayId) {
+  // A Relay's own output, and Kiln's services on its host, are only ever
+  // the Relay the capability is for.
+  if (
+    (input.resource.kind === "relay" || input.resource.kind === "platform") &&
+    input.resource.id !== input.relayId
+  ) {
     return yield* Effect.fail(new Error("Relay not found"))
   }
   for (
@@ -497,6 +515,12 @@ const authorizeBrowserCapabilityEffect = Effect.fn(
       loginSession: input.authorizationSession,
       user: input.identity.user,
     })
+    // Kiln's own services are for platform administrators, as their page is.
+    if (input.resource.kind === "platform" && !isPlatformAdmin(snapshot.user)) {
+      return yield* Effect.fail(
+        new Error("Only platform administrators can read Kiln's logs")
+      )
+    }
     yield* requireRelayPermissionsEffect({
       ...resourceScope(input.resource),
       permissions: input.permissions,
@@ -589,7 +613,8 @@ const createBrowserCapabilityEffect = Effect.fn("relay.capability.sign")(
             action === "instance.console.write" ||
             action === "instance.files.upload" ||
             action === "app.files.upload" ||
-            action === "relay.files.upload"
+            action === "relay.files.upload" ||
+            action === "database.dump.import"
         )
         const payload = {
           actions: input.actions,
@@ -687,13 +712,19 @@ function resourceVersion(
       throw new Error("Update this Relay to access host files.")
     return version
   }
+  if (operation === "file" && resource.kind === "database") {
+    if (version !== 2 || !features.has(relayDatabaseDumpFilesV1Feature))
+      throw new Error("Update this Relay to import or export data.")
+    return version
+  }
 
   if (
     resource.kind !== "instance" &&
     (version !== 2 ||
       !features.has(relayConsoleResourcesV1Feature) ||
       (resource.kind === "app" && !features.has(relayAppsV1Feature)) ||
-      (resource.kind === "relay" && !features.has(relayLogsV1Feature)))
+      (resource.kind === "relay" && !features.has(relayLogsV1Feature)) ||
+      (resource.kind === "platform" && !features.has(relayPlatformV2Feature)))
   ) {
     throw new Error("Update this Relay to view these logs.")
   }
@@ -723,11 +754,15 @@ function resourceScope(resource: RelayConsoleResource) {
   switch (resource.kind) {
     case "instance":
       return { instanceId: resource.id }
+    // A database's dumps are addressed by its dump folder
+    // (`database:<databaseId>`).
     case "database":
-      return { databaseId: resource.id }
-    // App and Relay permissions are granted on the Relay.
+      return { databaseId: databaseIdFromFileRoot(resource.id) ?? resource.id }
+    // An app's files are addressed by its data directory (`app:<appId>`).
     case "app":
+      return { appId: appIdFromFileRoot(resource.id) ?? resource.id }
     case "relay":
+    case "platform":
       return {}
     default:
       return resource.kind satisfies never

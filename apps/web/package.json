@@ -43,6 +43,7 @@
     "@workspace/ui": "workspace:*",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
     "better-auth": "^1.7.7",
     "codemirror": "^6.0.2",
@@ -58,6 +59,7 @@
     "resend": "^6.32.0",
     "srvx": "^1.0.5",
     "tldts": "^7.4.16",
+    "web-push": "^3.6.7",
     "ws": "8.22.0",
     "yaml": "2.9.1",
     "zod": "^4.6.5"
@@ -69,6 +71,7 @@
     "@types/node": "^22.20.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/web-push": "^3.6.4",
     "@types/ws": "8.18.2",
     "@vitejs/plugin-react": "^6.1.2",
     "auth": "^1.7.7",

@@ -1,5 +1,6 @@
 import type { ComponentType } from "react"
 import {
+  Bell,
   CalendarDays,
   CircleUserRound,
   CreditCard,
@@ -22,6 +23,7 @@ import {
   Waypoints,
 } from "lucide-react"
 import {
+  accessPermissionSupported,
   builtinTailscaleBrickId,
   type DatabaseEngine,
   type RelayInstance,
@@ -65,10 +67,11 @@ export interface NavigationAccessCapabilities {
   grants: ReadonlyArray<{
     relayId: string
     resourceId: string
-    resourceType: "database" | "instance" | "relay"
+    resourceType: "app" | "database" | "instance" | "relay"
     permissions: readonly AccessPermission[]
   }>
   isPlatformAdmin: boolean
+  isRelayCreator: boolean
 }
 
 // Tabs render in this order, with a divider wherever `group` changes.
@@ -199,6 +202,12 @@ export const settingsDestinations = [
     keywords: ["settings", "downloads", "editor"],
     label: "Files",
     to: "/settings/files",
+  },
+  {
+    icon: Bell,
+    keywords: ["settings", "push", "alerts"],
+    label: "Notifications",
+    to: "/settings/notifications",
   },
   {
     icon: CircleUserRound,
@@ -505,17 +514,24 @@ export const appDestinations = [
   },
 ] as const satisfies ReadonlyArray<AppDestination>
 
-// App permissions are granted on a Relay, for all of its apps.
+// Granted on the app's Relay, for all of its apps, or by owning the app.
 export function canAccessAppPermission(
   capabilities: NavigationAccessCapabilities,
-  app: { relayId: string },
+  app: { id: string; relayId: string },
   permission: AccessPermission
 ): boolean {
-  return canAccessRelayPermission(capabilities, app.relayId, permission)
+  if (capabilities.isPlatformAdmin) return true
+  return capabilities.grants.some(
+    (grant) =>
+      grant.relayId === app.relayId &&
+      (grant.resourceType === "relay" ||
+        (grant.resourceType === "app" && grant.resourceId === app.id)) &&
+      grantHasPermission(grant, permission)
+  )
 }
 
 export function accessibleDestinationsForApp(
-  app: { relayId: string },
+  app: { id: string; relayId: string },
   capabilities: NavigationAccessCapabilities
 ): ReadonlyArray<AppDestination> {
   const destinations: ReadonlyArray<AppDestination> = appDestinations
@@ -595,6 +611,58 @@ export const relayDestinations = [
   },
 ] as const satisfies ReadonlyArray<RelayDestination>
 
+export type KilnDestinationId = "info" | "logs" | "terminal" | "viewer"
+
+export interface KilnDestination extends NavigationDestination {
+  id: KilnDestinationId
+}
+
+// Kiln itself: Hearth, its database and cache, and the Traefik in front of
+// them. Platform administrators only.
+export const kilnDestinations = [
+  {
+    icon: SlidersHorizontal,
+    id: "info",
+    keywords: [
+      "kiln",
+      "system",
+      "hearth",
+      "panel",
+      "mysql",
+      "valkey",
+      "cache",
+      "traefik",
+      "https",
+      "platform",
+      "repair",
+      "recovery",
+    ],
+    label: "Info",
+    to: "/kiln/info",
+  },
+  {
+    icon: Table2,
+    id: "viewer",
+    keywords: ["kiln", "hearth", "database", "tables", "rows", "sql", "query"],
+    label: "Viewer",
+    to: "/kiln/viewer",
+  },
+  {
+    icon: ScrollText,
+    id: "logs",
+    keywords: ["kiln", "hearth", "output", "errors"],
+    label: "Logs",
+    to: "/kiln/logs",
+  },
+  {
+    icon: TerminalSquare,
+    id: "terminal",
+    keywords: ["kiln", "shell", "mysql", "valkey", "traefik"],
+    label: "Terminal",
+    to: "/kiln/terminal",
+  },
+] as const satisfies ReadonlyArray<KilnDestination>
+
 // Granted on the Relay itself.
 export function canAccessRelayPermission(
   capabilities: NavigationAccessCapabilities,
@@ -658,23 +726,32 @@ export function canAccessInfrastructureDestination(
     // Sources feed syncs. Each person's sources are their own.
     return canUseSyncs(capabilities)
   }
+  // Each list also opens for people who can only create there; its create
+  // action is what they came for.
   if (destination.access === "app-read") {
-    return hasScopedPermission(capabilities, "app.read", ["relay"])
+    return (
+      hasScopedPermission(capabilities, "app.read", ["relay", "app"]) ||
+      hasScopedPermission(capabilities, "app.create", ["relay"])
+    )
   }
   if (destination.access === "instance-read") {
     return (
-      capabilities.canManageRelays ||
       capabilities.pendingScopes?.some(
         (scope) => scope.resourceType === "instance"
       ) === true ||
-      hasScopedPermission(capabilities, "instance.read", ["instance", "relay"])
+      hasScopedPermission(capabilities, "instance.read", [
+        "instance",
+        "relay",
+      ]) ||
+      hasScopedPermission(capabilities, "instance.create", ["relay"])
     )
   }
   return (
     capabilities.pendingScopes?.some(
       (scope) => scope.resourceType === "database"
     ) === true ||
-    hasScopedPermission(capabilities, "database.read", ["database", "relay"])
+    hasScopedPermission(capabilities, "database.read", ["database", "relay"]) ||
+    hasScopedPermission(capabilities, "database.create", ["relay"])
   )
 }
 
@@ -714,7 +791,7 @@ function canUseSyncs(capabilities: NavigationAccessCapabilities): boolean {
       "instance",
       "relay",
     ]) ||
-    hasScopedPermission(capabilities, "app.files.write", ["relay"]) ||
+    hasScopedPermission(capabilities, "app.files.write", ["relay", "app"]) ||
     hasScopedPermission(capabilities, "relay.files.write", ["relay"])
   )
 }
@@ -755,6 +832,15 @@ function hasScopedPermission(
 ): boolean {
   if (capabilities.isPlatformAdmin) return true
   const allowedResourceTypes = resourceTypes ? new Set(resourceTypes) : null
+  // A Relay Creator owns every Relay they pair, with every Relay permission.
+  // Show that workspace from the start instead of after the first pairing.
+  if (
+    capabilities.isRelayCreator &&
+    (!allowedResourceTypes || allowedResourceTypes.has("relay")) &&
+    accessPermissionSupported(permission, "relay")
+  ) {
+    return true
+  }
   return capabilities.grants.some(
     (grant) =>
       (!allowedResourceTypes || allowedResourceTypes.has(grant.resourceType)) &&

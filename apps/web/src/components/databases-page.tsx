@@ -2,9 +2,11 @@ import { DatabaseKindIcon } from "@/components/instance-kind-icon"
 import type { getManagedDatabaseDirectory } from "@/server/databases"
 import type { getInfraRelayOptions } from "@/server/infra-directory"
 import {
+  PendingInvitationCard,
   PendingResourceInvitations,
   PendingResourceInvitationBadge,
   resourceInvitationScopeKey,
+  type PendingInvitationCells,
 } from "@/components/pending-resource-invitations"
 import * as React from "react"
 import { useLiveSuspenseQuery } from "@tanstack/react-db"
@@ -84,6 +86,10 @@ import {
   useFavoritesOnly,
   useFavoritesOnlySource,
 } from "@/components/instance-favorite"
+import {
+  AddFirstRelayButton,
+  useAwaitingFirstRelay,
+} from "@/components/relay/pair-first-relay"
 import { DataTable } from "@/components/data-table-view"
 import {
   DataTableToolbar,
@@ -397,7 +403,7 @@ const DatabaseTable = React.memo(function DatabaseTable({
                     relayId: database.relayId,
                   }}
                   name={database.name}
-                  nameClassName="transition-colors group-hover/database-link:text-primary"
+                  nameClassName="transition-colors group-hover/database-link:text-primary-ink"
                   meta={database.shortId}
                   metaClassName="font-mono"
                   showFavorite={false}
@@ -419,14 +425,7 @@ const DatabaseTable = React.memo(function DatabaseTable({
         id: "engine",
         header: "Engine",
         sortFn: "text",
-        cell: ({ row }) => (
-          <Badge
-            variant="outline"
-            className={`type-meta font-mono uppercase ${engineBadgeClasses[row.original.engine]}`}
-          >
-            {engineLabel(row.original.engine)}
-          </Badge>
-        ),
+        cell: ({ row }) => <EngineBadge engine={row.original.engine} />,
         meta: dataTableColumnMeta({
           hideBelow: "md",
           width: "8.5rem",
@@ -478,6 +477,8 @@ const DatabaseTable = React.memo(function DatabaseTable({
     <DataTable
       leadingBody={
         <PendingResourceInvitations
+          cells={databasePendingCells}
+          columns={definition.columns}
           resourceType="database"
           visibleResourceKeys={visibleResourceKeys}
           searchStore={searchStore}
@@ -581,7 +582,7 @@ const DatabaseActions = React.memo(function DatabaseActions({
           <TooltipTrigger asChild>
             <Button
               aria-label={`Delete ${database.name}`}
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
               disabled={busy}
               size="icon-sm"
               type="button"
@@ -677,7 +678,7 @@ function ActionIconButton({
       <TooltipTrigger asChild>
         <Button
           aria-label={label}
-          className="text-muted-foreground hover:text-primary"
+          className="text-muted-foreground hover:text-primary-ink"
           disabled={disabled}
           size="icon-sm"
           type="button"
@@ -835,13 +836,16 @@ function EmptyDatabaseTable({
   onCreate: () => void
   searchActive: boolean
 }) {
+  const awaitingFirstRelay = useAwaitingFirstRelay()
   return (
     <DataTableEmptyState
       action={
-        !searchActive && canCreate ? (
+        searchActive ? null : canCreate ? (
           <Button size="sm" type="button" onClick={onCreate}>
             <Plus /> Add Database
           </Button>
+        ) : awaitingFirstRelay ? (
+          <AddFirstRelayButton />
         ) : null
       }
       description={
@@ -850,7 +854,9 @@ function EmptyDatabaseTable({
             ? "Try a database name, engine, ID, Relay, or internal hostname."
             : canCreate
               ? "Provision a private MySQL, MariaDB, PostgreSQL, Redis, or Valkey database."
-              : "No databases have been assigned to your account yet."}
+              : awaitingFirstRelay
+                ? "Pair a Relay to start provisioning databases."
+                : "No databases have been assigned to your account yet."}
         </span>
       }
       icon={<DatabaseKindIcon className="size-6" />}
@@ -870,4 +876,23 @@ function databaseFavorite(database: {
   relayId: string
 }): InstanceFavorite {
   return { id: database.id, kind: "database", relayId: database.relayId }
+}
+
+// A pending database shows what its row will once accepted.
+const databasePendingCells: PendingInvitationCells = {
+  database: (invitation) => <PendingInvitationCard invitation={invitation} />,
+  engine: ({ databaseEngine }) =>
+    databaseEngine ? <EngineBadge engine={databaseEngine} /> : null,
+  relay: (invitation) => <DataTableTextCell value={invitation.relayName} />,
+}
+
+function EngineBadge({ engine }: { engine: DatabaseEngine }) {
+  return (
+    <Badge
+      variant="outline"
+      className={`type-meta font-mono uppercase ${engineBadgeClasses[engine]}`}
+    >
+      {engineLabel(engine)}
+    </Badge>
+  )
 }

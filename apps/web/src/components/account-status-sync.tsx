@@ -1,4 +1,5 @@
 import { Result } from "effect"
+import { withRenderedAccount } from "@/lib/browser-accounts"
 import { memo, useEffect } from "react"
 
 export const AccountStatusSync = memo(function AccountStatusSync({
@@ -9,7 +10,7 @@ export const AccountStatusSync = memo(function AccountStatusSync({
   resumePath?: string
 }) {
   useEffect(() => {
-    const source = new EventSource("/api/account-status")
+    const source = new EventSource(withRenderedAccount("/api/account-status"))
     let previousVerification: boolean | null = null
     const onMessage = (event: MessageEvent<string>) => {
       Result.try(() => {

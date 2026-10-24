@@ -39,6 +39,7 @@ export function CodeDocumentPanel({
   languagePath,
   noun,
   onShare,
+  sourceLabel,
   sourceUrl,
   title,
 }: {
@@ -55,6 +56,8 @@ export function CodeDocumentPanel({
   // Lowercase, as in "Copy recipe".
   noun: string
   onShare?: (content: string) => Promise<string>
+  // What the source link says; "View <noun> URL" when left out.
+  sourceLabel?: string
   sourceUrl?: string | null
   title: string
 }) {
@@ -110,7 +113,7 @@ export function CodeDocumentPanel({
     <section className="flex h-[min(72dvh,42rem)] min-h-80 min-w-0 flex-col overflow-hidden bg-card">
       <div className="flex min-h-14 shrink-0 items-center gap-2 border-b px-3 py-2 pr-12 sm:gap-3">
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
-          <FileCode2 className="size-5 shrink-0 text-primary" />
+          <FileCode2 className="size-5 shrink-0 text-primary-ink" />
           <p className="truncate text-sm font-semibold">{title}</p>
         </div>
 
@@ -199,13 +202,15 @@ export function CodeDocumentPanel({
                     href={sourceUrl}
                     target="_blank"
                     rel="noreferrer"
-                    aria-label={`View ${noun} URL`}
+                    aria-label={sourceLabel ?? `View ${noun} URL`}
                   >
                     <ExternalLink />
                   </a>
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom">View {noun} URL</TooltipContent>
+              <TooltipContent side="bottom">
+                {sourceLabel ?? `View ${noun} URL`}
+              </TooltipContent>
             </Tooltip>
           ) : null}
 

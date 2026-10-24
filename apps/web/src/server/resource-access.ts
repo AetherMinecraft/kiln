@@ -6,9 +6,10 @@ import { z } from "zod"
 import {
   builtinPermissionPresets,
   builtinPresetSelections,
+  databaseEngineSchema,
   expandPermissionSelections,
   permissionSelectionsSchema,
-  permissionScopeTypeSchema,
+  accessGrantScopeTypeSchema,
   relayIdSchema,
   type PermissionSelection,
 } from "@workspace/contracts"
@@ -22,6 +23,7 @@ import { runAppEffect } from "@/effect/runtime"
 import type { InvitationOutcome } from "@/lib/notifications"
 import { databaseTable } from "@/lib/database-config"
 import { databasePool } from "@/lib/database"
+import { resourceOwnerQuery } from "@/lib/resource-owners"
 import { kilnPublicUrl } from "@/lib/environment"
 import { requireEligibleResourceUser, requireVerifiedUser } from "@/server/auth"
 import {
@@ -30,7 +32,7 @@ import {
   effectiveScopePermissions,
   expandStoredSelections,
   type ResolvedAccessGrant,
-  type ResourceScope,
+  type AccessGrantScope,
 } from "@/lib/resource-permissions"
 import { displayNameFromEmail } from "@/lib/display-name"
 import {
@@ -40,6 +42,7 @@ import {
   peopleFilter,
   supportedScopePermissions,
 } from "@/server/resource-access.server"
+import { listInvitedRelaysEffect } from "@/server/invited-relays.server"
 import {
   accessPolicyTransaction,
   lockAccessActorEffect,
@@ -56,7 +59,7 @@ import {
 
 export const resourceScopeSchema = z.object({
   relayId: relayIdSchema,
-  resourceType: permissionScopeTypeSchema,
+  resourceType: accessGrantScopeTypeSchema,
   resourceId: z.string().min(1).max(64),
 })
 const assignmentSchema = z.object({
@@ -101,20 +104,25 @@ const cancelPendingInvitationsEffect = Effect.fnUntraced(function* (
 })
 
 const currentAttemptFor = (alias = "") =>
-  ["accepted_at IS NULL", "declined_at IS NULL", "revoked_at IS NULL"]
+  [
+    "accepted_at IS NULL",
+    "declined_at IS NULL",
+    "revoked_at IS NULL",
+    "cancelled_at IS NULL",
+  ]
     .map((column) => `${alias}${column}`)
     .join(" AND ") + ` AND ${alias}expires_at > ?`
 const currentAttempt = currentAttemptFor()
-const scopeValues = (scope: ResourceScope) => [
+const scopeValues = (scope: AccessGrantScope) => [
   scope.relayId,
   scope.resourceType,
   scope.resourceId,
 ]
 const scopeFromRow = (row: {
   relay_id: string
-  resource_type: ResourceScope["resourceType"]
+  resource_type: AccessGrantScope["resourceType"]
   resource_id: string
-}): ResourceScope => ({
+}): AccessGrantScope => ({
   relayId: row.relay_id,
   resourceType: row.resource_type,
   resourceId: row.resource_id,
@@ -130,7 +138,7 @@ interface GrantRow extends RowDataPacket {
   state: "pending" | "active" | "revoked"
   revision: number
   relay_id: string
-  resource_type: ResourceScope["resourceType"]
+  resource_type: AccessGrantScope["resourceType"]
   resource_id: string
   email: string
   name: string
@@ -146,7 +154,7 @@ interface PresetRow extends RowDataPacket {
   name: string
   revision: number
   relay_id: string
-  resource_type: ResourceScope["resourceType"]
+  resource_type: AccessGrantScope["resourceType"]
   resource_id: string
   created_at: number
   updated_at: number
@@ -162,7 +170,7 @@ interface InvitationRow extends RowDataPacket {
   user_id: string
   email: string
   relay_id: string
-  resource_type: ResourceScope["resourceType"]
+  resource_type: AccessGrantScope["resourceType"]
   resource_id: string
   invited_by: string
   accepted_at: number | null
@@ -170,11 +178,13 @@ interface InvitationRow extends RowDataPacket {
   acceptance_method: string | null
   declined_at: number | null
   revoked_at: number | null
+  cancelled_at: number | null
   expires_at: number
   created_at: number
   resource_name: string | null
   inviter_name: string | null
   relay_name: string | null
+  database_engine: string | null
   access_type: string
   delivery_status: string
 }
@@ -220,7 +230,7 @@ export const inviteResourceAccess = createServerFn({ method: "POST" })
           const invitations: Array<{
             id: string
             accessId: string
-            scope: ResourceScope
+            scope: AccessGrantScope
             inviteUrl: string
             expiresAt: string
             resourceName: string
@@ -381,7 +391,7 @@ export const inviteResourceAccess = createServerFn({ method: "POST" })
 
 const iso = (value: number | null) =>
   value === null ? null : new Date(value).toISOString()
-const invitationSelect = `SELECT i.*, g.resource_type, g.resource_id, COALESCE(s.display_name, s.source_name, d.name, r.name) AS resource_name, u.name AS inviter_name, r.name AS relay_name
+const invitationSelect = `SELECT i.*, g.resource_type, g.resource_id, COALESCE(s.display_name, s.source_name, d.name, r.name) AS resource_name, u.name AS inviter_name, r.name AS relay_name, d.engine AS database_engine
   FROM ${databaseTable("invitation")} i
   LEFT JOIN ${databaseTable("user")} u ON u.id = i.invited_by
   LEFT JOIN ${databaseTable("access_grant")} g ON g.id = i.access_id
@@ -398,6 +408,8 @@ function invitationView(row: InvitationRow) {
     resourceName: row.resource_name ?? row.resource_id,
     inviterName: row.inviter_name ?? "Kiln",
     relayName: row.relay_name ?? "Relay",
+    databaseEngine:
+      databaseEngineSchema.safeParse(row.database_engine).data ?? null,
     createdAt: new Date(row.created_at).toISOString(),
     expiresAt: new Date(row.expires_at).toISOString(),
     acceptedAt: iso(row.accepted_at),
@@ -410,6 +422,7 @@ function invitationView(row: InvitationRow) {
       !row.accepted_at &&
       !row.declined_at &&
       !row.revoked_at &&
+      !row.cancelled_at &&
       row.expires_at > Date.now(),
   }
 }
@@ -421,7 +434,27 @@ export const getMyInvitations = createServerFn({ method: "GET" }).handler(
       `${invitationSelect} WHERE i.user_id = ? AND i.access_type = 'scoped' AND ${currentAttemptFor("i.")} AND g.state = 'pending' AND r.enabled = TRUE ORDER BY i.created_at DESC LIMIT 500`,
       [user.id, Date.now()]
     )
-    return rows.map(invitationView)
+    const invitations = rows.map(invitationView)
+    const invitedRelays = invitations.some(
+      (invitation) => invitation.scope.resourceType === "relay"
+    )
+      ? new Map(
+          (
+            await runAppEffect(
+              "resourceInvitations.invitedRelays",
+              listInvitedRelaysEffect(user.id, true)
+            )
+          ).map((relay) => [relay.id, relay])
+        )
+      : null
+    return invitations.map((invitation) => ({
+      ...invitation,
+      // What the Relay's own table row shows, for a Relay invitation.
+      relay:
+        invitation.scope.resourceType === "relay"
+          ? (invitedRelays?.get(invitation.scope.relayId) ?? null)
+          : null,
+    }))
   }
 )
 
@@ -543,6 +576,7 @@ export const decideResourceInvitation = createServerFn({ method: "POST" })
             invitation.accepted_at ||
             invitation.declined_at ||
             invitation.revoked_at ||
+            invitation.cancelled_at ||
             invitation.expires_at <= now
           )
             return yield* Effect.fail(
@@ -889,7 +923,9 @@ export const updateResourceAccess = createServerFn({ method: "POST" })
                   relayId: data.relayId,
                   type: data.resourceType,
                 },
-              }
+              },
+              // Removing your own access tells you nothing new.
+              { actorUserId: user.id }
             )
           return {
             userId: grant.user_id,
@@ -962,15 +998,10 @@ export const getResourceAccess = createServerFn({ method: "GET" })
     const { permissions: supportedPermissions, supportedCapabilities } =
       await supportedScopePermissions(data, permissions)
     if (!supportedPermissions.length) throw new Error("Resource not found")
+    const ownerQuery = resourceOwnerQuery(data)
     const [owners] = await databasePool.query<Array<UserRow>>(
-      data.resourceType === "relay"
-        ? `SELECT u.id, u.name, u.email FROM ${databaseTable("relay")} r LEFT JOIN ${databaseTable("user")} u ON u.id = r.created_by WHERE r.id = ?`
-        : data.resourceType === "instance"
-          ? `SELECT u.id, u.name, u.email FROM ${databaseTable("instance")} r LEFT JOIN ${databaseTable("user")} u ON u.id = r.owner_id WHERE r.relay_id = ? AND r.instance_id = ?`
-          : `SELECT u.id, u.name, u.email FROM ${databaseTable("database")} r LEFT JOIN ${databaseTable("user")} u ON u.id = r.created_by WHERE r.relay_id = ? AND r.database_id = ?`,
-      data.resourceType === "relay"
-        ? [data.relayId]
-        : [data.relayId, data.resourceId]
+      `SELECT u.id, u.name, u.email FROM (${ownerQuery.sql}) r LEFT JOIN ${databaseTable("user")} u ON u.id = r.user_id`,
+      ownerQuery.values
     )
     if (!owners.length) throw new Error("Resource not found")
     const canReadPeople = permissions.includes("access.read")
@@ -1042,9 +1073,7 @@ export const getResourceAccess = createServerFn({ method: "GET" })
       },
       permissions: supportedPermissions,
       supportedCapabilities,
-      canTransferOwnership:
-        data.resourceType === "instance" &&
-        (admin || owners[0]?.id === user.id),
+      canTransferOwnership: admin || owners[0]?.id === user.id,
       owner: owners[0]?.id
         ? {
             id: owners[0].id,
@@ -1150,7 +1179,7 @@ export const getAccessResources = createServerFn({ method: "GET" })
       admin = user.role === "admin" || user.isDevelopmentBypass
     interface ResourceRow extends RowDataPacket {
       relay_id: string
-      resource_type: ResourceScope["resourceType"]
+      resource_type: AccessGrantScope["resourceType"]
       resource_id: string
       name: string
       relay_name: string
@@ -1224,7 +1253,7 @@ export const getAccessResources = createServerFn({ method: "GET" })
       `SELECT relay_id, resource_type, resource_id, name, relay_name FROM (
     SELECT id AS relay_id, 'relay' AS resource_type, id AS resource_id, name, created_by AS owner_id, name AS relay_name FROM ${databaseTable("relay")} WHERE enabled = TRUE
     UNION ALL SELECT i.relay_id, 'instance', i.instance_id, COALESCE(i.display_name, i.source_name, i.instance_id), i.owner_id, r.name FROM ${databaseTable("instance")} i JOIN ${databaseTable("relay")} r ON r.id = i.relay_id AND r.enabled = TRUE
-    UNION ALL SELECT d.relay_id, 'database', d.database_id, d.name, d.created_by, r.name FROM ${databaseTable("database")} d JOIN ${databaseTable("relay")} r ON r.id = d.relay_id AND r.enabled = TRUE
+    UNION ALL SELECT d.relay_id, 'database', d.database_id, d.name, d.owner_id, r.name FROM ${databaseTable("database")} d JOIN ${databaseTable("relay")} r ON r.id = d.relay_id AND r.enabled = TRUE
     ) resources WHERE (name LIKE ? OR resource_id LIKE ? OR relay_id LIKE ?)${accessFilter} ORDER BY name, resource_id LIMIT ? OFFSET ?`,
       [
         ...Array<string>(3).fill(

@@ -1,6 +1,6 @@
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import type { ResourceLimits } from "@workspace/contracts"
+import type { BackupTarget, ResourceLimits } from "@workspace/contracts"
 import {
   ArrowRight,
   Cable,
@@ -234,7 +234,11 @@ function CopyConnectionUrlButton({ url }: { url: string | null }) {
       size="sm"
       variant="outline"
       disabled={!url}
-      className={copied ? "text-emerald-400 hover:text-emerald-400" : undefined}
+      className={
+        copied
+          ? "text-emerald-400 hover:text-emerald-400 light:text-emerald-700 light:hover:text-emerald-700"
+          : undefined
+      }
       onClick={() => void copy()}
     >
       Connection URL
@@ -244,7 +248,9 @@ function CopyConnectionUrlButton({ url }: { url: string | null }) {
 }
 
 function CredentialPending() {
-  return <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />
+  return (
+    <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />
+  )
 }
 
 // Data in and out: drop a SQL dump to import it, export one, or restore a
@@ -303,7 +309,18 @@ export function DatabaseDataSection({
               View Data
             </InfoSectionLink>
           ) : null}
-          {canRestore ? <RestoreBackupButton database={database} /> : null}
+          {canRestore ? (
+            <RestoreBackupLink
+              emptyMessage="No backups found for this database"
+              relayId={database.relayId}
+              search={{
+                kind: "database",
+                relay: database.relayId,
+                server: database.id,
+              }}
+              target={{ id: database.id, kind: "database" }}
+            />
+          ) : null}
         </>
       }
     >
@@ -317,25 +334,23 @@ export function DatabaseDataSection({
   )
 }
 
-// Opens the database's backups on the Backups page, where they're restored.
+// Opens a database's backups on the Backups page, where they're restored.
 // With none finished yet, it says so instead.
-function RestoreBackupButton({ database }: { database: ManagedDatabase }) {
-  const { data } = useQuery(
-    backupUsageQueryOptions(database.relayId, {
-      id: database.id,
-      kind: "database",
-    })
-  )
+export function RestoreBackupLink({
+  emptyMessage,
+  relayId,
+  search,
+  target,
+}: {
+  emptyMessage: string
+  relayId: string
+  search: { kind: "database" | "relay"; relay: string; server: string }
+  target: BackupTarget
+}) {
+  const { data } = useQuery(backupUsageQueryOptions(relayId, target))
   if (data && data.quantityAvailable > 0) {
     return (
-      <InfoSectionLink
-        to="/backups/runs"
-        search={{
-          kind: "database",
-          relay: database.relayId,
-          server: database.id,
-        }}
-      >
+      <InfoSectionLink to="/backups/runs" search={search}>
         Restore Backup
       </InfoSectionLink>
     )
@@ -357,13 +372,12 @@ function RestoreBackupButton({ database }: { database: ManagedDatabase }) {
         </span>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={6}>
-        No backups found for this database
+        {emptyMessage}
       </TooltipContent>
     </Tooltip>
   )
 }
 
-// Dropping or choosing a dump opens the import, which confirms it first.
 function DatabaseImportDropZone({
   database,
   disabledReason,
@@ -372,51 +386,9 @@ function DatabaseImportDropZone({
   disabledReason: string | undefined
 }) {
   const [file, setFile] = React.useState<File | null>(null)
-  const [dragging, setDragging] = React.useState(false)
-  const disabled = Boolean(disabledReason)
-
   return (
     <>
-      <label
-        title={disabledReason}
-        className={cn(
-          "flex flex-col items-center gap-1.5 border border-dashed px-4 py-6 text-center transition-colors focus-within:border-primary",
-          disabled
-            ? "cursor-not-allowed opacity-60"
-            : "cursor-pointer hover:border-primary/70 hover:bg-muted/30",
-          dragging && "border-primary bg-primary/5"
-        )}
-        onDragOver={(event) => {
-          if (disabled) return
-          event.preventDefault()
-          setDragging(true)
-        }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={(event) => {
-          event.preventDefault()
-          setDragging(false)
-          if (disabled) return
-          const dropped = event.dataTransfer.files[0]
-          if (dropped) setFile(dropped)
-        }}
-      >
-        <Upload className="size-5 text-muted-foreground" />
-        <span className="text-[0.8125rem] font-medium">
-          Upload a .sql or .dmp file to import
-        </span>
-        <span className="text-xs text-muted-foreground">700 KB Limit</span>
-        <input
-          accept={DATABASE_DUMP_ACCEPT}
-          className="sr-only"
-          disabled={disabled}
-          type="file"
-          onChange={(event) => {
-            const chosen = event.currentTarget.files?.[0]
-            if (chosen) setFile(chosen)
-            event.currentTarget.value = ""
-          }}
-        />
-      </label>
+      <SqlImportDropZone disabledReason={disabledReason} onFile={setFile} />
       {file ? (
         <ImportDatabaseDialog
           database={database}
@@ -428,6 +400,66 @@ function DatabaseImportDropZone({
         />
       ) : null}
     </>
+  )
+}
+
+// Dropping or choosing a dump hands it on, to an import that confirms it
+// first.
+export function SqlImportDropZone({
+  disabledReason,
+  label = "Upload a .sql or .dmp file to import",
+  limit,
+  onFile,
+}: {
+  disabledReason: string | undefined
+  label?: string
+  limit?: string
+  onFile: (file: File) => void
+}) {
+  const [dragging, setDragging] = React.useState(false)
+  const disabled = Boolean(disabledReason)
+
+  return (
+    <label
+      title={disabledReason}
+      className={cn(
+        "flex flex-col items-center gap-1.5 border border-dashed px-4 py-6 text-center transition-colors focus-within:border-primary",
+        disabled
+          ? "cursor-not-allowed opacity-60"
+          : "cursor-pointer hover:border-primary/70 hover:bg-muted/30",
+        dragging && "border-primary bg-primary/5"
+      )}
+      onDragOver={(event) => {
+        if (disabled) return
+        event.preventDefault()
+        setDragging(true)
+      }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={(event) => {
+        event.preventDefault()
+        setDragging(false)
+        if (disabled) return
+        const dropped = event.dataTransfer.files[0]
+        if (dropped) onFile(dropped)
+      }}
+    >
+      <Upload className="size-5 text-muted-foreground" />
+      <span className="text-[0.8125rem] font-medium">{label}</span>
+      {limit ? (
+        <span className="text-xs text-muted-foreground">{limit}</span>
+      ) : null}
+      <input
+        accept={DATABASE_DUMP_ACCEPT}
+        className="sr-only"
+        disabled={disabled}
+        type="file"
+        onChange={(event) => {
+          const chosen = event.currentTarget.files?.[0]
+          if (chosen) onFile(chosen)
+          event.currentTarget.value = ""
+        }}
+      />
+    </label>
   )
 }
 

@@ -13,8 +13,6 @@ export type ManagedDatabase = Omit<ManagedDatabaseListItem, "observedState"> & {
   runtimeStatus?: import("@/lib/instance-state").InstanceState
 }
 
-export const DATABASE_DUMP_LIMIT_BYTES = 700_000
-
 export const engineOptions: ReadonlyArray<{
   description: string
   label: string
@@ -29,13 +27,15 @@ export const engineOptions: ReadonlyArray<{
 
 export const engineBadgeClasses: Record<DatabaseEngine, string> = {
   mariadb:
-    "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300",
-  mysql: "border-sky-500/35 bg-sky-500/10 text-sky-700 dark:text-sky-300",
+    "border-amber-500/35 bg-amber-500/10 light:bg-amber-500/20 text-amber-700 dark:text-amber-300",
+  mysql:
+    "border-sky-500/35 bg-sky-500/10 light:bg-sky-500/20 text-sky-700 dark:text-sky-300",
   postgres:
-    "border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-  redis: "border-red-500/35 bg-red-500/10 text-red-700 dark:text-red-300",
+    "border-emerald-500/35 bg-emerald-500/10 light:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300",
+  redis:
+    "border-red-500/35 bg-red-500/10 light:bg-red-500/20 text-red-700 dark:text-red-300",
   valkey:
-    "border-violet-500/35 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+    "border-violet-500/35 bg-violet-500/10 light:bg-violet-500/20 text-violet-700 dark:text-violet-300",
 }
 
 export function databaseStatusPresentation(
@@ -99,17 +99,6 @@ export function engineLabel(engine: DatabaseEngine): string {
   return (
     engineOptions.find((option) => option.value === engine)?.label ?? engine
   )
-}
-
-export function downloadTextFile(fileName: string, content: string) {
-  const url = URL.createObjectURL(
-    new Blob([content], { type: "application/sql" })
-  )
-  const link = document.createElement("a")
-  link.href = url
-  link.download = fileName
-  link.click()
-  URL.revokeObjectURL(url)
 }
 
 export function showDatabaseOperationError(message: string, error: Error) {

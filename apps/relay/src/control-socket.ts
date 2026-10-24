@@ -25,6 +25,7 @@ import {
   relayAuthenticationWindowMs,
   relayAuthChallengeTranscript,
   relayAuthResponseTranscript,
+  relayHearthContainerTranscript,
   relayBrowserCapabilityV2Feature,
   relayBrowserLeaseRenewalV1Feature,
   relayControlDeadlineMs,
@@ -43,6 +44,11 @@ import {
   relayDatabaseLimitsV1Feature,
   relayAppLimitsV1Feature,
   relayAppGitHubV1Feature,
+  relayAppImageUpdatesV1Feature,
+  relayPlatformV1Feature,
+  relayPlatformV2Feature,
+  relayPlatformDatabaseV1Feature,
+  relayDatabaseDumpFilesV1Feature,
   relayVolumesV1Feature,
   relayDatabaseProvisioningV1Feature,
   relayAppProvisioningV1Feature,
@@ -108,10 +114,23 @@ const MAX_IN_FLIGHT_REQUESTS = 32
 const MAX_CONTROL_SESSIONS = 128
 const MAX_CONTROL_SESSIONS_PER_CLIENT = 4
 
+export interface HearthContainerClaim {
+  readonly containerId: string
+  readonly installationId: string
+  readonly proof: string
+  readonly transcript: string
+}
+
 export interface ControlSocketOptions {
   // Saves the installation ID a full-access Hearth authenticated with. The
   // session is ready only once this settles; it reports its own failures.
   readonly adoptInstallationId?: (installationId: string) => Promise<void>
+  /**
+   * Checks, in the background, the container a full-access Hearth says it
+   * runs in: `proof` must be an HMAC of `transcript` keyed by that
+   * container's BETTER_AUTH_SECRETS.
+   */
+  readonly identifyHearth?: (claim: HearthContainerClaim) => void
   /**
    * Runs once an authorized request has its place in line, before it waits
    * for its locks: a delete stops a running deployment here, so it doesn't
@@ -457,7 +476,8 @@ function authenticateSocket(
           message.clientId,
           message.signature,
           message.features ?? [],
-          message.installationId
+          message.installationId,
+          message.hearthContainer
         ).pipe(
           Effect.catch(() =>
             Effect.sync(() => {
@@ -634,7 +654,8 @@ function authenticateSocket(
     clientId: string,
     signature: string,
     features: ReadonlyArray<string>,
-    installationId: string | undefined
+    installationId: string | undefined,
+    hearthContainer: { readonly id: string; readonly proof: string } | undefined
   ): EffectType.Effect<void, Error> {
     return Effect.gen(function* () {
       if (Date.now() > challenge.expiresAt || authenticatedClient) {
@@ -661,7 +682,11 @@ function authenticateSocket(
       nodeResourceDeltasEnabled = features.includes(
         relaySnapshotNodeResourcesFeature
       )
-      yield* completedAuthenticationEffect(client, installationId)
+      yield* completedAuthenticationEffect(
+        client,
+        installationId,
+        hearthContainer
+      )
     })
   }
 
@@ -1073,7 +1098,8 @@ function authenticateSocket(
 
   function completedAuthenticationEffect(
     client: RelayClientGrant,
-    installationId: string | undefined
+    installationId: string | undefined,
+    hearthContainer: { readonly id: string; readonly proof: string } | undefined
   ): EffectType.Effect<void, Error> {
     return Effect.gen(function* () {
       const clientSessionCount = [...authenticatedSockets.values()].filter(
@@ -1094,6 +1120,23 @@ function authenticateSocket(
       const adopt = options.adoptInstallationId
       if (adopt && installationId && client.role === "full_access") {
         yield* promiseOperation(() => adopt(installationId)).pipe(Effect.ignore)
+      }
+      if (
+        options.identifyHearth &&
+        hearthContainer &&
+        installationId &&
+        client.role === "full_access"
+      ) {
+        options.identifyHearth({
+          containerId: hearthContainer.id,
+          installationId,
+          proof: hearthContainer.proof,
+          transcript: relayHearthContainerTranscript(
+            unsignedChallenge,
+            client.id,
+            hearthContainer.id
+          ),
+        })
       }
       authenticatedClient = client
       yield* Fiber.interrupt(authenticationTimeoutFiber)
@@ -1135,6 +1178,11 @@ function authenticateSocket(
           relayAppProvisioningV1Feature,
           relayAppGitHubV1Feature,
           relayVolumesV1Feature,
+          relayAppImageUpdatesV1Feature,
+          relayPlatformV1Feature,
+          relayPlatformV2Feature,
+          relayPlatformDatabaseV1Feature,
+          relayDatabaseDumpFilesV1Feature,
         ],
         protocol: relayControlProtocol,
         relayBuild: relayBuildLabel(),
@@ -1490,6 +1538,14 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "relay.terminal.claim":
     case "relay.terminal.restart":
       return "relay.terminal"
+    // A shell in Kiln's own containers is as much as a host shell.
+    case "relay.platform.terminal.attach":
+    case "relay.platform.terminal.heartbeat":
+    case "relay.platform.terminal.detach":
+    case "relay.platform.terminal.write":
+    case "relay.platform.terminal.claim":
+    case "relay.platform.terminal.restart":
+      return "relay.terminal"
     // A root shell on the host could reboot it anyway.
     case "relay.host.restart":
       return "relay.terminal"
@@ -1518,6 +1574,18 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "relay.pairing.revoke"
     case "relay.clients.list":
       return "relay.clients.list"
+    // Hearth's logs can hold anything it printed. Only the Hearth this
+    // Relay installed may restart or repair it; the Relay checks that too.
+    case "relay.platform.read":
+      return "relay.read"
+    case "relay.platform.logs":
+      return "relay.logs.read"
+    case "relay.platform.action":
+      return "relay.update"
+    // Hearth's own database holds everything Hearth knows.
+    case "relay.platform.database.read":
+    case "relay.platform.database.write":
+      return "relay.update"
     case "relay.clients.update":
       return "relay.clients.update"
     case "relay.clients.revoke":
@@ -1567,6 +1635,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "database.dump.import"
     case "app.list":
     case "app.network.routes.read":
+    case "app.image.check":
       return "app.read"
     case "app.deployment.read":
       return "app.logs.read"

@@ -37,10 +37,10 @@ export class BackupLimitError extends Schema.TaggedError<BackupLimitError>()(
     used: Schema.Number,
   }
 ) {
+  // Retention makes room for new backups, so the only limit that refuses
+  // one is a platform ceiling of none, which turns backups off.
   override get message() {
-    return this.kind === "quantity"
-      ? `This resource has reached its ${this.limit} backup limit`
-      : "This resource does not have enough backup storage remaining"
+    return "Backups are turned off for this resource"
   }
 }
 
@@ -213,3 +213,27 @@ export class RenderReadError extends Schema.TaggedError<RenderReadError>()(
   "RenderReadError",
   { message: Schema.String }
 ) {}
+
+// Exporting or importing Hearth's own database; `reason` is MySQL's.
+export class KilnDatabaseError extends Schema.TaggedError<KilnDatabaseError>()(
+  "KilnDatabaseError",
+  {
+    operation: Schema.Literals(["export", "import"]),
+    // Why an import was refused before it ran anything.
+    refusal: Schema.optional(
+      Schema.Literals([
+        "too_large",
+        "not_kiln_export",
+        "changed",
+        "other_schema",
+        "no_recent_backup",
+      ])
+    ),
+    reason: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  }
+) {
+  override get message() {
+    return this.reason
+  }
+}

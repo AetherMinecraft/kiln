@@ -1,9 +1,12 @@
 import * as React from "react"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
+import type { QueryClient } from "@tanstack/react-query"
 import { Link, useNavigate } from "@tanstack/react-router"
 import {
+  CloudUpload,
   HardDrive,
   PackageCheck,
+  PackagePlus,
   Rocket,
   UserMinus,
   UserPlus,
@@ -19,6 +22,7 @@ import {
   acceptedInvitationHref,
   useResourceInvitationDecision,
 } from "@/components/resource-invitation-dialog"
+import { appRouteIdentifier } from "@/lib/app-route"
 import {
   clearNotificationsMutationOptions,
   dismissNotificationMutationOptions,
@@ -30,8 +34,8 @@ import type {
   NotificationContent,
   NotificationResource,
 } from "@/lib/notifications"
-import { formatBytes } from "@/lib/format-bytes"
-import { kilnReleaseLabel } from "@/lib/release-version"
+import { notificationDetail, notificationTitle } from "@/lib/notification-text"
+import { appDirectoryQueryOptions } from "@/lib/query-options"
 
 export type NotificationListItem =
   | { key: string; kind: "group"; label: string }
@@ -140,7 +144,7 @@ export const NotificationRow = React.memo(function NotificationRow({
       <span
         className={cn(
           "grid size-8 shrink-0 place-items-center rounded-md border border-border/70 bg-muted/40 text-muted-foreground",
-          highlighted && "border-primary/30 bg-primary/10 text-primary"
+          highlighted && "border-primary/30 bg-primary/10 text-primary-ink"
         )}
       >
         <Icon className="size-4" aria-hidden />
@@ -232,6 +236,8 @@ function NotificationActions({
     case "access.removed":
       return null
     case "resource.disk-limit":
+    case "app.image-update":
+    case "app.deployed":
       return (
         <OpenResourceButton
           resource={content.resource}
@@ -244,12 +250,7 @@ function NotificationActions({
 // Opens the Updates dialog's changelog.
 function ChangelogLink({ onNavigate }: { onNavigate?: () => void }) {
   return (
-    <Button
-      asChild
-      variant="ghost"
-      size="xs"
-      className="text-muted-foreground hover:text-foreground"
-    >
+    <Button asChild variant="outline" size="xs">
       <Link to="/infra/updates/changelog" onClick={onNavigate}>
         Changelog
       </Link>
@@ -330,7 +331,7 @@ function OpenResourceButton({
         void navigate({
           href:
             resource.type === "app"
-              ? `/infra/apps?search=${encodeURIComponent(resource.id)}`
+              ? appHref(queryClient, resource.id)
               : acceptedInvitationHref(queryClient, {
                   relayId: resource.relayId,
                   resourceId: resource.id,
@@ -342,6 +343,15 @@ function OpenResourceButton({
       Open
     </Button>
   )
+}
+
+// The app's own page, by its short ID when the cached directory can tell it
+// apart. The route resolves a full ID too, and falls back to the Apps list for
+// an app that's gone.
+function appHref(queryClient: QueryClient, appId: string) {
+  const apps = queryClient.getQueryData(appDirectoryQueryOptions().queryKey)
+  const routeId = apps ? appRouteIdentifier(apps, { id: appId }) : appId
+  return `/app/${encodeURIComponent(routeId)}`
 }
 
 function showNotificationFailure(action: string) {
@@ -376,68 +386,9 @@ const notificationIcons = {
   "kiln.release": Rocket,
   "kiln.updated": PackageCheck,
   "resource.disk-limit": HardDrive,
+  "app.image-update": PackagePlus,
+  "app.deployed": CloudUpload,
 } satisfies Record<
   NotificationContent["kind"],
   React.ComponentType<{ className?: string }>
 >
-
-const resourceTypeLabels = {
-  app: "App",
-  database: "Database",
-  instance: "Game Server",
-  relay: "Relay",
-} satisfies Record<NotificationResource["type"], string>
-
-// The release name GitHub gave the build, e.g. "v0.1.0 Nightly #17", or one
-// made from its version for notifications written without it.
-function releaseName(name: string | undefined, version: string) {
-  return name ?? kilnReleaseLabel(version)
-}
-
-export function notificationTitle(content: NotificationContent): string {
-  switch (content.kind) {
-    case "kiln.release":
-      return `${releaseName(content.name, content.version)} available`
-    case "kiln.updated":
-      return `Updated to ${releaseName(content.name, content.version)}`
-    case "access.invited": {
-      const { actorName, resource } = content
-      switch (content.outcome) {
-        case undefined:
-          return `${actorName} invited you to ${resource.name}`
-        case "accepted":
-          return `Joined ${resource.name}`
-        case "declined":
-          return `Declined ${actorName}'s invite to ${resource.name}`
-        case "cancelled":
-          return `${actorName}'s invite to ${resource.name} was cancelled`
-        case "expired":
-          return `${actorName}'s invite to ${resource.name} expired`
-      }
-    }
-    case "access.removed":
-      return `Removed from ${content.resource.name}`
-    case "resource.disk-limit":
-      // Apps stop at their limit; databases keep running.
-      return content.resource.type === "app"
-        ? `${content.resource.name} was stopped at its disk limit`
-        : `${content.resource.name} is over its disk limit`
-  }
-}
-
-function notificationDetail(content: NotificationContent): string | null {
-  switch (content.kind) {
-    case "kiln.release":
-      return null
-    case "kiln.updated":
-      return `from ${releaseName(content.previousName, content.previousVersion)}`
-    case "access.invited":
-      return content.outcome === "accepted"
-        ? `invited by ${content.actorName}`
-        : resourceTypeLabels[content.resource.type]
-    case "access.removed":
-      return `by ${content.actorName}`
-    case "resource.disk-limit":
-      return `${formatBytes(content.usedBytes)} of ${formatBytes(content.limitBytes)}`
-  }
-}

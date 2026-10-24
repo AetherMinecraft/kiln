@@ -44,12 +44,14 @@ import {
   relayAppWebRoutesWriteSchema,
   relayDeleteAppSchema,
   relayAppDeploymentReadSchema,
+  relayAppImageCheckSchema,
   relayDeployAppSchema,
   relayDatabaseActionSchema,
   relayDatabaseLimitsSchema,
-  relayDatabaseDumpSchema,
   relayDatabaseDataReadSchema,
   relayDatabaseDataWriteSchema,
+  relayPlatformDatabaseReadSchema,
+  relayPlatformDatabaseWriteSchema,
   relayDatabaseTerminalAttachSchema,
   relayDatabaseTerminalDetachSchema,
   relayDatabaseTerminalHeartbeatSchema,
@@ -57,6 +59,7 @@ import {
   relayDatabaseTerminalRestartSchema,
   relayDatabaseTerminalWriteSchema,
   relayDatabaseExportSchema,
+  relayDatabaseImportSchema,
   relayDatabaseInspectRequestSchema,
   relayDatabaseWipeSchema,
   relayDatabaseNetworkSchema,
@@ -110,6 +113,12 @@ import {
   RelayBrowserAuthorizationReviseSchema,
   relayBrowserAuthorizationReviseMaxItems,
   relayBackupFailureCodesV1Feature,
+  relayPlatformActionInputSchema,
+  relayPlatformLogsInputSchema,
+  relayPlatformTerminalAttachSchema,
+  relayPlatformTerminalClaimSchema,
+  relayPlatformTerminalRestartSchema,
+  relayPlatformTerminalWriteSchema,
 } from "@workspace/contracts"
 import { relayScheduleProjectionSchema } from "@workspace/contracts/schedules"
 import type {
@@ -135,10 +144,14 @@ import { attachControlSocket } from "./control-socket.js"
 import { DockerDriver } from "./docker.js"
 import { DatabaseBrowser, readDatabaseFile } from "./database-browser.js"
 import { DatabaseDriver } from "./databases.js"
-import { browseManagedDatabase } from "./database-sql-browser.js"
+import {
+  browseManagedDatabase,
+  type BrowsableDatabase,
+} from "./database-sql-browser.js"
 import { consoleSources } from "./console-sources.js"
 import {
   appTerminalTarget,
+  platformTerminalTarget,
   ContainerTerminals,
   databaseTerminalTarget,
 } from "./container-terminal.js"
@@ -153,11 +166,7 @@ import {
   traefikRouteUpstream,
   traefikStaticConfiguration,
 } from "./traefik.js"
-import {
-  forkPromise,
-  promiseEffect,
-  recoverPromise,
-} from "./effect/promise.js"
+import { forkPromise, promiseEffect, recoverPromise } from "./effect/promise.js"
 import { DockerEngine } from "./docker-engine.js"
 import { RelayVolumes } from "./volumes.js"
 import {
@@ -210,6 +219,7 @@ import { attachSftpServer } from "./sftp-server.js"
 import {
   exclusive,
   laneKeys,
+  LaneRejectedError,
   OperationLanes,
   type LaneAdmission,
 } from "./operation-lanes.js"
@@ -235,6 +245,27 @@ import { appProvisioning } from "./app-provisioning.js"
 import { databaseProvisioning } from "./database-provisioning.js"
 import { serverProvisioning } from "./server-provisioning.js"
 import { SystemUpdateManager } from "./system-updates.js"
+import {
+  addOwnerInvitation,
+  checkHearthRestart,
+  externalPlatformPresent,
+  isPlatformOwner,
+  identifyHearth,
+  platformAction,
+  platformLogs,
+  platformSetupUrl,
+  platformStatus,
+  platformUpdateRefusal,
+  platformManagedContainer,
+  platformTargetContainer,
+  reconcilePlatform,
+  restartPlatformService,
+  runPlatformCli,
+  startPlatform,
+  withPlatformRestoreHold,
+  type PlatformContext,
+  type PlatformPassResult,
+} from "./platform.js"
 import { ScheduleManager } from "./schedules.js"
 import { assignRelayWebRouteIds } from "./web-route-ids.js"
 import { planWebRouteRecovery } from "./web-route-labels.js"
@@ -280,6 +311,21 @@ const startupCore = await runRelayEffect(
   })
 )
 const cliArguments = process.argv.slice(2)
+// Before pairing, so the bootstrap invitation expects the token the
+// installed Hearth is given.
+const platformStartup = await runRelayEffect(
+  "relay.startup.platform",
+  Effect.gen(function* () {
+    const clients = yield* startupCore.state.listClients()
+    return yield* startPlatform(config, new DockerEngine(config.dockerSocket), {
+      pairedClients: clients.length,
+      saveInputs: cliArguments.length === 0,
+    })
+  })
+)
+if (platformStartup.refused && cliArguments.length === 0) {
+  console.error(platformStartup.refused)
+}
 let relayIdentity = startupCore.identity
 config.nodeId = relayIdentity.fingerprint
 config.nodeName = relayIdentity.name
@@ -290,10 +336,12 @@ const lanes = new OperationLanes()
 // A Relay a Hearth paused stays paused across restarts: nothing starts until
 // it's resumed, so this is read before any worker runs.
 lanes.setPaused(
-  (await runRelayEffect(
-    "relay.startup.pauseHolds",
-    startupCore.state.listPauseHolds()
-  )).length > 0
+  (
+    await runRelayEffect(
+      "relay.startup.pauseHolds",
+      startupCore.state.listPauseHolds()
+    )
+  ).length > 0
 )
 const powerIntents = new PowerIntents()
 const runtimeRecovery = new RuntimeRecoveryManager(
@@ -349,7 +397,12 @@ await databases.recoverReplacements()
 const hostShell = new HostShell(config)
 const relayEngine = new DockerEngine(config.dockerSocket)
 const terminals = new ContainerTerminals(config)
-const systemUpdates = new SystemUpdateManager(config)
+// The config itself, not a copy: it reads the installation ID Hearth gives
+// the Relay later.
+const systemUpdates = new SystemUpdateManager(config, {
+  refuseTarget: (container) =>
+    platformUpdateRefusal(config.dataDirectory, container),
+})
 // Set once a restart of the Relay or its host is under way, so a second
 // request in the moment before the Relay goes down doesn't start another.
 let restarting = false
@@ -423,26 +476,6 @@ const apps = new AppDriver(
   lanes,
   { allocations: docker.allocations, state: startupCore.state }
 )
-// Apps past their disk limit are stopped; each check is its own span.
-const appDiskLimitFiber = forkRelayEffect(
-  "relay.apps.diskLimits",
-  Effect.sleep("1 minute").pipe(
-    Effect.andThen(
-      Effect.tryPromise({
-        try: () => apps.enforceDiskLimits(),
-        catch: (cause) => cause,
-      }).pipe(
-        Effect.withSpan("Apps.enforceDiskLimits"),
-        Effect.catch((cause) =>
-          Effect.sync(() =>
-            reportRelayError(cause, { operation: "relay.apps.diskLimits" })
-          )
-        )
-      )
-    ),
-    Effect.forever
-  )
-)
 lifecycle.useAppServiceContainers(async (appId, service) => {
   await apps.get(appId)
   return (await apps.serviceContainer(appId, service))?.name ?? null
@@ -465,29 +498,49 @@ async function hostFileRoot(id: string): Promise<FileRoot> {
   return { id, directory: "." }
 }
 const appDatabaseBrowser = new DatabaseBrowser(appFilesystem)
-// A helper left from when host access was on goes; one still in use has its
-// sessions swept with the rest.
-if (!hostShell.enabled) forkPromise(() => hostShell.remove())
-forkPromise(async () => {
-  const [managedDatabases, managedApps, hostContainer] = await Promise.all([
-    databases.list(),
-    apps.list(),
-    hostShell.enabled ? hostShell.runningContainer() : null,
-  ])
-  await terminals.sweep([
-    ...(hostContainer ? [hostContainer] : []),
-    ...managedDatabases.flatMap((database) =>
-      database.containerId && database.observedState === "running"
-        ? [database.containerId]
-        : []
-    ),
-    ...managedApps.flatMap((app) =>
-      app.containers.flatMap((container) =>
-        container.running ? [container.id] : []
-      )
-    ),
-  ])
+const databaseDumpFilesystem = new FilesystemDriver({
+  ...config,
+  rootDirectory: databases.dumpDirectory,
 })
+// A helper left from when host access was on goes; one still in use has its
+// sessions swept with the rest. Only the Relay itself sweeps: a CLI command
+// runs beside it, often from one of those sessions.
+if (!hostShell.enabled && cliArguments.length === 0) {
+  forkPromise(() => hostShell.remove())
+}
+if (cliArguments.length === 0)
+  forkPromise(async () => {
+    const [managedDatabases, managedApps, hostContainer, platformContainers] =
+      await Promise.all([
+        databases.list(),
+        apps.list(),
+        hostShell.enabled ? hostShell.runningContainer() : null,
+        Promise.all(
+          (["database", "cache", "proxy"] as const).map((target) =>
+            runRelayEffect(
+              "relay.platform.terminal.sweepTarget",
+              platformManagedContainer({ config, engine: relayEngine }, target)
+            )
+          )
+        ),
+      ])
+    await terminals.sweep([
+      ...(hostContainer ? [hostContainer] : []),
+      ...platformContainers.flatMap((container) =>
+        container?.State.Running ? [container.Id] : []
+      ),
+      ...managedDatabases.flatMap((database) =>
+        database.containerId && database.observedState === "running"
+          ? [database.containerId]
+          : []
+      ),
+      ...managedApps.flatMap((app) =>
+        app.containers.flatMap((container) =>
+          container.running ? [container.id] : []
+        )
+      ),
+    ])
+  })
 const databaseConnectionSnapshots = await docker.databaseConnectionSnapshots()
 await databaseConnections.initialize(databaseConnectionSnapshots)
 for (const snapshot of databaseConnectionSnapshots) {
@@ -514,13 +567,14 @@ const startup = { ...startupCore, tls: activeTls }
 if (
   cliArguments[0] === "pair" ||
   cliArguments[0] === "hearth" ||
+  cliArguments[0] === "platform" ||
   cliArguments[0] === "platform-backup"
 ) {
   await runRelayCli(cliArguments)
   await disposeRelayRuntime()
   process.exit(0)
 }
-const initialPairing = await runRelayEffect(
+let initialPairing = await runRelayEffect(
   "relay.startup.pairing",
   initializePairing({
     config,
@@ -535,6 +589,24 @@ if (initialPairing.kind === "automatic") {
   )
 } else if (initialPairing.invitation) {
   console.log(renderPairingInvitation(initialPairing.invitation))
+}
+if (
+  platformStartup.state &&
+  initialPairing.kind === "automatic" &&
+  initialPairing.invitation
+) {
+  await runRelayEffect(
+    "relay.startup.platform.owner",
+    addOwnerInvitation(
+      config.dataDirectory,
+      initialPairing.invitation.envelope.invitationId
+    )
+  )
+}
+if (platformStartup.state?.phase === "installing") {
+  console.log(
+    `Kiln is installing. Once Hearth is up, create its administrator at:\n  ${platformSetupUrl(platformStartup.state)}`
+  )
 }
 await lifecycle.initializeProxy(
   await loadStartupWebRoutes(),
@@ -766,6 +838,38 @@ async function loadStartupWebRoutes() {
 async function runRelayCli(arguments_: ReadonlyArray<string>): Promise<void> {
   const [resource, command = resource === "pair" ? "create" : "list"] =
     arguments_
+  if (resource === "platform" && command === "pair") {
+    // An invitation for the installed Hearth, such as one restored onto a
+    // new host, which then manages Kiln's services as the original did.
+    const invitation = await runRelayEffect(
+      "relay.cli.platform.pair",
+      Effect.gen(function* () {
+        const created = yield* createPairingInvitation({
+          config,
+          identity: relayIdentity,
+          role: "full_access",
+          state: startup.state,
+          tls: startup.tls,
+        })
+        yield* addOwnerInvitation(
+          config.dataDirectory,
+          created.envelope.invitationId
+        )
+        return created
+      })
+    )
+    console.log(renderPairingInvitation(invitation))
+    return
+  }
+  if (resource === "platform") {
+    await runRelayEffect(
+      "relay.cli.platform",
+      runPlatformCli(arguments_, { config, engine: relayEngine }, (text) =>
+        console.log(text)
+      )
+    )
+    return
+  }
   if (resource === "pair" && command === "create") {
     const role = arguments_.includes("--read-only")
       ? "read_only"
@@ -871,10 +975,19 @@ async function runRelayCli(arguments_: ReadonlyArray<string>): Promise<void> {
       confirmIndex === -1 ? undefined : arguments_[confirmIndex + 1],
       "--confirm installation ID"
     )
-    const restored = await restoreEncryptedPlatformBackup(
-      config,
-      source,
-      confirmedInstallationId
+    // On a Relay that installed Kiln, only while Hearth is held stopped.
+    const restored = await runRelayEffect(
+      "relay.cli.platformBackup.restore",
+      withPlatformRestoreHold(
+        config,
+        Effect.tryPromise(() =>
+          restoreEncryptedPlatformBackup(
+            config,
+            source,
+            confirmedInstallationId
+          )
+        )
+      )
     )
     console.log(
       `Restored Kiln platform backup for ${restored.installationId}. Start Hearth and verify the installation before resuming operations.`
@@ -959,6 +1072,28 @@ const controlSocket = attachControlSocket({
         reportRelayError(cause, { operation: "relay.installation.adopt" })
       }
     ),
+  identifyHearth: (claim) => {
+    // A Relay that installed Kiln knows its containers already.
+    if (platformStartup.state) return
+    forkPromise(
+      () =>
+        runRelayEffect(
+          "relay.platform.identifyHearth",
+          Effect.gen(function* () {
+            const saved = yield* identifyHearth(
+              relayEngine,
+              config,
+              startup.state,
+              claim
+            )
+            if (saved) yield* refreshExternalPlatform
+          })
+        ),
+      (cause) => {
+        reportRelayError(cause, { operation: "relay.platform.identifyHearth" })
+      }
+    )
+  },
   beforeRun: (request) => {
     if (request.operation === "app.delete") {
       const appId = lockFields(request.payload).appId
@@ -989,11 +1124,30 @@ const browserSocket = attachBrowserSocket({
     filesystem: appFilesystem,
     root: (appId) => apps.fileRoot(appId),
   },
-  consoleSources: consoleSources(docker, databases, apps, () => ({
-    // Docker names a container's host after its ID.
-    containerId: process.env.HOSTNAME?.trim() || null,
-    id: config.nodeId,
-  })),
+  databaseFiles: {
+    filesystem: databaseDumpFilesystem,
+    root: (databaseId) => databases.dumpFileRoot(databaseId),
+  },
+  consoleSources: consoleSources(
+    docker,
+    databases,
+    apps,
+    () => ({
+      // Docker names a container's host after its ID.
+      containerId: process.env.HOSTNAME?.trim() || null,
+      id: config.nodeId,
+    }),
+    {
+      authorize: requirePlatformReader,
+      container: async (target) =>
+        (
+          await runRelayEffect(
+            "relay.platform.console",
+            platformTargetContainer(platformReadContext(), target)
+          )
+        )?.Id ?? null,
+    }
+  ),
   docker,
   filesystem,
   identity: relayIdentity,
@@ -1066,7 +1220,6 @@ const sftpServer = await Effect.runPromise(
       Effect.sync(() => {
         tailscaleFirewallFiber.interruptUnsafe()
         capacityMetricsFiber.interruptUnsafe()
-        appDiskLimitFiber.interruptUnsafe()
         operationPruneFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
         provisioningFiber.interruptUnsafe()
@@ -1105,6 +1258,34 @@ const tlsRefreshFiber = forkRelayEffect(
   "relay.tls.refreshLoop",
   tlsRefreshLoop()
 )
+// The last pass over Kiln's services, reported in snapshots and to Hearth.
+let platformPass: PlatformPassResult = {
+  blocked: false,
+  issue: null,
+  state: platformStartup.state,
+}
+// Without platform mode: whether Hearth runs beside this Relay anyway.
+let externalPlatform = false
+// Looks again, refreshing snapshots when that changed.
+const refreshExternalPlatform = Effect.suspend(() =>
+  externalPlatformPresent(relayEngine, config)
+).pipe(
+  Effect.tap((present) =>
+    Effect.sync(() => {
+      if (present !== externalPlatform) {
+        externalPlatform = present
+        void snapshotHub.refresh()
+      }
+    })
+  )
+)
+const platformContext: PlatformContext = {
+  attachRelay: true,
+  beforeHearth: Effect.suspend(() => ensurePlatformInvitation()),
+  config,
+  engine: relayEngine,
+}
+const platformFiber = forkRelayEffect("relay.platform", platformLoop())
 
 let shutdownStarted = false
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
@@ -1293,9 +1474,9 @@ function shutdownRelay(signal: NodeJS.Signals): Promise<void> {
         healthServer?.closeAllConnections()
         tailscaleFirewallFiber.interruptUnsafe()
         capacityMetricsFiber.interruptUnsafe()
-        appDiskLimitFiber.interruptUnsafe()
         operationPruneFiber.interruptUnsafe()
         tlsRefreshFiber.interruptUnsafe()
+        platformFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
         provisioningFiber.interruptUnsafe()
         scheduleFiber.interruptUnsafe()
@@ -1392,6 +1573,11 @@ async function relaySnapshot() {
       id: relayIdentity.fingerprint,
       name: relayIdentity.name,
       paused: lanes.paused,
+      ...(platformStartup.state
+        ? { platform: { management: "relay" as const } }
+        : externalPlatform
+          ? { platform: { management: "external" as const } }
+          : {}),
       proxyMode: config.proxyMode,
       sftp: {
         developmentAuthentication: config.sftpDevAuthentication,
@@ -1692,7 +1878,7 @@ async function executeControlRequest(
           }
         }),
         staticConfiguration: bundled
-          ? traefikStaticConfiguration(settings)
+          ? traefikStaticConfiguration(settings, config)
           : null,
       })
     }
@@ -1929,18 +2115,14 @@ async function executeControlRequest(
       )
     }
     case "database.provision.claim": {
-      const { databaseId } = relayProvisionDatabaseSchema.parse(
-        request.payload
-      )
+      const { databaseId } = relayProvisionDatabaseSchema.parse(request.payload)
       return runRelayEffect(
         "relay.database.provision.claim",
         provisioningManager.claim("database", databaseId)
       )
     }
     case "database.provision.cancel": {
-      const { databaseId } = relayProvisionDatabaseSchema.parse(
-        request.payload
-      )
+      const { databaseId } = relayProvisionDatabaseSchema.parse(request.payload)
       const cancelled = await runRelayEffect(
         "relay.database.provision.cancel",
         provisioningManager.cancel("database", databaseId)
@@ -1958,7 +2140,10 @@ async function executeControlRequest(
             () => databases.delete({ ...input, deleteData: true }),
             (cause) => {
               if (
-                !(cause instanceof Error && cause.message === "Database not found")
+                !(
+                  cause instanceof Error &&
+                  cause.message === "Database not found"
+                )
               )
                 throw cause
             }
@@ -1998,7 +2183,7 @@ async function executeControlRequest(
       )
     case "database.dump.import":
       return databases.importDump(
-        relayDatabaseDumpSchema.parse(request.payload)
+        relayDatabaseImportSchema.parse(request.payload)
       )
     case "database.data.read": {
       const input = relayDatabaseDataReadSchema.parse(request.payload)
@@ -2150,6 +2335,11 @@ async function executeControlRequest(
     case "app.deployment.read":
       return apps.readDeployment(
         relayAppDeploymentReadSchema.parse(request.payload)
+      )
+    case "app.image.check":
+      return apps.checkImages(
+        relayAppImageCheckSchema.parse(request.payload),
+        signal
       )
     case "app.action":
       return apps.action(relayAppActionSchema.parse(request.payload))
@@ -2939,6 +3129,168 @@ async function executeControlRequest(
       )
       return lifecycle.webRouteState(instance.id, routes)
     }
+    case "relay.platform.read":
+      return runRelayEffect(
+        "relay.platform.read",
+        platformStatus(platformReadContext(), await clientRecord(client.id))
+      )
+    case "relay.platform.logs": {
+      const input = relayPlatformLogsInputSchema.parse(request.payload)
+      await requirePlatformReader(client.id)
+      return runRelayEffect(
+        "relay.platform.logs",
+        platformLogs(platformReadContext(), input.role, input.lines)
+      )
+    }
+    case "relay.platform.database.read": {
+      const input = relayPlatformDatabaseReadSchema.parse(request.payload)
+      await requirePlatformReader(client.id, "browse Kiln's database")
+      return runRelayEffect(
+        "relay.platform.database.read",
+        browseManagedDatabase(
+          databases,
+          await platformDatabaseTarget(input.databaseName),
+          input,
+          input.request,
+          { canWrite: false, readOnly: true }
+        )
+      )
+    }
+    case "relay.platform.database.write": {
+      const input = relayPlatformDatabaseWriteSchema.parse(request.payload)
+      await requirePlatformReader(client.id, "change Kiln's database")
+      return runRelayEffect(
+        "relay.platform.database.write",
+        browseManagedDatabase(
+          databases,
+          await platformDatabaseTarget(input.databaseName),
+          input,
+          input.request,
+          { canWrite: true, readOnly: input.readOnly === true }
+        )
+      )
+    }
+    case "relay.platform.terminal.attach": {
+      const input = relayPlatformTerminalAttachSchema.parse(request.payload)
+      await requirePlatformOwner(client.id)
+      const container = await runRelayEffect(
+        "relay.platform.terminal.target",
+        platformManagedContainer(platformReadContext(), input.role)
+      )
+      if (!container) {
+        throw new Error(
+          "Kiln doesn't manage that container, so it opens no shell in it"
+        )
+      }
+      return terminals.attach(
+        terminalOwner(client, request),
+        platformTerminalTarget(input.role, {
+          id: container.Id,
+          running: container.State.Running,
+        }),
+        input,
+        (output, timeoutMs) =>
+          requestHearth("hearth.database.terminal.output", output, timeoutMs)
+      )
+    }
+    case "relay.platform.terminal.heartbeat": {
+      const input = relayDatabaseTerminalHeartbeatSchema.parse(request.payload)
+      return terminals.heartbeat(
+        terminalOwner(client, request),
+        input.attachmentIds
+      )
+    }
+    case "relay.platform.terminal.detach": {
+      const input = relayDatabaseTerminalDetachSchema.parse(request.payload)
+      return terminals.detach(
+        terminalOwner(client, request),
+        input.attachmentId
+      )
+    }
+    case "relay.platform.terminal.restart": {
+      const input = relayPlatformTerminalRestartSchema.parse(request.payload)
+      await requirePlatformOwner(client.id)
+      return terminals.restart(
+        terminalOwner(client, request),
+        platformTerminalTarget(input.role, null).key
+      )
+    }
+    case "relay.platform.terminal.write": {
+      const input = relayPlatformTerminalWriteSchema.parse(request.payload)
+      return terminals.write(
+        terminalOwner(client, request),
+        platformTerminalTarget(input.role, null).key,
+        input.sessionId,
+        input.data
+      )
+    }
+    case "relay.platform.terminal.claim": {
+      const input = relayPlatformTerminalClaimSchema.parse(request.payload)
+      await requirePlatformOwner(client.id)
+      return terminals.claim(
+        terminalOwner(client, request),
+        platformTerminalTarget(input.role, null).key,
+        input.sessionId,
+        input.attachmentId,
+        input.rows,
+        input.cols
+      )
+    }
+    case "relay.platform.action": {
+      const input = relayPlatformActionInputSchema.parse(request.payload)
+      const record = await clientRecord(client.id)
+      if (
+        !platformStartup.state ||
+        !isPlatformOwner(platformPass.state ?? platformStartup.state, record)
+      ) {
+        throw new Error(
+          "Only the Hearth this Relay installed can restart or repair Kiln's services"
+        )
+      }
+      if (input.action === "restart" && input.role === "hearth") {
+        await runRelayEffect(
+          "relay.platform.checkRestart",
+          checkHearthRestart(platformContext)
+        )
+        // Hearth is the one asking: it restarts once it has its answer,
+        // taking its turn in the lanes then.
+        forkRelayEffect(
+          "relay.platform.restartHearth",
+          Effect.sleep("1 second").pipe(
+            Effect.andThen(
+              lanes.run(
+                {
+                  label: "platform.restart",
+                  locks: [exclusive(laneKeys.platform)],
+                },
+                restartPlatformService(platformContext, "hearth")
+              )
+            ),
+            Effect.catch((cause) =>
+              Effect.sync(() => {
+                reportRelayError(cause, {
+                  operation: "relay.platform.restartHearth",
+                })
+              })
+            )
+          )
+        )
+      } else {
+        const result = await runRelayEffect(
+          "relay.platform.action",
+          platformAction(platformContext, input)
+        )
+        if (input.action === "repair") notePlatformPass(result)
+      }
+      await appendRelayAudit("platform.action", client.id, request.id, {
+        action: input.action,
+        ...(input.action === "restart" ? { role: input.role } : {}),
+      })
+      return runRelayEffect(
+        "relay.platform.read",
+        platformStatus(platformReadContext(), record)
+      )
+    }
     case "relay.rename": {
       relayIdentity = await runRelayEffect(
         "relay.control.rename",
@@ -2959,6 +3311,171 @@ async function executeControlRequest(
     case "sftp.authorization.resolve":
       throw new Error(`${request.operation} is not available yet`)
   }
+}
+
+function platformReadContext() {
+  return {
+    blocked: platformPass.blocked,
+    config,
+    engine: relayEngine,
+    issue: platformPass.issue,
+  }
+}
+
+function clientRecord(clientId: string) {
+  return runRelayEffect(
+    "relay.platform.client",
+    startup.state.findClientById(clientId)
+  )
+}
+
+// Shells in Kiln's containers: only the Hearth this Relay installed.
+async function requirePlatformOwner(clientId: string): Promise<void> {
+  const record = await clientRecord(clientId)
+  const state = platformPass.state ?? platformStartup.state
+  if (!state || !isPlatformOwner(state, record)) {
+    throw new Error(
+      "Only the Hearth this Relay installed can open shells in Kiln's services"
+    )
+  }
+}
+
+// Hearth's logs and database: the installed Hearth's, or, for services this
+// Relay only reports, a full-access Hearth's. Its database also takes the
+// login Hearth sends, so another Hearth can't open it without knowing that.
+async function requirePlatformReader(
+  clientId: string,
+  purpose = "read Kiln's logs"
+): Promise<void> {
+  const record = await clientRecord(clientId)
+  const allowed = platformStartup.state
+    ? isPlatformOwner(platformPass.state ?? platformStartup.state, record)
+    : record?.role === "full_access"
+  if (!allowed) {
+    throw new Error(`Only the Hearth this Relay installed can ${purpose}`)
+  }
+}
+
+// Hearth's MySQL container, described for browsing as a managed database is.
+async function platformDatabaseTarget(
+  databaseName: string
+): Promise<BrowsableDatabase> {
+  const container = await runRelayEffect(
+    "relay.platform.database.target",
+    platformTargetContainer(platformReadContext(), "database")
+  )
+  if (!container) {
+    throw new Error("Kiln's database container isn't on this Relay's host")
+  }
+  return {
+    containerId: container.Id,
+    databaseName,
+    engine: "mysql",
+    internalPort: 3306,
+    observedState: container.State.Running ? "running" : "stopped",
+  }
+}
+
+function notePlatformPass(result: PlatformPassResult): void {
+  if (result.issue !== platformPass.issue) {
+    if (result.issue) console.warn(`Kiln's services: ${result.issue}`)
+    else if (platformPass.issue) console.log("Kiln's services are running")
+  }
+  platformPass = {
+    ...result,
+    state: result.state ?? platformPass.state,
+  }
+}
+
+/**
+ * Passes over Kiln's services every 30 seconds in platform mode. Otherwise
+ * looks once a minute for a Hearth beside this Relay, to report it. Each pass
+ * waits its turn in the lanes, so a paused Relay leaves them alone.
+ */
+function platformLoop() {
+  if (!platformStartup.state) {
+    return refreshExternalPlatform.pipe(
+      Effect.ignore,
+      Effect.andThen(Effect.sleep("1 minute")),
+      Effect.forever
+    )
+  }
+  return lanes
+    .run(
+      { label: "platform.reconcile", locks: [exclusive(laneKeys.platform)] },
+      reconcilePlatform(platformContext)
+    )
+    .pipe(
+      Effect.tap((result) => Effect.sync(() => notePlatformPass(result))),
+      // Kiln's network exists once a pass has run; Traefik retries here.
+      Effect.tap(() =>
+        Effect.tryPromise(() => lifecycle.reconcilePlatformEdge()).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Traefik couldn't serve Hearth", cause)
+          )
+        )
+      ),
+      Effect.catchIf(
+        (cause) => cause instanceof LaneRejectedError,
+        () => Effect.void
+      ),
+      Effect.andThen(Effect.sleep("30 seconds")),
+      Effect.forever
+    )
+}
+
+/**
+ * Before Hearth starts, while it hasn't paired yet, makes sure the bootstrap
+ * invitation it pairs with hasn't expired: Hearth may start long after the
+ * Relay, after a slow image pull or a stop for maintenance. Returns a new
+ * invitation's ID, for the pass to record as the installed Hearth's.
+ */
+function ensurePlatformInvitation(): Effect.Effect<string | null> {
+  return Effect.gen(function* () {
+    const token = config.bootstrapToken
+    if (!token) return null
+    const clients = yield* startup.state.listClients()
+    if (clients.length > 0) return null
+    const current = initialPairing.invitation
+    if (
+      initialPairing.kind === "automatic" &&
+      current &&
+      current.envelope.expiresAt - Date.now() > 5 * 60_000
+    ) {
+      return null
+    }
+    if (current) {
+      yield* startup.state.revokeInvitation(
+        current.envelope.invitationId,
+        Date.now()
+      )
+    }
+    const invitation = yield* createPairingInvitation({
+      config,
+      identity: relayIdentity,
+      role: "full_access",
+      state: startup.state,
+      tls: activeTls,
+      token,
+    })
+    yield* startup.state.setMetadata(
+      "networking_initial_invitation",
+      JSON.stringify({
+        createdAt: Date.now(),
+        invitationId: invitation.envelope.invitationId,
+        kind: "automatic",
+      })
+    )
+    initialPairing = { invitation, kind: "automatic" }
+    return invitation.envelope.invitationId
+  }).pipe(
+    Effect.catch((cause) =>
+      Effect.sync(() => {
+        reportRelayError(cause, { operation: "relay.platform.invitation" })
+        return null
+      })
+    )
+  )
 }
 
 function relayClientRole(value: unknown): RelayClientRole {

@@ -14,8 +14,8 @@ manual tasks use the same durable task model that schedules can enqueue later.
   after reconnecting.
 - Serialize backup and restore work per Relay to bound disk, CPU, and network
   pressure.
-- Enforce per-resource quantity and logical-size limits set by the resource
-  owner, with optional stricter platform-admin caps.
+- Keep each resource's newest backups, by number, total logical size, and
+  age, as its owner sets, within optional platform-admin ceilings.
 - Restore with one clear action and optionally create a safety backup first.
 - Produce short-lived download URLs for both local and S3 artifacts.
 - Take a portable full backup before destructive resource deletion.
@@ -75,23 +75,20 @@ Targets are:
 - `database`: a managed database logical dump;
 - `platform`: Hearth's database and the recoverable Kiln configuration.
 
-Reasons are `manual`, `pre_restore`, `final_delete`, and the reserved
-`scheduled` value. Artifact kinds start with `archive`, `database_dump`, and
-`platform_bundle`. A `full`/`incremental` mode is recorded independently so a
-future Restic artifact does not require a catalog migration.
+Reasons are `manual`, `pre_restore`, `final_delete`, and `scheduled`.
+Artifact kinds start with `archive`, `database_dump`, and `platform_bundle`.
+A `full`/`incremental` mode is recorded independently so a future Restic
+artifact does not require a catalog migration.
 
-Each resource can set a preferred destination, exclude patterns, quantity
-limit, and total logical-size limit. Platform admins can set caps. The
-effective numeric limit is the lower non-null value. `0` disables new backups;
-`null` is unlimited. Queued/running creates reserve one quantity slot and their
-configured maximum bytes so concurrent requests cannot race past a limit.
-Failed artifacts do not consume retention. Final-deletion backups bypass a
-user limit but not Relay free-space safety checks or a platform cap explicitly
-configured to block backups.
-
-When adding a normal backup would exceed a limit, creation fails without
-silently deleting data. A later retention policy may offer opt-in oldest-first
-pruning, with protected/final backups excluded.
+Each resource can set a preferred destination, exclude patterns, and its
+retention (see [Retention](#retention)): the most backups it keeps, the most
+logical space they take together, and the longest it keeps them. Platform
+admins can set a ceiling on each; the lower non-null value applies, and
+`null` keeps without that limit. A ceiling of no backups at all turns
+backups off for the resource, and is the only limit that refuses a new one.
+A backup can be at most as large as all the space kept. Final-deletion
+backups pass the owner's limits but not a ceiling, nor Relay free-space
+safety checks.
 
 ## Storage destinations
 
@@ -198,10 +195,48 @@ The bundle is a backup of Kiln's Hearth catalog, not its deployment
 configuration. Operators must retain the Compose environment, TLS material,
 and platform recovery key separately; rotating or losing application encryption
 secrets can make restored secret-bearing catalog values unusable.
+A Relay in platform mode keeps that configuration itself and exports it as a
+recovery kit (`kiln-relay platform export-kit`); see
+[Self-hosting](self-hosting.md#recovery).
 
 Every artifact gets a manifest containing format version, target identity,
 created time, engine/Brick metadata, exclusions, consistency warnings, logical
 bytes, stored bytes, and SHA-256 digest.
+
+## Kiln's own backups
+
+Kiln is a backup target like any game server or database: pickers, schedules,
+and the runs table show it as **Kiln**, backed up on the Relay beside it (the
+one Kiln's pages use, preferring a Relay that reports this installation's
+ID). Only platform administrators back Kiln up, by hand or on a schedule. Its backups are the encrypted platform bundles above.
+Hearth stores a schedule target of kind `relay` for it, and the Relay turns it
+into a `platform` backup of its installation.
+
+A fresh installation backs Kiln up once a day, at 03:00 UTC, to the Relay,
+and keeps 30 days of them, in at most 20 GiB. Migration 24 marks a database migrated before
+anyone signed up; once an administrator and a Relay reporting this
+installation exist, Hearth creates the **Kiln backups** schedule, owned by
+the first administrator, with Kiln's retention, and clears the mark, so
+deleting or editing either sticks. The same sweep resends any schedule a Relay hasn't acknowledged, so
+a first deploy that failed is retried.
+Existing installations keep the schedules they chose.
+
+Restoring Kiln stays offline (see below). Its Restore shows the commands for
+the Relay's host and, where the Relay installed Kiln, opens that Relay's
+terminal with `stop-hearth`, the restore, and `start-hearth` typed for the
+operator to send.
+
+## Retention
+
+A resource's backup policy is its retention. Hearth keeps its newest
+backups, by hand or on a schedule, while they're within its number, younger
+than its age, and fit in its space, newest first, and deletes the rest,
+oldest first, with every copy of each. The newest is always kept, so
+retention never leaves a resource without a backup, and final-deletion
+backups are never deleted. Hearth applies it soon after a backup finishes or
+a retention changes, and every ten minutes, when it also catalogs the
+backups Relays made on their own. Setting a retention takes `backup.delete`
+as well as `backup.create`.
 
 ## Restore and deletion safety
 
@@ -250,8 +285,7 @@ reason, size, status/progress, and creation time. Actions are download,
 restore, and delete. Transient outcomes use Sonner; queue state updates in
 place without shifting the layout.
 
-The create dialog selects a target and destination, shows effective quantity
-and size headroom, and accepts exclusions. The restore dialog explains whether
+The create dialog selects a target and destination, and accepts exclusions. The restore dialog explains whether
 the target must be stopped and defaults to "Take a safety backup first."
 Storage configuration clearly separates platform destinations from "My S3"
 destinations and never redisplays a saved secret.
@@ -313,7 +347,7 @@ Kiln keeps it and lists the skipped files as the backup's warnings, shown
 beside its size. A snapshot recovered after a Relay restart can't list them,
 so it says so instead.
 
-Quantity limits map to retained snapshot rows. Size limits use each snapshot's
+Retention counts each snapshot as a backup. Its space uses each snapshot's
 logical restore size because physical repository bytes are shared. Database
 dumps and platform bundles stay full archives. Incremental backups accept
 exactly one destination. The 5 GiB single-PUT ceiling applies only to full
@@ -370,9 +404,9 @@ silently orphaning data.
 Development preview (`pnpm dev:docker`) starts a TLS MinIO at
 `https://minio:9000`. Register it as a platform destination with path-style
 access, private-network allowed, bucket `kiln-backups`, region `us-east-1`,
-access key `kiln`, and secret `kilnminiodevpassword`. Hearth trusts the
-generated certificate through `NODE_EXTRA_CA_CERTS`; Relay restic uses
-`RESTIC_CACERT`.
+access key `kiln`, and secret `kilnminiodevpassword`. Hearth and the Relay's
+full-archive uploads trust the generated certificate through
+`NODE_EXTRA_CA_CERTS`; Relay restic uses `RESTIC_CACERT`.
 
 Ceph RGW is already covered by the S3-compatible adapter. CephFS/RBD snapshots
 are infrastructure-specific consistency sources, not a portable backup format,

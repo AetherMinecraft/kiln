@@ -23,6 +23,7 @@ import {
 } from "@/components/app/app-workspace-context"
 import { ProvisioningGate } from "@/components/provisioning-progress"
 import {
+  WorkspaceCopyLinkButton,
   WorkspaceCopyValueButton,
   WorkspaceHeader,
   WorkspaceIdCopyButton,
@@ -42,7 +43,10 @@ import { recoverPromise } from "@/effect/promise"
 import { appRouteIdentifier, resolveAppRoute } from "@/lib/app-route"
 import type { ServerAction } from "@/lib/instance-power-state"
 import { appDestinations } from "@/lib/navigation-destinations"
-import { appDirectoryQueryOptions } from "@/lib/query-options"
+import {
+  appDirectoryQueryOptions,
+  appWebRoutesQueryOptions,
+} from "@/lib/query-options"
 import { deployApp, runAppAction } from "@/server/apps"
 
 export const AppWorkspaceShell = React.memo(function AppWorkspaceShell({
@@ -173,8 +177,6 @@ function useAppWorkspaceQuery(
           containers: [],
           dataDirectory: "",
           deployment: null,
-          diskLimitBytes: null,
-          diskUsedBytes: null,
           hostname: `app-${directory.shortId}`,
           network: "",
           observedState: "failed" as const,
@@ -241,10 +243,7 @@ const AppWorkspaceHeader = React.memo(function AppWorkspaceHeader({
             />
             <WorkspaceMetaSeparator />
           </span>
-          <WorkspaceCopyValueButton
-            label="internal address"
-            value={app.hostname}
-          />
+          <AppHeaderAddress app={app} />
         </WorkspaceIdentity>
       }
       actions={
@@ -257,6 +256,23 @@ const AppWorkspaceHeader = React.memo(function AppWorkspaceHeader({
     />
   )
 })
+
+// The app's first domain, where people reach it, or its address inside the
+// Relay's network when it has none.
+function AppHeaderAddress({ app }: { app: App }) {
+  const route = useQuery({
+    ...appWebRoutesQueryOptions(app.relayId, app.id),
+    select: (state) => state.routes[0],
+  }).data
+  return route ? (
+    <WorkspaceCopyLinkButton
+      href={`https://${route.hostname}${route.path ?? ""}`}
+      label="domain"
+    />
+  ) : (
+    <WorkspaceCopyValueButton label="internal address" value={app.hostname} />
+  )
+}
 
 function AppPowerControls({
   onError,

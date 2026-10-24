@@ -13,7 +13,7 @@
  * Only what Relay actually invokes is modelled; anything else fails loudly and
  * is reported by `reset()`.
  */
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { rmSync } from "node:fs"
 import {
   createServer,
@@ -30,6 +30,7 @@ import type { CommandOptions, CommandResult } from "../command.js"
 import {
   normalizedReference,
   parseImageReference,
+  repositoryName,
 } from "../docker-reference.js"
 import { CommandError } from "../effect/errors.js"
 
@@ -107,6 +108,8 @@ export interface FakeContainer {
   sqlDump: string
   /** SQL database clients in the container were given on stdin. */
   executedSql: Array<string>
+  /** What pg_restore in the container was given on stdin, byte for byte. */
+  restoredDumps: Array<Buffer>
   /** iptables chains inside the container's network namespace. */
   firewall: Map<string, Array<string>>
   /** TCP ports the container's process is listening on. */
@@ -126,6 +129,8 @@ export interface FakeExec {
   running: boolean
   /** Set once a non-interactive exec has run. */
   exitCode: number | null
+  /** 0 until the process starts, and for good if it never does. */
+  pid: number
 }
 
 export interface FakeNetwork {
@@ -213,6 +218,11 @@ export class FakeDocker {
    */
   readonly programFailures = new Map<string, string>()
   /**
+   * Programs no container has, such as `sh` in a distroless image; Docker
+   * can't start an interactive exec of one.
+   */
+  readonly missingPrograms = new Set<string>()
+  /**
    * Programs whose exec stream Docker breaks with an error frame (as it does
    * for an error it hits after answering) instead of their output; for a
    * one-off container (`run --rm -i`), its image.
@@ -231,8 +241,28 @@ export class FakeDocker {
   readonly imageConfigs = new Map<string, Record<string, unknown>>()
   /** What each tag points at (`docker image tag`), by full reference. */
   readonly imageTags = new Map<string, string>()
+  /**
+   * The digest each tag names in its registry, by full reference; a tag
+   * not listed names one made from its reference.
+   */
+  readonly registryDigests = new Map<string, string>()
+  // The image each digest a registry named is, so pulling `repo@digest`
+  // gets what the tag named then, health checks and config included.
+  readonly #digestImages = new Map<string, string>()
+  // `RepoDigests` of each local image, by its key in `images`.
+  readonly #repoDigests = new Map<string, Set<string>>()
   /** Images whose health check fails once they start. */
   readonly unhealthyImages = new Set<string>()
+  /**
+   * Anonymous volumes whose container was removed without them, as `docker
+   * rm` without `--volumes` leaves them on disk.
+   */
+  readonly danglingVolumes = new Set<string>()
+  /**
+   * Named volumes a container was created on without `nocopy`, which Docker
+   * fills with the image's files at that path while they're empty.
+   */
+  readonly filledVolumes = new Set<string>()
   /**
    * How a health-checked container of an image reports its health as it
    * runs: each entry holds from `afterMs` past its start.
@@ -266,6 +296,7 @@ export class FakeDocker {
   #lastTimestamp = 0
   #socketPath: string | null = null
   readonly #execSockets = new Map<string, Duplex>()
+  #nextPid = 100
   /** `POST /containers/{id}/wait` requests, resolved as containers exit. */
   readonly #exitWaiters = new Map<string, Array<(exitCode: number) => void>>()
   /** Responses following a running container's logs. */
@@ -305,6 +336,7 @@ export class FakeDocker {
     this.containers.clear()
     this.execs.clear()
     this.execGreeting = ""
+    this.missingPrograms.clear()
     this.networks.clear()
     this.volumes.clear()
     this.images.clear()
@@ -313,7 +345,12 @@ export class FakeDocker {
     this.pulls.clear()
     this.imageConfigs.clear()
     this.imageTags.clear()
+    this.registryDigests.clear()
+    this.#digestImages.clear()
+    this.#repoDigests.clear()
     this.unhealthyImages.clear()
+    this.danglingVolumes.clear()
+    this.filledVolumes.clear()
     this.healthTimelines.clear()
     this.crashingImages.clear()
     this.programFailures.clear()
@@ -401,6 +438,7 @@ export class FakeDocker {
       processes: [],
       sqlDump: "",
       executedSql: [],
+      restoredDumps: [],
       firewall: new Map(),
       listeningPorts: [...(seed.listeningPorts ?? [])],
     }
@@ -644,6 +682,7 @@ export class FakeDocker {
     const project = arguments_[arguments_.indexOf("-p") + 1] ?? ""
     const definition = JSON.parse(input) as {
       networks?: Record<string, { external?: boolean; name?: string } | null>
+      volumes?: Record<string, { name?: string } | null>
       services: Record<
         string,
         {
@@ -659,6 +698,7 @@ export class FakeDocker {
             source?: string
             target: string
             type: string
+            volume?: { nocopy?: boolean }
           }>
         }
       >
@@ -675,6 +715,18 @@ export class FakeDocker {
       const imageConfig = this.imageConfigs.get(image) as
         | { Healthcheck?: unknown; Volumes?: Record<string, object> }
         | undefined
+      for (const volume of settings.volumes ?? []) {
+        if (
+          volume.type === "volume" &&
+          volume.source &&
+          !volume.volume?.nocopy
+        ) {
+          this.filledVolumes.add(
+            definition.volumes?.[volume.source]?.name ??
+              `${project}_${volume.source}`
+          )
+        }
+      }
       this.addContainer({
         image,
         labels: {
@@ -684,15 +736,21 @@ export class FakeDocker {
           "com.docker.compose.service": service,
         },
         mounts: [
-          // Its binds, as the host path Docker gets.
+          // Its binds, as the host path Docker gets, and its named
+          // volumes, by the name the file gives them.
           ...(settings.volumes ?? []).flatMap((volume) =>
-            volume.type === "bind" && volume.source
+            (volume.type === "bind" || volume.type === "volume") &&
+            volume.source
               ? [
                   {
                     destination: volume.target,
                     readOnly: volume.read_only ?? false,
-                    source: volume.source,
-                    type: "bind" as const,
+                    source:
+                      volume.type === "volume"
+                        ? (definition.volumes?.[volume.source]?.name ??
+                          `${project}_${volume.source}`)
+                        : volume.source,
+                    type: volume.type as FakeMount["type"],
                   },
                 ]
               : []
@@ -813,7 +871,8 @@ export class FakeDocker {
 
   #containerObject(reference: string): unknown {
     const found = this.container(reference)
-    const timeline = found && this.healthTimelines.get(found.image)
+    const timeline =
+      found && this.healthTimelines.get(this.#imageName(found.image))
     if (found?.state.running && found.healthCheck && timeline) {
       const running = Date.now() - Date.parse(found.state.startedAt)
       found.state.health =
@@ -931,6 +990,8 @@ export class FakeDocker {
 
   /** The key of a local image `reference` names, as Docker normalizes it. */
   #imageKey(reference: string): string | undefined {
+    const pulled = this.#digestImages.get(digestOf(reference) ?? "")
+    if (pulled !== undefined && this.images.has(pulled)) return pulled
     const wanted = normalizedImage(reference)
     return [...this.images.keys()].find(
       (key) =>
@@ -948,8 +1009,23 @@ export class FakeDocker {
       : {
           Config: { ...this.imageConfigs.get(key), Labels: labels },
           Id: this.#imageId(key),
+          RepoDigests: [...(this.#repoDigests.get(key) ?? [])],
           RepoTags: [key],
         }
+  }
+
+  /** The name tests gave the image a digest reference was pulled as. */
+  #imageName(reference: string): string {
+    return this.#digestImages.get(digestOf(reference) ?? "") ?? reference
+  }
+
+  /** The digest `reference`'s tag names in its registry now. */
+  #registryDigest(reference: string): string {
+    const name = normalizedImage(reference)
+    return (
+      this.registryDigests.get(name) ??
+      `sha256:${createHash("sha256").update(name).digest("hex")}`
+    )
   }
 
   /** The image a reference names: its tag's target, or its own ID. */
@@ -1138,14 +1214,14 @@ export class FakeDocker {
       setImmediate(() => this.#finishRunOnce(container))
       return
     }
-    const crashing = this.crashingImages.has(container.image)
+    const crashing = this.crashingImages.has(this.#imageName(container.image))
     container.state.running = true
     container.state.restarting = crashing && container.restartPolicy !== "no"
     container.state.exitCode = crashing ? 1 : 0
     container.state.oomKilled = false
     container.state.startedAt = this.#timestamp()
     container.state.health = container.healthCheck
-      ? this.unhealthyImages.has(container.image)
+      ? this.unhealthyImages.has(this.#imageName(container.image))
         ? "unhealthy"
         : "healthy"
       : undefined
@@ -1192,7 +1268,11 @@ export class FakeDocker {
     }
   }
 
-  async #removeOne(reference: string, force: boolean): Promise<void> {
+  async #removeOne(
+    reference: string,
+    force: boolean,
+    volumes = false
+  ): Promise<void> {
     await this.#checkpoint("rm", reference)
     const container = this.#requiredContainer(reference)
     if (container.state.running && !force) {
@@ -1203,6 +1283,11 @@ export class FakeDocker {
     }
     this.#endExecs(container)
     this.containers.delete(container.id)
+    if (!volumes) {
+      for (const mount of container.mounts) {
+        if (mount.anonymous) this.danglingVolumes.add(mount.source)
+      }
+    }
     this.#appliedCheckpoint("rm", reference)
   }
 
@@ -1231,7 +1316,7 @@ export class FakeDocker {
     container: FakeContainer,
     argv: Array<string>,
     env: Record<string, string>,
-    input = "",
+    input: Buffer | string = "",
     user?: string
   ): string {
     container.processes.push({ argv, env, ...(user ? { user } : {}) })
@@ -1243,7 +1328,11 @@ export class FakeDocker {
       return container.sqlDump
     }
     if (["mysql", "mariadb", "psql"].includes(client)) {
-      container.executedSql.push(input)
+      container.executedSql.push(input.toString())
+      return ""
+    }
+    if (client === "pg_restore") {
+      container.restoredDumps.push(Buffer.from(input))
       return ""
     }
     if (program === "iptables") {
@@ -1443,6 +1532,8 @@ export class FakeDocker {
       return json(200, { ApiVersion: "1.47", Version: "27.3.1" })
     }
     if (method === "GET" && path === "/containers/json") {
+      // Targeted by its filters, or "" for every container.
+      await this.#checkpoint("ps", url.searchParams.get("filters") ?? "")
       const filters = apiFilters(url)
       return json(
         200,
@@ -1535,7 +1626,7 @@ export class FakeDocker {
       method === "DELETE" &&
       (parameters = route(/^\/containers\/([^/]+)$/u))
     ) {
-      await this.#removeOne(parameters[0] ?? "", flag("force"))
+      await this.#removeOne(parameters[0] ?? "", flag("force"), flag("v"))
       return json(204)
     }
     if (
@@ -1629,6 +1720,7 @@ export class FakeDocker {
         ),
         exitCode: null,
         id: randomBytes(32).toString("hex"),
+        pid: 0,
         running: false,
         size: null,
         tty: input.Tty ?? false,
@@ -1665,7 +1757,11 @@ export class FakeDocker {
     if (method === "GET" && (parameters = route(/^\/exec\/([^/]+)\/json$/u))) {
       const exec = this.execs.get(parameters[0] ?? "")
       if (!exec) throw new DockerFailure("No such exec instance", 404)
-      return json(200, { ExitCode: exec.exitCode, Running: exec.running })
+      return json(200, {
+        ExitCode: exec.exitCode,
+        Pid: exec.pid,
+        Running: exec.running,
+      })
     }
     if (method === "GET" && path === "/networks") {
       await this.#checkpoint("network ls")
@@ -1756,6 +1852,37 @@ export class FakeDocker {
       await this.#volumeRemove(parameters[0] ?? "")
       return json(204)
     }
+    if (
+      method === "GET" &&
+      (parameters = route(/^\/distribution\/(.+)\/json$/u))
+    ) {
+      const [reference = ""] = parameters
+      await this.#checkpoint("distribution", reference)
+      const named = [...this.unreachableImages].find(
+        (image) => normalizedImage(image) === normalizedImage(reference)
+      )
+      if (named !== undefined) {
+        throw new DockerFailure(
+          `Get "https://registry.example/v2/": net/http: request canceled (registry timeout)`,
+          500
+        )
+      }
+      const digest = this.#registryDigest(reference)
+      this.#digestImages.set(
+        digest,
+        [...this.images.keys(), ...this.pullOutput.keys()].find(
+          (image) => normalizedImage(image) === normalizedImage(reference)
+        ) ?? reference
+      )
+      return json(200, {
+        Descriptor: {
+          digest,
+          mediaType: "application/vnd.oci.image.index.v1+json",
+          size: 1_024,
+        },
+        Platforms: [{ architecture: "amd64", os: "linux" }],
+      })
+    }
     if (method === "POST" && path === "/images/create") {
       const fromImage = url.searchParams.get("fromImage") ?? ""
       const tag = url.searchParams.get("tag") ?? "latest"
@@ -1829,8 +1956,13 @@ export class FakeDocker {
       [...images].find(
         (image) => normalizedImage(image) === normalizedImage(reference)
       )
-    const image = named(this.images.keys()) ?? named(this.pullOutput.keys()) ??
-      named(this.unreachableImages) ?? reference
+    const digest = digestOf(reference)
+    const image =
+      (digest === undefined ? undefined : this.#digestImages.get(digest)) ??
+      named(this.images.keys()) ??
+      named(this.pullOutput.keys()) ??
+      named(this.unreachableImages) ??
+      reference
     await this.#checkpoint("pull", image)
     this.pulls.set(
       normalizedImage(reference),
@@ -1847,6 +1979,13 @@ export class FakeDocker {
       messages.push({ error: message, errorDetail: { message } })
     } else {
       this.images.set(image, this.images.get(image) ?? {})
+      // Docker records the digest it pulled the image as.
+      const pulled = digest ?? this.#registryDigest(reference)
+      this.#digestImages.set(pulled, image)
+      const repository = repositoryName(parseImageReference(reference))
+      const digests = this.#repoDigests.get(image) ?? new Set<string>()
+      digests.add(`${repository}@${pulled}`)
+      this.#repoDigests.set(image, digests)
       messages.push({ status: `Status: Downloaded newer image for ${image}` })
     }
     return {
@@ -1959,6 +2098,15 @@ export class FakeDocker {
 
   #createFromApi(name: string | undefined, body: CreateBody): FakeContainer {
     const host = body.HostConfig ?? {}
+    for (const mount of host.Mounts ?? []) {
+      if (
+        mount.Type === "volume" &&
+        mount.Source &&
+        !mount.VolumeOptions?.NoCopy
+      ) {
+        this.filledVolumes.add(mount.Source)
+      }
+    }
     const mounts: Array<FakeMount> = [
       ...(host.Binds ?? []).map((bind) => parseVolume(bind)),
       ...(host.Mounts ?? []).map((mount) => ({
@@ -1970,7 +2118,16 @@ export class FakeDocker {
         type: mount.Type === "volume" ? ("volume" as const) : ("bind" as const),
       })),
     ]
-    for (const destination of Object.keys(body.Volumes ?? {})) {
+    // Those it asks for, and those its image declares.
+    const imageVolumes = (
+      this.imageConfigs.get(this.#imageName(body.Image)) as
+        | { Volumes?: Record<string, object> }
+        | undefined
+    )?.Volumes
+    for (const destination of Object.keys({
+      ...body.Volumes,
+      ...imageVolumes,
+    })) {
       if (mounts.some((mount) => mount.destination === destination)) continue
       mounts.push({
         anonymous: true,
@@ -2093,11 +2250,21 @@ export class FakeDocker {
       this.#startStreamedExec(exec, request, socket, head)
       return
     }
+    const upgraded =
+      "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+    const program = exec.cmd[0] ?? ""
+    if (this.missingPrograms.has(program)) {
+      // Docker reports the failure in the stream it already upgraded.
+      exec.exitCode = 127
+      socket.end(
+        `${upgraded}OCI runtime exec failed: exec failed: unable to start container process: exec: "${program}": executable file not found in $PATH\r\n`
+      )
+      return
+    }
     exec.running = true
+    exec.pid = this.#nextPid++
     this.#execSockets.set(execId, socket)
-    socket.write(
-      `HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n${exec.tty ? this.execGreeting : ""}`
-    )
+    socket.write(`${upgraded}${this.execGreeting}`)
     // The start options arrive as a body ahead of the TTY stream.
     let options = Buffer.alloc(0)
     let optionsLength = Number(request.headers["content-length"] ?? 0)
@@ -2142,6 +2309,7 @@ export class FakeDocker {
     head: Buffer
   ) {
     exec.running = true
+    exec.pid = this.#nextPid++
     this.#execSockets.set(exec.id, socket)
     socket.write(
       "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
@@ -2165,7 +2333,7 @@ export class FakeDocker {
             container,
             exec.cmd,
             exec.env,
-            Buffer.concat(input).toString("utf8"),
+            Buffer.concat(input),
             exec.user
           )
         } catch (cause) {
@@ -2330,6 +2498,7 @@ interface CreateBody {
       Source?: string
       Target: string
       Type: string
+      VolumeOptions?: { NoCopy?: boolean }
     }>
     NetworkMode?: string
     PortBindings?: Record<
@@ -2367,6 +2536,12 @@ function clientOf(argv: ReadonlyArray<string>): string {
   return program === "sh" || program === "bash"
     ? (/\bexec (\S+)/u.exec(script)?.[1] ?? program)
     : program
+}
+
+/** The digest a reference names, if it names one. */
+function digestOf(reference: string): string | undefined {
+  const parsed = Result.try(() => parseImageReference(reference))
+  return Result.isSuccess(parsed) ? parsed.success.digest : undefined
 }
 
 /**

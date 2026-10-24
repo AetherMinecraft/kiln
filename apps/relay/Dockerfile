@@ -86,6 +86,10 @@ ARG KILN_GIT_REPO=https://github.com/kiln-site/kiln
 ENV KILN_GIT_REPO=$KILN_GIT_REPO
 ENV KILN_DEFAULT_GIT_REPO=$KILN_GIT_REPO
 ENV NODE_ENV=production
+# node:sqlite is still experimental in Node 24, and its warning showed in every
+# Relay process and `kiln-relay` command. Docker adds image variables a
+# replaced container lacks, so updated Relays get this too.
+ENV NODE_OPTIONS=--disable-warning=ExperimentalWarning
 WORKDIR /app
 
 # Compose runs on its own from PATH; buildx is a plugin, where Compose and

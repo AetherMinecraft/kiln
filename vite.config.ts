@@ -40,7 +40,12 @@ export default defineConfig({
         rules: { "kiln/effect-recovery": "off" },
       },
     ],
-    options: { typeAware: true, typeCheck: false },
+    // Only the unavailable-tsrs fallback enables compiler diagnostics here.
+    // Ordinary `vp check` runs semantic lint rules without a second typecheck.
+    options: {
+      typeAware: true,
+      typeCheck: process.env.KILN_TYPECHECK_FALLBACK === "1",
+    },
   },
   test: {
     // Repository tooling tests; workspace packages run their own via `vp run -r test`.

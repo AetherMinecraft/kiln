@@ -22,6 +22,7 @@ import ZipStream from "zip-stream"
 
 import {
   appIdFromFileRoot,
+  databaseIdFromFileRoot,
   isRelayFileRoot,
   projectRelayInstanceOverview,
   RelayBrowserCapabilitySchema,
@@ -217,6 +218,11 @@ export interface BrowserSocketOptions {
   readonly appFiles?: {
     readonly filesystem: FilesystemDriver
     readonly root: (appId: string) => Promise<FileRoot>
+  }
+  // Serves databases' dump folders, addressed as `database:<databaseId>`.
+  readonly databaseFiles?: {
+    readonly filesystem: FilesystemDriver
+    readonly root: (databaseId: string) => Promise<FileRoot>
   }
   readonly identity: RelayIdentity
   /** The lanes console input and uploads wait in, with Hearth's requests. */
@@ -532,23 +538,41 @@ function authenticateBrowser(
         socket.close(4403, "Console capability does not allow this resource")
         return
       }
-      const parent = tracedSubscription
-        ? undefined
-        : browserTraceParent(value)
+      const parent = tracedSubscription ? undefined : browserTraceParent(value)
       tracedSubscription = true
-      forkPromise(
-        () =>
-          traceRelayPromise(
-            "Subscribe browser console",
-            (span) => hubs.subscribe(socket, resource, source, span),
-            {
-              "kiln.operation": "relay.console.subscribe",
-              "kiln.resource.kind": resource.kind,
-            },
-            parent
-          ),
-        () => socket.close(4500, "Console stream failed")
-      )
+      const subscribe = () =>
+        forkPromise(
+          () =>
+            traceRelayPromise(
+              "Subscribe browser console",
+              (span) => hubs.subscribe(socket, resource, source, span),
+              {
+                "kiln.operation": "relay.console.subscribe",
+                "kiln.resource.kind": resource.kind,
+              },
+              parent
+            ),
+          () => socket.close(4500, "Console stream failed")
+        )
+      // Some kinds hold the Hearth that issued the capability to more than
+      // the read action, as Kiln's services do.
+      const { authorize } = source
+      if (authorize) {
+        const issuer = capability.issuer
+        forkPromise(
+          async () => {
+            await authorize(issuer)
+            subscribe()
+          },
+          () =>
+            socket.close(
+              4403,
+              "Console capability does not allow this resource"
+            )
+        )
+      } else {
+        subscribe()
+      }
       return
     }
     const resourceSubscription = decodeBrowserResourceSubscription(value)
@@ -1084,7 +1108,8 @@ function validateCapabilityV2(
       action === "instance.console.write" ||
       action === "instance.files.upload" ||
       action === "app.files.upload" ||
-      action === "relay.files.upload"
+      action === "relay.files.upload" ||
+      action === "database.dump.import"
   )
   const maximumLease = writes
     ? BROWSER_WRITE_LEASE_MAX_MS
@@ -1126,9 +1151,10 @@ const browserCapabilityActions: Record<
     file: ["app.files.download", "app.files.upload"],
     resources: [],
   },
+  // A database's files are its dumps (`database:<databaseId>`).
   database: {
     console: [relayConsoleReadActions.database],
-    file: [],
+    file: ["database.dump.export", "database.dump.import"],
     resources: [],
   },
   instance: {
@@ -1139,6 +1165,11 @@ const browserCapabilityActions: Record<
   relay: {
     console: [relayConsoleReadActions.relay],
     file: ["relay.files.download", "relay.files.upload"],
+    resources: [],
+  },
+  platform: {
+    console: [relayConsoleReadActions.platform],
+    file: [],
     resources: [],
   },
 }
@@ -1374,16 +1405,21 @@ async function handleBrowserFileRequest(
     browserOperation(async () => {
       const host = isRelayFileRoot(instanceId)
       const appId = appIdFromFileRoot(instanceId)
+      const databaseId = databaseIdFromFileRoot(instanceId)
       const filesystem = host
         ? options.hostFiles?.filesystem
         : appId
           ? options.appFiles?.filesystem
-          : options.filesystem
+          : databaseId
+            ? options.databaseFiles?.filesystem
+            : options.filesystem
       const instance = host
         ? await options.hostFiles?.root(instanceId)
         : appId
           ? await options.appFiles?.root(appId)
-          : await options.docker.findInstance(instanceId)
+          : databaseId
+            ? await options.databaseFiles?.root(databaseId)
+            : await options.docker.findInstance(instanceId)
       if (!instance || !filesystem) {
         browserJson(response, 404, { error: "Instance not found" }, origin)
         return
@@ -1393,10 +1429,10 @@ async function handleBrowserFileRequest(
           options.lanes.run(
             {
               label: "browser.file.upload",
-              // An App or host root is addressed by its root ID; a game
-              // server by the full ID it was found under.
+              // An App, database, or host root is addressed by its root ID;
+              // a game server by the full ID it was found under.
               locks: fileRootTransferLocks(
-                host || appId ? instanceId : instance.id
+                host || appId || databaseId ? instanceId : instance.id
               ),
             },
             filesystem.upload(instance, path, request, transfer.active)
@@ -1581,10 +1617,13 @@ async function handleBrowserFileRequest(
   return true
 }
 
-// Transfers of an app's files (`app:<appId>`) need its own file actions.
+// Transfers of an app's files (`app:<appId>`) need its own file actions, and
+// of a database's dumps (`database:<databaseId>`), its dump actions.
 function fileTransferAction(method: BrowserFileMethod, instanceId: string) {
   if (isRelayFileRoot(instanceId))
     return method === "PUT" ? "relay.files.upload" : "relay.files.download"
+  if (databaseIdFromFileRoot(instanceId) !== null)
+    return method === "PUT" ? "database.dump.import" : "database.dump.export"
   const app = appIdFromFileRoot(instanceId) !== null
   if (method === "PUT")
     return app ? "app.files.upload" : "instance.files.upload"
@@ -3122,12 +3161,7 @@ function timedBrowserOperation<TResult>(
   parent?: Tracer.AnySpan
 ): Effect.Effect<TResult, Error> {
   return browserOperation((signal) =>
-    traceRelayPromise(
-      name,
-      () => run(signal),
-      { "kiln.operation": op },
-      parent
-    )
+    traceRelayPromise(name, () => run(signal), { "kiln.operation": op }, parent)
   )
 }
 

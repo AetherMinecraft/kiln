@@ -43,6 +43,7 @@ import {
   deploymentStatusPresentation,
   deploymentTriggerLabels,
   shortCommit,
+  shortDigest,
 } from "@/components/app/app-deployment-presentation"
 import { sourceTypeLabels } from "@/components/app/app-presentation"
 import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
@@ -50,6 +51,10 @@ import {
   DataTableActionGroup,
   DataTableEmptyState,
 } from "@/components/data-table"
+import {
+  AddFirstRelayButton,
+  useAwaitingFirstRelay,
+} from "@/components/relay/pair-first-relay"
 import { DataTable } from "@/components/data-table-view"
 import {
   DataTableToolbar,
@@ -255,7 +260,9 @@ const DeploymentsTable = React.memo(function DeploymentsTable({
         header: () => <span className="sr-only sm:not-sr-only">Status</span>,
         sortFn: "text",
         cell: ({ row }) => (
-          <StatusIndicator status={deploymentStatusPresentation(row.original)} />
+          <StatusIndicator
+            status={deploymentStatusPresentation(row.original)}
+          />
         ),
         meta: dataTableColumnMeta(
           { width: { base: "2.5rem", sm: statusColumnWidth } },
@@ -334,33 +341,45 @@ const DeploymentsTable = React.memo(function DeploymentsTable({
       search: { fields: searchFields },
     })
   }, [onOpenLog])
-  const emptyState = React.useCallback(
-    ({ searchActive }: { searchActive: boolean }) => (
-      <DataTableEmptyState
-        description={
-          <span className="block max-w-sm">
-            {searchActive
-              ? "Try an app, commit, branch, or who deployed it."
-              : "Each time an app deploys, by hand or from a push to GitHub, it shows here."}
-          </span>
-        }
-        icon={<Rocket className="size-6 text-muted-foreground/45" />}
-        title={
-          searchActive ? "No deployments match your search" : "No deployments"
-        }
-      />
-    ),
-    []
-  )
   return (
     <DataTable
       definition={definition}
-      emptyState={emptyState}
+      emptyState={deploymentsEmptyState}
       searchStore={searchStore}
       source={source}
     />
   )
 })
+
+function deploymentsEmptyState({ searchActive }: { searchActive: boolean }) {
+  return <EmptyDeploymentTable searchActive={searchActive} />
+}
+
+function EmptyDeploymentTable({ searchActive }: { searchActive: boolean }) {
+  const awaitingFirstRelay = useAwaitingFirstRelay()
+  return (
+    <DataTableEmptyState
+      action={
+        !searchActive && awaitingFirstRelay ? <AddFirstRelayButton /> : null
+      }
+      description={
+        <span className="block max-w-sm">
+          {searchActive
+            ? "Try an app, commit, branch, or who deployed it."
+            : awaitingFirstRelay
+              ? "Pair a Relay and deploy an app to see its deployments here."
+              : "Each time an app deploys, by hand or from a push to GitHub, it shows here."}
+        </span>
+      }
+      icon={
+        <Rocket className="size-6 text-muted-foreground/45 light:text-muted-foreground/72" />
+      }
+      title={
+        searchActive ? "No deployments match your search" : "No deployments"
+      }
+    />
+  )
+}
 
 function deploymentKey(deployment: Deployment): string {
   return deployment.id
@@ -388,7 +407,7 @@ const DeploymentApp = React.memo(function DeploymentApp({
         meta={deployment.relayName}
         metaClassName="font-mono"
         name={deployment.appName}
-        nameClassName="transition-colors group-hover/app-link:text-primary"
+        nameClassName="transition-colors group-hover/app-link:text-primary-ink"
         showFavorite={false}
         showStatus={false}
       />
@@ -403,8 +422,18 @@ const DeploymentCommit = React.memo(function DeploymentCommit({
 }) {
   if (!deployment.commitSha) {
     return (
-      <span className="type-meta text-muted-foreground">
-        {sourceTypeLabels[deployment.sourceType]}
+      <span className="flex min-w-0 flex-col gap-0.5">
+        <span className="type-meta text-muted-foreground">
+          {sourceTypeLabels[deployment.sourceType]}
+        </span>
+        {deployment.imageDigest ? (
+          <span
+            className="type-meta truncate font-mono text-muted-foreground"
+            title={deployment.imageDigest}
+          >
+            {shortDigest(deployment.imageDigest)}
+          </span>
+        ) : null}
       </span>
     )
   }
@@ -423,7 +452,7 @@ const DeploymentCommit = React.memo(function DeploymentCommit({
             href={deployment.commitUrl}
             rel="noreferrer"
             target="_blank"
-            className="shrink-0 font-mono hover:text-primary"
+            className="shrink-0 font-mono hover:text-primary-ink"
           >
             {shortCommit(deployment.commitSha)}
           </a>
@@ -448,7 +477,11 @@ function DeploymentTrigger({ deployment }: { deployment: Deployment }) {
       </span>
       <span className="type-meta truncate text-muted-foreground">
         {deployment.triggeredByName ??
-          (deployment.commitAuthor ? `by ${deployment.commitAuthor}` : "GitHub")}
+          (deployment.commitAuthor
+            ? `by ${deployment.commitAuthor}`
+            : deployment.trigger === "update"
+              ? "Kiln"
+              : "GitHub")}
       </span>
     </span>
   )
@@ -470,12 +503,13 @@ const DeploymentActions = React.memo(function DeploymentActions({
       showToast({
         message: deployment.commitSha
           ? `Deploying ${shortCommit(deployment.commitSha)} again`
-          : "Deploying again",
+          : deployment.imageDigest
+            ? `Deploying ${shortDigest(deployment.imageDigest)} again`
+            : "Deploying again",
         type: "success",
       })
     },
-    onError: (error) =>
-      showToast({ message: error.message, type: "error" }),
+    onError: (error) => showToast({ message: error.message, type: "error" }),
   })
   return (
     <DataTableActionGroup>
@@ -484,7 +518,7 @@ const DeploymentActions = React.memo(function DeploymentActions({
           <TooltipTrigger asChild>
             <Button
               aria-label={`Log of ${deployment.appName}'s deployment`}
-              className="text-muted-foreground hover:text-primary"
+              className="text-muted-foreground hover:text-primary-ink"
               size="icon-sm"
               type="button"
               variant="ghost"
@@ -580,7 +614,9 @@ function DeploymentLogDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             {deployment.appName}
-            <StatusIndicator status={deploymentStatusPresentation(deployment)} />
+            <StatusIndicator
+              status={deploymentStatusPresentation(deployment)}
+            />
           </DialogTitle>
           <DialogDescription className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <span>
@@ -597,7 +633,7 @@ function DeploymentLogDialog({
                 to="/app/$appId/logs"
                 params={{ appId: deployment.appId }}
                 search={{ stream: "deployment" }}
-                className="text-primary hover:underline"
+                className="text-primary-ink hover:underline"
               >
                 Follow it live
               </Link>
@@ -629,7 +665,8 @@ function DeploymentLogDialog({
                   className={cn(
                     "break-words whitespace-pre-wrap",
                     line.level === "error" && "text-destructive",
-                    line.level === "warn" && "text-amber-500"
+                    line.level === "warn" &&
+                      "text-amber-500 light:text-amber-700"
                   )}
                 >
                   {line.text}

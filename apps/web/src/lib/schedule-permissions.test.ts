@@ -106,4 +106,36 @@ describe("schedule authorization", () => {
       })
     ).toContain("schedule.execute")
   })
+
+  it("keeps Kiln's backups to platform administrators, whatever a Relay grant allows", () => {
+    const kiln: ScheduleTarget = {
+      id: "relay-a",
+      kind: "relay",
+      name: "Kiln",
+      relayId: "relay-a",
+    }
+    const relayGrant: AccessGrant = {
+      id: "grant",
+      relayId: "relay-a",
+      resourceId: "relay-a",
+      resourceType: "relay",
+      permissions: ["schedule.create", "backup.create"],
+    }
+    const input = {
+      actions: [],
+      grants: [relayGrant],
+      schedulePermission: "schedule.create",
+      targets: [kiln],
+    } as const
+
+    expect(scheduleAuthorizationFailure({ ...input, user })).toBe(
+      "Only a platform administrator can schedule Kiln's backups"
+    )
+    expect(
+      scheduleAuthorizationFailure({
+        ...input,
+        user: { ...user, role: "admin" },
+      })
+    ).toBeNull()
+  })
 })

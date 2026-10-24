@@ -29,9 +29,9 @@ every file, and each is checked on disk, so no entry can write or point
 outside it. A Dockerfile build drops its checkout once it succeeds. A Compose
 deployment keeps its own, since its services may bind files from it, and the
 next successful deployment removes it. Configs and secrets a Compose file
-reads from its folder are bound read-only from the checkout. Persistent
-data belongs in
-`${KILN_DATA}`, the app's data directory, not the checkout.
+reads from its folder are bound read-only from the checkout. Containers
+keep nothing across deployments; data that should last belongs in a volume
+mounted from the app's Volumes section, not the checkout.
 
 Containers carry the commit they were built from in `kiln.app.commit`.
 
@@ -53,6 +53,51 @@ can run what a pasted Compose file could, host binds included. Turn it off,
 or protect the branch, for repositories others can write to. An app
 switched to another source keeps its repository, unused.
 
+## Image updates
+
+An app that deploys from an image runs it by digest. Each deployment asks
+the registry what digest the tag names (Docker's `GET /distribution`, which
+reads the manifest without pulling it), pulls `repository@digest`, and runs
+that. The container keeps the image as its config names it in
+`kiln.app.image`, and the digest in `kiln.app.image.digest`. Another app
+pulling the same tag meanwhile can't change what this one starts. A
+registry that can't name the digest leaves the deployment to pull the tag,
+as before.
+
+Registries have no way to subscribe to a tag, so Hearth asks. Every hour,
+each Relay checks all of its image apps in one `app.image.check` request,
+16 apps at a time. Apps naming the same image share one registry lookup,
+four at a time. The Relay compares the digest the tag names with the one
+the app's container runs. Docker Hub doesn't count these lookups against
+its pull limits. A Relay skips an app that is deploying, runs another image
+than its config names, or names a digest, which never moves. For a
+container deployed before Kiln labelled its digest, it uses the digests
+Docker recorded when it pulled the image.
+
+Each app chooses, from **Updates** on its Deployment card:
+
+- **Notify**, the default: a new image notifies everyone who can deploy
+  the app (`app.manage` on its Relay) once.
+- **Automatic**: also deploys the update once it's been out for the app's
+  wait, three days unless changed. Registries don't say when a tag moved,
+  so the wait counts from when Kiln first saw the digest. A tag that moves
+  again before then offers its newest image and waits again; Kiln never
+  deploys an image the tag has moved past. While the registry can't be
+  reached, the update waits for a check that gets through.
+- **Off**: no checks.
+
+**Update now** deploys the image on offer, whatever its wait. **Skip**
+passes over it: it neither notifies nor deploys on its own, and the next
+image the tag names is offered as usual. An automatic update deploys the
+digest Kiln found, checks again when its turn comes that it's still due,
+and isn't tried again for the same digest once it has run, however it
+went. Deploying an image update again from the Deployments list deploys
+its digest, as a rollback, and an automatic update doesn't deploy the
+image it rolled back from again. A Relay too old to deploy by digest
+refuses the rollback rather than pull the tag. Unless checks are off, an
+image deployment checks the app again when it ends, so the card shows what
+it runs.
+
 ## Rolling deployments
 
 When an app is running, a deployment starts its new containers beside the
@@ -72,16 +117,17 @@ have exited cleanly, before any traffic moves.
 The old containers stop first instead when two copies can't run together:
 
 - the app publishes ports on the Relay, or has a Tailscale address;
+- the app mounts a volume or a path on the node read-write, from its
+  Volumes section: two copies would write to the same data;
 - a Compose service keeps data in a volume, named or declared by its image,
   as databases do: two copies would share or lose it;
 - a Compose service uses another network mode;
 - the node hasn't the memory to hold both copies at once.
 
-The deployment log says which. While the copies overlap they share the
-app's data directory, so an app that can't run twice on its files, such as
-one that writes SQLite without WAL, should publish a port or use Compose
-with a volume to deploy stop-first. A Relay that restarts mid-way leaves
-both copies running until the next deployment replaces them.
+The deployment log says which. Copies share nothing else, so an app whose
+data lives only in its containers loses it on every deployment. A Relay
+that restarts mid-way leaves both copies running until the next deployment
+replaces them.
 
 A Compose project replaced this way deploys as before, under the app's own
 project name, so Compose keeps its volumes. While both copies run, the node

@@ -1,10 +1,13 @@
 import { cn } from "@workspace/ui/lib/utils"
 
 import { useKilnGitRepository } from "@/lib/git-repository"
+import { useKilnLegalUrl } from "@/lib/legal-urls"
 import { footerSocialLinkIds, socialLinks } from "@/lib/social-links"
 
 export function PanelFooter({ className }: { className?: string }) {
   const gitRepository = useKilnGitRepository()
+  const termsUrl = useKilnLegalUrl("terms")
+  const privacyUrl = useKilnLegalUrl("privacy")
   const commit = import.meta.env.VITE_KILN_BUILD_SHA.trim()
   const commitUrl = commit ? `${gitRepository}/commit/${commit}` : null
   const shortCommit = commit.slice(0, 7)
@@ -26,12 +29,12 @@ export function PanelFooter({ className }: { className?: string }) {
             target="_blank"
             rel="noreferrer"
             aria-label={`View deployed commit ${commit}`}
-            className="font-mono text-primary/90 transition-colors hover:text-primary focus-visible:text-primary focus-visible:outline-none"
+            className="font-mono text-primary-ink/90 transition-colors hover:text-primary-ink focus-visible:text-primary-ink focus-visible:outline-none"
           >
             {shortCommit}
           </a>
         ) : (
-          <span className="font-mono text-primary/80">Development</span>
+          <span className="font-mono text-primary-ink/80">Development</span>
         )}
       </div>
       <div className="col-start-1 row-start-2 flex items-center justify-center gap-x-2 self-start justify-self-center pt-0.5 whitespace-nowrap sm:col-start-2">
@@ -43,8 +46,8 @@ export function PanelFooter({ className }: { className?: string }) {
         <span className="text-border" aria-hidden="true">
           /
         </span>
-        <FooterLink href="/terms">Terms of Use</FooterLink>
-        <FooterLink href="/privacy">Privacy Policy</FooterLink>
+        <FooterLink href={termsUrl}>Terms of Use</FooterLink>
+        <FooterLink href={privacyUrl}>Privacy Policy</FooterLink>
       </div>
       <div className="col-start-2 row-span-2 row-start-1 flex h-full justify-self-end px-1 sm:col-start-3">
         <FooterBrandLink
@@ -88,7 +91,7 @@ function FooterBrandLink({
       rel="noreferrer"
       aria-label={label}
       title={title}
-      className="grid h-full w-9 place-items-center text-muted-foreground/90 transition-colors outline-none hover:bg-primary/10 hover:text-primary focus-visible:bg-primary/12 focus-visible:text-primary focus-visible:ring-1 focus-visible:ring-ring/40 focus-visible:ring-inset"
+      className="grid h-full w-9 place-items-center text-muted-foreground/90 transition-colors outline-none hover:bg-primary/10 hover:text-primary-ink focus-visible:bg-primary/12 focus-visible:text-primary-ink focus-visible:ring-1 focus-visible:ring-ring/40 focus-visible:ring-inset"
     >
       <BrandIcon src={src} className="size-5" />
     </a>
@@ -99,6 +102,8 @@ function FooterLink({ children, href }: { children: string; href: string }) {
   return (
     <a
       href={href}
+      target="_blank"
+      rel="noreferrer"
       className="transition-colors outline-none hover:text-foreground focus-visible:text-foreground focus-visible:ring-1 focus-visible:ring-ring/40"
     >
       {children}

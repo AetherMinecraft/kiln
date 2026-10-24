@@ -46,10 +46,13 @@ import {
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import {
+  appConfigPatchSchema,
   authorizedApp,
+  getAppConfigHandler,
   getAppOwnerHandler,
   getAppOwnerMinecraftProfileIdHandler,
   hasAppPermission,
+  updateAppConfigHandler,
 } from "@/server/app-access"
 import { requireEligibleResourceUser } from "@/server/auth"
 import { databaseRpc, requiredRelay } from "@/server/managed-database-access"
@@ -65,16 +68,10 @@ const createAppInputSchema = z.strictObject({
 const appActionInputSchema = appInputSchema.extend({
   action: z.enum(["start", "stop", "restart"]),
 })
-// Databases change through the network, which also connects running
-// containers, and limits through their own update, which applies them to
-// running ones; everything else waits for the next deployment.
 const appConfigInputSchema = appInputSchema.extend({
-  config: appConfigSchema
-    .omit({ databaseIds: true, diskLimitBytes: true, serviceLimits: true })
-    .partial(),
+  config: appConfigPatchSchema,
 })
 const appLimitsInputSchema = appInputSchema.extend({
-  diskLimitBytes: appConfigSchema.shape.diskLimitBytes.unwrap(),
   serviceLimits: appServiceLimitsSchema,
 })
 const appRenameInputSchema = appInputSchema.extend({ name: appNameSchema })
@@ -113,7 +110,7 @@ export const getAppDirectory = createServerFn({ method: "GET" }).handler(
       const relayName = relayNames.get(record.relayId)
       if (
         !relayName ||
-        !hasAppPermission(user, grants, record.relayId, "app.read")
+        !hasAppPermission(user, grants, record, "app.read")
       ) {
         return []
       }
@@ -122,7 +119,7 @@ export const getAppDirectory = createServerFn({ method: "GET" }).handler(
           id: record.appId,
           createdAt: record.createdAt,
           permissions: appPermissions.filter((permission) =>
-            hasAppPermission(user, grants, record.relayId, permission)
+            hasAppPermission(user, grants, record, permission)
           ),
           name: record.name,
           relayId: record.relayId,
@@ -134,31 +131,13 @@ export const getAppDirectory = createServerFn({ method: "GET" }).handler(
   }
 )
 
-// The app's configuration. Its environment carries secrets, so only people
-// who can change the app see it.
+// The app's configuration. Its environment and the files it mounts carry
+// secrets, so only people who can change the app see them.
 export const getAppConfig = createServerFn({ method: "GET" })
   .validator(appInputSchema)
-  .handler(async ({ data }) => {
-    const { app, user } = await authorizedApp(data, "app.read")
-    const canManage = await Effect.runPromise(
-      Effect.tryPromise({
-        try: () =>
-          requireRelayPermission({
-            permission: "app.manage",
-            relayId: data.relayId,
-            user,
-          }),
-        catch: (cause) => cause,
-      }).pipe(
-        Effect.as(true),
-        Effect.orElseSucceed(() => false)
-      )
-    )
-    return {
-      config: canManage ? app.config : { ...app.config, environment: "" },
-      environmentHidden: !canManage,
-    }
-  })
+  .handler(async ({ data }) =>
+    getAppConfigHandler(await requireEligibleResourceUser(), data)
+  )
 
 // Who created the app, for its Info rail. Their email only for those who can
 // read the Relay's people.
@@ -289,13 +268,9 @@ export const createApp = createServerFn({ method: "POST" })
 export const updateAppConfig = createServerFn({ method: "POST" })
   .validator(appConfigInputSchema)
   .handler(async ({ data }) => {
-    await authorizedApp(data, "app.manage")
-    // Only the fields this edit changes, into the config saved now.
-    const config = await runAppEffect(
-      "apps.config.save",
-      updateAppConfigEffect(data.relayId, data.appId, (current) =>
-        appConfigSchema.parse({ ...current, ...data.config })
-      )
+    const config = await updateAppConfigHandler(
+      await requireEligibleResourceUser(),
+      data
     )
     publishAppChange(data.relayId, false)
     return { config }
@@ -348,7 +323,7 @@ export const updateAppLimits = createServerFn({ method: "POST" })
       throw new Error("Update this Relay to set app limits")
     }
     const limits = appConfigSchema
-      .pick({ diskLimitBytes: true, serviceLimits: true })
+      .pick({ serviceLimits: true })
       .parse(data)
     // Saved once the Relay applies them, so limits it refuses aren't used
     // by the next deployment, and into the config saved by then, so other

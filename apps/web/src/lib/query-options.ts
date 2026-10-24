@@ -6,6 +6,7 @@ import {
 import type { QueryClient } from "@tanstack/react-query"
 import type {
   BackupTarget,
+  RelayPlatformTarget,
   RelayConsoleResource,
   RelayFileEntry,
   RelayInstance,
@@ -19,6 +20,7 @@ import {
   getBackupUsage,
 } from "@/server/backups"
 import { getBackupStorage } from "@/server/backup-storage"
+import { getKilnPlatform, getKilnPlatformLogs } from "@/server/platform"
 import {
   getBrickCatalog,
   getBrickIconPresentations,
@@ -113,6 +115,7 @@ import {
   getAppDeploymentLog,
   getAppDeployments,
   getAppDeploymentSummary,
+  getAppGitHubSourceFile,
 } from "@/server/app-deployments"
 import {
   getAppConfig,
@@ -193,6 +196,14 @@ export const queryKeys = {
     directory: ["servers", "directory"] as const,
     navigation: ["servers", "navigation"] as const,
   },
+  // Apart from the app's other keys, so its changes don't fetch the file
+  // from GitHub again.
+  appGitHubSourceFile: (
+    relayId: string,
+    appId: string,
+    branch: string,
+    path: string
+  ) => ["app-github-source-file", relayId, appId, branch, path] as const,
   appDeployments: {
     list: (scope: { appId?: string; relayId?: string }) =>
       ["app-deployments", "list", scope] as const,
@@ -274,12 +285,18 @@ export const queryKeys = {
     ["relays", "host-files", relayId] as const,
   tailscale: (relayId: string) => ["tailscale", "relays", relayId] as const,
   tailscaleStacks: ["tailscale", "stacks"] as const,
+  kilnPlatform: {
+    all: ["kiln-platform"] as const,
+    logs: (relayId: string, role: RelayPlatformTarget) =>
+      ["kiln-platform", "logs", relayId, role] as const,
+  },
   updates: ["updates", "overview"] as const,
   releaseHistory: ["updates", "release-history"] as const,
   relayRelease: (relayId: string, version: string) =>
     ["updates", "relay", relayId, version] as const,
   instanceFavorites: ["instance-favorites"] as const,
   notifications: ["notifications"] as const,
+  notificationPreferences: ["notification-preferences"] as const,
   uiPreferences: ["ui", "preferences"] as const,
 }
 
@@ -950,6 +967,30 @@ export function relayTailscaleQueryOptions(relayId: string) {
   })
 }
 
+// Kiln's own services, for its pages. Polled while one is open, since
+// a restart or repair changes them over the next minute.
+export function kilnPlatformQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.kilnPlatform.all,
+    queryFn: () => getKilnPlatform(),
+    refetchInterval: 10_000,
+    retry: false,
+    staleTime: 5_000,
+  })
+}
+
+export function kilnPlatformLogsQueryOptions(
+  relayId: string,
+  role: RelayPlatformTarget
+) {
+  return queryOptions({
+    queryKey: queryKeys.kilnPlatform.logs(relayId, role),
+    queryFn: () => getKilnPlatformLogs({ data: { lines: 500, relayId, role } }),
+    retry: false,
+    staleTime: 0,
+  })
+}
+
 export function tailscaleStacksQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.tailscaleStacks,
@@ -1075,6 +1116,24 @@ export function appDeploymentSummaryQueryOptions(
   return queryOptions({
     queryKey: queryKeys.appDeployments.summary(relayId, appId),
     queryFn: () => getAppDeploymentSummary({ data: { appId, relayId } }),
+  })
+}
+
+// The file a GitHub app deploys, as its branch has it now.
+export function appGitHubSourceFileQueryOptions(
+  relayId: string,
+  appId: string,
+  source: { branch: string; path: string }
+) {
+  return queryOptions({
+    queryKey: queryKeys.appGitHubSourceFile(
+      relayId,
+      appId,
+      source.branch,
+      source.path
+    ),
+    queryFn: () => getAppGitHubSourceFile({ data: { appId, relayId } }),
+    staleTime: 60_000,
   })
 }
 
