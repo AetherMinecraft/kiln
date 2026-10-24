@@ -22,9 +22,11 @@ import {
 } from "@workspace/contracts"
 
 import type { RelayConfig } from "./config.js"
+import { provenDatabaseContainer, provenHearthRunning } from "./platform.js"
 import { relayOwnsLabels } from "./relay-resources.js"
 import {
   DockerEngine,
+  type DockerContainerInspect,
   type DockerContainerSummary,
   type DockerExecProcess,
   streamIntoProcess,
@@ -42,6 +44,9 @@ export interface PlatformBackupManifest {
   compression: "gzip"
   createdAt: string
   databaseEngine: "mysql"
+  // The database dumped, which the dump drops and recreates by name. Older
+  // backups don't say.
+  databaseName?: string
   encryption: "aes-256-gcm+scrypt"
   formatVersion: 1
   installationId: string
@@ -58,11 +63,15 @@ export async function createEncryptedPlatformBackup(
   signal.throwIfAborted()
   const installationId = requiredInstallationId(config, input.target.id)
   const recoveryKey = requiredRecoveryKey(config)
-  const container = await hearthDatabaseContainer(config, installationId)
+  const { container, databaseName } = await hearthDatabaseContainer(
+    config,
+    installationId
+  )
   const manifest: PlatformBackupManifest = {
     compression: "gzip",
     createdAt: new Date().toISOString(),
     databaseEngine: "mysql",
+    databaseName,
     encryption: "aes-256-gcm+scrypt",
     formatVersion: 1,
     installationId,
@@ -220,7 +229,24 @@ export async function restoreEncryptedPlatformBackup(
   )
   decipher.setAAD(opened.manifestBytes)
   decipher.setAuthTag(opened.tag)
-  const container = await hearthDatabaseContainer(config, installationId)
+  const { container, databaseName, labeled } = await hearthDatabaseContainer(
+    config,
+    installationId
+  )
+  // The dump recreates the database it came from by name, whatever the
+  // client connects to. Backups older than the name restore as before
+  // onto Kiln's labeled containers only.
+  if (
+    opened.manifest.databaseName === undefined
+      ? !labeled
+      : opened.manifest.databaseName !== databaseName
+  ) {
+    throw new Error(
+      opened.manifest.databaseName === undefined
+        ? "This backup predates Kiln recording which database it holds, so it restores only onto Kiln's labeled MySQL"
+        : `This backup holds the database ${opened.manifest.databaseName}, but Hearth's MySQL container was created for ${databaseName}`
+    )
+  }
   const restoreDirectory = resolve(config.dataDirectory, "restores")
   const stagedDump = resolve(
     restoreDirectory,
@@ -350,10 +376,14 @@ function runningHearthContainers(
   )
 }
 
+/**
+ * Kiln's MySQL container, the database it was created for, which Kiln's
+ * backups dump and restore, and whether Kiln's labels found it.
+ */
 async function hearthDatabaseContainer(
   config: RelayConfig,
   installationId: string
-): Promise<string> {
+): Promise<{ container: string; databaseName: string; labeled: boolean }> {
   const matching = await runningHearthContainers(
     config,
     installationId,
@@ -366,6 +396,19 @@ async function hearthDatabaseContainer(
   )
   const containers =
     config.resourceNamespace && owned.length > 0 ? owned : matching
+  const engine = new DockerEngine(config.dockerSocket)
+  if (containers.length === 0) {
+    const unlabeled = await Effect.runPromise(
+      provenDatabaseContainer(engine, config)
+    )
+    if (unlabeled) {
+      return {
+        container: unlabeled.Id,
+        databaseName: createdDatabase(unlabeled),
+        labeled: false,
+      }
+    }
+  }
   const [container] = containers
   if (!container || containers.length > 1) {
     throw new Error(
@@ -374,7 +417,25 @@ async function hearthDatabaseContainer(
         : "Multiple Hearth database containers matched this installation"
     )
   }
-  return container.Id
+  const inspected = await Effect.runPromise(
+    engine.inspectContainer(container.Id)
+  )
+  return {
+    container: container.Id,
+    databaseName: createdDatabase(inspected),
+    labeled: true,
+  }
+}
+
+function createdDatabase(container: DockerContainerInspect): string {
+  const entry = container.Config.Env?.find((value) =>
+    value.startsWith("MYSQL_DATABASE=")
+  )
+  const name = entry?.slice("MYSQL_DATABASE=".length)
+  if (!name) {
+    throw new Error("Kiln's MySQL container doesn't name its database")
+  }
+  return name
 }
 
 async function hearthApplicationIsRunning(
@@ -382,7 +443,12 @@ async function hearthApplicationIsRunning(
   installationId: string
 ): Promise<boolean> {
   return (
-    (await runningHearthContainers(config, installationId, "hearth")).length > 0
+    (await runningHearthContainers(config, installationId, "hearth")).length >
+      0 ||
+    // A Docker error fails the restore rather than read as none running.
+    (await Effect.runPromise(
+      provenHearthRunning(new DockerEngine(config.dockerSocket), config)
+    ))
   )
 }
 
@@ -446,7 +512,9 @@ function parsePlatformManifest(value: Buffer): PlatformBackupManifest {
     parsed.payload !== "hearth.dmp" ||
     typeof parsed.createdAt !== "string" ||
     !Number.isFinite(Date.parse(parsed.createdAt)) ||
-    !isKilnInstallationId(parsed.installationId)
+    !isKilnInstallationId(parsed.installationId) ||
+    (parsed.databaseName !== undefined &&
+      (typeof parsed.databaseName !== "string" || !parsed.databaseName))
   ) {
     throw new Error("The Kiln platform backup manifest is invalid")
   }

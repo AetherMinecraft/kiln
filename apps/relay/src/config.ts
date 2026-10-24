@@ -72,6 +72,37 @@ export interface RelayPlatformEdge {
 }
 export type RelayGameHostSource = "configured" | "public_ip" | "relay"
 
+/**
+ * A Hearth that proved the container it runs in, and what it found beside
+ * it then: the database and cache its DB_HOST and CACHE_HOST reached, the
+ * database it uses (DB_NAME), and a digest of each secret in its
+ * BETTER_AUTH_SECRETS. Coolify removes Hearth's container when it stops
+ * Hearth and recreates it under a new ID, so these find Kiln's services,
+ * and a Hearth that hasn't connected yet, without it.
+ */
+export interface ProvenHearth {
+  readonly cache: ProvenContainer | null
+  readonly containerId: string
+  readonly database: ProvenContainer | null
+  readonly databaseName: string | null
+  readonly installationId: string
+  readonly secretDigests: ReadonlyArray<string>
+}
+
+/**
+ * A container by name, and where it keeps its data: each volume
+ * (`volume:<name>`) or host folder (`bind:<path>`) and the path it's
+ * mounted at. One recreated under the name is only taken for it with the
+ * same data in the same places.
+ */
+export interface ProvenContainer {
+  readonly mounts: ReadonlyArray<{
+    readonly destination: string
+    readonly source: string
+  }>
+  readonly name: string
+}
+
 export interface RelayConfig {
   advertisedHost: string
   advertisedHostInferred: boolean
@@ -121,6 +152,13 @@ export interface RelayConfig {
   installationId: string | null
   // Whether KILN_INSTALLATION_ID set it, so Hearth's ID doesn't replace it.
   installationIdConfigured: boolean
+  /**
+   * The Hearth that last proved the container it runs in, which the Relay
+   * saves and loads at startup. While it's for this installation, Kiln's
+   * services deployed without Kiln's labels, as Coolify does, are found
+   * from it.
+   */
+  provenHearth: ProvenHearth | null
   managedLabel: string
   mclogsApiUrl: string
   mode: RelayMode
@@ -279,6 +317,7 @@ export function loadConfig(
     host: environment.KILN_RELAY_BIND_HOST?.trim() || "0.0.0.0",
     installationId,
     installationIdConfigured: installationId !== null,
+    provenHearth: null,
     managedLabel: "kiln.relay.managed=true",
     mclogsApiUrl:
       environment.MCLOGS_API_URL?.trim() || "https://api.mclo.gs/1/log",
