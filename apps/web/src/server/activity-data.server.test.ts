@@ -197,6 +197,158 @@ describeMysql("Activity permission boundary", () => {
         })
     )
 
+    // server-a was copied to relay-b as server-copy, which the viewer can
+    // see; server-a itself they can't.
+    const seedCopy = (keepActivity: boolean, finishedAt = 5) =>
+      Effect.gen(function* () {
+        yield* seed([
+          {
+            permissions: ["instance.read"],
+            relayId: "relay-b",
+            resourceId: "server-copy",
+            resourceType: "instance",
+          },
+        ])
+        yield* insertInstance("relay-b", "server-copy", {
+          display_name: "server-copy",
+        })
+        yield* insertRows("server_migration", {
+          actor: JSON.stringify(user),
+          claim_generation: 1,
+          create_key: randomUUID(),
+          created_at: 1,
+          destination_instance_id: "server-copy",
+          destination_name: "server-copy",
+          destination_relay_id: "relay-b",
+          finished_at: finishedAt,
+          id: randomUUID(),
+          mode: "migrate",
+          options: JSON.stringify({
+            backup: null,
+            copyAccess: false,
+            keepActivity,
+            moveDomain: false,
+            moveWebRoutes: false,
+            stopSource: true,
+          }),
+          requested_by: user.id,
+          source_instance_id: "server-a",
+          source_name: "server-a",
+          source_relay_id: "relay-a",
+          state: "completed",
+          step: "finish",
+          updated_at: 1,
+        })
+      })
+
+    it.effect(
+      "shows a copied server's earlier history as the copy's, to those who can see the copy",
+      () =>
+        Effect.gen(function* () {
+          yield* seedCopy(true)
+
+          const result = yield* activityFor(user)
+
+          assert.deepEqual(
+            result.entries.map((entry) => ({
+              id: entry.id,
+              relay: entry.relay.id,
+              target: entry.target?.id,
+            })),
+            [
+              {
+                id: "relay-a:server-a-event:relay-b:server-copy",
+                relay: "relay-b",
+                target: "server-copy",
+              },
+            ]
+          )
+        })
+    )
+
+    it.effect("shows the shared history once for each copy", () =>
+      Effect.gen(function* () {
+        yield* seedCopy(true)
+        // A second copy of server-a, which the viewer can also see.
+        yield* insertGrant({
+          id: "second-copy-grant",
+          relayId: "relay-b",
+          resourceId: "server-copy-2",
+          resourceType: "instance",
+          userId: user.id,
+        })
+        yield* insertRows("access_selection", [
+          {
+            access_id: "second-copy-grant",
+            selection_key: "instance.read",
+            selection_kind: "permission",
+          },
+        ])
+        yield* insertInstance("relay-b", "server-copy-2", {
+          display_name: "server-copy-2",
+        })
+        yield* insertRows("server_migration", {
+          actor: JSON.stringify(user),
+          claim_generation: 1,
+          create_key: randomUUID(),
+          created_at: 1,
+          destination_instance_id: "server-copy-2",
+          destination_name: "server-copy-2",
+          destination_relay_id: "relay-b",
+          finished_at: 5,
+          id: randomUUID(),
+          mode: "duplicate",
+          options: JSON.stringify({
+            backup: null,
+            copyAccess: false,
+            keepActivity: true,
+            moveDomain: false,
+            moveWebRoutes: false,
+            stopSource: false,
+          }),
+          requested_by: user.id,
+          source_instance_id: "server-a",
+          source_name: "server-a",
+          source_relay_id: "relay-a",
+          state: "completed",
+          step: "finish",
+          updated_at: 1,
+        })
+
+        const result = yield* activityFor(user)
+
+        assert.sameMembers(
+          result.entries.map((entry) => entry.target?.id),
+          ["server-copy", "server-copy-2"]
+        )
+      })
+    )
+
+    it.effect(
+      "keeps what happens to a copied server after the copy to itself",
+      () =>
+        Effect.gen(function* () {
+          // server-a's event comes after its copy finished.
+          yield* seedCopy(true, 0)
+
+          const result = yield* activityFor(user)
+
+          assert.deepEqual(result.entries, [])
+        })
+    )
+
+    it.effect(
+      "keeps a copy's earlier history to itself when it wasn't kept",
+      () =>
+        Effect.gen(function* () {
+          yield* seedCopy(false)
+
+          const result = yield* activityFor(user)
+
+          assert.deepEqual(result.entries, [])
+        })
+    )
+
     it.effect("names the app or database an event acted on", () =>
       Effect.gen(function* () {
         yield* seed([])
@@ -238,7 +390,11 @@ describeMysql("Activity permission boundary", () => {
             },
             {
               id: "database-link",
-              details: { databaseId, instanceId: "server-a", operation: "link" },
+              details: {
+                databaseId,
+                instanceId: "server-a",
+                operation: "link",
+              },
               occurredAt: 1,
             },
           ].map((record) => ({
