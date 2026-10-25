@@ -119,12 +119,21 @@ export function useDatabaseNetworkToggle(
 
 export const DatabaseNetworkPicker = React.memo(function DatabaseNetworkPicker({
   database,
+  onCloseAutoFocus,
+  onOpenChange,
+  open: controlledOpen,
   variant = "icon",
 }: {
   database: NetworkDatabase
+  onCloseAutoFocus?: (event: Event) => void
+  /** Set both to open the picker from elsewhere, like a menu. */
+  onOpenChange?: (open: boolean) => void
+  open?: boolean
   variant?: "button" | "icon"
 }) {
-  const [open, setOpen] = React.useState(false)
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(false)
+  const open = controlledOpen ?? uncontrolledOpen
+  const setOpen = onOpenChange ?? setUncontrolledOpen
 
   return (
     <DrawerPopover open={open} onOpenChange={setOpen}>
@@ -163,6 +172,7 @@ export const DatabaseNetworkPicker = React.memo(function DatabaseNetworkPicker({
         title={`Connect game servers to ${database.name}`}
         align="end"
         className="w-[min(32rem,calc(100vw-2rem))] overflow-hidden p-0"
+        onCloseAutoFocus={onCloseAutoFocus}
       >
         <DatabaseServerPicker database={database} />
       </DrawerPopoverContent>

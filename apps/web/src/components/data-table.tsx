@@ -12,6 +12,7 @@ import { ArrowDown, ArrowUp, ArrowUpDown, LoaderCircle } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
 import { Skeleton } from "@workspace/ui/components/skeleton"
+import { useIsMobile } from "@workspace/ui/hooks/use-mobile"
 import { cn } from "@workspace/ui/lib/utils"
 import {
   dataTableFeatures,
@@ -283,7 +284,7 @@ function DataTableRowModel<TData extends RowData>({
           aria-rowcount={
             leadingBody ? undefined : hasBodyState ? 2 : rows.length + 1
           }
-          className="flex h-full min-h-0 w-full min-w-0 border-collapse flex-col overflow-hidden text-left"
+          className="flex h-full min-h-0 w-full min-w-0 border-collapse flex-col overflow-hidden text-left [--data-table-row-height:4rem] md:[--data-table-row-height:3.5rem]"
           role="table"
           style={gridStyle}
         >
@@ -453,7 +454,7 @@ export function dataTableCellClassName(
   meta: DataTableColumnMeta | undefined
 ): string {
   return cn(
-    "flex h-14 min-w-0 items-center px-3",
+    "flex h-(--data-table-row-height) min-w-0 items-center px-3",
     dataTableColumnVisibilityClass(meta?.layout?.hideBelow, "cell"),
     meta?.cellClassName
   )
@@ -559,6 +560,30 @@ export const DataTableTextCell = React.memo(function DataTableTextCell({
   )
 })
 
+/**
+ * On phones, the one detail a row shows beside its name, like a host or an
+ * engine. It takes only its content's width, up to half the row, so it sits
+ * against the row's menu and the name gets the rest. Each row, and the
+ * header, sizes it alone; they all end at the menu, so their right edges
+ * line up.
+ */
+export const dataTablePhoneDetailWidth = "fit-content(50%)"
+export const dataTablePhoneDetailCellClassName = "max-md:px-2"
+
+/**
+ * On phones, stretches a row's main link over the whole row, so a tap
+ * anywhere opens it. Controls in the row sit above it with `relative z-10`.
+ */
+export const dataTableRowLinkClassName =
+  "max-md:after:absolute max-md:after:inset-0"
+
+/**
+ * A row menu's trigger. On phones, where it is a row's only action, it fills
+ * its cell so the whole end of the row opens the menu.
+ */
+export const dataTableRowMenuTriggerClassName =
+  "max-md:size-full max-md:rounded-none"
+
 export function DataTableActionGroup({
   children,
   className,
@@ -568,11 +593,59 @@ export function DataTableActionGroup({
 }) {
   return (
     <div
-      className={cn("flex w-full items-center justify-end gap-1", className)}
+      className={cn(
+        "flex w-full items-center justify-end gap-1 max-md:self-stretch",
+        className
+      )}
     >
       {children}
     </div>
   )
+}
+
+/**
+ * Row actions shown beside the row's menu, hidden on phones. Repeat them in
+ * the menu inside DataTablePhoneMenuItems.
+ */
+export function DataTableInlineActions({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return <div className="hidden md:contents">{children}</div>
+}
+
+/**
+ * Menu items for the actions DataTableInlineActions hides on phones. Menus
+ * mount when opened, so this only runs in the browser.
+ */
+export function DataTablePhoneMenuItems({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return useIsMobile() ? children : null
+}
+
+/**
+ * For row menu items that open a dialog. The item's action waits until the
+ * menu has closed and handed focus back to its trigger, so the dialog starts
+ * from there and returns focus there when it closes, not to the page.
+ */
+export function useRowMenuDialogs() {
+  const pendingRef = React.useRef<(() => void) | null>(null)
+  const openAfterClose = React.useCallback(
+    (open: () => void) => () => {
+      pendingRef.current = open
+    },
+    []
+  )
+  const onCloseAutoFocus = React.useCallback(() => {
+    const open = pendingRef.current
+    pendingRef.current = null
+    open?.()
+  }, [])
+  return { onCloseAutoFocus, openAfterClose }
 }
 
 export function DataTableEmptyState({
@@ -777,7 +850,7 @@ function DataTableHeaderCellContent<TData extends RowData>({
       {header.isPlaceholder ? null : canSort ? (
         <button
           aria-label={`Sort by ${sortLabel}`}
-          className="group/sort -mx-2 inline-flex h-full max-w-full items-center gap-1.5 rounded-sm px-2 text-left outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60"
+          className="group/sort -mx-2 inline-flex h-full max-w-[calc(100%+1rem)] items-center gap-1.5 rounded-sm px-2 text-left outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60"
           type="button"
           onClick={header.column.getToggleSortingHandler()}
         >
@@ -1083,7 +1156,7 @@ function DataTableRow<TData extends RowData>({
       ref={ref}
       aria-rowindex={ariaRowIndex}
       className={cn(
-        "group grid grid-cols-[var(--data-table-grid-base)] border-b border-border/70 transition-colors hover:bg-muted/20 sm:grid-cols-[var(--data-table-grid-sm)] md:grid-cols-[var(--data-table-grid-md)] lg:grid-cols-[var(--data-table-grid-lg)] xl:grid-cols-[var(--data-table-grid-xl)]",
+        "group relative grid grid-cols-[var(--data-table-grid-base)] border-b border-border/70 transition-colors hover:bg-muted/20 sm:grid-cols-[var(--data-table-grid-sm)] md:grid-cols-[var(--data-table-grid-md)] lg:grid-cols-[var(--data-table-grid-lg)] xl:grid-cols-[var(--data-table-grid-xl)]",
         rowClassName
       )}
       data-index={dataIndex}

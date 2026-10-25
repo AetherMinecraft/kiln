@@ -18,6 +18,7 @@ import {
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
+import { cn } from "@workspace/ui/lib/utils"
 import {
   Dialog,
   DialogContent,
@@ -62,8 +63,15 @@ import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
 import { GitHubMark } from "@/components/github-mark"
 import {
   DataTableActionGroup,
+  DataTableInlineActions,
+  DataTablePhoneMenuItems,
   DataTableEmptyState,
   DataTableTextCell,
+  useRowMenuDialogs,
+  dataTableRowLinkClassName,
+  dataTableRowMenuTriggerClassName,
+  dataTablePhoneDetailCellClassName,
+  dataTablePhoneDetailWidth,
 } from "@/components/data-table"
 import {
   AddFirstRelayButton,
@@ -107,10 +115,11 @@ import {
 } from "@/lib/infra-directory"
 import type { DataTableSource } from "@/lib/data-table-source"
 import type { InstanceFavorite } from "@/lib/instance-favorites"
-import { queryKeys } from "@/lib/query-options"
+import { queryKeys, relayWebRoutesQueryOptions } from "@/lib/query-options"
 import { recoverPromise } from "@/effect/promise"
 import { saveAppGitHubSource } from "@/server/app-deployments"
 import { createApp, deployApp, runAppAction } from "@/server/apps"
+import type { getRelayWebRoutes } from "@/server/relays"
 import type { getInfraRelayOptions } from "@/server/infra-directory"
 
 type AppRelay = Awaited<
@@ -153,7 +162,7 @@ export const AppsPage = React.memo(function AppsPage({
   const canCreate = data?.relays.some((relay) => relay.canCreate)
 
   return (
-    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-3 pb-3 sm:px-5 sm:pb-5">
+    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-2 pb-3 sm:px-5 sm:pb-5">
       <DataTableWorkspace
         toolbar={
           <AppToolbar
@@ -295,12 +304,8 @@ const AppTable = React.memo(function AppTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "2.5rem", sm: statusColumnWidth } },
-          {
-            cellClassName: "px-2 sm:px-3",
-            headerClassName: "px-2 sm:px-3",
-            headerLabelClassName: "shrink-0 overflow-visible text-clip",
-          }
+          { hideBelow: "md", width: statusColumnWidth },
+          { headerLabelClassName: "shrink-0 overflow-visible text-clip" }
         ),
       }),
       appTableColumnHelper.display({
@@ -316,8 +321,8 @@ const AppTable = React.memo(function AppTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "1.75rem" } },
-          { cellClassName: "px-0", headerClassName: "px-0" }
+          { hideBelow: "md", width: "1.75rem" },
+          { cellClassName: "relative z-10 px-0", headerClassName: "px-0" }
         ),
       }),
       appTableColumnHelper.accessor((app) => app.name, {
@@ -333,7 +338,10 @@ const AppTable = React.memo(function AppTable({
               // other app shares its short ID.
               params={{ appId: app.id }}
               preload="intent"
-              className="group/app-link flex min-h-14 w-full min-w-0 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+              className={cn(
+                dataTableRowLinkClassName,
+                "group/app-link flex min-h-14 w-full min-w-0 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+              )}
             >
               <InstanceCard
                 state={app.instanceState}
@@ -343,6 +351,8 @@ const AppTable = React.memo(function AppTable({
                 nameClassName="transition-colors group-hover/app-link:text-primary-ink"
                 meta={app.shortId}
                 metaClassName="font-mono"
+                iconFavorite
+                iconFavoriteClassName="md:hidden"
                 showFavorite={false}
               />
             </Link>
@@ -351,6 +361,21 @@ const AppTable = React.memo(function AppTable({
         meta: dataTableColumnMeta({
           width: { base: "minmax(0,1fr)", md: "minmax(0,1.5fr)" },
         }),
+      }),
+      appTableColumnHelper.display({
+        id: "link",
+        header: "Link",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <AppLinkCell appId={row.original.id} relayId={row.original.relayId} />
+        ),
+        meta: dataTableColumnMeta(
+          { width: { base: dataTablePhoneDetailWidth, md: "minmax(0,1fr)" } },
+          {
+            cellClassName: dataTablePhoneDetailCellClassName,
+            headerClassName: dataTablePhoneDetailCellClassName,
+          }
+        ),
       }),
       appTableColumnHelper.accessor((app) => appRowContainersLabel(app), {
         id: "containers",
@@ -366,7 +391,7 @@ const AppTable = React.memo(function AppTable({
             value={appRowContainersLabel(row.original)}
           />
         ),
-        meta: dataTableColumnMeta({ hideBelow: "md", width: "9rem" }),
+        meta: dataTableColumnMeta({ hideBelow: "lg", width: "9rem" }),
       }),
       appTableColumnHelper.accessor((app) => app.relayName, {
         id: "relay",
@@ -374,7 +399,7 @@ const AppTable = React.memo(function AppTable({
         sortFn: "text",
         cell: ({ row }) => <DataTableTextCell value={row.original.relayName} />,
         meta: dataTableColumnMeta({
-          hideBelow: "md",
+          hideBelow: "xl",
           width: "minmax(8rem,0.8fr)",
         }),
       }),
@@ -390,8 +415,11 @@ const AppTable = React.memo(function AppTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "6.5rem", sm: "7.5rem" } },
-          { cellClassName: "px-1 sm:px-3", headerClassName: "px-1 sm:px-3" }
+          { width: { base: "3rem", md: "7.5rem" } },
+          {
+            cellClassName: "relative z-10 px-0 md:px-3",
+            headerClassName: "px-1 md:px-3",
+          }
         ),
       }),
     ])
@@ -470,56 +498,62 @@ const AppActions = React.memo(function AppActions({
   const running =
     state.phase === "ready" && state.observation.runtime === "running"
   const busy = deploy.isPending || action.isPending
+  const menu = useRowMenuDialogs()
+  const canDelete = app.permissions.includes("app.delete")
+  const deployDisabled = !available || !app.detail || busy || deploying
 
   return (
     <DataTableActionGroup>
-      {canManage ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              aria-label={`Deploy ${app.name}`}
-              className="text-muted-foreground hover:text-primary-ink"
-              disabled={!available || !app.detail || busy || deploying}
-              size="icon-sm"
-              type="button"
-              variant="ghost"
-              onClick={() => deploy.mutate()}
-            >
-              {deploying || deploy.isPending ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <Rocket />
-              )}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">
-            {deploying ? "Deploying" : "Deploy"}
-          </TooltipContent>
-        </Tooltip>
-      ) : null}
-      {app.permissions.includes("app.delete") ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              aria-label={`Delete ${app.name}`}
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
-              disabled={busy}
-              size="icon-sm"
-              type="button"
-              variant="ghost"
-              onClick={() => onDelete(app)}
-            >
-              <Trash2 />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Delete</TooltipContent>
-        </Tooltip>
-      ) : null}
+      <DataTableInlineActions>
+        {canManage ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-label={`Deploy ${app.name}`}
+                className="text-muted-foreground hover:text-primary-ink"
+                disabled={deployDisabled}
+                size="icon-sm"
+                type="button"
+                variant="ghost"
+                onClick={() => deploy.mutate()}
+              >
+                {deploying || deploy.isPending ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : (
+                  <Rocket />
+                )}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {deploying ? "Deploying" : "Deploy"}
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
+        {canDelete ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-label={`Delete ${app.name}`}
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
+                disabled={busy}
+                size="icon-sm"
+                type="button"
+                variant="ghost"
+                onClick={() => onDelete(app)}
+              >
+                <Trash2 />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Delete</TooltipContent>
+          </Tooltip>
+        ) : null}
+      </DataTableInlineActions>
       <DropdownMenu>
         <Tooltip>
           <TooltipTrigger asChild>
             <DropdownMenuTrigger asChild>
               <Button
+                className={dataTableRowMenuTriggerClassName}
                 aria-label={`More actions for ${app.name}`}
                 disabled={busy}
                 size="icon-sm"
@@ -536,7 +570,22 @@ const AppActions = React.memo(function AppActions({
           </TooltipTrigger>
           <TooltipContent side="bottom">More actions</TooltipContent>
         </Tooltip>
-        <DropdownMenuContent align="end" className="min-w-44">
+        <DropdownMenuContent
+          align="end"
+          className="min-w-44"
+          onCloseAutoFocus={menu.onCloseAutoFocus}
+        >
+          {canManage ? (
+            <DataTablePhoneMenuItems>
+              <DropdownMenuItem
+                disabled={deployDisabled}
+                onSelect={() => deploy.mutate()}
+              >
+                <Rocket /> {deploying ? "Deploying" : "Deploy"}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </DataTablePhoneMenuItems>
+          ) : null}
           <InstanceFavoriteMenuItem
             favorite={{ id: app.id, kind: "app", relayId: app.relayId }}
           />
@@ -561,9 +610,59 @@ const AppActions = React.memo(function AppActions({
           ) : null}
           <CopyIdentifierMenuItem label="App ID" value={app.id} />
           <CopyIdentifierMenuItem label="Relay ID" value={app.relayId} />
+          {canDelete ? (
+            <DataTablePhoneMenuItems>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={busy}
+                variant="destructive"
+                onSelect={menu.openAfterClose(() => onDelete(app))}
+              >
+                <Trash2 /> Delete
+              </DropdownMenuItem>
+            </DataTablePhoneMenuItems>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
     </DataTableActionGroup>
+  )
+})
+
+// An app's first web route. The Relay's routes come in one request, shared
+// by every app on it; each cell re-renders only when its own link changes.
+const AppLinkCell = React.memo(function AppLinkCell({
+  appId,
+  relayId,
+}: {
+  appId: string
+  relayId: string
+}) {
+  const selectLink = React.useCallback(
+    (routes: Awaited<ReturnType<typeof getRelayWebRoutes>>) => {
+      const route = routes?.find(
+        ({ owner }) => owner.kind === "app" && owner.id === appId
+      )
+      return route ? `${route.hostname}${route.path ?? ""}` : null
+    },
+    [appId]
+  )
+  const { data: link } = useQuery({
+    ...relayWebRoutesQueryOptions(relayId),
+    select: selectLink,
+  })
+  if (!link) {
+    return <span className="type-meta text-muted-foreground">—</span>
+  }
+  return (
+    <a
+      className="type-meta relative z-10 block min-w-0 truncate font-mono text-foreground hover:text-primary-ink"
+      href={`https://${link}`}
+      rel="noreferrer"
+      target="_blank"
+      title={`https://${link}`}
+    >
+      {link}
+    </a>
   )
 })
 

@@ -25,9 +25,11 @@ import {
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
+import { cn } from "@workspace/ui/lib/utils"
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
@@ -55,7 +57,14 @@ import {
 import {
   DataTableActionGroup,
   DataTableEmptyState,
+  DataTableInlineActions,
+  DataTablePhoneMenuItems,
   DataTableTextCell,
+  useRowMenuDialogs,
+  dataTableRowLinkClassName,
+  dataTableRowMenuTriggerClassName,
+  dataTablePhoneDetailCellClassName,
+  dataTablePhoneDetailWidth,
 } from "@/components/data-table"
 import {
   ServerDeleteDialog,
@@ -178,7 +187,7 @@ export const ServersPage = React.memo(function ServersPage({
   }, [])
 
   return (
-    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-3 pb-3 sm:px-5 sm:pb-5">
+    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-2 pb-3 sm:px-5 sm:pb-5">
       <DataTableWorkspace
         toolbar={
           <DataTableToolbar
@@ -381,12 +390,8 @@ const ServerDataTable = React.memo(function ServerDataTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "2.5rem", sm: statusColumnWidth } },
-          {
-            cellClassName: "px-2 sm:px-3",
-            headerClassName: "px-2 sm:px-3",
-            headerLabelClassName: "shrink-0 overflow-visible text-clip",
-          }
+          { hideBelow: "md", width: statusColumnWidth },
+          { headerLabelClassName: "shrink-0 overflow-visible text-clip" }
         ),
       }),
       serverTableColumnHelper.display({
@@ -402,8 +407,8 @@ const ServerDataTable = React.memo(function ServerDataTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "1.75rem" } },
-          { cellClassName: "px-0", headerClassName: "px-0" }
+          { hideBelow: "md", width: "1.75rem" },
+          { cellClassName: "relative z-10 px-0", headerClassName: "px-0" }
         ),
       }),
       serverTableColumnHelper.accessor(({ server }) => server.name, {
@@ -418,7 +423,10 @@ const ServerDataTable = React.memo(function ServerDataTable({
                 to="/server/$serverId/console"
                 params={{ serverId: routeIdentifier }}
                 preload="intent"
-                className="group/server-link flex min-h-14 min-w-0 flex-1 items-center px-3 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                className={cn(
+                  dataTableRowLinkClassName,
+                  "group/server-link flex min-h-14 min-w-0 flex-1 items-center px-3 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                )}
               >
                 <InstanceCard
                   state={server.instanceState}
@@ -437,6 +445,8 @@ const ServerDataTable = React.memo(function ServerDataTable({
                       .join(" · ") || server.shortId
                   }
                   metaClassName="font-mono"
+                  iconFavorite
+                  iconFavoriteClassName="md:hidden"
                   showFavorite={false}
                 />
               </Link>
@@ -466,7 +476,7 @@ const ServerDataTable = React.memo(function ServerDataTable({
           <DataTableTextCell value={row.original.server.relayName} />
         ),
         meta: dataTableColumnMeta({
-          hideBelow: "md",
+          hideBelow: "xl",
           width: "minmax(0,0.8fr)",
         }),
       }),
@@ -489,10 +499,19 @@ const ServerDataTable = React.memo(function ServerDataTable({
             />
           )
         },
-        meta: dataTableColumnMeta({
-          hideBelow: "xl",
-          width: "minmax(12rem,1fr)",
-        }),
+        meta: dataTableColumnMeta(
+          {
+            width: {
+              base: dataTablePhoneDetailWidth,
+              md: "minmax(0,1fr)",
+              xl: "minmax(12rem,1fr)",
+            },
+          },
+          {
+            cellClassName: dataTablePhoneDetailCellClassName,
+            headerClassName: dataTablePhoneDetailCellClassName,
+          }
+        ),
       }),
       serverTableColumnHelper.display({
         id: "actions",
@@ -510,10 +529,10 @@ const ServerDataTable = React.memo(function ServerDataTable({
           )
         },
         meta: dataTableColumnMeta(
-          { width: { base: "8.5rem", sm: "9.5rem" } },
+          { width: { base: "3rem", md: "9.5rem" } },
           {
-            cellClassName: "px-1 sm:px-3",
-            headerClassName: "px-1 sm:px-3",
+            cellClassName: "relative z-10 px-0 md:px-3",
+            headerClassName: "px-1 md:px-3",
           }
         ),
       }),
@@ -576,63 +595,90 @@ const ServerActions = React.memo(function ServerActions({
   const deleteEnabled =
     server.instanceState.phase === "ready" &&
     server.instanceState.observation.reachability === "connected"
+  const menu = useRowMenuDialogs()
+  const deleteServer = () =>
+    onDelete({
+      backupAvailable:
+        server.instanceState.phase === "ready" &&
+        server.instanceState.observation.runtime !== "provisioning",
+      id: server.id,
+      name: server.name,
+      relayId: server.relayId,
+    })
   return (
     <DataTableActionGroup>
-      <ServerActionLink
-        icon={TerminalSquare}
-        label={`Open ${server.name} console`}
-        routeIdentifier={routeIdentifier}
-        tab="console"
-        tooltip="Console"
-      />
-      <ServerActionLink
-        icon={Folder}
-        label={`Open ${server.name} files`}
-        routeIdentifier={routeIdentifier}
-        tab="files"
-        tooltip="Files"
-      />
-      {canDelete ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              size="icon-sm"
-              variant="ghost"
-              aria-label={`Delete ${server.name}`}
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
-              disabled={!deleteEnabled}
-              onClick={() =>
-                onDelete({
-                  backupAvailable:
-                    server.instanceState.phase === "ready" &&
-                    server.instanceState.observation.runtime !== "provisioning",
-                  id: server.id,
-                  name: server.name,
-                  relayId: server.relayId,
-                })
-              }
-            >
-              <Trash2 />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={6}>
-            {deleteEnabled ? "Delete" : "Relay unavailable"}
-          </TooltipContent>
-        </Tooltip>
-      ) : null}
+      <DataTableInlineActions>
+        <ServerActionLink
+          icon={TerminalSquare}
+          label={`Open ${server.name} console`}
+          routeIdentifier={routeIdentifier}
+          tab="console"
+          tooltip="Console"
+        />
+        <ServerActionLink
+          icon={Folder}
+          label={`Open ${server.name} files`}
+          routeIdentifier={routeIdentifier}
+          tab="files"
+          tooltip="Files"
+        />
+        {canDelete ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon-sm"
+                variant="ghost"
+                aria-label={`Delete ${server.name}`}
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
+                disabled={!deleteEnabled}
+                onClick={deleteServer}
+              >
+                <Trash2 />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={6}>
+              {deleteEnabled ? "Delete" : "Relay unavailable"}
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
+      </DataTableInlineActions>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
             size="icon-sm"
             variant="ghost"
+            className={dataTableRowMenuTriggerClassName}
             aria-label={`More actions for ${server.name}`}
           >
             <EllipsisVertical />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-44">
+        <DropdownMenuContent
+          align="end"
+          className="min-w-44"
+          onCloseAutoFocus={menu.onCloseAutoFocus}
+        >
+          <DataTablePhoneMenuItems>
+            <DropdownMenuItem asChild>
+              <Link
+                to="/server/$serverId/console"
+                params={{ serverId: routeIdentifier }}
+              >
+                <TerminalSquare /> Console
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link
+                to="/server/$serverId/files/$"
+                params={{ serverId: routeIdentifier, _splat: "" }}
+              >
+                <Folder /> Files
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </DataTablePhoneMenuItems>
           <InstanceFavoriteMenuItem
             favorite={{
               id: server.id,
@@ -643,6 +689,18 @@ const ServerActions = React.memo(function ServerActions({
           <DropdownMenuSeparator />
           <CopyIdentifierMenuItem label="Server ID" value={server.id} />
           <CopyIdentifierMenuItem label="Relay ID" value={server.relayId} />
+          {canDelete ? (
+            <DataTablePhoneMenuItems>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={!deleteEnabled}
+                variant="destructive"
+                onSelect={menu.openAfterClose(deleteServer)}
+              >
+                <Trash2 /> Delete
+              </DropdownMenuItem>
+            </DataTablePhoneMenuItems>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
     </DataTableActionGroup>

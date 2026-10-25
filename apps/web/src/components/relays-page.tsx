@@ -24,12 +24,16 @@ import {
   EllipsisVertical,
   ListTodo,
   LoaderCircle,
+  Pause,
+  Play,
   Plus,
   Settings2,
+  Trash2,
   UserRound,
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
+import { cn } from "@workspace/ui/lib/utils"
 import {
   Dialog,
   DialogContent,
@@ -42,6 +46,7 @@ import { Input } from "@workspace/ui/components/input"
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
@@ -72,10 +77,13 @@ import {
 import {
   RelayDeleteButton,
   RelayPauseButton,
+  RelayPauseDialog,
+  RemoveRelayDialog,
   invalidateRelayRuntimeQueries,
   messageFrom,
   showRelayError,
   updateRelayCache,
+  useRelayPauseToggle,
 } from "@/components/relay/relay-actions"
 import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
 import {
@@ -89,7 +97,14 @@ import {
 import {
   DataTableActionGroup,
   DataTableEmptyState,
+  DataTableInlineActions,
+  DataTablePhoneMenuItems,
   DataTableTextCell,
+  useRowMenuDialogs,
+  dataTableRowLinkClassName,
+  dataTableRowMenuTriggerClassName,
+  dataTablePhoneDetailCellClassName,
+  dataTablePhoneDetailWidth,
 } from "@/components/data-table"
 import { DataTable } from "@/components/data-table-view"
 import {
@@ -219,7 +234,7 @@ export const RelaysPage = React.memo(function RelaysPage({
   }, [joinId, navigate])
 
   return (
-    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-3 pb-3 sm:px-5 sm:pb-5">
+    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-2 pb-3 sm:px-5 sm:pb-5">
       <DataTableWorkspace
         toolbar={
           <RelayToolbar searchStore={searchStore} onAdd={dialogStore.openAdd} />
@@ -548,12 +563,8 @@ function RelayTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "2.5rem", sm: statusColumnWidth } },
-          {
-            cellClassName: "px-2 sm:px-3",
-            headerClassName: "px-2 sm:px-3",
-            headerLabelClassName: "shrink-0 overflow-visible text-clip",
-          }
+          { hideBelow: "md", width: statusColumnWidth },
+          { headerLabelClassName: "shrink-0 overflow-visible text-clip" }
         ),
       }),
       relayTableColumnHelper.display({
@@ -569,8 +580,8 @@ function RelayTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "1.75rem" } },
-          { cellClassName: "px-0", headerClassName: "px-0" }
+          { hideBelow: "md", width: "1.75rem" },
+          { cellClassName: "relative z-10 px-0", headerClassName: "px-0" }
         ),
       }),
       relayTableColumnHelper.accessor((relay) => relay.name, {
@@ -587,7 +598,10 @@ function RelayTable({
                 // other Relay shares its short ID.
                 params={{ relayId: relay.id }}
                 preload="intent"
-                className="group/relay-link flex min-h-14 min-w-0 flex-1 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                className={cn(
+                  dataTableRowLinkClassName,
+                  "group/relay-link flex min-h-14 min-w-0 flex-1 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                )}
               >
                 <InstanceCard
                   state={relay.instanceState}
@@ -602,6 +616,8 @@ function RelayTable({
                   metaClassName="font-mono"
                   name={relay.name}
                   nameClassName="transition-colors group-hover/relay-link:text-primary-ink"
+                  iconFavorite
+                  iconFavoriteClassName="md:hidden"
                   showFavorite={false}
                 />
               </Link>
@@ -654,10 +670,19 @@ function RelayTable({
             />
           )
         },
-        meta: dataTableColumnMeta({
-          hideBelow: "lg",
-          width: "minmax(0,1fr)",
-        }),
+        meta: dataTableColumnMeta(
+          {
+            width: {
+              base: dataTablePhoneDetailWidth,
+              md: "minmax(0,0.9fr)",
+              lg: "minmax(0,1fr)",
+            },
+          },
+          {
+            cellClassName: dataTablePhoneDetailCellClassName,
+            headerClassName: dataTablePhoneDetailCellClassName,
+          }
+        ),
       }),
       relayTableColumnHelper.accessor(
         (relay) =>
@@ -686,15 +711,10 @@ function RelayTable({
           <RelayActions relay={row.original} onEdit={onEdit} />
         ),
         meta: dataTableColumnMeta(
+          { width: { base: "3rem", md: "10rem" } },
           {
-            width: {
-              base: "9rem",
-              sm: "10rem",
-            },
-          },
-          {
-            cellClassName: "px-1 sm:px-3",
-            headerClassName: "px-1 sm:px-3",
+            cellClassName: "relative z-10 px-0 md:px-3",
+            headerClassName: "px-1 md:px-3",
           }
         ),
       }),
@@ -745,30 +765,83 @@ const RelayActions = React.memo(function RelayActions({
   relay: RelayTableItem
   onEdit: (relayId: string) => void
 }) {
+  const menu = useRowMenuDialogs()
+  const [dialog, setDialog] = React.useState<"pause" | "remove" | null>(null)
+  const pause = useRelayPauseToggle(relay)
+  const togglePaused = () =>
+    relay.enabled ? setDialog("pause") : void pause.toggle()
+  const removeRelay = () => setDialog("remove")
+
   return (
     <DataTableActionGroup>
-      <RelayEditButton relay={relay} onEdit={onEdit} />
-      <RelayPauseButton relay={relay} />
-      <RelayDeleteButton relayId={relay.id} name={relay.name} />
+      <DataTableInlineActions>
+        <RelayEditButton relay={relay} onEdit={onEdit} />
+        <RelayPauseButton
+          enabled={relay.enabled}
+          name={relay.name}
+          pending={pause.pending}
+          onClick={togglePaused}
+        />
+        <RelayDeleteButton name={relay.name} onClick={removeRelay} />
+      </DataTableInlineActions>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
             size="icon-sm"
             variant="ghost"
+            className={dataTableRowMenuTriggerClassName}
             aria-label={`More actions for ${relay.name}`}
           >
             <EllipsisVertical />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-44">
+        <DropdownMenuContent
+          align="end"
+          className="min-w-44"
+          onCloseAutoFocus={menu.onCloseAutoFocus}
+        >
+          <DataTablePhoneMenuItems>
+            <DropdownMenuItem
+              onSelect={menu.openAfterClose(() => onEdit(relay.id))}
+            >
+              <Settings2 /> Configure
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={pause.pending}
+              onSelect={menu.openAfterClose(togglePaused)}
+            >
+              {relay.enabled ? <Pause /> : <Play />}
+              {relay.enabled ? "Pause" : "Resume"}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </DataTablePhoneMenuItems>
           <InstanceFavoriteMenuItem
             favorite={{ id: relay.id, kind: "relay", relayId: relay.id }}
           />
           <DropdownMenuSeparator />
           <CopyIdentifierMenuItem label="Relay ID" value={relay.id} />
+          <DataTablePhoneMenuItems>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              variant="destructive"
+              onSelect={menu.openAfterClose(removeRelay)}
+            >
+              <Trash2 /> Remove
+            </DropdownMenuItem>
+          </DataTablePhoneMenuItems>
         </DropdownMenuContent>
       </DropdownMenu>
+      {dialog === "pause" ? (
+        <RelayPauseDialog relay={relay} onClose={() => setDialog(null)} />
+      ) : null}
+      {dialog === "remove" ? (
+        <RemoveRelayDialog
+          name={relay.name}
+          relayId={relay.id}
+          onOpenChange={(open) => setDialog(open ? "remove" : null)}
+        />
+      ) : null}
     </DataTableActionGroup>
   )
 })
