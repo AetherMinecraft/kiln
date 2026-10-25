@@ -10,6 +10,7 @@ import {
 } from "node:crypto"
 import { request as httpRequest } from "node:http"
 import { request as httpsRequest } from "node:https"
+import type { LookupFunction } from "node:net"
 import { TLSSocket } from "node:tls"
 import type { RowDataPacket } from "mysql2/promise"
 import { Clock, Effect, Result } from "effect"
@@ -33,6 +34,7 @@ import { loadedKilnInstallationId } from "@/effect/installation"
 import {
   mapPairingHttpResponse,
   mapPairingTransportError,
+  unreachablePairingError,
 } from "@/lib/relay-pairing-errors"
 import { relayPairingOrigin } from "@/lib/relay-control-endpoint"
 import { relayNameForNewPairing } from "@/lib/relay-names"
@@ -1414,18 +1416,25 @@ function decodePairingUri(value: string) {
 export async function postPairingRequest(
   url: URL,
   caCertificatePem: string | null,
-  body: RelayPairingRequestContract
+  body: RelayPairingRequestContract,
+  // Resolves the Relay's name, for a caller that limits where it may be.
+  lookup?: LookupFunction
 ): Promise<unknown> {
   const encoded = Buffer.from(JSON.stringify(body))
   const request = url.protocol === "https:" ? httpsRequest : httpRequest
   return new Promise((resolve, reject) => {
     const fail = (cause: unknown) => {
-      reject(mapPairingTransportError(cause) ?? cause)
+      reject(
+        mapPairingTransportError(cause) ??
+          unreachablePairingError(cause, url) ??
+          cause
+      )
     }
     const outgoing = request(
       url,
       {
         ca: caCertificatePem ?? undefined,
+        ...(lookup && { lookup }),
         headers: {
           Accept: "application/json",
           "Content-Length": encoded.length,
