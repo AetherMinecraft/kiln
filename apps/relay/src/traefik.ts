@@ -140,7 +140,10 @@ function withWebRouteRevision(
 
 export function traefikStaticConfiguration(
   settings: RelayProxySettings,
-  config: Pick<RelayConfig, "platformEdge" | "traefikAcmeCaServer">
+  config: Pick<
+    RelayConfig,
+    "advertisedHost" | "platformEdge" | "proxyMode" | "traefikAcmeCaServer"
+  >
 ): string {
   const email = settings.acmeEmail
     ? `      email: ${JSON.stringify(settings.acmeEmail)}\n`
@@ -150,9 +153,9 @@ export function traefikStaticConfiguration(
     : ""
   // Let's Encrypt issues certificates for an IP address only from its
   // six-day profile, and without the address as the Common Name. Only a
-  // platform Relay serving Hearth at an address gets the resolver: older
-  // Traefik versions a Relay may be pinned to can't load it.
-  const ipResolver = isPlatformIpEdge(config)
+  // Traefik serving an address gets the resolver, and only one that can
+  // load it.
+  const ipResolver = traefikIpHost(config, settings.traefikImage)
     ? `  kiln-ip:
     acme:
 ${email}${directory}      profile: shortlived
@@ -217,7 +220,7 @@ export function traefikRouteUpstream(
 export function traefikDynamicConfiguration(
   config: RelayConfig,
   routes: ReadonlyArray<RelayStoredWebRoute>,
-  _settings: RelayProxySettings
+  settings: RelayProxySettings
 ): string {
   const resources = relayResourceNames(config)
   // Only a Relay in Traefik mode is itself reached through Traefik, and only
@@ -225,6 +228,16 @@ export function traefikDynamicConfiguration(
   const relayRouted =
     config.proxyMode === "traefik" && isTraefikHostname(config.advertisedHost)
   const served = config.proxyMode === "traefik" ? routes : []
+  const ipHost = traefikIpHost(config, settings.traefikImage)
+  const relayTls =
+    relayRouted && ipHost === config.advertisedHost
+      ? [
+          "      tls:",
+          "        certResolver: kiln-ip",
+          "        domains:",
+          `          - main: ${JSON.stringify(ipHost)}`,
+        ]
+      : ["      tls:", "        certResolver: kiln"]
   const lines = ["http:", "  routers:"]
   if (relayRouted) {
     lines.push(
@@ -233,8 +246,7 @@ export function traefikDynamicConfiguration(
       "      entryPoints:",
       "        - websecure",
       "      service: kiln-relay",
-      "      tls:",
-      "        certResolver: kiln",
+      ...relayTls,
       "    kiln-relay-browser:",
       `      rule: ${JSON.stringify(
         `Host(\`${config.advertisedHost}\`) && Path(\`/v1/browser\`)`
@@ -245,12 +257,11 @@ export function traefikDynamicConfiguration(
       "      service: kiln-relay",
       "      middlewares:",
       "        - kiln-relay-browser-admission",
-      "      tls:",
-      "        certResolver: kiln"
+      ...relayTls
     )
   }
   const edge = config.platformEdge
-  const ipEdge = isPlatformIpEdge(config)
+  const ipEdge = edge !== null && ipHost === edge.host
   if (edge) {
     lines.push(
       "    kiln-hearth:",
@@ -335,9 +346,9 @@ export function traefikDynamicConfiguration(
       `          - ${JSON.stringify(route.path)}`
     )
   }
-  // Browsers send no server name for an address, so its certificate has to
+  // Clients send no server name for an address, so its certificate has to
   // be the one Traefik answers with by default.
-  if (edge && ipEdge) {
+  if (ipHost) {
     lines.push(
       "tls:",
       "  stores:",
@@ -345,15 +356,46 @@ export function traefikDynamicConfiguration(
       "      defaultGeneratedCert:",
       "        resolver: kiln-ip",
       "        domain:",
-      `          main: ${JSON.stringify(edge.host)}`
+      `          main: ${JSON.stringify(ipHost)}`
     )
   }
   lines.push("")
   return `${lines.join("\n")}\n`
 }
 
-function isPlatformIpEdge(config: Pick<RelayConfig, "platformEdge">): boolean {
-  return config.platformEdge !== null && isIP(config.platformEdge.host) !== 0
+// The address Traefik serves by IP rather than by name, if any: Hearth's in
+// platform mode, or the Relay's own when it's in Traefik mode at an address.
+// None for a Traefik too old to load the IP resolver, which then keeps
+// serving everything else.
+function traefikIpHost(
+  config: Pick<RelayConfig, "advertisedHost" | "platformEdge" | "proxyMode">,
+  image: string
+): string | null {
+  if (!traefikLoadsIpResolver(image)) return null
+  if (config.platformEdge) {
+    return isIP(config.platformEdge.host) !== 0 ? config.platformEdge.host : null
+  }
+  return config.proxyMode === "traefik" && isIP(config.advertisedHost) !== 0
+    ? config.advertisedHost
+    : null
+}
+
+// The IP resolver's settings load from Traefik v3.6: `profile` came in
+// v3.5 and `disableCommonName` in v3.6. An image counts only when its tag
+// names v3.6 or later, or it has no tag or `latest`, which is current. A
+// digest or other tag could be any version, so it doesn't.
+function traefikLoadsIpResolver(image: string): boolean {
+  const name = image.slice(image.lastIndexOf("/") + 1)
+  const [reference = "", digest] = name.split("@")
+  const colon = reference.indexOf(":")
+  const tag = colon === -1 ? null : reference.slice(colon + 1)
+  if (tag === null) return digest === undefined
+  if (tag === "latest") return true
+  const version = /^v?(\d+)\.(\d+)(?:\.|-|$)/u.exec(tag)
+  if (!version) return false
+  const major = Number(version[1])
+  const minor = Number(version[2])
+  return major > 3 || (major === 3 && minor >= 6)
 }
 
 function traefikRouteName(id: string): string {
