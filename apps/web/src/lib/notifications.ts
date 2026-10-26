@@ -9,6 +9,14 @@ const notificationResourceSchema = z.object({
   type: z.enum(["relay", "instance", "database", "app"]),
 })
 
+const severitySchema = z.enum([
+  "critical",
+  "high",
+  "medium",
+  "low",
+  "negligible",
+])
+
 /**
  * What a notification says, stored as the row's `kind` plus JSON `data`.
  * Rows are kept across Kiln versions: only add kinds or optional fields, and
@@ -70,23 +78,15 @@ export const notificationContentSchema = z.discriminatedUnion("kind", [
     status: z.enum(["succeeded", "failed"]),
     update: z.boolean(),
   }),
-  // Grype found vulnerabilities its people hadn't heard of in what a
-  // resource runs: for a Relay, its host or one of Kiln's services there,
-  // which `component` names.
+  // Grype found vulnerabilities the user hadn't heard of in what they can
+  // fix, as one report for everything. A newer report replaces it, adding in
+  // what this one said while it's unread. The Security page has the details.
   z.object({
-    component: z.string().nullable(),
     count: z.number().int().positive(),
-    fixable: z.number().int().nonnegative(),
-    kind: z.literal("security.vulnerabilities"),
+    kind: z.literal("security.report"),
     knownExploited: z.number().int().nonnegative(),
-    resource: notificationResourceSchema,
-    severity: z.enum(["critical", "high", "medium", "low", "negligible"]),
-    top: z.object({
-      fixedVersion: z.string().nullable(),
-      id: z.string(),
-      packageName: z.string(),
-      packageVersion: z.string(),
-    }),
+    resources: z.array(notificationResourceSchema).min(1),
+    severity: severitySchema,
   }),
   // A game server finished copying to a new one, as a duplicate or a move to
   // another Relay. A finished move offers to delete the server it left;
@@ -105,6 +105,42 @@ export const notificationContentSchema = z.discriminatedUnion("kind", [
 
 export type NotificationContent = z.infer<typeof notificationContentSchema>
 export type NotificationKind = NotificationContent["kind"]
+
+// Before reports, Kiln told of vulnerabilities in one notification per
+// resource. Ones still stored read as a report of their resource.
+const legacyVulnerabilitiesSchema = z
+  .object({
+    count: z.number().int().positive(),
+    kind: z.literal("security.vulnerabilities"),
+    knownExploited: z.number().int().nonnegative(),
+    resource: notificationResourceSchema,
+    severity: severitySchema,
+  })
+  .transform(
+    ({ count, knownExploited, resource, severity }): NotificationContent => ({
+      count,
+      kind: "security.report",
+      knownExploited,
+      resources: [resource],
+      severity,
+    })
+  )
+
+/** A stored notification's content, including kinds a newer one replaced. */
+export const storedNotificationContentSchema = z.union([
+  notificationContentSchema,
+  legacyVulnerabilitiesSchema,
+])
+
+/**
+ * The kinds a kind replaced, whose stored rows and settings carry over to it.
+ */
+export const formerNotificationKinds: Partial<
+  Record<NotificationKind, ReadonlyArray<string>>
+> = {
+  "security.report": ["security.vulnerabilities"],
+}
+
 export type NotificationResource = z.infer<typeof notificationResourceSchema>
 export type InvitationOutcome = NonNullable<
   Extract<NotificationContent, { kind: "access.invited" }>["outcome"]

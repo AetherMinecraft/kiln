@@ -9,6 +9,7 @@ import {
   listNotificationsEffect,
   markNotificationsReadEffect,
   notifyUsersEffect,
+  replaceNotificationEffect,
   resolveInvitationNotificationsEffect,
   resolveNotificationsEffect,
 } from "@/effect/notifications"
@@ -158,6 +159,71 @@ describeMysql("notifications", () => {
         yield* notifyUsersEffect(["user-b"], "kiln.release:0.3.0", release)
         assert.deepStrictEqual(yield* contents("user-b"), [])
       })
+    )
+
+    it.effect(
+      "keeps one report, folding in the one it replaces while unread",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertUser("user-a")
+          yield* insertUser("user-b")
+          const report = (count: number): NotificationContent => ({
+            count,
+            kind: "security.report",
+            knownExploited: 0,
+            resources: [removed.resource],
+            severity: "high",
+          })
+          // Adds the unread reports' counts to the news.
+          const replace = (userId: string, count: number) =>
+            replaceNotificationEffect(userId, "security.report", (unread) =>
+              report(
+                unread.reduce(
+                  (sum, content) =>
+                    content.kind === "security.report"
+                      ? sum + content.count
+                      : sum,
+                  count
+                )
+              )
+            )
+
+          yield* TestClock.setTime(1_000)
+          yield* replace("user-a", 2)
+          yield* replace("user-b", 1)
+          yield* notifyUsersEffect(
+            ["user-a"],
+            "access.removed:grant-a:1",
+            removed
+          )
+          yield* TestClock.setTime(2_000)
+          yield* replace("user-a", 3)
+          // The new report is the newest, and the others' report is theirs.
+          assert.deepStrictEqual(yield* contents("user-a"), [
+            { content: report(5), read: false },
+            { content: removed, read: false },
+          ])
+          assert.deepStrictEqual(yield* contents("user-b"), [
+            { content: report(1), read: false },
+          ])
+
+          // One already read is replaced by just the news.
+          yield* markNotificationsReadEffect("user-a", "all")
+          yield* replace("user-a", 4)
+          assert.deepStrictEqual(yield* contents("user-a"), [
+            { content: report(4), read: false },
+            { content: removed, read: true },
+          ])
+
+          // And after it's cleared, the news arrives on its own.
+          yield* clearNotificationsEffect("user-a", 2_000)
+          yield* TestClock.setTime(3_000)
+          yield* replace("user-a", 1)
+          assert.deepStrictEqual(yield* contents("user-a"), [
+            { content: report(1), read: false },
+          ])
+        })
     )
 
     it.effect("marks only the user's own notifications read", () =>
@@ -389,6 +455,73 @@ describeMysql("notifications", () => {
           ]
         )
       })
+    )
+
+    it.effect(
+      "reads per-resource vulnerability notifications as reports it replaces",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertUser("user-a")
+          const report = (
+            count: number,
+            knownExploited: number
+          ): NotificationContent => ({
+            count,
+            kind: "security.report",
+            knownExploited,
+            resources: [removed.resource],
+            severity: "critical",
+          })
+          // Adds every unread report to the news.
+          const replace = (count: number) =>
+            replaceNotificationEffect("user-a", "security.report", (unread) => {
+              let exploited = 0
+              for (const content of unread)
+                if (content.kind === "security.report") {
+                  count += content.count
+                  exploited += content.knownExploited
+                }
+              return report(count, exploited)
+            })
+
+          yield* TestClock.setTime(1_000)
+          yield* replace(1)
+          // As a Hearth from before reports writes it, after this one's
+          // report arrived.
+          yield* insertRows("notification", {
+            id: "00000000-0000-4000-8000-0000000000b1",
+            user_id: "user-a",
+            kind: "security.vulnerabilities",
+            source_key: "security:app:app-a:1",
+            data: JSON.stringify({
+              component: null,
+              count: 2,
+              fixable: 1,
+              knownExploited: 1,
+              resource: removed.resource,
+              severity: "critical",
+              top: {
+                fixedVersion: null,
+                id: "CVE-1",
+                packageName: "openssl",
+                packageVersion: "1",
+              },
+            }),
+            created_at: 2_000,
+          })
+          assert.deepStrictEqual(yield* contents("user-a"), [
+            { content: report(2, 1), read: false },
+            { content: report(1, 0), read: false },
+          ])
+
+          // Neither was read, so the next report holds both.
+          yield* TestClock.setTime(3_000)
+          yield* replace(3)
+          assert.deepStrictEqual(yield* contents("user-a"), [
+            { content: report(6, 1), read: false },
+          ])
+        })
     )
 
     it.effect("skips notifications this version cannot show", () =>

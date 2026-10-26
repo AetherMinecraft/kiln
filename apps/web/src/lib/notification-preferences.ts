@@ -1,7 +1,10 @@
 import { Predicate } from "effect"
 import { z } from "zod"
 
-import type { NotificationKind } from "@/lib/notifications"
+import {
+  formerNotificationKinds,
+  type NotificationKind,
+} from "@/lib/notifications"
 import {
   defaultSecurityNotificationSettings,
   securityNotificationSettingsSchema,
@@ -51,7 +54,7 @@ export const notificationPreferenceGroups = [
   {
     adminOnly: false,
     id: "security",
-    kinds: [{ kind: "security.vulnerabilities", label: "Vulnerabilities" }],
+    kinds: [{ kind: "security.report", label: "Vulnerability reports" }],
     label: "Security",
   },
   {
@@ -110,7 +113,7 @@ const allKinds: ReadonlyArray<NotificationKind> = [
   "resource.disk-limit",
   "app.image-update",
   "app.deployed",
-  "security.vulnerabilities",
+  "security.report",
   "server.migration",
 ] satisfies ReadonlyArray<NotificationKind>
 
@@ -168,7 +171,9 @@ export function normalizeNotificationPreferences(
   const stored = readStored(value)
   const kinds = {} as Record<NotificationKind, NotificationKindPreference>
   for (const kind of allKinds) {
-    const choice = stored.kinds?.[kind]
+    const choice = [kind, ...(formerNotificationKinds[kind] ?? [])]
+      .map((name) => stored.kinds?.[name])
+      .find((found) => found !== undefined)
     kinds[kind] = {
       inbox: kindsWithRequiredInbox.has(kind) ? true : (choice?.inbox ?? true),
       push: choice?.push ?? true,
