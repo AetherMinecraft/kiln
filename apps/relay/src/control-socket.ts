@@ -39,6 +39,7 @@ import {
   relayWebRouteOptionsV1Feature,
   relayHostFilesV1Feature,
   relayLinkedBackupsV1Feature,
+  relayTransferSpaceV1Feature,
   relayPeerTransfersV1Feature,
   relayRestartV1Feature,
   relayResourcesV1Feature,
@@ -1195,6 +1196,7 @@ function authenticateSocket(
           relayWebRouteOptionsV1Feature,
           relayPeerTransfersV1Feature,
           relayLinkedBackupsV1Feature,
+          relayTransferSpaceV1Feature,
         ],
         protocol: relayControlProtocol,
         relayBuild: relayBuildLabel(),
@@ -1675,6 +1677,14 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
         objectString(request.payload, "rootId") ?? "",
         "download"
       )
+    // Free disk is the Relay's state; measuring a root reads what a
+    // transfer of it would download.
+    case "transfer.space": {
+      const rootId = objectString(request.payload, "rootId")
+      return rootId === null
+        ? "relay.read"
+        : fileTransferAction(rootId, "download")
+    }
     case "transfer.pull.start":
       return fileTransferAction(
         objectString(objectRecord(request.payload, "target") ?? {}, "rootId") ??

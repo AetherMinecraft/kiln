@@ -882,13 +882,7 @@ export class FilesystemDriver {
       const root = yield* this.#instanceRoot(instance)
       const selected = paths.length
         ? distinctMutationPaths(paths)
-        : yield* filesystemOperation("transfer.listRoot", async () => {
-            const names: Array<string> = []
-            for await (const child of await opendir(root)) {
-              names.push(child.name)
-            }
-            return names.sort((left, right) => left.localeCompare(right))
-          })
+        : yield* rootChildNames(root)
       const entries = yield* collectArchiveEntries(root, selected)
       let completed = false
       return yield* filesystemOperation("transfer.pack", (signal) =>
@@ -1265,6 +1259,36 @@ export class FilesystemDriver {
       }
       return candidate
     })
+  }
+
+  /**
+   * Disk a copy of the whole root takes, as its archive or unpacked,
+   * walking it as a transfer packs it, so each name of a file linked more
+   * than once counts. Each entry is rounded up to a filesystem block, with
+   * room for its archive header, which bounds both the archive and the
+   * unpacked files; a sliver more covers compression and large files'
+   * filesystem metadata.
+   */
+  rootBytes(instance: FileRoot) {
+    return Effect.gen({ self: this }, function* () {
+      const root = yield* this.#instanceRoot(instance)
+      const entries = yield* collectArchiveEntries(
+        root,
+        yield* rootChildNames(root)
+      )
+      const bytes = entries.reduce(
+        (total, entry) =>
+          total +
+          TAR_BLOCK_BYTES +
+          Math.max(
+            Math.ceil(entry.size / FILESYSTEM_BLOCK_BYTES),
+            entry.kind === "file" ? 0 : 1
+          ) *
+            FILESYSTEM_BLOCK_BYTES,
+        TAR_BLOCK_BYTES * 2
+      )
+      return bytes + Math.ceil(bytes / 1024)
+    }).pipe(Effect.withSpan("relay.files.rootBytes"))
   }
 
   #instanceRoot(instance: FileRoot) {
@@ -1994,6 +2018,21 @@ const availableDuplicatePath = Effect.fn("relay.files.availableDuplicatePath")(
     )
   }
 )
+
+// A tar header and its records' unit, and the block size most
+// filesystems allocate in.
+const TAR_BLOCK_BYTES = 512
+const FILESYSTEM_BLOCK_BYTES = 4096
+
+function rootChildNames(root: string) {
+  return filesystemOperation("transfer.listRoot", async () => {
+    const names: Array<string> = []
+    for await (const child of await opendir(root)) {
+      names.push(child.name)
+    }
+    return names.sort((left, right) => left.localeCompare(right))
+  })
+}
 
 const collectArchiveEntries = Effect.fn("relay.files.collectArchiveEntries")(
   function* (root: string, requestedPaths: ReadonlyArray<string>) {

@@ -85,9 +85,18 @@ Hearth (`apps/relay/src/transfers/peer/`, `apps/web/src/server/relay-transfers.s
    checks the artifact's SHA-256 against the grant and installs it with
    `transferInstallLocks`, which run alone, into a folder that must be
    missing or empty. Files keep their modes and belong to the root's owner.
-5. Hearth discards the source's artifact once the pull ends. Artifacts
-   nobody discards are deleted after a day; finished pulls' records after a
-   week.
+5. The destination deletes what it fetched once it's installed. Hearth
+   discards the source's artifact once the pull ends, and cancelling a pull,
+   failed or not, deletes what it fetched. Artifacts nobody discards are
+   deleted after a day; finished pulls' records after a week.
+
+`transfer.space` (`transfer-space-v1`) reports a Relay's free disk where it
+keeps artifacts and where it keeps game servers' folders, and, asked about
+a root, the disk a copy of it takes, archived or unpacked, so Hearth can
+check a copy fits first. It walks the root as packing does, counting each
+name of a hard-linked file, and rounds each entry up to a filesystem block
+plus its archive header. Free disk needs `relay.read`; a root's size needs its download
+action.
 
 Copying needs the source root's download action and the destination
 root's upload action, for the person on Hearth and for Hearth's pairing on
