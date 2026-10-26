@@ -1,10 +1,12 @@
 // The server migration server functions in ./server-migrations authenticate
 // the caller and hand the signed-in user to these handlers.
 import {
+  DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
   relayLinkedBackupsV1Feature,
   relayInstanceWebRouteStateSchema,
   relaySnapshotSchema,
   type RelayInstance,
+  type ResourceLimits,
 } from "@workspace/contracts"
 import { Effect } from "effect"
 import type { RowDataPacket } from "mysql2/promise"
@@ -40,13 +42,13 @@ import {
   startServerMigrationEffect,
 } from "@/lib/server-migrations.server"
 import { resolveAuthorizedBackupStorageSelection } from "@/lib/backup-storage-selection.server"
+import { relayResourceLimitsRequest } from "@/lib/resource-limits.server"
 import type {
   MigrationRelayRoom,
   MigrationSourceRoom,
 } from "@/lib/server-migration-room"
 import {
   checkMigrationRoom,
-  defaultBackupIsLocal,
   loadRelayRoom,
   migrationSourceRoom,
 } from "@/lib/server-migration-room.server"
@@ -101,8 +103,6 @@ export interface ServerMigrationPreview {
    * fits; null when its Relay couldn't say.
    */
   readonly room: {
-    /** Whether its backups go to its own Relay by default. */
-    readonly defaultBackupLocal: boolean
     readonly server: MigrationSourceRoom
     readonly source: MigrationRelayRoom
   } | null
@@ -113,6 +113,8 @@ export interface ServerMigrationPreview {
   }
   readonly source: {
     readonly instanceId: string
+    /** The limits its copy takes unless it's given others. */
+    readonly limits: ResourceLimits
     readonly name: string
     readonly nodeArch: string | null
     readonly provisioning: boolean
@@ -129,13 +131,10 @@ export async function previewServerMigrationHandler(
 ): Promise<ServerMigrationPreview> {
   const { authorization, instance, relay } = await authorizeSource(user, data)
   const relays = (await listPersistedRelays()).filter((item) => item.enabled)
-  const [sourceRoom, defaultBackupLocal] = await Promise.all([
-    recoverPromise(
-      () => loadRelayRoom(relay, { rootId: instance.id, subject: user.id }),
-      () => null
-    ),
-    defaultBackupIsLocal(relay.id, instance.id),
-  ])
+  const sourceRoom = await recoverPromise(
+    () => loadRelayRoom(relay, { rootId: instance.id, subject: user.id }),
+    () => null
+  )
   const destinations = await Promise.all(
     relays.map(async (candidate) => {
       const allowed = (
@@ -145,7 +144,7 @@ export async function previewServerMigrationHandler(
         })
       ).allows("instance.create")
       if (!allowed) return null
-      const [problems, takenNames, room] = await Promise.all([
+      const [problems, takenNames, space] = await Promise.all([
         runAppEffect(
           "serverMigrations.preview.problems",
           relayTransferProblemsEffect({
@@ -157,10 +156,9 @@ export async function previewServerMigrationHandler(
         ),
         serverNames(candidate, user),
         candidate.id === relay.id
-          ? (sourceRoom?.room ?? null)
+          ? sourceRoom
           : recoverPromise(
-              async () =>
-                (await loadRelayRoom(candidate, { subject: user.id })).room,
+              () => loadRelayRoom(candidate, { subject: user.id }),
               () => null
             ),
       ])
@@ -174,7 +172,7 @@ export async function previewServerMigrationHandler(
         name: candidate.name,
         nodeArch: candidate.nodeArch,
         problems,
-        room,
+        room: space?.room ?? null,
         takenNames,
       } satisfies ServerMigrationDestination
     })
@@ -220,7 +218,6 @@ export async function previewServerMigrationHandler(
     destinations: destinations.filter((item) => item !== null),
     room: sourceRoom
       ? {
-          defaultBackupLocal,
           server: migrationSourceRoom(instance, sourceRoom.rootBytes),
           source: sourceRoom.room,
         }
@@ -233,6 +230,7 @@ export async function previewServerMigrationHandler(
     },
     source: {
       instanceId: instance.id,
+      limits: instance.limits,
       name: instance.name,
       nodeArch: relay.nodeArch,
       provisioning: Boolean(instance.provisioning),
@@ -325,8 +323,19 @@ export async function startServerMigrationHandler(
       `A server on ${destination.name} is already named ${data.name}`
     )
   }
+  // Limits a Relay can't take are refused here, not partway through.
+  if (options.limits) {
+    const diskBytes =
+      options.limits.diskBytes ?? DEFAULT_INSTANCE_DISK_LIMIT_BYTES
+    relayResourceLimitsRequest(
+      destination.id,
+      { cpuMillis: null, diskBytes, memoryBytes: null },
+      options.limits
+    )
+  }
   const room = await checkMigrationRoom({
     backup: options.backup,
+    copyLimits: options.limits,
     destination,
     instanceId: instance.id,
     limits: true,

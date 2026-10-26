@@ -1,5 +1,6 @@
 import * as React from "react"
-import { ArrowRightLeft, Copy } from "lucide-react"
+import { useQueryClient } from "@tanstack/react-query"
+import { ArrowRightLeft, Copy, LoaderCircle } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
 
@@ -26,6 +27,8 @@ import type {
   RelayNodeSummary,
 } from "@/lib/relay-selectors"
 import { ResourceSecurityAlert } from "@/components/resource-security-alert"
+import { ensuringPromise, recoverPromise } from "@/effect/promise"
+import { serverMigrationPreviewQueryOptions } from "@/lib/server-migration-queries"
 
 // The game server's details, each section with the actions that change it,
 // and a rail summing up where it runs and who can reach it. While it's
@@ -145,6 +148,32 @@ function ServerMigrationSection({
   relayConnected: boolean
 }) {
   const [mode, setMode] = React.useState<ServerMigrationMode | null>(null)
+  const [opening, setOpening] = React.useState<ServerMigrationMode | null>(null)
+  const queryClient = useQueryClient()
+  const previewOptions = serverMigrationPreviewQueryOptions({
+    instanceId: instance.id,
+    relayId: instance.relayId,
+  })
+  // Asked for as the pointer reaches a button, and waited for on click, so
+  // the dialog opens whole rather than growing once it loads.
+  const prefetch = () => {
+    void queryClient.prefetchQuery(previewOptions)
+  }
+  const open = (next: ServerMigrationMode) => {
+    setOpening(next)
+    // The dialog shows a failed preview itself.
+    void ensuringPromise(
+      () =>
+        recoverPromise(
+          () => queryClient.fetchQuery(previewOptions),
+          () => undefined
+        ),
+      () => {
+        setOpening(null)
+        setMode(next)
+      }
+    )
+  }
   const unavailable = relayConnected
     ? undefined
     : "Reconnect this server's Relay first"
@@ -157,21 +186,33 @@ function ServerMigrationSection({
           <Button
             variant="outline"
             size="sm"
-            disabled={!relayConnected}
+            disabled={!relayConnected || opening !== null}
             title={unavailable}
-            onClick={() => setMode("duplicate")}
+            onClick={() => open("duplicate")}
+            onFocus={prefetch}
+            onPointerEnter={prefetch}
           >
-            <Copy />
+            {opening === "duplicate" ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <Copy />
+            )}
             Duplicate
           </Button>
           <Button
             variant="outline"
             size="sm"
-            disabled={!relayConnected}
+            disabled={!relayConnected || opening !== null}
             title={unavailable}
-            onClick={() => setMode("migrate")}
+            onClick={() => open("migrate")}
+            onFocus={prefetch}
+            onPointerEnter={prefetch}
           >
-            <ArrowRightLeft />
+            {opening === "migrate" ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <ArrowRightLeft />
+            )}
             Move to another Relay
           </Button>
           {mode ? (
@@ -179,7 +220,10 @@ function ServerMigrationSection({
               open
               initialMode={mode}
               server={{
+                brickId: instance.brickId,
+                brickSource: instance.brickSource,
                 id: instance.id,
+                implementation: instance.implementation,
                 name: instance.name,
                 relayId: instance.relayId,
               }}

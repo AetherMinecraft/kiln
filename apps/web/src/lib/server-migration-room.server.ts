@@ -7,6 +7,7 @@ import {
   relayTransferSpaceV1Feature,
   type RelayInstance,
   type RelaySnapshot,
+  type ResourceLimits,
 } from "@workspace/contracts"
 import { Schema } from "effect"
 
@@ -59,16 +60,18 @@ export async function loadRelayRoom(
     node.storage.totalBytes - node.storage.usedBytes,
     0
   )
+  const assignableDiskBytes = relayDiskAllocationAvailableBytes(
+    node.storage.totalBytes,
+    allocated("diskBytes")
+  )
+  const assignableMemoryBytes = Math.max(
+    node.memory.totalBytes - allocated("memoryBytes"),
+    0
+  )
   return {
     room: {
-      assignableDiskBytes: relayDiskAllocationAvailableBytes(
-        node.storage.totalBytes,
-        allocated("diskBytes")
-      ),
-      assignableMemoryBytes: Math.max(
-        node.memory.totalBytes - allocated("memoryBytes"),
-        0
-      ),
+      assignableDiskBytes,
+      assignableMemoryBytes,
       cores: node.cpu.cores,
       name: relay.name,
       relayId: relay.id,
@@ -82,17 +85,17 @@ export async function loadRelayRoom(
 }
 
 /**
- * The server's limits as its copy takes them, and its folder's size:
- * measured, else a running server's live figure, else its disk limit.
+ * The limits its copy takes, its own or those it's given, and the server's
+ * folder's size: measured, else a running server's live figure, else its
+ * disk limit, or the default one when it has none.
  */
 export function migrationSourceRoom(
   instance: RelayInstance,
-  rootBytes: number | null
+  rootBytes: number | null,
+  given: ResourceLimits | null = null
 ): MigrationSourceRoom {
-  const limits = {
-    ...instance.limits,
-    diskBytes: instance.limits.diskBytes ?? DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
-  }
+  const limits = given ?? instance.limits
+  const ownDisk = instance.limits.diskBytes ?? DEFAULT_INSTANCE_DISK_LIMIT_BYTES
   if (rootBytes !== null) {
     return { limits, usedBytes: rootBytes, usedFrom: "measured" }
   }
@@ -100,7 +103,7 @@ export function migrationSourceRoom(
   if (live !== null && live !== undefined) {
     return { limits, usedBytes: live, usedFrom: "running" }
   }
-  return { limits, usedBytes: limits.diskBytes, usedFrom: "limit" }
+  return { limits, usedBytes: ownDisk, usedFrom: "limit" }
 }
 
 /** Whether the server's backups go to its own Relay by default. */
@@ -122,6 +125,8 @@ export async function defaultBackupIsLocal(
  */
 export async function checkMigrationRoom(input: {
   readonly backup: ServerMigrationOptions["backup"]
+  /** The copy's limits, when it's given its own. */
+  readonly copyLimits: ResourceLimits | null
   readonly destination: PersistedRelay
   readonly instanceId: string
   readonly limits: boolean
@@ -149,7 +154,7 @@ export async function checkMigrationRoom(input: {
     destination: (destination ?? source).room,
     limits: input.limits,
     localBackups: backupLocal ? 1 : 0,
-    server: migrationSourceRoom(instance, source.rootBytes),
+    server: migrationSourceRoom(instance, source.rootBytes, input.copyLimits),
     source: source.room,
   })
 }

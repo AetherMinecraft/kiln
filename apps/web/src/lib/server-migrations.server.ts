@@ -586,7 +586,8 @@ const stopSource = Effect.fnUntraced(function* (
 })
 
 // Creates the copy, stopped, from the exact Brick the old server was built
-// from, with its settings and limits. Repeating it resumes the same server.
+// from, with its settings, and its limits unless it was given its own.
+// Repeating it resumes the same server.
 const createDestination = Effect.fnUntraced(function* (
   row: MigrationRow,
   generation: number,
@@ -618,19 +619,25 @@ const createDestination = Effect.fnUntraced(function* (
   }
   const recipe = yield* promise(() => loadInstanceRecipe(source, instance))
   const diskLimitBytes =
-    instance.limits.diskBytes ?? DEFAULT_INSTANCE_DISK_LIMIT_BYTES
-  const create = relayCreateInstanceSchema.parse({
-    diskLimitBytes,
-    ...relayResourceLimitsRequest(
-      destination.id,
-      { cpuMillis: null, diskBytes: diskLimitBytes, memoryBytes: null },
-      instance.limits
-    ),
-    name: row.destination_name,
-    recipe: recipe.brickSource,
-    recipeDefinition: brickRecipeDefinition(recipe.brick),
-    start: false,
-    variables: instance.variables ?? {},
+    (options.limits ?? instance.limits).diskBytes ??
+    DEFAULT_INSTANCE_DISK_LIMIT_BYTES
+  // A Relay that can't take these limits fails the copy, not the worker.
+  const create = yield* Effect.try({
+    try: () =>
+      relayCreateInstanceSchema.parse({
+        diskLimitBytes,
+        ...relayResourceLimitsRequest(
+          destination.id,
+          { cpuMillis: null, diskBytes: diskLimitBytes, memoryBytes: null },
+          options.limits ?? instance.limits
+        ),
+        name: row.destination_name,
+        recipe: recipe.brickSource,
+        recipeDefinition: brickRecipeDefinition(recipe.brick),
+        start: false,
+        variables: instance.variables ?? {},
+      }),
+    catch: (cause) => cause,
   })
   // A move takes the old server's domains along, so the copy isn't given
   // one of its own when it's provisioned.
@@ -1108,6 +1115,7 @@ const requireRoom = Effect.fnUntraced(function* (
   const problems = yield* promise(() =>
     checkMigrationRoom({
       backup: row.backup_id === null ? options.backup : null,
+      copyLimits: options.limits,
       destination,
       instanceId: row.source_instance_id,
       limits,
