@@ -49,20 +49,17 @@ import {
   getManagedDatabaseContainer,
   getManagedDatabaseDirectory,
 } from "@/server/databases"
-import {
-  isMinecraftUsername,
-  minecraftUsernameKey,
-} from "@/lib/minecraft-profile"
 import { getUiPreferences } from "@/server/preferences"
 import {
   getInstanceFavorites,
   setInstanceFavorite,
 } from "@/server/instance-favorites"
+import { getIconDetails, getIconIndex } from "@/server/icons"
+import { iconSubjectKey, type IconSubject } from "@/lib/icons"
 import {
   instanceFavoriteKey,
   type InstanceFavorite,
 } from "@/lib/instance-favorites"
-import { getMinecraftProfile } from "@/server/minecraft"
 import { getRelayResources } from "@/server/relay-host"
 import { getRelayVolumes } from "@/server/relay-volumes"
 import { isDatabaseFilePath } from "@/lib/database-files"
@@ -83,7 +80,6 @@ import {
   getRelayTree,
 } from "@/server/relay"
 import {
-  getRelayOwnerMinecraftProfiles,
   getRelayProxy,
   getRelayWebRoutes,
   getRelayHostFiles,
@@ -100,7 +96,6 @@ import {
 } from "@/server/updates"
 import {
   getResourceOwner,
-  getResourceOwnerMinecraftProfileId,
   getResourceUserCount,
 } from "@/server/resource-access"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
@@ -121,7 +116,6 @@ import {
   getAppConfig,
   getAppDirectory,
   getAppOwner,
-  getAppOwnerMinecraftProfileId,
   getAppWebRoutes,
 } from "@/server/apps"
 import {
@@ -145,12 +139,6 @@ const relayPollHeaders = { "x-kiln-request-purpose": "relay-poll" }
 export const queryKeys = {
   auth: {
     state: ["auth", "state"] as const,
-  },
-  minecraft: {
-    profile: (displayName: string) =>
-      ["minecraft", "profile", displayName] as const,
-    relayOwners: (ownerNames: string) =>
-      ["minecraft", "relay-owner-profiles", ownerNames] as const,
   },
   access: {
     capabilities: ["access", "capabilities"] as const,
@@ -295,6 +283,11 @@ export const queryKeys = {
   relayRelease: (relayId: string, version: string) =>
     ["updates", "relay", relayId, version] as const,
   instanceFavorites: ["instance-favorites"] as const,
+  icons: {
+    index: ["icons", "index"] as const,
+    details: ["icons", "details"] as const,
+    detail: (key: string) => ["icons", "details", key] as const,
+  },
   notifications: ["notifications"] as const,
   notificationPreferences: ["notification-preferences"] as const,
   uiPreferences: ["ui", "preferences"] as const,
@@ -357,30 +350,6 @@ export function authStateQueryOptions() {
     queryKey: queryKeys.auth.state,
     queryFn: () => getAuthState(),
     staleTime: 30_000,
-  })
-}
-
-export function minecraftProfileQueryOptions(displayName: string) {
-  const username = minecraftUsernameKey(displayName)
-  return queryOptions({
-    queryKey: queryKeys.minecraft.profile(username),
-    queryFn: ({ signal }) => getMinecraftProfile({ signal }),
-    enabled: isMinecraftUsername(displayName),
-    gcTime: 60 * 60_000,
-    retry: false,
-    staleTime: 60 * 60_000,
-  })
-}
-
-/** Keyed by the visible owners so pairing or sharing a Relay refetches. */
-export function relayOwnerMinecraftProfilesQueryOptions(ownerNames: string) {
-  return queryOptions({
-    queryKey: queryKeys.minecraft.relayOwners(ownerNames),
-    queryFn: ({ signal }) => getRelayOwnerMinecraftProfiles({ signal }),
-    enabled: ownerNames.length > 0,
-    gcTime: 60 * 60_000,
-    retry: false,
-    staleTime: 60 * 60_000,
   })
 }
 
@@ -458,35 +427,6 @@ export function resourceOwnerQueryOptions(scope: {
     queryFn: () => getResourceOwner({ data: scope }),
     retry: false,
     staleTime: 30_000,
-  })
-}
-
-// The owner's Minecraft head, apart from the owner so their card shows
-// before Mojang answers. Keyed by the owner's name too, so a new owner or
-// name looks the head up again.
-export function resourceOwnerMinecraftProfileQueryOptions(
-  scope: {
-    relayId: string
-    resourceId: string
-    resourceType: "database" | "instance" | "relay"
-  },
-  ownerName: string
-) {
-  return queryOptions({
-    queryKey: [
-      "resource-access",
-      scope.relayId,
-      scope.resourceType,
-      scope.resourceId,
-      "owner",
-      "minecraft",
-      ownerName,
-    ] as const,
-    queryFn: ({ signal }) =>
-      getResourceOwnerMinecraftProfileId({ data: scope, signal }),
-    gcTime: 60 * 60_000,
-    retry: false,
-    staleTime: 60 * 60_000,
   })
 }
 
@@ -711,23 +651,6 @@ export function appOwnerQueryOptions(relayId: string, appId: string) {
   })
 }
 
-// The owner's Minecraft head, keyed by their name so a new name looks it up
-// again.
-export function appOwnerMinecraftProfileQueryOptions(
-  relayId: string,
-  appId: string,
-  ownerName: string
-) {
-  return queryOptions({
-    queryKey: ["app-owner", relayId, appId, "minecraft", ownerName] as const,
-    queryFn: ({ signal }) =>
-      getAppOwnerMinecraftProfileId({ data: { appId, relayId }, signal }),
-    gcTime: 60 * 60_000,
-    retry: false,
-    staleTime: 60 * 60_000,
-  })
-}
-
 export function appConfigQueryOptions(relayId: string, appId: string) {
   return queryOptions({
     queryKey: queryKeys.apps.config(relayId, appId),
@@ -819,6 +742,22 @@ export function invitationPreviewQueryOptions(token: string) {
   return queryOptions({
     queryKey: queryKeys.access.invitation(token),
     queryFn: () => getInvitationPreview({ data: { token } }),
+    staleTime: 30_000,
+  })
+}
+
+export function iconIndexQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.icons.index,
+    queryFn: () => getIconIndex(),
+    staleTime: Infinity,
+  })
+}
+
+export function iconDetailsQueryOptions(subject: IconSubject) {
+  return queryOptions({
+    queryKey: queryKeys.icons.detail(iconSubjectKey(subject)),
+    queryFn: () => getIconDetails({ data: { subject } }),
     staleTime: 30_000,
   })
 }
