@@ -641,7 +641,8 @@ export class FakeDocker {
     }
     if (
       executable === "docker-compose" &&
-      arguments_.slice(-4).join(" ") === "up --no-start --build --remove-orphans"
+      arguments_.slice(-4).join(" ") ===
+        "up --no-start --build --remove-orphans"
     ) {
       return this.#composeUp(arguments_, input ?? "", false)
     }
@@ -730,7 +731,12 @@ export class FakeDocker {
       this.addContainer({
         image,
         labels: {
-          ...settings.labels,
+          ...Object.fromEntries(
+            Object.entries(settings.labels ?? {}).map(([key, value]) => [
+              key,
+              composeInterpolated(value, `services.${service}.labels.${key}`),
+            ])
+          ),
           "com.docker.compose.oneoff": "False",
           "com.docker.compose.project": project,
           "com.docker.compose.service": service,
@@ -929,7 +935,9 @@ export class FakeDocker {
         NanoCpus: container.nanoCpus,
         NetworkMode: container.networkMode,
         PortBindings: container.portBindings,
-        VolumesFrom: container.volumesFrom.length ? container.volumesFrom : null,
+        VolumesFrom: container.volumesFrom.length
+          ? container.volumesFrom
+          : null,
         RestartPolicy: { MaximumRetryCount: 0, Name: container.restartPolicy },
       },
       Id: container.id,
@@ -1828,15 +1836,15 @@ export class FakeDocker {
         Volumes: [...this.volumes.values()]
           .filter((volume) => (volume.driver ?? "local") === "local")
           .map((volume) => ({
-          Name: volume.name,
-          UsageData: {
-            RefCount: 0,
-            Size: [...volume.files.values()].reduce(
-              (total, content) => total + Buffer.byteLength(content),
-              0
-            ),
-          },
-        })),
+            Name: volume.name,
+            UsageData: {
+              RefCount: 0,
+              Size: [...volume.files.values()].reduce(
+                (total, content) => total + Buffer.byteLength(content),
+                0
+              ),
+            },
+          })),
       })
     }
     if (method === "GET" && (parameters = route(/^\/volumes\/([^/]+)$/u))) {
@@ -1894,10 +1902,7 @@ export class FakeDocker {
         : `${fromImage}:${tag}`
       return this.#pullFromApi(reference, headers["x-registry-auth"])
     }
-    if (
-      method === "POST" &&
-      (parameters = route(/^\/images\/(.+)\/tag$/u))
-    ) {
+    if (method === "POST" && (parameters = route(/^\/images\/(.+)\/tag$/u))) {
       const [source = ""] = parameters
       const key = this.#imageKey(source)
       if (key === undefined) {
@@ -2073,13 +2078,7 @@ export class FakeDocker {
     let stdout = ""
     let stderr = ""
     try {
-      stdout = this.#runProgram(
-        container,
-        exec.cmd,
-        exec.env,
-        "",
-        exec.user
-      )
+      stdout = this.#runProgram(container, exec.cmd, exec.env, "", exec.user)
       exec.exitCode = 0
     } catch (cause) {
       if (!(cause instanceof DockerFailure)) throw cause
@@ -2726,4 +2725,21 @@ function readBody(request: IncomingMessage): Promise<string> {
     request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
     request.on("error", reject)
   })
+}
+
+// A value as Compose reads it from a project: `$$` is a literal `$`. Kiln
+// sets no variables there, so Compose would reject any other `$`.
+function composeInterpolated(value: string, path: string): string {
+  let result = ""
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== "$") {
+      result += value[index]
+    } else if (value[index + 1] === "$") {
+      result += "$"
+      index += 1
+    } else {
+      throw new Error(`invalid interpolation format for ${path}`)
+    }
+  }
+  return result
 }

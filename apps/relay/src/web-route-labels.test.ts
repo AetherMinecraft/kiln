@@ -25,6 +25,10 @@ describe("Relay web route recovery labels", () => {
           name: "Live Map",
           path: "/map",
           stripPrefix: true,
+          httpsRedirect: true,
+          primary: false,
+          redirect: null,
+          www: "none" as const,
           targetPort: 8_080,
         },
         {
@@ -33,6 +37,10 @@ describe("Relay web route recovery labels", () => {
           name: "Admin Panel",
           path: "/admin",
           stripPrefix: false,
+          httpsRedirect: true,
+          primary: false,
+          redirect: null,
+          www: "none" as const,
           targetPort: 3_000,
         },
       ])
@@ -42,6 +50,65 @@ describe("Relay web route recovery labels", () => {
       "kiln.relay.web-routes.decafbad":
         "admin.donutsmp.com:3000/admin|name=Admin%20Panel,keep-prefix",
     })
+  })
+
+  it("recovers a route's www, HTTP, primary, and redirect options", () => {
+    const routes = [
+      {
+        hostname: "donutsmp.com",
+        httpsRedirect: false,
+        id: "b00d4423",
+        name: "",
+        path: null,
+        primary: true,
+        redirect: null,
+        stripPrefix: true,
+        targetPort: 8_080,
+        www: "redirect" as const,
+      },
+      {
+        hostname: "donut-smp.net",
+        httpsRedirect: true,
+        id: "decafbad",
+        name: "Old name",
+        path: "/shop",
+        primary: false,
+        redirect: {
+          permanent: false,
+          preservePath: false,
+          to: "https://donutsmp.com/store?ref=old,a|b",
+        },
+        stripPrefix: true,
+        targetPort: null,
+        www: "serve" as const,
+      },
+    ]
+    const plan = recoverFromLabels(webRouteRecoveryLabels(routes))
+
+    expect(plan.warnings).toEqual([])
+    expect(plan.recoveries[0]?.routes).toEqual(routes)
+  })
+
+  it("still reads a route without a port as invalid unless it redirects", () => {
+    const plan = recoverFromLabels({
+      "kiln.relay.web-routes.b00d4423": "donutsmp.com|name=Site",
+    })
+
+    expect(plan.recoveries).toEqual([])
+    expect(plan.warnings).toHaveLength(1)
+  })
+
+  it("skips a label whose route breaks a saved route's rules", () => {
+    const plan = recoverFromLabels({
+      "kiln.relay.web-routes.b00d4423":
+        "donutsmp.com:8080|name=Site,redirect=https%3A%2F%2Fnew.example.com",
+      "kiln.relay.web-routes.decafbad": "map.donutsmp.com:8100|name=Map",
+    })
+
+    expect(plan.recoveries[0]?.routes.map((route) => route.id)).toEqual([
+      "decafbad",
+    ])
+    expect(plan.warnings).toHaveLength(1)
   })
 
   it("recovers routes from labels and ignores the revision marker", () => {
@@ -62,6 +129,10 @@ describe("Relay web route recovery labels", () => {
         name: "Live Map",
         path: "/map",
         stripPrefix: true,
+        httpsRedirect: true,
+        primary: false,
+        redirect: null,
+        www: "none" as const,
         targetPort: 8_080,
       },
       {
@@ -70,6 +141,10 @@ describe("Relay web route recovery labels", () => {
         name: "Admin Panel",
         path: "/admin",
         stripPrefix: false,
+        httpsRedirect: true,
+        primary: false,
+        redirect: null,
+        www: "none" as const,
         targetPort: 3_000,
       },
     ])
@@ -84,6 +159,10 @@ describe("Relay web route recovery labels", () => {
         name: "New Route",
         path: null,
         stripPrefix: true,
+        httpsRedirect: true,
+        primary: false,
+        redirect: null,
+        www: "none" as const,
         targetPort: 8_080,
       },
     ]
@@ -131,6 +210,10 @@ describe("Relay web route recovery labels", () => {
         name: "valid.donutsmp.com",
         path: null,
         stripPrefix: true,
+        httpsRedirect: true,
+        primary: false,
+        redirect: null,
+        www: "none" as const,
         targetPort: 9_000,
       },
     ])
