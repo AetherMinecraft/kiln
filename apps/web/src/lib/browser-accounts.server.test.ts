@@ -1,7 +1,9 @@
 import { layer } from "@effect/vitest"
+import { requestHandler } from "@tanstack/react-start/server"
 import { Effect } from "effect"
 import { expect, vi } from "vite-plus/test"
 
+import type { BrowserAccount } from "@/lib/browser-accounts"
 import { TestDatabase, describeMysql, resetDatabase } from "@/test/database"
 import { insertRows, insertUser, selectRows } from "@/test/seed"
 
@@ -17,7 +19,9 @@ class Browser {
 
   headers(): Headers {
     return new Headers({
-      cookie: [...this.cookies].map(([name, value]) => `${name}=${value}`).join("; "),
+      cookie: [...this.cookies]
+        .map(([name, value]) => `${name}=${value}`)
+        .join("; "),
       origin,
     })
   }
@@ -28,7 +32,8 @@ class Browser {
   ) {
     const { auth } = await import("@/lib/auth")
     const headers = this.headers()
-    for (const [name, value] of new Headers(init.headers)) headers.set(name, value)
+    for (const [name, value] of new Headers(init.headers))
+      headers.set(name, value)
     if (init.body) headers.set("content-type", "application/json")
     const response = await auth.handler(
       new Request(`${origin}/api/auth${path}`, {
@@ -57,6 +62,22 @@ class Browser {
       method: "POST",
       body: { email, password },
     })
+  }
+
+  async listAccounts(): Promise<
+    Array<Omit<BrowserAccount, "minecraftProfileId">>
+  > {
+    const { listBrowserAccounts } =
+      await import("@/lib/browser-accounts.server")
+    const handler = requestHandler(async (request) =>
+      Response.json(await listBrowserAccounts(request.headers))
+    )
+    const response = await handler(
+      new Request(`${origin}/accounts`, { headers: this.headers() }),
+      {}
+    )
+    this.store(response.headers)
+    return response.json()
   }
 }
 
@@ -104,18 +125,95 @@ describeMysql("browser accounts", () => {
           )
           expect(activated.status).toBe(404)
 
-          const { listBrowserAccounts } =
-            yield* Effect.promise(() => import("@/lib/browser-accounts.server"))
+          const { listBrowserAccounts } = yield* Effect.promise(
+            () => import("@/lib/browser-accounts.server")
+          )
           const accounts = yield* Effect.promise(() =>
             listBrowserAccounts(browser.headers())
           )
           expect(
             accounts.map(({ active, userId }) => ({ active, userId }))
           ).toEqual([
-            { active: true, userId: "bob" },
             { active: false, userId: "alice" },
+            { active: true, userId: "bob" },
           ])
           expect(JSON.stringify(accounts)).not.toMatch(/token/i)
+        }),
+      { timeout: 30_000 }
+    )
+
+    it.effect(
+      "keeps account order across switches, renames, and session replacements",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* seedAccount("alice")
+          yield* seedAccount("bob")
+          yield* seedAccount("charlie")
+          const browser = new Browser()
+          yield* Effect.promise(() => browser.signIn("charlie@example.test"))
+          yield* Effect.promise(() => browser.signIn("alice@example.test"))
+          yield* Effect.promise(() => browser.signIn("bob@example.test"))
+
+          const { auth } = yield* Effect.promise(() => import("@/lib/auth"))
+          const accounts = yield* Effect.promise(() => browser.listAccounts())
+          const order = accounts.map(({ userId }) => userId)
+          expect(order).toEqual(["alice", "bob", "charlie"])
+
+          const renamed = yield* Effect.promise(() =>
+            browser.request("/update-user", {
+              method: "POST",
+              body: { name: "Aaron" },
+            })
+          )
+          expect(renamed.status).toBe(200)
+          const afterRename = yield* Effect.promise(() =>
+            browser.listAccounts()
+          )
+          expect(afterRename.map(({ userId }) => userId)).toEqual(order)
+          expect(afterRename.find(({ userId }) => userId === "bob")?.name).toBe(
+            "Aaron"
+          )
+
+          for (const account of accounts) {
+            // Exercise the same activation endpoint used by switchBrowserAccount
+            // and keep its cookies, as a browser does across the full reload.
+            const sessions = yield* Effect.promise(() =>
+              auth.api.listDeviceSessions({ headers: browser.headers() })
+            )
+            const target = sessions.find(
+              ({ session }) => session.id === account.sessionId
+            )!
+            const activated = yield* Effect.promise(() =>
+              auth.api.setActiveSession({
+                headers: browser.headers(),
+                body: { sessionToken: target.session.token },
+                returnHeaders: true,
+              })
+            )
+            browser.store(activated.headers)
+
+            const reloaded = yield* Effect.promise(() => browser.listAccounts())
+            expect(reloaded.map(({ userId }) => userId)).toEqual(order)
+            expect(reloaded.find(({ active }) => active)?.userId).toBe(
+              account.userId
+            )
+
+            const confirmed = yield* Effect.promise(() =>
+              browser.request("/password-confirmation/confirm", {
+                method: "POST",
+                body: { password },
+              })
+            )
+            expect(confirmed.status).toBe(200)
+            const refreshed = yield* Effect.promise(() =>
+              browser.listAccounts()
+            )
+            expect(refreshed.map(({ userId }) => userId)).toEqual(order)
+            const active = refreshed.find(({ active }) => active)
+            expect(active?.userId).toBe(account.userId)
+            expect(active?.sessionId).not.toBe(account.sessionId)
+          }
         }),
       { timeout: 30_000 }
     )
@@ -202,15 +300,13 @@ describeMysql("browser accounts", () => {
           browser.store(remembered.headers)
           yield* Effect.promise(() => browser.signIn("bob@example.test"))
 
-          const { listBrowserAccounts } =
-            yield* Effect.promise(() => import("@/lib/browser-accounts.server"))
+          const { listBrowserAccounts } = yield* Effect.promise(
+            () => import("@/lib/browser-accounts.server")
+          )
           const accounts = yield* Effect.promise(() =>
             listBrowserAccounts(browser.headers())
           )
-          expect(accounts.map(({ userId }) => userId).sort()).toEqual([
-            "alice",
-            "bob",
-          ])
+          expect(accounts.map(({ userId }) => userId)).toEqual(["alice", "bob"])
         }),
       { timeout: 30_000 }
     )
