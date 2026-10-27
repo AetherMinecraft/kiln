@@ -952,6 +952,36 @@ relay_feature() {
   return 1
 }
 
+# Downloads the release and starts the Relay here afresh from it. A Relay
+# it can't replace, as when the release is older or can't be downloaded,
+# stays as it is.
+refresh_relay() {
+  step_progress=pull_progress
+  step_soft=1
+  step "Downloading Kiln" pull_relay || return 0
+  if ! relay_feature replace; then
+    log "this Relay release can't replace a Relay; leaving it as it is"
+    return 0
+  fi
+  step_soft=1
+  step "Restarting the Relay" replace_relay && return 0
+  reason=$(tail -n +"$((step_log_start + 1))" "$log_file" | sed -n 's/^kiln: //p' | tail -n 1)
+  [ -n "$reason" ] || reason="The Relay couldn't be restarted, so it stays as it was."
+  say ""
+  say "  $reason"
+  say "  ${dim}Install log: $log_file$reset"
+  say ""
+}
+
+# Replaces the Relay here with one from the downloaded image, keeping its
+# settings and data: the image does it as Kiln updates a Relay, and puts
+# the old one back if the new one doesn't become healthy. Ctrl-C stops
+# waiting for it, not the replacement.
+replace_relay() {
+  dk run --rm --sig-proxy=false --network none --volumes-from "$container" \
+    "$image" dist/src/replace-relay.mjs "$container" "$image"
+}
+
 # Which proxy gives Kiln HTTPS: Coolify's on a Coolify server, otherwise
 # Traefik on ports 80 and 443 when they're free.
 choose_proxy() {
@@ -1324,28 +1354,31 @@ if docker_reachable; then
   fi
 fi
 
-# Already here: say so, and show where it's at.
+# Already here: the Relay starts afresh from the downloaded image, keeping
+# its settings and data, so running this again updates and restarts it.
+# Then it joins Kiln, or this says where it's at.
 if docker_reachable && dk container inspect "$container" >/dev/null 2>&1; then
+  say "  A Relay is already installed here. It restarts with this"
+  say "  release, keeping its settings and data."
+  say ""
+  refresh_relay
   if [ -n "$join" ]; then
     [ "$(dk inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" = "true" ] ||
       fail "A Relay is installed here but stopped. Start it with \`docker start $container\`, then run this again."
     dk exec "$container" kiln-relay pair join --check >/dev/null 2>&1 ||
       fail "This Relay is older than joining needs. Update it, or pair it by hand: run \`docker exec $container kiln-relay pair create\` and paste the link into Hearth's Pairing link tab."
-    say "  A Relay is already running here; joining it to that Kiln."
-    say ""
     join_output=$(mktemp)
     dk exec "$container" kiln-relay pair join "$join" >"$join_output" 2>&1 &
     join_hearth
     exit 0
   fi
   if [ "$mode" = "node" ]; then
-    say "  A Relay is already running here. A new invitation to pair it"
-    say "  (it expires in 15 minutes):"
+    say ""
+    say "  A new invitation to pair it (it expires in 15 minutes):"
     say ""
     dk exec "$container" kiln-relay pair create 2>>"$log_file"
     exit 0
   fi
-  say "  Kiln is already installed here."
   say ""
   dk exec "$container" kiln-relay platform status 2>>"$log_file" | sed 's/^/  /'
   setup=$(dk exec "$container" kiln-relay platform setup-url 2>>"$log_file" || true)

@@ -9,6 +9,7 @@ import {
   managedImageChannel,
   replaceContainerEffect,
 } from "./update-container.js"
+import { retryContainerReplacementEffect } from "./updater-effects.js"
 
 const channelReference = "ghcr.io/kiln-site/hearth:latest-nightly"
 const targetDigest = `ghcr.io/kiln-site/hearth@sha256:${"c".repeat(64)}`
@@ -141,6 +142,33 @@ describe("container replacement", () => {
   )
 
   effectIt.effect(
+    "replaces a Relay on Docker's default bridge, which takes no aliases",
+    () =>
+      Effect.gen(function* () {
+        const docker = yield* Effect.promise(async () => {
+          // Started by the installer without a proxy: no network of its own.
+          const current = fakeDocker.addContainer({
+            image: channelReference,
+            name: "hearth",
+            running: true,
+          })
+          current.networks.set("bridge", { aliases: [], ipAddress: "" })
+          fakeDocker.images.set(targetDigest, targetLabels)
+          fakeDocker.imageConfigs.set(targetDigest, {
+            Healthcheck: { Test: ["CMD", "new-healthcheck"] },
+          })
+          return new DockerEngine(await fakeDocker.listen())
+        })
+
+        yield* replaceContainerEffect(replacement, docker, ignorePhase)
+
+        expect(hearth()?.labels).toMatchObject(targetLabels)
+        expect(hearth()?.state.running).toBe(true)
+        expect(fakeDocker.container("hearth-backup")).toBeUndefined()
+      })
+  )
+
+  effectIt.effect(
     "labels a container from before installation IDs with this installation",
     () =>
       Effect.gen(function* () {
@@ -224,6 +252,32 @@ describe("container replacement", () => {
         expect(hearth()?.state.running).toBe(true)
         expect(fakeDocker.container("hearth-backup")).toBeUndefined()
         expect(channelTarget()).toBe(oldImage)
+      })
+  )
+
+  // Retried after a backoff on the real clock.
+  effectIt.live(
+    "retries a failed start with the target image, wherever rollback put its tag",
+    () =>
+      Effect.gen(function* () {
+        const { docker } = yield* runningHearth()
+        fakeDocker.failNext(
+          { command: "start", target: "hearth" },
+          "driver failed programming external connectivity"
+        )
+
+        // By ID, as the installer gives it: the tag is the channel's.
+        yield* retryContainerReplacementEffect(
+          replaceContainerEffect(
+            { ...replacement, targetImage: `sha256:${targetDigest}` },
+            docker,
+            ignorePhase
+          )
+        )
+
+        expect(hearth()?.labels).toMatchObject(targetLabels)
+        expect(hearth()?.state.running).toBe(true)
+        expect(channelTarget()).toBe(`sha256:${targetDigest}`)
       })
   )
 
