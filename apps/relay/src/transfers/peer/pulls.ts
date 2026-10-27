@@ -328,12 +328,15 @@ export class TransferPulls {
           })
         ).pipe(
           Effect.map(() => true),
+          // Whatever this address did, another may serve the pull: it can
+          // reach something other than the source, such as another Relay
+          // or a router's page. Once every address had its turn, the pull
+          // is tried again if any of them may answer later.
           Effect.catchIf(
-            (error): error is PeerFetchError =>
-              error instanceof PeerFetchError && error.retryable,
+            (error): error is PeerFetchError => error instanceof PeerFetchError,
             (error) =>
               Effect.sync(() => {
-                lastError = error
+                if (!lastError?.retryable || error.retryable) lastError = error
                 return false
               })
           )

@@ -77,7 +77,15 @@ Hearth (`apps/relay/src/transfers/peer/`, `apps/web/src/server/relay-transfers.s
 3. Hearth sends the grant to the destination with `transfer.pull.start`,
    with the addresses it may reach the source at: the listener Hearth
    itself reaches, trusted through the CA Hearth pinned for it, the address
-   the Relay advertised, and its public browser origin.
+   the Relay advertised, its public browser origin, and last Hearth itself
+   (`/api/relays/<source>/peer`), which passes the pull through to the
+   source unchanged, through a tunnel when the source dials Hearth. Every
+   Relay reaches Hearth, so a copy works even when the destination can't
+   reach the source, such as one behind a home router; its bytes then cross
+   Hearth, which passes only pulls carrying the grant it signed and keeps
+   to its limits on what it carries (relay-operations.md, "Transfers
+   through Hearth"). The destination tries each address in turn whatever
+   one answers, since an address can reach something other than the source.
 4. The destination fetches the artifact into `<data>/transfers/incoming/`
    with Range requests, each signed with its identity key. A dropped
    connection, a busy source, or a restart resumes from what it already

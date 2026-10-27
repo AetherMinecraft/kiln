@@ -15,7 +15,12 @@ vi.mock("@/lib/relay-tunnel.server", () => ({
   relayReachedThroughTunnel: () => false,
 }))
 
-import { passRelayBrowserRequest } from "@/lib/relay-browser-passthrough.server"
+import { relayPeerTransferPath } from "@workspace/contracts"
+
+import {
+  passRelayBrowserRequest,
+  passRelayPeerRequest,
+} from "@/lib/relay-browser-passthrough.server"
 import { relayPassthroughUsage } from "@/lib/relay-passthrough-limits.server"
 import { loadPersistedRelay, loadRelayCredentials } from "@/lib/relay-registry"
 
@@ -711,4 +716,48 @@ it("takes no body a Relay sends with an answer that has none", async () => {
   expect(response.status).toBe(205)
   await vi.waitFor(() => expect(finished).toBe(false))
   expect(relayPassthroughUsage(bodyless).bytesFromRelay).toBe(0)
+})
+
+it("passes a pull another Relay makes through Hearth on to the source", async () => {
+  const paths: Array<string | undefined> = []
+  await relayListener((request, response) => {
+    paths.push(request.url)
+    response.end()
+  })
+  // A Relay puts its usual route beneath the pass-through's path, which
+  // arrives as the route here.
+  const route = relayPeerTransferPath("transfer-1").slice(1)
+  const grant = (transferId: string) => ({
+    authorization: `KilnPeer ${signed({ transferId })}`,
+  })
+  const pulled = await passRelayPeerRequest(
+    relayId,
+    route,
+    new Request("https://kiln.example/api?traceparent=t", {
+      headers: grant("transfer-1"),
+    })
+  )
+  expect(pulled.status).toBe(200)
+  expect(paths).toEqual(["/v1/peer/transfers/transfer-1?traceparent=t"])
+
+  // Only with the grant Hearth signed for that copy.
+  for (const headers of [{}, grant("transfer-2")]) {
+    const refused = await passRelayPeerRequest(
+      relayId,
+      route,
+      new Request("https://kiln.example/api", { headers })
+    )
+    expect(refused.status).toBe(401)
+  }
+  const written = await passRelayPeerRequest(
+    relayId,
+    route,
+    new Request("https://kiln.example/api", {
+      body: "x",
+      headers: grant("transfer-1"),
+      method: "POST",
+    })
+  )
+  expect(written.status).toBe(404)
+  expect(paths).toHaveLength(1)
 })
