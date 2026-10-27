@@ -15,8 +15,12 @@ import {
   isKilnNightlyVersion,
   RELAY_JOIN_ID_LABEL,
   RELAY_JOIN_INVITATION_LABEL,
+  RELAY_JOIN_HOLD_MAX_MS,
   RELAY_JOIN_LIFETIME_MS,
   relayControlDialV1Feature,
+  relayJoinHeldHeader,
+  relayJoinHoldHeader,
+  relayJoinSavedHeader,
   relayJoinPairingV1Feature,
   type RelayJoinEnvelope,
   RelayJoinAnnouncementSchema,
@@ -30,7 +34,18 @@ import {
   type RelayPairingRequestContract,
   type RelayPairingResponseContract,
 } from "@workspace/contracts"
-import { Clock, Effect, Option, Result, Schema } from "effect"
+import {
+  Clock,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  Result,
+  Schedule,
+  Schema,
+} from "effect"
+import type { Tracer } from "effect"
 import type { RowDataPacket } from "mysql2/promise"
 import { z } from "zod"
 
@@ -90,10 +105,60 @@ const LEASE_RENEW_MS = 30_000
 // A finished join keeps its secret this long, to tell its Relay how it went.
 const TERMINAL_RETENTION_MS = 24 * 60 * 60_000
 const ANNOUNCEMENT_BYTES = 16 * 1024
-const CONNECT_ATTEMPTS = 12
-const CONNECT_DELAY_MS = 5_000
-// How often the worker looks for a Relay's pairing reply.
+// How the worker keeps trying to reach a Relay it just saved: soon at
+// first, since a try can fail as the Relay's own connection takes its place,
+// then at most every 2 s, for a minute. A Relay that dials Hearth usually
+// arrives during a try; one older than waking its dialer arrives within its
+// next pass, up to 17 s later.
+const connectSchedule = Schedule.min([
+  Schedule.exponential("250 millis"),
+  Schedule.spaced("2 seconds"),
+]).pipe(Schedule.upTo({ duration: "1 minute" }))
+// How often the worker, and an announcement Hearth holds, look at a join
+// again when nothing in this process said it changed: the change may come
+// from another Hearth process.
 const REPLY_POLL_MS = 1_000
+const HOLD_RECHECK_MS = 500
+
+// Wakes whatever in this process waits on a join once a change to it is
+// committed: the worker waiting for the Relay's reply, and announcements
+// Hearth holds. Only a shortcut: they also look again on their own, since
+// the change can come from another process.
+const joinListeners = new Map<string, Set<() => void>>()
+
+function joinChanged(joinId: string): void {
+  for (const listener of joinListeners.get(joinId) ?? []) listener()
+}
+
+// Watches for a change to the join in this process for as long as the scope
+// lasts. Taken before the caller looks at the join, so a change that lands
+// while it looks still counts: the wait it gives ends at once then, and
+// otherwise at the next change or after `ms`.
+const watchJoin = (joinId: string) =>
+  Effect.acquireRelease(
+    Effect.sync(() => {
+      const changed = Deferred.makeUnsafe<void>()
+      const listener = () => {
+        Deferred.doneUnsafe(changed, Exit.void)
+      }
+      const listeners = joinListeners.get(joinId) ?? new Set<() => void>()
+      joinListeners.set(joinId, listeners)
+      listeners.add(listener)
+      return { changed, listener }
+    }),
+    ({ listener }) =>
+      Effect.sync(() => {
+        const listeners = joinListeners.get(joinId)
+        listeners?.delete(listener)
+        if (listeners?.size === 0) joinListeners.delete(joinId)
+      })
+  ).pipe(
+    Effect.map(
+      ({ changed }) =>
+        (ms: number) =>
+          Effect.raceFirst(Deferred.await(changed), Effect.sleep(ms))
+    )
+  )
 
 export type RelayJoinState =
   | "waiting"
@@ -462,6 +527,7 @@ export const refreshRelayJoinEffect = Effect.fn("relayJoin.refresh")(function* (
               AND (progress IS NULL OR progress = 'pairing')))`,
     [now, joinId, userId]
   )
+  joinChanged(joinId)
   if (revoked.affectedRows === 0) {
     const row = yield* loadJoin(joinId, userId)
     if (row?.state === "confirming" || row?.state === "needs_review") {
@@ -509,10 +575,77 @@ export const answerRelayJoinAnnouncement = Effect.fn("relayJoin.answer")(
         { status: 400 }
       )
     }
+    const { joinId } = announcement.value
     const answer = yield* acceptAnnouncement(announcement.value)
-    return Response.json(answer.body, { status: answer.status })
+    joinChanged(joinId)
+    const holdMs = Math.min(
+      Number(request.headers.get(relayJoinHoldHeader)) || 0,
+      RELAY_JOIN_HOLD_MAX_MS
+    )
+    const saved = (current: typeof answer): Record<string, string> =>
+      "saved" in current && current.saved ? { [relayJoinSavedHeader]: "1" } : {}
+    // Not news the Relay hasn't heard: that Hearth saved it, as when that
+    // happened between two announcements.
+    const heardSaved = request.headers.get(relayJoinSavedHeader) === "1"
+    if (
+      answer.key === null ||
+      holdMs <= 0 ||
+      ("saved" in answer && answer.saved && !heardSaved)
+    ) {
+      return Response.json(answer.body, {
+        headers: saved(answer),
+        status: answer.status,
+      })
+    }
+    // Held until there's something new to tell the Relay, so it hears the
+    // moment someone confirms it, and hears its reply was taken only once
+    // Hearth saved it: it dials Hearth then, and Hearth knows it.
+    const start = yield* Clock.currentTimeMillis
+    let changed = false
+    while (!changed && !request.signal.aborted) {
+      const left = start + holdMs - (yield* Clock.currentTimeMillis)
+      if (left <= 0) break
+      changed = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const untilChange = yield* watchJoin(joinId)
+          // Not a span each look: the hold's own span says how long it took.
+          const row = yield* Effect.withTracerEnabled(loadJoin(joinId), false)
+          if (!row || joinKey(row) !== answer.key) return true
+          yield* untilChange(Math.min(left, HOLD_RECHECK_MS))
+          return false
+        })
+      )
+    }
+    yield* Effect.annotateCurrentSpan({
+      "relay_join.held_ms": (yield* Clock.currentTimeMillis) - start,
+      "relay_join.changed": changed,
+    })
+    const final = changed
+      ? yield* acceptAnnouncement(announcement.value)
+      : answer
+    return Response.json(final.body, {
+      headers: { [relayJoinHeldHeader]: "1", ...saved(final) },
+      status: final.status,
+    })
   }
 )
+
+// What the join's Relay acts on: whether the answer carries Hearth's
+// pairing request, whether Hearth saved the Relay, and how the join ended.
+// Someone confirming it is news once the worker asks it to pair.
+function joinKey(row: RelayJoinRow): string {
+  const pending =
+    row.state === "announced" ||
+    row.state === "confirming" ||
+    row.state === "needs_review"
+  return [
+    pending ? "pending" : row.state,
+    row.state === "confirming" && row.pairing_request && !row.pairing_response
+      ? "asking"
+      : "",
+    row.progress !== null && row.progress !== "pairing" ? "saved" : "",
+  ].join("|")
+}
 
 const acceptAnnouncement = Effect.fn("relayJoin.announce")(function* (
   announcement: typeof RelayJoinAnnouncementSchema.Type
@@ -527,7 +660,7 @@ const acceptAnnouncement = Effect.fn("relayJoin.announce")(function* (
       )
       const row = rows[0]
       if (!row?.secret_ciphertext) {
-        return { body: { error: "Unknown join" }, status: 404 }
+        return { body: { error: "Unknown join" }, key: null, status: 404 }
       }
       const secret = decryptPrivateKey(row.secret_ciphertext).plaintext
       const expected = createHmac("sha256", secret)
@@ -538,7 +671,11 @@ const acceptAnnouncement = Effect.fn("relayJoin.announce")(function* (
         expected.length !== actual.length ||
         !timingSafeEqual(expected, actual)
       ) {
-        return { body: { error: "Not this join's Relay" }, status: 403 }
+        return {
+          body: { error: "Not this join's Relay" },
+          key: null,
+          status: 403,
+        }
       }
       // A pending answer tells the Relay which of Hearth's clients may pair
       // with it, and until when.
@@ -578,6 +715,12 @@ const acceptAnnouncement = Effect.fn("relayJoin.announce")(function* (
               )
               .digest("base64url"),
           },
+          // Only a pending answer can be held for a newer one, and not one
+          // carrying Hearth's pairing request, which the Relay acts on.
+          key: status === "pending" && !pairingRequest ? joinKey(row) : null,
+          saved:
+            row.state === "paired" ||
+            (row.progress !== null && row.progress !== "pairing"),
           status: 200,
         }
       }
@@ -632,7 +775,9 @@ const acceptAnnouncement = Effect.fn("relayJoin.announce")(function* (
             return answer("expired")
           }
           const problem = envelopeProblem(announcement.envelope, row.id)
-          if (problem) return { body: { error: problem }, status: 422 }
+          if (problem) {
+            return { body: { error: problem }, key: null, status: 422 }
+          }
           yield* transaction.execute(
             `UPDATE ${databaseTable("relay_join")}
                 SET state = 'announced', envelope = ?, envelope_digest = ?,
@@ -647,7 +792,10 @@ const acceptAnnouncement = Effect.fn("relayJoin.announce")(function* (
               row.id,
             ]
           )
-          return answer("pending")
+          // At once, however long the Relay would wait: this answer makes
+          // its invitation, and the installer prints the link to confirm
+          // it then.
+          return { ...answer("pending"), key: null }
         }
       }
     })
@@ -875,7 +1023,8 @@ export const confirmRelayJoinEffect = Effect.fn("relayJoin.confirm")(
           return Number(row.claim_generation) + 1
         })
     )
-    if (claimed !== null) forkJoinWorker(input.joinId, claimed)
+    joinChanged(input.joinId)
+    if (claimed !== null) yield* forkJoinWorker(input.joinId, claimed)
     const row = yield* loadJoin(input.joinId, input.userId)
     if (!row) return yield* Effect.fail(new RelayJoinFailure("Join not found"))
     return yield* joinView(row)
@@ -905,19 +1054,36 @@ const resumeIfAbandoned = Effect.fnUntraced(function* (
     [now + LEASE_MS, now, row.id, row.claim_generation]
   )
   if (taken.affectedRows === 1) {
-    forkJoinWorker(row.id, Number(row.claim_generation) + 1)
+    yield* forkJoinWorker(row.id, Number(row.claim_generation) + 1)
   }
 })
 
-function forkJoinWorker(joinId: string, generation: number): void {
+// Its trace starts on its own, linked to the request that started it, such
+// as the confirmation: a worker outlives that request.
+const forkJoinWorker = Effect.fnUntraced(function* (
+  joinId: string,
+  generation: number
+) {
+  const startedBy = yield* Effect.option(Effect.currentSpan)
+  const links: Array<Tracer.SpanLink> = Option.isSome(startedBy)
+    ? [{ attributes: {}, span: startedBy.value }]
+    : []
   forkAppWorker(
     driveJoin(joinId, generation).pipe(
+      Effect.withSpan("relayJoin.drive", {
+        attributes: {
+          "relay_join.generation": generation,
+          "relay_join.id": joinId,
+        },
+        links,
+        root: true,
+      }),
       Effect.catchCause((cause) =>
         Effect.logWarning(`Adding the Relay for join ${joinId} stopped`, cause)
       )
     )
   )
-}
+})
 
 // ---------------------------------------------------------- the worker
 
@@ -945,51 +1111,62 @@ const claimWrite = Effect.fnUntraced(function* (
   if (result.affectedRows === 0) return yield* Effect.fail(new StaleClaim())
 })
 
-const driveJoin = Effect.fn("relayJoin.drive")(function* (
+const driveJoin = Effect.fnUntraced(function* (
   joinId: string,
   generation: number
 ) {
   let renewedAt = 0
   while (true) {
-    const row = yield* loadJoin(joinId)
-    if (
-      !row ||
-      row.state !== "confirming" ||
-      Number(row.claim_generation) !== generation
-    ) {
-      return
-    }
-    const now = yield* Clock.currentTimeMillis
-    if (now - renewedAt > LEASE_RENEW_MS) {
-      yield* claimWrite(joinId, generation, "error = error", [])
-      renewedAt = now
-    }
-    const step = joinStep(row, generation).pipe(
-      Effect.map(() => "next" as const),
-      Effect.catch((cause) =>
-        cause instanceof StaleClaim
-          ? Effect.succeed("stop" as const)
-          : // The dialog shows why and offers to try again, which takes
-            // over this claim.
-            claimWrite(
-              joinId,
-              generation,
-              "error = ?",
-              [errorMessage(cause)],
-              "release"
-            ).pipe(
-              Effect.as("stop" as const),
-              Effect.catch(() => Effect.succeed("stop" as const))
-            )
-      )
+    const next = yield* Effect.scoped(
+      Effect.gen(function* () {
+        // Before looking at the join, so a reply that lands meanwhile ends
+        // the wait for it.
+        const untilChange = yield* watchJoin(joinId)
+        const row = yield* loadJoin(joinId)
+        if (
+          !row ||
+          row.state !== "confirming" ||
+          Number(row.claim_generation) !== generation
+        ) {
+          return "stop" as const
+        }
+        const now = yield* Clock.currentTimeMillis
+        if (now - renewedAt > LEASE_RENEW_MS) {
+          yield* claimWrite(joinId, generation, "error = error", [])
+          renewedAt = now
+        }
+        return yield* joinStep(row, generation, untilChange).pipe(
+          Effect.as("next" as const),
+          Effect.catch((cause) =>
+            cause instanceof StaleClaim
+              ? Effect.succeed("stop" as const)
+              : // The dialog shows why and offers to try again, which takes
+                // over this claim.
+                claimWrite(
+                  joinId,
+                  generation,
+                  "error = ?",
+                  [errorMessage(cause)],
+                  "release"
+                ).pipe(
+                  Effect.as("stop" as const),
+                  Effect.catch(() => Effect.succeed("stop" as const))
+                )
+          )
+        )
+      })
     )
-    if ((yield* step) === "stop") return
+    // Outside the watch, so the worker doesn't wake itself.
+    joinChanged(joinId)
+    if (next === "stop") return
   }
 })
 
 const joinStep = Effect.fnUntraced(function* (
   row: RelayJoinRow,
-  generation: number
+  generation: number,
+  // Until the join changes, or the given time passes.
+  untilChange: (ms: number) => Effect.Effect<void>
 ) {
   const intent = json(row.intent)
   const envelope = json(row.envelope)
@@ -999,7 +1176,13 @@ const joinStep = Effect.fnUntraced(function* (
   switch (row.progress) {
     case null:
     case "pairing":
-      return yield* pairJoinedRelay(row, envelope, intent, generation)
+      return yield* pairJoinedRelay(
+        row,
+        envelope,
+        intent,
+        generation,
+        untilChange
+      )
     case "saved":
       return yield* connectJoinedRelay(row, envelope, intent, generation)
     case "connected":
@@ -1013,11 +1196,12 @@ const joinStep = Effect.fnUntraced(function* (
 // all, in the transaction that records the join's progress. A lost answer
 // is asked again with the same key, which the Relay answers for the client
 // it already paired.
-const pairJoinedRelay = Effect.fnUntraced(function* (
+const pairJoinedRelay = Effect.fn("relayJoin.pair")(function* (
   row: RelayJoinRow,
   envelope: RelayJoinEnvelope,
   intent: RelayJoinIntent,
-  generation: number
+  generation: number,
+  untilChange: (ms: number) => Effect.Effect<void>
 ) {
   const now = yield* Clock.currentTimeMillis
   if (row.progress === null) {
@@ -1055,7 +1239,7 @@ const pairJoinedRelay = Effect.fnUntraced(function* (
         )
       )
     }
-    yield* Effect.sleep(REPLY_POLL_MS)
+    yield* untilChange(REPLY_POLL_MS)
     return
   }
   const response = throughAnnouncements
@@ -1200,12 +1384,17 @@ function pairsThroughAnnouncements(row: RelayJoinRow): boolean {
 
 // Reaches the Relay over its session and reads its installation ID, which
 // may have changed since it announced itself.
-const connectJoinedRelay = Effect.fnUntraced(function* (
+const connectJoinedRelay = Effect.fn("relayJoin.connect")(function* (
   row: RelayJoinRow,
   envelope: RelayJoinEnvelope,
   intent: RelayJoinIntent,
   generation: number
 ) {
+  yield* Effect.annotateCurrentSpan("relay.id", envelope.relayFingerprint)
+  // Whether Hearth can reach the Relay itself, asked while it connects.
+  const reach = pairsThroughAnnouncements(row)
+    ? yield* Effect.forkChild(joinReach(row.id, envelope))
+    : null
   const observed = yield* readInstallation(envelope.relayFingerprint)
   // The client this one replaces can't do anything without its key, which
   // Hearth no longer has; revoke it anyway.
@@ -1216,6 +1405,7 @@ const connectJoinedRelay = Effect.fnUntraced(function* (
     yield* relayCall(envelope.relayFingerprint, "relay.clients.revoke", {
       clientId: intent.previousClientId,
     }).pipe(
+      Effect.withSpan("relayJoin.revokePreviousClient"),
       Effect.catchCause((cause) =>
         Effect.logWarning(
           "Couldn't revoke the Relay's previous Hearth client",
@@ -1229,10 +1419,7 @@ const connectJoinedRelay = Effect.fnUntraced(function* (
   ).pipe(Effect.ignore)
   // Browsers can't reach a Relay Hearth can't, so its consoles and
   // transfers go through Hearth.
-  if (
-    pairsThroughAnnouncements(row) &&
-    (yield* promiseEffect(() => relayReach(envelope))) !== null
-  ) {
+  if (reach && (yield* Fiber.join(reach)) !== null) {
     yield* useHearthForBrowsers(envelope.relayFingerprint).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning(
@@ -1251,24 +1438,28 @@ const connectJoinedRelay = Effect.fnUntraced(function* (
 })
 
 // Puts the Relay in `hearth` proxy mode, keeping its other proxy settings.
-const useHearthForBrowsers = Effect.fnUntraced(function* (relayId: string) {
-  const current = relayProxyReadSchema.parse(
-    yield* relayCall(relayId, "relay.proxy.read", { includeDiagnostics: true })
-  )
-  if (current.settings.mode === "hearth") return
-  yield* relayCall(
-    relayId,
-    "relay.proxy.write",
-    relayProxySettingsSchema.parse({ ...current.settings, mode: "hearth" }),
-    240_000
-  )
-})
+const useHearthForBrowsers = Effect.fn("relayJoin.useHearthForBrowsers")(
+  function* (relayId: string) {
+    const current = relayProxyReadSchema.parse(
+      yield* relayCall(relayId, "relay.proxy.read", {
+        includeDiagnostics: true,
+      })
+    )
+    if (current.settings.mode === "hearth") return
+    yield* relayCall(
+      relayId,
+      "relay.proxy.write",
+      relayProxySettingsSchema.parse({ ...current.settings, mode: "hearth" }),
+      240_000
+    )
+  }
+)
 
 const relayProxyReadSchema = z.object({
   settings: z.object({ mode: z.string() }).passthrough(),
 })
 
-const applyInstallation = Effect.fnUntraced(function* (
+const applyInstallation = Effect.fn("relayJoin.applyInstallation")(function* (
   row: RelayJoinRow,
   envelope: RelayJoinEnvelope,
   intent: RelayJoinIntent,
@@ -1295,33 +1486,35 @@ const applyInstallation = Effect.fnUntraced(function* (
 
 // After the replacement was sent: asks the Relay how it went, by the
 // operation ID kept for it, and never sends that ID twice.
-const recoverInstallation = Effect.fnUntraced(function* (
-  row: RelayJoinRow,
-  envelope: RelayJoinEnvelope,
-  intent: RelayJoinIntent,
-  generation: number
-) {
-  const lookup = Schema.decodeUnknownSync(RelayOperationLookupSchema)(
-    yield* relayCall(envelope.relayFingerprint, "operation.get", {
-      operationId: intent.installationOperationId,
-    })
-  )
-  switch (lookup.status) {
-    case "succeeded":
-      return yield* finishJoin(row.id, generation, "paired", true)
-    case "running":
-      yield* Effect.sleep("2 seconds")
-      return
-    case "failed":
-    case "interrupted":
-    case "unknown": {
-      const current = yield* readInstallation(envelope.relayFingerprint)
-      return current.id === intent.targetInstallationId
-        ? yield* finishJoin(row.id, generation, "paired", true)
-        : yield* needsReview(row.id, generation, current)
+const recoverInstallation = Effect.fn("relayJoin.recoverInstallation")(
+  function* (
+    row: RelayJoinRow,
+    envelope: RelayJoinEnvelope,
+    intent: RelayJoinIntent,
+    generation: number
+  ) {
+    const lookup = Schema.decodeUnknownSync(RelayOperationLookupSchema)(
+      yield* relayCall(envelope.relayFingerprint, "operation.get", {
+        operationId: intent.installationOperationId,
+      })
+    )
+    switch (lookup.status) {
+      case "succeeded":
+        return yield* finishJoin(row.id, generation, "paired", true)
+      case "running":
+        yield* Effect.sleep("2 seconds")
+        return
+      case "failed":
+      case "interrupted":
+      case "unknown": {
+        const current = yield* readInstallation(envelope.relayFingerprint)
+        return current.id === intent.targetInstallationId
+          ? yield* finishJoin(row.id, generation, "paired", true)
+          : yield* needsReview(row.id, generation, current)
+      }
     }
   }
-})
+)
 
 const replaceInstallation = Effect.fnUntraced(function* (
   envelope: RelayJoinEnvelope,
@@ -1350,23 +1543,26 @@ const replaceInstallation = Effect.fnUntraced(function* (
   )
 })
 
-const readInstallation = Effect.fnUntraced(function* (relayId: string) {
-  let attempt = 0
-  while (true) {
-    attempt += 1
-    const read = yield* relayCall(relayId, "relay.installation.read", {}).pipe(
-      Effect.map((value) => relayInstallationSchema.parse(value)),
-      Effect.result
+const readInstallation = Effect.fn("relayJoin.readInstallation")(function* (
+  relayId: string
+) {
+  let attempts = 0
+  const read = yield* Effect.suspend(() => {
+    attempts += 1
+    return relayCall(relayId, "relay.installation.read", {})
+  }).pipe(
+    Effect.map((value) => relayInstallationSchema.parse(value)),
+    Effect.retry(connectSchedule),
+    Effect.ensuring(
+      Effect.suspend(() =>
+        Effect.annotateCurrentSpan("relay_join.attempts", attempts)
+      )
     )
-    if (Result.isSuccess(read)) {
-      return {
-        fixed: read.success.fixed,
-        id: read.success.installationId,
-      } satisfies ObservedInstallation
-    }
-    if (attempt >= CONNECT_ATTEMPTS) return yield* Effect.fail(read.failure)
-    yield* Effect.sleep(CONNECT_DELAY_MS)
-  }
+  )
+  return {
+    fixed: read.fixed,
+    id: read.installationId,
+  } satisfies ObservedInstallation
 })
 
 const relayCall = Effect.fnUntraced(function* (
@@ -1499,6 +1695,37 @@ async function relayReachProblem(
   }
   return check.problem ?? null
 }
+
+// Whether Hearth can reach a join's Relay itself, for adding it: null when
+// it can. The dialog's answer when this process has a recent one, as it
+// does once someone confirmed the Relay here, or a check of its own.
+const joinReach = Effect.fn("relayJoin.reach")(function* (
+  joinId: string,
+  envelope: RelayJoinEnvelope
+) {
+  const check = reachChecks.get(joinId)
+  const age = (yield* Clock.currentTimeMillis) - (check?.checkedAt ?? 0)
+  // That Hearth can't reach it holds for a while, and acting on it when it
+  // no longer does only sends browsers through Hearth needlessly. That it
+  // can holds only while fresh: acting on it when it no longer does leaves
+  // browsers no way in. A check under way is quick when it can.
+  const cached =
+    check?.problem !== undefined &&
+    age <= (check.problem === null ? REACH_RECHECK_MS : REACH_FORGET_MS)
+  const problem =
+    cached && check.problem !== undefined
+      ? check.problem
+      : yield* promiseEffect(() =>
+          check?.checking
+            ? check.checking.then(() => check.problem ?? null)
+            : relayReach(envelope)
+        )
+  yield* Effect.annotateCurrentSpan({
+    "relay_join.reach_cached": cached,
+    "relay_join.reachable": problem === null,
+  })
+  return problem
+})
 
 function relayReach(envelope: RelayJoinEnvelope): Promise<string | null> {
   const origin = relayPairingOrigin({

@@ -103,6 +103,23 @@ export type RelayJoinEnvelope = typeof RelayJoinEnvelopeSchema.Type
 // reach the Relay at all, as for one behind a home router.
 export const relayJoinPairingV1Feature = "join-pairing-v1"
 
+// A Relay that already has its invitation asks Hearth, with this request
+// header (milliseconds), to hold its announcement until there's something
+// new to answer: someone confirmed it, Hearth saved it, or the join ended.
+// Hearth caps the wait, and says it held the announcement with
+// `relayJoinHeldHeader`, so the Relay asks again at once rather than after
+// its usual pause. Hearths that predate it answer at once, as before.
+export const relayJoinHoldHeader = "kiln-join-hold"
+export const relayJoinHeldHeader = "kiln-join-held"
+// On an answer once Hearth saved the Relay: the Relay dials Hearth then, and
+// Hearth knows it. A hold that ran out first answers without it. The Relay
+// sends it back once it knows, and until then Hearth answers it at once
+// rather than hold news the Relay hasn't heard.
+export const relayJoinSavedHeader = "kiln-join-saved"
+// The longest Hearth holds an announcement, well inside any proxy's deadline
+// between them. The Relay waits that much longer than usual for an answer.
+export const RELAY_JOIN_HOLD_MAX_MS = 10_000
+
 const PEM = Schema.String.check(
   Schema.isMinLength(80),
   Schema.isMaxLength(2_048)

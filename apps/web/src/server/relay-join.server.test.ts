@@ -11,7 +11,7 @@ import { createServer, type Socket } from "node:net"
 import type { RowDataPacket } from "mysql2"
 
 import { assert, layer } from "@effect/vitest"
-import { Effect, Schedule } from "effect"
+import { Effect, Fiber, Schedule } from "effect"
 import { TestClock } from "effect/testing"
 import { vi } from "vite-plus/test"
 import {
@@ -19,7 +19,10 @@ import {
   type RelayPairingRequestContract,
   type RelayPairingResponseContract,
   relayJoinAnnouncementTranscript,
+  relayJoinHeldHeader,
+  relayJoinHoldHeader,
   relayJoinResponseTranscript,
+  relayJoinSavedHeader,
   relayPairingResponseTranscript,
 } from "@workspace/contracts"
 
@@ -125,25 +128,36 @@ function announce(
   address: string,
   extra: {
     readonly features?: ReadonlyArray<string>
+    // How long Hearth may hold it for news.
+    readonly hold?: number
+    // Whether the Relay heard Hearth saved it.
+    readonly heardSaved?: boolean
     readonly pairing?: RelayPairingResponseContract
   } = {}
 ) {
+  const { heardSaved, hold, ...fields } = extra
   const nonce = randomBytes(32).toString("base64url")
   const unsigned = { envelope, joinId, nonce, version: 1 as const }
   const request = new Request("https://hearth.test/api/relays/join", {
     body: JSON.stringify({
       ...unsigned,
-      ...extra,
+      ...fields,
       mac: createHmac("sha256", secret)
         .update(relayJoinAnnouncementTranscript(unsigned))
         .digest("base64url"),
     }),
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(hold === undefined ? {} : { [relayJoinHoldHeader]: String(hold) }),
+      ...(heardSaved ? { [relayJoinSavedHeader]: "1" } : {}),
+    },
     method: "POST",
   })
   return answerRelayJoinAnnouncement(request, address).pipe(
     Effect.flatMap((response) =>
       Effect.promise(async () => ({
+        held: response.headers.get(relayJoinHeldHeader) === "1",
+        saved: response.headers.get(relayJoinSavedHeader) === "1",
         body: (await response.json()) as {
           clientId?: string | null
           expiresAt?: number | null
@@ -492,6 +506,141 @@ describeMysql("Relay joins", () => {
             assert.strictEqual(saved?.controlDial, "relay")
           })
         ),
+      30_000
+    )
+
+    it.effect(
+      "hold a Relay's announcements until there's news: someone confirming it, then Hearth saving it",
+      () =>
+        // Held announcements run on the test clock, which stands still, so
+        // only news can answer them; the rest on real time, with the worker.
+        Effect.gen(function* () {
+          yield* resetDatabase
+          const join = yield* TestClock.withLive(openRelayJoinEffect("owner"))
+          const keys = generateKeyPairSync("ed25519", {
+            privateKeyEncoding: { format: "pem", type: "pkcs8" },
+            publicKeyEncoding: { format: "pem", type: "spki" },
+          })
+          const port = yield* Effect.promise(closedPort)
+          const envelope = relayEnvelope(join.id, {
+            browserOrigin: `https://127.0.0.1:${port}`,
+            controlEndpoint: `wss://127.0.0.1:${port}/v1/socket`,
+            relayFingerprint: publicKeyFingerprint(keys.publicKey),
+            relayPublicKeyPem: keys.publicKey,
+          })
+          const relayAnnounces = (
+            hold: number,
+            pairing?: RelayPairingResponseContract,
+            heardSaved = false
+          ) =>
+            announce(join.id, join.secret ?? "", envelope, "203.0.113.10", {
+              features: ["join-pairing-v1", "control-dial-v1"],
+              heardSaved,
+              hold,
+              ...(pairing ? { pairing } : {}),
+            }).pipe(Effect.forkChild)
+          // Answered without the clock moving, or never.
+          const answered = <A, E>(fiber: Fiber.Fiber<A, E>) =>
+            TestClock.withLive(
+              Fiber.join(fiber).pipe(Effect.timeout("5 seconds"))
+            )
+
+          // The first is answered at once: it makes the Relay's invitation.
+          const first = yield* answered(yield* relayAnnounces(10_000))
+          assert.isFalse(first.held)
+          assert.strictEqual(first.body.status, "pending")
+
+          // Without news, Hearth holds it as long as the Relay asked.
+          const quiet = yield* relayAnnounces(300)
+          while (quiet.pollUnsafe() === undefined) {
+            yield* TestClock.adjust(100)
+            yield* TestClock.withLive(Effect.sleep(5))
+          }
+          const unchanged = yield* Fiber.join(quiet)
+          assert.isTrue(unchanged.held)
+          assert.isUndefined(unchanged.body.pairing)
+
+          // Held until someone confirms the Relay, and then answered with
+          // Hearth's pairing request.
+          const waiting = yield* relayAnnounces(10_000)
+          const view = yield* TestClock.withLive(
+            relayJoinViewEffect("owner", join.id).pipe(
+              Effect.repeat({
+                schedule: Schedule.spaced("100 millis"),
+                until: (current) => current.announcement?.unreachable !== null,
+              }),
+              Effect.timeout("15 seconds")
+            )
+          )
+          assert.isUndefined(waiting.pollUnsafe())
+          yield* TestClock.withLive(
+            confirmRelayJoinEffect({
+              canManageAnyRelay: true,
+              envelopeDigest: view.announcement?.envelopeDigest ?? "",
+              installation: "keep",
+              joinId: join.id,
+              name: null,
+              userId: "owner",
+            })
+          )
+          const asked = yield* answered(waiting)
+          assert.isTrue(asked.held && asked.proven)
+          assert.isFalse(asked.saved)
+          const request = asked.body.pairing?.request
+          if (!request) throw new Error("No pairing request")
+          // Asked again before it replies, as when someone confirmed it
+          // between two announcements, it hears so at once.
+          const repeated = yield* answered(yield* relayAnnounces(10_000))
+          assert.strictEqual(
+            repeated.body.pairing?.request.nonce,
+            request.nonce
+          )
+          assert.isFalse(repeated.saved)
+
+          // The Relay's reply is answered once Hearth saved the Relay, so
+          // the Relay can dial it straight away.
+          const unsigned = {
+            actions: ["*"],
+            clientId: publicKeyFingerprint(request.publicKeyPem),
+            expiresAt: Date.now() + 60_000,
+            nonce: request.nonce,
+            relayFingerprint: envelope.relayFingerprint,
+            relayName: "Relay",
+            relayPublicKeyPem: keys.publicKey,
+            role: "full_access" as const,
+            signature: "",
+            version: 1 as const,
+          }
+          const replied = yield* answered(
+            yield* relayAnnounces(10_000, {
+              ...unsigned,
+              signature: sign(
+                null,
+                Buffer.from(relayPairingResponseTranscript(unsigned)),
+                keys.privateKey
+              ).toString("base64url"),
+            })
+          )
+          // It says so, since a hold can also run out before the save.
+          assert.isTrue(replied.held && replied.saved)
+          assert.strictEqual(replied.body.status, "pending")
+          const saved = yield* Effect.promise(() =>
+            loadPersistedRelay(envelope.relayFingerprint)
+          )
+          assert.strictEqual(saved?.controlDial, "relay")
+
+          // Asked again by a Relay that hasn't heard, as when Hearth saved it
+          // between two announcements, it hears at once; one that has heard
+          // is held until there's more news.
+          const unheard = yield* answered(
+            yield* relayAnnounces(10_000, undefined)
+          )
+          assert.isTrue(unheard.saved)
+          const heard = yield* relayAnnounces(10_000, undefined, true)
+          yield* TestClock.withLive(Effect.sleep("300 millis"))
+          assert.isUndefined(heard.pollUnsafe())
+          yield* Fiber.interrupt(heard)
+        }),
       30_000
     )
 
