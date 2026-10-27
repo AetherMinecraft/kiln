@@ -9,6 +9,9 @@ import {
   relayControlMaxFrameBytes,
   relayControlProtocol,
   relayDialCloseCodes,
+  relayTunnelPath,
+  relayTunnelProtocol,
+  relayTunnelTokenHeader,
 } from "@workspace/contracts"
 import { Option, Result, Schema } from "effect"
 import { WebSocketServer } from "ws"
@@ -18,6 +21,10 @@ import { forkPromise } from "@/effect/promise"
 import { reportAppError } from "@/effect/runtime"
 import { adoptRelayControlSocket } from "@/lib/relay-connection"
 import { loadPersistedRelay } from "@/lib/relay-registry"
+import {
+  acceptRelayTunnel,
+  relayTunnelAwaited,
+} from "@/lib/relay-tunnel.server"
 import { assertRequestRateLimit } from "@/lib/request-rate-limit"
 
 // Relays dialing Hearth: a Relay Hearth can't reach, such as one behind a
@@ -27,6 +34,9 @@ import { assertRequestRateLimit } from "@/lib/request-rate-limit"
 // connection (`adoptRelayControlSocket`), which runs the same session as
 // one Hearth opened. Anyone can connect, so nothing is trusted until that
 // challenge checks out, and sockets still waiting for one are capped.
+//
+// Relays open tunnels here too (`relayTunnelPath`, relay-tunnel.server.ts):
+// each upgrade names the token Hearth asked for it with.
 
 const MAX_WAITING = 256
 // Per minute, by the address the connection came from.
@@ -46,6 +56,14 @@ const server = new WebSocketServer({
   noServer: true,
   perMessageDeflate: false,
 })
+const tunnels = new WebSocketServer({
+  clientTracking: false,
+  handleProtocols: (protocols) =>
+    protocols.has(relayTunnelProtocol) ? relayTunnelProtocol : false,
+  maxPayload: 1024 * 1024,
+  noServer: true,
+  perMessageDeflate: false,
+})
 
 /**
  * Takes a WebSocket upgrade for Hearth's Relay control path. Returns false
@@ -59,7 +77,23 @@ export function handleRelayControlUpgrade(
   const pathname = Result.getOrNull(
     Result.try(() => new URL(request.url ?? "/", "http://hearth").pathname)
   )
-  if (pathname !== relayControlDialPath) return false
+  if (pathname !== relayControlDialPath && pathname !== relayTunnelPath) {
+    return false
+  }
+  // Tunnels come as often as transfers through Hearth do, so they don't
+  // count against control connections; only one named for a tunnel Hearth
+  // waits for is taken at all.
+  if (pathname === relayTunnelPath) {
+    const token = request.headers[relayTunnelTokenHeader]
+    if (typeof token === "string" && relayTunnelAwaited(token)) {
+      tunnels.handleUpgrade(request, socket, head, (tunnel) =>
+        receiveTunnel(tunnel, token)
+      )
+    } else {
+      refuseUpgrade(socket, "401 Unauthorized")
+    }
+    return true
+  }
   const forwarded = request.headers["x-forwarded-for"]
   const address =
     (typeof forwarded === "string"
@@ -93,6 +127,16 @@ function refuseUpgrade(socket: Duplex, status: string): void {
   socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`, () =>
     socket.destroy()
   )
+}
+
+// Hands a tunnel to whoever asked for it with its token.
+function receiveTunnel(socket: WebSocket, token: string): void {
+  socket.on("error", () => undefined)
+  if (socket.protocol !== relayTunnelProtocol) {
+    socket.terminate()
+  } else if (!acceptRelayTunnel(socket, token)) {
+    socket.close(4401, "Hearth didn't ask for this tunnel")
+  }
 }
 
 // Says hello and waits for the Relay's challenge, which names the Relay.

@@ -7,11 +7,12 @@ import {
 } from "node:crypto"
 import { once } from "node:events"
 import { createServer } from "node:http"
-import { connect } from "node:net"
 import type { AddressInfo } from "node:net"
 
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test"
-import { WebSocket, WebSocketServer } from "ws"
+import { connect, createServer as createTcpServer } from "node:net"
+
+import { createWebSocketStream, WebSocket, WebSocketServer } from "ws"
 
 import {
   relayAuthChallengeTranscript,
@@ -20,6 +21,9 @@ import {
   relayControlDialV1Feature,
   relayControlProtocol,
   relayDialCloseCodes,
+  relayTunnelPath,
+  relayTunnelProtocol,
+  relayTunnelTokenHeader,
 } from "@workspace/contracts"
 import type {
   RelayAuthChallenge,
@@ -56,6 +60,8 @@ import {
 } from "@/lib/relay-connection"
 import type { RelayEndpoint } from "@/lib/relay-control-endpoint"
 import { handleRelayControlUpgrade } from "@/lib/relay-control-dial.server"
+import { openRelayTunnel } from "@/lib/relay-tunnel.server"
+import { passRelayBrowserRequest } from "@/lib/relay-browser-passthrough.server"
 import { loadPersistedRelay, loadRelayCredentials } from "@/lib/relay-registry"
 import { subscribeRealtimeChanges } from "@/lib/realtime-source.server"
 
@@ -271,6 +277,106 @@ it("opens its own connection when a Relay it prefers to be dialed by doesn't", a
   expect(listening.connections()).toBe(1)
 })
 
+it("lets go of a tunnel it refuses even while the other end holds on", async () => {
+  const raw = connect({
+    allowHalfOpen: true,
+    host: "127.0.0.1",
+    port: Number(new URL(hearthOrigin).port),
+  })
+  await once(raw, "connect")
+  raw.on("error", () => undefined)
+  raw.resume()
+  raw.write(
+    [
+      `GET ${relayTunnelPath} HTTP/1.1`,
+      "Host: hearth",
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      `Sec-WebSocket-Key: ${randomBytes(16).toString("base64")}`,
+      "Sec-WebSocket-Version: 13",
+      `Sec-WebSocket-Protocol: ${relayTunnelProtocol}`,
+      "",
+      "",
+    ].join("\r\n")
+  )
+  await advanceUntil(once(raw, "end"))
+  // Writing on is refused once Hearth let go of its end.
+  const closed = new Promise((resolve) => raw.once("close", resolve))
+  const writes = setInterval(() => raw.write("still here"), 10)
+  onCleanup(async () => clearInterval(writes))
+  await advanceUntil(closed)
+})
+
+it("takes a tunnel only for a token it asked for, and carries bytes through it", async () => {
+  const tunnelTo = (token?: string) =>
+    new WebSocket(
+      `${hearthOrigin.replace("http", "ws")}${relayTunnelPath}`,
+      relayTunnelProtocol,
+      token ? { headers: { [relayTunnelTokenHeader]: token } } : {}
+    )
+  const refusal = async (socket: WebSocket) =>
+    (
+      (await advanceUntil(once(socket, "unexpected-response"))) as [
+        unknown,
+        { readonly statusCode: number },
+      ]
+    )[1].statusCode
+  relayAt(await closedPort(), "relay")
+  // Hearth waits for no tunnel, so it takes none.
+  expect(await refusal(tunnelTo(randomBytes(32).toString("base64url")))).toBe(
+    401
+  )
+
+  // The Relay's listener, here one that echoes.
+  const listener = createTcpServer((socket) => socket.pipe(socket))
+  listener.listen(0, "127.0.0.1")
+  await once(listener, "listening")
+  onCleanup(
+    () => new Promise<void>((resolve) => listener.close(() => resolve()))
+  )
+  const relay = relayAt(await closedPort(), "relay")
+  const dialing = await dialHearth()
+  await dialing.authenticate()
+  const opened = openRelayTunnel(relay)
+  const request = (await advanceUntil(dialing.nextRequest())) as {
+    readonly id: string
+    readonly operation: string
+    readonly payload: { readonly token: string }
+  }
+  expect(request.operation).toBe("relay.tunnel.open")
+  // While Hearth waits for one, others can't take its place, named or not.
+  expect(await refusal(tunnelTo())).toBe(401)
+  expect(await refusal(tunnelTo(randomBytes(32).toString("base64url")))).toBe(
+    401
+  )
+  // As the Relay does: open the tunnel named for it, carry the listener.
+  const tunnel = tunnelTo(request.payload.token)
+  await advanceUntil(once(tunnel, "open"))
+  const local = connect((listener.address() as AddressInfo).port, "127.0.0.1")
+  await advanceUntil(once(local, "connect"))
+  const remote = createWebSocketStream(tunnel)
+  remote.pipe(local).pipe(remote)
+  dialing.answer(request, { tls: false })
+
+  const stream = await advanceUntil(opened)
+  stream.write("through the tunnel")
+  const [echoed] = (await advanceUntil(once(stream, "data"))) as [Buffer]
+  expect(echoed.toString()).toBe("through the tunnel")
+  stream.destroy()
+})
+
+it("passes browsers through to the Relay's transfer routes only", async () => {
+  relayAt(await closedPort(), "relay")
+  for (const route of ["socket", "pair", "files/a/../../socket", "trust"]) {
+    const response = await passRelayBrowserRequest(
+      relayId,
+      route,
+      new Request(`${hearthOrigin}/api/relays/${relayId}/browser/${route}`)
+    )
+    expect(response.status).toBe(404)
+  }
+})
+
 function relayAt(port: number, controlDial: "hearth" | "relay"): RelayEndpoint {
   const relay = {
     controlDial,
@@ -363,7 +469,11 @@ async function dialHearth(
     challenge,
     closed,
     nextRequest: () =>
-      next("request") as Promise<{ readonly id: string }>,
+      next("request") as Promise<{
+        readonly id: string
+        readonly operation?: string
+        readonly payload?: unknown
+      }>,
     get responses() {
       return messages.filter((message) => message.type === "auth.response")
     },
