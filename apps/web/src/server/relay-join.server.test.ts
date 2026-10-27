@@ -5,7 +5,10 @@ import {
   generateKeyPairSync,
   randomBytes,
 } from "node:crypto"
+import { sign } from "node:crypto"
 import { createServer, type Socket } from "node:net"
+
+import type { RowDataPacket } from "mysql2"
 
 import { assert, layer } from "@effect/vitest"
 import { Effect, Schedule } from "effect"
@@ -13,8 +16,11 @@ import { TestClock } from "effect/testing"
 import { vi } from "vite-plus/test"
 import {
   type RelayJoinEnvelope,
+  type RelayPairingRequestContract,
+  type RelayPairingResponseContract,
   relayJoinAnnouncementTranscript,
   relayJoinResponseTranscript,
+  relayPairingResponseTranscript,
 } from "@workspace/contracts"
 
 import {
@@ -24,8 +30,14 @@ import {
   refreshRelayJoinEffect,
   relayJoinViewEffect,
 } from "@/server/relay-join.server"
+import { Database } from "@/effect/database"
+import { databaseTable } from "@/lib/database-config"
 import { TestDatabase, describeMysql, resetDatabase } from "@/test/database"
-import { deletePersistedRelayEffect } from "@/lib/relay-registry"
+import {
+  deletePersistedRelayEffect,
+  loadPersistedRelay,
+  publicKeyFingerprint,
+} from "@/lib/relay-registry"
 import { insertRelay } from "@/test/seed"
 
 vi.stubEnv("BETTER_AUTH_SECRETS", `1:${"j".repeat(32)}`)
@@ -104,18 +116,24 @@ function relayEnvelope(
   }
 }
 
-// Posts an announcement to the join endpoint, keyed by `secret`.
+// Posts an announcement to the join endpoint, keyed by `secret`, with what
+// a Relay that pairs through its announcements adds outside the MAC.
 function announce(
   joinId: string,
   secret: string,
   envelope: RelayJoinEnvelope,
-  address: string
+  address: string,
+  extra: {
+    readonly features?: ReadonlyArray<string>
+    readonly pairing?: RelayPairingResponseContract
+  } = {}
 ) {
   const nonce = randomBytes(32).toString("base64url")
   const unsigned = { envelope, joinId, nonce, version: 1 as const }
   const request = new Request("https://hearth.test/api/relays/join", {
     body: JSON.stringify({
       ...unsigned,
+      ...extra,
       mac: createHmac("sha256", secret)
         .update(relayJoinAnnouncementTranscript(unsigned))
         .digest("base64url"),
@@ -130,6 +148,10 @@ function announce(
           clientId?: string | null
           expiresAt?: number | null
           mac?: string
+          pairing?: {
+            dialUrl: string | null
+            request: RelayPairingRequestContract
+          }
           status?: string
         },
         status: response.status,
@@ -148,6 +170,9 @@ function announce(
                 expiresAt: answer.body.expiresAt ?? null,
                 joinId,
                 nonce,
+                ...(answer.body.pairing
+                  ? { pairing: answer.body.pairing }
+                  : {}),
                 status: answer.body.status as "pending",
               })
             )
@@ -346,6 +371,128 @@ describeMysql("Relay joins", () => {
             "announced"
           )
         })
+    )
+
+    it.effect(
+      "adds a Relay it can't reach through the Relay's announcements",
+      () =>
+        TestClock.withLive(
+          Effect.gen(function* () {
+            yield* resetDatabase
+            const join = yield* openRelayJoinEffect("owner")
+            const keys = generateKeyPairSync("ed25519", {
+              privateKeyEncoding: { format: "pem", type: "pkcs8" },
+              publicKeyEncoding: { format: "pem", type: "spki" },
+            })
+            const port = yield* Effect.promise(closedPort)
+            const envelope = relayEnvelope(join.id, {
+              browserOrigin: `https://127.0.0.1:${port}`,
+              controlEndpoint: `wss://127.0.0.1:${port}/v1/socket`,
+              relayFingerprint: publicKeyFingerprint(keys.publicKey),
+              relayPublicKeyPem: keys.publicKey,
+            })
+            const features = ["join-pairing-v1", "control-dial-v1"]
+            const relayAnnounces = (pairing?: RelayPairingResponseContract) =>
+              announce(join.id, join.secret ?? "", envelope, "203.0.113.9", {
+                features,
+                ...(pairing ? { pairing } : {}),
+              })
+            yield* relayAnnounces()
+
+            // Hearth can't reach it, and still lets it be added.
+            const view = yield* relayJoinViewEffect("owner", join.id).pipe(
+              Effect.repeat({
+                schedule: Schedule.spaced("100 millis"),
+                until: (current) => current.announcement?.unreachable !== null,
+              }),
+              Effect.timeout("15 seconds")
+            )
+            assert.isTrue(view.announcement?.reachesHearth)
+            yield* confirmRelayJoinEffect({
+              canManageAnyRelay: true,
+              envelopeDigest: view.announcement?.envelopeDigest ?? "",
+              installation: "keep",
+              joinId: join.id,
+              name: null,
+              userId: "owner",
+            })
+
+            // The next answer carries Hearth's pairing request, under the
+            // join's MAC.
+            const answered = yield* Effect.suspend(() => relayAnnounces()).pipe(
+              Effect.repeat({
+                schedule: Schedule.spaced("200 millis"),
+                until: (answer) => answer.body.pairing !== undefined,
+              }),
+              Effect.timeout("10 seconds")
+            )
+            assert.isTrue(answered.proven)
+            const request = answered.body.pairing?.request
+            if (!request) throw new Error("No pairing request")
+
+            const reply = (expiresAt: number) => {
+              const unsigned = {
+                actions: ["*"],
+                clientId: publicKeyFingerprint(request.publicKeyPem),
+                expiresAt,
+                nonce: request.nonce,
+                relayFingerprint: envelope.relayFingerprint,
+                relayName: "Relay",
+                relayPublicKeyPem: keys.publicKey,
+                role: "full_access" as const,
+                signature: "",
+                version: 1 as const,
+              }
+              return {
+                ...unsigned,
+                signature: sign(
+                  null,
+                  Buffer.from(relayPairingResponseTranscript(unsigned)),
+                  keys.privateKey
+                ).toString("base64url"),
+              }
+            }
+
+            // A reply Hearth kept past its expiry, as across a restart, is
+            // let go, so the Relay is asked again.
+            const database = yield* Database
+            yield* database.execute(
+              "test_expired_pairing_reply",
+              `UPDATE ${databaseTable("relay_join")}
+                  SET pairing_response = ? WHERE id = ?`,
+              [JSON.stringify(reply(Date.now() - 1)), join.id]
+            )
+            yield* database
+              .queryRows<RowDataPacket & { pairing_response: unknown }>(
+                "test_expired_pairing_reply",
+                `SELECT pairing_response FROM ${databaseTable("relay_join")}
+                  WHERE id = ?`,
+                [join.id]
+              )
+              .pipe(
+                Effect.repeat({
+                  schedule: Schedule.spaced("200 millis"),
+                  until: ([row]) => row?.pairing_response === null,
+                }),
+                Effect.timeout("10 seconds")
+              )
+
+            // The Relay replies, signed with its key; Hearth saves it,
+            // preferring that it dials Hearth.
+            yield* relayAnnounces(reply(Date.now() + 60_000))
+            const saved = yield* Effect.promise(() =>
+              loadPersistedRelay(envelope.relayFingerprint)
+            ).pipe(
+              Effect.repeat({
+                schedule: Schedule.spaced("200 millis"),
+                until: (relay) => relay !== null,
+              }),
+              Effect.timeout("10 seconds")
+            )
+            assert.strictEqual(saved?.controlDial, "relay")
+          })
+        ),
+      30_000
     )
 
     it.effect(

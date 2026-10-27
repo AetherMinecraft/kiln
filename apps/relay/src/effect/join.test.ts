@@ -103,6 +103,108 @@ describe("Relay joining", () => {
   )
 
   it.effect(
+    "pairs through its announcements when Hearth can't reach it, and keeps where to dial Hearth",
+    () =>
+      withJoiningRelay((relay) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const hearthKeys = ed25519Keys()
+            const clientId = fingerprint(hearthKeys.publicKey)
+            const request = joinPairingRequest(hearthKeys)
+            const dialUrl = "https://hearth.test/api/relays/control"
+            const answers: Array<Omit<RelayJoinResponse, "mac">> = [
+              { clientId, expiresAt: Date.now() + 60_000, status: "pending" },
+              // Someone confirmed it: Hearth's answer carries its request.
+              {
+                clientId,
+                expiresAt: Date.now() + 60_000,
+                pairing: { dialUrl, request },
+                status: "pending",
+              },
+            ]
+            const hearth = yield* fakeHearth(answers)
+            const events: Array<string> = []
+            const joining = yield* runRelayJoin(
+              { ...relay, link: { hearthOrigin: hearth.origin, secret } },
+              (event) => events.push(event.kind)
+            ).pipe(Effect.forkChild)
+
+            yield* advanceUntil(() =>
+              hearth.announcements.some((announcement) => announcement.pairing)
+            )
+            const replied = hearth.announcements.find(
+              (announcement) => announcement.pairing
+            )
+            assert.include(replied?.features ?? [], "join-pairing-v1")
+            // The Relay's signed reply to that request, for that client.
+            assert.strictEqual(replied?.pairing?.clientId, clientId)
+            assert.strictEqual(replied?.pairing?.nonce, request.nonce)
+            assert.strictEqual(
+              (yield* relay.state.findClientById(clientId))?.id,
+              clientId
+            )
+            assert.strictEqual(
+              yield* relay.state.getMetadata(`control_dial:${clientId}`),
+              dialUrl
+            )
+
+            answers.push({ clientId: null, expiresAt: null, status: "paired" })
+            yield* advanceUntil(() => events.includes("finished"))
+            assert.strictEqual(yield* Fiber.join(joining), "paired")
+          })
+        )
+      )
+  )
+
+  it.effect(
+    "signs its pairing reply again when it nears expiry before Hearth keeps it",
+    () =>
+      withJoiningRelay((relay) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const hearthKeys = ed25519Keys()
+            const clientId = fingerprint(hearthKeys.publicKey)
+            // Hearth keeps asking: the reply never arrived in time.
+            const hearth = yield* fakeHearth([
+              {
+                clientId,
+                expiresAt: Date.now() + 10 * 60_000,
+                pairing: {
+                  dialUrl: "https://hearth.test/api/relays/control",
+                  request: joinPairingRequest(hearthKeys),
+                },
+                status: "pending",
+              },
+            ])
+            yield* runRelayJoin(
+              { ...relay, link: { hearthOrigin: hearth.origin, secret } },
+              () => {}
+            ).pipe(Effect.forkChild)
+            const replies = () =>
+              hearth.announcements.flatMap((announcement) =>
+                announcement.pairing ? [announcement.pairing] : []
+              )
+            yield* advanceUntil(() => replies().length > 0)
+            const first = replies()[0]!
+
+            const realNow = Date.now
+            const later = realNow() + 50_000
+            Date.now = () => later
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                Date.now = realNow
+              })
+            )
+            yield* advanceUntil(
+              () => (replies().at(-1)?.expiresAt ?? 0) > first.expiresAt
+            )
+            assert.isAbove(replies().at(-1)!.expiresAt, later)
+          })
+        )
+      )
+  )
+
+  it.effect(
     "keeps waiting after pairing until Hearth says it saved the Relay",
     () =>
       withJoiningRelay((relay) =>
