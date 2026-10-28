@@ -45,6 +45,7 @@ import {
   type DatabaseReadRequest,
   type DatabaseWriteRequest,
   relaySnapshotSchema,
+  webRouteHostnames,
 } from "@workspace/contracts"
 import { z } from "zod"
 
@@ -681,27 +682,50 @@ export const getRelayInstanceResources = createServerFn({ method: "GET" })
 export const updateInstanceWebRoutes = createServerFn({ method: "POST" })
   .validator(webRoutesInputSchema)
   .handler(async ({ data }) => {
-    const value = await relayRequest(
-      `/v1/instances/${encodeURIComponent(data.instanceId)}/web-routes`,
-      {
-        body: JSON.stringify({
-          routes: webRoutesForRelay(data.relayId, data.routes),
-        }),
-        headers: { "Content-Type": "application/json" },
-        method: "PUT",
-      },
-      "instance.network.write",
-      data.instanceId,
-      data.relayId,
-      240_000
+    const user = await requireEligibleResourceUser()
+    await requireRelayPermission({
+      instanceId: data.instanceId,
+      permission: "instance.network.write",
+      relayId: data.relayId,
+      user,
+    })
+    const resource = {
+      relayId: data.relayId,
+      resourceId: data.instanceId,
+      resourceType: "instance" as const,
+    }
+    const { saveClaimingWebRouteHostnames, syncWebRouteHostnames } =
+      await import("@/server/web-hostname-access.server")
+    const routes = await saveClaimingWebRouteHostnames(
+      user,
+      resource,
+      data.routes.flatMap(webRouteHostnames),
+      async () =>
+        relayInstanceWebRouteStateSchema.parse(
+          await relayRequest(
+            `/v1/instances/${encodeURIComponent(data.instanceId)}/web-routes`,
+            {
+              body: JSON.stringify({
+                routes: webRoutesForRelay(data.relayId, data.routes),
+              }),
+              headers: { "Content-Type": "application/json" },
+              method: "PUT",
+            },
+            "instance.network.write",
+            data.instanceId,
+            data.relayId,
+            240_000
+          )
+        )
     )
-    const routes = relayInstanceWebRouteStateSchema.parse(value)
     publishRealtimeChange({
       audience: { kind: "relays", relayIds: [data.relayId] },
       scope: { instanceId: data.instanceId, relayId: data.relayId },
       topics: ["instance-web-routes"],
       type: "hearth.invalidate",
     })
+    // Kiln keeps the DNS records of hostnames in zones it manages.
+    await syncWebRouteHostnames(resource)
     return routes
   })
 

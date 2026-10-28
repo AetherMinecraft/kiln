@@ -63,6 +63,7 @@ import {
   useInstancePermissions,
   useInstanceRelayConnected,
 } from "@/components/instance-workspace-context"
+import { ServerDomainsSection } from "@/components/server-domains-section"
 import { TailscaleMembershipSection } from "@/components/tailscale-network-membership"
 import type { IdentityStatusPresentation } from "@/components/identity-name"
 import {
@@ -136,6 +137,14 @@ function WebRoutesNetworkPage({
   const instance = useInstanceIdentity()
   const permissions = useInstancePermissions()
   const relayConnected = useInstanceRelayConnected()
+  const dnsResource = React.useMemo(
+    () => ({
+      relayId: instance.relayId,
+      resourceId: instance.id,
+      resourceType: "instance" as const,
+    }),
+    [instance.id, instance.relayId]
+  )
   const queryClient = useQueryClient()
   const queryKey = React.useMemo(
     () => queryKeys.relay.webRoutes(instance.relayId, instance.id),
@@ -202,6 +211,7 @@ function WebRoutesNetworkPage({
       <div className="mx-auto max-w-4xl space-y-4">
         <DatabaseConnectionWarnings />
         <SavedDatabaseConnections />
+        <ServerDomainsSection />
         <ConfiguredRoutesSection
           key={editGamePort ? "edit-game-port" : "network"}
           canPublicPortWrite={permissions.networkPublicPortWrite}
@@ -221,6 +231,7 @@ function WebRoutesNetworkPage({
             instance.managedByRelay &&
             relayConnected
           }
+          dnsResource={dnsResource}
           error={routes.error}
           kind="server"
           routes={routes.data?.routes}

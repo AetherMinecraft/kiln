@@ -17,6 +17,7 @@ import {
   relayAppWebRoutesWriteSchema,
   relayAppWebRouteStateSchema,
   relayIdSchema,
+  webRouteHostnames,
 } from "@workspace/contracts"
 import type { RelayApp } from "@workspace/contracts"
 import { Effect, Result } from "effect"
@@ -221,6 +222,7 @@ export const createApp = createServerFn({ method: "POST" })
         unregister,
       })
       publishAppChange(relay.id, true)
+      generateAppHostname(relay.id, id)
       return {
         id: placeholder.id,
         relayId: relay.id,
@@ -250,8 +252,22 @@ export const createApp = createServerFn({ method: "POST" })
       throw persisted.failure
     }
     publishAppChange(relay.id, true)
+    generateAppHostname(relay.id, id)
     return { id: created.id, relayId: relay.id, shortId: created.shortId }
   })
+
+// A new app gets an address under a vanity domain, as game servers do. In
+// the background: it calls Cloudflare, and the app opens without it.
+function generateAppHostname(relayId: string, appId: string) {
+  void import("@/server/web-hostname-access.server").then(
+    ({ generateAppHostnameBestEffort }) =>
+      generateAppHostnameBestEffort({
+        relayId,
+        resourceId: appId,
+        resourceType: "app",
+      })
+  )
+}
 
 export const updateAppConfig = createServerFn({ method: "POST" })
   .validator(appConfigInputSchema)
@@ -412,19 +428,34 @@ export const updateAppWebRoutes = createServerFn({ method: "POST" })
   )
   .handler(async ({ data }) => {
     const { relay, user } = await authorizedApp(data, "app.manage")
-    const state = relayAppWebRouteStateSchema.parse(
-      await databaseRpc(
-        relay,
-        "app.network.routes.write",
-        {
-          appId: data.appId,
-          routes: webRoutesForRelay(relay.id, data.routes),
-        },
-        240_000,
-        user.id
-      )
+    const resource = {
+      relayId: relay.id,
+      resourceId: data.appId,
+      resourceType: "app" as const,
+    }
+    const { saveClaimingWebRouteHostnames, syncWebRouteHostnames } =
+      await import("@/server/web-hostname-access.server")
+    const state = await saveClaimingWebRouteHostnames(
+      user,
+      resource,
+      data.routes.flatMap(webRouteHostnames),
+      async () =>
+        relayAppWebRouteStateSchema.parse(
+          await databaseRpc(
+            relay,
+            "app.network.routes.write",
+            {
+              appId: data.appId,
+              routes: webRoutesForRelay(relay.id, data.routes),
+            },
+            240_000,
+            user.id
+          )
+        )
     )
     publishAppChange(relay.id, false)
+    // Kiln keeps the DNS records of hostnames in zones it manages.
+    await syncWebRouteHostnames(resource)
     return state
   })
 
@@ -451,6 +482,16 @@ export const deleteApp = createServerFn({ method: "POST" })
     ) {
       throw removed.failure
     }
+    // Its hostnames are marked for deletion before its record goes, so a
+    // Hearth that stops in between leaves them to the DNS worker, or to
+    // deleting it again, rather than to nothing.
+    const { deleteResourceWebHostnamesBestEffort } =
+      await import("@/server/web-hostname-access.server")
+    await deleteResourceWebHostnamesBestEffort({
+      relayId: relay.id,
+      resourceId: data.appId,
+      resourceType: "app",
+    })
     await runAppEffect(
       "apps.record.delete",
       deleteAppRecordEffect(relay.id, data.appId)

@@ -9,6 +9,7 @@ import { fileActivityRoots } from "@/migrations/0009_file_activity_roots"
 import { incrementalBackupArtifacts } from "@/migrations/0013_incremental_backup_artifacts"
 import { domainZones } from "@/migrations/0015_domain_zones"
 import { securityReports } from "@/migrations/0031_security_reports"
+import { cloudflareConnections } from "@/migrations/0035_cloudflare_connections"
 import { baselineTables } from "@/migrations/baseline-schema"
 import { describeMysql, testDatabaseClient } from "@/test/database"
 import {
@@ -77,8 +78,8 @@ describeMysql("database migrations", () => {
           // events, apps' GitHub sources and deployments, image apps'
           // updates, push subscriptions, Relay joins, and the security
           // checks' targets, inventories, findings, vulnerabilities, and
-          // alerts, game server migrations, and icons.
-          expect(count).toBe(baselineTables.length + 25)
+          // alerts, game server migrations, icons, and web hostnames.
+          expect(count).toBe(baselineTables.length + 27)
           expect(yield* ledger).toEqual(migrationIds)
           // Only better-auth keeps dates, as DATETIME.
           expect((yield* columnTypes).map((row) => row.dataType)).toEqual([
@@ -422,11 +423,11 @@ describeMysql("database migrations", () => {
             },
           ])
           expect(
-            yield* selectRows<{ assignment_strategy: string }>(
+            yield* selectRows<{ api_token_ciphertext: string }>(
               "domain_integration"
             )
           ).toMatchObject([
-            { api_token_ciphertext: "ciphertext", assignment_strategy: "default" },
+            { api_token_ciphertext: "ciphertext", owner_id: null },
           ])
           const [assignment] = yield* selectRows<{
             address_record_id: string
@@ -575,6 +576,89 @@ describeMysql("database migrations", () => {
               userId: "user-b",
             },
           ])
+        }),
+      120_000
+    )
+
+    it.effect(
+      "makes the one Cloudflare connection the shared one, keeping its reserved names",
+      () =>
+        Effect.gen(function* () {
+          yield* dropAllTables
+          yield* applyMigrations(
+            migrations.filter(
+              (migration) => migration.id < cloudflareConnections.id
+            )
+          )
+          yield* insertRows("domain_integration", {
+            id: "cloudflare",
+            provider: "cloudflare",
+            api_token_ciphertext: "ciphertext",
+            assignment_strategy: "balanced",
+            blacklist_patterns: JSON.stringify(["^staff-"]),
+            enabled: false,
+            created_at: 0,
+            updated_at: 0,
+          })
+          yield* insertRows("domain_zone", {
+            domain: "play.kiln.site",
+            integration_id: "cloudflare",
+            zone_id: "a".repeat(32),
+            zone_name: "kiln.site",
+            is_default: true,
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+          })
+          yield* insertRows("instance_domain", {
+            id: "00000000-0000-4000-8000-000000000001",
+            relay_id: "relay-one",
+            instance_id: "b".repeat(40),
+            is_primary: true,
+            integration_id: "cloudflare",
+            vanity_label: "survival",
+            domain: "play.kiln.site",
+            public_host: "relay-one.example",
+            public_port: 25_565,
+            status: "active",
+            created_at: 0,
+            updated_at: 0,
+          })
+
+          yield* applyMigrations(migrations)
+
+          // The game server keeps its address, which no web route can take.
+          expect(yield* selectRows("hostname_claim")).toMatchObject([
+            {
+              hostname: "survival.play.kiln.site",
+              resource_id: "b".repeat(40),
+              resource_type: "instance",
+            },
+          ])
+          const [connection] = yield* selectRows<{
+            blacklist_patterns: unknown
+          }>("domain_integration")
+          expect(connection).toMatchObject({
+            api_token_ciphertext: "ciphertext",
+            id: "cloudflare",
+            owner_id: null,
+          })
+          const patterns = connection?.blacklist_patterns
+          expect(
+            typeof patterns === "string" ? JSON.parse(patterns) : patterns
+          ).toEqual(["^staff-"])
+          // Automatic addresses were off, so its domain stops taking new ones
+          // but keeps the addresses on it.
+          expect(
+            yield* selectRows<{ domain: string }>("domain_zone")
+          ).toMatchObject([
+            {
+              domain: "play.kiln.site",
+              enabled: 0,
+              integration_id: "cloudflare",
+            },
+          ])
+          expect(yield* ledger).toEqual(migrationIds)
         }),
       120_000
     )
