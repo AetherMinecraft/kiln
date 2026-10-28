@@ -14,30 +14,50 @@ import { loadOperation } from "./lanes"
 import { RelayCommandError, relayCommand } from "./relay-command"
 import { testOperationsEngine } from "./test/engine"
 
-// The Relay is the only fake: an outcome journal by command ID, as its
-// control socket keeps, and a way for its next reply to go missing or for
-// a change to be withdrawn before it runs.
+// The Relay is the only fake: the starts it applied, an outcome journal by
+// command ID, as its control socket keeps, and a way for its next reply to
+// go missing, for a change to be withdrawn before it runs, or for the
+// Relay's state to be rebuilt, which starts a new journal.
 const relay = vi.hoisted(() => ({
+  applied: [] as Array<string>,
+  journalId: "journal-one" as string | null,
   journal: new Map<
     string,
     | { status: "succeeded"; result: unknown }
     | { code: string; message: string; retryable: boolean; status: "failed" }
   >(),
-  next: null as null | "loses-reply" | "refuses" | "withdraws",
+  next: null as
+    | null
+    | "loses-reply"
+    | "loses-reply-and-rebuilds"
+    | "refuses"
+    | "withdraws",
   sent: [] as Array<string>,
 }))
 
 vi.mock("@/lib/relay-connection", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/relay-connection")>()),
+  relayJournal: async () =>
+    relay.journalId === null
+      ? null
+      : { clientId: "hearth-one", journalId: relay.journalId },
   relayRpc: async (
     _relay: unknown,
     operation: string,
-    payload: { operationId?: string; action?: string },
+    payload: { operationId?: string; action?: string; instanceId?: string },
     _timeout?: number,
     _subject?: string,
     _signal?: AbortSignal,
-    operationId?: string
+    frame: { operationId?: string; journal?: { journalId: string } } = {}
   ) => {
+    if (frame.journal && frame.journal.journalId !== relay.journalId) {
+      throw RelayUnavailableError.make({
+        code: "journal_changed",
+        message: "This Relay's state was rebuilt since that change was sent",
+        retryable: false,
+      })
+    }
+    const operationId = frame.operationId
     if (operation === "operation.get") {
       return (
         relay.journal.get(payload.operationId ?? "") ?? { status: "unknown" }
@@ -69,8 +89,13 @@ vi.mock("@/lib/relay-connection", async (importOriginal) => ({
       })
     }
     const result = { started: payload.action }
+    relay.applied.push(payload.instanceId ?? "")
     relay.journal.set(id, { result, status: "succeeded" })
-    if (next === "loses-reply") {
+    if (next === "loses-reply-and-rebuilds") {
+      relay.journal.clear()
+      relay.journalId = "journal-two"
+    }
+    if (next === "loses-reply" || next === "loses-reply-and-rebuilds") {
       throw RelayUnavailableError.make({
         message: "The connection dropped before the Relay answered",
         outcome: "unknown",
@@ -81,6 +106,14 @@ vi.mock("@/lib/relay-connection", async (importOriginal) => ({
 }))
 
 afterAll(() => disposeAppRuntime())
+
+const resetRelay = () => {
+  relay.applied.length = 0
+  relay.journal.clear()
+  relay.journalId = "journal-one"
+  relay.next = null
+  relay.sent.length = 0
+}
 
 // Starts a game server through its Relay, as a durable step.
 const start = durableOperation({
@@ -125,8 +158,7 @@ describeMysql("Relay commands from durable operations", () => {
         Effect.gen(function* () {
           yield* resetDatabase
           yield* insertRelay("relay-one")
-          relay.journal.clear()
-          relay.sent.length = 0
+          resetRelay()
           relay.next = "loses-reply"
 
           const done = yield* runToEnd("survival")
@@ -138,13 +170,49 @@ describeMysql("Relay commands from durable operations", () => {
     )
 
     it.effect(
+      "stops instead of sending a change again to a Relay whose state was rebuilt",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertRelay("relay-one")
+          resetRelay()
+          relay.next = "loses-reply-and-rebuilds"
+
+          const done = yield* runToEnd("survival")
+
+          // The rebuilt Relay doesn't know the change, but it ran: once.
+          assert.strictEqual(done?.state, "failed")
+          assert.include(done?.error ?? "", "nobody can say")
+          assert.deepStrictEqual(relay.applied, ["survival"])
+        }).pipe(TestClock.withLive),
+      30_000
+    )
+
+    it.effect(
+      "sends nothing to a Relay that doesn't name its journal",
+      () =>
+        Effect.gen(function* () {
+          yield* resetDatabase
+          yield* insertRelay("relay-one")
+          resetRelay()
+          relay.journalId = null
+
+          const done = yield* runToEnd("survival")
+
+          assert.strictEqual(done?.state, "failed")
+          assert.include(done?.error ?? "", "didn't name its journal")
+          assert.deepStrictEqual(relay.applied, [])
+        }).pipe(TestClock.withLive),
+      30_000
+    )
+
+    it.effect(
       "stops at a change the Relay refuses, rather than asking forever",
       () =>
         Effect.gen(function* () {
           yield* resetDatabase
           yield* insertRelay("relay-one")
-          relay.journal.clear()
-          relay.sent.length = 0
+          resetRelay()
           relay.next = "refuses"
 
           const done = yield* runToEnd("survival")
@@ -161,8 +229,7 @@ describeMysql("Relay commands from durable operations", () => {
         Effect.gen(function* () {
           yield* resetDatabase
           yield* insertRelay("relay-one")
-          relay.journal.clear()
-          relay.sent.length = 0
+          resetRelay()
           relay.next = "withdraws"
 
           const done = yield* runToEnd("creative")
