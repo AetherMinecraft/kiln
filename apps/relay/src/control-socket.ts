@@ -821,9 +821,15 @@ function authenticateSocket(
           }
           const issuerInternal =
             request.operation === "browser.authorization.revise"
+          const memberActions = memberActionsForRequest(request)
           if (
             !issuerInternal &&
-            (!action || !isActionAllowed(actions, action))
+            (!action ||
+              !isActionAllowed(actions, action) ||
+              memberActions === null ||
+              !memberActions.every((member) =>
+                isActionAllowed(actions, member)
+              ))
           ) {
             yield* Effect.sync(() => {
               sendError(
@@ -1547,6 +1553,39 @@ function appFileAction(operation: RelayControlOperation): RelayAction {
   }
 }
 
+/**
+ * What a request needs besides its action, of the other resource it
+ * changes: a database connection changes its member as well as the
+ * database. Null refuses a request that doesn't say what it changes.
+ */
+function memberActionsForRequest(
+  request: RelayControlRequest
+): ReadonlyArray<RelayAction> | null {
+  switch (request.operation) {
+    case "database.network.write": {
+      const member =
+        request.payload && typeof request.payload === "object"
+          ? (request.payload as Record<string, unknown>).member
+          : undefined
+      switch (objectString(member, "kind")) {
+        case "instance":
+          return ["instance.network.write"]
+        case "app":
+          return ["app.manage"]
+        case "database":
+          return ["database.network.write"]
+        default:
+          return null
+      }
+    }
+    // It connects Apps.
+    case "database.network.import":
+      return ["app.manage"]
+    default:
+      return []
+  }
+}
+
 function actionForRequest(request: RelayControlRequest): RelayAction | null {
   if (
     request.operation.startsWith("instance.files.") &&
@@ -1691,6 +1730,8 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "database.credentials.rotate":
       return "database.credentials.rotate"
     case "database.network.write":
+    // Hearth hands over the connections it kept for Apps.
+    case "database.network.import":
       return "database.network.write"
     case "database.dump.export":
       return "database.dump.export"
@@ -1725,7 +1766,6 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "app.deploy":
     case "app.action":
     case "app.limits.write":
-    case "app.network.write":
     case "app.network.routes.write":
       return "app.manage"
     case "app.terminal.attach":

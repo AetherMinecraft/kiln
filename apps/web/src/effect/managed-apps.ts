@@ -2,7 +2,12 @@ import type { RowDataPacket } from "mysql2/promise"
 import { Clock, Effect } from "effect"
 
 import type { AppConfig } from "@workspace/contracts"
-import { appConfigSchema, defaultAppConfig } from "@workspace/contracts"
+import {
+  appConfigSchema,
+  databaseIdSchema,
+  defaultAppConfig,
+} from "@workspace/contracts"
+import { z } from "zod"
 
 import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
 import { Database } from "@/effect/database"
@@ -12,6 +17,16 @@ import { databaseTable } from "@/lib/database-config"
 import { betterAuthSecrets } from "@/lib/environment"
 
 const APP_CONFIG_PURPOSE = "kiln-app-config"
+
+// Configs saved before Relays kept Apps' database connections name them in
+// `databaseIds`. Edits keep the field until Hearth hands it to the App's
+// Relay and then drops it (lib/app-database-connections.server.ts); nothing
+// else reads it.
+const storedAppConfigSchema = appConfigSchema
+  .extend({ databaseIds: z.array(databaseIdSchema).max(32).optional() })
+  .strip()
+
+type StoredAppConfig = z.infer<typeof storedAppConfigSchema>
 
 interface AppRow extends RowDataPacket {
   app_id: string
@@ -153,19 +168,108 @@ export const updateAppConfigEffect = Effect.fn("apps.updateConfig")(function* (
       )
       const row = rows.at(0)
       if (!row) return yield* Effect.fail(new Error("App not found"))
-      const config = update(yield* decryptConfig(row))
+      const { databaseIds, ...saved } = yield* decryptStoredConfig(row)
+      const config = update(saved)
       yield* transaction.execute(
         `UPDATE ${databaseTable("app")}
             SET config_ciphertext = ?, updated_at = ?
           WHERE relay_id = ? AND app_id = ?`,
-        [yield* encryptConfig(config), now, relayId, appId]
+        [
+          yield* encryptConfig(
+            databaseIds === undefined ? config : { ...config, databaseIds }
+          ),
+          now,
+          relayId,
+          appId,
+        ]
       )
       return config
     })
   )
 })
 
+/**
+ * The Apps on a Relay whose configs still keep database connections, with
+ * them, and those whose configs can't be read now, as when the secret they
+ * were saved with is gone, so whether they keep any is unknown.
+ */
+export const listLegacyAppDatabaseIdsEffect = Effect.fn(
+  "apps.legacyDatabaseIds"
+)(function* (relayId: string) {
+  const database = yield* Database
+  const rows = yield* database.queryRows<AppConfigRow>(
+    "app_configs_legacy_database_ids",
+    `SELECT app_id, relay_id, name, config_ciphertext, created_by, created_at
+       FROM ${databaseTable("app")}
+      WHERE relay_id = ?
+      ORDER BY app_id`,
+    [relayId]
+  )
+  const read = yield* Effect.forEach(rows, (row) =>
+    decryptStoredConfig(row).pipe(
+      Effect.map(({ databaseIds }) => ({
+        appId: row.app_id,
+        databaseIds: databaseIds ?? null,
+      })),
+      Effect.orElseSucceed(() => ({ appId: row.app_id, unreadable: true }))
+    )
+  )
+  return {
+    apps: read.flatMap((app) =>
+      "databaseIds" in app && app.databaseIds !== null
+        ? [{ appId: app.appId, databaseIds: app.databaseIds }]
+        : []
+    ),
+    unreadable: read.flatMap((app) => ("unreadable" in app ? [app.appId] : [])),
+  }
+})
+
+/**
+ * Removes `databaseIds` from these Apps' configs, one App at a time, each
+ * holding its row as an edit does. Safe to repeat: a config without it, or
+ * one that can't be read, is left as it is.
+ */
+export const clearLegacyAppDatabaseIdsEffect = Effect.fn(
+  "apps.clearLegacyDatabaseIds"
+)(function* (relayId: string, appIds: ReadonlyArray<string>) {
+  const database = yield* Database
+  for (const appId of appIds) {
+    yield* database.transaction(
+      "app_config_clear_database_ids",
+      (transaction) =>
+        Effect.gen(function* () {
+          const [row] = yield* transaction.queryRows<AppConfigRow>(
+            `SELECT app_id, relay_id, name, config_ciphertext, created_by, created_at
+               FROM ${databaseTable("app")}
+              WHERE relay_id = ? AND app_id = ?
+              LIMIT 1
+                FOR UPDATE`,
+            [relayId, appId]
+          )
+          if (!row) return
+          const stored = yield* decryptStoredConfig(row).pipe(
+            Effect.orElseSucceed(() => null)
+          )
+          if (!stored || stored.databaseIds === undefined) return
+          const { databaseIds: _cleared, ...config } = stored
+          yield* transaction.execute(
+            `UPDATE ${databaseTable("app")}
+                SET config_ciphertext = ?
+              WHERE relay_id = ? AND app_id = ?`,
+            [yield* encryptConfig(config), relayId, appId]
+          )
+        })
+    )
+  }
+})
+
 function decryptConfig(row: AppConfigRow) {
+  return decryptStoredConfig(row).pipe(
+    Effect.map(({ databaseIds: _legacy, ...config }): AppConfig => config)
+  )
+}
+
+function decryptStoredConfig(row: AppConfigRow) {
   return Effect.try({
     try: () =>
       decryptWithKeyring(
@@ -179,7 +283,7 @@ function decryptConfig(row: AppConfigRow) {
     // Fields apps no longer have, like the data mount and disk limit, are
     // dropped from configs saved before.
     Effect.map((decrypted) =>
-      appConfigSchema.strip().parse({
+      storedAppConfigSchema.parse({
         ...defaultAppConfig,
         ...(JSON.parse(decrypted.plaintext) as object),
       })
@@ -242,7 +346,7 @@ function toRecord(row: AppRow): AppRecord {
   }
 }
 
-function encryptConfig(config: AppConfig) {
+function encryptConfig(config: StoredAppConfig) {
   return Effect.try({
     try: () =>
       encryptWithKeyring(
