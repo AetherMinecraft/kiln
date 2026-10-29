@@ -1,6 +1,7 @@
 import { Layer } from "effect"
 
 import { deliverInvitation } from "@/lib/access-invitation-delivery"
+import { deleteResource, keepResource } from "@/lib/resource-deletion.server"
 import { deleteTailscaleNetwork } from "@/lib/tailscale-cleanup.server"
 
 /**
@@ -10,5 +11,7 @@ import { deleteTailscaleNetwork } from "@/lib/tailscale-cleanup.server"
  */
 export const HearthWorkflows = Layer.mergeAll(
   deliverInvitation.layer,
+  deleteResource.layer,
+  keepResource.layer,
   deleteTailscaleNetwork.layer
 )
