@@ -249,14 +249,25 @@ export const relayScheduleS3DestinationSchema = backupS3CredentialSchema
   })
   .strict()
 
+// One target's scheduled backup, as Hearth admitted it when it last sent
+// the schedule: where it goes, or, when Hearth would refuse it as it would
+// a manual one, why not, in which case the Relay doesn't run it.
 const relayScheduleBackupExecutionSchema = z
   .object({
-    destination: z.discriminatedUnion("kind", [
-      backupLocalDestinationSchema,
-      backupResticDestinationSchema,
-      relayScheduleS3DestinationSchema,
-    ]),
+    destination: z
+      .discriminatedUnion("kind", [
+        backupLocalDestinationSchema,
+        backupResticDestinationSchema,
+        relayScheduleS3DestinationSchema,
+      ])
+      .nullable(),
+    /** The most it may write, from the target's size ceilings. */
+    maxBytes: z.number().int().positive().nullable().optional(),
     mode: backupModeSchema,
+    /** Why it may not run; null when it may. */
+    refusal: z.string().min(1).max(300).nullable().optional(),
+    /** An incremental backup's repository, which catalogs it. */
+    repositoryId: z.uuid().nullable().optional(),
     targetId: z.string().min(1).max(120),
     targetKind: z.enum(["instance", "database", "relay"]),
   })
@@ -283,6 +294,13 @@ export type RelayScheduleAction = z.infer<typeof relayScheduleActionSchema>
 export const relayScheduleProjectionSchema = scheduleDefinitionSchema
   .safeExtend({
     actions: z.array(relayScheduleActionSchema).min(1).max(32),
+    /**
+     * Which version of what Hearth sends for this schedule and Relay: it
+     * rises with every send and every change to what decides it, such as a
+     * destination being disabled, without the schedule's revision changing.
+     * A Relay keeps the newest and turns away older ones arriving late.
+     */
+    generation: z.number().int().nonnegative().optional(),
   })
   .strict()
 
@@ -362,6 +380,8 @@ export type ScheduleRun = z.infer<typeof scheduleRunSchema>
 
 export const relayScheduleDeploymentSchema = z
   .object({
+    /** The generation the Relay now holds, which may be newer than sent. */
+    acknowledgedGeneration: z.number().int().nonnegative().optional(),
     acknowledgedRevision: z.number().int().positive(),
     nextRunAt: z.number().int().nonnegative().nullable(),
     scheduleId: z.uuid(),

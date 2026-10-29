@@ -87,6 +87,7 @@ export async function ensureFinalInstanceDeletion(input: {
   const backup = reserved.success
   publishBackupChange(input.relay.id, backup.backupId)
   const { dispatchBackupTask } = await import("@/lib/backup-reconciliation")
+  await deliverSchedules()
   await dispatchBackupTask(input.relay, backup, input.requestedBy)
   const created = await finalDeletion(input.relay.id, input.instanceId)
   if (!created) throw new Error("Final server deletion was not persisted")
@@ -217,6 +218,7 @@ async function processFinalInstanceDeletion(
         from: ["backing_up"],
         status: "failed",
       })
+      await deliverSchedules()
       return
     }
     if (deletion.backupStatus !== "available") return
@@ -336,4 +338,13 @@ function finalBackupFailure(deletion: FinalInstanceDeletion): Error {
   return new Error(
     deletion.error ?? "The final backup failed; the server was not deleted"
   )
+}
+
+// Scheduled backups stop while it's being deleted, and resume if its
+// deletion stops: reserving its final backup, or recording it failed, marked
+// its schedules owed (`invalidateScheduleDeploymentsEffect`).
+async function deliverSchedules() {
+  const { deliverPendingSchedules } =
+    await import("@/server/schedule-deployment.server")
+  deliverPendingSchedules()
 }

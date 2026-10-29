@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto"
 import { Effect, Result } from "effect"
 import { z } from "zod"
 
-
 import {
   clearFailedFinalDatabaseDeletionEffect,
   getFinalDatabaseDeletionEffect,
@@ -161,6 +160,7 @@ export async function ensureFinalDatabaseDeletion(input: {
   }
   publishBackupChange(input.relay.id, reserved.success.backupId)
   const { dispatchBackupTask } = await import("@/lib/backup-reconciliation")
+  await deliverSchedules()
   await dispatchBackupTask(input.relay, reserved.success, input.requestedBy)
   const created = await finalDatabaseDeletion(input.relay.id, input.databaseId)
   if (!created) throw new Error("Final database deletion was not persisted")
@@ -180,6 +180,7 @@ async function processFinalDatabaseDeletion(
         deletion.taskError ??
           "The final backup failed; the database was not deleted"
       )
+      await deliverSchedules()
       return
     }
     if (deletion.backupStatus !== "available") return
@@ -289,4 +290,13 @@ function finalBackupFailure(deletion: FinalDatabaseDeletion): Error {
   return new Error(
     deletion.error ?? "The final backup failed; the database was not deleted"
   )
+}
+
+// Scheduled backups stop while it's being deleted, and resume if its
+// deletion stops: reserving its final backup, or recording it failed, marked
+// its schedules owed (`invalidateScheduleDeploymentsEffect`).
+async function deliverSchedules() {
+  const { deliverPendingSchedules } =
+    await import("@/server/schedule-deployment.server")
+  deliverPendingSchedules()
 }

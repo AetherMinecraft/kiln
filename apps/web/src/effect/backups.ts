@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto"
 import type { RowDataPacket } from "mysql2/promise"
-import { Clock, Effect } from "effect"
+import { Clock, Effect, Result } from "effect"
 
 import type {
   BackupConsistency,
@@ -26,6 +26,7 @@ import {
 import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
 import { Database } from "@/effect/database"
 import type { DatabaseTransaction } from "@/effect/database"
+import { invalidateScheduleDeploymentsEffect } from "@/effect/schedule-invalidation"
 import { kilnInstallationId } from "@/effect/installation"
 import {
   BackupLimitError,
@@ -228,8 +229,11 @@ interface DispatchableBackupRow extends RowDataPacket {
 }
 
 interface KnownBackupTaskRow extends RowDataPacket {
+  task_kind?: string
   backup_mode: BackupRow["backup_mode"]
   backup_status: BackupRow["status"]
+  reason?: string
+  repository_id?: string | null
   bytes_completed: number | string
   id: string
   relay_updated_at_ms: number | string | null
@@ -729,6 +733,15 @@ const reserveBackupCreateEffect = Effect.fn("backups.reserveCreate")(
             ]
           )
         }
+        // Its scheduled backups stop while it's being deleted. The seam with
+        // deletion: where it runs as `resource.delete`, its own transitions
+        // do this.
+        if (input.reason === "final_delete") {
+          yield* invalidateScheduleDeploymentsEffect(transaction, {
+            relayId: input.relayId,
+            target: { id: input.targetId, kind: input.targetKind },
+          })
+        }
         return {
           artifacts,
           artifactKind,
@@ -837,6 +850,100 @@ export const reserveResourceBackupEffect = Effect.fn("backups.reserveResource")(
     })
 )
 
+/**
+ * Whether one target's scheduled backup may run, decided as a manual
+ * backup's reservation decides it: not while the target is being deleted,
+ * not where backups are turned off for it (a quantity or size ceiling of
+ * none), and only to a destination that's enabled, not being deleted, and
+ * shared or the schedule owner's. The Relay runs scheduled backups on its
+ * own, so Hearth decides this when it sends the schedule, and sends it again
+ * when any of it changes (`invalidateScheduleDeploymentsEffect`). Also the most an
+ * admitted one may write.
+ */
+export const scheduledBackupAdmissionEffect = Effect.fn(
+  "backups.scheduledAdmission"
+)(function* (input: {
+  mode: "full" | "incremental"
+  /** Who owns the schedule; a personal destination must be theirs. */
+  owner: string | null
+  relayId: string
+  storageId: string | null
+  targetId: string
+  targetKind: BackupTargetKind
+}) {
+  const database = yield* Database
+  const admitted = (maxBytes: number | null) => ({ maxBytes, refusal: null })
+  const refused = (refusal: string) => ({ maxBytes: null, refusal })
+  return yield* database.transaction(
+    "backup_scheduled_admission",
+    (transaction) =>
+      Effect.gen(function* () {
+        // The seam with deletion: on this base, the final-delete tables;
+        // where deletion runs as `resource.delete`, its own table.
+        const deleting = yield* Effect.result(
+          refuseIfFinalDeletionInProgress(transaction, {
+            operation: "backup.scheduled",
+            relayId: input.relayId,
+            targetId: input.targetId,
+            targetKind: input.targetKind,
+          })
+        )
+        if (Result.isFailure(deleting)) {
+          return refused("it's being permanently deleted")
+        }
+        const [policy] = yield* transaction.queryRows<BackupPolicyRow>(
+          `SELECT quantity_limit, size_limit_bytes, admin_quantity_limit,
+                  admin_size_limit_bytes
+             FROM ${databaseTable("backup_policy")}
+            WHERE relay_id = ? AND target_kind = ? AND target_id = ?`,
+          [input.relayId, input.targetKind, input.targetId]
+        )
+        const quantityLimit = effectiveBackupLimit(
+          policy?.quantity_limit ?? null,
+          policy?.admin_quantity_limit ?? null
+        )
+        const sizeLimit = effectiveBackupLimit(
+          nullableDatabaseNumber(
+            policy?.size_limit_bytes ?? null,
+            "backup size limit"
+          ),
+          nullableDatabaseNumber(
+            policy?.admin_size_limit_bytes ?? null,
+            "admin backup size limit"
+          )
+        )
+        if (quantityLimit === 0 || sizeLimit === 0) {
+          return refused("backups are turned off for it")
+        }
+        if (input.storageId) {
+          const storage = (yield* lockBackupStorageRows(transaction, [
+            input.storageId,
+          ])).get(input.storageId)
+          if (!storage) return refused("its backup destination is gone")
+          if (!storage.enabled) {
+            return refused("its backup destination is disabled")
+          }
+          if (storage.deleting) {
+            return refused("its backup destination is being deleted")
+          }
+          if (
+            storage.owner_user_id !== null &&
+            storage.owner_user_id !== input.owner
+          ) {
+            return refused(
+              "its backup destination is someone else's personal one"
+            )
+          }
+          if (input.mode === "incremental") {
+            const locationError = incrementalStorageLocationError(storage)
+            if (locationError) return refused(locationError)
+          }
+        }
+        return admitted(sizeLimit)
+      })
+  )
+})
+
 const adoptScheduledBackupTask = Effect.fnUntraced(function* (
   transaction: DatabaseTransaction,
   relayId: string,
@@ -854,20 +961,39 @@ const adoptScheduledBackupTask = Effect.fnUntraced(function* (
   const catalog = input.catalog
   const artifactId = input.destination.artifactId
   if (!catalog || !artifactId) return
+  // An incremental one names the repository Hearth sent with its schedule;
+  // one from before that is found by its target and destination. Without
+  // its repository's password a snapshot can't be restored, so one whose
+  // repository is gone is cataloged as failed, not left out.
   const repositoryRows =
     input.mode === "incremental"
-      ? yield* transaction.queryRows<ScheduledBackupRepositoryRow>(
-          `SELECT id
-             FROM ${databaseTable("backup_repository")}
-            WHERE relay_id = ? AND target_kind = ? AND target_id = ?
-              AND storage_id <=> ?
-            LIMIT 1
-            FOR UPDATE`,
-          [relayId, input.target.kind, input.target.id, catalog.storageId]
-        )
+      ? catalog.repositoryId
+        ? yield* transaction.queryRows<ScheduledBackupRepositoryRow>(
+            `SELECT id
+               FROM ${databaseTable("backup_repository")}
+              WHERE id = ? AND relay_id = ? AND target_kind = ?
+                AND target_id = ?
+              LIMIT 1
+              FOR UPDATE`,
+            [catalog.repositoryId, relayId, input.target.kind, input.target.id]
+          )
+        : yield* transaction.queryRows<ScheduledBackupRepositoryRow>(
+            `SELECT id
+               FROM ${databaseTable("backup_repository")}
+              WHERE relay_id = ? AND target_kind = ? AND target_id = ?
+                AND storage_key = ?
+              LIMIT 1
+              FOR UPDATE`,
+            [
+              relayId,
+              input.target.kind,
+              input.target.id,
+              catalog.storageId ?? "local",
+            ]
+          )
       : []
   const repositoryId = repositoryRows[0]?.id ?? null
-  if (input.mode === "incremental" && !repositoryId) return
+  const orphaned = input.mode === "incremental" && !repositoryId
   const objectKey =
     input.destination.kind === "s3" ? input.destination.objectKey : null
 
@@ -876,7 +1002,7 @@ const adoptScheduledBackupTask = Effect.fnUntraced(function* (
       (id, relay_id, target_kind, target_id, storage_id, artifact_kind,
        backup_mode, reason, status, name, object_key, repository_id,
        warnings, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', 'queued', ?, ?, ?,
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?,
              JSON_ARRAY(), NULL, ?, ?)`,
     [
       input.backupId,
@@ -886,6 +1012,7 @@ const adoptScheduledBackupTask = Effect.fnUntraced(function* (
       catalog.storageId,
       input.artifactKind,
       input.mode,
+      orphaned ? "failed" : "queued",
       catalog.name,
       objectKey,
       repositoryId,
@@ -897,12 +1024,13 @@ const adoptScheduledBackupTask = Effect.fnUntraced(function* (
     `INSERT IGNORE INTO ${databaseTable("backup_artifact")}
       (id, backup_id, destination_key, storage_id, status, object_key,
        created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       artifactId,
       input.backupId,
       input.mode === "incremental" ? "restic" : (catalog.storageId ?? "local"),
       catalog.storageId,
+      orphaned ? "failed" : "queued",
       objectKey,
       task.createdAt,
       now,
@@ -911,9 +1039,19 @@ const adoptScheduledBackupTask = Effect.fnUntraced(function* (
   yield* transaction.execute(
     `INSERT IGNORE INTO ${databaseTable("backup_task")}
       (id, backup_id, task_kind, status, reserved_bytes, requested_by,
-       created_at, updated_at)
-     VALUES (?, ?, 'create', 'queued', ?, NULL, ?, ?)`,
-    [input.taskId, input.backupId, input.maxBytes, task.createdAt, now]
+       error, created_at, updated_at)
+     VALUES (?, ?, 'create', ?, ?, NULL, ?, ?, ?)`,
+    [
+      input.taskId,
+      input.backupId,
+      orphaned ? "failed" : "queued",
+      input.maxBytes,
+      orphaned
+        ? "Its repository was gone when it finished, so it can't be restored"
+        : null,
+      task.createdAt,
+      now,
+    ]
   )
 })
 
@@ -927,6 +1065,7 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
         const knownTasks = yield* transaction.queryRows<KnownBackupTaskRow>(
           `SELECT task.id, task.status, task.bytes_completed,
                   backup.status AS backup_status, backup.backup_mode,
+                  backup.repository_id, backup.reason, task.task_kind,
                   task.relay_updated_at_ms
              FROM ${databaseTable("backup_task")} task
              JOIN ${databaseTable("backup")} backup ON backup.id = task.backup_id
@@ -941,6 +1080,7 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
           const adoptedTasks = yield* transaction.queryRows<KnownBackupTaskRow>(
             `SELECT task.id, task.status, task.bytes_completed,
                       backup.status AS backup_status, backup.backup_mode,
+                      backup.repository_id, backup.reason, task.task_kind,
                       task.relay_updated_at_ms
                  FROM ${databaseTable("backup_task")} task
                  JOIN ${databaseTable("backup")} backup ON backup.id = task.backup_id
@@ -951,6 +1091,17 @@ export const reconcileBackupTaskEffect = Effect.fn("backups.reconcile")(
           knownTask = adoptedTasks[0]
         }
         if (!knownTask) return
+        // A scheduled snapshot whose repository was gone when it was
+        // cataloged stays failed: it can't be restored, whatever the Relay
+        // says of it.
+        if (
+          knownTask.task_kind === "create" &&
+          knownTask.reason === "scheduled" &&
+          knownTask.backup_mode === "incremental" &&
+          !knownTask.repository_id
+        ) {
+          return
+        }
         if (
           !shouldApplyRelayBackupTaskSnapshot(
             {
@@ -2592,10 +2743,11 @@ export const ensureBackupRepositoryEffect = Effect.fn(
           targetKind: "instance",
         })
         return {
+          id: repository.id,
           objectPrefix: repository.objectPrefix,
           password: repository.password,
           storageId: repository.storageId,
-        } satisfies BackupRepositorySecret
+        }
       })
   )
 })
@@ -3055,9 +3207,10 @@ export const updateBackupLimitsEffect = Effect.fn("backups.updateLimits")(
     const quantityColumn = `${prefix}quantity_limit`
     const sizeColumn = `${prefix}size_limit_bytes`
     const daysColumn = `${prefix}retention_days`
-    yield* database.execute(
-      "backup_limits_update",
-      `INSERT INTO ${databaseTable("backup_policy")}
+    yield* database.transaction("backup_limits_update", (transaction) =>
+      Effect.gen(function* () {
+        yield* transaction.execute(
+          `INSERT INTO ${databaseTable("backup_policy")}
         (relay_id, target_kind, target_id, exclude_patterns,
          ${quantityColumn}, ${sizeColumn}, ${daysColumn}, created_at,
          updated_at)
@@ -3067,16 +3220,24 @@ export const updateBackupLimitsEffect = Effect.fn("backups.updateLimits")(
          ${sizeColumn} = VALUES(${sizeColumn}),
          ${daysColumn} = VALUES(${daysColumn}),
          updated_at = VALUES(updated_at)`,
-      [
-        input.relayId,
-        input.targetKind,
-        input.targetId,
-        input.quantityLimit,
-        input.sizeLimitBytes,
-        input.retentionDays,
-        now,
-        now,
-      ]
+          [
+            input.relayId,
+            input.targetKind,
+            input.targetId,
+            input.quantityLimit,
+            input.sizeLimitBytes,
+            input.retentionDays,
+            now,
+            now,
+          ]
+        )
+        // Turning backups off, or on, or capping their size decides what
+        // the target's scheduled backups may do.
+        yield* invalidateScheduleDeploymentsEffect(transaction, {
+          relayId: input.relayId,
+          target: { id: input.targetId, kind: input.targetKind },
+        })
+      })
     )
   }
 )
@@ -3248,22 +3409,34 @@ export const updateFinalInstanceDeletionEffect = Effect.fn(
   const database = yield* Database
   const now = yield* Clock.currentTimeMillis
   const placeholders = input.from.map(() => "?").join(", ")
-  const result = yield* database.execute(
+  return yield* database.transaction(
     "backup_final_delete_update",
-    `UPDATE ${databaseTable("backup_final_delete")}
-        SET status = ?, error = ?, updated_at = ?
-      WHERE relay_id = ? AND target_id = ?
-        AND status IN (${placeholders})`,
-    [
-      input.status,
-      input.error,
-      now,
-      input.relayId,
-      input.targetId,
-      ...input.from,
-    ]
+    (transaction) =>
+      Effect.gen(function* () {
+        const result = yield* transaction.execute(
+          `UPDATE ${databaseTable("backup_final_delete")}
+            SET status = ?, error = ?, updated_at = ?
+          WHERE relay_id = ? AND target_id = ?
+            AND status IN (${placeholders})`,
+          [
+            input.status,
+            input.error,
+            now,
+            input.relayId,
+            input.targetId,
+            ...input.from,
+          ]
+        )
+        // Stopped, it may be backed up on schedule again.
+        if (result.affectedRows > 0 && input.status === "failed") {
+          yield* invalidateScheduleDeploymentsEffect(transaction, {
+            relayId: input.relayId,
+            target: { id: input.targetId, kind: "instance" },
+          })
+        }
+        return result.affectedRows > 0
+      })
   )
-  return result.affectedRows > 0
 })
 
 export const getFinalDatabaseDeletionEffect = Effect.fn(
@@ -3320,22 +3493,34 @@ export const updateFinalDatabaseDeletionEffect = Effect.fn(
   const database = yield* Database
   const now = yield* Clock.currentTimeMillis
   const placeholders = input.from.map(() => "?").join(", ")
-  const result = yield* database.execute(
+  return yield* database.transaction(
     "backup_final_database_delete_update",
-    `UPDATE ${databaseTable("backup_final_database_delete")}
-        SET status = ?, error = ?, updated_at = ?
-      WHERE relay_id = ? AND target_id = ?
-        AND status IN (${placeholders})`,
-    [
-      input.status,
-      input.error,
-      now,
-      input.relayId,
-      input.targetId,
-      ...input.from,
-    ]
+    (transaction) =>
+      Effect.gen(function* () {
+        const result = yield* transaction.execute(
+          `UPDATE ${databaseTable("backup_final_database_delete")}
+            SET status = ?, error = ?, updated_at = ?
+          WHERE relay_id = ? AND target_id = ?
+            AND status IN (${placeholders})`,
+          [
+            input.status,
+            input.error,
+            now,
+            input.relayId,
+            input.targetId,
+            ...input.from,
+          ]
+        )
+        // Stopped, it may be backed up on schedule again.
+        if (result.affectedRows > 0 && input.status === "failed") {
+          yield* invalidateScheduleDeploymentsEffect(transaction, {
+            relayId: input.relayId,
+            target: { id: input.targetId, kind: "database" },
+          })
+        }
+        return result.affectedRows > 0
+      })
   )
-  return result.affectedRows > 0
 })
 
 const finalInstanceDeletionSelect = `SELECT final_delete.relay_id,

@@ -20,6 +20,7 @@ import {
   setBackupPolicyStorageEffect,
   type BackupStorageRecord,
 } from "@/backups/destinations/s3"
+import { ensuringPromise } from "@/effect/promise"
 import { runAppEffect } from "@/effect/runtime"
 import { hasPlatformPermission, isPlatformAdmin } from "@/lib/access-control"
 import {
@@ -151,6 +152,9 @@ export const saveBackupStorage = createServerFn({ method: "POST" })
       })
     )
     publishBackupStorageChange(ownerUserId)
+    // Schedules carry its credentials and whether it may be used; saving
+    // marked them owed.
+    await deliverSchedules()
     return { id, verified: true }
   })
 
@@ -169,9 +173,15 @@ export const deleteBackupStorage = createServerFn({ method: "POST" })
     ) {
       throw new Error("You cannot delete this backup destination")
     }
-    await runAppEffect(
-      "backupStorage.delete",
-      deleteBackupStorageEffect(data.id)
+    // Marking it deleted marks the schedules backing up to it owed; they're
+    // sent whether or not purging it then succeeds.
+    await ensuringPromise(
+      () =>
+        runAppEffect(
+          "backupStorage.delete",
+          deleteBackupStorageEffect(data.id)
+        ),
+      () => void deliverSchedules()
     )
     publishBackupStorageChange(existing.ownerUserId)
     return { deleted: true }
@@ -256,4 +266,10 @@ function canUseStorage(
   userId: string
 ): boolean {
   return storage.ownerUserId === null || storage.ownerUserId === userId
+}
+
+async function deliverSchedules() {
+  const { deliverPendingSchedules } =
+    await import("@/server/schedule-deployment.server")
+  deliverPendingSchedules()
 }
