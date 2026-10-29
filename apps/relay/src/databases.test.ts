@@ -74,7 +74,7 @@ describe("managed database recovery metadata", () => {
         id,
         view: "detail",
         observedState: "running",
-        database: expect.objectContaining({ id, connectedInstanceIds: [] }),
+        database: expect.objectContaining({ id, members: [] }),
       },
     ])
   })
@@ -905,8 +905,19 @@ describe("explicit database connections", () => {
       member: { id: serverId, kind: "instance" },
     })
 
-    expect(updated.connectedInstanceIds).toEqual([serverId])
-    expect(server.networks.has(networkOf(id))).toBe(true)
+    expect(updated.members).toEqual([
+      {
+        attached: true,
+        hostnames: [`server-${serverId}`],
+        id: serverId,
+        kind: "instance",
+        pendingHostnames: [],
+        saved: true,
+      },
+    ])
+    expect(server.networks.get(networkOf(id))?.aliases).toContain(
+      `server-${serverId}`
+    )
     expect(server.state).toMatchObject({ running: true, startedAt })
   })
 
@@ -1074,6 +1085,346 @@ describe("connections of every member kind", () => {
       networkOf(member!),
     ])
     expect((await harness.apps.get(appId)).savedDatabaseIds).toEqual([other])
+  })
+
+  it("lists a database's members of every kind, as connected and as they are, under their names", async () => {
+    const harness = await relayHarness()
+    const [target, member] = ["d", "e"].map((c) => c.repeat(40))
+    for (const id of [target!, member!]) await createDatabase(harness, id)
+    await harness.seedServer({ id: serverId, running: true })
+    const app = await runningApp(harness)
+    const undeployed = "f".repeat(40)
+    await harness.apps.create({ id: undeployed, name: "Docs" })
+    for (const to of [
+      { id: serverId, kind: "instance" },
+      { id: appId, kind: "app" },
+      { id: undeployed, kind: "app" },
+      { id: member!, kind: "database" },
+    ] as const) {
+      await harness.databases.updateNetwork({
+        connected: true,
+        databaseId: target!,
+        member: to,
+      })
+    }
+
+    const listed = (await harness.databases.list()).find(
+      (database) => database.id === target
+    )
+    expect(
+      [...(listed?.members ?? [])].sort((left, right) =>
+        `${left.kind}${left.id}`.localeCompare(`${right.kind}${right.id}`)
+      )
+    ).toEqual([
+      {
+        attached: true,
+        hostnames: [`web.app-${appId.slice(0, 8)}`],
+        id: appId,
+        kind: "app",
+        pendingHostnames: [],
+        saved: true,
+      },
+      // An App joins once it has containers, under its services' names.
+      {
+        attached: false,
+        hostnames: [],
+        id: undeployed,
+        kind: "app",
+        pendingHostnames: [],
+        saved: true,
+      },
+      {
+        attached: true,
+        hostnames: [`database-${member}`],
+        id: member,
+        kind: "database",
+        pendingHostnames: [],
+        saved: true,
+      },
+      {
+        attached: true,
+        hostnames: [`server-${serverId}`],
+        id: serverId,
+        kind: "instance",
+        pendingHostnames: [],
+        saved: true,
+      },
+    ])
+    expect(app.networks.get(networkOf(target!))?.aliases).toContain(
+      `web.app-${appId.slice(0, 8)}`
+    )
+    // A connection goes one way: the database doesn't join its member's
+    // network, nor does the member list it.
+    expect(databaseContainer(target!).networks.has(networkOf(member!))).toBe(
+      false
+    )
+    expect(
+      (await harness.databases.list()).find(
+        (database) => database.id === member
+      )?.members
+    ).toEqual([])
+  })
+
+  it("reports a name a member that joined before names lacks as pending, until it's recreated", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.createServer({ id: serverId })
+    // Joined by a Relay that gave members no name there.
+    await harness.databaseConnections.set(
+      { id: serverId, kind: "instance" },
+      id,
+      true
+    )
+    fakeDocker.connect(
+      harness.resources.instanceContainer(serverId),
+      networkOf(id)
+    )
+    const membersOf = async () =>
+      (await harness.databases.list()).find((database) => database.id === id)
+        ?.members
+    expect(await membersOf()).toEqual([
+      expect.objectContaining({
+        attached: true,
+        hostnames: [],
+        pendingHostnames: [`server-${serverId}`],
+      }),
+    ])
+
+    // A port change recreates the server's container.
+    await harness.lifecycle.updateInstancePorts(
+      serverId,
+      [
+        {
+          id: "primary",
+          internalPort: 25_566,
+          name: "Default Server",
+          protocol: "tcp",
+        },
+      ],
+      []
+    )
+
+    expect(await membersOf()).toEqual([
+      expect.objectContaining({
+        attached: true,
+        hostnames: [`server-${serverId}`],
+        pendingHostnames: [],
+      }),
+    ])
+  })
+
+  it.each(["start", "restart"] as const)(
+    "gives a member database that joined without its name the name when it %ss",
+    async (action) => {
+      const harness = await relayHarness()
+      const [target, member] = ["d", "e"].map((c) => c.repeat(40))
+      for (const id of [target!, member!]) await createDatabase(harness, id)
+      // Joined by a Relay that gave members no name there.
+      await harness.databaseConnections.set(
+        { id: member!, kind: "database" },
+        target!,
+        true
+      )
+      fakeDocker.connect(databaseContainer(member!).name, networkOf(target!))
+      if (action === "start") {
+        await harness.databases.action({ action: "stop", databaseId: member! })
+      }
+
+      await harness.databases.action({ action, databaseId: member! })
+
+      expect(
+        databaseContainer(member!).networks.get(networkOf(target!))?.aliases
+      ).toContain(`database-${member}`)
+    }
+  )
+
+  it("keeps a member database on the network while it shuts down for a restart, and only then gives it its name", async () => {
+    const harness = await relayHarness()
+    const [target, member] = ["d", "e"].map((c) => c.repeat(40))
+    for (const id of [target!, member!]) await createDatabase(harness, id)
+    await harness.databaseConnections.set(
+      { id: member!, kind: "database" },
+      target!,
+      true
+    )
+    fakeDocker.connect(databaseContainer(member!).name, networkOf(target!))
+    const stopping = fakeDocker.hold({
+      command: "stop",
+      target: databaseContainer(member!).id,
+    })
+
+    const restarted = harness.databases.action({
+      action: "restart",
+      databaseId: member!,
+    })
+    await stopping.reached
+    // Still reaching the database while it shuts down.
+    expect(
+      databaseContainer(member!).networks.get(networkOf(target!))?.aliases
+    ).not.toContain(`database-${member}`)
+    expect(databaseContainer(member!).networks.has(networkOf(target!))).toBe(
+      true
+    )
+    stopping.release()
+    await restarted
+
+    expect(
+      databaseContainer(member!).networks.get(networkOf(target!))?.aliases
+    ).toContain(`database-${member}`)
+  })
+
+  it("leaves a running member database's attachment alone when asked to start", async () => {
+    const harness = await relayHarness()
+    const [target, member] = ["d", "e"].map((c) => c.repeat(40))
+    for (const id of [target!, member!]) await createDatabase(harness, id)
+    await harness.databaseConnections.set(
+      { id: member!, kind: "database" },
+      target!,
+      true
+    )
+    fakeDocker.connect(databaseContainer(member!).name, networkOf(target!))
+    const before = databaseContainer(member!).networks.get(networkOf(target!))
+
+    await harness.databases.action({ action: "start", databaseId: member! })
+
+    // The same attachment, not one made again.
+    expect(databaseContainer(member!).networks.get(networkOf(target!))).toBe(
+      before
+    )
+  })
+
+  it("keeps a game server on the network while it shuts down for a restart", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.createServer({ id: serverId, start: true })
+    await harness.databaseConnections.set(
+      { id: serverId, kind: "instance" },
+      id,
+      true
+    )
+    const container = harness.resources.instanceContainer(serverId)
+    fakeDocker.connect(container, networkOf(id))
+    const instance = await harness.docker.findInstance(serverId)
+    if (!instance) throw new Error("The server was not discovered")
+    const stopping = fakeDocker.hold({ command: "stop" })
+
+    const restarted = harness.docker.runAction(instance, "restart")
+    await stopping.reached
+    expect(fakeDocker.container(container)?.networks.has(networkOf(id))).toBe(
+      true
+    )
+    stopping.release()
+    await restarted
+
+    expect(
+      fakeDocker.container(container)?.networks.get(networkOf(id))?.aliases
+    ).toContain(`server-${serverId}`)
+  })
+
+  it("gives a crashed game server that joined without its name the name as recovery starts it", async () => {
+    const harness = await relayHarness({
+      KILN_RELAY_CRASH_RETRY_DELAY_SECONDS: "0",
+    })
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.createServer({ id: serverId, start: true })
+    await harness.databaseConnections.set(
+      { id: serverId, kind: "instance" },
+      id,
+      true
+    )
+    const container = harness.resources.instanceContainer(serverId)
+    fakeDocker.connect(container, networkOf(id))
+    fakeDocker.exit(container, { exitCode: 1 })
+
+    // Recovery schedules a start for the crash, then makes it.
+    await harness.docker.inspectInstances()
+    await harness.docker.inspectInstances()
+    await vi.waitFor(() =>
+      expect(fakeDocker.container(container)?.state.running).toBe(true)
+    )
+
+    expect(
+      fakeDocker.container(container)?.networks.get(networkOf(id))?.aliases
+    ).toContain(`server-${serverId}`)
+  })
+
+  it.each(["start", "restart"] as const)(
+    "gives a game server that joined without its name the name when it %ss",
+    async (action) => {
+      const harness = await relayHarness()
+      const id = "d".repeat(40)
+      await createDatabase(harness, id)
+      await harness.createServer({ id: serverId, start: action === "restart" })
+      await harness.databaseConnections.set(
+        { id: serverId, kind: "instance" },
+        id,
+        true
+      )
+      const container = harness.resources.instanceContainer(serverId)
+      fakeDocker.connect(container, networkOf(id))
+      const instance = await harness.docker.findInstance(serverId)
+      if (!instance) throw new Error("The server was not discovered")
+
+      await harness.docker.runAction(instance, action)
+
+      expect(
+        fakeDocker.container(container)?.networks.get(networkOf(id))?.aliases
+      ).toContain(`server-${serverId}`)
+    }
+  )
+
+  it("names a saved member that hasn't joined as pending, not as reachable", async () => {
+    const harness = await relayHarness()
+    const id = "d".repeat(40)
+    await createDatabase(harness, id)
+    await harness.databaseConnections.set(
+      { id: serverId, kind: "instance" },
+      id,
+      true
+    )
+
+    expect(
+      (await harness.databases.list()).find((database) => database.id === id)
+        ?.members
+    ).toEqual([
+      {
+        attached: false,
+        hostnames: [],
+        id: serverId,
+        kind: "instance",
+        pendingHostnames: [`server-${serverId}`],
+        saved: true,
+      },
+    ])
+  })
+
+  it("keeps a member database's name on the network when its container is replaced", async () => {
+    const harness = await relayHarness()
+    const [target, member] = ["d", "e"].map((c) => c.repeat(40))
+    for (const id of [target!, member!]) await createDatabase(harness, id)
+    await harness.databases.updateNetwork({
+      connected: true,
+      databaseId: target!,
+      member: { id: member!, kind: "database" },
+    })
+    const original = databaseContainer(member!).id
+    await harness.databases.setLimits({
+      databaseId: member!,
+      limits: { memoryBytes: 512 * 1024 ** 2 },
+    })
+    await harness.databases.setLimits({
+      databaseId: member!,
+      limits: { memoryBytes: null },
+    })
+
+    const replacement = databaseContainer(member!)
+    expect(replacement.id).not.toBe(original)
+    expect(replacement.networks.get(networkOf(target!))?.aliases).toContain(
+      `database-${member}`
+    )
   })
 
   it("joins a member database's replacement to its connections when a restart came first", async () => {
