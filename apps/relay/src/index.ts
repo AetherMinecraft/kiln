@@ -47,6 +47,7 @@ import {
   RelayTransferSourcePrepareSchema,
   appIdSchema,
   appTailscaleMember,
+  databaseTailscaleMemberId,
   instanceTailscaleMemberId,
   relayAppWebRouteStateSchema,
   relayAppWebRoutesWriteSchema,
@@ -435,8 +436,6 @@ const docker = new DockerDriver(
   lanes
 )
 const databases = new DatabaseDriver(config, docker, databaseConnections)
-// Before anything reads the databases, so none shows twice.
-await databases.recoverReplacements()
 const hostShell = new HostShell(config)
 const relayEngine = new DockerEngine(config.dockerSocket)
 const terminals = new ContainerTerminals(config)
@@ -487,6 +486,21 @@ const lifecycle = new LifecycleDriver(
 )
 // Before anything reads a Tailscale stack.
 await lifecycle.migrateTailscaleStackMembers()
+lifecycle.useDatabaseContainers((databaseId) =>
+  databases.containerOf(databaseId)
+)
+// A game server's container takes its addresses on its Tailscale networks
+// whenever it starts, its recovery starts included.
+runtimeRecovery.useTailscaleAddresses((instanceId) =>
+  lifecycle.reattachTailscaleMember(instanceTailscaleMemberId(instanceId))
+)
+// A database's container takes its addresses on its Tailscale networks once
+// a replacement's old one has let them go, and whenever it starts.
+databases.useTailscaleAddresses((databaseId) =>
+  lifecycle.reattachTailscaleMember(databaseTailscaleMemberId(databaseId))
+)
+// Before anything reads the databases, so none shows twice.
+await databases.recoverReplacements()
 // What each queued change to a Tailscale stack planned its locks from, so it
 // can tell, once it runs, whether the stack changed meanwhile.
 const tailscaleStackPlans = new WeakMap<object, string>()
@@ -523,6 +537,10 @@ const apps = new AppDriver(
           startupCore.state.listInstanceRoutes(appRouteOwner(appId))
         )
       ),
+    reattachTailscale: (appId) =>
+      lifecycle.reattachTailscaleMembers(
+        (memberId) => appTailscaleMember(memberId)?.appId === appId
+      ),
     tailscale: async (appId) =>
       (
         await lifecycle.tailscaleMemberships(
@@ -541,6 +559,10 @@ lifecycle.useAppServiceContainers(async (appId, service) => {
   await apps.get(appId)
   return (await apps.serviceContainer(appId, service))?.name ?? null
 })
+// Every member whose container lost an address on its Tailscale networks
+// takes it again: a container the Relay replaced but stopped before
+// reattaching, or one Docker disconnected while the Relay was down.
+await lifecycle.reattachTailscaleMembers(() => true)
 const appFilesystem = new FilesystemDriver({
   ...config,
   rootDirectory: apps.rootDirectory,
@@ -2419,6 +2441,20 @@ async function executeControlRequest(
         )
       )
       if (discarded) return { databaseId: input.databaseId, deleted: true }
+      // Hearth removes its DNS records from every node first.
+      const member = databaseTailscaleMemberId(input.databaseId)
+      await lifecycle.detachFromTailscale(
+        (memberId) => memberId === member,
+        async ({ memberId, mode, stackIds }) => {
+          await awaitingTailscaleDns(stackIds, () =>
+            requestHearth(
+              "hearth.tailscale.member.detach",
+              { memberId, mode, stackIds },
+              60_000
+            )
+          )
+        }
+      )
       return databases.delete(input)
     }
     case "database.wipe":
@@ -2578,12 +2614,12 @@ async function executeControlRequest(
       )
       if (discarded) return { appId: input.appId, deleted: true }
       // Hearth removes its services' DNS records from every node first.
-      await lifecycle.detachAppFromTailscale(
-        input.appId,
+      await lifecycle.detachFromTailscale(
+        (memberId) => appTailscaleMember(memberId)?.appId === input.appId,
         async ({ memberId, mode, stackIds }) => {
           await awaitingTailscaleDns(stackIds, () =>
             requestHearth(
-              "hearth.tailscale.instance.detach",
+              "hearth.tailscale.member.detach",
               { memberId, mode, stackIds },
               60_000
             )
@@ -3015,7 +3051,7 @@ async function executeControlRequest(
         async ({ mode, stackIds }) => {
           await awaitingTailscaleDns(stackIds, () =>
             requestHearth(
-              "hearth.tailscale.instance.detach",
+              "hearth.tailscale.member.detach",
               {
                 memberId: instanceTailscaleMemberId(instanceId),
                 mode,

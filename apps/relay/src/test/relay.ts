@@ -16,6 +16,8 @@ import { pathToFileURL } from "node:url"
 import {
   appTailscaleMember,
   brickRecipeSchema,
+  databaseTailscaleMemberId,
+  instanceTailscaleMemberId,
   relayCreateInstanceSchema,
   type BrickRecipe,
   type RelayInstance,
@@ -136,6 +138,10 @@ export async function relayHarness(
       config,
       () => lifecycle.hostDataDirectory(),
       {
+        reattachTailscale: (appId) =>
+          lifecycle.reattachTailscaleMembers(
+            (memberId) => appTailscaleMember(memberId)?.appId === appId
+          ),
         routes: async (appId) =>
           lifecycle.appRoutePlan(
             await Effect.runPromise(
@@ -161,6 +167,15 @@ export async function relayHarness(
       return (await apps.serviceContainer(appId, service))?.name ?? null
     })
     const databases = new DatabaseDriver(config, docker, databaseConnections)
+    lifecycle.useDatabaseContainers((databaseId) =>
+      databases.containerOf(databaseId)
+    )
+    runtimeRecovery.useTailscaleAddresses((instanceId) =>
+      lifecycle.reattachTailscaleMember(instanceTailscaleMemberId(instanceId))
+    )
+    databases.useTailscaleAddresses((databaseId) =>
+      lifecycle.reattachTailscaleMember(databaseTailscaleMemberId(databaseId))
+    )
     return {
       apps,
       bricks,

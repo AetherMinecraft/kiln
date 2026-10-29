@@ -230,6 +230,32 @@ export class DatabaseDriver {
     })
   }
 
+  /** The database's container, or null when there's no such database. */
+  async containerOf(databaseId: string): Promise<string | null> {
+    const [container] = await this.#discover([databaseId])
+    return container?.Id ?? null
+  }
+
+  // Puts a database's container at its addresses on its Tailscale networks:
+  // once a replacement's old container is gone, and before it starts, so an
+  // attempt that failed is tried again. What it does is beside the
+  // replacement or start, which go ahead either way.
+  #tailscaleAddresses: (databaseId: string) => Promise<void> = async () => {}
+
+  useTailscaleAddresses(take: (databaseId: string) => Promise<void>) {
+    this.#tailscaleAddresses = take
+  }
+
+  async #takeTailscaleAddresses(databaseId: string): Promise<void> {
+    const done = await promiseResult(() => this.#tailscaleAddresses(databaseId))
+    if (Result.isFailure(done)) {
+      console.warn(
+        `Database ${databaseId.slice(0, 8)} couldn't take its place on its Tailscale networks:`,
+        done.failure
+      )
+    }
+  }
+
   /** Every database, with the placeholders of those still provisioning. */
   async list(): Promise<Array<RelayManagedDatabase>> {
     const [databases, provisioning] = await Promise.all([
@@ -651,6 +677,7 @@ export class DatabaseDriver {
     await Effect.runPromise(
       docker.removeContainer(container.Id, { force: true }).pipe(Effect.ignore)
     )
+    await this.#takeTailscaleAddresses(id)
   }
 
   /**
@@ -665,6 +692,8 @@ export class DatabaseDriver {
     const config = this.#config
     // A restart can come between creating the replacement and joining it to
     // the databases this one is connected to.
+    const replaced = (databaseId: string) =>
+      Effect.promise(() => this.#takeTailscaleAddresses(databaseId))
     const reconnect = (databaseId: string, container: string) =>
       Effect.promise(() =>
         this.connections.reconcile({ id: databaseId, kind: "database" }, [
@@ -728,6 +757,7 @@ export class DatabaseDriver {
           yield* engine
             .removeContainer(container.Id, { force: true })
             .pipe(Effect.ignore)
+          if (databaseId) yield* replaced(databaseId)
         }
       }).pipe(
         Effect.catch((cause) =>
@@ -757,6 +787,7 @@ export class DatabaseDriver {
       )
     } else if (input.action === "start") {
       await connect(!database.observedState.match(/^(?:running|starting)$/u))
+      await this.#takeTailscaleAddresses(database.id)
       await Effect.runPromise(
         this.#engine.startContainer(container, { timeout: 120_000 })
       )
@@ -767,6 +798,7 @@ export class DatabaseDriver {
         this.#engine.stopContainer(container, { seconds: 30, timeout: 45_000 })
       )
       await connect(true)
+      await this.#takeTailscaleAddresses(database.id)
       await Effect.runPromise(
         this.#engine.startContainer(container, { timeout: 120_000 })
       )

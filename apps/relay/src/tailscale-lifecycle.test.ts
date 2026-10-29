@@ -3,6 +3,7 @@ import { join } from "node:path"
 
 import {
   builtinTailscaleBrickId,
+  relayCreateDatabaseSchema,
   relayTailscaleStackApplySchema,
   relayTailscaleStackConfigSchema,
   relayTailscaleStackSchema,
@@ -326,15 +327,15 @@ describe("Tailscale stack forwarding", () => {
 })
 
 describe("Tailscale members", () => {
-  it("keeps a server at its Tailscale address when its container is recreated", async () => {
-    const harness = await relayHarness()
-    const serverId = "a".repeat(40)
-    const stackId = "c".repeat(40)
-    const address = "10.165.57.10"
-    await harness.createServer({ id: serverId })
+  const serverId = "a".repeat(40)
+  const stackId = "c".repeat(40)
+  const address = "10.165.57.10"
+
+  async function serverOnStack(harness: RelayHarness, start = false) {
+    await harness.createServer({ id: serverId, start })
     const network = harness.resources.tailscaleStackNetwork(stackId)
     fakeDocker.addNetwork({
-      labels: owner,
+      labels: { ...owner, "kiln.relay.network": `tailscale:${stackId}` },
       name: network,
       subnet: "10.165.57.0/24",
     })
@@ -356,7 +357,12 @@ describe("Tailscale members", () => {
         })
       )
     )
-    const container = harness.resources.instanceContainer(serverId)
+    return { container: harness.resources.instanceContainer(serverId), network }
+  }
+
+  it("keeps a server at its Tailscale address when its container is recreated", async () => {
+    const harness = await relayHarness()
+    const { container, network } = await serverOnStack(harness)
     fakeDocker.connect(container, network, address)
 
     // A port change recreates the server's container.
@@ -378,6 +384,94 @@ describe("Tailscale members", () => {
     ).toMatchObject({
       ipAddress: address,
     })
+  })
+
+  it("keeps an apply that finds its member already attached by the time it connects it", async () => {
+    const harness = await relayHarness()
+    const { container, network } = await serverOnStack(harness)
+    // The stack's container as installing it labels it.
+    const stack = harness.resources.tailscaleStackContainer(stackId)
+    fakeDocker.tailscale.machines.set(stack, {
+      ipv4: "100.64.0.9",
+      loggedIn: true,
+    })
+    await harness.seedServer({
+      id: stackId,
+      image: "tailscale/tailscale:stable",
+      labels: {
+        "kiln.brick.format": "kiln.brick/v1",
+        "kiln.brick.id": builtinTailscaleBrickId,
+        "kiln.instance.mount": "/config",
+        "kiln.instance.name": "Private Network",
+      },
+      mounts: [
+        {
+          destination: "/config",
+          source: join(harness.config.rootDirectory, stackId),
+          type: "bind",
+        },
+      ],
+      name: stack,
+      running: true,
+    })
+    const connect = fakeDocker.hold({
+      command: "network connect",
+      target: network,
+    })
+
+    const applied = harness.lifecycle.applyTailscaleStack(
+      relayTailscaleStackApplySchema.parse({
+        bindings: [{ hostname: "paper", memberId: `instance:${serverId}` }],
+        domain: "test",
+        hostname: "private-network",
+        id: stackId,
+        name: "Private Network",
+      })
+    )
+    await connect.reached
+    // The server's start puts it there first.
+    fakeDocker.connect(container, network, address)
+    connect.release()
+
+    await expect(applied).resolves.toBeDefined()
+    expect(
+      fakeDocker.container(container)!.networks.get(network)
+    ).toMatchObject({ ipAddress: address })
+    expect(await harness.lifecycle.tailscaleMemberships(() => true)).toEqual([
+      { address, memberId: `instance:${serverId}`, network },
+    ])
+  })
+
+  it("puts a crashed server back at its Tailscale address as recovery starts it", async () => {
+    const harness = await relayHarness({
+      KILN_RELAY_CRASH_RETRY_DELAY_SECONDS: "0",
+    })
+    const { container, network } = await serverOnStack(harness, true)
+    fakeDocker.exit(container, { exitCode: 1 })
+
+    // Recovery schedules a start for the crash, then makes it.
+    await harness.docker.inspectInstances()
+    await harness.docker.inspectInstances()
+    await vi.waitFor(() =>
+      expect(fakeDocker.container(container)!.state.running).toBe(true)
+    )
+
+    expect(
+      fakeDocker.container(container)!.networks.get(network)
+    ).toMatchObject({ ipAddress: address })
+  })
+
+  it("puts a server back at its Tailscale address when it starts, if it lost it", async () => {
+    const harness = await relayHarness()
+    const { container, network } = await serverOnStack(harness)
+    expect(fakeDocker.container(container)!.networks.has(network)).toBe(false)
+
+    const instance = await harness.docker.findInstance(serverId)
+    await harness.lifecycle.runInstanceAction(instance!, "start", [])
+
+    expect(
+      fakeDocker.container(container)!.networks.get(network)
+    ).toMatchObject({ ipAddress: address })
   })
 })
 
@@ -592,5 +686,136 @@ describe("Tailscale member identities", () => {
         harness.lifecycle.applyTailscaleStack(apply([]), planned)
       ).rejects.toThrow("changed while the change waited its turn")
     })
+  })
+})
+
+describe("Tailscale databases", () => {
+  const stackId = "c".repeat(40)
+  const databaseId = "d".repeat(40)
+  const address = "10.165.57.10"
+  const member = `database:${databaseId}`
+
+  async function databaseOnStack(harness: RelayHarness) {
+    await harness.databases.create(
+      relayCreateDatabaseSchema.parse({
+        databaseName: "kiln_app",
+        engine: "postgres",
+        id: databaseId,
+        name: "Main database",
+        password: "correct-horse-battery-staple-1",
+        username: "kiln_user",
+      })
+    )
+    const network = harness.resources.tailscaleStackNetwork(stackId)
+    fakeDocker.addNetwork({
+      labels: owner,
+      name: network,
+      subnet: "10.165.57.0/24",
+    })
+    const directory = join(harness.config.rootDirectory, stackId)
+    await mkdir(directory, { recursive: true })
+    await writeFile(
+      join(directory, "stack.json"),
+      JSON.stringify(
+        stackConfig(stackId, {
+          bindings: [
+            { address, enabled: true, hostname: "orders", memberId: member },
+          ],
+          subnet: "10.165.57.0/24",
+        })
+      )
+    )
+    const container = `${TEST_NAMESPACE}-kiln-db-${databaseId}-database`
+    fakeDocker.connect(container, network, address)
+    return { container, network }
+  }
+
+  it("keeps a database at its Tailscale address when its container is replaced", async () => {
+    const harness = await relayHarness()
+    const { container, network } = await databaseOnStack(harness)
+    const original = fakeDocker.container(container)!.id
+    await harness.databases.setLimits({
+      databaseId,
+      limits: { memoryBytes: 512 * 1024 ** 2 },
+    })
+
+    // Removing the limit replaces the container.
+    await harness.databases.setLimits({
+      databaseId,
+      limits: { memoryBytes: null },
+    })
+
+    const replacement = fakeDocker.container(container)!
+    expect(replacement.id).not.toBe(original)
+    expect(replacement.networks.get(network)).toMatchObject({
+      ipAddress: address,
+    })
+  })
+
+  it("puts a database back at its Tailscale address when the Relay starts, if it lost it meanwhile", async () => {
+    const harness = await relayHarness()
+    const { container, network } = await databaseOnStack(harness)
+    // Taken off behind the Relay's back, as a crash between replacing its
+    // container and reattaching it leaves it.
+    await Effect.runPromise(
+      new DockerEngine(harness.config.dockerSocket).disconnectNetwork(
+        network,
+        container
+      )
+    )
+    expect(fakeDocker.container(container)!.networks.has(network)).toBe(false)
+
+    const restarted = await harness.restart()
+    await restarted.lifecycle.reattachTailscaleMembers(() => true)
+
+    expect(
+      fakeDocker.container(container)!.networks.get(network)
+    ).toMatchObject({ ipAddress: address })
+  })
+
+  it("puts a replaced database back at its Tailscale address when it restarts, if taking it failed", async () => {
+    const harness = await relayHarness()
+    const { container, network } = await databaseOnStack(harness)
+    await harness.databases.setLimits({
+      databaseId,
+      limits: { memoryBytes: 512 * 1024 ** 2 },
+    })
+    // The old container is gone by the time the new one takes its address,
+    // so nothing is left to recover from when that fails.
+    fakeDocker.failNext(
+      { command: "network connect", target: network },
+      "Network unavailable"
+    )
+    await harness.databases.setLimits({
+      databaseId,
+      limits: { memoryBytes: null },
+    })
+    expect(fakeDocker.container(container)!.networks.has(network)).toBe(false)
+
+    await harness.databases.action({ action: "restart", databaseId })
+
+    expect(
+      fakeDocker.container(container)!.networks.get(network)
+    ).toMatchObject({ ipAddress: address })
+  })
+
+  it("takes a deleted database off its networks once Hearth has prepared their DNS", async () => {
+    const harness = await relayHarness()
+    const { container, network } = await databaseOnStack(harness)
+    stackContainer(harness, stackId, true)
+    const steps: Array<string> = []
+
+    await harness.lifecycle.detachFromTailscale(
+      (memberId) => memberId === member,
+      async ({ memberId, mode, stackIds }) => {
+        steps.push(
+          `${mode} ${memberId} ${stackIds.join(",")} attached=${fakeDocker.container(container)!.networks.has(network)}`
+        )
+      }
+    )
+
+    expect(steps).toEqual([`prepare ${member} ${stackId} attached=true`])
+    expect(fakeDocker.container(container)!.networks.has(network)).toBe(false)
+    expect(await harness.lifecycle.tailscaleMemberships(() => true)).toEqual([])
   })
 })

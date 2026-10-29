@@ -46,6 +46,7 @@ import type {
 } from "@workspace/contracts"
 import {
   appTailscaleMember,
+  databaseTailscaleMember,
   instanceTailscaleMember,
   instanceTailscaleMemberId,
   builtinTailscaleBrickId,
@@ -751,6 +752,13 @@ export class LifecycleDriver {
         // Throws for an app that isn't on this Relay. One not deployed yet
         // joins when it deploys.
         await this.#appServiceContainer?.(app.appId, app.service)
+        continue
+      }
+      const databaseId = databaseTailscaleMember(binding.memberId)
+      if (databaseId) {
+        if (!(await this.#databaseContainer?.(databaseId))) {
+          throw new Error(`Database ${binding.memberId} was not found`)
+        }
         continue
       }
       const instanceId = instanceTailscaleMember(binding.memberId)
@@ -4720,13 +4728,30 @@ export class LifecycleDriver {
     this.#appServiceContainer = resolve
   }
 
-  // The container a Tailscale member runs in: a game server's, or an App
-  // service's newest. Null when it has none yet.
+  // A database's container, or null when there's no such database. Set
+  // once the database driver exists.
+  #databaseContainer: ((databaseId: string) => Promise<string | null>) | null =
+    null
+
+  useDatabaseContainers(
+    resolve: (databaseId: string) => Promise<string | null>
+  ) {
+    this.#databaseContainer = resolve
+  }
+
+  // The container a Tailscale member runs in: a game server's, an App
+  // service's newest, or a database's. Null when it has none yet.
   async #tailscaleMemberContainer(memberId: string): Promise<string | null> {
     const app = appTailscaleMember(memberId)
     if (app) {
       return this.#appServiceContainer
         ? this.#appServiceContainer(app.appId, app.service)
+        : null
+    }
+    const databaseId = databaseTailscaleMember(memberId)
+    if (databaseId) {
+      return this.#databaseContainer
+        ? this.#databaseContainer(databaseId)
         : null
     }
     const instanceId = instanceTailscaleMember(memberId)
@@ -4750,8 +4775,35 @@ export class LifecycleDriver {
     )
   }
 
+  /**
+   * Puts every matching member's container back at its addresses: at
+   * startup, after a crash between replacing a container and reattaching
+   * it, and as a member starts. A member that can't be reattached is logged
+   * and skipped, and tried again when it next starts.
+   */
+  async reattachTailscaleMembers(
+    matches: (memberId: string) => boolean
+  ): Promise<void> {
+    const memberIds = new Set(
+      (await this.tailscaleMemberships(matches)).map(
+        (membership) => membership.memberId
+      )
+    )
+    for (const memberId of memberIds) {
+      await recoverPromise(
+        () => this.reattachTailscaleMember(memberId),
+        (cause) => {
+          console.warn(
+            `Could not put ${memberId} back on its Tailscale networks:`,
+            cause
+          )
+        }
+      )
+    }
+  }
+
   // Puts a member's container back at its address on each of its Tailscale
-  // networks, after the container was recreated.
+  // networks: after the container was recreated, or as it starts.
   async reattachTailscaleMember(memberId: string): Promise<void> {
     const container = await this.#tailscaleMemberContainer(memberId)
     if (!container) return
@@ -4767,11 +4819,11 @@ export class LifecycleDriver {
     }
   }
 
-  // Takes an app's services off their Tailscale networks before the app is
-  // deleted. Hearth drops their DNS records from every node first, and puts
-  // them back if the detach fails.
-  async detachAppFromTailscale(
-    appId: string,
+  // Takes members off their Tailscale networks before what they run in is
+  // deleted: an App's services, or a database. Hearth drops their DNS
+  // records from every node first, and puts them back if the detach fails.
+  async detachFromTailscale(
+    matches: (memberId: string) => boolean,
     synchronize: (input: {
       memberId: string
       mode: "prepare" | "rollback"
@@ -4784,7 +4836,7 @@ export class LifecycleDriver {
         configs.flatMap((config) =>
           config.bindings
             .map((binding) => binding.memberId)
-            .filter((memberId) => appTailscaleMember(memberId)?.appId === appId)
+            .filter((memberId) => matches(memberId))
         )
       ),
     ]
@@ -4861,15 +4913,32 @@ async function attachTailscaleMember(
   network: string,
   address: string
 ): Promise<void> {
-  const endpoint = (await containerNetworks(docker, container))[network]
-  if (endpoint && endpointAddress(endpoint) === address) return
-  if (endpoint) {
+  const attached = async () => {
+    const endpoint = (await containerNetworks(docker, container))[network]
+    return endpoint ? endpointAddress(endpoint) === address : null
+  }
+  // Something else can move it meanwhile, as a member's start does beside
+  // an apply that keeps its membership: a step that fails is fine if the
+  // endpoint is where that step was taking it.
+  const unless = (done: (now: boolean | null) => boolean) =>
+    Effect.catch((cause: unknown) =>
+      Effect.promise(attached).pipe(
+        Effect.flatMap((now) => (done(now) ? Effect.void : Effect.fail(cause)))
+      )
+    )
+  const before = await attached()
+  if (before) return
+  if (before === false) {
     await runLifecycle(
-      docker.disconnectNetwork(network, container, { force: true })
+      docker
+        .disconnectNetwork(network, container, { force: true })
+        .pipe(unless((now) => now !== false))
     )
   }
   await runLifecycle(
-    docker.connectNetwork(network, container, { ipv4Address: address })
+    docker
+      .connectNetwork(network, container, { ipv4Address: address })
+      .pipe(unless((now) => now === true))
   )
 }
 
