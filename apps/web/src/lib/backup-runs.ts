@@ -1,3 +1,8 @@
+import {
+  backupTargetKindSchema,
+  backupTargetSchema,
+  type BackupTargetKind,
+} from "@workspace/contracts"
 import { z } from "zod"
 
 import type { CursorPage } from "@/lib/cursor-page"
@@ -8,14 +13,14 @@ export type BackupRunSort = (typeof backupRunSorts)[number]
 export type BackupRunSortDirection = "asc" | "desc"
 export type BackupRunStatus = "active" | "available" | "failed"
 
-const backupRunTargetKindSchema = z.enum(["database", "instance", "platform"])
+const backupRunTargetKindSchema = backupTargetKindSchema
 
 /** One backup target, or every target of a kind, including future ones. */
 export const backupRunScopeSchema = z.union([
   z.strictObject({
     kind: backupRunTargetKindSchema,
     relayId: z.string().min(1).max(43),
-    targetId: z.string().min(1).max(120),
+    targetId: backupTargetSchema.shape.id,
   }),
   z.strictObject({ kind: backupRunTargetKindSchema }),
 ])
@@ -56,6 +61,7 @@ export interface BackupRun {
     | "database_dump"
     | "platform_bundle"
     | "restic_snapshot"
+    | "tar_archive"
   backupMode: "full" | "incremental"
   bytes: number | null
   checksumSha256: string | null
@@ -72,7 +78,7 @@ export interface BackupRun {
   status: "available" | "deleted" | "deleting" | "failed" | "queued" | "running"
   storageId: string | null
   targetId: string
-  targetKind: "database" | "instance" | "platform"
+  targetKind: BackupTargetKind
   taskBytesCompleted: number
   taskBytesTotal: number | null
   taskCurrentArtifactId: string | null
