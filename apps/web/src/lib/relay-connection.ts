@@ -33,6 +33,7 @@ import {
   relayControlRequestTimeoutMs,
   relayControlProtocol,
   relayControlDialV1Feature,
+  relayVolumesV1Feature,
   relayDialCloseCodes,
   relaySnapshotControlDelta,
   relaySnapshotDeltaFeature,
@@ -563,6 +564,27 @@ export function relayBrowserAuthorizationReady(
     : Promise.reject(new Error("Relay browser authorization is not connected"))
 }
 
+/**
+ * Whether this Hearth has sent a Relay every App's configured volumes on its
+ * current connection, so the Relay can tell which volumes are in use; or is
+ * retrying after a failure.
+ */
+export type VolumeReferencesState = "current" | "pending" | "retrying"
+
+export function relayVolumeReferencesState(
+  relayId: string
+): VolumeReferencesState {
+  return connections.get(relayId)?.volumeReferences ?? "pending"
+}
+
+/**
+ * Reconnects to every Relay, so each counts only the App configurations
+ * Hearth's database holds now, as after it's restored.
+ */
+export function reconnectRelayConnections(): void {
+  for (const connection of connections.values()) connection.reconnect()
+}
+
 export function closeRelayConnection(relayId: string): void {
   const connection = connections.get(relayId)
   connections.delete(relayId)
@@ -614,6 +636,10 @@ class RelayConnection {
   #relay: RelayEndpoint
   #reconnectFiber: Fiber.Fiber<void, unknown> | null = null
   #auditFiber: Fiber.Fiber<void, unknown> | null = null
+  // Sending the Relay every App's configured volumes, again until it takes
+  // them, on each connection.
+  #volumeReferencesFiber: Fiber.Fiber<void, unknown> | null = null
+  #volumeReferences: VolumeReferencesState = "pending"
   #livenessFiber: Fiber.Fiber<void, unknown> | null = null
   // The socket the liveness check dropped, so its close names why.
   #unresponsiveSocket: WebSocket | null = null
@@ -683,7 +709,12 @@ class RelayConnection {
         Effect.flatMap((credentials) =>
           Effect.try({
             try: () =>
-              checkRelayChallenge(this.#relay.id, credentials, challenge, nonce),
+              checkRelayChallenge(
+                this.#relay.id,
+                credentials,
+                challenge,
+                nonce
+              ),
             catch: asError,
           })
         ),
@@ -1116,6 +1147,31 @@ class RelayConnection {
     )
   }
 
+  get volumeReferences(): VolumeReferencesState {
+    return this.#volumeReferences
+  }
+
+  // The Relay's volumes page says whether protection is still pending.
+  #setVolumeReferences(state: VolumeReferencesState): void {
+    if (this.#volumeReferences === state) return
+    this.#volumeReferences = state
+    publishRealtimeChange({
+      audience: { kind: "relays", relayIds: [this.#relay.id] },
+      scope: { relayId: this.#relay.id },
+      topics: ["relay-volumes"],
+      type: "hearth.invalidate",
+    })
+  }
+
+  /**
+   * Drops the control connection so it connects again, as after Hearth's
+   * database changed under it: the Relay counts a Hearth's App
+   * configurations only as the current connection sent them.
+   */
+  reconnect(): void {
+    this.#socket?.terminate()
+  }
+
   close(): void {
     this.#closed = true
     this.#connecting?.interruptUnsafe()
@@ -1124,6 +1180,9 @@ class RelayConnection {
     this.#reconnectFiber = null
     this.#auditFiber?.interruptUnsafe()
     this.#auditFiber = null
+    this.#volumeReferencesFiber?.interruptUnsafe()
+    this.#volumeReferencesFiber = null
+    this.#volumeReferences = "pending"
     this.#livenessFiber?.interruptUnsafe()
     this.#livenessFiber = null
     this.#pauseFiber?.interruptUnsafe()
@@ -1610,6 +1669,9 @@ class RelayConnection {
         this.#unresponsiveSocket = null
         this.#auditFiber?.interruptUnsafe()
         this.#auditFiber = null
+        this.#volumeReferencesFiber?.interruptUnsafe()
+        this.#volumeReferencesFiber = null
+        this.#volumeReferences = "pending"
         this.#livenessFiber?.interruptUnsafe()
         this.#livenessFiber = null
         this.#pauseFiber?.interruptUnsafe()
@@ -2005,9 +2067,16 @@ class RelayConnection {
         | { readonly status: "forgotten" }
       > = await runAppEffect(
         "relay.operation.lookup",
-        this.request("operation.get", { operationId }, 10_000, undefined, undefined, {
-          journal: change.journal,
-        }).pipe(
+        this.request(
+          "operation.get",
+          { operationId },
+          10_000,
+          undefined,
+          undefined,
+          {
+            journal: change.journal,
+          }
+        ).pipe(
           Effect.flatMap(
             Schema.decodeUnknownEffect(RelayOperationLookupSchema)
           ),
@@ -2147,6 +2216,38 @@ class RelayConnection {
           )
         )
       )
+      // The Relay keeps which volumes this Hearth's Apps' configurations
+      // name, to refuse deleting them, and counts only those this
+      // connection sends; it gets them all on every connect, again with
+      // backoff until it takes them, so one a save couldn't tell it arrives.
+      this.#volumeReferencesFiber?.interruptUnsafe()
+      this.#volumeReferences = "pending"
+      if (this.#features.has(relayVolumesV1Feature)) {
+        this.#volumeReferencesFiber = forkAppEffect(
+          "apps.volumeReferences.reconcileOnConnect",
+          Effect.gen({ self: this }, function* () {
+            const { importRelayAppVolumeReferencesEffect } =
+              yield* Effect.promise(() => import("@/effect/managed-apps"))
+            for (let attempt = 0; ; attempt += 1) {
+              const sent = yield* Effect.result(
+                importRelayAppVolumeReferencesEffect(this.#relay.id)
+              )
+              if (Result.isSuccess(sent)) {
+                this.#setVolumeReferences("current")
+                return
+              }
+              this.#setVolumeReferences("retrying")
+              yield* Effect.logWarning(
+                "Sending the Relay Apps' configured volumes failed; retrying",
+                { cause: sent.failure, relayId: this.#relay.id }
+              )
+              yield* Effect.sleep(
+                Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** Math.min(attempt, 5))
+              )
+            }
+          })
+        )
+      }
       forkAppEffect(
         "backups.reconcileOnConnect",
         Effect.tryPromise({

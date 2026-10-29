@@ -95,6 +95,8 @@ import {
   relayProxySettingsSchema,
   relayVolumeCreateSchema,
   relayVolumeDeleteSchema,
+  relayAppVolumesImportSchema,
+  relayAppVolumesWriteSchema,
   relayVolumeRenameSchema,
   relayDirectoryPageInputSchema,
   relayDirectorySizesInputSchema,
@@ -524,7 +526,8 @@ async function awaitingTailscaleDns<A>(
 const volumes = new RelayVolumes(
   config,
   new DockerEngine(config.dockerSocket),
-  startupCore.state
+  startupCore.state,
+  () => lifecycle.hostDataDirectory()
 )
 const apps = new AppDriver(
   config,
@@ -1295,6 +1298,10 @@ const controlSocket = attachControlSocket({
     }
   },
   execute: executeControlRequest,
+  // Which import each Hearth's protection of volumes counts is its current
+  // connection's.
+  clientConnected: (clientId, connectionId) =>
+    volumes.clientConnected(clientId, connectionId),
   identity: relayIdentity,
   journalId: startup.journalId,
   initialSnapshot: () => snapshotHub.read(),
@@ -1868,7 +1875,8 @@ async function executeControlRequest(
     payload: unknown,
     timeoutMs: number
   ) => Promise<unknown>,
-  hearthFeatures: ReadonlySet<string>
+  hearthFeatures: ReadonlySet<string>,
+  connectionId: string
 ): Promise<unknown> {
   if (signal.aborted) throw new Error("Relay request was cancelled")
   const sendBackupTask = (task: RelayBackupTask) =>
@@ -2203,6 +2211,25 @@ async function executeControlRequest(
       const input = relayVolumeDeleteSchema.parse(request.payload)
       await runRelayEffect("relay.volumes.delete", volumes.delete(input.id))
       return { id: input.id }
+    }
+    case "relay.volumes.references.hold":
+      await runRelayEffect(
+        "relay.volumes.references.hold",
+        volumes.holdAppReferences(client.id, connectionId)
+      )
+      return { held: true }
+    case "relay.volumes.references.import": {
+      const input = relayAppVolumesImportSchema.parse(request.payload)
+      await runRelayEffect(
+        "relay.volumes.references.import",
+        volumes.importAppReferences(
+          client.id,
+          connectionId,
+          input.apps,
+          input.unresolvedAppIds
+        )
+      )
+      return { apps: input.apps.length }
     }
     case "relay.audit.list":
       return runRelayEffect(
@@ -2612,7 +2639,13 @@ async function executeControlRequest(
           apps.discard(input.appId)
         )
       )
-      if (discarded) return { appId: input.appId, deleted: true }
+      if (discarded) {
+        await runRelayEffect(
+          "relay.apps.volumes.forget",
+          volumes.forgetApp(client.id, input.appId)
+        )
+        return { appId: input.appId, deleted: true }
+      }
       // Hearth removes its services' DNS records from every node first.
       await lifecycle.detachFromTailscale(
         (memberId) => appTailscaleMember(memberId)?.appId === input.appId,
@@ -2627,6 +2660,11 @@ async function executeControlRequest(
         }
       )
       const deleted = await apps.delete(input)
+      // What its configuration mounted no longer keeps those volumes.
+      await runRelayEffect(
+        "relay.apps.volumes.forget",
+        volumes.forgetApp(client.id, input.appId)
+      )
       // Its routes go with it, so their hostnames are free again.
       await withRoutesLock("app.delete.routes", async () => {
         await runRelayEffect(
@@ -2657,6 +2695,14 @@ async function executeControlRequest(
       return apps.action(relayAppActionSchema.parse(request.payload))
     case "app.limits.write":
       return apps.setLimits(relayAppLimitsSchema.parse(request.payload))
+    case "app.volumes.write": {
+      const input = relayAppVolumesWriteSchema.parse(request.payload)
+      await runRelayEffect(
+        "relay.apps.volumes.write",
+        volumes.writeAppReferences(client.id, input.appId, input.volumeIds)
+      )
+      return { appId: input.appId, volumeIds: input.volumeIds }
+    }
     case "app.network.routes.read": {
       const appId = appIdSchema.parse(payload.appId)
       return webRouteStateForHearth(

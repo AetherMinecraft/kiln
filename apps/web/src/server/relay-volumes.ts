@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto"
 import { createServerFn } from "@tanstack/react-start"
 import {
+  RELAY_VOLUME_REFERENCES_PENDING,
   relayIdSchema,
   relayVolumeIdSchema,
   relayVolumeNameSchema,
@@ -8,8 +9,12 @@ import {
   relayVolumesSchema,
   relayVolumesV1Feature,
 } from "@workspace/contracts"
+import { Effect } from "effect"
 import { z } from "zod"
 
+import { importRelayAppVolumeReferencesEffect } from "@/effect/managed-apps"
+import { promiseEffect } from "@/effect/promise"
+import { runAppEffect } from "@/effect/runtime"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { databaseRpc } from "@/server/managed-database-access"
 import { authorizedRelay } from "@/server/relay-access"
@@ -17,19 +22,40 @@ import { authorizedRelay } from "@/server/relay-access"
 const targetSchema = z.object({ relayId: relayIdSchema })
 const volumeSchema = targetSchema.extend({ volumeId: relayVolumeIdSchema })
 
-// A Relay's Docker named volumes, with what mounts each. Docker measures
-// every volume for their sizes, so this can take a while.
+// A Relay's Docker named volumes, with what mounts and uses each, what Apps
+// mount that no volume Kiln manages holds, and whether the Relay knows yet
+// which volumes every Hearth's Apps' configurations name; Hearth sends its
+// own when it connects. Docker measures every volume for their sizes, so
+// this can take a while.
 export const getRelayVolumes = createServerFn({ method: "GET" })
   .validator(targetSchema)
   .handler(async ({ data }) => {
     const { relay } = await authorizedRelay(data.relayId, "relay.read")
     if (!(await relayHasVolumes(relay.id))) {
-      return { measuring: false, supported: false, volumes: [] }
+      return {
+        measuring: false,
+        protection: { ready: true, reason: null, retrying: false },
+        supported: false,
+        uncovered: [],
+        volumes: [],
+      }
     }
-    const { measuring, volumes } = relayVolumesSchema.parse(
-      await databaseRpc(relay, "relay.volumes.read", {}, 30_000)
-    )
-    return { measuring, supported: true, volumes }
+    const { measuring, protection, uncovered, volumes } =
+      relayVolumesSchema.parse(
+        await databaseRpc(relay, "relay.volumes.read", {}, 30_000)
+      )
+    // This Hearth's own import failed and is being sent again.
+    const { relayVolumeReferencesState } =
+      await import("@/lib/relay-connection")
+    const retrying =
+      !protection.ready && relayVolumeReferencesState(relay.id) === "retrying"
+    return {
+      measuring,
+      protection: { ...protection, retrying },
+      supported: true,
+      uncovered,
+      volumes,
+    }
   })
 
 export const createRelayVolume = createServerFn({ method: "POST" })
@@ -80,16 +106,41 @@ export const deleteRelayVolume = createServerFn({ method: "POST" })
       "relay.configure"
     )
     await requireRelayVolumes(relay.id)
-    await databaseRpc(
-      relay,
-      "relay.volumes.delete",
-      { id: data.volumeId },
-      30_000,
-      user.id
+    const remove = () =>
+      databaseRpc(
+        relay,
+        "relay.volumes.delete",
+        { id: data.volumeId },
+        30_000,
+        user.id
+      )
+    // A Relay still waiting for this Hearth's Apps' configured volumes,
+    // as when a connect's import failed, gets them now; one waiting for
+    // another Hearth's still refuses.
+    await Effect.runPromise(
+      promiseEffect(remove).pipe(
+        Effect.catchIf(
+          (error) =>
+            error instanceof Error &&
+            error.message.includes(RELAY_VOLUME_REFERENCES_PENDING),
+          () =>
+            promiseEffect(async () => {
+              await importVolumeReferences(relay.id)
+              await remove()
+            })
+        )
+      )
     )
     publishRelayVolumesChange(relay.id)
     return { deleted: true }
   })
+
+async function importVolumeReferences(relayId: string): Promise<void> {
+  await runAppEffect(
+    "relay.volumes.references.import",
+    importRelayAppVolumeReferencesEffect(relayId)
+  )
+}
 
 // An offline Relay has no features yet; asking it says why it can't answer.
 async function relayHasVolumes(relayId: string): Promise<boolean> {

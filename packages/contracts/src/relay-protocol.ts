@@ -161,6 +161,8 @@ export const relayControlOperations = [
   "relay.volumes.create",
   "relay.volumes.rename",
   "relay.volumes.delete",
+  "relay.volumes.references.import",
+  "relay.volumes.references.hold",
   "relay.pairing.create",
   "relay.pairing.list",
   "relay.pairing.revoke",
@@ -211,6 +213,7 @@ export const relayControlOperations = [
   "app.deploy",
   "app.action",
   "app.limits.write",
+  "app.volumes.write",
   "app.network.routes.read",
   "app.deployment.read",
   "app.image.check",
@@ -292,6 +295,8 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.volumes.create",
   "relay.volumes.rename",
   "relay.volumes.delete",
+  "relay.volumes.references.import",
+  "relay.volumes.references.hold",
   "relay.tailscale.install",
   "relay.tailscale.stack.apply",
   "relay.tailscale.stack.dns",
@@ -346,6 +351,7 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "app.deploy",
   "app.action",
   "app.limits.write",
+  "app.volumes.write",
   "app.network.routes.write",
   "app.terminal.attach",
   "app.terminal.restart",
@@ -470,6 +476,8 @@ export function relayControlOperationChanges(
     case "relay.volumes.create":
     case "relay.volumes.rename":
     case "relay.volumes.delete":
+    case "relay.volumes.references.import":
+    case "relay.volumes.references.hold":
     case "relay.pairing.create":
     case "relay.pairing.revoke":
     case "relay.clients.update":
@@ -499,6 +507,7 @@ export function relayControlOperationChanges(
     case "app.deploy":
     case "app.action":
     case "app.limits.write":
+    case "app.volumes.write":
     case "app.network.routes.write":
     case "backup.task.enqueue":
     case "backup.task.cancel":
@@ -568,6 +577,8 @@ export function relayControlOperationRefusedWhilePaused(
   if (
     operation === "relay.pause.write" ||
     operation === "browser.authorization.revise" ||
+    // Only adds protection, which restoring Hearth's database needs.
+    operation === "relay.volumes.references.hold" ||
     operation === "relay.clients.revoke" ||
     operation === "relay.pairing.revoke"
   ) {
