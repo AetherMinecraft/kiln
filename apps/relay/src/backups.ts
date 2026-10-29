@@ -10,6 +10,7 @@ import {
   mkdir,
   open,
   opendir,
+  readdir,
   readFile,
   realpath,
   rename,
@@ -21,8 +22,7 @@ import {
 import { basename, dirname, relative, resolve, sep } from "node:path"
 import { constants as zlibConstants } from "node:zlib"
 import { logException } from "@workspace/telemetry"
-import { Effect, Fiber, Queue, Result } from "effect"
-import { minimatch } from "minimatch"
+import { Deferred, Effect, Fiber, Option, Queue, Result, Schema } from "effect"
 import ZipStream from "zip-stream"
 
 import {
@@ -35,11 +35,14 @@ import {
   type BackupExportTaskResult,
   type BackupFailureCode,
   type BackupResticCreateTaskResult,
+  type BackupRestoreTaskInput,
+  type BackupTarget,
   type BackupTaskInput,
   type BackupTaskPhase,
   type BackupTaskResult,
   type RelayBackupTask,
   type RelayInstanceWebRoute,
+  type RelayVolume,
   type ResticRepositoryLocation,
 } from "@workspace/contracts"
 
@@ -54,9 +57,37 @@ import { createEncryptedPlatformBackup } from "./platform-backups.js"
 import { RelayBackupError } from "./effect/errors.js"
 import { promiseEffect, recoverPromise } from "./effect/promise.js"
 import { RelayStateStore, type ScheduledBackupPrune } from "./effect/state.js"
-import { LaneRejectedError } from "./operation-lanes.js"
+import {
+  exclusive,
+  LaneRejectedError,
+  laneKeys,
+  type LaneLock,
+} from "./operation-lanes.js"
 import type { OperationLanes } from "./operation-lanes.js"
-import { backupTaskLocks } from "./operation-plans.js"
+import {
+  appLifecycleLocks,
+  appReplaceLocks,
+  appStartLocks,
+  backupTaskLocks,
+} from "./operation-plans.js"
+import { backupPathIsExcluded } from "./backups/exclude.js"
+import {
+  abandonTarRestore,
+  createTarBackup,
+  finishTarRestore,
+  removeLeftoverTarHelpers,
+  restoreTarBackup,
+  type TarSource,
+} from "./backups/tar-archives.js"
+import {
+  readTarRestoreJournal,
+  readTarRestoreJournals,
+  TAR_RESTORE_RECOVERY_LABEL,
+  TarRestoreFences,
+  type TarRestoreJournal,
+} from "./backups/tar-restore-journal.js"
+import { DockerEngine } from "./docker-engine.js"
+import { writeFileAtomic } from "./effect/atomic-file.js"
 import { backupFailureCode } from "./backups/failure.js"
 import {
   backupTaskAttributes,
@@ -139,6 +170,30 @@ type BackupTaskEnd = {
   failure: BackupFailureCode | null
 }
 
+/** What backups of Apps' folders and their power need of the App driver. */
+export interface BackupApps {
+  /** The App's folder on the Docker host, or null when it isn't here. */
+  hostFolder(appId: string): Promise<string | null>
+  isRunning(appId: string): Promise<boolean>
+  start(appId: string): Promise<void>
+  stop(appId: string): Promise<void>
+  /** The managed volumes starting the App mounts, by ID. */
+  volumes(appId: string): Promise<ReadonlyArray<string>>
+}
+
+/** A managed volume as backups find it, by its ID. */
+export interface BackupVolumes {
+  find(
+    id: string
+  ): Effect.Effect<
+    Pick<
+      RelayVolume,
+      "dockerName" | "kind" | "mounts" | "name" | "owner" | "users"
+    > | null,
+    unknown
+  >
+}
+
 export class BackupManager {
   readonly #config: RelayConfig
   readonly #findInstance: (
@@ -146,6 +201,10 @@ export class BackupManager {
   ) => Promise<RelayInstanceConfig | null>
   readonly #isInstanceStopped: (instanceId: string) => Promise<boolean>
   readonly #databases: DatabaseDriver | null
+  readonly #apps: BackupApps | null
+  readonly #volumes: BackupVolumes | null
+  readonly #engine: DockerEngine
+  readonly #fences: TarRestoreFences
   readonly #lanes: OperationLanes
   readonly #restic: ResticDriver
   readonly #state: RelayStateStore["Service"]
@@ -157,6 +216,9 @@ export class BackupManager {
     findInstance: (instanceId: string) => Promise<RelayInstanceConfig | null>
     isInstanceStopped: (instanceId: string) => Promise<boolean>
     databases: DatabaseDriver | null
+    apps: BackupApps | null
+    volumes: BackupVolumes | null
+    fences: TarRestoreFences
     lanes: OperationLanes
     restic: ResticDriver
     state: RelayStateStore["Service"]
@@ -167,6 +229,10 @@ export class BackupManager {
     this.#findInstance = options.findInstance
     this.#isInstanceStopped = options.isInstanceStopped
     this.#databases = options.databases
+    this.#apps = options.apps
+    this.#volumes = options.volumes
+    this.#engine = new DockerEngine(options.config.dockerSocket)
+    this.#fences = options.fences
     this.#restic = options.restic
     this.#state = options.state
     this.#wake = options.wake
@@ -177,21 +243,39 @@ export class BackupManager {
     findInstance: (instanceId: string) => Promise<RelayInstanceConfig | null>
     isInstanceStopped: (instanceId: string) => Promise<boolean>
     databases?: DatabaseDriver
+    apps?: BackupApps
+    volumes?: BackupVolumes
     /**
      * Each task holds its target's lane while it runs: a backup alongside
      * other work, a restore alone. While the lanes are paused, queued tasks
      * wait; `resume` starts them again.
      */
     lanes: OperationLanes
+    /**
+     * The targets of unfinished restores, which the lanes already refuse
+     * work on. Without them, they're read now and the lanes told.
+     */
+    fences?: TarRestoreFences
   }) {
     return Effect.gen(function* () {
       const state = yield* RelayStateStore
       const wake = yield* Queue.unbounded<void>()
+      let fences = options.fences
+      if (!fences) {
+        const loaded = yield* promiseEffect(() =>
+          TarRestoreFences.load(options.config)
+        )
+        options.lanes.addRefusal((label, locks) => loaded.refusal(label, locks))
+        fences = loaded
+      }
       const manager = new BackupManager({
         config: options.config,
         findInstance: options.findInstance,
         isInstanceStopped: options.isInstanceStopped,
         databases: options.databases ?? null,
+        apps: options.apps ?? null,
+        volumes: options.volumes ?? null,
+        fences,
         lanes: options.lanes,
         restic: createResticDriver({
           cacheDirectory: resolve(
@@ -213,6 +297,12 @@ export class BackupManager {
           Date.now()
         )
       }
+      // Restores of Apps' folders and volumes a stop or a failed swap left
+      // midway, finished or undone, and Apps a stopped backup left stopped,
+      // started again. Neither keeps the Relay from starting when Docker
+      // can't answer; a restore that can't finish keeps its target fenced.
+      yield* manager.#recoverTarRestores()
+      yield* manager.#restartStoppedApps()
       yield* state.requeueInterruptedBackupTasks(Date.now())
       yield* promiseEffect(() => sweepExpiredBackupExports(options.config))
       yield* Effect.forkChild(
@@ -256,6 +346,28 @@ export class BackupManager {
     })
   }
 
+  /**
+   * Finishes or abandons a restore of an App's folder or a volume whose swap
+   * didn't finish, which fences its target until then. Finishing stops the
+   * Apps running on the target first; abandoning keeps what the target
+   * holds now.
+   */
+  resolveTarRestore(taskId: string, action: "abandon" | "finish") {
+    return Effect.gen({ self: this }, function* () {
+      const journal = (yield* promiseEffect(() =>
+        readTarRestoreJournals(this.#config)
+      )).find((entry) => entry.taskId === taskId)
+      if (!journal) {
+        return yield* backupFailure(
+          "restore_not_unfinished",
+          "restore.resolve",
+          "No unfinished restore has this ID"
+        )
+      }
+      yield* this.#settleTarRestore(journal, action, true)
+    }).pipe(Effect.withSpan("Backups.resolveTarRestore"))
+  }
+
   run() {
     return Effect.gen({ self: this }, function* () {
       while (true) {
@@ -280,161 +392,1092 @@ export class BackupManager {
         if (this.#lanes.paused) return
         const task = yield* this.#state.claimNextBackupTask(Date.now())
         if (!task) return
-        const controller = new AbortController()
-        this.#activeCreates.set(task.taskId, controller)
-        const current = yield* this.#state.getBackupTask(task.taskId)
-        if (!current || current.status !== "running") controller.abort()
-        const startedAt = Date.now()
-        yield* recordBackupTaskQueued(
-          this.#config.nodeId,
-          task,
-          startedAt - task.createdAt
-        )
-        let timedOut = false
-        // A restore that has started swapping its files in finishes; before
-        // then its deadline stops it. Each side decides synchronously, before
-        // it awaits anything, so exactly one wins.
-        let installing = false
-        let deadlinePassed = false
-        const beginInstall = () => {
-          if (deadlinePassed || controller.signal.aborted) {
-            throw controller.signal.aborted
-              ? backupAbortError(controller.signal)
-              : new Error(BACKUP_TIMEOUT_REASON)
-          }
-          installing = true
+        const batch = stoppedBatch(task)
+        const outcome = batch
+          ? yield* this.#runBatch(task, batch)
+          : yield* this.#runTask(task, null)
+        if (outcome === "paused") return
+      }
+    })
+  }
+
+  /**
+   * Runs one claimed task, waiting its turn in the lanes; or, in a stopped
+   * batch's window, inside the locks the batch already holds.
+   */
+  #runTask(task: RelayBackupTask, window: StoppedWindow | null) {
+    return Effect.gen({ self: this }, function* () {
+      const controller = new AbortController()
+      this.#activeCreates.set(task.taskId, controller)
+      const current = yield* this.#state.getBackupTask(task.taskId)
+      if (!current || current.status !== "running") controller.abort()
+      const startedAt = Date.now()
+      yield* recordBackupTaskQueued(
+        this.#config.nodeId,
+        task,
+        startedAt - task.createdAt
+      )
+      let timedOut = false
+      // A restore that has started swapping its files in finishes; before
+      // then its deadline stops it. Each side decides synchronously, before
+      // it awaits anything, so exactly one wins.
+      let installing = false
+      let deadlinePassed = false
+      const beginInstall = () => {
+        if (deadlinePassed || controller.signal.aborted) {
+          throw controller.signal.aborted
+            ? backupAbortError(controller.signal)
+            : new Error(BACKUP_TIMEOUT_REASON)
         }
-        const timeoutFiber = yield* Effect.forkChild(
-          Effect.sleep(this.#config.backupTimeoutMs).pipe(
-            Effect.andThen(
-              Effect.suspend(() => {
-                if (installing) return Effect.succeed(false)
-                deadlinePassed = true
-                return task.kind === "create"
-                  ? this.#state.cancelBackupTask(
-                      task.taskId,
-                      Date.now(),
-                      BACKUP_TIMEOUT_REASON,
-                      "timed_out"
-                    )
-                  : this.#state.failBackupTask(
-                      task.taskId,
-                      BACKUP_TIMEOUT_REASON,
-                      Date.now(),
-                      "timed_out"
-                    )
-              })
-            ),
-            Effect.tap((stopped) =>
-              stopped
-                ? Effect.sync(() => {
-                    timedOut = true
-                    controller.abort()
-                  })
-                : Effect.void
-            ),
-            Effect.asVoid
+        installing = true
+      }
+      const timeoutFiber = yield* Effect.forkChild(
+        Effect.sleep(this.#config.backupTimeoutMs).pipe(
+          Effect.andThen(
+            Effect.suspend(() => {
+              if (installing) return Effect.succeed(false)
+              deadlinePassed = true
+              return task.kind === "create"
+                ? this.#state.cancelBackupTask(
+                    task.taskId,
+                    Date.now(),
+                    BACKUP_TIMEOUT_REASON,
+                    "timed_out"
+                  )
+                : this.#state.failBackupTask(
+                    task.taskId,
+                    BACKUP_TIMEOUT_REASON,
+                    Date.now(),
+                    "timed_out"
+                  )
+            })
+          ),
+          Effect.tap((stopped) =>
+            stopped
+              ? Effect.sync(() => {
+                  timedOut = true
+                  controller.abort()
+                })
+              : Effect.void
+          ),
+          Effect.asVoid
+        )
+      )
+      // The Apps whose lifecycles a volume's stopped backup or restore
+      // holds, looked up before its turn and checked again once it has
+      // it; a lookup that fails fails the task, never locking too little.
+      const outcome = yield* (
+        window ? Effect.succeed([]) : this.#lockedVolumeApps(task.input)
+      )
+        .pipe(
+          Effect.flatMap((volumeApps) =>
+            window
+              ? // Its batch holds the locks; it starts unless cancelled.
+                Effect.suspend(() =>
+                  controller.signal.aborted
+                    ? Effect.fail(backupAbortError(controller.signal))
+                    : this.#execute(
+                        task,
+                        controller.signal,
+                        beginInstall,
+                        window.lockedApps,
+                        window
+                      )
+                )
+              : this.#lanes.run(
+                  {
+                    label: `backup.${task.kind}`,
+                    // A task that timed out or was cancelled while it waited
+                    // its turn mustn't start, a restore least of all.
+                    precondition: () => !controller.signal.aborted,
+                    // A task may name its game server by short ID or name.
+                    locks: backupTaskLocks(
+                      task.input,
+                      (reference) =>
+                        /^[a-f0-9]{40}$/u.test(reference)
+                          ? reference
+                          : recoverPromise(
+                              async () =>
+                                (await this.#findInstance(reference))?.id ??
+                                reference,
+                              () => reference
+                            ),
+                      () => volumeApps
+                    ),
+                  },
+                  this.#execute(
+                    task,
+                    controller.signal,
+                    beginInstall,
+                    new Set(volumeApps),
+                    null
+                  )
+                )
           )
         )
-        const outcome = yield* this.#lanes
-          .run(
-            {
-              label: `backup.${task.kind}`,
-              // A task that timed out or was cancelled while it waited its turn
-              // mustn't start, a restore least of all.
-              precondition: () => !controller.signal.aborted,
-              // A task may name its game server by short ID or name.
-              locks: backupTaskLocks(task.input, (reference) =>
-                /^[a-f0-9]{40}$/u.test(reference)
-                  ? reference
-                  : recoverPromise(
-                      async () =>
-                        (await this.#findInstance(reference))?.id ?? reference,
-                      () => reference
+        .pipe(
+          Effect.as<BackupTaskEnd>({ outcome: "succeeded", failure: null }),
+          // Withdrawn by a pause before it started: it goes back in line
+          // and starts once the Relay is resumed.
+          Effect.catch((cause) =>
+            cause instanceof LaneRejectedError && cause.reason === "paused"
+              ? // Its deadline mustn't cancel it while it goes back.
+                Fiber.interrupt(timeoutFiber).pipe(
+                  Effect.andThen(
+                    this.#state.returnBackupTask(task.taskId, Date.now())
+                  ),
+                  Effect.as("paused" as const)
+                )
+              : Effect.fail(cause)
+          ),
+          Effect.catch((cause) =>
+            this.#state
+              .failBackupTask(
+                task.taskId,
+                backupErrorMessage(cause),
+                Date.now(),
+                backupFailureCode(cause)
+              )
+              .pipe(
+                Effect.flatMap((failed): Effect.Effect<BackupTaskEnd> => {
+                  // Cancelled by a user, or stopped by its deadline, which
+                  // already recorded the timeout.
+                  if (!failed && !timedOut) {
+                    return Effect.succeed({
+                      outcome: "cancelled",
+                      failure: null,
+                    })
+                  }
+                  const failure = failed
+                    ? backupFailureCode(cause)
+                    : "timed_out"
+                  return logException(cause, {
+                    operation: `Backups.${task.kind}`,
+                    attributes: {
+                      ...backupTaskAttributes(task),
+                      "backup.failure.code": failure,
+                      "backup.error.code":
+                        cause instanceof RelayBackupError ? cause.code : null,
+                    },
+                  }).pipe(Effect.as({ outcome: "failed", failure }))
+                })
+              )
+          ),
+          Effect.tap((ended) =>
+            ended === "paused"
+              ? Effect.void
+              : Effect.annotateCurrentSpan({
+                  "backup.task.outcome": ended.outcome,
+                  "backup.failure.code": ended.failure,
+                }).pipe(
+                  Effect.andThen(
+                    recordBackupTask(
+                      this.#config.nodeId,
+                      task,
+                      ended.outcome,
+                      ended.failure,
+                      Date.now() - startedAt
                     )
-              ),
-            },
-            this.#execute(task, controller.signal, beginInstall)
+                  )
+                )
+          ),
+          Effect.ensuring(
+            timeoutFiber ? Fiber.interrupt(timeoutFiber) : Effect.void
+          ),
+          Effect.ensuring(
+            controller
+              ? Effect.sync(() => this.#activeCreates.delete(task.taskId))
+              : Effect.void
+          ),
+          // A batch's window closes once every backup in it has left.
+          Effect.ensuring(window ? window.leave(task.taskId) : Effect.void),
+          Effect.withSpan(`Backups.${task.kind}`, {
+            attributes: backupTaskAttributes(task),
+          })
+        )
+      return outcome === "paused" ? ("paused" as const) : undefined
+    })
+  }
+
+  /**
+   * Runs a stopped batch, as backing up an App starts its folder's and each
+   * owned volume's: every backup in it within one stopped window, holding
+   * all their locks, so the copies agree. The Apps that use any of them stop
+   * once, journaled as a single stopped backup's are, and those that ran
+   * start again once every archive is taken. Backups of it still on their
+   * way join within moments; any later run in a window of their own.
+   */
+  #runBatch(leader: RelayBackupTask, batch: { id: string; size: number }) {
+    return Effect.gen({ self: this }, function* () {
+      const members = [leader]
+      for (let wait = 0; members.length < batch.size && wait < 20; wait += 1) {
+        members.push(
+          ...(yield* this.#state.claimBatchBackupTasks(batch.id, Date.now()))
+        )
+        if (members.length < batch.size) yield* Effect.sleep("250 millis")
+      }
+      const prepared = yield* Effect.result(this.#batchLocks(members))
+      if (Result.isFailure(prepared)) {
+        for (const member of members) {
+          yield* this.#state.failBackupTask(
+            member.taskId,
+            backupErrorMessage(prepared.failure),
+            Date.now()
           )
-          .pipe(
-            Effect.as<BackupTaskEnd>({ outcome: "succeeded", failure: null }),
-            // Withdrawn by a pause before it started: it goes back in line
-            // and starts once the Relay is resumed.
-            Effect.catch((cause) =>
-              cause instanceof LaneRejectedError && cause.reason === "paused"
-                ? // Its deadline mustn't cancel it while it goes back.
-                  Fiber.interrupt(timeoutFiber).pipe(
-                    Effect.andThen(
-                      this.#state.returnBackupTask(task.taskId, Date.now())
-                    ),
-                    Effect.as("paused" as const)
-                  )
-                : Effect.fail(cause)
-            ),
-            Effect.catch((cause) =>
+        }
+        return undefined
+      }
+      const { lockedApps, locks } = prepared.success
+      const window = yield* this.#stoppedWindow(leader, members, lockedApps)
+      const run = yield* Effect.result(
+        this.#lanes.run(
+          { label: "backup.batch", locks },
+          Effect.forEach(members, (member) => this.#runTask(member, window), {
+            concurrency: "unbounded",
+            discard: true,
+          })
+        )
+      )
+      if (Result.isSuccess(run)) return undefined
+      // Withdrawn by a pause before it started: back in line.
+      const paused =
+        run.failure instanceof LaneRejectedError &&
+        run.failure.reason === "paused"
+      for (const member of members) {
+        yield* paused
+          ? this.#state.returnBackupTask(member.taskId, Date.now())
+          : this.#state
+              .failBackupTask(
+                member.taskId,
+                backupErrorMessage(run.failure),
+                Date.now()
+              )
+              .pipe(Effect.asVoid)
+      }
+      return paused ? ("paused" as const) : undefined
+    }).pipe(Effect.withSpan("Backups.batch"))
+  }
+
+  // Every lock a batch's backups take, and the Apps whose lifecycles they
+  // hold, looked up before its turn.
+  #batchLocks(members: ReadonlyArray<RelayBackupTask>) {
+    return Effect.gen({ self: this }, function* () {
+      const lockedApps = new Set<string>()
+      const locks: Array<LaneLock> = []
+      for (const member of members) {
+        const apps = yield* this.#lockedVolumeApps(member.input)
+        for (const appId of apps) lockedApps.add(appId)
+        if (
+          member.input.kind === "create" &&
+          member.input.target.kind === "app"
+        ) {
+          lockedApps.add(member.input.target.id)
+        }
+        locks.push(
+          ...(yield* promiseEffect(async () =>
+            backupTaskLocks(
+              member.input,
+              (reference) => reference,
+              () => apps
+            )
+          ))
+        )
+      }
+      return { lockedApps: lockedApps as ReadonlySet<string>, locks }
+    })
+  }
+
+  // A batch's stopped window: the first backup to need it stops every App
+  // that uses any of the batch's targets; the last to leave starts again
+  // those that ran.
+  #stoppedWindow(
+    leader: RelayBackupTask,
+    members: ReadonlyArray<RelayBackupTask>,
+    lockedApps: ReadonlySet<string>
+  ) {
+    return Effect.gen({ self: this }, function* () {
+      let stopped: ReadonlyArray<StoppedApp> = []
+      const begin = yield* Effect.cached(
+        Effect.gen({ self: this }, function* () {
+          // Checked again now the batch holds its locks, before anything
+          // stops: an App that began using one of its targets since they
+          // were looked up holds no lock here, so stopping it could race
+          // its own start or deployment. The whole window fails instead.
+          const consumers = new Set<string>()
+          for (const member of members) {
+            if (member.input.kind !== "create") continue
+            yield* this.#requireLockedApps(member.input.target, lockedApps)
+            const source = yield* this.#tarSource(member.input.target, true)
+            for (const appId of source.consumers) consumers.add(appId)
+          }
+          if ([...consumers].some((appId) => !lockedApps.has(appId))) {
+            return yield* backupFailure(
+              "volume_users_changed",
+              "lookup",
+              "The Apps using what this backup covers changed while it waited its turn; run it again"
+            )
+          }
+          stopped = yield* this.#stopApps(leader.taskId, [...consumers], true)
+        })
+      )
+      const done = yield* Deferred.make<ReadonlyArray<string>>()
+      const left = new Set<string>()
+      let restarting = false
+      const finishIfLast = Effect.suspend(() => {
+        if (restarting || left.size < members.length) return Effect.void
+        restarting = true
+        return this.#startApps(leader.taskId, stopped).pipe(
+          Effect.orElseSucceed((): ReadonlyArray<string> => []),
+          Effect.flatMap((warnings) => Deferred.succeed(done, warnings)),
+          Effect.asVoid
+        )
+      })
+      return {
+        arrive: (taskId: string) =>
+          Effect.suspend(() => {
+            left.add(taskId)
+            return finishIfLast.pipe(Effect.andThen(Deferred.await(done)))
+          }),
+        begin,
+        leave: (taskId: string) =>
+          Effect.suspend(() => {
+            left.add(taskId)
+            return finishIfLast
+          }),
+        lockedApps,
+      } satisfies StoppedWindow
+    })
+  }
+
+  /**
+   * Backs up an App's folder or a volume through Docker. Stopped, it stops
+   * each App that uses it first, recording which in a journal so a Relay
+   * that stops midway starts them again, and starts them again after,
+   * unless it's a final backup. An App that won't start again is a warning
+   * on the backup, which succeeded.
+   */
+  #createTar(
+    taskId: string,
+    input: BackupCreateTaskInput,
+    signal: AbortSignal,
+    lockedApps: ReadonlySet<string>,
+    window: StoppedWindow | null
+  ) {
+    return Effect.gen({ self: this }, function* () {
+      const final = input.reason === "final_delete"
+      const consistency =
+        input.consistency === "stopped" || final ? "stopped" : "live"
+      if (consistency === "stopped") {
+        yield* this.#requireLockedApps(input.target, lockedApps)
+      }
+      const { consumers, manifestVolume, source } = yield* this.#tarSource(
+        input.target,
+        consistency === "stopped"
+      )
+      const progress: BackupProgress = {
+        completed: 0,
+        currentArtifactId: null,
+        currentPath: null,
+        phase: "preparing",
+        total: 0,
+      }
+      const progressFiber = yield* Effect.forkChild(
+        Effect.sleep("500 millis").pipe(
+          Effect.andThen(
+            Effect.suspend(() =>
               this.#state
-                .failBackupTask(
-                  task.taskId,
-                  backupErrorMessage(cause),
-                  Date.now(),
-                  backupFailureCode(cause)
+                .updateBackupTaskProgress(
+                  taskId,
+                  progress.completed,
+                  progress.total || null,
+                  progress.phase,
+                  progress.currentPath,
+                  progress.currentArtifactId,
+                  Date.now()
                 )
-                .pipe(
-                  Effect.flatMap((failed): Effect.Effect<BackupTaskEnd> => {
-                    // Cancelled by a user, or stopped by its deadline, which
-                    // already recorded the timeout.
-                    if (!failed && !timedOut) {
-                      return Effect.succeed({
-                        outcome: "cancelled",
-                        failure: null,
-                      })
-                    }
-                    const failure = failed
-                      ? backupFailureCode(cause)
-                      : "timed_out"
-                    return logException(cause, {
-                      operation: `Backups.${task.kind}`,
-                      attributes: {
-                        ...backupTaskAttributes(task),
-                        "backup.failure.code": failure,
-                        "backup.error.code":
-                          cause instanceof RelayBackupError ? cause.code : null,
-                      },
-                    }).pipe(Effect.as({ outcome: "failed", failure }))
-                  })
+                .pipe(Effect.asVoid)
+            )
+          ),
+          Effect.forever
+        )
+      )
+      const destination = backupArchivePath(this.#config, input.backupId)
+      const archive = Effect.tryPromise({
+        try: async () => {
+          const directory = backupDirectoryPath(this.#config)
+          await mkdir(directory, { recursive: true, mode: 0o700 })
+          await cleanupBackupPartials(directory, input.backupId)
+          await rm(destination, { force: true })
+          const maximumBytes = archiveMaximumBytes(input)
+          await requireBackupSpace(directory, 0, maximumBytes)
+          const partial = resolve(
+            directory,
+            `.${input.backupId}.${randomUUID()}.partial`
+          )
+          progress.phase = "archiving"
+          return Effect.runPromise(
+            promiseEffect(() =>
+              createTarBackup({
+                config: this.#config,
+                engine: this.#engine,
+                exclude: input.exclude,
+                manifest: {
+                  artifactKind: "tar_archive",
+                  backupId: input.backupId,
+                  consistency,
+                  createdAt: new Date().toISOString(),
+                  formatVersion: 1,
+                  mode: "full",
+                  target: input.target,
+                  volume: manifestVolume,
+                },
+                maxBytes: maximumBytes,
+                partial,
+                progress,
+                signal,
+                source,
+              })
+            ).pipe(
+              Effect.tap(() =>
+                promiseEffect(() => rename(partial, destination))
+              ),
+              Effect.ensuring(
+                promiseEffect(() => rm(partial, { force: true })).pipe(
+                  Effect.ignore
                 )
+              )
+            )
+          )
+        },
+        catch: (cause) =>
+          cause instanceof RelayBackupError
+            ? cause
+            : RelayBackupError.make({
+                code: "archive_failed",
+                operation: "create.archive",
+                reason: backupErrorMessage(cause),
+                cause,
+              }),
+      })
+      // The Apps it stopped start again however the archive went, before
+      // the upload, which can take a while.
+      // In a batch, its window stops and starts them, around every
+      // backup's archive.
+      if (window && consistency === "stopped") yield* window.begin
+      const stopped =
+        consistency === "stopped" && !window
+          ? yield* this.#stopApps(taskId, consumers, !final)
+          : []
+      const archived = yield* Effect.result(archive)
+      const restarted = window
+        ? yield* window.arrive(taskId)
+        : stopped.length > 0 && !final
+          ? yield* this.#startApps(taskId, stopped)
+          : []
+      if (Result.isFailure(archived))
+        return yield* Effect.fail(archived.failure)
+      progress.phase = "finalizing"
+      return yield* storeCreatedBackup(
+        this.#config,
+        input,
+        {
+          bytes: archived.success.bytes,
+          checksumSha256: archived.success.checksumSha256,
+          consistency,
+          filename: backupArtifactFilename(input.backupId, "tar_archive"),
+          warnings: [...archived.success.warnings, ...restarted].slice(
+            0,
+            1_000
+          ),
+        },
+        progress,
+        signal
+      ).pipe(Effect.ensuring(Fiber.interrupt(progressFiber)))
+    }).pipe(
+      Effect.onError(() =>
+        promiseEffect(() =>
+          rm(backupArchivePath(this.#config, input.backupId), { force: true })
+        ).pipe(Effect.ignore)
+      )
+    )
+  }
+
+  /**
+   * Restores an App's folder or a volume through Docker. Nothing that uses
+   * it may run: an App's folder needs the App stopped, and a volume every
+   * container that mounts it.
+   */
+  #restoreTar(
+    input: BackupRestoreTaskInput & {
+      kind: "restore"
+      target: BackupTarget & { kind: "app" | "volume" }
+    },
+    signal: AbortSignal,
+    beginInstall: RestoreInstallGate,
+    lockedApps: ReadonlySet<string>
+  ) {
+    return Effect.gen({ self: this }, function* () {
+      yield* this.#requireLockedApps(input.target, lockedApps)
+      const { source } = yield* this.#tarSource(input.target, false, true)
+      if (input.target.kind === "app") {
+        const running = yield* promiseEffect(() =>
+          this.#apps!.isRunning(input.target.id)
+        )
+        if (running) {
+          return yield* backupFailure(
+            "app_running",
+            "restore.preflight",
+            "Stop the App before restoring its folder"
+          )
+        }
+      } else {
+        const volume = yield* this.#requiredVolume(input.target.id, true)
+        const running = volume.mounts.filter((mount) => mount.running)
+        if (running.length > 0) {
+          return yield* backupFailure(
+            "volume_in_use",
+            "restore.preflight",
+            running.length === 1
+              ? `Stop ${running[0]!.container}, which mounts this volume, before restoring it`
+              : `Stop the ${running.length} containers that mount this volume before restoring it`
+          )
+        }
+      }
+      const temporary = resolve(
+        this.#config.dataDirectory,
+        "restores",
+        `${input.taskId}.tar.gz`
+      )
+      return yield* Effect.tryPromise({
+        try: async () => {
+          const archive = await materializeBackupArtifact(
+            this.#config,
+            input,
+            temporary
+          )
+          return restoreTarBackup({
+            archive,
+            backupId: input.archive?.backupId ?? input.backupId,
+            beginInstall,
+            config: this.#config,
+            consumers: [...lockedApps],
+            engine: this.#engine,
+            fences: this.#fences,
+            signal,
+            source,
+            target: input.target,
+            taskId: input.taskId,
+          })
+        },
+        catch: (cause) =>
+          cause instanceof RelayBackupError
+            ? cause
+            : RelayBackupError.make({
+                code: "restore_failed",
+                operation: "restore",
+                reason: backupErrorMessage(cause),
+                cause,
+              }),
+      }).pipe(
+        Effect.ensuring(
+          promiseEffect(() => rm(temporary, { force: true })).pipe(
+            Effect.ignore
+          )
+        )
+      )
+    })
+  }
+
+  // What Docker mounts for an App's folder or a volume, the Apps a stopped
+  // backup stops, and the volume as its manifest records it. A stopped
+  // backup of a volume a container other than an App's runs from is
+  // refused: Kiln can't stop and start it as its owner would.
+  #tarSource(target: BackupTarget, stopping: boolean, restoring = false) {
+    return Effect.gen({ self: this }, function* () {
+      if (target.kind === "app") {
+        if (!this.#apps) {
+          return yield* backupFailure(
+            "app_driver_unavailable",
+            "lookup",
+            "The App backup driver is unavailable"
+          )
+        }
+        const folder = yield* promiseEffect(() =>
+          this.#apps!.hostFolder(target.id)
+        )
+        if (!folder) {
+          return yield* backupFailure(
+            "app_not_found",
+            "lookup",
+            "The App no longer exists on this Relay"
+          )
+        }
+        return {
+          consumers: [target.id],
+          manifestVolume: null,
+          source: { kind: "bind", path: folder } satisfies TarSource,
+        }
+      }
+      const volume = yield* this.#requiredVolume(target.id, restoring)
+      const others = volume.mounts.filter(
+        (mount) => mount.running && mount.kind !== "app"
+      )
+      if (stopping && others.length > 0) {
+        return yield* backupFailure(
+          "volume_in_use",
+          "lookup",
+          `${others[0]!.container} mounts this volume and isn't an App's; stop it before a stopped backup`
+        )
+      }
+      return {
+        consumers: [
+          ...new Set(
+            volume.mounts.flatMap((mount) =>
+              mount.kind === "app" && mount.resourceId ? [mount.resourceId] : []
+            )
+          ),
+        ],
+        manifestVolume: {
+          dockerName: volume.dockerName,
+          kind: volume.kind === "app" ? ("app" as const) : ("kiln" as const),
+          name: volume.name,
+        },
+        source: { kind: "volume", name: volume.dockerName } satisfies TarSource,
+      }
+    })
+  }
+
+  #requiredVolume(id: string, restoring = false) {
+    return Effect.gen({ self: this }, function* () {
+      const volume = this.#volumes
+        ? yield* this.#volumes.find(id).pipe(
+            Effect.mapError((cause) =>
+              RelayBackupError.make({
+                code: "volume_lookup_failed",
+                operation: "lookup",
+                reason: backupErrorMessage(cause),
+                cause,
+              })
+            )
+          )
+        : null
+      // Only volumes Kiln manages have IDs to back up by; the Relay's own
+      // data volume is the platform backup's.
+      if (!volume || volume.kind === "relay") {
+        return yield* backupFailure(
+          "volume_not_found",
+          "lookup",
+          restoring
+            ? "The volume no longer exists on this Relay; a backup restores only into the volume it was taken from"
+            : "The volume no longer exists on this Relay"
+        )
+      }
+      return volume
+    })
+  }
+
+  // The Apps whose lifecycles a volume's stopped backup or restore holds:
+  // its owner, and every App that uses it.
+  #volumeApps(volumeId: string) {
+    const owner = /^([a-f0-9]{40})\//u.exec(volumeId)?.[1]
+    return Effect.gen({ self: this }, function* () {
+      const volume = this.#volumes
+        ? yield* this.#volumes.find(volumeId).pipe(
+            Effect.mapError((cause) =>
+              RelayBackupError.make({
+                code: "volume_lookup_failed",
+                operation: "lookup",
+                reason: `The Apps using the volume couldn't be found: ${backupErrorMessage(cause)}`,
+                cause,
+              })
+            )
+          )
+        : null
+      return [
+        ...new Set([
+          ...(owner ? [owner] : []),
+          ...(volume?.users.map((user) => user.appId) ?? []),
+        ]),
+      ]
+    })
+  }
+
+  // The volume Apps a task's locks must hold, before it waits its turn.
+  #lockedVolumeApps(
+    input: BackupTaskInput
+  ): Effect.Effect<ReadonlyArray<string>, RelayBackupError> {
+    if (
+      (input.kind === "create" &&
+        input.target.kind === "volume" &&
+        (input.consistency === "stopped" || input.reason === "final_delete")) ||
+      (input.kind === "restore" && input.target.kind === "volume")
+    ) {
+      return this.#volumeApps(input.target.id)
+    }
+    return Effect.succeed([])
+  }
+
+  // Once a task has its locks, the Apps using its volume must still be ones
+  // they hold: one that began using it while the task waited would start,
+  // stop, or deploy beside it.
+  #requireLockedApps(target: BackupTarget, lockedApps: ReadonlySet<string>) {
+    return Effect.gen({ self: this }, function* () {
+      if (target.kind !== "volume") return
+      const apps = yield* this.#volumeApps(target.id)
+      if (apps.some((appId) => !lockedApps.has(appId))) {
+        return yield* backupFailure(
+          "volume_users_changed",
+          "lookup",
+          "The Apps using this volume changed while the task waited its turn; run it again"
+        )
+      }
+    })
+  }
+
+  // Stops each running App, journaling them first, with the power intent
+  // each had, when they start again after. One that won't stop fails the
+  // backup, and those stopped before it start again.
+  #stopApps(taskId: string, apps: ReadonlyArray<string>, restart: boolean) {
+    return Effect.gen({ self: this }, function* () {
+      const running: Array<string> = []
+      for (const appId of apps) {
+        if (yield* promiseEffect(() => this.#apps!.isRunning(appId))) {
+          running.push(appId)
+        }
+      }
+      if (running.length === 0) return []
+      const revisions = yield* this.#state.listAppPowerRevisions(running)
+      const entries = running.map((appId): StoppedApp => ({
+        appId,
+        revision: revisions.get(appId) ?? 0,
+      }))
+      if (restart) yield* this.#journalStoppedApps(taskId, entries)
+      const stopped: Array<StoppedApp> = []
+      for (const entry of entries) {
+        const result = yield* Effect.result(
+          promiseEffect(() => this.#apps!.stop(entry.appId))
+        )
+        if (Result.isSuccess(result)) {
+          stopped.push(entry)
+          continue
+        }
+        // One whose stop failed may be partly stopped, so it starts again
+        // with the others.
+        if (restart) yield* this.#startApps(taskId, [...stopped, entry])
+        return yield* Effect.fail(
+          RelayBackupError.make({
+            code: "app_stop_failed",
+            operation: "create.stop",
+            reason: `An App couldn't be stopped for the backup: ${backupErrorMessage(result.failure)}`,
+            cause: result.failure,
+          })
+        )
+      }
+      return stopped
+    })
+  }
+
+  // Starts Apps a backup stopped again, answering a warning for each that
+  // won't. Those that won't stay journaled, for the Relay to start when it
+  // next starts; the rest are forgotten, as is one whose power a person has
+  // changed since.
+  #startApps(taskId: string, apps: ReadonlyArray<StoppedApp>) {
+    return Effect.gen({ self: this }, function* () {
+      const warnings: Array<string> = []
+      const unstarted: Array<StoppedApp> = []
+      for (const entry of apps) {
+        if (!(yield* this.#stillOwed(entry))) continue
+        const started = yield* Effect.result(
+          promiseEffect(() => this.#apps!.start(entry.appId))
+        )
+        if (Result.isFailure(started)) {
+          unstarted.push(entry)
+          warnings.push(
+            backupWarning(
+              `App ${entry.appId.slice(0, 8)} couldn't be started again after the backup: ${backupErrorMessage(started.failure)}`
+            )
+          )
+        }
+      }
+      yield* this.#keepStoppedApps(taskId, unstarted)
+      return warnings
+    })
+  }
+
+  /**
+   * Starts, as the Relay starts, the Apps stopped backups still owe a
+   * start, each in its lifecycle lane, unless a person has changed its
+   * power since the backup stopped it: what they chose stands.
+   */
+  #restartStoppedApps() {
+    return Effect.gen({ self: this }, function* () {
+      if (!this.#apps) return
+      for (const { apps, taskId } of yield* this.#readStoppedApps()) {
+        const unstarted: Array<StoppedApp> = []
+        for (const entry of apps) {
+          const { appId } = entry
+          // As a person's start does, it waits for any restore of a
+          // volume the App mounts.
+          yield* promiseEffect(() => this.#apps!.volumes(appId)).pipe(
+            Effect.flatMap((volumes) =>
+              this.#lanes.run(
+                {
+                  label: "backup.app.restart",
+                  locks: appStartLocks(appId, volumes),
+                },
+                Effect.gen({ self: this }, function* () {
+                  if (!(yield* this.#stillOwed(entry))) return
+                  yield* promiseEffect(() => this.#apps!.start(appId))
+                })
+              )
             ),
-            Effect.tap((ended) =>
-              ended === "paused"
-                ? Effect.void
-                : Effect.annotateCurrentSpan({
-                    "backup.task.outcome": ended.outcome,
-                    "backup.failure.code": ended.failure,
-                  }).pipe(
-                    Effect.andThen(
-                      recordBackupTask(
-                        this.#config.nodeId,
-                        task,
-                        ended.outcome,
-                        ended.failure,
-                        Date.now() - startedAt
-                      )
-                    )
-                  )
-            ),
-            Effect.ensuring(
-              timeoutFiber ? Fiber.interrupt(timeoutFiber) : Effect.void
-            ),
-            Effect.ensuring(
-              controller
-                ? Effect.sync(() => this.#activeCreates.delete(task.taskId))
-                : Effect.void
-            ),
-            Effect.withSpan(`Backups.${task.kind}`, {
-              attributes: backupTaskAttributes(task),
+            Effect.catch((cause) => {
+              unstarted.push(entry)
+              return Effect.logWarning(
+                "An App a stopped backup stopped couldn't be started again",
+                { appId, cause }
+              )
             })
           )
-        if (outcome === "paused") return
+        }
+        yield* this.#keepStoppedApps(taskId, unstarted)
+      }
+    }).pipe(Effect.ignore)
+  }
+
+  // Whether a start is still owed: no one has changed the App's power since.
+  #stillOwed(entry: StoppedApp) {
+    return this.#state
+      .listAppPowerRevisions([entry.appId])
+      .pipe(
+        Effect.map(
+          (revisions) => (revisions.get(entry.appId) ?? 0) === entry.revision
+        )
+      )
+  }
+
+  #journalStoppedApps(taskId: string, apps: ReadonlyArray<StoppedApp>) {
+    const directory = stoppedAppsDirectory(this.#config)
+    return promiseEffect(async () => {
+      await mkdir(directory, { mode: 0o700, recursive: true })
+      await Effect.runPromise(
+        writeFileAtomic(
+          resolve(directory, `${taskId}.json`),
+          `${JSON.stringify(apps)}\n`,
+          0o600
+        )
+      )
+    })
+  }
+
+  // Every task's journal of the Apps it stopped and still owes a start.
+  #readStoppedApps() {
+    const directory = stoppedAppsDirectory(this.#config)
+    return Effect.gen(function* () {
+      const names = yield* promiseEffect(async () => {
+        await mkdir(directory, { mode: 0o700, recursive: true })
+        return readdir(directory)
+      })
+      const journals: Array<{ apps: Array<StoppedApp>; taskId: string }> = []
+      for (const name of names.sort()) {
+        if (!name.endsWith(".json")) continue
+        const text = yield* promiseEffect(() =>
+          readFile(resolve(directory, name), "utf8")
+        )
+        const apps = Option.getOrElse(
+          decodeStoppedApps(
+            Result.getOrElse(
+              Result.try((): unknown => JSON.parse(text)),
+              () => null
+            )
+          ),
+          () => []
+        )
+        journals.push({
+          apps: [...apps],
+          taskId: name.slice(0, -".json".length),
+        })
+      }
+      return journals
+    })
+  }
+
+  // Keeps only the Apps a task still owes a start, forgetting it once none.
+  #keepStoppedApps(taskId: string, apps: ReadonlyArray<StoppedApp>) {
+    if (apps.length > 0) {
+      return this.#journalStoppedApps(taskId, apps).pipe(Effect.ignore)
+    }
+    return promiseEffect(() =>
+      rm(resolve(stoppedAppsDirectory(this.#config), `${taskId}.json`), {
+        force: true,
+      })
+    ).pipe(Effect.ignore)
+  }
+
+  /**
+   * Settles every restore of an App's folder or a volume a stop or a failed
+   * swap left unfinished, as the Relay starts. One that can't finish now,
+   * as when something runs on its target, keeps it fenced.
+   */
+  #recoverTarRestores() {
+    return Effect.gen({ self: this }, function* () {
+      yield* promiseEffect(() =>
+        removeLeftoverTarHelpers(this.#config, this.#engine)
+      )
+      const journals = yield* promiseEffect(() =>
+        readTarRestoreJournals(this.#config)
+      )
+      for (const journal of journals) {
+        yield* this.#settleTarRestore(journal, "finish", false).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning(
+              "An unfinished volume or App folder restore couldn't be settled; its target stays fenced",
+              { cause, taskId: journal.taskId }
+            )
+          )
+        )
+      }
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning(
+          "Couldn't settle unfinished volume and App folder restores",
+          { cause }
+        )
+      )
+    )
+  }
+
+  /**
+   * Finishes or abandons one unfinished restore, holding the locks its
+   * restore held, with nothing running on its target: Apps running on it
+   * are stopped when `stopApps`, as when someone asks for it, or keep it
+   * from finishing; any other container keeps it from finishing.
+   */
+  #settleTarRestore(
+    journal: TarRestoreJournal,
+    action: "abandon" | "finish",
+    stopApps: boolean
+  ) {
+    return Effect.gen({ self: this }, function* () {
+      const { target } = journal
+      let locks: ReadonlyArray<LaneLock>
+      if (target.kind === "app") {
+        locks = appReplaceLocks(target.id)
+      } else {
+        const apps = new Set([
+          ...journal.consumers,
+          ...(yield* this.#volumeApps(target.id)),
+        ])
+        locks = [
+          exclusive(laneKeys.volume(target.id)),
+          ...[...apps].flatMap((appId) => appLifecycleLocks(appId)),
+        ]
+      }
+      yield* this.#lanes.run(
+        { label: TAR_RESTORE_RECOVERY_LABEL, locks },
+        Effect.gen({ self: this }, function* () {
+          // The discovery read only chose the locks. Another recovery may
+          // have advanced or removed the journal while this one waited.
+          const current = yield* promiseEffect(() =>
+            readTarRestoreJournal(this.#config, journal.taskId)
+          )
+          if (!current) return
+          if (
+            current.target.kind !== target.kind ||
+            current.target.id !== target.id ||
+            JSON.stringify(current.source) !== JSON.stringify(journal.source) ||
+            current.consumers.some((id) => !journal.consumers.includes(id))
+          ) {
+            return yield* backupFailure(
+              "restore_journal_changed",
+              "restore.resolve",
+              "The restore target changed while waiting for its recovery locks"
+            )
+          }
+          journal = current
+          if (action === "abandon") {
+            yield* promiseEffect(() =>
+              abandonTarRestore(
+                this.#config,
+                this.#engine,
+                journal,
+                this.#fences
+              )
+            )
+            yield* this.#state.failBackupTask(
+              journal.taskId,
+              "The restore was abandoned partway; its target keeps what it held then",
+              Date.now()
+            )
+            return
+          }
+          if (journal.phase !== "staging") {
+            yield* this.#quietTarTarget(journal, stopApps)
+          }
+          const finished = yield* promiseEffect(() =>
+            finishTarRestore(this.#config, this.#engine, journal, this.#fences)
+          )
+          if (finished) {
+            yield* this.#state.completeRecoveredRestore(
+              journal.taskId,
+              Date.now(),
+              stopApps ? "Finished when asked, after its swap stopped" : null
+            )
+          }
+        })
+      )
+    })
+  }
+
+  // Nothing may run on a restore's target while it's swapped in.
+  #quietTarTarget(journal: TarRestoreJournal, stopApps: boolean) {
+    return Effect.gen({ self: this }, function* () {
+      const { target } = journal
+      if (!this.#apps) {
+        return yield* backupFailure(
+          "app_driver_unavailable",
+          "lookup",
+          "The App backup driver is unavailable"
+        )
+      }
+      const runningApps: Array<string> = []
+      const others: Array<string> = []
+      if (target.kind === "app") {
+        const found = yield* promiseEffect(() =>
+          this.#apps!.hostFolder(target.id)
+        )
+        if (
+          found &&
+          (yield* promiseEffect(() => this.#apps!.isRunning(target.id)))
+        ) {
+          runningApps.push(target.id)
+        }
+      } else {
+        const volume = yield* this.#requiredVolume(target.id, true)
+        for (const mount of volume.mounts) {
+          if (!mount.running) continue
+          if (mount.kind === "app" && mount.resourceId) {
+            runningApps.push(mount.resourceId)
+          } else others.push(mount.container)
+        }
+      }
+      if (others.length > 0) {
+        return yield* backupFailure(
+          "volume_in_use",
+          "restore.recover",
+          `Stop ${others[0]!}, which mounts this volume, so its restore can finish`
+        )
+      }
+      if (runningApps.length === 0) return
+      if (!stopApps) {
+        return yield* backupFailure(
+          "app_running",
+          "restore.recover",
+          "An App runs on what the restore was swapping in; stop it so the restore can finish"
+        )
+      }
+      for (const appId of new Set(runningApps)) {
+        yield* promiseEffect(() => this.#apps!.stop(appId))
       }
     })
   }
@@ -442,7 +1485,9 @@ export class BackupManager {
   #execute(
     task: RelayBackupTask,
     signal: AbortSignal,
-    beginInstall: RestoreInstallGate
+    beginInstall: RestoreInstallGate,
+    lockedApps: ReadonlySet<string>,
+    window: StoppedWindow | null
   ) {
     return Effect.gen({ self: this }, function* () {
       const createSignal = signal
@@ -512,6 +1557,28 @@ export class BackupManager {
       }
       if (task.input.kind === "restore") {
         const input = task.input
+        const target = input.target
+        if (target.kind === "app" || target.kind === "volume") {
+          const result = yield* this.#restoreTar(
+            { ...input, target: { ...target, kind: target.kind } },
+            signal,
+            beginInstall,
+            lockedApps
+          )
+          const completed = yield* this.#state.completeBackupTask(
+            task.taskId,
+            result,
+            Date.now()
+          )
+          if (!completed) {
+            return yield* backupFailure(
+              "task_state_changed",
+              "restore.complete",
+              "The backup task was no longer running when restore completed"
+            )
+          }
+          return
+        }
         if (input.target.kind === "database") {
           if (!this.#databases) {
             return yield* backupFailure(
@@ -701,6 +1768,31 @@ export class BackupManager {
         return
       }
       const input = task.input
+      if (input.artifactKind === "tar_archive" && input.mode === "full") {
+        const result = yield* this.#createTar(
+          task.taskId,
+          input,
+          signal,
+          lockedApps,
+          window
+        )
+        const completed = yield* this.#state.completeBackupTask(
+          task.taskId,
+          result,
+          Date.now()
+        )
+        if (!completed) {
+          yield* promiseEffect(() =>
+            rm(backupArchivePath(this.#config, input.backupId), { force: true })
+          ).pipe(Effect.ignore)
+          return yield* backupFailure(
+            "task_state_changed",
+            "create.complete",
+            "The backup task was no longer running when the archive completed"
+          )
+        }
+        return
+      }
       if (
         input.target.kind === "platform" &&
         input.artifactKind === "platform_bundle" &&
@@ -1087,6 +2179,64 @@ export class BackupManager {
   }
 }
 
+/**
+ * The stopped window a batch's backups share: `begin` stops what uses any
+ * of them, once; `arrive` waits, once a backup's archive is taken, until
+ * every backup's is, then answers the warnings starting things again left;
+ * `leave` counts a backup that won't arrive, as one that failed first.
+ */
+interface StoppedWindow {
+  readonly arrive: (taskId: string) => Effect.Effect<ReadonlyArray<string>>
+  readonly begin: Effect.Effect<void, unknown>
+  readonly leave: (taskId: string) => Effect.Effect<void>
+  readonly lockedApps: ReadonlySet<string>
+}
+
+// The batch a claimed task opens a stopped window for, if any.
+function stoppedBatch(
+  task: RelayBackupTask
+): { id: string; size: number } | null {
+  return task.input.kind === "create" &&
+    task.input.consistency === "stopped" &&
+    task.input.batch
+    ? task.input.batch
+    : null
+}
+
+/**
+ * An App a stopped backup stopped, with the revision of its power intent
+ * then: a start is owed only while no one has changed its power since.
+ */
+const StoppedAppSchema = Schema.Struct({
+  appId: Schema.String,
+  revision: Schema.Number,
+})
+type StoppedApp = typeof StoppedAppSchema.Type
+const decodeStoppedApps = Schema.decodeUnknownOption(
+  Schema.Array(StoppedAppSchema)
+)
+
+// Where a stopped backup records the Apps it stopped, by task.
+function stoppedAppsDirectory(config: RelayConfig): string {
+  return resolve(config.dataDirectory, "backup-state", "stopped")
+}
+
+// The most a full archive may take: the task's own limit, and each
+// destination's.
+function archiveMaximumBytes(input: BackupCreateTaskInput): number | null {
+  return [input.destination, ...(input.replicas ?? [])].reduce<number | null>(
+    (limit, destination) => {
+      if (destination.kind === "restic") return limit
+      const destinationLimit = backupDestinationFor(
+        destination.kind
+      ).maximumFullBackupBytes
+      if (destinationLimit === null) return limit
+      return Math.min(limit ?? destinationLimit, destinationLimit)
+    },
+    input.maxBytes
+  )
+}
+
 async function createPortableInstanceBackup(
   config: RelayConfig,
   input: BackupCreateTaskInput,
@@ -1104,16 +2254,7 @@ async function createPortableInstanceBackup(
   const backupDirectory = backupDirectoryPath(config)
   await mkdir(backupDirectory, { recursive: true, mode: 0o700 })
   const destination = backupArchivePath(config, input.backupId)
-  const maximumBytes = [input.destination, ...(input.replicas ?? [])].reduce<
-    number | null
-  >((limit, destination) => {
-    if (destination.kind === "restic") return limit
-    const destinationLimit = backupDestinationFor(
-      destination.kind
-    ).maximumFullBackupBytes
-    if (destinationLimit === null) return limit
-    return Math.min(limit ?? destinationLimit, destinationLimit)
-  }, input.maxBytes)
+  const maximumBytes = archiveMaximumBytes(input)
   const patterns = [...DEFAULT_EXCLUDES, ...input.exclude]
   let warnings: Array<string> = []
 
@@ -2761,29 +3902,6 @@ function writeBackupArchive(
     }
     append(0)
   })
-}
-
-function backupPathIsExcluded(
-  path: string,
-  directory: boolean,
-  patterns: ReadonlyArray<string>
-): boolean {
-  let excluded = false
-  for (const rawPattern of patterns) {
-    const trimmed = rawPattern.trim()
-    if (!trimmed || trimmed.startsWith("#")) continue
-    const negated = trimmed.startsWith("!")
-    const pattern = negated ? trimmed.slice(1) : trimmed
-    if (!pattern) continue
-    const candidate = directory ? `${path}/` : path
-    const matched = minimatch(candidate, pattern, {
-      dot: true,
-      matchBase: !pattern.includes("/"),
-      nocase: false,
-    })
-    if (matched) excluded = !negated
-  }
-  return excluded
 }
 
 function requireContained(root: string, candidate: string): void {

@@ -73,7 +73,15 @@ Targets are:
 
 - `instance`: a game server data directory;
 - `database`: a managed database logical dump;
-- `platform`: Hearth's database and the recoverable Kiln configuration.
+- `platform`: Hearth's database and the recoverable Kiln configuration;
+- `app`: an App's folder;
+- `volume`: a volume Kiln manages, by its ID: a Kiln volume's, or
+  `<App ID>/<key>` for one an App's Compose project declares (see
+  [App deployments](app-deployments.md#volumes)).
+
+Relays back up and restore Apps and volumes; Hearth catalogs, authorizes,
+and offers them in a later layer, and until then accepts only the first
+three.
 
 Reasons are `manual`, `pre_restore`, `final_delete`, and `scheduled`.
 Artifact kinds start with `archive`, `database_dump`, and `platform_bundle`.
@@ -182,6 +190,61 @@ Redis and Valkey backups are deferred until Kiln supports engine snapshots and
 compression. Their deletion therefore proceeds without a final backup instead
 of reserving a logical dump that Relay cannot create.
 
+An App's folder and a volume are archived through Docker as `tar_archive`
+artifacts (`.tar.gz`), never by the `docker` CLI. A short-lived helper
+container mounts the volume, or the App's folder as a bind, at `/volume`,
+and the Relay reads it with `GET /containers/{id}/archive` while the helper
+is only created, so nothing runs in it. Docker's archive keeps each file's
+owner, mode, and extended attributes, and symlinks stay links, which a
+database's files need. The Relay validates every path Docker sends,
+leaves out the exclusions, and writes `.kiln-backup/manifest.json` (target,
+consistency, and the volume's Docker name) followed by the files under
+`data/`. Devices and pipes are left out with a warning. An App's folder
+holds only its data: its configuration's files, its Dockerfile, and a
+repository checkout live outside it, and its Compose file's relative binds
+are inside it, so they're backed up with it.
+
+The helper runs the Relay's own image, found through the Relay's container
+(`KILN_RELAY_CONTAINER` or its hostname), which every Relay running in
+Docker has without a pull. Apps and volumes can't be backed up by a Relay
+that doesn't run in Docker. The image is distroless, so a restore's steps
+run the Relay's own Node code (`tar-restore-helper`). Helpers have no
+network, run as root so files keep their owners, and are removed after
+each step, or at the Relay's next start.
+
+A backup is **live** by default and records that it is: a crash-consistent
+copy of a resource that kept running. It can instead be **stopped**: the
+Relay stops each App that uses what it backs up (the App, or every App
+whose containers mount the volume), backs up, and starts again those that
+were running, before uploading. A stopped volume backup is refused while a
+container that isn't an App's mounts it, since Kiln can't stop and start it
+as its owner would. Apps it stopped are journaled first, so a Relay that
+stops midway starts them again when it starts; one that won't start again
+is a warning on the backup, which still succeeds, and stays journaled for
+the Relay's next start. The journal records each App's power-intent
+revision, which every start, stop, restart, deployment, or deletion a
+person asks for advances; a start is owed only while it's unchanged, so a
+later choice stands. If an App can't be stopped, the backup fails and
+every App it stopped starts again, the one whose stop failed included,
+since it may be partly stopped. The Apps a stopped backup or a restore of a
+volume locks are looked up before it waits its turn and checked again once
+it has it; if they changed meanwhile, or can't be looked up, the task fails
+rather than run beside an App it doesn't hold. Stopped backups started together as a batch (`batch: {id, size}`, as
+backing up an App starts its folder's and each owned volume's) share one
+stopped window: the Relay claims the batch's queued backups together, waiting
+a few moments for any still arriving, holds all their locks at once, stops
+every App that uses any of them once (journaled under the first backup, as a
+single stopped backup's are, so a Relay that stops midway starts them again
+and the backups rerun), takes every archive, and only then starts again those
+that ran, so the copies agree. A backup of the batch that arrives later runs
+in a window of its own. Live batches are independent backups. A final backup is always
+stopped, and nothing starts again. Game servers, databases, and Kiln are
+backed up live only for now.
+
+A volume an App's Compose project made without an ID, as a file that
+changed the volume's Docker name leaves behind, isn't backed up: the App
+doesn't use it any more, and it goes when the App is deleted.
+
 A platform bundle contains a logical Hearth database dump plus a versioned
 manifest describing the installation. Relay gzip-compresses the dump and
 encrypts it with AES-256-GCM using a key derived from the separately recoverable
@@ -246,6 +309,44 @@ Restore extracts into a sibling staging directory, validates every path and the
 manifest, then swaps directories where the filesystem permits. If an atomic
 swap is unavailable, Relay records the restore phase so recovery can complete
 or roll back deterministically.
+
+Restoring a volume requires every container that mounts it to be stopped,
+and restoring an App's folder requires the App to be stopped; the Relay
+checks both. The Relay checks the archive's manifest and every entry, so
+nothing lands outside the target or through a symlink the archive made,
+and nothing takes a name restores keep for their staging folders
+(`.kiln-restore-*` at the target's root). A backup checks every entry it
+writes by the same rules, so one that succeeds can be restored: a hard
+link whose file an exclusion left out holds the file's contents instead.
+
+A helper step makes the restore's staging folder inside the target, and
+the restore stops, changing nothing, if anything already has its name.
+Docker extracts the archive (`PUT /containers/{id}/archive`) into it,
+keeping the old files until the copy is whole. Two more steps then clear
+the old files and move the restored ones in, and Docker sets the root's
+extended attributes, which the steps can't, by extracting its entry over
+the mount. A journal records each phase: a restore that fails or stops
+while staging leaves the target as it was.
+
+One that fails or stops while clearing or moving leaves the target holding
+neither copy, so its journal **fences** the target until the restore
+finishes: the Relay's lanes refuse every other change to it, starting,
+deploying, or replacing an App that uses the volume, and new backups and
+restores of it, saying the restore must finish first. The Relay tries to
+finish it when it next starts, under the restore's own locks, unless
+something runs on the target, as when Docker's restart policy started an
+App, since moving the restored files in would overwrite what it wrote.
+Starting, deploying, or deleting an App holds every managed volume it
+mounts shared: a start or deletion those its containers mount or its
+configuration names, and a deployment also every volume its Compose file
+declares, by the Docker name Compose gives it (external, named, or after
+the project, since Compose reuses one already there), held from before
+its containers are made. So a restore, which holds the volume alone, comes wholly before or
+after, and an unfinished one refuses them.
+`backup.restore.resolve` finishes it on request, stopping the Apps running
+on it first (another container mounting a volume still refuses), or
+abandons it, leaving the target as it is and dropping the staging folder.
+A restore needs room for both copies in the target's filesystem.
 
 Database restore requires the database to be running. The logical import is a
 tracked task and its output is bounded and redacted. A pre-restore dump is the

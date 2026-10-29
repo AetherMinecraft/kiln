@@ -95,7 +95,8 @@ and a change to the network queued behind the deletion waits for it in turn.
 So while a deletion
 waits on a network's DNS, rewriting that DNS (`relay.tailscale.stack.dns`)
 waits only for what holds its locks, not for what waits in line, and counts
-toward the lanes' waiting limit like any request; at any other time it takes
+toward the lanes' waiting limit and is refused, as by an unfinished
+restore's fence, like any request; at any other time it takes
 its turn like any change. Relays rewrite bindings saved with a
 game server's bare ID when they start, and Hearth its copies of them in a
 migration.
@@ -132,6 +133,18 @@ worker locks the work when it runs it:
 - **Backups** run alongside other work on their target (shared lock). A
   **restore** runs alone (exclusive), so it waits for file writes and power
   changes and nothing starts the server mid-restore.
+  An App's folder or a volume backed up **stopped** also holds the
+  lifecycle of each App it stops (for a volume, its owner and every App
+  that uses it), so nothing starts them meanwhile, and holds a volume
+  exclusively, so no App that begins using it deploys or starts either. A volume's restore holds
+  the volume exclusively with every such App's lifecycle; an App folder's
+  restore replaces the App. A restore whose swap didn't finish keeps its
+  target fenced: the lanes refuse every operation that locks it, and those
+  that start, deploy, or replace an App using the volume, until its
+  recovery (`backup.restore.recover`) finishes or abandons it. Starting
+  or deleting an App holds every managed volume it mounts shared, and a
+  deployment holds every one its Compose file declares too, by Docker name, in a
+  nested step before it makes containers, checked against the same fences.
 - **Provisioning** holds the new server exclusively while it's created.
   Jobs for different instances run at once, up to half the host's cores
   (two to four), so a slow image download or install doesn't hold up the

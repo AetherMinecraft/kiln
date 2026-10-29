@@ -15,6 +15,7 @@
  */
 import {
   OperationLanes as Lanes,
+  type LaneLock,
   type OperationLanesOptions,
 } from "@workspace/operations"
 
@@ -60,16 +61,55 @@ export const laneKeys = {
   volume: (id: string) => `volume:${id}`,
 } as const
 
+/**
+ * Why an operation may not run now, or null when it may: something the
+ * Relay keeps across operations, such as a restore that didn't finish.
+ */
+export type LaneRefusal = (
+  label: string,
+  locks: ReadonlyArray<LaneLock>
+) => string | null
+
 /** The Relay's lanes, in its words and with its span attribute. */
 export class OperationLanes extends Lanes {
+  readonly #refusals: Array<LaneRefusal>
+
   constructor(options: Pick<OperationLanesOptions, "maxWaiting"> = {}) {
+    const refusals: Array<LaneRefusal> = []
     super({
       ...options,
       messages: {
         busy: "The Relay is busy; try again shortly",
         paused: (label) => `${label} didn't run: this Relay is paused`,
       },
+      refuse: (label, locks) => firstRefusal(refusals, label, locks),
       waitAttribute: "relay.lanes.wait_ms",
     })
+    this.#refusals = refusals
   }
+
+  /** Checks every operation from now on, as its turn comes. */
+  addRefusal(refusal: LaneRefusal): void {
+    this.#refusals.push(refusal)
+  }
+
+  /**
+   * Why work would be refused, for locks an operation takes once it's
+   * running (`runNested`), which the lanes don't check themselves.
+   */
+  refusalFor(label: string, locks: ReadonlyArray<LaneLock>): string | null {
+    return firstRefusal(this.#refusals, label, locks)
+  }
+}
+
+function firstRefusal(
+  refusals: ReadonlyArray<LaneRefusal>,
+  label: string,
+  locks: ReadonlyArray<LaneLock>
+): string | null {
+  for (const refusal of refusals) {
+    const reason = refusal(label, locks)
+    if (reason) return reason
+  }
+  return null
 }

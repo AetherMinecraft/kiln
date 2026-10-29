@@ -14,6 +14,7 @@ import { Effect, Predicate, Schema } from "effect"
 
 import {
   RelayInventoryLookupSchema,
+  backupRestoreResolveSchema,
   backupTaskIdSchema,
   decodeRelayJoinLink,
   relayInstallationReplaceInputSchema,
@@ -156,6 +157,7 @@ import { transferSpace } from "./transfers/peer/space.js"
 import type { TransferRootResolver } from "./transfers/peer/roots.js"
 import { TransferSources } from "./transfers/peer/sources.js"
 import { BackupManager } from "./backups.js"
+import { TarRestoreFences } from "./backups/tar-restore-journal.js"
 import { attachBrowserSocket } from "./browser-socket.js"
 import {
   discoverRelayAdvertisedHost,
@@ -379,6 +381,10 @@ const bricks = new BrickCatalog(config.brickCatalogUrl, config.dataDirectory)
 // Every change to a game server, App, or database waits its turn here,
 // whichever actor asks for it. See operation-plans.ts.
 const lanes = new OperationLanes()
+// Restores of Apps' folders and volumes that began swapping and didn't
+// finish fence their targets: read before any work is admitted.
+const restoreFences = await TarRestoreFences.load(config)
+lanes.addRefusal((label, locks) => restoreFences.refusal(label, locks))
 // A Relay a Hearth paused stays paused across restarts: nothing starts until
 // it's resumed, so this is read before any worker runs.
 lanes.setPaused(
@@ -556,7 +562,9 @@ const apps = new AppDriver(
   },
   lanes,
   { allocations: docker.allocations, state: startupCore.state },
-  databaseConnections
+  databaseConnections,
+  (dockerNames) =>
+    runRelayEffect("relay.apps.volumes", volumes.idsByDockerName(dockerNames))
 )
 lifecycle.useAppServiceContainers(async (appId, service) => {
   await apps.get(appId)
@@ -778,9 +786,34 @@ const provisioningFiber = forkRelayEffect(
 const backupManager = await runRelayEffect(
   "relay.startup.backups",
   BackupManager.make({
+    apps: {
+      hostFolder: async (appId) => {
+        const found = await recoverPromise(
+          async () => (await apps.get(appId)).id,
+          () => null
+        )
+        return found
+          ? join(await lifecycle.hostDataDirectory(), "apps", found)
+          : null
+      },
+      isRunning: async (appId) =>
+        (await apps.get(appId)).containers.some(
+          (container) => container.running
+        ),
+      start: async (appId) => {
+        await apps.action({ action: "start", appId })
+      },
+      stop: async (appId) => {
+        await apps.action({ action: "stop", appId })
+      },
+      volumes: (appId) =>
+        runRelayEffect("relay.apps.volumes", volumes.appVolumeIds(appId)),
+    },
     config,
     databases,
+    fences: restoreFences,
     lanes,
+    volumes,
     findInstance: (instanceId) => docker.findInstance(instanceId),
     isInstanceStopped: async (instanceId) => {
       const instance = (await docker.inspectInstances()).find(
@@ -1317,6 +1350,8 @@ const controlSocket = attachControlSocket({
       request.operation,
       lockFields(request.payload),
       resolveInstanceReference,
+      (appId) =>
+        runRelayEffect("relay.apps.volumes", volumes.appVolumeIds(appId)),
       async (stackId) => {
         const plan = await lifecycle.tailscaleStackPlan(stackId)
         tailscaleStackPlans.set(request, plan.basis)
@@ -1864,6 +1899,15 @@ function terminalOwner(
   request: RelayControlRequest
 ): string {
   return `${client.id}:${request.subject ?? ""}`
+}
+
+// A person changed an App's power, which a start a stopped backup owed from
+// before doesn't override.
+async function notePowerChange(appId: string): Promise<void> {
+  await runRelayEffect(
+    "relay.apps.powerRevision",
+    startup.state.bumpAppPowerRevision(appId, Date.now())
+  )
 }
 
 async function executeControlRequest(
@@ -2631,6 +2675,7 @@ async function executeControlRequest(
     }
     case "app.delete": {
       const input = relayDeleteAppSchema.parse(request.payload)
+      await notePowerChange(input.appId)
       // One still provisioning goes with whatever its create made: at most
       // its network and data directory.
       const discarded = await runRelayEffect(
@@ -2680,8 +2725,11 @@ async function executeControlRequest(
       })
       return deleted
     }
-    case "app.deploy":
-      return apps.deploy(relayDeployAppSchema.parse(request.payload))
+    case "app.deploy": {
+      const input = relayDeployAppSchema.parse(request.payload)
+      await notePowerChange(input.appId)
+      return apps.deploy(input)
+    }
     case "app.deployment.read":
       return apps.readDeployment(
         relayAppDeploymentReadSchema.parse(request.payload)
@@ -2691,8 +2739,11 @@ async function executeControlRequest(
         relayAppImageCheckSchema.parse(request.payload),
         signal
       )
-    case "app.action":
-      return apps.action(relayAppActionSchema.parse(request.payload))
+    case "app.action": {
+      const input = relayAppActionSchema.parse(request.payload)
+      await notePowerChange(input.appId)
+      return apps.action(input)
+    }
     case "app.limits.write":
       return apps.setLimits(relayAppLimitsSchema.parse(request.payload))
     case "app.volumes.write": {
@@ -2855,6 +2906,14 @@ async function executeControlRequest(
           .cancel(backupTaskIdSchema.parse(requiredString(payload, "taskId")))
           .pipe(Effect.map((task) => (task ? sendBackupTask(task) : task)))
       )
+    case "backup.restore.resolve": {
+      const input = backupRestoreResolveSchema.parse(request.payload)
+      await runRelayEffect(
+        "relay.backups.resolveRestore",
+        backupManager.resolveTarRestore(input.taskId, input.action)
+      )
+      return { resolved: true, taskId: input.taskId }
+    }
     case "backup.task.get":
       return runRelayEffect(
         "relay.backups.get",

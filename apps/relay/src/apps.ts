@@ -245,6 +245,9 @@ export class AppDriver {
   readonly #lanes: OperationLanes
   readonly #limits: AppLimitStores
   readonly #connections: DatabaseConnections
+  readonly #volumeIds: (
+    dockerNames: ReadonlyArray<string>
+  ) => Promise<ReadonlyArray<string>>
 
   /**
    * Callers hold the App's lane locks for each change; a deployment's build
@@ -256,8 +259,13 @@ export class AppDriver {
     networking: AppNetworking,
     lanes: OperationLanes,
     limits: AppLimitStores,
-    connections: DatabaseConnections
+    connections: DatabaseConnections,
+    /** The managed volumes with these Docker names, by ID. */
+    volumeIds: (
+      dockerNames: ReadonlyArray<string>
+    ) => Promise<ReadonlyArray<string>>
   ) {
+    this.#volumeIds = volumeIds
     this.#config = config
     this.#engine = new DockerEngine(config.dockerSocket)
     this.#resources = relayResourceNames(config)
@@ -1908,105 +1916,168 @@ export class AppDriver {
       )
     log("Reading Compose file")
     const normalized = await readConfig(base)
-    const databases = await this.#connectableDatabases(input.appId, deployment)
-    const routes = await this.#networking.routes(input.appId)
-    const tailscale = await this.#networking.tailscale(input.appId)
-    const options = {
-      appId: input.appId,
-      binds,
-      commit: deployment.commit,
-      databases,
-      deploymentId: deployment.id,
-      mounts,
-      routes,
-      serviceLimits: input.config.serviceLimits,
-      tailscale,
-    }
-    const previous = await this.#appContainers(input.appId)
-    const running = previous.some((container) => container.running)
-    const blocker =
-      mountsRollingBlocker(mounts) ??
-      composeRollingBlocker(normalized, tailscale)
-    if (running && blocker) {
-      log(`Stopping the running containers first, since ${blocker}`)
-    }
-    // Every service counts, with the limits the Compose file sets for those
-    // Kiln leaves alone.
-    const reserve = (
-      prepared: ComposeProject,
-      apply: (surge: boolean) => Promise<void>,
-      surge = false
-    ) =>
-      this.#reserving(
-        input.appId,
-        Object.values(prepared.services).map(composeServiceLimits),
-        (fits) =>
-          traceRelayPromise("relay.apps.deployment.composeUp", () =>
-            apply(fits)
-          ),
-        { surge }
-      )
-    if (running && blocker === null) {
-      // Its own project, so its networks and containers stand apart from
-      // the running ones until it takes over.
-      const project = `${base}-${deployment.id}`
-      const prepared = this.#prepareCompose(await readConfig(project), {
-        ...options,
-        deferAliases: true,
-      })
-      log(`Services: ${Object.keys(prepared.services).join(", ")}`)
-      let rolled = false
-      await reserve(
-        prepared,
-        async (surge) => {
-          if (!surge) {
-            log(
-              "Stopping the running containers first, since the node can't hold both copies at once"
-            )
+    await this.#holdingComposeVolumes(
+      input.appId,
+      base,
+      normalized,
+      async () => {
+        const databases = await this.#connectableDatabases(
+          input.appId,
+          deployment
+        )
+        const routes = await this.#networking.routes(input.appId)
+        const tailscale = await this.#networking.tailscale(input.appId)
+        const options = {
+          appId: input.appId,
+          binds,
+          commit: deployment.commit,
+          databases,
+          deploymentId: deployment.id,
+          mounts,
+          routes,
+          serviceLimits: input.config.serviceLimits,
+          tailscale,
+        }
+        const previous = await this.#appContainers(input.appId)
+        const running = previous.some((container) => container.running)
+        const blocker =
+          mountsRollingBlocker(mounts) ??
+          composeRollingBlocker(normalized, tailscale)
+        if (running && blocker) {
+          log(`Stopping the running containers first, since ${blocker}`)
+        }
+        // Every service counts, with the limits the Compose file sets for those
+        // Kiln leaves alone.
+        const reserve = (
+          prepared: ComposeProject,
+          apply: (surge: boolean) => Promise<void>,
+          surge = false
+        ) =>
+          this.#reserving(
+            input.appId,
+            Object.values(prepared.services).map(composeServiceLimits),
+            (fits) =>
+              traceRelayPromise("relay.apps.deployment.composeUp", () =>
+                apply(fits)
+              ),
+            { surge }
+          )
+        if (running && blocker === null) {
+          // Its own project, so its networks and containers stand apart from
+          // the running ones until it takes over.
+          const project = `${base}-${deployment.id}`
+          const prepared = this.#prepareCompose(await readConfig(project), {
+            ...options,
+            deferAliases: true,
+          })
+          log(`Services: ${Object.keys(prepared.services).join(", ")}`)
+          let rolled = false
+          await reserve(
+            prepared,
+            async (surge) => {
+              if (!surge) {
+                log(
+                  "Stopping the running containers first, since the node can't hold both copies at once"
+                )
+                return
+              }
+              rolled = await this.#rollCompose(
+                input,
+                deployment,
+                composeArguments(project),
+                environment,
+                prepared,
+                previous
+              )
+            },
+            true
+          )
+          if (rolled) {
+            deployment.rolling = true
+            await this.#removeComposeNetworks(input.appId, project)
             return
           }
-          rolled = await this.#rollCompose(
-            input,
-            deployment,
-            composeArguments(project),
-            environment,
-            prepared,
-            previous
-          )
-        },
-        true
-      )
-      if (rolled) {
-        deployment.rolling = true
-        await this.#removeComposeNetworks(input.appId, project)
-        return
-      }
-    }
-    deployment.rolling = false
-    const prepared = this.#prepareCompose(normalized, {
-      ...options,
-      deferAliases: false,
-    })
-    if (!running || blocker) {
-      log(`Services: ${Object.keys(prepared.services).join(", ")}`)
-    }
-    // Containers from an image or Dockerfile deployment, or a rolled one,
-    // aren't the project's, so Compose's --remove-orphans can't see them.
-    const outside = previous.filter(
-      (container) => container.labels[COMPOSE_PROJECT_LABEL] !== base
-    )
-    await reserve(prepared, () =>
-      this.#replacing(input.appId, deployment, outside, [], () =>
-        this.#composeUp(
-          input,
-          deployment,
-          composeArguments(base),
-          environment,
-          prepared
+        }
+        deployment.rolling = false
+        const prepared = this.#prepareCompose(normalized, {
+          ...options,
+          deferAliases: false,
+        })
+        if (!running || blocker) {
+          log(`Services: ${Object.keys(prepared.services).join(", ")}`)
+        }
+        // Containers from an image or Dockerfile deployment, or a rolled one,
+        // aren't the project's, so Compose's --remove-orphans can't see them.
+        const outside = previous.filter(
+          (container) => container.labels[COMPOSE_PROJECT_LABEL] !== base
         )
+        await reserve(prepared, () =>
+          this.#replacing(input.appId, deployment, outside, [], () =>
+            this.#composeUp(
+              input,
+              deployment,
+              composeArguments(base),
+              environment,
+              prepared
+            )
+          )
+        )
+        await this.#removeComposeNetworks(input.appId, base)
+      }
+    )
+  }
+
+  /**
+   * Runs what makes and starts an App's containers holding, shared, every
+   * managed volume its Compose file declares, by the Docker name Compose
+   * gives it: one named as external, one it names without (Compose reuses
+   * a volume that's already there), and one it names after the project. A
+   * Kiln volume, another App's, or its own: a restore of one holds it
+   * alone, so it comes wholly before or after, and one whose restore didn't
+   * finish refuses the deployment. Kiln's own mounts were held when it was
+   * admitted.
+   */
+  async #holdingComposeVolumes<A>(
+    appId: string,
+    project: string,
+    normalized: ComposeProject,
+    run: () => Promise<A>
+  ): Promise<A> {
+    const projectName = Predicate.isString(normalized.name)
+      ? normalized.name
+      : project
+    const names = Object.entries(normalized.volumes ?? {}).map(
+      ([key, volume]) => {
+        if (!Predicate.isObject(volume)) return `${projectName}_${key}`
+        const external = volume.external
+        if (Predicate.isObject(external) && Predicate.isString(external.name)) {
+          return external.name
+        }
+        if (Predicate.isString(volume.name)) return volume.name
+        return external === true ? key : `${projectName}_${key}`
+      }
+    )
+    if (names.length === 0) return run()
+    const locks = (await this.#volumeIds(names)).map((id) =>
+      shared(laneKeys.volume(id))
+    )
+    const refused = () => this.#lanes.refusalFor("app.deployment", locks)
+    const before = refused()
+    if (before) throw new Error(before)
+    return Effect.runPromise(
+      traceRelayEffect(
+        "relay.apps.deployment.volumes",
+        this.#lanes.runNested(
+          { label: "app.deployment.volumes", locks },
+          Effect.suspend(() => {
+            // A restore it waited for may have left one unfinished.
+            const after = refused()
+            return after ? Effect.fail(new Error(after)) : promiseEffect(run)
+          })
+        ),
+        { "relay.app_id": appId }
       )
     )
-    await this.#removeComposeNetworks(input.appId, base)
   }
 
   async #composeUp(

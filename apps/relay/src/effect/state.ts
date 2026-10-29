@@ -625,6 +625,25 @@ export class RelayStateStore extends Context.Service<
      * Records a task's result. A `prune` is queued with it, in the same
      * transaction, unless one for the same repository is already waiting.
      */
+    /**
+     * Marks a restore that startup recovery finished as succeeded: one a
+     * stop cut off while running, or one that failed while swapping its
+     * files in, which recovery finished, saying so.
+     */
+    /**
+     * Claims the queued backups of a stopped batch, which run in the stopped
+     * window its first claimed backup opened, oldest first.
+     */
+    readonly claimBatchBackupTasks: (
+      batchId: string,
+      now: number
+    ) => Effect.Effect<ReadonlyArray<RelayBackupTask>, RelayStateError>
+    readonly completeRecoveredRestore: (
+      taskId: string,
+      now: number,
+      /** Its warning, when it's not the one for finishing at startup. */
+      warning?: string | null
+    ) => Effect.Effect<boolean, RelayStateError>
     readonly completeBackupTask: (
       taskId: string,
       result: BackupTaskResult,
@@ -850,6 +869,18 @@ export class RelayStateStore extends Context.Service<
      * Forgets that a Hearth has sent its Apps' configurations, so deletion
      * waits until it sends them again; what it named stays.
      */
+    /**
+     * Notes that a person changed an App's power: started, stopped,
+     * restarted, deployed, or deleted it.
+     */
+    readonly bumpAppPowerRevision: (
+      appId: string,
+      now: number
+    ) => Effect.Effect<void, RelayStateError>
+    /** Each App's power revision; one never changed is 0, and left out. */
+    readonly listAppPowerRevisions: (
+      appIds: ReadonlyArray<string>
+    ) => Effect.Effect<ReadonlyMap<string, number>, RelayStateError>
     readonly holdVolumeReferenceImport: (
       clientId: string
     ) => Effect.Effect<void, RelayStateError>
@@ -1530,6 +1561,16 @@ const migrations = SqliteMigrator.fromRecord({
       CREATE INDEX IF NOT EXISTS relay_app_volume_references_volume
       ON relay_app_volume_references (volume_id)
     `
+  }),
+  // How many times a person has changed each App's power, so a start a
+  // stopped backup owes from before isn't made over a later choice.
+  "30_app_power_revisions": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE IF NOT EXISTS relay_app_power_revisions (
+      app_id TEXT PRIMARY KEY NOT NULL,
+      revision INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    ) STRICT`
   }),
 })
 
@@ -2618,6 +2659,44 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
+    claimBatchBackupTasks: (batchId, now) =>
+      run(
+        "claim_batch_backup_tasks",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<{ taskId: string }>`
+              SELECT task_id AS taskId
+              FROM relay_backup_tasks
+              WHERE status = 'queued' AND input_refresh_required = 0
+                AND kind = 'create'
+                AND json_extract(input_json, '$.batch.id') = ${batchId}
+              ORDER BY created_at ASC, task_id ASC
+            `
+            const claimed: Array<RelayBackupTask> = []
+            for (const row of rows) {
+              yield* sql`
+                UPDATE relay_backup_tasks
+                SET status = 'running',
+                    started_at = COALESCE(started_at, ${now}),
+                    updated_at = ${now},
+                    error = NULL,
+                    error_code = NULL,
+                    phase = 'preparing',
+                    current_artifact_id = NULL,
+                    current_path = NULL,
+                    finished_at = NULL
+                WHERE task_id = ${row.taskId} AND status = 'queued'
+              `
+              const task = yield* backupTasks({ taskId: row.taskId }).pipe(
+                Effect.map((tasks) => tasks[0] ?? null),
+                Effect.orElseSucceed(() => null)
+              )
+              if (task) claimed.push(task)
+            }
+            return claimed
+          })
+        )
+      ),
     returnBackupTask: (taskId, now) =>
       run(
         "return_backup_task",
@@ -2782,6 +2861,47 @@ const makeRelayStateStore = Effect.gen(function* () {
             `
             yield* pruneSupersededExportTasks()
             if (prune) yield* insertBackupPrune(prune, now)
+            return true
+          })
+        )
+      ),
+    completeRecoveredRestore: (taskId, now, warning) =>
+      run(
+        "complete_recovered_restore",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<{ inputJson: string; status: string }>`
+              SELECT input_json AS inputJson, status
+              FROM relay_backup_tasks
+              WHERE task_id = ${taskId} AND kind = 'restore'
+                AND status IN ('running', 'failed')
+              LIMIT 1
+            `
+            const row = rows[0]
+            if (!row) return false
+            const result = {
+              warnings: [
+                warning ??
+                  (row.status === "failed"
+                    ? "Finished after the Relay restarted"
+                    : "Restore completed during Relay recovery"),
+              ],
+            }
+            yield* sql`
+              UPDATE relay_backup_tasks
+              SET status = 'succeeded',
+                  input_json = ${scrubBackupTaskInputJson(row.inputJson)},
+                  result_json = ${JSON.stringify(result)},
+                  error = NULL,
+                  error_code = NULL,
+                  phase = NULL,
+                  current_artifact_id = NULL,
+                  current_path = NULL,
+                  finished_at = ${now},
+                  updated_at = ${now}
+              WHERE task_id = ${taskId} AND kind = 'restore'
+                AND status IN ('running', 'failed')
+            `
             return true
           })
         )
@@ -3880,6 +4000,31 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
+    bumpAppPowerRevision: (appId, now) =>
+      run(
+        "bump_app_power_revision",
+        sql`
+          INSERT INTO relay_app_power_revisions (app_id, revision, updated_at)
+          VALUES (${appId}, 1, ${now})
+          ON CONFLICT (app_id) DO UPDATE
+          SET revision = revision + 1, updated_at = excluded.updated_at
+        `.pipe(Effect.asVoid)
+      ),
+    listAppPowerRevisions: (appIds) =>
+      appIds.length === 0
+        ? Effect.succeed(new Map<string, number>())
+        : run(
+            "list_app_power_revisions",
+            sql<{ appId: string; revision: number }>`
+              SELECT app_id AS appId, revision
+              FROM relay_app_power_revisions
+              WHERE app_id IN ${sql.in(appIds)}
+            `.pipe(
+              Effect.map(
+                (rows) => new Map(rows.map((row) => [row.appId, row.revision]))
+              )
+            )
+          ),
     holdVolumeReferenceImport: (clientId) =>
       run(
         "hold_volume_reference_import",
