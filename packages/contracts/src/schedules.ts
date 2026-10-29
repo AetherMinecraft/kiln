@@ -20,6 +20,14 @@ export const scheduleActionTypeSchema = z.enum([
 export type ScheduleActionType = z.infer<typeof scheduleActionTypeSchema>
 
 const scheduleActionIdSchema = z.uuid()
+/**
+ * Set by Hearth on the command and power steps it saves, once it has checked
+ * the authority each database the step names needs. Steps stored before
+ * commands and kills reached databases lack it, whatever their
+ * `targetKeys`, because they were never checked for it; they keep running
+ * only where they ran before.
+ */
+export const scheduleActionAuthorizedTargetsSchema = z.literal(2).optional()
 const scheduleActionTargetKeysSchema = z
   .array(z.string().trim().min(1).max(512))
   .max(2_000)
@@ -27,6 +35,7 @@ const scheduleActionTargetKeysSchema = z
 
 export const scheduleConsoleCommandActionSchema = z
   .object({
+    authorizedTargets: scheduleActionAuthorizedTargetsSchema,
     command: z.string().trim().min(1).max(4_096),
     id: scheduleActionIdSchema,
     targetKeys: scheduleActionTargetKeysSchema,
@@ -63,6 +72,7 @@ export const scheduleBackupActionSchema = z
 export const schedulePowerActionSchema = z
   .object({
     action: z.enum(["start", "stop", "restart", "kill"]),
+    authorizedTargets: scheduleActionAuthorizedTargetsSchema,
     id: scheduleActionIdSchema,
     targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("power"),
@@ -316,7 +326,24 @@ export const scheduleAttemptStatusSchema = z.enum([
   "skipped_policy",
   "interrupted",
   "not_run",
+  // A command Kiln lost track of after it may have started. It is never run
+  // again on its own.
+  "unknown",
 ])
+
+/**
+ * How a command run in a container went: its exit code, null when Kiln lost
+ * track of it, and the end of what it printed.
+ */
+export const scheduleCommandResultSchema = z
+  .object({
+    exitCode: z.number().int().nullable(),
+    output: z.string().max(4_096),
+    truncated: z.boolean(),
+  })
+  .strict()
+
+export type ScheduleCommandResult = z.infer<typeof scheduleCommandResultSchema>
 
 export const scheduleTargetRunStatusSchema = z.enum([
   "succeeded",
@@ -343,6 +370,8 @@ export const scheduleActionAttemptSchema = z
     error: z.string().max(2_000).nullable(),
     finishedAt: z.number().int().nonnegative(),
     id: z.string().min(1).max(128),
+    // Commands run in an App's or database's container.
+    result: scheduleCommandResultSchema.optional(),
     startedAt: z.number().int().nonnegative(),
     status: scheduleAttemptStatusSchema,
   })
@@ -460,13 +489,10 @@ export function scheduleActionSupportsTarget(
   target: Pick<ScheduleTarget, "kind">
 ): boolean {
   if (action.type === "wait") return true
-  if (action.type === "console_command") return target.kind === "instance"
-  if (action.type === "power") {
-    return (
-      target.kind !== "relay" &&
-      !(target.kind === "database" && action.action === "kill")
-    )
-  }
+  // A game server's goes to its console; a database's runs in its
+  // container's shell.
+  if (action.type === "console_command") return target.kind !== "relay"
+  if (action.type === "power") return target.kind !== "relay"
   if (action.mode === "incremental") return target.kind === "instance"
   return true
 }
@@ -477,8 +503,31 @@ export function scheduleTargetKey(
   return `${target.relayId}:${target.kind}:${target.id}`
 }
 
+/**
+ * Whether a step runs on a target only when Hearth checked it there: its
+ * `targetKeys` names the target and it carries `authorizedTargets`.
+ * Commands and kills reach databases now, but stored steps were saved, and
+ * authorized, when they skipped databases, even ones whose `targetKeys`
+ * named one, so they still skip them. A step reaches a database only once
+ * someone names it and Hearth saves it, authorizing it then.
+ */
+export function scheduleActionNeedsNamedTarget(
+  action: {
+    action?: "kill" | "restart" | "start" | "stop"
+    type: ScheduleActionType
+  },
+  target: Pick<ScheduleTarget, "kind">
+): boolean {
+  return (
+    target.kind === "database" &&
+    (action.type === "console_command" ||
+      (action.type === "power" && action.action === "kill"))
+  )
+}
+
 export function scheduleActionAppliesToTarget(
   action: {
+    authorizedTargets?: 2
     targetKeys?: ReadonlyArray<string>
     action?: "kill" | "restart" | "start" | "stop"
     mode?: "full" | "incremental"
@@ -487,9 +536,29 @@ export function scheduleActionAppliesToTarget(
   target: ScheduleTarget
 ) {
   if (action.type === "wait") return true
+  if (!scheduleActionSupportsTarget(action, target)) return false
+  if (scheduleActionNeedsNamedTarget(action, target)) {
+    return (
+      action.authorizedTargets === 2 &&
+      action.targetKeys?.includes(scheduleTargetKey(target)) === true
+    )
+  }
   return (
-    scheduleActionSupportsTarget(action, target) &&
-    (action.targetKeys === undefined ||
-      action.targetKeys.includes(scheduleTargetKey(target)))
+    action.targetKeys === undefined ||
+    action.targetKeys.includes(scheduleTargetKey(target))
+  )
+}
+
+/**
+ * Marks the command and power steps Hearth is saving as checked, before it
+ * authorizes them, so the check covers every target they reach.
+ */
+export function scheduleActionsForSave<
+  Action extends { readonly type: ScheduleActionType },
+>(actions: ReadonlyArray<Action>): Array<Action> {
+  return actions.map((action) =>
+    action.type === "console_command" || action.type === "power"
+      ? { ...action, authorizedTargets: 2 as const }
+      : action
   )
 }

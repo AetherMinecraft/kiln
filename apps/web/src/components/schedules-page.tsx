@@ -15,6 +15,7 @@ import {
   CirclePause,
   CirclePlay,
   CircleCheck,
+  CircleHelp,
   CircleX,
   Code2,
   Copy,
@@ -48,6 +49,8 @@ import type {
 import {
   normalizeScheduleCron,
   scheduleActionAppliesToTarget,
+  scheduleActionNeedsNamedTarget,
+  scheduleActionsForSave,
   scheduleActionSupportsTarget,
   scheduleCronAliases,
   validateScheduleCron,
@@ -1027,7 +1030,7 @@ function latestRunResult(run: ScheduleRunWithRelay) {
   ]
   const passed = attempts.filter((attempt) => attempt.status === "succeeded")
   const failed = attempts.filter((attempt) =>
-    ["failed", "interrupted", "not_run", "skipped_missing"].includes(
+    ["failed", "interrupted", "not_run", "skipped_missing", "unknown"].includes(
       attempt.status
     )
   )
@@ -2184,6 +2187,9 @@ function ActionAttemptAudit({
                   {attempt.error}
                 </p>
               ) : null}
+              {attempt.result ? (
+                <CommandResult result={attempt.result} />
+              ) : null}
             </div>
           </li>
         )
@@ -2199,19 +2205,48 @@ function AttemptStatus({
 }) {
   const succeeded = status === "succeeded"
   const failed = status === "failed" || status === "interrupted"
+  // It may have run; nothing runs it again.
+  const unknown = status === "unknown"
   return (
     <span
-      className={`type-label inline-flex items-center gap-1 capitalize ${succeeded ? "text-emerald-400" : failed ? "text-destructive" : "text-muted-foreground"}`}
+      className={`type-label inline-flex items-center gap-1 capitalize ${succeeded ? "text-emerald-400" : failed ? "text-destructive" : unknown ? "text-amber-300" : "text-muted-foreground"}`}
     >
       {succeeded ? (
         <Check className="size-3" />
       ) : failed ? (
         <X className="size-3" />
+      ) : unknown ? (
+        <CircleHelp className="size-3" />
       ) : (
         <CirclePause className="size-3" />
       )}
       {status.replaceAll("_", " ")}
     </span>
+  )
+}
+
+// What a command run in a container printed, and how it exited.
+function CommandResult({
+  result,
+}: {
+  result: NonNullable<
+    ScheduleHistoryRun["targetRuns"][number]["attempts"][number]["result"]
+  >
+}) {
+  return (
+    <div className="mt-2 min-w-0">
+      <p className="type-meta text-muted-foreground">
+        {result.exitCode === null
+          ? "Exit code unknown"
+          : `Exit code ${result.exitCode}`}
+        {result.truncated ? " · showing the end of its output" : ""}
+      </p>
+      {result.output ? (
+        <pre className="type-meta mt-1 max-h-48 overflow-auto rounded-md border bg-muted/40 px-2.5 py-2 font-mono break-all whitespace-pre-wrap">
+          {result.output}
+        </pre>
+      ) : null}
+    </div>
   )
 }
 
@@ -2278,7 +2313,8 @@ function ScheduleEditorDialog({
             }
       )
     }
-    return complete
+    // Marked as Hearth saves them, so what's checked here is what runs.
+    return scheduleActionsForSave(complete)
   }, [actions, selectedOptions])
   const actionSelectionValid = completeActions.every((action) =>
     scheduleActionPermitted(action, selectedOptions, permissionKey)
@@ -2997,21 +3033,46 @@ const ActionEditor = React.memo(function ActionEditor({
             target[permissionKey] &&
             target.permittedActions.includes(action.type)
         )
+  // Without its own list, a step runs where the Relay runs it: every
+  // target but those it must name.
   const actionTargetKeys =
     action.type === null || action.type === "wait"
       ? new Set<string>()
       : new Set<string>(
           action.targetKeys ??
-            eligibleTargets.map((target) => targetKey(target))
+            eligibleTargets
+              .filter(
+                (target) => !scheduleActionNeedsNamedTarget(action, target)
+              )
+              .map((target) => targetKey(target))
         )
-  const selectedActionTargets = eligibleTargets.filter((target) =>
-    actionTargetKeys.has(targetKey(target))
+  const changeAction = React.useCallback(
+    (next: ScheduleActionDraft) =>
+      onChange(
+        namingNewTargets(action, next, selectedOptions, permissionKey)
+      ),
+    [action, onChange, permissionKey, selectedOptions]
   )
+  // Targets a saved step names that this person can't run it on, as when it
+  // was saved before commands reached databases. They show as chosen so
+  // they can be removed, and can't be chosen again.
+  const namedRestrictedTargets =
+    action.type === null || action.type === "wait"
+      ? []
+      : restrictedTargets.filter(
+          (target) => action.targetKeys?.includes(targetKey(target)) === true
+        )
+  const selectedActionTargets = [
+    ...eligibleTargets.filter((target) =>
+      actionTargetKeys.has(targetKey(target))
+    ),
+    ...namedRestrictedTargets,
+  ]
 
   return (
     <div
       data-schedule-action-row
-      className={`${action.type === "wait" ? "h-20" : "h-12"} rounded-lg border bg-background/45 p-1 transition-[border-color,opacity] sm:h-16 sm:p-2 ${dragging ? "border-primary/40 opacity-55" : ""}`}
+      className={`${namedRestrictedTargets.length > 0 ? "space-y-2" : action.type === "wait" ? "h-20 sm:h-16" : "h-12 sm:h-16"} rounded-lg border bg-background/45 p-1 transition-[border-color,opacity] sm:p-2 ${dragging ? "border-primary/40 opacity-55" : ""}`}
       onDragOver={(event) => {
         event.preventDefault()
         onDragOver(action.id)
@@ -3019,7 +3080,7 @@ const ActionEditor = React.memo(function ActionEditor({
       onDrop={(event) => event.preventDefault()}
     >
       <div
-        className={`grid h-full items-center gap-0.5 sm:grid-cols-[2rem_9rem_minmax(0,1fr)_auto] sm:grid-rows-1 sm:gap-2 ${action.type === "wait" ? "grid-cols-[1.25rem_minmax(0,1fr)_auto] grid-rows-2" : "grid-cols-[1.25rem_8rem_minmax(0,1fr)_auto]"}`}
+        className={`grid items-center gap-0.5 sm:grid-cols-[2rem_9rem_minmax(0,1fr)_auto] sm:grid-rows-1 sm:gap-2 ${namedRestrictedTargets.length > 0 ? "h-10 sm:h-12" : "h-full"} ${action.type === "wait" ? "grid-cols-[1.25rem_minmax(0,1fr)_auto] grid-rows-2" : "grid-cols-[1.25rem_8rem_minmax(0,1fr)_auto]"}`}
       >
         <Tooltip>
           <TooltipTrigger asChild>
@@ -3056,7 +3117,7 @@ const ActionEditor = React.memo(function ActionEditor({
           <ScheduleActionTypeSelect
             action={action}
             index={index}
-            onChange={onChange}
+            onChange={changeAction}
           />
         </div>
         <div
@@ -3085,7 +3146,10 @@ const ActionEditor = React.memo(function ActionEditor({
             <Select
               value={action.action}
               onValueChange={(value) =>
-                onChange({ ...action, action: value as typeof action.action })
+                changeAction({
+                  ...action,
+                  action: value as typeof action.action,
+                })
               }
             >
               <SelectTrigger className="h-8 w-20 min-w-0 font-medium sm:w-28 [&_[data-slot=select-value]]:truncate">
@@ -3118,10 +3182,16 @@ const ActionEditor = React.memo(function ActionEditor({
                 selectedTargets={selectedActionTargets}
                 onToggle={(targetKeyValues, checked) => {
                   if (action.type === null) return
-                  const next = new Set(actionTargetKeys)
+                  const eligibleKeys = new Set(eligibleTargets.map(targetKey))
+                  const next = new Set([
+                    ...actionTargetKeys,
+                    ...namedRestrictedTargets.map(targetKey),
+                  ])
                   for (const targetKeyValue of targetKeyValues) {
-                    if (checked) next.add(targetKeyValue)
-                    else next.delete(targetKeyValue)
+                    // Only targets this person may run it on can be added.
+                    if (checked && eligibleKeys.has(targetKeyValue))
+                      next.add(targetKeyValue)
+                    else if (!checked) next.delete(targetKeyValue)
                   }
                   onChange({ ...action, targetKeys: [...next] })
                 }}
@@ -3187,9 +3257,41 @@ const ActionEditor = React.memo(function ActionEditor({
           title="Configure Backup"
         />
       ) : null}
+      {action.type !== null && namedRestrictedTargets.length > 0 ? (
+        <NamedRestrictedTargetsNote
+          action={action}
+          targets={namedRestrictedTargets}
+        />
+      ) : null}
     </div>
   )
 })
+
+// Why a step that names targets this person can't run it on can't be saved,
+// and what to do about it.
+function NamedRestrictedTargetsNote({
+  action,
+  targets,
+}: {
+  action: ScheduleAction
+  targets: ReadonlyArray<ScheduleOption>
+}) {
+  const shell = (target: ScheduleOption) =>
+    action.type === "console_command" && target.kind === "database"
+  const databases = targets.filter(shell)
+  const others = targets.filter((target) => !shell(target))
+  return (
+    <p className="type-meta rounded-md border border-amber-400/30 bg-amber-400/5 px-2.5 py-2 text-pretty text-amber-300 light:text-amber-700">
+      {databases.length > 0
+        ? `Saving runs this command in ${targetList(databases)}'s shell, which needs Relay terminal permission. `
+        : null}
+      {others.length > 0
+        ? `You don't have permission to run this action on ${targetList(others)}. `
+        : null}
+      Remove {targetList(targets)} from this step to save.
+    </p>
+  )
+}
 
 const ScheduleActionTargetsButton = React.memo(
   function ScheduleActionTargetsButton({
@@ -3206,17 +3308,20 @@ const ScheduleActionTargetsButton = React.memo(
     targets: ReadonlyArray<ScheduleOption>
   }) {
     const [open, setOpen] = React.useState(false)
-    const items = React.useMemo(() => {
-      const eligibleKeys = new Set(eligibleTargets.map(targetKey))
-      return targets.map((target): InstancePickerItem => ({
-        ...scheduleTargetPickerItem(target),
-        disabled: !eligibleKeys.has(targetKey(target)),
-      }))
-    }, [eligibleTargets, targets])
     const selectedKeys = React.useMemo(
       () => new Set(selectedTargets.map(targetKey)),
       [selectedTargets]
     )
+    // A target it can't run on stays removable while the step names it.
+    const items = React.useMemo(() => {
+      const eligibleKeys = new Set(eligibleTargets.map(targetKey))
+      return targets.map((target): InstancePickerItem => ({
+        ...scheduleTargetPickerItem(target),
+        disabled:
+          !eligibleKeys.has(targetKey(target)) &&
+          !selectedKeys.has(targetKey(target)),
+      }))
+    }, [eligibleTargets, selectedKeys, targets])
     const toggleTarget = React.useCallback(
       (item: InstancePickerItem) =>
         onToggle([item.key], !selectedKeys.has(item.key)),
@@ -3805,6 +3910,36 @@ function canOperateSchedule(
         permittedActions.has(action.type)
     )
   })
+}
+
+/**
+ * Choosing a command or kill for targets that must be named, such as
+ * databases, names every target it can run on, so they're included and
+ * authorized as such.
+ */
+function namingNewTargets(
+  previous: ScheduleActionDraft,
+  next: ScheduleActionDraft,
+  targets: ReadonlyArray<ScheduleOption>,
+  permission: "canCreate" | "canUpdate"
+): ScheduleActionDraft {
+  if (next.type === null || next.type === "wait") return next
+  if (next.targetKeys !== undefined) return next
+  const chosen =
+    previous.type !== next.type ||
+    (previous.type === "power" &&
+      next.type === "power" &&
+      previous.action !== next.action)
+  if (!chosen) return next
+  const eligible = targets.filter(
+    (target) =>
+      scheduleActionSupportsTarget(next, target) &&
+      target[permission] &&
+      target.permittedActions.includes(next.type)
+  )
+  if (!eligible.some((target) => scheduleActionNeedsNamedTarget(next, target)))
+    return next
+  return { ...next, targetKeys: eligible.map((target) => targetKey(target)) }
 }
 
 function scheduleActionPermitted(

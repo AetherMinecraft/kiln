@@ -107,6 +107,57 @@ describe("schedule authorization", () => {
     ).toContain("schedule.execute")
   })
 
+  it("runs a database command only for those with a terminal on its Relay", () => {
+    const database: ScheduleTarget = {
+      id: "database-a",
+      kind: "database",
+      name: "Main database",
+      relayId: "relay-a",
+    }
+    const databaseGrant: AccessGrant = {
+      id: "grant",
+      relayId: "relay-a",
+      resourceId: "database-a",
+      resourceType: "database",
+      permissions: ["schedule.create", "database.terminal", "database.power"],
+    }
+    const relayGrant: AccessGrant = {
+      id: "relay-grant",
+      relayId: "relay-a",
+      resourceId: "relay-a",
+      resourceType: "relay",
+      permissions: ["schedule.create", "relay.terminal"],
+    }
+    const named: ScheduleAction = {
+      ...consoleAction,
+      authorizedTargets: 2,
+      targetKeys: ["relay-a:database:database-a"],
+    }
+    const input = {
+      actions: [named],
+      schedulePermission: "schedule.create",
+      targets: [database],
+      user,
+    } as const
+
+    expect(
+      scheduleAuthorizationFailure({ ...input, grants: [databaseGrant] })
+    ).toBe("You do not have relay.terminal permission for Main database")
+    expect(
+      scheduleAuthorizationFailure({ ...input, grants: [relayGrant] })
+    ).toBeNull()
+    // A stored step that doesn't name the database, or named it before
+    // Hearth checked database commands, never runs there, so it needs no
+    // shell.
+    expect(
+      scheduleAuthorizationFailure({
+        ...input,
+        actions: [consoleAction, { ...named, authorizedTargets: undefined }],
+        grants: [databaseGrant],
+      })
+    ).toBeNull()
+  })
+
   it("keeps Kiln's backups to platform administrators, whatever a Relay grant allows", () => {
     const kiln: ScheduleTarget = {
       id: "relay-a",

@@ -270,15 +270,14 @@ import {
 import {
   controlRequestContinues,
   controlRequestLocks,
-  databaseLocks,
   databaseReadLocks,
   instanceLifecycleLocks,
-  instancePowerLocks,
   transferInstallLocks,
   transferPackLocks,
 } from "./operation-plans.js"
 import { actionsForRole, relayActions } from "./permissions.js"
-import { PowerIntents } from "./power-intents.js"
+import { ContainerCommands } from "./container-commands.js"
+import { ResourcePower, type PowerAction } from "./resource-power.js"
 import type { RelayAction } from "./permissions.js"
 import { normalizeSourceCidrs } from "./source-policy.js"
 import { withRemoteFileSource } from "./remote-file-source.js"
@@ -406,7 +405,6 @@ lanes.setPaused(
     )
   ).length > 0
 )
-const powerIntents = new PowerIntents()
 const runtimeRecovery = new RuntimeRecoveryManager(
   config,
   startupCore.state,
@@ -653,7 +651,7 @@ if (cliArguments.length === 0)
 // frozen, and its deletion freezing it again tries once more.
 await resourceFreezes.reapply((freeze, record) =>
   recoverPromise(
-    () => quietFrozenResource(freeze, record),
+    () => quietFrozenResource(freeze, record, true),
     (error) => {
       console.warn(`Could not quiet ${freeze.kind} ${freeze.id}:`, error)
     }
@@ -910,6 +908,48 @@ const transferSweepFiber = forkRelayEffect(
     Effect.forever
   )
 )
+// Every power change to a game server, App, or database, whoever asks.
+const power = new ResourcePower({
+  adapters: {
+    // Whoever changes an App's power, a person or a schedule, overrides the
+    // start a stopped backup owes it (`notePowerChange`).
+    app: async (appId, action) => {
+      await notePowerChange(appId)
+      return apps.action({ action, appId })
+    },
+    database: (databaseId, action) =>
+      databases.action({ action, databaseId }),
+    instance: runInstancePower,
+  },
+  lanes,
+  // A schedule's power step takes what the same request from Hearth would:
+  // an App's start also holds the volumes it mounts.
+  locks: async (kind, id, action) =>
+    (await controlRequestLocks(
+      kind === "instance" ? "instance.action" : `${kind}.action`,
+      {
+        action,
+        ...(kind === "app"
+          ? { appId: id }
+          : kind === "database"
+            ? { databaseId: id }
+            : { instanceId: id }),
+      },
+      resolveInstanceReference,
+      (appId) =>
+        runRelayEffect("relay.apps.volumes", volumes.appVolumeIds(appId)),
+      undefined,
+      (frozenKind, frozenId) => lanes.isFrozen(frozenKind, frozenId)
+    )) ?? [],
+  replacements: { app: (appId) => apps.replacements(appId) },
+})
+// One-off commands in an App's service or a database's container.
+const containerCommands = new ContainerCommands({
+  apps,
+  databases,
+  engine: relayEngine,
+  lanes,
+})
 const scheduleManager = await ScheduleManager.make({
   enqueueBackup: (input) =>
     runRelayEffect(
@@ -930,45 +970,14 @@ const scheduleManager = await ScheduleManager.make({
       { operation: "schedule.occurrence" }
     )
   },
-  instancePowerIntent: (instanceId) => instancePowerIntent(instanceId),
   isPaused: () => lanes.paused,
-  runDatabasePower: async (databaseId, action) => {
-    await inLane(
-      { label: "schedule.database.power", locks: databaseLocks(databaseId) },
-      () => databases.action({ action, databaseId })
-    )
-  },
-  // A schedule's own steps don't count as someone changing the server's
+  powerIntent: (kind, id) => power.intent(kind, id),
+  runContainerCommand: (target, command) =>
+    containerCommands.run(target, command),
+  // A schedule's own steps don't count as someone changing the target's
   // power; a later step only runs while nobody else has.
-  runInstancePower: async (instanceId, action, powerIntent) => {
-    await inLane(
-      {
-        label: "schedule.instance.power",
-        locks: instancePowerLocks(instanceId, action),
-        precondition: () => instancePowerIntent(instanceId) === powerIntent,
-      },
-      async () => {
-        const instance = await docker.findInstance(instanceId)
-        if (!instance) throw new Error("Instance not found")
-        const [routes, pendingPrimaryPort] = await Effect.runPromise(
-          Effect.all(
-            [
-              startup.state.listInstanceRoutes(instance.id),
-              startup.state.getPendingPrimaryPort(instance.id),
-            ] as const,
-            { concurrency: 2 }
-          )
-        )
-        await lifecycle.runInstanceAction(
-          instance,
-          action,
-          routes,
-          pendingPrimaryPort
-        )
-      }
-    )
-    await snapshotHub.refresh()
-  },
+  runPower: (kind, id, action, powerIntent) =>
+    power.scheduled(kind, id, action, powerIntent),
   sendConsoleCommand: (instanceId, command) =>
     inLane(
       {
@@ -1437,7 +1446,7 @@ const browserSocket = attachBrowserSocket({
   filesystem,
   identity: relayIdentity,
   lanes,
-  onConsoleStop: (instanceId) => powerIntents.advance(instanceId),
+  onConsoleStop: (instanceId) => power.changed("instance", instanceId),
   runEffect: (effect) => runRelayEffect("relay.browser.state", effect),
   server,
   state: startup.state,
@@ -2581,8 +2590,10 @@ async function executeControlRequest(
     }
     case "database.wipe":
       return databases.wipe(relayDatabaseWipeSchema.parse(request.payload))
-    case "database.action":
-      return databases.action(relayDatabaseActionSchema.parse(request.payload))
+    case "database.action": {
+      const input = relayDatabaseActionSchema.parse(request.payload)
+      return power.requested("database", input.databaseId, input.action)
+    }
     case "database.limits.write":
       return databases.setLimits(
         relayDatabaseLimitsSchema.parse(request.payload)
@@ -2811,8 +2822,7 @@ async function executeControlRequest(
       )
     case "app.action": {
       const input = relayAppActionSchema.parse(request.payload)
-      await notePowerChange(input.appId)
-      return apps.action(input)
+      return power.requested("app", input.appId, input.action)
     }
     case "app.limits.write":
       return apps.setLimits(relayAppLimitsSchema.parse(request.payload))
@@ -3264,53 +3274,12 @@ async function executeControlRequest(
       return { deleted: true, instanceId }
     }
     case "instance.action": {
-      const instance = await requiredInstance(payload)
-      const retainedInstance =
-        (await snapshotHub.read()).instances.find(
-          (candidate) => candidate.id === instance.id
-        ) ?? relayInstanceSchema.parse(instance)
       const input = relayInstanceActionSchema.parse(payload)
-      // Someone changed this server's power, so a schedule's pending power
-      // steps give way.
-      powerIntents.advance(instance.id)
-      return retainingInstance(retainedInstance, async () => {
-        const [routes, pendingPrimaryPort] = await Effect.runPromise(
-          Effect.all(
-            [
-              relayOperation(() =>
-                runRelayEffect(
-                  "relay.network.routes.forAction",
-                  startup.state.listInstanceRoutes(instance.id)
-                )
-              ),
-              relayOperation(() =>
-                runRelayEffect(
-                  "relay.instance.pendingPrimaryPort.forAction",
-                  startup.state.getPendingPrimaryPort(instance.id)
-                )
-              ),
-            ] as const,
-            { concurrency: 2 }
-          )
-        )
-        const updated = await lifecycle.runInstanceAction(
-          instance,
-          input.action,
-          routes,
-          pendingPrimaryPort
-        )
-        if (
-          pendingPrimaryPort &&
-          (input.action === "start" || input.action === "restart") &&
-          updated.ports.some((allocation) => allocation.kind === "primary")
-        ) {
-          await runRelayEffect(
-            "relay.instance.pendingPrimaryPort.applied",
-            startup.state.deletePendingPrimaryPort(instance.id)
-          )
-        }
-        return relayInstanceWithStoredName(updated)
-      })
+      return power.requested(
+        "instance",
+        await resolveInstanceReference(requiredString(payload, "instanceId")),
+        input.action
+      )
     }
     case "instance.resources.read": {
       const instanceId = requiredString(payload, "instanceId")
@@ -3528,7 +3497,7 @@ async function executeControlRequest(
         instance,
         input.command
       )
-      if (intentionalStop) powerIntents.advance(instance.id)
+      if (intentionalStop) power.changed("instance", instance.id)
       return { accepted: true, command: input.command }
     }
     case "instance.console.complete": {
@@ -4275,7 +4244,8 @@ async function requiredFileRoot(instanceId: string) {
 // again as the Relay starts. What it changes goes to `record` first.
 async function quietFrozenResource(
   freeze: RelayResourceFreeze,
-  record: (undo: RelayResourceFreezeUndo) => Promise<void>
+  record: (undo: RelayResourceFreezeUndo) => Promise<void>,
+  recovering = false
 ): Promise<void> {
   switch (freeze.kind) {
     case "instance": {
@@ -4285,10 +4255,12 @@ async function quietFrozenResource(
       if (instance.id !== freeze.id) {
         throw new Error("Freezing a game server needs its full ID")
       }
-      powerIntents.advance(instance.id)
+      // Startup has no in-memory power intents or schedules yet, and the
+      // power coordinator isn't constructed until recovery has finished.
+      if (!recovering) power.changed("instance", instance.id)
       const routes = await runRelayEffect(
         "relay.network.routes.forFreeze",
-        startup.state.listInstanceRoutes(instance.id)
+        startupCore.state.listInstanceRoutes(instance.id)
       )
       await lifecycle.runInstanceAction(instance, "stop", routes)
       return
@@ -4451,12 +4423,56 @@ async function applyPauseHolds(): Promise<void> {
   await snapshotHub.refresh()
 }
 
-// Changes when someone changes a game server's power, or when anything
-// replaces the server: a reinstall, restore, or delete.
-function instancePowerIntent(instanceId: string): string {
-  return `${powerIntents.current(instanceId)}:${lanes.exclusiveGeneration(
-    laneKeys.instance(instanceId)
-  )}`
+// A game server's power action: recreating its container with its current
+// routes and ports when it starts, and keeping it in snapshots meanwhile.
+async function runInstancePower(
+  instanceId: string,
+  action: PowerAction
+): Promise<RelayInstance> {
+  const instance = await docker.findInstance(instanceId)
+  if (!instance) throw new Error("Instance not found")
+  const retainedInstance =
+    (await snapshotHub.read()).instances.find(
+      (candidate) => candidate.id === instance.id
+    ) ?? relayInstanceSchema.parse(instance)
+  return retainingInstance(retainedInstance, async () => {
+    const [routes, pendingPrimaryPort] = await Effect.runPromise(
+      Effect.all(
+        [
+          relayOperation(() =>
+            runRelayEffect(
+              "relay.network.routes.forAction",
+              startup.state.listInstanceRoutes(instance.id)
+            )
+          ),
+          relayOperation(() =>
+            runRelayEffect(
+              "relay.instance.pendingPrimaryPort.forAction",
+              startup.state.getPendingPrimaryPort(instance.id)
+            )
+          ),
+        ] as const,
+        { concurrency: 2 }
+      )
+    )
+    const updated = await lifecycle.runInstanceAction(
+      instance,
+      action,
+      routes,
+      pendingPrimaryPort
+    )
+    if (
+      pendingPrimaryPort &&
+      (action === "start" || action === "restart") &&
+      updated.ports.some((allocation) => allocation.kind === "primary")
+    ) {
+      await runRelayEffect(
+        "relay.instance.pendingPrimaryPort.applied",
+        startup.state.deletePendingPrimaryPort(instance.id)
+      )
+    }
+    return relayInstanceWithStoredName(updated)
+  })
 }
 
 // Runs `mutate` in its turn in the lanes, for work the Relay starts itself.

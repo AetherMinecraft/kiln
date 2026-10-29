@@ -16,6 +16,7 @@ import {
   scheduleStableId,
 } from "@workspace/contracts/schedules"
 
+import { RelayStateError } from "./effect/errors.js"
 import { makeRelayStateLayer, RelayStateStore } from "./effect/state.js"
 
 import { ScheduleManager, type ScheduleManagerOptions } from "./schedules.js"
@@ -77,9 +78,15 @@ async function manager(
     getBackup: (taskId: string) => Promise<RelayBackupTask | null>
     reportError: (message: string, cause: unknown) => void
     sendConsoleCommand: (instanceId: string, command: string) => Promise<void>
-    instancePowerIntent: (instanceId: string) => string
+    powerIntent: ScheduleManagerOptions["powerIntent"]
     isPaused: () => boolean
-    runInstancePower: ScheduleManagerOptions["runInstancePower"]
+    listDatabaseIds: ScheduleManagerOptions["listDatabaseIds"]
+    runContainerCommand: ScheduleManagerOptions["runContainerCommand"]
+    runPower: ScheduleManagerOptions["runPower"]
+    // Stands in for the Relay's storage, as a failing disk would.
+    state: (
+      state: ScheduleManagerOptions["state"]
+    ) => ScheduleManagerOptions["state"]
   }> = {}
 ) {
   const directory =
@@ -93,14 +100,18 @@ async function manager(
       }),
     findInstance: overrides.findInstance ?? (async () => null),
     getBackup: overrides.getBackup ?? (async () => null),
-    listDatabaseIds: async () => new Set(),
+    listDatabaseIds: overrides.listDatabaseIds ?? (async () => new Set()),
     platformTargetId: () => "platform",
     relayId: "relay-a",
     reportError: overrides.reportError,
-    instancePowerIntent: overrides.instancePowerIntent ?? (() => "0"),
+    powerIntent: overrides.powerIntent ?? (() => "0"),
     isPaused: overrides.isPaused ?? (() => false),
-    runDatabasePower: async () => undefined,
-    runInstancePower: overrides.runInstancePower ?? (async () => undefined),
+    runContainerCommand:
+      overrides.runContainerCommand ??
+      (async () => {
+        throw new Error("not used")
+      }),
+    runPower: overrides.runPower ?? (async () => undefined),
     sendConsoleCommand: overrides.sendConsoleCommand ?? (async () => undefined),
     stateDirectory: directory,
   }
@@ -117,7 +128,7 @@ async function manager(
     overrides.beforeMake?.(filename)
     const schedules = await ScheduleManager.make({
       ...options,
-      state: store.schedules,
+      state: overrides.state?.(store.schedules) ?? store.schedules,
     })
     managers.push(schedules)
     return schedules
@@ -1145,7 +1156,7 @@ describe("Relay schedule persistence", () => {
     const { schedules } = await manager({
       findInstance: async () => ({}),
       // Paused after the step checked, while it waited for its lane.
-      runInstancePower: async () => {
+      runPower: async () => {
         throw new LaneRejectedError({
           message: "paused",
           reason: "paused",
@@ -1180,10 +1191,10 @@ describe("Relay schedule persistence", () => {
     const ran: Array<string> = []
     const { schedules } = await manager({
       findInstance: async () => ({}),
-      instancePowerIntent: () => intent,
+      powerIntent: () => intent,
       // As the Relay does: a step runs only while the intent it was given
       // is still current.
-      runInstancePower: async (_instanceId, action, powerIntent) => {
+      runPower: async (_kind, _id, action, powerIntent) => {
         if (powerIntent !== intent) {
           throw new LaneRejectedError({
             message: "superseded",
@@ -1739,5 +1750,277 @@ describe("Relay schedule persistence", () => {
     expect(
       (await latestRun(schedules))?.targetRuns[0]?.attempts[0]?.status
     ).toBe("failed")
+  })
+})
+
+describe("Relay schedule commands in containers", () => {
+  const databaseId = "d".repeat(40)
+  const databaseKey = `relay-a:database:${databaseId}`
+  const databaseCommands: RelayScheduleProjection = {
+    ...projection,
+    actions: [
+      {
+        command: "./migrate",
+        id: "5d8f43a2-6a0e-4d36-9c11-3b1f4f5e2a10",
+        authorizedTargets: 2,
+        targetKeys: [databaseKey],
+        type: "console_command",
+      },
+      {
+        command: "./vacuum",
+        id: "a4c1e6b9-2f7d-4c0a-8e35-7b9d2c6f1e44",
+        authorizedTargets: 2,
+        targetKeys: [databaseKey],
+        type: "console_command",
+      },
+      {
+        command: "./report",
+        id: "e2b7d9c4-1a3f-4e8b-9c62-5d0f7a8b3c19",
+        authorizedTargets: 2,
+        targetKeys: [databaseKey],
+        type: "console_command",
+      },
+    ],
+    targets: [
+      {
+        id: databaseId,
+        kind: "database",
+        name: "Main database",
+        relayId: "relay-a",
+      },
+    ],
+  }
+
+  it("never runs a stored command or kill on a database it doesn't name", async () => {
+    const consoleCommands: Array<string> = []
+    const containerCommands: Array<string> = []
+    const power: Array<string> = []
+    const { schedules } = await manager({
+      findInstance: async () => ({}),
+      listDatabaseIds: async () => new Set([databaseId]),
+      runContainerCommand: async (_target, command) => {
+        containerCommands.push(command)
+        return { exitCode: 0, output: "", truncated: false, unknown: null }
+      },
+      runPower: async (kind, id, action) => {
+        power.push(`${kind}:${id}:${action}`)
+      },
+      sendConsoleCommand: async (instanceId, command) => {
+        consoleCommands.push(`${instanceId}:${command}`)
+      },
+    })
+    // Saved before commands and kills reached databases: no step names its
+    // targets, so each meant the game server alone.
+    await schedules.apply({
+      ...projection,
+      actions: [
+        projection.actions[0]!,
+        {
+          action: "kill",
+          id: "0e9a7f5c-77e8-4b39-8c1a-6d5bb9c0b3a1",
+          type: "power",
+        },
+      ],
+      targets: [...projection.targets, ...databaseCommands.targets],
+    })
+
+    await runNow(schedules)
+
+    await advanceUntil(async () =>
+      expect((await latestRun(schedules))?.status).toBe("succeeded")
+    )
+    expect(consoleCommands).toEqual(["server-a:say hello"])
+    expect(power).toEqual(["instance:server-a:kill"])
+    expect(containerCommands).toEqual([])
+    expect((await latestRun(schedules))?.targetRuns[1]).toMatchObject({
+      attempts: [{ status: "skipped_policy" }, { status: "skipped_policy" }],
+      status: "noop",
+      target: { kind: "database" },
+    })
+  })
+
+  it("runs a step naming a database there only once Hearth has checked it", async () => {
+    const containerCommands: Array<string> = []
+    const power: Array<string> = []
+    const { schedules } = await manager({
+      listDatabaseIds: async () => new Set([databaseId]),
+      runContainerCommand: async (_target, command) => {
+        containerCommands.push(command)
+        return { exitCode: 0, output: "", truncated: false, unknown: null }
+      },
+      runPower: async (kind, id, action) => {
+        power.push(`${kind}:${id}:${action}`)
+      },
+    })
+    // Saved before commands and kills reached databases: the old schema
+    // took the database's key, and nothing checked it because it was
+    // skipped.
+    const legacy = [
+      {
+        command: "./legacy",
+        id: "5d8f43a2-6a0e-4d36-9c11-3b1f4f5e2a10",
+        targetKeys: [databaseKey],
+        type: "console_command" as const,
+      },
+      {
+        action: "kill" as const,
+        id: "0e9a7f5c-77e8-4b39-8c1a-6d5bb9c0b3a1",
+        targetKeys: [databaseKey],
+        type: "power" as const,
+      },
+    ]
+    await schedules.apply({ ...databaseCommands, actions: legacy })
+    await runNow(schedules)
+    await advanceUntil(async () =>
+      expect((await latestRun(schedules))?.status).toBe("noop")
+    )
+    expect(containerCommands).toEqual([])
+    expect(power).toEqual([])
+
+    // The same steps, saved by Hearth now.
+    await schedules.apply({
+      ...databaseCommands,
+      actions: legacy.map((action) => ({ ...action, authorizedTargets: 2 })),
+      revision: 2,
+    })
+    await schedules.runNow({ revision: 2, scheduleId: projection.id })
+    await advanceUntil(() => expect(power).toHaveLength(1))
+    expect(containerCommands).toEqual(["./legacy"])
+    expect(power).toEqual([`database:${databaseId}:kill`])
+  })
+
+  it("records each command's exit code and output, and stops at one whose outcome is unknown", async () => {
+    const commands: Array<string> = []
+    const { schedules } = await manager({
+      listDatabaseIds: async () => new Set([databaseId]),
+      runContainerCommand: async (target, command) => {
+        expect(target).toEqual({ id: databaseId, kind: "database" })
+        commands.push(command)
+        return command === "./migrate"
+          ? { exitCode: 0, output: "migrated\n", truncated: false, unknown: null }
+          : {
+              exitCode: null,
+              output: "vacuuming",
+              truncated: false,
+              unknown: "The command didn't finish within 10 minutes",
+            }
+      },
+    })
+    await schedules.apply(databaseCommands)
+
+    await runNow(schedules)
+
+    await advanceUntil(async () =>
+      expect((await latestRun(schedules))?.status).toBe("failed")
+    )
+    expect(commands).toEqual(["./migrate", "./vacuum"])
+    expect((await latestRun(schedules))?.targetRuns[0]).toMatchObject({
+      attempts: [
+        {
+          result: { exitCode: 0, output: "migrated\n", truncated: false },
+          status: "succeeded",
+        },
+        {
+          error: "The command didn't finish within 10 minutes",
+          result: { exitCode: null, output: "vacuuming" },
+          status: "unknown",
+        },
+        { error: "A previous action failed", status: "not_run" },
+      ],
+      status: "failed",
+    })
+  })
+
+  it("refuses to send a command it couldn't record first", async () => {
+    const commands: Array<string> = []
+    const reported: Array<string> = []
+    const { schedules } = await manager({
+      listDatabaseIds: async () => new Set([databaseId]),
+      reportError: (message) => reported.push(message),
+      runContainerCommand: async (_target, command) => {
+        commands.push(command)
+        return { exitCode: 0, output: "", truncated: false, unknown: null }
+      },
+      state: (state) => ({
+        ...state,
+        recordProgress: () =>
+          Effect.fail(
+            RelayStateError.make({
+              cause: new Error("disk I/O error"),
+              operation: "schedules.record_progress",
+            })
+          ),
+      }),
+    })
+    await schedules.apply(databaseCommands)
+
+    await runNow(schedules)
+
+    await advanceUntil(async () =>
+      expect((await latestRun(schedules))?.status).toBe("failed")
+    , 1_000)
+    expect(commands).toEqual([])
+    expect(reported).toContain("Relay schedule progress write failed")
+    expect((await latestRun(schedules))?.targetRuns[0]?.attempts).toMatchObject(
+      [
+        {
+          error:
+            "Not run: the Relay couldn't record the command before sending it",
+          status: "failed",
+        },
+        { status: "not_run" },
+        { status: "not_run" },
+      ]
+    )
+  })
+
+  it("reports a command the Relay stopped during as unknown and never runs it again", async () => {
+    const commands: Array<string> = []
+    const { restart, schedules } = await manager({
+      listDatabaseIds: async () => new Set([databaseId]),
+      // The Relay stops while the second command runs, so it never answers.
+      runContainerCommand: async (_target, command) => {
+        commands.push(command)
+        if (command === "./migrate") {
+          return { exitCode: 0, output: "", truncated: false, unknown: null }
+        }
+        return new Promise(() => undefined)
+      },
+    })
+    await schedules.apply({ ...databaseCommands, cron: "hourly" })
+    await runNow(schedules)
+    await advanceUntil(() =>
+      expect(commands).toEqual(["./migrate", "./vacuum"])
+    )
+    schedules.close()
+
+    const recovered = await restart()
+    const run = await latestRun(recovered)
+    expect(run).toMatchObject({
+      status: "interrupted",
+      targetRuns: [
+        {
+          attempts: [
+            { result: { exitCode: 0 }, status: "succeeded" },
+            {
+              error:
+                "The Relay stopped before this command finished, so it may have run",
+              status: "unknown",
+            },
+          ],
+          status: "interrupted",
+        },
+      ],
+    })
+    // The worker carries on with later occurrences, never this one again.
+    const worker = Effect.runFork(recovered.run())
+    try {
+      await vi.advanceTimersByTimeAsync(30 * minuteMs)
+      await yieldToEventLoop()
+      expect(commands).toEqual(["./migrate", "./vacuum"])
+      expect((await recovered.overview([projection.id])).runs).toHaveLength(1)
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(worker))
+    }
   })
 })
