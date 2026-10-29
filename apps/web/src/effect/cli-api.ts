@@ -91,6 +91,10 @@ import {
   reconcileRelayBackups,
 } from "@/lib/backup-reconciliation"
 import {
+  instanceDeletionNameEffect,
+  requireDeleteConfirmationEffect,
+} from "@/lib/delete-confirmation.server"
+import {
   awaitResourceDeletion,
   requestResourceDeletion,
 } from "@/lib/resource-deletion.server"
@@ -989,13 +993,28 @@ export const deleteCliServerEffect = Effect.fn("cli.api.servers.delete")(
   function* (principal: CliPrincipal, unknownInput: unknown) {
     yield* requireCliWrite(principal)
     const input = yield* parseInput(cliDeleteServerRequestSchema, unknownInput)
-    if (input.confirmation !== `${input.relayId}:${input.instanceId}`) {
-      return yield* forbidden(
-        "The server confirmation did not match the requested server."
-      )
-    }
     const relay = yield* authorizeTarget(principal, input, "instance.delete")
     yield* authorizeTarget(principal, input, "backup.create")
+    // As deleting it in the browser asks: its name, and the password.
+    yield* requireDeleteConfirmationEffect({
+      confirmation: input.confirmation,
+      name: yield* instanceDeletionNameEffect(relay, input.instanceId),
+      password: input.password,
+      user: principal.user,
+    }).pipe(
+      Effect.catchTag("AuthenticationError", (error) =>
+        Effect.fail(forbidden(error.message))
+      ),
+      Effect.catchTag("PasswordAttemptsError", (error) =>
+        Effect.fail(
+          CliAccessError.make({
+            code: "rate_limited",
+            message: error.message,
+            retryable: true,
+          })
+        )
+      )
+    )
     yield* Effect.tryPromise({
       try: async () =>
         awaitResourceDeletion(
