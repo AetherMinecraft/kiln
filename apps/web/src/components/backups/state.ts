@@ -16,10 +16,11 @@ export type BackupAvailabilityDestination = {
   provider: string | null
 }
 export interface BackupFilters {
-  kind?: "database" | "relay" | "server"
+  kind?: "app" | "database" | "relay" | "server"
   relay?: string
   search?: string
   server?: string
+  volume?: string
   status?: "active" | "available" | "failed"
 }
 

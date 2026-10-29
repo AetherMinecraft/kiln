@@ -5,8 +5,10 @@ import {
   ChevronsUpDown,
   Cloud,
   CloudCog,
+  CirclePause,
   HardDrive,
   LoaderCircle,
+  Radio,
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
@@ -35,13 +37,20 @@ import { timestampedBackupName } from "@/lib/backup-name"
 export interface BackupConfigurationTarget {
   id: string
   key: string
-  kind: "database" | "instance" | "platform"
+  consistencyChoice?: {
+    stoppedDescription?: string | undefined
+    stoppedUnavailable: string | null
+  }
+  kind: "app" | "volume" | "database" | "instance" | "platform"
   name: string
+  description?: string
   relayId: string
   relayName: string
 }
 
 export interface BackupConfiguration {
+  /** For an App or a volume: taken live, or with what uses it stopped. */
+  consistency: "live" | "stopped"
   destinationKeys: ReadonlyArray<string>
   mode: "full" | "incremental"
   name: string
@@ -59,6 +68,7 @@ interface BackupStorageOption {
 export function BackupConfigurationDialog({
   allowDefaultDestination = true,
   allowIncremental,
+  consistencyChoice: fixedConsistencyChoice,
   description = "Relay runs this job in its single durable queue. Servers remain online while their data is archived.",
   error,
   initialDestinationKeys,
@@ -78,6 +88,16 @@ export function BackupConfigurationDialog({
 }: {
   allowDefaultDestination?: boolean
   allowIncremental?: boolean
+  /**
+   * An App's or a volume's backup, always a full archive, offers taking it
+   * live or with what uses it stopped, in place of the mode.
+   */
+  consistencyChoice?: {
+    /** What stopping it does, when it's more than one target's. */
+    stoppedDescription?: string
+    /** Why it can't be stopped, as without permission to manage its Apps. */
+    stoppedUnavailable: string | null
+  }
   description?: React.ReactNode
   error?: string
   initialDestinationKeys?: ReadonlyArray<string>
@@ -112,9 +132,17 @@ export function BackupConfigurationDialog({
     ]
   )
   const [mode, setMode] = React.useState<"full" | "incremental">(initialMode)
+  const [consistency, setConsistency] = React.useState<"live" | "stopped">(
+    "live"
+  )
   const target = showTarget
     ? targets.find((candidate) => candidate.key === targetKeyValue)
     : undefined
+  const consistencyChoice = showTarget
+    ? target?.consistencyChoice
+    : fixedConsistencyChoice
+  const effectiveConsistency =
+    consistencyChoice?.stoppedUnavailable === null ? consistency : "live"
   const incrementalAllowed = showTarget
     ? target?.kind === "instance"
     : (allowIncremental ?? false)
@@ -155,7 +183,8 @@ export function BackupConfigurationDialog({
     () => new Set(destinationKeysInUse),
     [destinationKeysInUse]
   )
-  const showMode = showTarget ? target?.kind === "instance" : true
+  const showMode =
+    !consistencyChoice && (showTarget ? target?.kind === "instance" : true)
 
   const resetConfiguration = () => {
     setName(initialName ?? timestampedBackupName("manual"))
@@ -170,6 +199,7 @@ export function BackupConfigurationDialog({
       ]),
     ])
     setMode(initialMode)
+    setConsistency("live")
   }
 
   const changeOpen = (nextOpen: boolean) => {
@@ -230,6 +260,14 @@ export function BackupConfigurationDialog({
               />
             </div>
           ) : null}
+          {consistencyChoice ? (
+            <BackupConsistencyChoices
+              consistency={effectiveConsistency}
+              stoppedDescription={consistencyChoice.stoppedDescription}
+              stoppedUnavailable={consistencyChoice.stoppedUnavailable}
+              onConsistencyChange={setConsistency}
+            />
+          ) : null}
           {showMode ? (
             <BackupModeChoices
               effectiveMode={effectiveMode}
@@ -246,7 +284,11 @@ export function BackupConfigurationDialog({
             targetKind={target?.kind}
             onToggleDestination={toggleDestination}
           />
-          {error ? <p className="text-xs text-destructive">{error}</p> : null}
+          {error ? (
+            <p role="alert" className="text-xs text-destructive">
+              {error}
+            </p>
+          ) : null}
         </div>
         <DialogFooter>
           <Button
@@ -261,6 +303,7 @@ export function BackupConfigurationDialog({
             type="button"
             onClick={() =>
               onSubmit({
+                consistency: effectiveConsistency,
                 destinationKeys: destinationKeysInUse,
                 mode: effectiveMode,
                 name: name.trim(),
@@ -312,6 +355,51 @@ function BackupModeChoices({
           }}
         />
       </div>
+    </fieldset>
+  )
+}
+
+function BackupConsistencyChoices({
+  consistency,
+  onConsistencyChange,
+  stoppedDescription = "Stops the Apps that use it, then starts them again",
+  stoppedUnavailable,
+}: {
+  consistency: "live" | "stopped"
+  onConsistencyChange: (consistency: "live" | "stopped") => void
+  stoppedDescription?: string | undefined
+  stoppedUnavailable: string | null
+}) {
+  return (
+    <fieldset>
+      <legend className="mb-2 text-xs font-medium">While it backs up</legend>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <BackupDestinationChoice
+          checked={consistency === "live"}
+          description="Keeps running; copied as a crash would leave it"
+          icon={Radio}
+          label="Live"
+          onCheckedChange={(checked) => {
+            if (checked) onConsistencyChange("live")
+          }}
+        />
+        <BackupDestinationChoice
+          checked={consistency === "stopped"}
+          description={stoppedUnavailable ?? stoppedDescription}
+          disabled={stoppedUnavailable !== null}
+          icon={CirclePause}
+          label="Stopped"
+          onCheckedChange={(checked) => {
+            if (checked && stoppedUnavailable === null) {
+              onConsistencyChange("stopped")
+            }
+          }}
+        />
+      </div>
+      <p className="type-meta mt-2 text-muted-foreground">
+        Stop it for data a live copy can’t capture safely, such as a database’s
+        files. The backup records which.
+      </p>
     </fieldset>
   )
 }
@@ -539,11 +627,17 @@ function backupTargetItem(
   return {
     identity: {
       id: target.id,
-      kind: target.kind === "instance" ? "server" : "database",
+      kind:
+        target.kind === "instance"
+          ? "server"
+          : target.kind === "volume"
+            ? "relay"
+            : target.kind,
       relayId: target.relayId,
     },
     key: target.key,
-    meta: `${target.relayName} · ${target.id.slice(0, 8)}`,
+    meta:
+      target.description ?? `${target.relayName} · ${target.id.slice(0, 8)}`,
     name: target.name,
     searchText: `${target.id} ${target.relayName}`,
   }

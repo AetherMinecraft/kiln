@@ -509,6 +509,36 @@ the target must be stopped and defaults to "Take a safety backup first."
 Storage configuration clearly separates platform destinations from "My S3"
 destinations and never redisplays a saved secret.
 
+The picker also scopes to an App, showing the backups of what it owns or
+uses: its folder, the volumes its Compose project owns, and the Kiln volumes
+its configuration names or its containers mount. A row of an App's folder
+or a volume says whether it was taken live or stopped, and its restore
+dialog says what must be stopped (the App, or every container that mounts
+the volume, listing those running and the Apps that use it).
+
+An App's Info rail opens Backups scoped to the App. Each named volume in
+its Volumes table also opens Backups scoped to that volume, with a clearable
+volume filter; the picker still shows the App. Backup settings retain the
+App's Folder and Volume sections.
+
+New Backup offers Apps alongside game servers, databases and Kiln. An App
+backup includes its folder and every volume it owns together. A volume scope
+also offers that volume on its own. Both offer Live or Stopped, subject to
+permission to manage the App (or, for a Kiln volume, Apps on the Relay).
+Stopped App backups run as one batch, stopping the App once for all targets.
+
+The Settings page configures an App's folder and each volume it owns
+(choosing the App) and each Kiln volume on a Relay ("Kiln volumes on …"),
+with the same permissions as backing them up: retention, the platform
+ceiling, the destination, and exclusions, which apply to an App's folder
+and a volume as to a game server's, relative to their roots.
+
+A restore whose swap didn't finish shows on the Backups page as
+"A restore didn't finish", with Finish and Abandon for those
+who may restore its target (`backup.restore.unfinished` lists them; Hearth
+calls `backup.restore.resolve`, checking authority over every App that uses
+the target).
+
 ## CLI
 
 The CLI mirrors the same authorization and task APIs:

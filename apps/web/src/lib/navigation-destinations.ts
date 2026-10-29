@@ -854,7 +854,10 @@ function canUseSyncs(capabilities: NavigationAccessCapabilities): boolean {
 export function canAccessBackups(
   capabilities: NavigationAccessCapabilities
 ): boolean {
-  return hasScopedPermission(capabilities, "backup.read")
+  return (
+    hasScopedPermission(capabilities, "backup.read") ||
+    hasScopedPermission(capabilities, "app.read", ["relay", "app"])
+  )
 }
 
 export function canAccessActivity(
