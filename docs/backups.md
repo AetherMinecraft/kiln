@@ -430,14 +430,30 @@ while a labeled Hearth application container is running. Start Hearth
 afterward; normal Relay reconciliation repairs the restored catalog's queued
 snapshot of the backup task.
 
-Deleting a game server or database is the durable operation `resource.delete`
-(`apps/web/src/lib/resource-deletion.server.ts`), one row per resource in
-`resource_deletion`. It checks the person who asked may still delete it,
-freezes it on its Relay, takes a `final_delete` full backup if one was asked
-for, recording the backup's ID on the deletion in the reservation's
-transaction, and follows that backup to its end. A failed, cancelled, or
-missing backup stops the deletion with nothing deleted and the resource still
-frozen; its page offers to try again, to delete it without a final backup, or
+Deleting a game server, database, App, or Kiln volume is the durable
+operation `resource.delete` (`apps/web/src/lib/resource-deletion.server.ts`),
+one row per resource in `resource_deletion`. It checks the person who asked
+may still delete it, freezes it on its Relay, takes a `final_delete` full
+backup if one was asked for, recording the backup's ID on the deletion in the
+reservation's transaction, and follows that backup to its end. What an App's
+deletion takes is decided once, after the freeze, and kept in its journal:
+its folder, and each volume its Compose project made that nothing else uses.
+Its final backup is those parts, one backup at a time as steps of the
+deletion, each recorded on the deletion in place of the one before, and its
+Relay deletes only the volumes on that list, so a volume something else
+used then stays even if nothing does by the time it's deleted. A volume
+another App or container also mounts isn't backed up: a final backup never
+starts what it stopped, so the Relay refuses one, stopping nothing, that
+finds an App other than the one being deleted using what it backs up, as
+one deployed since. Deleting an App on its Relay is safe to send again, and
+says it's done only once the App's folder is gone, so a deletion the Relay
+stopped partway, after the App's containers went, is sent again rather than
+taken as done. Before any resource's Relay is asked to delete it, the
+deletion records that it's asking, with an App's volume list: from then on it
+can't be kept, since its data may be gone, and trying again finishes it with
+that list and no new final backup. A failed, cancelled, or missing backup, of
+any part, stops
+the deletion with nothing deleted and the resource still frozen; its page offers to try again, to delete it without a final backup, or
 to keep it. A game server keeps a final backup that finished for its next
 attempt, since it stayed stopped; a frozen database keeps serving what's
 connected to it, so a retry takes a new one. Keeping it is an operation of

@@ -29,7 +29,8 @@ import {
 } from "@/server/resource-deletions"
 
 /**
- * Says on a game server's or database's page that it's being deleted, and,
+ * Says on a game server's, database's, or App's page, or by a volume in its
+ * Relay's list, that it's being deleted, and,
  * when its deletion stopped, why, with what its person can do: try again,
  * delete it without a final backup, or keep it. Says nothing otherwise.
  */
@@ -73,7 +74,7 @@ export const ResourceDeletionAlert = React.memo(function ResourceDeletionAlert({
     },
   })
   if (!deletion) return null
-  const subject = target.kind === "instance" ? "game server" : "database"
+  const subject = subjects[target.kind]
   const failed = deletion.status === "failed"
   const busy = retry.isPending || cancel.isPending
   return (
@@ -112,7 +113,9 @@ export const ResourceDeletionAlert = React.memo(function ResourceDeletionAlert({
           {failed
             ? deletion.deletedOnRelay
               ? `Its Relay deleted it, but cleaning up after it didn't finish: ${sentence(deletion.error ?? "an unknown error")}`
-              : `${sentence(deletion.error ?? "It stopped for an unknown reason")} Until it's deleted or kept, it can't be changed${target.kind === "database" ? ", though game servers and Apps connected to it can still write to it. Trying again takes a new final backup" : ""}.`
+              : deletion.deletionStarted
+                ? `Its Relay began deleting it, but didn't finish: ${sentence(deletion.error ?? "an unknown error")} It can only be finished now. Final backups already taken stay.`
+                : `${sentence(deletion.error ?? "It stopped for an unknown reason")} Until it's deleted or kept, it can't be changed${target.kind === "database" ? ", though game servers and Apps connected to it can still write to it. Trying again takes a new final backup" : ""}.`
             : deletion.status === "cancelling"
               ? "Kiln is letting it go on its Relay. It can be changed again once that finishes."
               : target.kind === "database"
@@ -120,7 +123,9 @@ export const ResourceDeletionAlert = React.memo(function ResourceDeletionAlert({
                   ? "Its final backup is running. Game servers and Apps connected to it can still write to it, but what they write after the backup started isn't in it."
                   : "Kiln can't change it meanwhile, though game servers and Apps connected to it can still write to it."
                 : deletion.status === "backing_up"
-                  ? "Its final backup is running. Nothing can change it meanwhile."
+                  ? target.kind === "app"
+                    ? "Its final backups are running: its folder, then each volume only it uses. Nothing can change it meanwhile."
+                    : "Its final backup is running. Nothing can change it meanwhile."
                   : "Nothing can change it meanwhile."}
         </p>
         {failed && canDelete ? (
@@ -130,7 +135,11 @@ export const ResourceDeletionAlert = React.memo(function ResourceDeletionAlert({
               size="sm"
               variant="outline"
               onClick={() =>
-                retry.mutate({ finalBackup: deletion.finalBackup })
+                retry.mutate({
+                  finalBackup: deletion.deletionStarted
+                    ? false
+                    : deletion.finalBackup,
+                })
               }
             >
               {retry.isPending && !skipping ? (
@@ -138,9 +147,9 @@ export const ResourceDeletionAlert = React.memo(function ResourceDeletionAlert({
               ) : (
                 <RotateCcw />
               )}
-              Try again
+              {deletion.deletionStarted ? "Finish deletion" : "Try again"}
             </Button>
-            {deletion.deletedOnRelay ? null : (
+            {deletion.deletionStarted ? null : (
               <>
                 {deletion.finalBackup ? (
                   <Button
@@ -186,6 +195,13 @@ export const ResourceDeletionAlert = React.memo(function ResourceDeletionAlert({
   )
 })
 
+const subjects: Record<ResourceDeletionTarget["kind"], string> = {
+  app: "App",
+  database: "database",
+  instance: "game server",
+  volume: "volume",
+}
+
 function SkipFinalBackupDialog({
   name,
   onConfirm,
@@ -215,8 +231,10 @@ function SkipFinalBackupDialog({
             <DialogTitle>Delete {name} without a final backup?</DialogTitle>
             <DialogDescription>
               Without a final backup, this {subject} and its data are gone for
-              good. Backups made before stay. Schedules left with nothing else
-              to run on are deleted too.
+              good. Backups made before stay.
+              {subject === "game server" || subject === "database"
+                ? " Schedules left with nothing else to run on are deleted too."
+                : null}
             </DialogDescription>
           </DialogHeader>
           <DeleteConfirmationFields

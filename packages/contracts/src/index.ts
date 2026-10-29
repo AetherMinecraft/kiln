@@ -275,16 +275,17 @@ export const relayDeleteDatabaseSchema = z
   .strict()
 
 /**
- * A game server, App, or database being deleted, by its full ID. Frozen,
- * it's quiet (a database keeps running for its live dump), and the Relay
- * refuses every change to it but its final backup and its deletion; unfrozen, it is a resource
- * like any other again.
+ * A game server, App, database, or Kiln volume being deleted, by its full
+ * ID. Frozen, it's quiet (a database keeps running for its live dump), and
+ * the Relay refuses every change to it but its final backup and its
+ * deletion; unfrozen, it is a resource like any other again.
  */
 export const relayResourceFreezeSchema = z
   .object({
     deletionId: z.uuid(),
     id: z.string().regex(/^[a-f0-9]{40}$/u),
-    kind: z.enum(["app", "database", "instance"]),
+    // A volume is a Kiln volume, by its ID; an App's own volumes go with it.
+    kind: z.enum(["app", "database", "instance", "volume"]),
   })
   .strict()
 
@@ -1098,7 +1099,14 @@ export const relayAppActionSchema = z
   .strict()
 
 export const relayDeleteAppSchema = z
-  .object({ appId: appIdSchema, deleteData: z.boolean().default(true) })
+  .object({
+    appId: appIdSchema,
+    deleteData: z.boolean().default(true),
+    // The App's own volumes its deletion may take, by ID: those it planned
+    // to, and backed up if asked. Any other stays. Left out, every volume
+    // only the App's own Compose projects made and nothing mounts goes.
+    volumeIds: z.array(appVolumeIdSchema).max(256).optional(),
+  })
   .strict()
 
 // App terminals are full shells in one of the app's services, sessions kept

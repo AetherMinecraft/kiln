@@ -5,6 +5,7 @@ import { Effect, Layer } from "effect"
 import { TestClock } from "effect/testing"
 import { afterAll, vi } from "vite-plus/test"
 
+import { reserveBackupRestoreEffect } from "@/effect/backups"
 import { Database } from "@/effect/database"
 import { ResourceDeletionConflictError } from "@/effect/resource-deletions"
 import { disposeAppRuntime } from "@/effect/runtime"
@@ -14,18 +15,24 @@ import { stopScheduleDeliveries } from "@/server/schedule-deployment.server"
 import { TestDatabase, describeMysql } from "@/test/database"
 import {
   allow,
+  appId,
+  appRecords,
   at,
   databaseId,
   deletionOf,
   deletionRelay as relay,
   deletionUntil as until,
+  finishBackup,
   insertDeletion,
+  nextBackup,
   owner,
   relayId,
+  seedApp,
   seedDeletion as seed,
   serverId,
   serverRecords,
   stranger,
+  volumeId,
 } from "@/test/resource-deletion"
 import { insertBackup, insertRows, selectRows } from "@/test/seed"
 
@@ -112,8 +119,282 @@ const seedStoppedWithBackup = Effect.gen(function* () {
   relay.frozen.set(serverId, id)
 })
 
+// A finished archive of a target, kept on the Relay's disk.
+const completeBackup = (target: { id: string; kind: string }) =>
+  Effect.gen(function* () {
+    const backupId = randomUUID()
+    const archive = {
+      bytes: 1024,
+      checksum_sha256: "0".repeat(64),
+      filename: "final.tar.gz",
+    }
+    yield* insertBackup(backupId, {
+      ...archive,
+      artifact_kind: target.kind === "instance" ? "archive" : "tar_archive",
+      reason: "final_delete",
+      relay_id: relayId,
+      target_id: target.id,
+      target_kind: target.kind,
+    })
+    yield* insertRows("backup_artifact", {
+      ...archive,
+      backup_id: backupId,
+      created_at: at,
+      destination_key: "local",
+      id: randomUUID(),
+      status: "available",
+      updated_at: at,
+    })
+    return backupId
+  })
+
 describeMysql("Deleting a game server or database", () => {
   layer(Lanes, { timeout: 120_000 })((it) => {
+    it.effect(
+      "restores nothing of a resource its Relay began deleting, though its deletion stopped",
+      () =>
+        Effect.gen(function* () {
+          yield* seed
+          yield* seedApp()
+          const server = yield* completeBackup({
+            id: serverId,
+            kind: "instance",
+          })
+          const volume = yield* completeBackup({
+            id: `${appId}/data`,
+            kind: "volume",
+          })
+          // Both stopped after their Relay was asked to delete them.
+          for (const [resourceKind, resourceId] of [
+            ["instance", serverId],
+            ["app", appId],
+          ]) {
+            yield* insertDeletion({
+              error: "The Relay couldn't remove it",
+              relay_deleting_at: at,
+              resource_id: resourceId,
+              resource_kind: resourceKind,
+              status: "failed",
+            })
+          }
+
+          const refusals = yield* Effect.forEach([server, volume], (backupId) =>
+            Effect.flip(
+              reserveBackupRestoreEffect({
+                backupId,
+                dependsOnTaskId: null,
+                requestedBy: owner.id,
+                taskId: randomUUID(),
+              })
+            )
+          )
+
+          // An App's own volume goes with its App.
+          assert.deepStrictEqual(
+            refusals.map((refusal) =>
+              "code" in refusal ? refusal.code : refusal._tag
+            ),
+            ["final_delete_in_progress", "final_delete_in_progress"]
+          )
+        })
+    )
+
+    it.effect(
+      "keeps an App's volume its deletion didn't plan to take, though nothing else uses it any more",
+      () =>
+        Effect.gen(function* () {
+          const otherApp = "c".repeat(40)
+          yield* seed
+          yield* seedApp([
+            {
+              id: `${appId}/data`,
+              owner: appId,
+              users: [{ appId, configured: false }],
+            },
+            {
+              id: `${appId}/shared`,
+              owner: appId,
+              users: [
+                { appId, configured: false },
+                { appId: otherApp, configured: false },
+              ],
+            },
+          ])
+
+          yield* requestResourceDeletionEffect({
+            finalBackup: true,
+            kind: "app",
+            relayId,
+            resourceId: appId,
+            storageId: null,
+            user: owner,
+          })
+          const folder = yield* nextBackup(appId, null)
+          // The other App goes while the folder is backed up: the volume
+          // it used is no longer anyone else's, but wasn't backed up.
+          const shared = relay.volumes.find(
+            (volume) => volume.id === `${appId}/shared`
+          )!
+          shared.users = [{ appId, configured: false }]
+          yield* finishBackup(folder)
+          yield* finishBackup(yield* nextBackup(appId, folder))
+          const done = yield* until(appId, ["completed", "failed"])
+
+          assert.strictEqual(done?.status, "completed")
+          assert.deepStrictEqual(relay.appDeletes, [[`${appId}/data`]])
+          assert.deepStrictEqual(
+            relay.volumes.map((volume) => volume.id),
+            [`${appId}/shared`]
+          )
+        }).pipe(TestClock.withLive),
+      90_000
+    )
+
+    it.effect(
+      "won't keep an App its Relay began deleting, and finishes it on a retry without a new final backup",
+      () =>
+        Effect.gen(function* () {
+          yield* seed
+          yield* seedApp()
+          // Its data goes, then both sends fail.
+          relay.appDeletesFailingAfterData = 2
+
+          yield* requestResourceDeletionEffect({
+            finalBackup: true,
+            kind: "app",
+            relayId,
+            resourceId: appId,
+            storageId: null,
+            user: owner,
+          })
+          yield* finishBackup(yield* nextBackup(appId, null))
+          const stopped = yield* until(appId, ["completed", "failed"])
+          const kept = yield* Effect.flip(
+            cancelResourceDeletionEffect({
+              kind: "app",
+              relayId,
+              resourceId: appId,
+              user: owner,
+            })
+          )
+          yield* requestResourceDeletionEffect({
+            finalBackup: true,
+            kind: "app",
+            relayId,
+            resourceId: appId,
+            ...(stopped ? { retryOf: Number(stopped.attempt) } : {}),
+            storageId: null,
+            user: owner,
+          })
+          const done = yield* until(appId, ["completed"])
+
+          assert.strictEqual(stopped?.status, "failed")
+          assert.isNotNull(stopped?.relay_deleting_at)
+          assert.strictEqual(
+            kept.message,
+            "Deleting it has already started; finish deleting it"
+          )
+          assert.strictEqual(done?.status, "completed")
+          // Finished, not frozen or backed up again.
+          assert.deepStrictEqual(relay.changes, [
+            "resource.freeze",
+            "app.delete",
+            "app.delete",
+            "app.delete",
+          ])
+          assert.lengthOf(yield* selectRows("backup"), 1)
+          assert.deepStrictEqual(yield* appRecords, [])
+        }).pipe(TestClock.withLive),
+      90_000
+    )
+
+    it.effect(
+      "finishes an App's deletion its Relay stopped partway, rather than taking its missing containers as deleted",
+      () =>
+        Effect.gen(function* () {
+          yield* seed
+          yield* seedApp()
+          relay.nextDelete = "stops-partway"
+
+          yield* requestResourceDeletionEffect({
+            finalBackup: false,
+            kind: "app",
+            relayId,
+            resourceId: appId,
+            user: owner,
+          })
+          const done = yield* until(appId, ["completed", "failed"])
+
+          assert.strictEqual(done?.status, "completed")
+          // Sent again, which finished its folder.
+          assert.deepStrictEqual(relay.changes, [
+            "resource.freeze",
+            "app.delete",
+            "app.delete",
+          ])
+          assert.isFalse(relay.appFolders.has(appId))
+          assert.deepStrictEqual(yield* appRecords, [])
+        }).pipe(TestClock.withLive),
+      90_000
+    )
+
+    it.effect(
+      "deletes nothing of an App or a volume when any of its final backups fails",
+      () =>
+        Effect.gen(function* () {
+          yield* seed
+          yield* seedApp([
+            {
+              id: `${appId}/data`,
+              owner: appId,
+              users: [{ appId, configured: false }],
+            },
+            { id: volumeId },
+          ])
+
+          // The App's folder is backed up, then its volume's backup fails.
+          yield* requestResourceDeletionEffect({
+            finalBackup: true,
+            kind: "app",
+            relayId,
+            resourceId: appId,
+            storageId: null,
+            user: owner,
+          })
+          const folder = yield* nextBackup(appId, null)
+          yield* finishBackup(folder)
+          yield* failBackup(yield* nextBackup(appId, folder))
+          const app = yield* until(appId, ["completed", "failed"])
+          // A Kiln volume's only backup fails.
+          yield* requestResourceDeletionEffect({
+            finalBackup: true,
+            kind: "volume",
+            relayId,
+            resourceId: volumeId,
+            storageId: null,
+            user: owner,
+          })
+          yield* failBackup(yield* nextBackup(volumeId, null))
+          const volume = yield* until(volumeId, ["completed", "failed"])
+
+          assert.strictEqual(app?.status, "failed")
+          assert.strictEqual(volume?.status, "failed")
+          assert.include(app?.error ?? "", "Relay disk is full")
+          // Frozen, and nothing deleted, on the Relay or in Hearth.
+          assert.deepStrictEqual(relay.changes, [
+            "resource.freeze",
+            "resource.freeze",
+          ])
+          assert.isTrue(relay.apps.has(appId))
+          assert.deepStrictEqual(
+            relay.volumes.map((candidate) => candidate.id),
+            [`${appId}/data`, volumeId]
+          )
+          assert.deepStrictEqual(yield* appRecords, [appId])
+        }).pipe(TestClock.withLive),
+      90_000
+    )
+
     it.effect(
       "freezes then deletes once, even when the delete's reply is lost, and not again when started again",
       () =>
