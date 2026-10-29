@@ -70,6 +70,24 @@ has, and never one someone connected or disconnected on it: every such
 change leaves a record (`relay_database_connection_choices`), so a handover
 repeated, or sent by another Hearth, overrules nobody.
 
+A Tailscale network's members are named by kind: `instance:<id>` for a game
+server and `app:<id>:<service>` for an App's service. Applying a network
+(`relay.tailscale.stack.apply`) holds the network's own stack exclusively and
+takes the lifecycle lock of each member it joins or takes off, so it waits
+for that member's power changes as they wait for it; a member it leaves as it
+is is held shared, so it isn't deleted or replaced meanwhile. Removing a
+network does the same for all its members. The locks are planned from the
+members the network has when the change is admitted, and the change refuses
+to run if they've changed by its turn. A game server's or App's deletion
+holds it while Hearth rewrites its networks' DNS for it, and a change to the
+network queued behind the deletion waits for it in turn. So while a deletion
+waits on a network's DNS, rewriting that DNS (`relay.tailscale.stack.dns`)
+waits only for what holds its locks, not for what waits in line, and counts
+toward the lanes' waiting limit like any request; at any other time it takes
+its turn like any change. Relays rewrite bindings saved with a
+game server's bare ID when they start, and Hearth its copies of them in a
+migration.
+
 `apps/relay/src/operation-plans.ts` maps each control operation to its keys.
 Its switch is exhaustive, so a new operation can't compile until it declares
 what it locks, or that it locks nothing.

@@ -174,6 +174,11 @@ export interface ControlSocketOptions {
   readonly requestLocks: (
     request: RelayControlRequest
   ) => ReadonlyArray<LaneLock> | Promise<ReadonlyArray<LaneLock>> | null
+  /**
+   * Whether a request waits only for what holds its locks, not for what
+   * waits in line, as work something running waits on does.
+   */
+  readonly requestContinues?: (request: RelayControlRequest) => boolean
   readonly subscribeSnapshots: (
     listener: (snapshot: unknown) => void
   ) => () => void
@@ -630,7 +635,11 @@ function authenticateSocket(
     const ticket =
       locks === null
         ? null
-        : options.lanes.admit({ label: message.operation, locks })
+        : options.lanes.admit({
+            continuation: options.requestContinues?.(message) ?? false,
+            label: message.operation,
+            locks,
+          })
     const request: InFlightRequest = {
       controller,
       fiber: null,

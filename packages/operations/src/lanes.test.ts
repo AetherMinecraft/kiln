@@ -13,7 +13,10 @@ const start = Effect.fnUntraced(function* (
   log: Array<string>,
   label: string,
   locks: ReadonlyArray<LaneLock> | Promise<ReadonlyArray<LaneLock>>,
-  options: { readonly precondition?: () => boolean } = {}
+  options: {
+    readonly continuation?: boolean
+    readonly precondition?: () => boolean
+  } = {}
 ) {
   const release = yield* Deferred.make<void>()
   const fiber = yield* lanes
@@ -240,6 +243,85 @@ describe("operation lanes", () => {
         "delete.routes",
         "route-write",
       ])
+    })
+  )
+
+  it.effect(
+    "lets a continuation wait only for what holds its locks, and a pause withdraw it",
+    () =>
+      Effect.gen(function* () {
+        const lanes = new OperationLanes()
+        const log: Array<string> = []
+        // A deletion holds the server while it waits on the network's DNS.
+        const deletion = yield* start(lanes, log, "delete", [
+          exclusive("server"),
+        ])
+        // A change to the network waits for the deletion.
+        const change = yield* start(lanes, log, "network-change", [
+          exclusive("network"),
+          exclusive("server"),
+        ])
+        const holder = yield* start(lanes, log, "dns-holder", [
+          exclusive("dns"),
+        ])
+        const dns = yield* start(
+          lanes,
+          log,
+          "network-dns",
+          [exclusive("network"), exclusive("dns")],
+          { continuation: true }
+        )
+
+        // Only for the holder of what it takes, not the queued change.
+        assert.deepStrictEqual(log, ["delete", "dns-holder"])
+        yield* holder.finish
+        assert.deepStrictEqual(log, ["delete", "dns-holder", "network-dns"])
+        yield* dns.finish
+        yield* deletion.finish
+        yield* change.finish
+        assert.deepStrictEqual(log, [
+          "delete",
+          "dns-holder",
+          "network-dns",
+          "network-change",
+        ])
+
+        const blocker = yield* start(lanes, log, "blocker", [exclusive("x")])
+        const waiting = yield* start(
+          lanes,
+          log,
+          "later-dns",
+          [exclusive("x")],
+          {
+            continuation: true,
+          }
+        )
+        lanes.setPaused(true)
+        const withdrawn = yield* Effect.flip(Fiber.join(waiting.fiber))
+        assert.strictEqual((withdrawn as LaneRejectedError).reason, "paused")
+        yield* blocker.finish
+      })
+  )
+
+  it.effect("counts waiting continuations toward its waiting limit", () =>
+    Effect.gen(function* () {
+      const lanes = new OperationLanes({ maxWaiting: 1 })
+      const log: Array<string> = []
+      const holder = yield* start(lanes, log, "holder", [exclusive("a")])
+      yield* start(lanes, log, "dns", [exclusive("a")], { continuation: true })
+
+      const refused = yield* Effect.flip(
+        lanes.run(
+          { continuation: true, label: "more-dns", locks: [exclusive("a")] },
+          Effect.void
+        )
+      )
+      assert.strictEqual((refused as LaneRejectedError).reason, "busy")
+      const alsoRefused = yield* Effect.flip(
+        lanes.run({ label: "change", locks: [exclusive("a")] }, Effect.void)
+      )
+      assert.strictEqual((alsoRefused as LaneRejectedError).reason, "busy")
+      yield* holder.finish
     })
   )
 

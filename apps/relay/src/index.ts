@@ -47,6 +47,7 @@ import {
   RelayTransferSourcePrepareSchema,
   appIdSchema,
   appTailscaleMember,
+  instanceTailscaleMemberId,
   relayAppWebRouteStateSchema,
   relayAppWebRoutesWriteSchema,
   relayDeleteAppSchema,
@@ -188,7 +189,12 @@ import {
   traefikRouteUpstream,
   traefikStaticConfiguration,
 } from "./traefik.js"
-import { forkPromise, promiseEffect, recoverPromise } from "./effect/promise.js"
+import {
+  ensuringPromise,
+  forkPromise,
+  promiseEffect,
+  recoverPromise,
+} from "./effect/promise.js"
 import { DockerEngine } from "./docker-engine.js"
 import { RelayVolumes } from "./volumes.js"
 import {
@@ -253,6 +259,7 @@ import {
   type LaneAdmission,
 } from "./operation-lanes.js"
 import {
+  controlRequestContinues,
   controlRequestLocks,
   databaseLocks,
   instanceLifecycleLocks,
@@ -478,6 +485,28 @@ const lifecycle = new LifecycleDriver(
   databaseConnections,
   lanes
 )
+// Before anything reads a Tailscale stack.
+await lifecycle.migrateTailscaleStackMembers()
+// What each queued change to a Tailscale stack planned its locks from, so it
+// can tell, once it runs, whether the stack changed meanwhile.
+const tailscaleStackPlans = new WeakMap<object, string>()
+// The Tailscale networks whose DNS a deletion is waiting on Hearth to
+// rewrite, by how many deletions wait on each (`controlRequestContinues`).
+const awaitedTailscaleDns = new Map<string, number>()
+async function awaitingTailscaleDns<A>(
+  stackIds: ReadonlyArray<string>,
+  run: () => Promise<A>
+): Promise<A> {
+  for (const id of stackIds)
+    awaitedTailscaleDns.set(id, (awaitedTailscaleDns.get(id) ?? 0) + 1)
+  return ensuringPromise(run, () => {
+    for (const id of stackIds) {
+      const waiting = (awaitedTailscaleDns.get(id) ?? 1) - 1
+      if (waiting > 0) awaitedTailscaleDns.set(id, waiting)
+      else awaitedTailscaleDns.delete(id)
+    }
+  })
+}
 const volumes = new RelayVolumes(
   config,
   new DockerEngine(config.dockerSocket),
@@ -1248,11 +1277,22 @@ const controlSocket = attachControlSocket({
   journalId: startup.journalId,
   initialSnapshot: () => snapshotHub.read(),
   lanes,
+  requestContinues: (request) =>
+    controlRequestContinues(
+      request.operation,
+      lockFields(request.payload),
+      (stackId) => awaitedTailscaleDns.has(stackId)
+    ),
   requestLocks: (request) =>
     controlRequestLocks(
       request.operation,
       lockFields(request.payload),
-      resolveInstanceReference
+      resolveInstanceReference,
+      async (stackId) => {
+        const plan = await lifecycle.tailscaleStackPlan(stackId)
+        tailscaleStackPlans.set(request, plan.basis)
+        return plan.bindings
+      }
     ),
   runEffect: (effect) => runRelayEffect("relay.control.state", effect),
   saveDial: (clientId, url) => {
@@ -1952,7 +1992,10 @@ async function executeControlRequest(
       return lifecycle.tailscaleStacks()
     case "relay.tailscale.stack.apply": {
       const input = relayTailscaleStackApplySchema.parse(request.payload)
-      const stack = await lifecycle.applyTailscaleStack(input)
+      const stack = await lifecycle.applyTailscaleStack(
+        input,
+        tailscaleStackPlans.get(request)
+      )
       await snapshotHub.refresh()
       return stack
     }
@@ -1963,7 +2006,12 @@ async function executeControlRequest(
     case "relay.tailscale.stack.remove": {
       const { controlPlaneDeviceRemoved, id, mode } =
         relayTailscaleStackRemoveSchema.parse(request.payload)
-      await lifecycle.removeTailscaleStack(id, mode, controlPlaneDeviceRemoved)
+      await lifecycle.removeTailscaleStack(
+        id,
+        mode,
+        controlPlaneDeviceRemoved,
+        tailscaleStackPlans.get(request)
+      )
       if (mode === "commit") {
         await runRelayEffect(
           "relay.tailscale.stack.deleteName",
@@ -2533,10 +2581,12 @@ async function executeControlRequest(
       await lifecycle.detachAppFromTailscale(
         input.appId,
         async ({ memberId, mode, stackIds }) => {
-          await requestHearth(
-            "hearth.tailscale.instance.detach",
-            { instanceId: memberId, mode, stackIds },
-            60_000
+          await awaitingTailscaleDns(stackIds, () =>
+            requestHearth(
+              "hearth.tailscale.instance.detach",
+              { memberId, mode, stackIds },
+              60_000
+            )
           )
         }
       )
@@ -2963,10 +3013,16 @@ async function executeControlRequest(
         instanceId,
         payload.deleteData === true,
         async ({ mode, stackIds }) => {
-          await requestHearth(
-            "hearth.tailscale.instance.detach",
-            { instanceId, mode, stackIds },
-            60_000
+          await awaitingTailscaleDns(stackIds, () =>
+            requestHearth(
+              "hearth.tailscale.instance.detach",
+              {
+                memberId: instanceTailscaleMemberId(instanceId),
+                mode,
+                stackIds,
+              },
+              60_000
+            )
           )
         }
       )
