@@ -19,7 +19,12 @@ import type {
   RelayConsole,
   RelayConsoleResource,
   RelayConsoleLine,
+  RelayInstance,
   RelayInstanceLifecycleEvent,
+  RelayInstanceResources,
+  RelayWorkloadResourceKind,
+  RelayWorkloadUsage,
+  RelayWorkloadUsageHistory,
 } from "@workspace/contracts"
 import {
   relayConsoleCommandSchema,
@@ -173,6 +178,12 @@ export interface BrowserSocketOptions {
   readonly subscribeSnapshots: (
     listener: (sample: RelaySnapshotSample) => void
   ) => () => void
+  /** An App's or database's live usage, sampled on the snapshot loop. */
+  readonly workloadUsage: (
+    kind: RelayWorkloadResourceKind,
+    id: string,
+    history: RelayWorkloadUsageHistory
+  ) => RelayWorkloadUsage
 }
 
 export interface BrowserSocketServer {
@@ -208,9 +219,12 @@ export function attachBrowserSocket(
   )
   const resourceHubs = new ResourceHubRegistry(
     options.docker,
+    options.workloadUsage,
     options.subscribeSnapshots,
     (socket, encoded, kind, action) =>
-      outboxes.get(socket)?.send(encoded, kind, action) ?? false
+      outboxes.get(socket)?.send(encoded, kind, action) ?? false,
+    (socket, bytes) =>
+      outboxes.get(socket)?.whenRoomFor(bytes) ?? Promise.resolve(false)
   )
   const wss = new WebSocketServer({
     clientTracking: false,
@@ -502,16 +516,19 @@ function authenticateBrowser(
     const resourceSubscription = decodeBrowserResourceSubscription(value)
     if (Option.isSome(resourceSubscription)) {
       const subscription = resourceSubscription.value
+      // The capability decides the resource's kind, and the action that
+      // reads it.
+      const kind = capabilityResourceKind(capability)
       if (
-        capabilityResourceKind(capability) !== "instance" ||
+        !isResourceUsageKind(kind) ||
         subscription.instanceId !== capability.instanceId ||
         (capability.version === 2 && capability.operation !== "resources") ||
-        !registry.isActive(socket, "instance.read")
+        !registry.isActive(socket, resourceReadActions[kind])
       ) {
         socket.close(4403, "Resource capability does not allow this instance")
         return
       }
-      resourceHubs.subscribe(socket, subscription.instanceId)
+      resourceHubs.subscribe(socket, { id: subscription.instanceId, kind })
       return
     }
     const consoleWrite = decodeBrowserConsoleWrite(value)
@@ -1122,27 +1139,53 @@ class ConsoleHubRegistry {
   }
 }
 
+type ResourceUsageKind = "app" | "database" | "instance"
+
+// The action that reads each kind's usage.
+const resourceReadActions = {
+  app: "app.read",
+  database: "database.read",
+  instance: "instance.read",
+} as const satisfies Record<ResourceUsageKind, string>
+
+function isResourceUsageKind(kind: string): kind is ResourceUsageKind {
+  return Object.hasOwn(resourceReadActions, kind)
+}
+
+interface ResourceSubscription {
+  readonly id: string
+  readonly kind: ResourceUsageKind
+}
+
+// Delivers each subscribed resource's usage with every snapshot sample, so
+// game servers', Apps', and databases' arrive on one loop.
 class ResourceHubRegistry {
   readonly #deliver: BrowserDelivery
   readonly #docker: DockerDriver
   readonly #historyDelivered = new Set<WebSocket>()
+  readonly #room: BrowserRoom
   readonly #subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"]
-  readonly #subscriptions = new Map<WebSocket, string>()
+  readonly #subscriptions = new Map<WebSocket, ResourceSubscription>()
+  readonly #workloadUsage: BrowserSocketOptions["workloadUsage"]
   #lastSample: RelaySnapshotSample | null = null
   #unsubscribe: (() => void) | null = null
 
   constructor(
     docker: DockerDriver,
+    workloadUsage: BrowserSocketOptions["workloadUsage"],
     subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"],
-    deliver: BrowserDelivery
+    deliver: BrowserDelivery,
+    room: BrowserRoom
   ) {
     this.#docker = docker
+    this.#room = room
+    this.#workloadUsage = workloadUsage
     this.#subscribeSnapshots = subscribeSnapshots
     this.#deliver = deliver
   }
 
-  subscribe(socket: WebSocket, instanceId: string): void {
-    this.#subscriptions.set(socket, instanceId)
+  subscribe(socket: WebSocket, subscription: ResourceSubscription): void {
+    this.#subscriptions.set(socket, subscription)
     if (!this.#unsubscribe) {
       this.#unsubscribe = this.#subscribeSnapshots((sample) => {
         this.#lastSample = sample
@@ -1171,45 +1214,111 @@ class ResourceHubRegistry {
   }
 
   #deliverSample(sample: RelaySnapshotSample, only?: WebSocket): void {
-    const byId = new Map(
-      sample.snapshot.instances.map((instance) => [instance.id, instance])
-    )
-    const groups = new Map<string, Array<WebSocket>>()
-    for (const [subscriber, instanceId] of this.#subscriptions) {
+    const groups = new Map<
+      string,
+      { subscription: ResourceSubscription; sockets: Array<WebSocket> }
+    >()
+    for (const [subscriber, subscription] of this.#subscriptions) {
       if (only && subscriber !== only) continue
-      const sockets = groups.get(instanceId) ?? []
-      sockets.push(subscriber)
-      groups.set(instanceId, sockets)
+      const key = `${subscription.kind}:${subscription.id}`
+      const group = groups.get(key) ?? { sockets: [], subscription }
+      group.sockets.push(subscriber)
+      groups.set(key, group)
     }
-    for (const [instanceId, subscribers] of groups) {
-      const current = byId.get(instanceId)
-      if (!current) continue
-      const instance = projectRelayInstanceOverview(current)
-      const live = JSON.stringify({
-        history: [],
-        instance,
-        sequence: sample.sequence,
-        type: "resource",
-      })
-      let withHistory: string | null = null
-      for (const subscriber of subscribers) {
-        const first = !this.#historyDelivered.has(subscriber)
-        if (first) {
-          withHistory ??= JSON.stringify({
-            history: this.#docker.resourceHistory(instanceId),
-            instance,
-            sequence: sample.sequence,
-            type: "resource",
-          })
-        }
-        this.#deliver(
-          subscriber,
-          first ? (withHistory ?? live) : live,
-          "resource",
-          "instance.read"
+    let instances: ReadonlyMap<string, RelayInstance> | null = null
+    for (const { sockets, subscription } of groups.values()) {
+      let events: {
+        live: string
+        withHistory: () => ReadonlyArray<string>
+      } | null
+      if (subscription.kind === "instance") {
+        instances ??= new Map(
+          sample.snapshot.instances.map((instance) => [instance.id, instance])
         )
-        this.#historyDelivered.add(subscriber)
+        events = this.#instanceEvents(
+          instances,
+          subscription.id,
+          sample.sequence
+        )
+      } else {
+        events = this.#workloadEvents(
+          subscription.kind,
+          subscription.id,
+          sample.sequence
+        )
       }
+      if (!events) continue
+      let withHistory: ReadonlyArray<string> | null = null
+      const action = resourceReadActions[subscription.kind]
+      for (const subscriber of sockets) {
+        if (this.#historyDelivered.has(subscriber)) {
+          // A live sample replaces the one still waiting, as it's older.
+          this.#deliver(subscriber, events.live, "resource", action)
+          continue
+        }
+        this.#historyDelivered.add(subscriber)
+        withHistory ??= events.withHistory()
+        this.#deliverHistory(subscriber, withHistory, action)
+      }
+    }
+  }
+
+  // History queues in order, as console lines do, a frame at a time as the
+  // outbox has room, so a large App's never overflows it and none is lost.
+  #deliverHistory(
+    socket: WebSocket,
+    frames: ReadonlyArray<string>,
+    action: string
+  ): void {
+    const send = Effect.gen({ self: this }, function* () {
+      for (const frame of frames) {
+        const open = yield* Effect.promise(() =>
+          this.#room(socket, Buffer.byteLength(frame))
+        )
+        if (!open || !this.#subscriptions.has(socket)) return
+        this.#deliver(socket, frame, "console", action)
+      }
+    })
+    Effect.runFork(send)
+  }
+
+  #instanceEvents(
+    instances: ReadonlyMap<string, RelayInstance>,
+    instanceId: string,
+    sequence: number
+  ) {
+    const current = instances.get(instanceId)
+    if (!current) return null
+    const instance = projectRelayInstanceOverview(current)
+    const event = (history: ReadonlyArray<RelayInstanceResources>) =>
+      JSON.stringify({ history, instance, sequence, type: "resource" })
+    return {
+      live: event([]),
+      withHistory: () => [event(this.#docker.resourceHistory(instanceId))],
+    }
+  }
+
+  // Each event carries the latest samples. The minutes before follow a new
+  // subscriber in one event per history, the resource's and then each
+  // service's, so no frame holds more than one window of samples.
+  #workloadEvents(
+    kind: RelayWorkloadResourceKind,
+    id: string,
+    sequence: number
+  ) {
+    const event = (history: RelayWorkloadUsageHistory) => {
+      const usage = this.#workloadUsage(kind, id, history)
+      return JSON.stringify({ ...usage, id, kind, sequence, type: "resource.usage" })
+    }
+    const live = event("none")
+    return {
+      live,
+      withHistory: () => [
+        event("resource"),
+        ...this.#workloadUsage(kind, id, "none").services.map((service) =>
+          event({ service: service.service })
+        ),
+      ],
     }
   }
 }

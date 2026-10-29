@@ -5,14 +5,24 @@ import { createServer, request as httpRequest } from "node:http"
 import type { Server } from "node:http"
 import type { Duplex } from "node:stream"
 import { Effect } from "effect"
-import { afterEach, describe, expect, it, vi } from "vite-plus/test"
+import {
+  afterEach,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+  vi,
+} from "vite-plus/test"
 import { WebSocket } from "ws"
 
 import {
   relayBrowserConsoleProtocol,
+  relayBrowserMaxFrameBytes,
   relayBrowserProofTranscript,
+  relayConsoleReadActions,
   type RelayBrowserCapabilityV2,
   type RelayConsoleLine,
+  type RelayInstanceResources,
   type RelayManagedDatabase,
 } from "@workspace/contracts"
 
@@ -291,6 +301,122 @@ describe("relay browser socket integration", () => {
       instanceId: sharedId,
     })
   })
+
+  it("streams an App's usage, a history to a frame, to a capability for that App", async () => {
+    const relay = await startRelay({ actions: ["app.read"] })
+    const { messages, socket } = await authenticate(relay, appUsageCapability)
+    const frames: Array<number> = []
+    socket.on("message", (data: Buffer) => frames.push(data.length))
+    const closed = messages.closed()
+
+    socket.send(
+      JSON.stringify({ instanceId: sharedId, type: "resource.subscribe", v: 1 })
+    )
+    // Samples arrive on the snapshot loop, once the Relay has subscribed it.
+    const sampling = setInterval(relay.reportRuns, 20)
+    onTestFinished(() => clearInterval(sampling))
+
+    // The App's history, then each service's, each with the latest samples.
+    const first = await messages.next("resource.usage")
+    expect(first).toMatchObject({ id: sharedId, kind: "app" })
+    expect((first.history as Array<unknown>).length).toBe(usageWindowSamples)
+    const byService = new Map<string, number>()
+    for (const _service of appServices) {
+      const event = await messages.next("resource.usage")
+      expect(event.history).toEqual([])
+      for (const service of event.services as Array<{
+        history: Array<unknown>
+        resources: unknown
+        service: string
+      }>) {
+        expect(service.resources).not.toBeNull()
+        if (service.history.length > 0)
+          byService.set(service.service, service.history.length)
+      }
+    }
+    expect(Object.fromEntries(byService)).toEqual(
+      Object.fromEntries(
+        appServices.map((service) => [service, usageWindowSamples])
+      )
+    )
+    // Later samples come alone.
+    await expect(messages.next("resource.usage")).resolves.toMatchObject({
+      history: [],
+      services: appServices.map(() => ({ history: [] })),
+    })
+    // Every frame fits what a browser takes, and the socket stays open.
+    expect(Math.max(...frames)).toBeLessThanOrEqual(relayBrowserMaxFrameBytes)
+    const stillOpen = await Promise.race([
+      closed.then(() => false),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 50)),
+    ])
+    expect(stillOpen).toBe(true)
+  })
+
+  for (const kind of ["instance", "app", "database"] as const) {
+    it(`refuses a ${kind}'s usage to a capability that can't read it`, async () => {
+      const relay = await startRelay({
+        actions: [
+          "instance.read",
+          "app.read",
+          "database.read",
+          ...Object.values(relayConsoleReadActions),
+        ],
+      })
+      const readAction = {
+        app: "app.read",
+        database: "database.read",
+        instance: "instance.read",
+      }[kind]
+      const usage = {
+        actions: [readAction],
+        operation: "resources",
+        resourceKind: kind,
+      } satisfies Partial<RelayBrowserCapabilityV2>
+
+      // Another resource's usage, of the same kind.
+      const other = await authenticate(relay, {
+        ...usage,
+        instanceId: sharedId,
+        loginSessionId: `${kind}-other`,
+      })
+      const otherClosed = other.messages.closed()
+      other.socket.send(
+        JSON.stringify({
+          instanceId: "f".repeat(40),
+          type: "resource.subscribe",
+          v: 1,
+        })
+      )
+      await expect(otherClosed).resolves.toMatchObject({ code: 4403 })
+
+      // A console capability for the resource itself.
+      const console = await authenticate(relay, {
+        actions: [relayConsoleReadActions[kind]],
+        instanceId: sharedId,
+        loginSessionId: `${kind}-console`,
+        operation: "console",
+        resourceKind: kind,
+      })
+      const consoleClosed = console.messages.closed()
+      console.socket.send(
+        JSON.stringify({ instanceId: sharedId, type: "resource.subscribe", v: 1 })
+      )
+      await expect(consoleClosed).resolves.toMatchObject({ code: 4403 })
+
+      // Another kind's read action, which the capability can't carry.
+      const borrowed = await attemptAuthentication(relay, {
+        capability: {
+          ...usage,
+          actions: [kind === "app" ? "database.read" : "app.read"],
+          instanceId: sharedId,
+          loginSessionId: `${kind}-borrowed`,
+        },
+      })
+      expect(borrowed.ready).toBe(false)
+      expect(borrowed.closed.code).toBe(4401)
+    })
+  }
 
   it("streams the Relay's own container to a capability for its logs", async () => {
     const relay = await startRelay({ actions: ["relay.logs.read"] })
@@ -835,6 +961,23 @@ async function startRelay(
       snapshotListeners.add(listener)
       return () => snapshotListeners.delete(listener)
     },
+    // Each App runs `appServices`, and every history is a full window, as
+    // the Relay keeps; each read carries the history it asks for.
+    workloadUsage: (kind, id, history) => ({
+      history: history === "resource" ? usageWindow(`${kind}:${id}`) : [],
+      resources: usageSample(`${kind}:${id}`),
+      services:
+        kind === "app"
+          ? appServices.map((service) => ({
+              history:
+                typeof history === "object" && history.service === service
+                  ? usageWindow(`${id}/${service}`)
+                  : [],
+              resources: usageSample(`${id}/${service}`),
+              service,
+            }))
+          : [],
+    }),
   })
   const attached = browserServer
   await new Promise<void>((resolve, reject) => {
@@ -964,6 +1107,51 @@ function sendAuth(
       ...extra,
     })
   )
+}
+
+const appUsageCapability = {
+  actions: ["app.read"],
+  instanceId: sharedId,
+  operation: "resources",
+  resourceKind: "app",
+} satisfies Partial<RelayBrowserCapabilityV2>
+
+// Services the test App runs: enough that their histories together pass a
+// browser's frame limit, and the socket's outbox.
+const appServices = Array.from(
+  { length: 32 },
+  (_, index) => `service-${String(index).padStart(2, "0")}`
+)
+// Six minutes of samples at the Relay's cadence.
+const usageWindowSamples = 240
+
+function usageWindow(of: string): Array<RelayInstanceResources> {
+  return Array.from({ length: usageWindowSamples }, () => ({
+    ...usageSample(of),
+    network: {
+      receivedBytes: 1_234_567_890,
+      receivedBytesPerSecond: 12_345.678,
+      sentBytes: 987_654_321,
+      sentBytesPerSecond: 54_321.123,
+    },
+  }))
+}
+
+// A sample whose memory use tells which resource it's of.
+function usageSample(of: string): RelayInstanceResources {
+  return {
+    cpu: { capacityPercent: 100, percent: 1 },
+    memory: { percent: 1, totalBytes: 1_000, usedBytes: of.length },
+    sampledAt: new Date().toISOString(),
+    storage: {
+      nodePercent: 0,
+      nodeTotalBytes: 0,
+      nodeUsedBytes: 0,
+      percent: null,
+      totalBytes: 0,
+      usedBytes: null,
+    },
+  }
 }
 
 const databaseCapability = {

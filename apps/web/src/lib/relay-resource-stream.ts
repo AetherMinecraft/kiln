@@ -1,8 +1,16 @@
 import {
   relayBrowserProtocol,
   relayResourceStreamEventSchema,
+  relayWorkloadUsageEventSchema,
 } from "@workspace/contracts"
-import type { RelayResourceStreamEvent } from "@workspace/contracts"
+import type {
+  RelayBrowserResourceKind,
+  RelayResourceStreamEvent,
+  RelayWorkloadResourceKind,
+  RelayWorkloadUsage,
+  RelayWorkloadUsageEvent,
+  RelayWorkloadUsageHistory,
+} from "@workspace/contracts"
 import { Effect, Stream } from "effect"
 
 import { startBrowserSpan, traceBrowser } from "@/lib/browser-telemetry"
@@ -14,17 +22,53 @@ import {
 } from "@/lib/authenticated-relay-socket"
 import { acquireRelayBrowserCredentials } from "@/lib/relay-browser-credentials"
 import { getRelayInstanceResources } from "@/server/relay"
+import { getWorkloadUsage } from "@/server/workload-usage"
 
 export const RELAY_RESOURCE_POLL_INTERVAL_MS = 2_000
 
+/** A game server's usage, from its Relay or, failing that, through Hearth. */
 export function openRelayResourceStream(
   relayId: string,
   instanceId: string
 ): Stream.Stream<RelayResourceStreamEvent, Error> {
+  return openUsageStream({
+    decode: (message) => relayResourceStreamEventSchema.parse(message),
+    id: instanceId,
+    kind: "instance",
+    poll: openHearthResourceStream,
+    relayId,
+  })
+}
+
+/** An App's or database's usage, as a game server's arrives. */
+export function openRelayWorkloadUsageStream(
+  relayId: string,
+  kind: RelayWorkloadResourceKind,
+  id: string
+): Stream.Stream<RelayWorkloadUsageEvent, Error> {
+  return openUsageStream({
+    decode: (message) => relayWorkloadUsageEventSchema.parse(message),
+    id,
+    kind,
+    poll: (relayId, id) => openHearthWorkloadUsageStream(relayId, kind, id),
+    relayId,
+  })
+}
+
+function openUsageStream<Event>(options: {
+  readonly decode: (message: unknown) => Event
+  readonly id: string
+  readonly kind: RelayBrowserResourceKind
+  readonly poll: (relayId: string, id: string) => Stream.Stream<Event, Error>
+  readonly relayId: string
+}): Stream.Stream<Event, Error> {
+  const { decode, id: instanceId, kind, poll, relayId } = options
   return Stream.unwrap(
     Effect.gen(function* () {
       const credentials = yield* Effect.acquireRelease(
-        Effect.sync(() => acquireRelayBrowserCredentials(relayId, instanceId)),
+        Effect.sync(() =>
+          acquireRelayBrowserCredentials(relayId, instanceId, kind)
+        ),
         (lease) => Effect.sync(lease.release)
       )
       const observer = yield* Effect.acquireRelease(
@@ -50,7 +94,7 @@ export function openRelayResourceStream(
             catch: asError,
           })
           if (capability.proxyMode === "hearth") {
-            return openHearthResourceStream(relayId, instanceId).pipe(
+            return poll(relayId, instanceId).pipe(
               Stream.tap((event) =>
                 Effect.sync(() => observer.observe(event, "hearth"))
               )
@@ -117,7 +161,7 @@ export function openRelayResourceStream(
           return opened.inbox.stream.pipe(
             Stream.mapEffect((message) =>
               Effect.try({
-                try: () => relayResourceStreamEventSchema.parse(message),
+                try: () => decode(message),
                 catch: asError,
               })
             ),
@@ -134,7 +178,7 @@ export function openRelayResourceStream(
         Stream.catch((cause) =>
           isTerminalRelayBrowserFailure(cause)
             ? Stream.fail(cause)
-            : openHearthResourceStream(relayId, instanceId).pipe(
+            : poll(relayId, instanceId).pipe(
                 Stream.tap((event) =>
                   Effect.sync(() => observer.observe(event, "hearth"))
                 )
@@ -147,10 +191,7 @@ export function openRelayResourceStream(
 
 function resourceEventObserver(): {
   close: () => void
-  observe: (
-    event: RelayResourceStreamEvent,
-    transport: "direct" | "hearth"
-  ) => void
+  observe: (event: unknown, transport: "direct" | "hearth") => void
 } {
   const firstEventSpan = startBrowserSpan(
     "Receive first authoritative resource event",
@@ -206,6 +247,64 @@ function openHearthResourceStream(
               instance: snapshot.instance,
               sequence: sequence++,
               type: "resource",
+            }),
+          catch: asError,
+        })
+      })
+    )
+  })
+}
+
+// Polls Hearth for an App's or database's usage. Its history comes first,
+// one window to a request: the resource's, then each service's.
+function openHearthWorkloadUsageStream(
+  relayId: string,
+  kind: RelayWorkloadResourceKind,
+  id: string
+): Stream.Stream<RelayWorkloadUsageEvent, Error> {
+  return Stream.suspend(() => {
+    let sequence = Date.now()
+    let pending: Array<RelayWorkloadUsageHistory> | null = null
+    const read = (history: RelayWorkloadUsageHistory) =>
+      Effect.tryPromise({
+        try: (signal): Promise<RelayWorkloadUsage> =>
+          getWorkloadUsage({
+            data:
+              kind === "app"
+                ? { history, id, kind, relayId }
+                : {
+                    history: typeof history === "object" ? "none" : history,
+                    id,
+                    kind,
+                    relayId,
+                  },
+            signal,
+          }),
+        catch: asError,
+      })
+    return Stream.fromEffectRepeat(
+      Effect.gen(function* () {
+        let history: RelayWorkloadUsageHistory
+        if (pending === null) {
+          history = "resource"
+        } else if (pending.length > 0) {
+          history = pending.shift()!
+        } else {
+          yield* Effect.sleep(RELAY_RESOURCE_POLL_INTERVAL_MS)
+          history = "none"
+        }
+        const usage = yield* read(history)
+        if (pending === null) {
+          pending = usage.services.map(({ service }) => ({ service }))
+        }
+        return yield* Effect.try({
+          try: () =>
+            relayWorkloadUsageEventSchema.parse({
+              ...usage,
+              id,
+              kind,
+              sequence: sequence++,
+              type: "resource.usage",
             }),
           catch: asError,
         })

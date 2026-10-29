@@ -230,6 +230,8 @@ export const relayManagedDatabaseSchema = z
     /** Where its provisioning is, until the database exists. */
     provisioning: provisioningStateSchema.optional(),
     shortId: z.string().regex(/^[a-f0-9]{8}$/u),
+    /** When its container last started; null while it isn't running. */
+    startedAt: z.string().datetime().nullable().default(null),
     status: z.string().min(1).max(280),
     supportsImportExport: z.boolean(),
   })
@@ -2942,6 +2944,56 @@ export const relayResourceStreamEventSchema = z.object({
   sequence: z.number().int().nonnegative(),
 })
 
+// A resource's usage now, null while nothing of it runs, and over the last
+// minutes.
+export const relayResourceUsageSchema = z.object({
+  history: z
+    .array(relayInstanceResourcesSchema)
+    .max(relayResourceHistoryMaxSamples)
+    .default([]),
+  resources: relayInstanceResourcesSchema.nullable(),
+})
+
+export const relayWorkloadResourceKindSchema = z.enum(["app", "database"])
+
+// An App's or database's usage; an App's by service too.
+export const relayWorkloadUsageSchema = relayResourceUsageSchema.extend({
+  services: z
+    .array(relayResourceUsageSchema.extend({ service: appServiceNameSchema }))
+    .max(64)
+    .default([]),
+})
+
+// Which history a read of an App's or database's usage carries: the
+// resource's, one service's, or none, so no answer holds more than one
+// window of it.
+export const relayWorkloadUsageHistorySchema = z
+  .union([
+    z.enum(["none", "resource"]),
+    z.object({ service: appServiceNameSchema }).strict(),
+  ])
+  .default("resource")
+
+export const relayWorkloadUsageReadSchema = z
+  .object({ appId: appIdSchema, history: relayWorkloadUsageHistorySchema })
+  .strict()
+
+export const relayDatabaseUsageReadSchema = z
+  .object({
+    databaseId: databaseIdSchema,
+    history: z.enum(["none", "resource"]).default("resource"),
+  })
+  .strict()
+
+// What a browser following an App's or database's usage receives: history
+// with the first event, the latest sample with each.
+export const relayWorkloadUsageEventSchema = relayWorkloadUsageSchema.extend({
+  id: z.string().min(1).max(64),
+  kind: relayWorkloadResourceKindSchema,
+  sequence: z.number().int().nonnegative(),
+  type: z.literal("resource.usage"),
+})
+
 export const relayInstanceResourceSnapshotSchema = z.object({
   instance: relayInstanceSchema,
   history: z
@@ -3447,6 +3499,17 @@ export type RelayConsoleStreamEvent = z.infer<
 >
 export type RelayResourceStreamEvent = z.infer<
   typeof relayResourceStreamEventSchema
+>
+export type RelayResourceUsage = z.infer<typeof relayResourceUsageSchema>
+export type RelayWorkloadResourceKind = z.infer<
+  typeof relayWorkloadResourceKindSchema
+>
+export type RelayWorkloadUsage = z.infer<typeof relayWorkloadUsageSchema>
+export type RelayWorkloadUsageHistory = z.infer<
+  typeof relayWorkloadUsageHistorySchema
+>
+export type RelayWorkloadUsageEvent = z.infer<
+  typeof relayWorkloadUsageEventSchema
 >
 export type RelayConsoleCommand = z.infer<typeof relayConsoleCommandSchema>
 export type RelayConsoleCommandResult = z.infer<
