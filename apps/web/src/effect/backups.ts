@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto"
 import type { RowDataPacket } from "mysql2/promise"
-import { Clock, Effect, Predicate, Result } from "effect"
+import { Clock, Effect, Result } from "effect"
 
 import type {
   BackupConsistency,
@@ -25,6 +25,7 @@ import {
 
 import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
 import { Database } from "@/effect/database"
+import { isDeadlock } from "@/effect/database-deadlocks"
 import type { DatabaseTransaction } from "@/effect/database"
 import { invalidateScheduleDeploymentsEffect } from "@/effect/schedule-invalidation"
 import { kilnInstallationId } from "@/effect/installation"
@@ -490,28 +491,6 @@ export const reserveBackupBatchEffect = Effect.fn("backups.reserveBatch")(
 
 function policyOrder(input: BackupCreateReservation): string {
   return [input.relayId, input.targetKind, input.targetId].join("\u0000")
-}
-
-// MySQL's answer to a transaction it ended to break a deadlock (1213), in
-// the error or anything it wraps.
-function isDeadlock(error: unknown): boolean {
-  for (
-    let current: unknown = error, depth = 0;
-    current != null && depth < 6;
-    depth += 1
-  ) {
-    if (Predicate.hasProperty(current, "errno") && current.errno === 1213) {
-      return true
-    }
-    if (
-      Predicate.hasProperty(current, "code") &&
-      current.code === "ER_LOCK_DEADLOCK"
-    ) {
-      return true
-    }
-    current = Predicate.hasProperty(current, "cause") ? current.cause : null
-  }
-  return false
 }
 
 // A target's backup policy, made if it's missing, locked for the rest of
@@ -1060,12 +1039,14 @@ const adoptScheduledBackupTask = Effect.fnUntraced(function* (
   const objectKey =
     input.destination.kind === "s3" ? input.destination.objectKey : null
 
+  // An App's scheduled backups are cataloged as one batch, live or stopped,
+  // as its manual ones are.
   yield* transaction.execute(
     `INSERT IGNORE INTO ${databaseTable("backup")}
       (id, relay_id, target_kind, target_id, storage_id, artifact_kind,
        backup_mode, reason, status, name, object_key, repository_id,
-       warnings, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?,
+       consistency, batch_id, warnings, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?,
              JSON_ARRAY(), NULL, ?, ?)`,
     [
       input.backupId,
@@ -1079,6 +1060,10 @@ const adoptScheduledBackupTask = Effect.fnUntraced(function* (
       catalog.name,
       objectKey,
       repositoryId,
+      input.target.kind === "app" || input.target.kind === "volume"
+        ? (input.consistency ?? "live")
+        : null,
+      catalog.batchId ?? input.batch?.id ?? null,
       task.createdAt,
       now,
     ]

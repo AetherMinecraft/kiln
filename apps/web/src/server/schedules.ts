@@ -22,6 +22,8 @@ import {
 } from "@workspace/contracts/schedules"
 
 import { Database } from "@/effect/database"
+import { isDeadlock } from "@/effect/database-deadlocks"
+import { refuseResourcesBeingDeleted } from "@/effect/resource-deletions"
 import { forkAppEffect, runAppEffect } from "@/effect/runtime"
 import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
@@ -39,6 +41,8 @@ import {
 import { relayRpc } from "@/lib/relay-connection"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import { requireScheduleBackupDestinations } from "@/lib/schedule-backup-destinations.server"
+import { requireScheduleAppBackups } from "@/lib/schedule-app-backups.server"
+import { requireScheduleAppServices } from "@/lib/schedule-app-services.server"
 import { scheduleTargetsWithAvailability } from "@/lib/schedule-target-options"
 import { promiseEffect, recoverPromise } from "@/effect/promise"
 import { requireEligibleResourceUser } from "@/server/auth"
@@ -216,6 +220,8 @@ export const createSchedule = createServerFn({ method: "POST" })
       user,
     })
     await requireContinueOnFailureSupport(definition)
+    await requireScheduleAppServices(definition)
+    await requireScheduleAppBackups({ ...definition, user })
     await saveNewSchedule(definition, user.id)
     await deploySchedule(definition, user.id)
     const created = (await loadSchedules()).find(
@@ -281,6 +287,8 @@ export const updateSchedule = createServerFn({ method: "POST" })
       user,
     })
     await requireContinueOnFailureSupport(definition, existing)
+    await requireScheduleAppServices({ ...definition, existing })
+    await requireScheduleAppBackups({ ...definition, existing, user })
     const previousRelayIds = new Set(
       existing.targets.map((target) => target.relayId)
     )
@@ -436,20 +444,29 @@ export const removeDeletedResourceFromSchedules = createServerOnlyFn(async (
               }
               const schedule = scheduleDefinitionSchema.parse({
                 // An action that named it names the rest; one that named
-                // only it keeps an empty list rather than running on all.
+                // only it keeps an empty list rather than running on all. A
+                // command forgets the service it ran in on a deleted App.
                 actions: actions.map((action) => {
                   const parsed = scheduleActionSchema.parse(
                     jsonValue(action.action_config)
                   )
-                  return parsed.type === "wait" ||
-                    parsed.targetKeys === undefined
-                    ? parsed
-                    : {
-                        ...parsed,
-                        targetKeys: parsed.targetKeys.filter(
-                          (key) => key !== deletedKey
-                        ),
-                      }
+                  const scoped =
+                    parsed.type === "wait" || parsed.targetKeys === undefined
+                      ? parsed
+                      : {
+                          ...parsed,
+                          targetKeys: parsed.targetKeys.filter(
+                            (key) => key !== deletedKey
+                          ),
+                        }
+                  if (scoped.type !== "console_command" || !scoped.services)
+                    return scoped
+                  const { [deletedKey]: _deleted, ...services } =
+                    scoped.services
+                  const { services: _all, ...rest } = scoped
+                  return Object.keys(services).length > 0
+                    ? { ...rest, services }
+                    : rest
                 }),
                 continueOnFailure: Boolean(row.continue_on_failure),
                 cron: row.cron_expression,
@@ -650,6 +667,11 @@ async function loadTargetDirectory(): Promise<Array<ScheduleTarget>> {
        FROM ${databaseTable("database")} managed
        JOIN ${databaseTable("relay")} relay ON relay.id = managed.relay_id
       WHERE relay.enabled = TRUE
+      UNION ALL
+     SELECT app.app_id AS id, 'app' AS kind, app.name, app.relay_id
+       FROM ${databaseTable("app")} app
+       JOIN ${databaseTable("relay")} relay ON relay.id = app.relay_id
+      WHERE relay.enabled = TRUE
       ORDER BY relay_id, kind, name`
   )
   return rows.map((row) =>
@@ -757,9 +779,10 @@ async function saveNewSchedule(
     Effect.gen(function* () {
       const database = yield* Database
       const now = yield* Clock.currentTimeMillis
-      yield* database.transaction("schedules.create", (transaction) =>
+      const create = database.transaction("schedules.create", (transaction) =>
         insertSchedule(transaction, schedule, createdBy, now)
       )
+      yield* create.pipe(Effect.catchIf(isDeadlock, () => create))
     })
   )
 }
@@ -773,8 +796,11 @@ async function replaceSchedule(
     Effect.gen(function* () {
       const database = yield* Database
       const now = yield* Clock.currentTimeMillis
-      yield* database.transaction("schedules.update", (transaction) =>
+      const replace = database.transaction("schedules.update", (transaction) =>
         Effect.gen(function* () {
+          // Deletion locks its fence before invalidating schedule targets.
+          // Take that same order before replacing any rows of the schedule.
+          yield* refuseResourcesBeingDeleted(transaction, schedule.targets)
           const result = yield* transaction.execute(
             `UPDATE ${databaseTable("schedule")}
                 SET name = ?, cron_expression = ?, timezone = ?, enabled = ?,
@@ -809,10 +835,10 @@ async function replaceSchedule(
           yield* insertScheduleParts(transaction, schedule, now)
         })
       )
+      yield* replace.pipe(Effect.catchIf(isDeadlock, () => replace))
     })
   )
 }
-
 
 function requestScheduleReconciliation(
   schedules: ReadonlyArray<ScheduleDefinition>

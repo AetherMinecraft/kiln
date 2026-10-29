@@ -7,6 +7,7 @@ import { z } from "zod"
 import {
   relayScheduleDeploymentSchema,
   scheduleActionAppliesToTarget,
+  scheduleTargetKey,
   scheduleActionSchema,
   scheduleDefinitionSchema,
   scheduleRunSchema,
@@ -35,7 +36,9 @@ import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { relayRpc } from "@/lib/relay-connection"
-import { listPersistedRelays } from "@/lib/relay-registry"
+import { listPersistedRelays, type PersistedRelay } from "@/lib/relay-registry"
+import { appTargets, readRelayVolumes } from "@/server/app-backups.server"
+import type { RelayVolumes } from "@workspace/contracts"
 import { defaultKilnBackupsSettingId } from "@/migrations/0024_default_kiln_backups"
 
 // Saving schedules and handing them to their Relays, shared by the schedule
@@ -51,6 +54,7 @@ export function insertSchedule(
   now: number
 ) {
   return Effect.gen(function* () {
+    yield* refuseResourcesBeingDeleted(transaction, schedule.targets)
     yield* transaction.execute(
       `INSERT INTO ${databaseTable("schedule")}
          (id, name, cron_expression, timezone, enabled,
@@ -315,7 +319,8 @@ export async function deployScheduleToRelay(
           actions: await prepareRelayScheduleActions(
             schedule.actions,
             targets,
-            await scheduleOwner(schedule.id)
+            await scheduleOwner(schedule.id),
+            relay
           ),
           // Older Relays reject unknown keys, so only send the option when on.
           ...(schedule.continueOnFailure ? { continueOnFailure: true } : {}),
@@ -397,29 +402,44 @@ async function claimProjectionGeneration(
 async function prepareRelayScheduleActions(
   actions: ReadonlyArray<ScheduleAction>,
   targets: ReadonlyArray<ScheduleTarget>,
-  owner: string | null
+  owner: string | null,
+  relay: PersistedRelay
 ): Promise<Array<RelayScheduleAction>> {
+  // An App's backup is of its folder and the volumes it owns, as the Relay
+  // lists them now; asked once for every App the schedule backs up.
+  let listing: Promise<RelayVolumes> | null = null
+  const members = async (target: ScheduleTarget) => {
+    if (target.kind !== "app") return [target]
+    listing ??= readRelayVolumes(relay, owner ?? undefined)
+    return appTargets(target.id, await listing).map(
+      ({ id, kind }): BackupMember => ({
+        id,
+        kind,
+        relayId: target.relayId,
+        ...(kind === "volume" ? { appId: target.id } : {}),
+      })
+    )
+  }
   return Effect.runPromise(
     Effect.forEach(
-      actions,
+      actions.map((action) => forRelayTargets(action, targets)),
       (action): Effect.Effect<RelayScheduleAction, unknown> => {
         if (action.type !== "backup") return Effect.succeed(action)
         return Effect.forEach(
           targets,
           (target) =>
             !scheduleActionAppliesToTarget(action, target)
-              ? Effect.succeed(null)
-              : promiseEffect(() =>
-                  scheduledBackupExecution(action, target, owner)
+              ? Effect.succeed([])
+              : promiseEffect(async () =>
+                  Promise.all(
+                    (await members(target)).map((member) =>
+                      scheduledBackupExecution(action, member, owner)
+                    )
+                  )
                 ),
           { concurrency: scheduleReconciliationConcurrency }
         ).pipe(
-          Effect.map((executions) => ({
-            ...action,
-            executions: executions.flatMap((execution) =>
-              execution ? [execution] : []
-            ),
-          }))
+          Effect.map((executions) => ({ ...action, executions: executions.flat() }))
         )
       },
       { concurrency: 1 }
@@ -429,11 +449,12 @@ async function prepareRelayScheduleActions(
 
 async function scheduledBackupExecution(
   action: Extract<ScheduleAction, { type: "backup" }>,
-  target: ScheduleTarget,
+  target: BackupMember,
   owner: string | null
 ) {
   const targetKind = target.kind === "relay" ? "platform" : target.kind
   const execution = {
+    ...(target.appId ? { appId: target.appId } : {}),
     mode: action.mode,
     targetId: target.id,
     targetKind: target.kind,
@@ -493,9 +514,48 @@ async function scheduleOwner(scheduleId: string): Promise<string | null> {
   return rows[0]?.created_by ?? null
 }
 
+/**
+ * A step as one Relay runs it: the targets it names and the App services it
+ * runs in, of that Relay's targets only. A Relay refuses a step naming
+ * targets it doesn't have. A list emptied here stays empty, since no list
+ * would mean every target.
+ */
+function forRelayTargets(
+  action: ScheduleAction,
+  targets: ReadonlyArray<ScheduleTarget>
+): ScheduleAction {
+  if (action.type === "wait") return action
+  const keys = new Set(targets.map(scheduleTargetKey))
+  const scoped =
+    action.targetKeys === undefined
+      ? action
+      : {
+          ...action,
+          targetKeys: action.targetKeys.filter((key) => keys.has(key)),
+        }
+  if (scoped.type !== "console_command" || !scoped.services) return scoped
+  const services = Object.fromEntries(
+    Object.entries(scoped.services).filter(([key]) => keys.has(key))
+  )
+  const { services: _all, ...rest } = scoped
+  return Object.keys(services).length > 0 ? { ...rest, services } : rest
+}
+
+/**
+ * What one of a backup step's executions backs up: a schedule's target, or
+ * an App's folder or a volume it owns, admitted each as a manual backup of
+ * it would be.
+ */
+interface BackupMember {
+  readonly appId?: string
+  readonly id: string
+  readonly kind: Exclude<ScheduleTarget["kind"], "app"> | "app" | "volume"
+  readonly relayId: string
+}
+
 async function scheduledFullBackupDestination(
   action: Extract<ScheduleAction, { type: "backup" }>,
-  target: ScheduleTarget
+  target: BackupMember
 ) {
   if (action.destination.kind === "local") {
     return { kind: "local" as const }
@@ -530,7 +590,7 @@ async function scheduledFullBackupDestination(
 
 async function scheduledResticDestination(
   action: Extract<ScheduleAction, { type: "backup" }>,
-  target: ScheduleTarget
+  target: BackupMember
 ) {
   const storageId =
     action.destination.kind === "storage" ? action.destination.storageId : null

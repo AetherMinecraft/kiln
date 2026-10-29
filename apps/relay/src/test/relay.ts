@@ -50,6 +50,7 @@ import {
 import { appRouteOwner, relayResourceNames } from "../relay-resources.js"
 import { ResourcePower } from "../resource-power.js"
 import { RuntimeRecoveryManager } from "../runtime-recovery.js"
+import { ScheduleManager } from "../schedules.js"
 import { serverProvisioning } from "../server-provisioning.js"
 import { type ContainerSeed, type FakeContainer, fakeDocker } from "./docker.js"
 
@@ -61,6 +62,7 @@ export interface RelayDrivers {
   readonly commands: ContainerCommands
   readonly databaseConnections: DatabaseConnections
   readonly databases: DatabaseDriver
+  readonly volumes: RelayVolumes
   readonly docker: DockerDriver
   readonly freezes: ResourceFreezes
   readonly lanes: OperationLanes
@@ -200,6 +202,7 @@ export async function relayHarness(
       lifecycle.reattachTailscaleMember(databaseTailscaleMemberId(databaseId))
     )
     return {
+      volumes,
       apps,
       bricks,
       commands: new ContainerCommands({
@@ -379,5 +382,44 @@ export async function provisioningWorker(
   )
   const worker = Effect.runFork(manager.run())
   onTestFinished(() => Effect.runPromise(Fiber.interrupt(worker)))
+  return manager
+}
+
+/**
+ * The Relay's schedule worker over a harness's drivers, wired as index.ts
+ * wires it. It stops when the test finishes.
+ */
+export async function scheduleWorker(harness: RelayHarness) {
+  const directory = await mkdtemp(join(tmpdir(), "kiln-relay-schedules-"))
+  const manager = await ScheduleManager.make({
+    enqueueBackup: async () => {
+      throw new Error("not used")
+    },
+    findInstance: (instanceId) => harness.docker.findInstance(instanceId),
+    getBackup: async () => null,
+    isPaused: () => harness.lanes.paused,
+    listAppOwnedVolumeIds: (appId) =>
+      Effect.runPromise(harness.volumes.ownedAppVolumeIds(appId)),
+    listAppIds: async () =>
+      new Set((await harness.apps.list()).map(({ id }) => id)),
+    listDatabaseIds: async () =>
+      new Set((await harness.databases.list()).map(({ id }) => id)),
+    platformTargetId: () => "platform",
+    powerIntent: (kind, id) => harness.power.intent(kind, id),
+    relayId: "relay-a",
+    runContainerCommand: (target, command) =>
+      harness.commands.run(target, command),
+    runPower: (kind, id, action, powerIntent) =>
+      harness.power.scheduled(kind, id, action, powerIntent),
+    sendConsoleCommand: async () => {
+      throw new Error("not used")
+    },
+    state: harness.state.schedules,
+    stateDirectory: directory,
+  })
+  onTestFinished(async () => {
+    manager.close()
+    await rm(directory, { force: true, recursive: true })
+  })
   return manager
 }

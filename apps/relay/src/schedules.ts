@@ -19,6 +19,7 @@ import {
   scheduleDeterministicUuid,
   scheduleRunSchema,
   scheduleStableId,
+  scheduleTargetKey,
   type RelayScheduleAction,
   type RelayScheduleProjection,
   type ScheduleActionAttempt,
@@ -85,14 +86,19 @@ export interface ScheduleManagerOptions {
     effect: Effect.Effect<void, never>
   ) => Fiber.Fiber<void, unknown>
   readonly getBackup: (taskId: string) => Promise<RelayBackupTask | null>
+  readonly listAppOwnedVolumeIds: (
+    appId: string
+  ) => Promise<ReadonlyArray<string>>
+  readonly listAppIds: () => Promise<ReadonlySet<string>>
   readonly listDatabaseIds: () => Promise<ReadonlySet<string>>
   // Read per run: Hearth can give the Relay its installation ID at any time.
   readonly platformTargetId: () => string
   readonly reportError?: (message: string, cause: unknown) => void
   readonly relayId: string
   /**
-   * Runs a command in a database's container. It rejects when the command
-   * didn't run, and otherwise answers with how it went, which may be unknown.
+   * Runs a command in a database's container or an App's service. It
+   * rejects when the command didn't run, and otherwise answers with how it
+   * went, which may be unknown.
    */
   readonly runContainerCommand: (
     target: ContainerCommandTarget,
@@ -351,40 +357,42 @@ export class ScheduleManager {
     const progressPermit = Semaphore.makeUnsafe(1)
     const recordProgress = (required: boolean) =>
       Effect.runPromise(
-        progressPermit.withPermit(
-          Effect.suspend(() =>
-            this.#options.state.recordProgress(
-              scheduleRunSchema.parse({
-                finishedAt: Date.now(),
-                id: runId,
-                revision: schedule.revision,
-                scheduleId: schedule.id,
-                scheduledAt,
-                sequenceAttempts,
-                startedAt,
-                status: "running",
-                targetRuns: targetStates.map((state) =>
-                  targetRun(schedule.id, scheduledAt, state)
-                ),
+        progressPermit
+          .withPermit(
+            Effect.suspend(() =>
+              this.#options.state.recordProgress(
+                scheduleRunSchema.parse({
+                  finishedAt: Date.now(),
+                  id: runId,
+                  revision: schedule.revision,
+                  scheduleId: schedule.id,
+                  scheduledAt,
+                  sequenceAttempts,
+                  startedAt,
+                  status: "running",
+                  targetRuns: targetStates.map((state) =>
+                    targetRun(schedule.id, scheduledAt, state)
+                  ),
+                })
+              )
+            )
+          )
+          .pipe(
+            Effect.retry({
+              schedule: Schedule.exponential("200 millis"),
+              times: required ? progressWriteRetries : 0,
+            }),
+            Effect.as(true),
+            Effect.catch((cause) =>
+              Effect.sync(() => {
+                this.#options.reportError?.(
+                  "Relay schedule progress write failed",
+                  cause
+                )
+                return false
               })
             )
           )
-        ).pipe(
-          Effect.retry({
-            schedule: Schedule.exponential("200 millis"),
-            times: required ? progressWriteRetries : 0,
-          }),
-          Effect.as(true),
-          Effect.catch((cause) =>
-            Effect.sync(() => {
-              this.#options.reportError?.(
-                "Relay schedule progress write failed",
-                cause
-              )
-              return false
-            })
-          )
-        )
       )
     const targetRuns = await ensuringPromise(
       async () => {
@@ -656,9 +664,7 @@ export class ScheduleManager {
     // one, as when backups are off for the target, its destination is
     // disabled, or it's being deleted, and says so in the schedule it sends.
     const refusal =
-      action.type === "backup"
-        ? (backupExecution(action, state.target)?.refusal ?? null)
-        : null
+      action.type === "backup" ? backupRefusal(action, state.target) : null
     if (refusal) {
       state.attempts.push(
         attempt({
@@ -802,6 +808,9 @@ export class ScheduleManager {
     if (target.kind === "instance") {
       return (await this.#options.findInstance(target.id)) !== null
     }
+    if (target.kind === "app") {
+      return (await this.#options.listAppIds()).has(target.id)
+    }
     return (await this.#options.listDatabaseIds()).has(target.id)
   }
 
@@ -824,6 +833,16 @@ export class ScheduleManager {
           action.command
         )
       }
+      if (target.kind === "app") {
+        const service = action.services?.[scheduleTargetKey(target)]
+        if (!service) {
+          throw new Error("No service was chosen to run the command")
+        }
+        return this.#options.runContainerCommand(
+          { id: target.id, kind: "app", service },
+          action.command
+        )
+      }
     }
     if (action.type === "power" && target.kind !== "relay") {
       await this.#options.runPower(
@@ -835,6 +854,10 @@ export class ScheduleManager {
       return
     }
     if (action.type === "backup") {
+      if (target.kind === "app") {
+        await this.#backUpApp(schedule, action, target, scheduledAt, signal)
+        return
+      }
       const execution = backupExecution(action, target)
       const deployedDestination =
         execution?.destination ??
@@ -868,21 +891,12 @@ export class ScheduleManager {
             : targetKind === "database"
               ? ("database_dump" as const)
               : ("platform_bundle" as const)
-      const destination =
-        deployedDestination.kind === "s3"
-          ? {
-              accessKeyId: deployedDestination.accessKeyId,
-              allowPrivateNetwork: deployedDestination.allowPrivateNetwork,
-              artifactId,
-              bucket: deployedDestination.bucket,
-              endpoint: deployedDestination.endpoint,
-              forcePathStyle: deployedDestination.forcePathStyle,
-              kind: "s3" as const,
-              objectKey: `${deployedDestination.objectKeyPrefix}/${backupId}/${backupArtifactFilename(backupId, artifactKind)}`,
-              region: deployedDestination.region,
-              secretAccessKey: deployedDestination.secretAccessKey,
-            }
-          : { ...deployedDestination, artifactId }
+      const destination = scheduledBackupDestination(
+        deployedDestination,
+        backupId,
+        artifactId,
+        artifactKind
+      )
       const input: BackupTaskInput = {
         artifactKind,
         backupId,
@@ -924,6 +938,122 @@ export class ScheduleManager {
         signal ? { signal } : undefined
       )
     }
+  }
+
+  /**
+   * Backs up an App as Hearth projected it: its folder and each volume its
+   * Compose project owns, each a backup of its own, started together.
+   * Stopped, they share one stopped window, so the App stops once and its
+   * folder and volumes agree.
+   */
+  async #backUpApp(
+    schedule: RelayScheduleProjection,
+    action: Extract<TargetScheduleAction, { type: "backup" }>,
+    target: ScheduleTarget,
+    scheduledAt: number,
+    signal?: AbortSignal
+  ) {
+    const executions = appBackupExecutions(action, target)
+    if (
+      executions.length === 0 ||
+      executions.some((execution) => !execution.destination)
+    ) {
+      throw new Error("Scheduled backup destination is not deployed")
+    }
+    const owned = await this.#options.listAppOwnedVolumeIds(target.id)
+    const projected = new Set(
+      executions
+        .filter((execution) => execution.targetKind === "volume")
+        .map((execution) => execution.targetId)
+    )
+    if (
+      owned.length !== projected.size ||
+      owned.some((id) => !projected.has(id))
+    ) {
+      throw new Error(
+        "App backup coverage changed; waiting for Hearth to refresh the schedule"
+      )
+    }
+    const runId = scheduleStableId(
+      schedule.id,
+      scheduledAt,
+      this.#options.relayId
+    )
+    const batchId = scheduleDeterministicUuid(
+      "schedule-backup-batch",
+      schedule.id,
+      scheduledAt,
+      target.id,
+      action.id
+    )
+    const stopped = action.consistency === "stopped"
+    const inputs = executions.map((execution): BackupTaskInput => {
+      const backupId = scheduleDeterministicUuid(
+        "schedule-backup",
+        schedule.id,
+        scheduledAt,
+        execution.targetKind,
+        execution.targetId,
+        action.id
+      )
+      return {
+        artifactKind: "tar_archive",
+        backupId,
+        catalog: {
+          batchId,
+          name: resolveScheduleBackupName(action.name, {
+            backupId,
+            instanceId: target.id,
+            runId,
+            scheduleId: schedule.id,
+            scheduleName: schedule.name,
+            timestamp: scheduledAt,
+          }),
+          storageId:
+            action.destination.kind === "storage"
+              ? action.destination.storageId
+              : null,
+        },
+        appCoverage: {
+          appId: target.id,
+          volumeIds: executions
+            .filter((entry) => entry.targetKind === "volume")
+            .map((entry) => entry.targetId),
+        },
+        ...(stopped ? { consistency: "stopped" as const } : {}),
+        ...(executions.length >= 2
+          ? { batch: { id: batchId, size: executions.length } }
+          : {}),
+        destination: scheduledBackupDestination(
+          execution.destination!,
+          backupId,
+          scheduleDeterministicUuid("artifact", backupId),
+          "tar_archive"
+        ),
+        exclude: [],
+        kind: "create",
+        maxBytes: execution.maxBytes ?? null,
+        mode: "full",
+        reason: "scheduled",
+        target: {
+          id: execution.targetId,
+          kind: execution.targetKind === "volume" ? "volume" : "app",
+        },
+        taskId: scheduleDeterministicUuid("task", backupId),
+      }
+    })
+    // Every member is queued before any is waited for, as a stopped
+    // window starts only once its whole batch has arrived.
+    const queued = await Promise.all(
+      inputs.map((input) => this.#options.enqueueBackup(input))
+    )
+    await Effect.runPromise(
+      Effect.all(
+        queued.map((task) => this.#waitForBackup(task)),
+        { concurrency: "unbounded", discard: true }
+      ),
+      signal ? { signal } : undefined
+    )
   }
 
   #waitForBackup(initial: RelayBackupTask) {
@@ -1093,10 +1223,10 @@ function targetRun(
         : state.inFlight
           ? "interrupted"
           : state.failure || state.missing
-          ? "failed"
-          : succeeded
-            ? "succeeded"
-            : "noop",
+            ? "failed"
+            : succeeded
+              ? "succeeded"
+              : "noop",
     target: state.target,
   }
 }
@@ -1141,7 +1271,11 @@ function hasErrorCode(cause: unknown, code: string) {
 }
 
 function powerOwner(target: ScheduleTarget) {
-  return target.kind === "database" ? "the database's" : "the server's"
+  return target.kind === "database"
+    ? "the database's"
+    : target.kind === "app"
+      ? "the App's"
+      : "the server's"
 }
 
 function errorMessage(cause: unknown) {
@@ -1157,4 +1291,59 @@ function backupExecution(
     (candidate) =>
       candidate.targetId === target.id && candidate.targetKind === target.kind
   )
+}
+
+// What Hearth admitted of an App's backup: its folder's and each owned
+// volume's.
+function appBackupExecutions(
+  action: Extract<TargetScheduleAction, { type: "backup" }>,
+  target: ScheduleTarget
+) {
+  return action.executions.filter(
+    (candidate) =>
+      (candidate.targetKind === "app" && candidate.targetId === target.id) ||
+      (candidate.targetKind === "volume" && candidate.appId === target.id)
+  )
+}
+
+// Why Hearth refused a backup step for a target, as it would a manual one.
+// An App's is refused whole when any of its backups is.
+function backupRefusal(
+  action: Extract<TargetScheduleAction, { type: "backup" }>,
+  target: ScheduleTarget
+): string | null {
+  const executions =
+    target.kind === "app"
+      ? appBackupExecutions(action, target)
+      : [backupExecution(action, target)]
+  return executions.find((execution) => execution?.refusal)?.refusal ?? null
+}
+
+// Where a scheduled backup goes: its local or S3 destination, with the
+// artifact's identity and, on S3, its object key.
+function scheduledBackupDestination(
+  deployed: NonNullable<
+    Extract<
+      TargetScheduleAction,
+      { type: "backup" }
+    >["executions"][number]["destination"]
+  >,
+  backupId: string,
+  artifactId: string,
+  artifactKind: Extract<BackupTaskInput, { kind: "create" }>["artifactKind"]
+) {
+  return deployed.kind === "s3"
+    ? {
+        accessKeyId: deployed.accessKeyId,
+        allowPrivateNetwork: deployed.allowPrivateNetwork,
+        artifactId,
+        bucket: deployed.bucket,
+        endpoint: deployed.endpoint,
+        forcePathStyle: deployed.forcePathStyle,
+        kind: "s3" as const,
+        objectKey: `${deployed.objectKeyPrefix}/${backupId}/${backupArtifactFilename(backupId, artifactKind)}`,
+        region: deployed.region,
+        secretAccessKey: deployed.secretAccessKey,
+      }
+    : { ...deployed, artifactId }
 }
