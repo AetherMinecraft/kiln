@@ -76,6 +76,8 @@ import {
   relayDatabaseNetworkImportSchema,
   relayDatabaseNetworkSchema,
   relayDeleteDatabaseSchema,
+  relayResourceFreezeSchema,
+  type RelayResourceFreeze,
   relayAuditQuerySchema,
   relayCreateInstanceSchema,
   relayPrepareInstanceSchema,
@@ -246,6 +248,7 @@ import { RelayStateStore } from "./effect/state.js"
 import type {
   RelayClientGrant,
   RelayClientRole,
+  RelayResourceFreezeUndo,
   RelayStoredPendingPrimaryPort,
 } from "./effect/state.js"
 import { loadRelayTls } from "./effect/tls.js"
@@ -256,6 +259,7 @@ import { closeRelayServer } from "./shutdown.js"
 import { handleHealthRequest, listenRelayHealthServerEffect } from "./health.js"
 import { rejectMalformedUpgrades, requestUrl } from "./request-url.js"
 import { attachSftpServer } from "./sftp-server.js"
+import { ResourceFreezes } from "./resource-freezes.js"
 import {
   exclusive,
   laneKeys,
@@ -267,6 +271,7 @@ import {
   controlRequestContinues,
   controlRequestLocks,
   databaseLocks,
+  databaseReadLocks,
   instanceLifecycleLocks,
   instancePowerLocks,
   transferInstallLocks,
@@ -378,9 +383,15 @@ let relayIdentity = startupCore.identity
 config.nodeId = relayIdentity.fingerprint
 config.nodeName = relayIdentity.name
 const bricks = new BrickCatalog(config.brickCatalogUrl, config.dataDirectory)
+// Resources being deleted refuse every change but their final backup and
+// their deletion, from the first operation admitted.
+const resourceFreezes = await runRelayEffect(
+  "relay.startup.resourceFreezes",
+  ResourceFreezes.load(startupCore.state)
+)
 // Every change to a game server, App, or database waits its turn here,
 // whichever actor asks for it. See operation-plans.ts.
-const lanes = new OperationLanes()
+const lanes = new OperationLanes({ frozen: resourceFreezes })
 // Restores of Apps' folders and volumes that began swapping and didn't
 // finish fence their targets: read before any work is admitted.
 const restoreFences = await TarRestoreFences.load(config)
@@ -636,6 +647,18 @@ if (cliArguments.length === 0)
       ),
     ])
   })
+// Resources frozen for their deletion are quieted again before anything
+// else starts: Docker may have started one, or the Relay may have stopped
+// between freezing one and quieting it. One that can't be quieted now stays
+// frozen, and its deletion freezing it again tries once more.
+await resourceFreezes.reapply((freeze, record) =>
+  recoverPromise(
+    () => quietFrozenResource(freeze, record),
+    (error) => {
+      console.warn(`Could not quiet ${freeze.kind} ${freeze.id}:`, error)
+    }
+  )
+)
 const databaseConnectionSnapshots = await docker.databaseConnectionSnapshots()
 await databaseConnections.initialize(databaseConnectionSnapshots)
 for (const snapshot of databaseConnectionSnapshots) {
@@ -1356,7 +1379,8 @@ const controlSocket = attachControlSocket({
         const plan = await lifecycle.tailscaleStackPlan(stackId)
         tailscaleStackPlans.set(request, plan.basis)
         return plan.bindings
-      }
+      },
+      (kind, id) => lanes.isFrozen(kind, id)
     ),
   runEffect: (effect) => runRelayEffect("relay.control.state", effect),
   saveDial: (clientId, url) => {
@@ -2374,6 +2398,20 @@ async function executeControlRequest(
       await applyPauseHolds()
       return { paused: lanes.paused }
     }
+    case "resource.freeze": {
+      const freeze = relayResourceFreezeSchema.parse(payload)
+      await resourceFreezes.freeze(freeze, (record) =>
+        quietFrozenResource(freeze, record)
+      )
+      return { frozen: true }
+    }
+    case "resource.unfreeze": {
+      const freeze = relayResourceFreezeSchema.parse(payload)
+      await resourceFreezes.unfreeze(freeze, (undo) =>
+        restoreFrozenResource(freeze, undo)
+      )
+      return { frozen: resourceFreezes.has(freeze.kind, freeze.id) }
+    }
     case "relay.clients.revoke": {
       const clientId = requiredString(payload, "clientId")
       const revoked = await runRelayEffect(
@@ -2511,7 +2549,10 @@ async function executeControlRequest(
           )
         )
       )
-      if (discarded) return { databaseId: input.databaseId, deleted: true }
+      if (discarded) {
+        await resourceFreezes.forget("database", input.databaseId)
+        return { databaseId: input.databaseId, deleted: true }
+      }
       // Hearth removes its DNS records from every node first.
       const member = databaseTailscaleMemberId(input.databaseId)
       await lifecycle.detachFromTailscale(
@@ -2526,7 +2567,9 @@ async function executeControlRequest(
           )
         }
       )
-      return databases.delete(input)
+      const deleted = await databases.delete(input)
+      await resourceFreezes.forget("database", input.databaseId)
+      return deleted
     }
     case "database.wipe":
       return databases.wipe(relayDatabaseWipeSchema.parse(request.payload))
@@ -2581,17 +2624,31 @@ async function executeControlRequest(
     }
     case "database.terminal.attach": {
       const input = relayDatabaseTerminalAttachSchema.parse(request.payload)
-      return terminals.attach(
-        terminalOwner(client, request),
-        databaseTerminalTarget(
-          await databases.target(input.databaseId),
-          input.username,
-          input.password
-        ),
-        input,
-        // Output goes back to the Hearth connection that attached.
-        (output, timeoutMs) =>
-          requestHearth("hearth.database.terminal.output", output, timeoutMs)
+      // In the database's lane until the session is open, so freezing it
+      // for its deletion waits for an attach under way and refuses later
+      // ones.
+      return inLane(
+        {
+          label: "database.terminal.attach",
+          locks: databaseReadLocks(input.databaseId),
+        },
+        async () =>
+          terminals.attach(
+            terminalOwner(client, request),
+            databaseTerminalTarget(
+              await databases.target(input.databaseId),
+              input.username,
+              input.password
+            ),
+            input,
+            // Output goes back to the Hearth connection that attached.
+            (output, timeoutMs) =>
+              requestHearth(
+                "hearth.database.terminal.output",
+                output,
+                timeoutMs
+              )
+          )
       )
     }
     case "database.terminal.heartbeat": {
@@ -2603,6 +2660,7 @@ async function executeControlRequest(
     }
     case "database.terminal.restart": {
       const input = relayDatabaseTerminalRestartSchema.parse(request.payload)
+      refuseIfFrozenDatabase(input.databaseId)
       return terminals.restart(terminalOwner(client, request), input.databaseId)
     }
     case "database.terminal.detach": {
@@ -2614,6 +2672,7 @@ async function executeControlRequest(
     }
     case "database.terminal.write": {
       const input = relayDatabaseTerminalWriteSchema.parse(request.payload)
+      refuseIfFrozenDatabase(input.databaseId)
       return terminals.write(
         terminalOwner(client, request),
         input.databaseId,
@@ -2623,6 +2682,7 @@ async function executeControlRequest(
     }
     case "database.terminal.claim": {
       const input = relayDatabaseTerminalClaimSchema.parse(request.payload)
+      refuseIfFrozenDatabase(input.databaseId)
       return terminals.claim(
         terminalOwner(client, request),
         input.databaseId,
@@ -2689,6 +2749,7 @@ async function executeControlRequest(
           "relay.apps.volumes.forget",
           volumes.forgetApp(client.id, input.appId)
         )
+        await resourceFreezes.forget("app", input.appId)
         return { appId: input.appId, deleted: true }
       }
       // Hearth removes its services' DNS records from every node first.
@@ -2723,6 +2784,7 @@ async function executeControlRequest(
           )
         )
       })
+      await resourceFreezes.forget("app", input.appId)
       return deleted
     }
     case "app.deploy": {
@@ -3148,6 +3210,7 @@ async function executeControlRequest(
           "relay.instance.deletePreparedName",
           startup.state.deleteInstanceName(instanceId)
         )
+        await resourceFreezes.forget("instance", instanceId)
         return { deleted: true, instanceId }
       }
       await lifecycle.deleteInstance(
@@ -3187,6 +3250,7 @@ async function executeControlRequest(
           )
         )
       })
+      await resourceFreezes.forget("instance", instanceId)
       return { deleted: true, instanceId }
     }
     case "instance.action": {
@@ -4192,6 +4256,67 @@ async function requiredFileRoot(instanceId: string) {
   const root = await docker.findFileRoot(instanceId)
   if (!root) throw new Error("Instance not found")
   return root
+}
+
+// Quiets a resource frozen for its deletion: a game server or App stopped,
+// an App kept from starting with Docker, a database's terminal sessions
+// ended (it keeps running for its dump, and work a client already sent may
+// finish). Runs inside the freeze, which holds the resource whole, and
+// again as the Relay starts. What it changes goes to `record` first.
+async function quietFrozenResource(
+  freeze: RelayResourceFreeze,
+  record: (undo: RelayResourceFreezeUndo) => Promise<void>
+): Promise<void> {
+  switch (freeze.kind) {
+    case "instance": {
+      const instance = await docker.findInstance(freeze.id)
+      if (!instance) return
+      // Only its full ID: a short one would freeze nothing work names.
+      if (instance.id !== freeze.id) {
+        throw new Error("Freezing a game server needs its full ID")
+      }
+      powerIntents.advance(instance.id)
+      const routes = await runRelayEffect(
+        "relay.network.routes.forFreeze",
+        startup.state.listInstanceRoutes(instance.id)
+      )
+      await lifecycle.runInstanceAction(instance, "stop", routes)
+      return
+    }
+    case "app":
+      return apps.quietForDeletion(freeze.id, (restartPolicies) =>
+        record({ restartPolicies })
+      )
+    case "database": {
+      const database = await recoverPromise(
+        () => databases.target(freeze.id),
+        () => null
+      )
+      await terminals.endTarget(freeze.id, database?.containerId ?? null)
+      return
+    }
+  }
+}
+
+// Puts back what quieting a frozen resource changed, as letting it go
+// does. It stays stopped: starting it again is someone's choice.
+async function restoreFrozenResource(
+  freeze: RelayResourceFreeze,
+  undo: RelayResourceFreezeUndo
+): Promise<void> {
+  if (freeze.kind === "app" && undo.restartPolicies) {
+    await apps.restoreRestartPolicies(undo.restartPolicies)
+  }
+}
+
+// A database being deleted takes no terminal input: its client could write
+// to it after its final dump.
+function refuseIfFrozenDatabase(databaseId: string): void {
+  if (!resourceFreezes.has("database", databaseId)) return
+  throw new LaneRejectedError({
+    message: "This database is being deleted",
+    reason: "refused",
+  })
 }
 
 async function requiredInstance(payload: Readonly<Record<string, unknown>>) {

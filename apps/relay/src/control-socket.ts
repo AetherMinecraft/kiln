@@ -1796,6 +1796,18 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "app.provision.cancel":
     case "app.delete":
       return "app.delete"
+    // Freezing a resource, or letting it go, is part of deleting it.
+    case "resource.freeze":
+    case "resource.unfreeze": {
+      const kind = objectString(request.payload, "kind")
+      return kind === "instance"
+        ? "instance.delete"
+        : kind === "database"
+          ? "database.delete"
+          : kind === "app"
+            ? "app.delete"
+            : null
+    }
     case "app.deploy":
     case "app.action":
     case "app.limits.write":
@@ -2232,8 +2244,9 @@ function controlFailureFor(
   if (cause instanceof LaneRejectedError && cause.reason === "paused") {
     return { code: "relay_paused", message: cause.message, retryable: false }
   }
-  // Refused while something the Relay keeps, such as an unfinished restore,
-  // says it mustn't run: expected, not an error to report.
+  // Refused while something the Relay keeps says it mustn't run, such as an
+  // unfinished restore or the resource's deletion: expected, not an error to
+  // report.
   if (cause instanceof LaneRejectedError && cause.reason === "refused") {
     return {
       code: "operation_refused",

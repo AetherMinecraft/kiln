@@ -97,7 +97,15 @@ waits on a network's DNS, rewriting that DNS (`relay.tailscale.stack.dns`)
 waits only for what holds its locks, not for what waits in line, and counts
 toward the lanes' waiting limit and is refused, as by an unfinished
 restore's fence, like any request; at any other time it takes
-its turn like any change. Relays rewrite bindings saved with a
+its turn like any change.
+
+A deletion asks Hearth for DNS before taking the stack's own exclusive
+lane, so that its DNS continuation can finish. The local detach then
+rereads the configuration inside that lane, shared with apply and removal,
+so concurrent deletions cannot overwrite each other's bindings. A rollback
+takes the same lane and restores only the members its detach removed into
+the current configuration, preserving other deletions and applies.
+Relays rewrite bindings saved with a
 game server's bare ID when they start, and Hearth its copies of them in a
 migration.
 
@@ -332,6 +340,49 @@ Hearth also sends a paused Relay no changes: `relayRpc` refuses them with the
 same `relay_paused` error, and `activeRelay` in `lib/relay-registry.ts` is
 the one way server functions find the Relay for a person's change, failing
 the same way for a paused one and as not found for a missing one.
+
+## Resources being deleted
+
+Deleting a game server, App, or database first freezes it on its Relay
+with `resource.freeze`, naming the deletion and the resource's full ID. The
+freeze takes the resource whole, as replacing it does, so it waits for
+everything running on it. It records the freeze in SQLite, then quiets the
+resource so nothing Kiln starts writes to it but its final backup:
+
+- A game server is stopped.
+- An App is stopped, and its containers' restart policies are set to `no`
+  so Docker doesn't start them again.
+- A database keeps running, since its final backup is a live dump of it.
+  Everyone's terminal sessions on it end, its terminal clients are hung up,
+  and new sessions and input are refused; attaching takes the database's
+  lane, so one under way finishes before the freeze. Work a client already
+  sent may still finish, and game servers and Apps connected to it can
+  still write to it until it's deleted, so what's written during or after
+  its dump may not be in its final backup.
+
+What quieting changes is recorded with the freeze before it's made. From then on the lanes
+refuse any operation that touches the resource when its turn comes,
+whoever asks, including one already waiting: power, console input, files,
+uploads, SFTP, restores, deploys, schedules, and crash recovery. They answer
+`operation_refused`, as an unfinished restore's fence does. Only its final
+backup (`backup.create`), its deletion, and `resource.freeze` /
+`resource.unfreeze` still run. Nested work inside an
+operation already granted isn't checked, and Tailscale changes leave a
+frozen member's network as it was. Applying a network doesn't hold a frozen
+member it leaves as it is, so a deletion that stops partway never keeps the
+rest of the network from changing; joining or removing a frozen member, or
+removing the whole network, is refused, naming the member. Terminals need a
+running container, so a stopped resource has none.
+
+A freeze belongs to the deletion that made it: another deletion of the same
+resource is refused, and only its own deletion can let it go. Letting it go
+puts back what quieting changed (an App's restart policies) and leaves the
+resource stopped; one that can't be put back keeps the freeze, for letting
+it go again. The Relay reads its
+freezes before admitting anything after a restart and quiets each again,
+in case Docker started one or the Relay stopped before quieting it, and
+drops a freeze once it has deleted the resource. `ResourceFreezes`
+(`apps/relay/src/resource-freezes.ts`) holds them for the lanes.
 
 ## Tracing a change
 

@@ -274,6 +274,22 @@ export const relayDeleteDatabaseSchema = z
   })
   .strict()
 
+/**
+ * A game server, App, or database being deleted, by its full ID. Frozen,
+ * it's quiet (a database keeps running for its live dump), and the Relay
+ * refuses every change to it but its final backup and its deletion; unfrozen, it is a resource
+ * like any other again.
+ */
+export const relayResourceFreezeSchema = z
+  .object({
+    deletionId: z.uuid(),
+    id: z.string().regex(/^[a-f0-9]{40}$/u),
+    kind: z.enum(["app", "database", "instance"]),
+  })
+  .strict()
+
+export type RelayResourceFreeze = z.infer<typeof relayResourceFreezeSchema>
+
 export const relayRotateDatabaseCredentialsSchema = z
   .object({
     currentPassword: z.string().min(24).max(256),
@@ -384,6 +400,8 @@ export const databaseTerminalEndReasonSchema = z.enum([
   "timed-out",
   // Someone asked for a fresh session.
   "restarted",
+  // The database is being deleted, which ends every session on it.
+  "deleting",
   // The client could not be started, as when the container has no shell, or
   // its connection failed.
   "failed",

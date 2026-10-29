@@ -423,6 +423,35 @@ describe("database terminal sessions", () => {
     )
   })
 
+  it("ends everyone's sessions on a database being deleted, so its client can't write to it", async () => {
+    const harness = await relayHarness()
+    const database = await runningDatabase(harness)
+    const terminals = new ContainerTerminals(harness.config)
+    const first = viewer()
+    const second = viewer()
+    await attach(terminals, alice, database, first)
+    await attach(terminals, "bob", database, second)
+
+    await terminals.endTarget(databaseId, database.containerId)
+
+    await vi.waitFor(() => expect(first.ended?.reason).toBe("deleting"))
+    await vi.waitFor(() => expect(second.ended?.reason).toBe("deleting"))
+    await vi.waitFor(() =>
+      expect(clientExecs().filter((exec) => exec.running)).toHaveLength(0)
+    )
+  })
+
+  it("counts a stopped database as having no clients to stop", async () => {
+    const harness = await relayHarness()
+    const database = await runningDatabase(harness)
+    const terminals = new ContainerTerminals(harness.config)
+    fakeDocker.container(database.containerId!)!.state.running = false
+
+    await expect(
+      terminals.endTarget(databaseId, database.containerId)
+    ).resolves.toBeUndefined()
+  })
+
   it("shows a slow page every resize, even ones with no output between them", async () => {
     const harness = await relayHarness()
     const database = await runningDatabase(harness)

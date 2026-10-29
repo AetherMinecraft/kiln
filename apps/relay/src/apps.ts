@@ -532,6 +532,69 @@ export class AppDriver {
     this.#deployments.get(appId)?.abort.abort()
   }
 
+  /**
+   * Stops an App being deleted and keeps Docker from starting it again on
+   * its own. Each container's restart policy is passed to `record` before
+   * it's changed, so a Relay that stops partway can still put it back.
+   */
+  async quietForDeletion(
+    appId: string,
+    record: (
+      policies: Record<string, { maximumRetryCount: number; name: string }>
+    ) => Promise<void>
+  ): Promise<void> {
+    // Freezing is a power decision too. Persist it before stopping anything,
+    // so a stopped backup from before the deletion cannot restart this App
+    // after the deletion is cancelled, even across a Relay restart.
+    await Effect.runPromise(
+      this.#limits.state.bumpAppPowerRevision(appId, Date.now())
+    )
+    const containers = await this.#appContainers(appId)
+    for (const { id } of containers) {
+      const inspected = await docker(this.#engine.inspectContainer(id))
+      const policy = inspected.HostConfig?.RestartPolicy
+      if (!policy?.Name || policy.Name === "no") continue
+      await record({
+        [id]: {
+          maximumRetryCount: policy.MaximumRetryCount ?? 0,
+          name: policy.Name,
+        },
+      })
+      await docker(this.#engine.setRestartPolicy(id, "no"))
+    }
+    if (containers.some((container) => container.running)) {
+      await this.action({ action: "stop", appId })
+    }
+  }
+
+  /**
+   * Gives an App's containers back the restart policies freezing took. A
+   * container that's gone has nothing to give back; any other failure is
+   * thrown, so the freeze stays for letting it go again.
+   */
+  async restoreRestartPolicies(
+    policies: Readonly<
+      Record<string, { readonly maximumRetryCount: number; readonly name: string }>
+    >
+  ): Promise<void> {
+    for (const [container, policy] of Object.entries(policies)) {
+      await docker(
+        this.#engine
+          .setRestartPolicy(
+            container,
+            policy.name,
+            policy.name === "on-failure" ? policy.maximumRetryCount : undefined
+          )
+          .pipe(
+            Effect.catchIf(
+              (error) => error.status === 404,
+              () => Effect.void
+            )
+          )
+      )
+    }
+  }
+
   async action(input: RelayAppAction): Promise<RelayApp> {
     const containers = await this.#appContainers(input.appId)
     if (containers.length === 0) throw new Error("Deploy the app first")
