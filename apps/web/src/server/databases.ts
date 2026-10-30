@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto"
 
 import { createServerFn } from "@tanstack/react-start"
 import {
+  databaseConnectionMemberSchema,
   databaseEngineSupportsBrowsing,
   databaseEngineSupportsLogicalBackups,
   databaseEngineSchema,
@@ -49,10 +50,12 @@ import {
 } from "@/lib/access-control"
 import type { AccessGrant } from "@/lib/access-control"
 import type { AuthenticatedUser } from "@/lib/auth-session"
+import { deleteConfirmationSchema } from "@/lib/delete-confirmation"
+import { requireDeleteConfirmation } from "@/lib/delete-confirmation.server"
 import {
-  deleteDatabaseWithoutFinalBackup,
-  deleteDatabaseWithFinalBackup,
-} from "@/lib/final-database-deletion"
+  awaitResourceDeletion,
+  requestResourceDeletion,
+} from "@/lib/resource-deletion.server"
 import { accessPermissions, grantHasPermission } from "@/lib/permissions"
 import type { AccessPermission } from "@/lib/permissions"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
@@ -64,6 +67,7 @@ import { listPersistedRelays } from "@/lib/relay-registry"
 import { requireEligibleResourceUser } from "@/server/auth"
 import {
   authorizedDatabase,
+  databaseForViewer,
   databaseRpc,
   requiredCredential,
   requiredRelay,
@@ -90,7 +94,7 @@ const databaseRenameInputSchema = databaseInputSchema.extend({
 })
 const databaseNetworkInputSchema = databaseInputSchema.extend({
   connected: z.boolean(),
-  instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+  member: databaseConnectionMemberSchema,
 })
 const databaseRowsRequestSchema = databaseInputSchema.extend({
   request: databaseRowsInputSchema,
@@ -266,7 +270,7 @@ export const wipeManagedDatabase = createServerFn({ method: "POST" })
       )
     )
     publishDatabaseChange(relay.id, false)
-    return database
+    return databaseForViewer(user, relay.id, database)
   })
 
 // Renaming is managing the database as a whole, so it takes the permission
@@ -374,8 +378,7 @@ export const createManagedDatabase = createServerFn({ method: "POST" })
             30_000,
             user.id
           ),
-        unconfirmed:
-          "If it stays waiting, delete it and create it again.",
+        unconfirmed: "If it stays waiting, delete it and create it again.",
         unregister,
       })
       publishDatabaseChange(relay.id, true)
@@ -415,7 +418,7 @@ export const runManagedDatabaseAction = createServerFn({ method: "POST" })
       )
     )
     publishDatabaseChange(relay.id, false)
-    return database
+    return databaseForViewer(user, relay.id, database)
   })
 
 export const updateManagedDatabaseLimits = createServerFn({ method: "POST" })
@@ -439,7 +442,7 @@ export const updateManagedDatabaseLimits = createServerFn({ method: "POST" })
       )
     )
     publishDatabaseChange(relay.id, false)
-    return database
+    return databaseForViewer(user, relay.id, database)
   })
 
 export const rotateManagedDatabasePassword = createServerFn({ method: "POST" })
@@ -494,34 +497,15 @@ export const rotateManagedDatabasePassword = createServerFn({ method: "POST" })
     return { rotated: true }
   })
 
+// Connects a game server, an App, or another database to the database, or
+// disconnects it. Both ends need their network permissions.
 export const updateManagedDatabaseNetwork = createServerFn({ method: "POST" })
   .validator(databaseNetworkInputSchema)
   .handler(async ({ data }) => {
-    const { relay, user } = await authorizedDatabase(
-      data,
-      "database.network.write"
-    )
-    await requireRelayPermission({
-      instanceId: data.instanceId,
-      permission: "instance.network.write",
-      relayId: data.relayId,
-      user,
-    })
-    const database = relayManagedDatabaseSchema.parse(
-      await databaseRpc(
-        relay,
-        "database.network.write",
-        {
-          connected: data.connected,
-          databaseId: data.databaseId,
-          instanceId: data.instanceId,
-        },
-        30_000,
-        user.id
-      )
-    )
-    publishDatabaseChange(relay.id, false)
-    return database
+    const user = await requireEligibleResourceUser()
+    const { writeDatabaseConnection } =
+      await import("@/server/database-connections.server")
+    return writeDatabaseConnection(user, data)
   })
 
 // Dumps travel as files in the database's dump folder on its Relay, which
@@ -734,7 +718,10 @@ export const restartDatabaseTerminal = createServerFn({ method: "POST" })
   })
 
 export const deleteManagedDatabase = createServerFn({ method: "POST" })
-  .validator(databaseInputSchema)
+  .validator(databaseInputSchema.extend(deleteConfirmationSchema.shape).extend({
+    createBackup: z.boolean().default(true),
+    storageId: z.uuid().nullable().optional(),
+  }))
   .handler(async ({ data }) => {
     const { relay, user } = await authorizedDatabase(data, "database.delete")
     const database = (
@@ -747,28 +734,38 @@ export const deleteManagedDatabase = createServerFn({ method: "POST" })
         record.relayId === relay.id && record.databaseId === data.databaseId
     )
     if (!database) throw new Error("Database not found on this Relay")
-    const deletion = {
-      databaseId: data.databaseId,
-      relay,
-      requestedBy: user.id,
-    }
+    await requireDeleteConfirmation({
+      confirmation: data.confirmation,
+      name: database.name,
+      password: data.password,
+      user,
+    })
     const onRelay = await databaseOnRelay(relay, data.databaseId, user.id)
-    if (onRelay === "missing") {
-      // The Relay lists no container or job for it, as when an earlier
-      // delete stopped partway, so there's nothing to back up. The Relay
-      // removes what's left, keeping any data volume, which a database
-      // without a container can't be backed up from.
-      await deleteDatabaseWithoutFinalBackup({ ...deletion, deleteData: false })
-    } else if (
-      // One that never finished provisioning has no data to back up.
+    // Backed up first when it holds data a dump can reach: not one that
+    // never finished provisioning, nor one the Relay lists nothing of, as
+    // when an earlier delete stopped partway, whose leftover data volume
+    // the Relay keeps.
+    const finalBackup =
+      data.createBackup &&
       onRelay === "running" &&
       databaseEngineSupportsLogicalBackups(database.engine)
-    ) {
-      await deleteDatabaseWithFinalBackup({ ...deletion, user })
-    } else {
-      await deleteDatabaseWithoutFinalBackup(deletion)
+    if (finalBackup) {
+      await requireRelayPermission({
+        databaseId: data.databaseId,
+        permission: "backup.create",
+        relayId: relay.id,
+        user,
+      })
     }
-    publishDatabaseChange(relay.id, true, data.databaseId)
+    const deletion = await requestResourceDeletion({
+      finalBackup,
+      kind: "database",
+      relayId: relay.id,
+      resourceId: data.databaseId,
+      storageId: data.storageId,
+      user,
+    })
+    await awaitResourceDeletion(deletion)
     return { deleted: true }
   })
 
@@ -783,9 +780,7 @@ async function databaseOnRelay(
   // database that exists but failed, which share an observed state.
   const [item] = z
     .array(
-      z
-        .object({ database: relayManagedDatabaseSchema.optional() })
-        .loose()
+      z.object({ database: relayManagedDatabaseSchema.optional() }).loose()
     )
     .parse(
       await databaseRpc(
@@ -802,19 +797,14 @@ async function databaseOnRelay(
 
 function publishDatabaseChange(
   relayId: string,
-  directoryChanged: boolean,
-  deletedDatabaseId?: string
+  directoryChanged: boolean
 ): void {
   publishRealtimeChange({
     audience: { kind: "relays", relayIds: [relayId] },
-    scope: deletedDatabaseId
-      ? { databaseId: deletedDatabaseId, relayId }
-      : { relayId },
-    topics: deletedDatabaseId
-      ? ["databases", "database-directory", "database-credentials"]
-      : directoryChanged
-        ? ["databases", "database-directory"]
-        : ["databases"],
+    scope: { relayId },
+    topics: directoryChanged
+      ? ["databases", "database-directory"]
+      : ["databases"],
     type: "hearth.invalidate",
   })
 }

@@ -66,15 +66,6 @@ const insertBackupWithDependents = (
       expires_at: at,
       created_at: at,
     })
-    yield* insertRows("backup_final_delete", {
-      relay_id: row.relay_id,
-      target_id: row.target_id,
-      backup_id: id,
-      requested_by: "user-one",
-      status: "failed",
-      created_at: at,
-      updated_at: at,
-    })
   })
 
 const ids = (table: string) =>
@@ -152,37 +143,10 @@ describeMysql("backup forgetting", () => {
             "backup_artifact",
             "backup_task",
             "backup_download_share",
-            "backup_final_delete",
           ]) {
             assert.deepStrictEqual(yield* backupIdsIn(table), [], table)
           }
         })
-    )
-
-    it.effect("leaves everything in place when the backup is missing", () =>
-      Effect.gen(function* () {
-        yield* resetDatabase
-        yield* insertRepository("repository-one", "relay-gone", "instance-one")
-        yield* insertPolicy("relay-gone", "instance-one")
-        yield* insertBackupWithDependents("backup-one", {
-          relay_id: "relay-gone",
-          target_id: "instance-one",
-          repository_id: "repository-one",
-        })
-
-        assert.strictEqual(
-          yield* forgetBackupEffect("missing-backup"),
-          "not_found"
-        )
-
-        assert.deepStrictEqual(yield* ids("backup"), ["backup-one"])
-        assert.deepStrictEqual(yield* ids("backup_repository"), [
-          "repository-one",
-        ])
-        assert.deepStrictEqual(yield* policyTargets, [
-          "relay-gone/instance-one",
-        ])
-      })
     )
 
     it.effect("refuses to forget a backup whose Relay is still paired", () =>
@@ -196,6 +160,20 @@ describeMysql("backup forgetting", () => {
           target_id: "instance-one",
           repository_id: "repository-one",
         })
+        // The final backup of a deletion that stopped.
+        yield* insertRows("resource_deletion", {
+          id: "00000000-0000-4000-8000-000000000001",
+          relay_id: "relay-one",
+          resource_kind: "instance",
+          resource_id: "instance-one",
+          final_backup: true,
+          backup_id: "backup-one",
+          status: "failed",
+          requested_by: "user-one",
+          actor: JSON.stringify({ id: "user-one" }),
+          created_at: at,
+          updated_at: at,
+        })
 
         assert.strictEqual(
           yield* forgetBackupEffect("backup-one"),
@@ -206,7 +184,7 @@ describeMysql("backup forgetting", () => {
         assert.deepStrictEqual(yield* ids("backup_artifact"), [
           "backup-one-artifact",
         ])
-        assert.deepStrictEqual(yield* backupIdsIn("backup_final_delete"), [
+        assert.deepStrictEqual(yield* backupIdsIn("resource_deletion"), [
           "backup-one",
         ])
         assert.deepStrictEqual(yield* ids("backup_repository"), [
@@ -252,7 +230,6 @@ describeMysql("backup forgetting", () => {
           "backup_artifact",
           "backup_task",
           "backup_download_share",
-          "backup_final_delete",
         ]) {
           assert.deepStrictEqual(
             yield* backupIdsIn(table),

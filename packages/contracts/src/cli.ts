@@ -7,6 +7,7 @@ import {
   backupModeSchema,
   backupStatusSchema,
   backupTargetKindSchema,
+  backupTargetSchema,
   backupTaskStatusSchema,
 } from "./backups.js"
 import {
@@ -297,8 +298,13 @@ export const cliUpdateServerStartupRequestSchema = cliTargetSchema
     "Provide a Brick, resource limit, or startup variable"
   )
 
+// What deleting asks in the browser too: the server's name, typed, and the
+// account password.
 export const cliDeleteServerRequestSchema = cliTargetSchema
-  .extend({ confirmation: cliServerReferenceSchema })
+  .extend({
+    confirmation: z.string().min(1).max(256),
+    password: z.string().max(128),
+  })
   .strict()
 
 export const cliServerMutationResponseSchema = z
@@ -328,7 +334,7 @@ export const cliBackupSchema = z
     name: z.string().min(1).max(120),
     relayId: z.string().regex(/^[A-Za-z\d_-]{43}$/u),
     status: backupStatusSchema,
-    targetId: z.string().min(1).max(120),
+    targetId: backupTargetSchema.shape.id,
     targetKind: backupTargetKindSchema,
     taskError: z.string().nullable(),
     taskStatus: backupTaskStatusSchema,

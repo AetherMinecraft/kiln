@@ -1,3 +1,4 @@
+import { resourceDeletionQueryOptions } from "@/lib/resource-deletion-queries"
 import { AppKindIcon } from "@/components/instance-kind-icon"
 import { instanceInventoryScope } from "@/lib/instance-inventory"
 import { instanceInventoryQueryOptions } from "@/lib/instance-inventory"
@@ -6,6 +7,8 @@ import { instanceStatePresentation } from "@/lib/instance-state-presentation"
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useHydrated, useNavigate } from "@tanstack/react-router"
+import { primaryWebRoute, webRouteUrl } from "@workspace/contracts"
+import type { RelayInstanceWebRoute } from "@workspace/contracts"
 import { Rocket, Trash2 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
@@ -13,6 +16,7 @@ import { Button } from "@workspace/ui/components/button"
 import { DeleteAppDialog } from "@/components/app/app-dialogs"
 import {
   appRelayAvailable,
+  appServices,
   showAppOperationError,
   type App,
 } from "@/components/app/app-presentation"
@@ -38,6 +42,7 @@ import {
   type ResourceWorkspaceQuery,
 } from "@/components/resource-workspace"
 import { WorkspaceFrame } from "@/components/workspace-frame"
+import { WorkloadResourceMeters } from "@/components/workload-resource-meters"
 import { WorkspacePowerControls } from "@/components/workspace-power-controls"
 import { recoverPromise } from "@/effect/promise"
 import { appRouteIdentifier, resolveAppRoute } from "@/lib/app-route"
@@ -63,7 +68,7 @@ export const AppWorkspaceShell = React.memo(function AppWorkspaceShell({
         <ResourceWorkspaceBoundary
           context={AppWorkspaceContext}
           icon={<AppKindIcon />}
-          list={{ label: "All apps", to: "/infra/apps" }}
+          list={{ label: "All Apps", to: "/infra/apps" }}
           noun={{ one: "app", other: "apps" }}
           workspace={workspace}
         >
@@ -108,7 +113,7 @@ function DeleteFailedApp({ app }: { app: App }) {
         onClick={() => setOpen(true)}
       >
         <Trash2 />
-        Delete app
+        Delete App
       </Button>
       {open ? (
         <DeleteAppDialog
@@ -180,6 +185,7 @@ function useAppWorkspaceQuery(
           hostname: `app-${directory.shortId}`,
           network: "",
           observedState: "failed" as const,
+          savedDatabaseIds: [],
           status: "Unavailable",
         }),
         ...directory,
@@ -246,6 +252,7 @@ const AppWorkspaceHeader = React.memo(function AppWorkspaceHeader({
           <AppHeaderAddress app={app} />
         </WorkspaceIdentity>
       }
+      center={<AppResourceMeters app={app} />}
       actions={
         <AppPowerControls
           key={`${app.relayId}:${app.id}`}
@@ -257,21 +264,52 @@ const AppWorkspaceHeader = React.memo(function AppWorkspaceHeader({
   )
 })
 
-// The app's first domain, where people reach it, or its address inside the
-// Relay's network when it has none.
-function AppHeaderAddress({ app }: { app: App }) {
-  const route = useQuery({
-    ...appWebRoutesQueryOptions(app.relayId, app.id),
-    select: (state) => state.routes[0],
-  }).data
-  return route ? (
-    <WorkspaceCopyLinkButton
-      href={`https://${route.hostname}${route.path ?? ""}`}
-      label="domain"
+// The App's live usage, as a game server's header shows its own. It
+// re-renders only when the App's services or running state change; the
+// meters follow their samples themselves.
+function AppResourceMeters({ app }: { app: App }) {
+  const serviceList = appServices(app).join("\n")
+  const services = React.useMemo(
+    () => (serviceList ? serviceList.split("\n") : []),
+    [serviceList]
+  )
+  const running = app.containers.filter((container) => container.running)
+  const startedAt =
+    running
+      .flatMap((container) => (container.startedAt ? [container.startedAt] : []))
+      .sort()[0] ?? null
+  return (
+    <WorkloadResourceMeters
+      id={app.id}
+      kind="app"
+      relayConnected={appRelayAvailable(app)}
+      relayId={app.relayId}
+      running={running.length > 0}
+      services={services}
+      startedAt={startedAt}
     />
+  )
+}
+
+// The app's primary domain, where people reach it, or its address inside
+// the Relay's network when it has none.
+function AppHeaderAddress({ app }: { app: App }) {
+  const url = useQuery({
+    ...appWebRoutesQueryOptions(app.relayId, app.id),
+    select: selectPrimaryUrl,
+  }).data
+  return url ? (
+    <WorkspaceCopyLinkButton href={url} label="domain" />
   ) : (
     <WorkspaceCopyValueButton label="internal address" value={app.hostname} />
   )
+}
+
+function selectPrimaryUrl(state: {
+  routes: ReadonlyArray<RelayInstanceWebRoute>
+}): string | null {
+  const route = primaryWebRoute(state.routes)
+  return route ? webRouteUrl(route) : null
 }
 
 function AppPowerControls({
@@ -284,7 +322,12 @@ function AppPowerControls({
   const { app, routeId } = workspace
   const queryClient = useQueryClient()
   const navigate = useNavigate()
-  const canManage = app.permissions.includes("app.manage")
+  const { data: deletion } = useQuery(resourceDeletionQueryOptions({
+    kind: "app",
+    relayId: app.relayId,
+    resourceId: app.id,
+  }))
+  const canManage = !deletion && app.permissions.includes("app.manage")
   const deployed = app.containers.length > 0
   const powerPermissions = React.useMemo(
     () => ({

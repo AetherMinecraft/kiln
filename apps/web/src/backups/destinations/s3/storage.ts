@@ -1,9 +1,11 @@
 import type { RowDataPacket } from "mysql2/promise"
+import type { BackupTargetKind } from "@workspace/contracts"
 import { Clock, Effect, Result } from "effect"
 
 import { decryptWithKeyring, encryptWithKeyring } from "../../../../keyring.mjs"
 import { Database } from "@/effect/database"
 import { BackupStorageError, CredentialError } from "@/effect/errors"
+import { invalidateScheduleDeploymentsEffect } from "@/effect/schedule-invalidation"
 import { databaseTable } from "@/lib/database-config"
 import { betterAuthSecrets } from "@/lib/environment"
 import {
@@ -281,6 +283,11 @@ export const saveBackupStorageEffect = Effect.fn("backupStorage.save")(
               WHERE id = ?`,
             [...values, now, now, input.id]
           )
+          // Schedules backing up to it carry its credentials and whether
+          // it's enabled.
+          yield* invalidateScheduleDeploymentsEffect(transaction, {
+            storageId: input.id,
+          })
           return
         }
         yield* transaction.execute(
@@ -303,7 +310,7 @@ export const setBackupPolicyStorageEffect = Effect.fn(
   relayId: string
   storageId: string | null
   targetId: string
-  targetKind: "database" | "instance" | "platform"
+  targetKind: BackupTargetKind
 }) {
   const database = yield* Database
   const now = yield* Clock.currentTimeMillis
@@ -353,13 +360,7 @@ export const setBackupPolicyStorageEffect = Effect.fn(
         `UPDATE ${databaseTable("backup_policy")}
             SET storage_id = ?, updated_at = ?
           WHERE relay_id = ? AND target_kind = ? AND target_id = ?`,
-        [
-          input.storageId,
-          now,
-          input.relayId,
-          input.targetKind,
-          input.targetId,
-        ]
+        [input.storageId, now, input.relayId, input.targetKind, input.targetId]
       )
     })
   )
@@ -380,25 +381,28 @@ export const deleteBackupStorageEffect = Effect.fn("backupStorage.delete")(
               FOR UPDATE`,
             [storageId]
           )
+          // A game server being deleted purges its snapshots here once the
+          // Relay has deleted it.
           const finalDeletions = yield* transaction.queryRows<RowDataPacket>(
-            `SELECT final_delete.backup_id
-                 FROM ${databaseTable("backup_final_delete")} final_delete
+            `SELECT deletion.id
+                 FROM ${databaseTable("resource_deletion")} deletion
                  JOIN ${databaseTable("backup_repository")} repository
-                   ON repository.relay_id = final_delete.relay_id
+                   ON repository.relay_id = deletion.relay_id
                   AND repository.target_kind = 'instance'
-                  AND repository.target_id = final_delete.target_id
+                  AND repository.target_id = deletion.resource_id
                 WHERE repository.storage_id = ?
-                  AND final_delete.status IN ('backing_up', 'deleting')
+                  AND deletion.resource_kind = 'instance'
+                  AND deletion.status IN ('pending', 'backing_up', 'deleting', 'cancelling')
                 LIMIT 1
                 FOR UPDATE`,
             [storageId]
           )
-          if (finalDeletions[0]?.backup_id) {
+          if (finalDeletions[0]) {
             return yield* BackupStorageError.make({
               code: "storage_in_use",
               operation: "storage.delete",
               reason:
-                "A server using this destination is being permanently deleted",
+                "A game server using this destination is being permanently deleted",
             })
           }
           const rows = yield* transaction.queryRows<BackupStorageRow>(
@@ -460,6 +464,8 @@ export const deleteBackupStorageEffect = Effect.fn("backupStorage.delete")(
               WHERE storage_id = ?`,
             [now, storageId]
           )
+          // Scheduled backups to it stop from here, however its purge goes.
+          yield* invalidateScheduleDeploymentsEffect(transaction, { storageId })
           return {
             ...toRecord(existing),
             accessKeyId: accessKey.plaintext,

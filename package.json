@@ -4,9 +4,6 @@
   "private": true,
   "scripts": {
     "build": "vp run -r build",
-    "db:down": "docker compose down",
-    "db:reset": "docker compose down -v && docker compose up -d --wait mysql",
-    "db:up": "docker compose up -d mysql",
     "dev:setup": "node scripts/dev-docker.mjs setup",
     "dev:docker": "node scripts/dev-docker.mjs start",
     "dev:docker:up": "node scripts/dev-docker.mjs up",
@@ -23,10 +20,11 @@
     "test": "vp run -r test && vp test run",
     "format": "vp fmt",
     "typecheck": "vp run -r --concurrency-limit 1 typecheck",
+    "verify": "node scripts/verify.mjs",
     "doctor": "npx react-doctor@latest"
   },
   "devDependencies": {
-    "effect": "4.0.1",
+    "effect": "4.1.0",
     "tsrs": "0.18.0-ts7.1.0-dev.20260929",
     "typescript": "^6",
     "vite": "catalog:",

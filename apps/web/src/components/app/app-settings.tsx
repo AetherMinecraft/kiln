@@ -1,5 +1,6 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { appFileRootId, primaryWebRoute } from "@workspace/contracts"
 import type { RelayAppWebRoute } from "@workspace/contracts"
 import {
   Cable,
@@ -30,9 +31,11 @@ import {
   showAppOperationError,
   type App,
 } from "@/components/app/app-presentation"
+import { EditableIcon } from "@/components/icon-editor-dialog"
 import {
   InfoCopyValue,
   InfoFact,
+  InfoProfile,
   InfoSection,
   InfoSectionLink,
 } from "@/components/info-page"
@@ -66,11 +69,29 @@ export function AppGeneralSettings({
 }) {
   const available = appRelayAvailable(app)
   const compose = useAppRunsCompose(app)
+  const services = appServices(app)
+  const serviceKey = services.join("\n")
+  const editor = React.useMemo(
+    () => ({
+      fallback: <AppKindIcon />,
+      files: {
+        rootId: appFileRootId(app.id),
+        ...(compose && serviceKey ? { services: serviceKey.split("\n") } : {}),
+      },
+      fit: "contain" as const,
+      noun: "app",
+      subject: { kind: "app" as const, relayId: app.relayId, id: app.id },
+      title: "App icon",
+    }),
+    [app.id, app.relayId, compose, serviceKey]
+  )
   return (
-    <InfoSection
-      icon={<AppKindIcon />}
-      title="App"
-      action={
+    <InfoProfile
+      icon={<EditableIcon canEdit={canRename} editor={editor} />}
+      id={app.id}
+      idLabel="app ID"
+      name={app.name}
+      actions={
         <>
           {canRename ? <AppRenameButton app={app} /> : null}
           <InstanceFavoriteButton
@@ -81,12 +102,6 @@ export function AppGeneralSettings({
         </>
       }
     >
-      <InfoFact label="Name">
-        <InfoCopyValue label="app name" mono={false} value={app.name} />
-      </InfoFact>
-      <InfoFact label="Kiln ID">
-        <InfoCopyValue label="app ID" value={app.id} />
-      </InfoFact>
       {/* Only a Compose file runs more than one container. */}
       {compose ? (
         <InfoFact label="Containers">
@@ -98,14 +113,14 @@ export function AppGeneralSettings({
             <span className="text-muted-foreground">Not deployed</span>
           ) : (
             <span className="flex min-w-0 flex-wrap justify-end gap-1">
-              {appServices(app).map((service) => (
+              {services.map((service) => (
                 <ServiceTag key={service} app={app} service={service} />
               ))}
             </span>
           )}
         </InfoFact>
       ) : null}
-    </InfoSection>
+    </InfoProfile>
   )
 }
 
@@ -403,6 +418,11 @@ export function AppWebRouteSettings({
   const state = useQuery(appWebRoutesQueryOptions(app.relayId, app.id))
   const routes = state.data?.routes ?? []
   const empty = !state.data || routes.length === 0
+  const primary = primaryWebRoute(routes)
+  // The primary domain leads.
+  const orderedRoutes = primary
+    ? [primary, ...routes.filter((route) => route !== primary)]
+    : routes
 
   return (
     <InfoSection
@@ -437,8 +457,13 @@ export function AppWebRouteSettings({
           service over HTTPS.
         </p>
       ) : (
-        routes.map((route) => (
-          <WebRouteFact key={route.id} app={app} route={route} />
+        orderedRoutes.map((route) => (
+          <WebRouteFact
+            key={route.id}
+            app={app}
+            primary={route === primary}
+            route={route}
+          />
         ))
       )}
     </InfoSection>
@@ -449,9 +474,11 @@ export function AppWebRouteSettings({
 // service and port it reaches on the right.
 const WebRouteFact = React.memo(function WebRouteFact({
   app,
+  primary,
   route,
 }: {
   app: App
+  primary: boolean
   route: RelayAppWebRoute
 }) {
   const address = `${route.hostname}${route.path ?? ""}`
@@ -468,16 +495,27 @@ const WebRouteFact = React.memo(function WebRouteFact({
           {address}
         </a>
         <span className="hidden shrink-0 truncate text-xs text-muted-foreground sm:inline">
-          {route.name}
-          {route.path && route.stripPrefix ? " · strips path" : ""}
+          {[
+            primary ? "Primary" : null,
+            route.name || null,
+            route.path && route.stripPrefix ? "strips path" : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
         </span>
       </dt>
-      <dd className="flex shrink-0 items-center justify-end">
-        <ServiceTarget
-          app={app}
-          port={String(route.targetPort)}
-          service={route.service}
-        />
+      <dd className="flex min-w-0 shrink-0 items-center justify-end">
+        {route.redirect ? (
+          <span className="max-w-56 truncate font-mono text-xs text-muted-foreground">
+            → {route.redirect.to}
+          </span>
+        ) : (
+          <ServiceTarget
+            app={app}
+            port={String(route.targetPort)}
+            service={route.service}
+          />
+        )}
       </dd>
     </div>
   )

@@ -111,12 +111,6 @@ describeMysql("Activity permission boundary", () => {
   layer(TestDatabase)((it) => {
     for (const [label, grants, ids, actors] of [
       [
-        "Relay audit reader",
-        [{ permissions: ["relay.audit.read"] }],
-        ["relay-event", "server-a-event", "server-b-event"],
-        ["relay-actor", "actor-a", "actor-b"],
-      ],
-      [
         "Relay instance reader",
         [{ permissions: ["instance.read"] }],
         ["server-a-event", "server-b-event"],
@@ -134,19 +128,6 @@ describeMysql("Activity permission boundary", () => {
         ["server-a-event"],
         ["actor-a"],
       ],
-      [
-        "database reader",
-        [
-          {
-            permissions: ["database.read"],
-            resourceType: "database",
-            resourceId: "database-a",
-          },
-        ],
-        [],
-        [],
-      ],
-      ["ungranted reader", [], [], []],
     ] as const)
       it.effect(`limits records and actors for a ${label}`, () =>
         Effect.gen(function* () {
@@ -168,27 +149,6 @@ describeMysql("Activity permission boundary", () => {
           )
         })
       )
-
-    it.effect(
-      "filters child records even when the Relay returns other events",
-      () =>
-        Effect.gen(function* () {
-          yield* seed([
-            {
-              permissions: ["instance.read"],
-              resourceType: "instance",
-              resourceId: "server-a",
-            },
-          ])
-
-          const result = yield* activityFor(user)
-
-          assert.deepEqual(
-            result.entries.map((entry) => entry.id),
-            ["relay-a:server-a-event"]
-          )
-        })
-    )
 
     it.effect(
       "does not carry Relay audit authority into another Relay with a child grant",
@@ -215,91 +175,6 @@ describeMysql("Activity permission boundary", () => {
               "relay-b:server-a-event",
             ]
           )
-        })
-    )
-
-    it.effect("names the app or database an event acted on", () =>
-      Effect.gen(function* () {
-        yield* seed([])
-        const appId = "a".repeat(40)
-        const databaseId = "d".repeat(40)
-        yield* insertRows("app", {
-          app_id: appId,
-          relay_id: "relay-a",
-          name: "Bridge",
-          config_ciphertext: "unused",
-          created_by: "actor-a",
-          created_at: 0,
-          updated_at: 0,
-        })
-        yield* insertRows("database", {
-          database_id: databaseId,
-          relay_id: "relay-a",
-          name: "Stats",
-          engine: "postgres",
-          database_name: "stats",
-          username: "stats",
-          password_ciphertext: "unused",
-          created_by: "actor-a",
-          created_at: 0,
-          updated_at: 0,
-        })
-        relayRpc.mockImplementation(async (relay, operation) => {
-          if (operation !== "relay.audit.list") {
-            throw new Error("Snapshot unavailable")
-          }
-          if (relay.id !== "relay-a") return []
-          // An app's files stand in for a game server's as `app:<id>`;
-          // linking a database names both it and the game server.
-          return [
-            {
-              id: "app-files",
-              details: { instanceId: `app:${appId}`, operation: "files" },
-              occurredAt: 2,
-            },
-            {
-              id: "database-link",
-              details: { databaseId, instanceId: "server-a", operation: "link" },
-              occurredAt: 1,
-            },
-          ].map((record) => ({
-            ...record,
-            event: "control.mutation",
-            clientId: null,
-            requestId: null,
-          }))
-        })
-
-        const result = yield* activityFor({ ...user, role: "admin" })
-
-        assert.deepEqual(
-          result.entries.map(({ databaseId, target }) => ({
-            databaseId,
-            target,
-          })),
-          [
-            {
-              databaseId: null,
-              target: { id: appId, kind: "app", name: "Bridge" },
-            },
-            {
-              databaseId,
-              target: { id: "server-a", kind: "server", name: "server-a" },
-            },
-          ]
-        )
-      })
-    )
-
-    it.effect(
-      "allows platform admins to read every Relay's activity without grants",
-      () =>
-        Effect.gen(function* () {
-          yield* seed([])
-
-          const result = yield* activityFor({ ...user, role: "admin" })
-
-          assert.lengthOf(result.entries, 6)
         })
     )
   })

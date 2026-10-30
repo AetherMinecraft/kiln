@@ -2,7 +2,11 @@ import { createServerFn } from "@tanstack/react-start"
 import { getRequest } from "@tanstack/react-start/server"
 import { z } from "zod"
 
-import { backupTargetSchema, relayIdSchema } from "@workspace/contracts"
+import {
+  backupConsistencySchema,
+  backupTargetSchema,
+  relayIdSchema,
+} from "@workspace/contracts"
 
 import {
   backupRunsQuerySchema,
@@ -16,6 +20,7 @@ import {
   createDatabaseBackupHandler,
   createInstanceBackupHandler,
   createPlatformBackupHandler,
+  createResourceBackupHandler,
   deleteBackupHandler,
   getBackupDownloadUrlHandler,
   getBackupPolicyHandler,
@@ -25,6 +30,7 @@ import {
   renameBackupHandler,
   restoreDatabaseBackupHandler,
   restoreInstanceBackupHandler,
+  restoreResourceBackupHandler,
   syncBackupRunsHandler,
   updateBackupExcludesHandler,
   updateBackupLimitsHandler,
@@ -73,6 +79,43 @@ const platformBackupInputSchema = z.strictObject({
   relayId: relayIdSchema,
   storageId: z.uuid().nullable().optional(),
   storageIds: z.array(z.uuid().nullable()).min(1).max(16).optional(),
+})
+
+// An App's folder, or a volume: one Kiln made, or `<App ID>/<key>` for one
+// an App's Compose project declares.
+const resourceBackupInputSchema = z.strictObject({
+  consistency: backupConsistencySchema.optional(),
+  maxBytes: z
+    .number()
+    .int()
+    .positive()
+    .max(Number.MAX_SAFE_INTEGER)
+    .nullable()
+    .optional(),
+  name: z.string().trim().min(1).max(120),
+  relayId: relayIdSchema,
+  storageId: z.uuid().nullable().optional(),
+  storageIds: z.array(z.uuid().nullable()).min(1).max(16).optional(),
+  target: backupTargetSchema.extend({ kind: z.enum(["app", "volume"]) }),
+})
+
+const appIdSchema = z.string().regex(/^[a-f0-9]{40}$/u)
+
+const appBackupsInputSchema = z.strictObject({
+  appId: appIdSchema,
+  relayId: relayIdSchema,
+})
+
+const createAppBackupsInputSchema = appBackupsInputSchema.extend({
+  consistency: backupConsistencySchema.default("live"),
+  name: z.string().trim().min(1).max(120),
+  storageIds: z.array(z.uuid().nullable()).min(1).max(16).optional(),
+})
+
+const resolveRestoreInputSchema = z.strictObject({
+  action: z.enum(["abandon", "finish"]),
+  relayId: relayIdSchema,
+  taskId: z.uuid(),
 })
 
 const backupIdInputSchema = z.strictObject({ backupId: z.uuid() })
@@ -150,6 +193,7 @@ const backupPolicyInputSchema = z.strictObject({
 export type InstanceBackupInput = z.infer<typeof instanceBackupInputSchema>
 export type DatabaseBackupInput = z.infer<typeof databaseBackupInputSchema>
 export type PlatformBackupInput = z.infer<typeof platformBackupInputSchema>
+export type ResourceBackupInput = z.infer<typeof resourceBackupInputSchema>
 export type BackupIdInput = z.infer<typeof backupIdInputSchema>
 export type BackupRunForQueryInput = z.infer<typeof backupRunForQuerySchema>
 export type BackupRemovalInput = z.infer<typeof backupRemovalInputSchema>
@@ -181,6 +225,51 @@ export const createPlatformBackup = createServerFn({ method: "POST" })
   .handler(async ({ data }) =>
     createPlatformBackupHandler(await requireEligibleResourceUser(), data)
   )
+
+export const createResourceBackup = createServerFn({ method: "POST" })
+  .validator(resourceBackupInputSchema)
+  .handler(async ({ data }) =>
+    createResourceBackupHandler(await requireEligibleResourceUser(), data)
+  )
+
+// An App's backup settings: its folder and the volumes its Compose project
+// owns, each with its newest backup, and what it mounts that isn't covered.
+export const getAppBackups = createServerFn({ method: "GET" })
+  .validator(appBackupsInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireEligibleResourceUser()
+    const { getAppBackupsHandler } = await import("@/server/app-backups.server")
+    return getAppBackupsHandler(user, data)
+  })
+
+// Backs up an App's folder and owned volumes together.
+export const createAppBackups = createServerFn({ method: "POST" })
+  .validator(createAppBackupsInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireEligibleResourceUser()
+    const { createAppBackupsHandler } =
+      await import("@/server/app-backups.server")
+    return createAppBackupsHandler(user, data)
+  })
+
+// Restores whose swap didn't finish, which fence their targets.
+export const getUnfinishedRestores = createServerFn({ method: "GET" }).handler(
+  async () => {
+    const user = await requireEligibleResourceUser()
+    const { listUnfinishedRestoresHandler } =
+      await import("@/server/app-backups.server")
+    return listUnfinishedRestoresHandler(user)
+  }
+)
+
+export const resolveUnfinishedRestore = createServerFn({ method: "POST" })
+  .validator(resolveRestoreInputSchema)
+  .handler(async ({ data }) => {
+    const user = await requireEligibleResourceUser()
+    const { resolveUnfinishedRestoreHandler } =
+      await import("@/server/app-backups.server")
+    return resolveUnfinishedRestoreHandler(user, data)
+  })
 
 export const getBackupRunsPage = createServerFn({ method: "GET" })
   .validator(backupRunsQuerySchema)
@@ -257,6 +346,12 @@ export const restoreDatabaseBackup = createServerFn({ method: "POST" })
   .validator(backupRestoreInputSchema)
   .handler(async ({ data }) =>
     restoreDatabaseBackupHandler(await requireEligibleResourceUser(), data)
+  )
+
+export const restoreResourceBackup = createServerFn({ method: "POST" })
+  .validator(backupRestoreInputSchema)
+  .handler(async ({ data }) =>
+    restoreResourceBackupHandler(await requireEligibleResourceUser(), data)
   )
 
 export const updateBackupLimits = createServerFn({ method: "POST" })

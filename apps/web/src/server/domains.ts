@@ -1,43 +1,59 @@
 import { createServerFn } from "@tanstack/react-start"
-import { relayIdSchema } from "@workspace/contracts"
+import { appIdSchema, relayIdSchema } from "@workspace/contracts"
 import { z } from "zod"
 
 import {
-  domainAssignmentStrategySchema,
   domainBlacklistPatternsSchema,
   domainNameSchema,
   vanityLabelSchema,
 } from "@/lib/domain-schemas"
 import {
-  configureDomainIntegrationHandler,
   createInstanceDomainHandler,
-  discoverCloudflareDomainsHandler,
-  getDomainSettingsHandler,
   getInstanceDomainHandler,
   removeInstanceDomainHandler,
-  resyncDomainAssignmentsHandler,
   updateInstanceDomainHandler,
 } from "@/server/domains.server"
-import { publishDomainChange } from "@/lib/domain-realtime.server"
+import {
+  deleteDomainConnectionHandler,
+  discoverCloudflareDomainsHandler,
+  getDomainSettingsHandler,
+  getManualWebHostnamesHandler,
+  resyncDomainAssignmentsHandler,
+  saveDomainConnectionHandler,
+} from "@/server/domain-settings.server"
+import {
+  getResourceWebHostnamesHandler,
+  releaseWebHostnameHandler,
+} from "@/server/web-hostname-access.server"
 
 const apiTokenSchema = z.string().trim().min(20).max(512)
 const zoneIdSchema = z.string().regex(/^[a-f0-9]{32}$/u)
 const domainIdSchema = z.uuid()
+const connectionIdSchema = z.string().regex(/^[a-z0-9]{1,32}$/u)
 
-const configureDomainInputSchema = z.object({
+const saveDomainConnectionInputSchema = z.object({
   apiToken: apiTokenSchema.optional(),
-  blacklistPatterns: domainBlacklistPatternsSchema,
-  defaultDomain: domainNameSchema,
+  /** A shared connection's reserved names; omitted to keep them. */
+  blacklistPatterns: domainBlacklistPatternsSchema.optional(),
+  /** Omitted when none of this connection's domains is the default. */
+  defaultDomain: domainNameSchema.optional(),
+  /** Its vanity domains; empty to only manage web route records. */
   domains: z
     .array(z.object({ domain: domainNameSchema, zoneId: zoneIdSchema }))
-    .min(1, "Choose at least one domain")
     .max(50),
-  enabled: z.boolean().default(true),
-  strategy: domainAssignmentStrategySchema,
+  /** Omitted for a new connection. */
+  id: connectionIdSchema.optional(),
+  name: z.string().trim().min(1, "Name this connection").max(64),
+  /** A new shared connection, by a platform administrator. */
+  platform: z.boolean().default(false),
 })
+
+const deleteDomainConnectionInputSchema = z.object({ id: connectionIdSchema })
 
 const discoverDomainsInputSchema = z.object({
   apiToken: apiTokenSchema.optional(),
+  /** A saved connection whose token to use when none is pasted. */
+  connectionId: connectionIdSchema.optional(),
 })
 
 const instanceDomainInputSchema = z.object({
@@ -61,7 +77,27 @@ const updateInstanceDomainInputSchema = z.object({
 
 const removeInstanceDomainInputSchema = z.object({ id: domainIdSchema })
 
-export type ConfigureDomainInput = z.infer<typeof configureDomainInputSchema>
+const resourceWebHostnamesInputSchema = z.discriminatedUnion("resourceType", [
+  z.object({
+    relayId: relayIdSchema,
+    resourceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    resourceType: z.literal("instance"),
+  }),
+  z.object({
+    relayId: relayIdSchema,
+    resourceId: appIdSchema,
+    resourceType: z.literal("app"),
+  }),
+])
+
+const releaseWebHostnameInputSchema = z.object({ id: domainIdSchema })
+
+export type SaveDomainConnectionInput = z.infer<
+  typeof saveDomainConnectionInputSchema
+>
+export type DeleteDomainConnectionInput = z.infer<
+  typeof deleteDomainConnectionInputSchema
+>
 export type DiscoverDomainsInput = z.infer<typeof discoverDomainsInputSchema>
 export type InstanceDomainInput = z.infer<typeof instanceDomainInputSchema>
 export type CreateInstanceDomainInput = z.infer<
@@ -72,6 +108,12 @@ export type UpdateInstanceDomainInput = z.infer<
 >
 export type RemoveInstanceDomainInput = z.infer<
   typeof removeInstanceDomainInputSchema
+>
+export type ResourceWebHostnamesInput = z.infer<
+  typeof resourceWebHostnamesInputSchema
+>
+export type ReleaseWebHostnameInput = z.infer<
+  typeof releaseWebHostnameInputSchema
 >
 
 export interface InstanceDomainOverview {
@@ -87,6 +129,8 @@ export interface InstanceDomainOverview {
 
 export interface ManagedDomainOverview {
   address: string
+  /** Whether the person may rename or delete it. */
+  canManage: boolean
   domain: string
   /** How many domains point at this row's game server. */
   domainCount: number
@@ -114,6 +158,58 @@ export interface ManagedDomainOverview {
   zoneName: string | null
 }
 
+/** A web route hostname, and the DNS record Kiln keeps for it, if any. */
+export interface WebHostnameOverview {
+  /** Whether the person may release it. */
+  canManage: boolean
+  /** The connection's name, when it's one the person sees. */
+  connectionName: string | null
+  /** Kiln's generated address for an app. */
+  generated: boolean
+  hostname: string
+  id: string
+  lastError: string | null
+  /** Used by a web route, so it goes with the route. */
+  routed: boolean
+  relayId: string
+  relayName: string
+  resource:
+    | {
+        id: string
+        kind: "app"
+        name: string
+        /** The `/app/$appId` param. */
+        routeId: string
+      }
+    | {
+        brickId: string | undefined
+        id: string
+        implementation: string | undefined
+        kind: "server"
+        name: string
+        /** The `/server/$serverId` param. */
+        routeId: string
+      }
+  /** `manual`: on no connected domain, so its owner points it by hand. */
+  status: "active" | "error" | "external" | "manual" | "pending" | "removing"
+  /** The Relay address its record points at. */
+  target: string | null
+  /** Named under a vanity domain. */
+  vanity: boolean
+  /** The Cloudflare zone, for its dashboard link. */
+  zoneName: string | null
+}
+
+/** A web hostname as a game server's or app's network page shows it. */
+export interface ResourceWebHostname {
+  canRelease: boolean
+  generated: boolean
+  hostname: string
+  id: string
+  lastError: string | null
+  status: Exclude<WebHostnameOverview["status"], "manual">
+}
+
 export interface DiscoveredCloudflareZone {
   id: string
   name: string
@@ -123,26 +219,26 @@ export const getDomainSettings = createServerFn({ method: "GET" }).handler(() =>
   getDomainSettingsHandler()
 )
 
+export const getManualWebHostnames = createServerFn({ method: "GET" }).handler(
+  () => getManualWebHostnamesHandler()
+)
+
 // POST, so a pasted token travels in the body rather than a URL.
 export const discoverCloudflareDomains = createServerFn({ method: "POST" })
   .validator(discoverDomainsInputSchema)
   .handler(({ data }) => discoverCloudflareDomainsHandler(data))
 
-export const configureDomainIntegration = createServerFn({ method: "POST" })
-  .validator(configureDomainInputSchema)
-  .handler(async ({ data }) => {
-    const result = await configureDomainIntegrationHandler(data)
-    publishDomainChange()
-    return result
-  })
+export const saveDomainConnection = createServerFn({ method: "POST" })
+  .validator(saveDomainConnectionInputSchema)
+  .handler(({ data }) => saveDomainConnectionHandler(data))
+
+export const deleteDomainConnection = createServerFn({ method: "POST" })
+  .validator(deleteDomainConnectionInputSchema)
+  .handler(({ data }) => deleteDomainConnectionHandler(data))
 
 export const resyncDomainAssignments = createServerFn({
   method: "POST",
-}).handler(async () => {
-  const result = await resyncDomainAssignmentsHandler()
-  publishDomainChange()
-  return result
-})
+}).handler(() => resyncDomainAssignmentsHandler())
 
 export const getInstanceDomain = createServerFn({ method: "GET" })
   .validator(instanceDomainInputSchema)
@@ -159,3 +255,11 @@ export const updateInstanceDomain = createServerFn({ method: "POST" })
 export const removeInstanceDomain = createServerFn({ method: "POST" })
   .validator(removeInstanceDomainInputSchema)
   .handler(({ data }) => removeInstanceDomainHandler(data))
+
+export const getResourceWebHostnames = createServerFn({ method: "GET" })
+  .validator(resourceWebHostnamesInputSchema)
+  .handler(({ data }) => getResourceWebHostnamesHandler(data))
+
+export const releaseWebHostname = createServerFn({ method: "POST" })
+  .validator(releaseWebHostnameInputSchema)
+  .handler(({ data }) => releaseWebHostnameHandler(data))

@@ -16,6 +16,8 @@ import type {
   RelayDatabaseWipe,
   RelayDeleteDatabase,
   RelayManagedDatabase,
+  RelayDatabaseMember,
+  DatabaseConnectionMemberKind,
   RelayRotateDatabaseCredentials,
   InstanceObservedState,
   ProvisioningWorkPhase,
@@ -38,7 +40,10 @@ import { ensuringPromise } from "./effect/promise.js"
 import { traceRelayEffect, traceRelayPromise } from "./effect/runtime.js"
 import { collectProcessErrors } from "./database-backups.js"
 import type { FileRoot } from "./files.js"
-import type { DatabaseConnections } from "./database-connections.js"
+import {
+  databaseMemberAlias,
+  type DatabaseConnections,
+} from "./database-connections.js"
 import type { RelayConfig } from "./config.js"
 import type { DockerDriver } from "./docker.js"
 import {
@@ -55,7 +60,12 @@ import {
   streamIntoProcess,
 } from "./docker-engine.js"
 import { provisioningStatus } from "./provisioning.js"
-import { relayOwnerLabel, relayOwnsLabels } from "./relay-resources.js"
+import {
+  relayOwnerLabel,
+  relayOwnsLabels,
+  relayResourceNames,
+} from "./relay-resources.js"
+import { containerPower } from "./resource-power.js"
 import {
   assertResourceLimitsFit,
   containerLimitSpec,
@@ -155,6 +165,7 @@ interface DatabaseContainerInspect {
     ExitCode: number
     Health?: { Status: string }
     Running: boolean
+    StartedAt?: string
     Status: string
   }
 }
@@ -213,6 +224,38 @@ export class DatabaseDriver {
     docker.allocations.register(DATABASE_KIND, async () =>
       (await this.#existing()).map(({ id, limits }) => ({ id, limits }))
     )
+    // A database connected to another joins that one's network with its
+    // own container.
+    connections.useMembers("database", async (id) => {
+      const [container] = await this.#discover([id])
+      return container ? [{ container: container.Id }] : null
+    })
+  }
+
+  /** The database's container, or null when there's no such database. */
+  async containerOf(databaseId: string): Promise<string | null> {
+    const [container] = await this.#discover([databaseId])
+    return container?.Id ?? null
+  }
+
+  // Puts a database's container at its addresses on its Tailscale networks:
+  // once a replacement's old container is gone, and before it starts, so an
+  // attempt that failed is tried again. What it does is beside the
+  // replacement or start, which go ahead either way.
+  #tailscaleAddresses: (databaseId: string) => Promise<void> = async () => {}
+
+  useTailscaleAddresses(take: (databaseId: string) => Promise<void>) {
+    this.#tailscaleAddresses = take
+  }
+
+  async #takeTailscaleAddresses(databaseId: string): Promise<void> {
+    const done = await promiseResult(() => this.#tailscaleAddresses(databaseId))
+    if (Result.isFailure(done)) {
+      console.warn(
+        `Database ${databaseId.slice(0, 8)} couldn't take its place on its Tailscale networks:`,
+        done.failure
+      )
+    }
   }
 
   /** Every database, with the placeholders of those still provisioning. */
@@ -254,7 +297,6 @@ export class DatabaseDriver {
   placeholder(input: RelayCreateDatabase): RelayManagedDatabase {
     const spec = engineSpecs[input.engine]
     return relayManagedDatabaseSchema.parse({
-      connectedInstanceIds: [],
       containerId: null,
       createdAt: new Date().toISOString(),
       databaseName: input.databaseName,
@@ -264,6 +306,7 @@ export class DatabaseDriver {
       id: input.id,
       image: spec.image,
       internalPort: spec.internalPort,
+      members: [],
       limits: NO_RESOURCE_LIMITS,
       name: input.name,
       observedState: "provisioning",
@@ -604,6 +647,10 @@ export class DatabaseDriver {
         })
       )
       created = true
+      // The databases it's connected to, which it reached on the old one.
+      await this.connections.reconcile({ id, kind: "database" }, [
+        { container: name },
+      ])
       if (running) {
         await Effect.runPromise(
           docker.startContainer(name, { timeout: 120_000 })
@@ -632,6 +679,7 @@ export class DatabaseDriver {
     await Effect.runPromise(
       docker.removeContainer(container.Id, { force: true }).pipe(Effect.ignore)
     )
+    await this.#takeTailscaleAddresses(id)
   }
 
   /**
@@ -644,6 +692,16 @@ export class DatabaseDriver {
   async recoverReplacements(): Promise<void> {
     const engine = this.#engine
     const config = this.#config
+    // A restart can come between creating the replacement and joining it to
+    // the databases this one is connected to.
+    const replaced = (databaseId: string) =>
+      Effect.promise(() => this.#takeTailscaleAddresses(databaseId))
+    const reconnect = (databaseId: string, container: string) =>
+      Effect.promise(() =>
+        this.connections.reconcile({ id: databaseId, kind: "database" }, [
+          { container },
+        ])
+      )
     const ready = (reference: string) =>
       Effect.tryPromise({
         try: () => waitUntilReady(engine, reference),
@@ -679,6 +737,8 @@ export class DatabaseDriver {
             yield* restore
             continue
           }
+          const databaseId = replacement.Labels?.["kiln.database.id"]
+          if (databaseId) yield* reconnect(databaseId, replacement.Id)
           // As an uninterrupted change would: the replacement of a running
           // database must be ready, started if the restart caught it first.
           if (wasRunning) {
@@ -699,6 +759,7 @@ export class DatabaseDriver {
           yield* engine
             .removeContainer(container.Id, { force: true })
             .pipe(Effect.ignore)
+          if (databaseId) yield* replaced(databaseId)
         }
       }).pipe(
         Effect.catch((cause) =>
@@ -713,22 +774,34 @@ export class DatabaseDriver {
   async action(input: RelayDatabaseAction): Promise<RelayManagedDatabase> {
     const database = await this.#required(input.databaseId)
     const container = requiredContainerId(database)
-    if (input.action === "stop") {
-      await Effect.runPromise(
-        this.#engine.stopContainer(container, { seconds: 30, timeout: 45_000 })
+    // The databases it's connected to, joined before it starts. Only while
+    // it's stopped does an attachment without its name there join again
+    // with it: a running database keeps its connections until it stops.
+    const connect = (repairNames: boolean) =>
+      this.connections.reconcile(
+        { id: database.id, kind: "database" },
+        [{ container }],
+        { repairNames }
       )
-    } else if (input.action === "start") {
+    // A restart is a stop and a start, with its names put right while it's
+    // down.
+    if (input.action !== "start") {
       await Effect.runPromise(
-        this.#engine.startContainer(container, { timeout: 120_000 })
+        containerPower(
+          this.#engine,
+          container,
+          input.action === "restart" ? "stop" : input.action
+        )
       )
-      await waitUntilReady(this.#engine, container)
-    } else {
-      await Effect.runPromise(
-        this.#engine.restartContainer(container, {
-          seconds: 30,
-          timeout: 150_000,
-        })
+    }
+    if (input.action === "start" || input.action === "restart") {
+      await connect(
+        input.action === "restart" ||
+          !database.observedState.match(/^(?:running|starting)$/u)
       )
+      await this.#takeTailscaleAddresses(database.id)
+      await Effect.runPromise(containerPower(this.#engine, container, "start"))
+      // Started once its engine answers, not when Docker starts the process.
       await waitUntilReady(this.#engine, container)
     }
     return this.#required(input.databaseId)
@@ -853,36 +926,27 @@ export class DatabaseDriver {
     return this.#required(input.databaseId)
   }
 
-  // The caller holds the database's lock across lookup, saving intent, and
-  // attachment, so a queued connect can't recreate a row after deletion has
-  // cleared it.
-  updateNetwork(input: RelayDatabaseNetwork): Promise<RelayManagedDatabase> {
-    return this.#updateNetwork(input)
-  }
-
-  async #updateNetwork(
+  // The caller holds the database's lock and the member's across lookup,
+  // saving intent, and attachment, so a queued connect can't recreate a row
+  // after deletion has cleared it. A member without containers, as an App
+  // before its first deploy, joins once it has them.
+  async updateNetwork(
     input: RelayDatabaseNetwork
   ): Promise<RelayManagedDatabase> {
     const database = await this.#required(input.databaseId)
-    const instance = await this.#docker.findInstance(input.instanceId)
-    if (!instance) throw new Error("Server not found on this Relay")
-    await this.connections.set(instance.id, database.id, input.connected)
-    const issues = await this.connections.reconcile(
-      instance.id,
-      instance.service
-    )
-    const updated = await this.#required(input.databaseId)
-    if (
-      updated.connectedInstanceIds.includes(instance.id) !== input.connected
-    ) {
-      const failure =
-        issues.find((issue) => issue.databaseId === database.id) ??
-        issues.find((issue) => issue.databaseId === null)
+    const targets = await this.connections.resolve(input.member)
+    if (!targets) throw new Error(memberNotFound[input.member.kind])
+    await this.connections.set(input.member, database.id, input.connected)
+    const issues = await this.connections.reconcile(input.member, targets)
+    const failure =
+      issues.find((issue) => issue.databaseId === database.id) ??
+      issues.find((issue) => issue.databaseId === null)
+    if (failure) {
       throw new Error(
-        `${failure?.message ?? "Database connection could not be updated"}. Your server was not stopped. Retry the connection from the database page.`
+        `${failure.message}. ${memberStillRunning[input.member.kind]} Retry the connection from the database page.`
       )
     }
-    return updated
+    return this.#required(input.databaseId)
   }
 
   // Where databases' dump files live, a folder per database, for browsers to
@@ -1155,13 +1219,12 @@ export class DatabaseDriver {
       requiredLabel(labels, "kiln.database.engine")
     )
     const network = requiredLabel(labels, "kiln.database.network")
-    const attached = await this.#attachedContainers(network, signal)
-    const connectedInstanceIds = attached.flatMap((candidate) => {
-      const instanceId = candidate.Labels?.[this.#config.serverIdLabel]
-      return instanceId?.match(/^[a-f0-9]{40}$/iu)
-        ? [instanceId.toLowerCase()]
-        : []
-    })
+    const members = await this.#members(
+      id,
+      container.Id,
+      network,
+      await this.#attachedContainers(network, signal)
+    )
     const observedState = databaseObservedState(container)
     const status = container.State.Running
       ? container.State.Health?.Status === "starting"
@@ -1174,7 +1237,6 @@ export class DatabaseDriver {
           ? "Stopped"
           : `Exited with code ${container.State.ExitCode}`)
     return relayManagedDatabaseSchema.parse({
-      connectedInstanceIds,
       containerId: container.Id,
       createdAt: requiredLabel(labels, "kiln.database.created-at"),
       databaseName: requiredLabel(labels, "kiln.database.database-name"),
@@ -1183,6 +1245,7 @@ export class DatabaseDriver {
       id,
       image: labels["kiln.database.image"] ?? container.Config.Image,
       internalPort: engineSpecs[engine].internalPort,
+      members,
       limits: {
         ...containerResourceLimits(container),
         diskBytes: diskLimits.get(id) ?? null,
@@ -1194,9 +1257,115 @@ export class DatabaseDriver {
       name: requiredLabel(labels, "kiln.database.name"),
       observedState,
       shortId: id.slice(0, 8),
+      startedAt:
+        container.State.Running && container.State.StartedAt
+          ? new Date(container.State.StartedAt).toISOString()
+          : null,
       status,
       supportsImportExport: databaseEngineSupportsLogicalBackups(engine),
     })
+  }
+
+  // What the Relay keeps connected to the database, and what its network
+  // holds now: game servers, App services, and other databases, with the
+  // names each answers to there. A container that joined before members had
+  // names takes its name when it next starts, restarts, or deploys, so the
+  // names come from its attachment, and a name it lacks is reported as
+  // pending.
+  async #members(
+    databaseId: string,
+    ownContainer: string,
+    network: string,
+    attached: ReadonlyArray<DockerContainerSummary>
+  ): Promise<Array<RelayDatabaseMember>> {
+    const members = new Map<string, RelayDatabaseMember>()
+    const member = (kind: DatabaseConnectionMemberKind, id: string) => {
+      const key = `${kind}:${id}`
+      let found = members.get(key)
+      if (!found) {
+        found = {
+          attached: false,
+          hostnames: [],
+          id,
+          kind,
+          pendingHostnames: [],
+          saved: false,
+        }
+        members.set(key, found)
+      }
+      return found
+    }
+    for (const saved of this.connections.members(databaseId)) {
+      member(saved.kind, saved.id).saved = true
+    }
+    const resources = relayResourceNames(this.#config)
+    // Each attached member container, with the name it should have there.
+    const named: Array<{
+      container: string
+      name: string | null
+      to: RelayDatabaseMember
+    }> = []
+    for (const candidate of attached) {
+      if (candidate.Id === ownContainer) continue
+      const labels = candidate.Labels ?? {}
+      const instanceId = labels[this.#config.serverIdLabel]?.toLowerCase()
+      const appId = labels["kiln.app.id"]
+      const otherDatabase = labels["kiln.database.id"]
+      let to: RelayDatabaseMember | null = null
+      let name: string | null = null
+      if (instanceId?.match(/^[a-f0-9]{40}$/u)) {
+        to = member("instance", instanceId)
+        name = databaseMemberAlias(to)
+      } else if (
+        labels[DATABASE_KIND_LABEL] === "app" &&
+        appId?.match(/^[a-f0-9]{40}$/u)
+      ) {
+        to = member("app", appId)
+        const service = labels["kiln.app.service"]
+        name = service ? resources.appAlias(appId, service) : null
+      } else if (
+        labels[DATABASE_KIND_LABEL] === DATABASE_KIND &&
+        otherDatabase?.match(/^[a-f0-9]{40}$/u) &&
+        otherDatabase !== databaseId
+      ) {
+        to = member("database", otherDatabase)
+        name = databaseMemberAlias(to)
+      }
+      if (!to) continue
+      to.attached = true
+      named.push({ container: candidate.Id, name, to })
+    }
+    const inspected = new Map(
+      named.length === 0
+        ? []
+        : (
+            await Effect.runPromise(
+              this.#engine.inspectContainers(
+                named.map(({ container }) => container)
+              )
+            )
+          ).map((container) => [
+            container.Id,
+            container.NetworkSettings?.Networks?.[network]?.Aliases ?? [],
+          ])
+    )
+    for (const { container, name, to } of named) {
+      if (!name) continue
+      if (inspected.get(container)?.includes(name)) {
+        if (!to.hostnames.includes(name)) to.hostnames.push(name)
+      } else if (!to.pendingHostnames.includes(name)) {
+        to.pendingHostnames.push(name)
+      }
+    }
+    for (const found of members.values()) {
+      // Not on the network now, it joins under its name.
+      const alias = databaseMemberAlias(found)
+      if (!found.attached && alias) found.pendingHostnames.push(alias)
+      found.pendingHostnames = found.pendingHostnames.filter(
+        (name) => !found.hostnames.includes(name)
+      )
+    }
+    return [...members.values()]
   }
 
   // Listed containers carry their labels, so none is inspected.
@@ -1655,3 +1824,15 @@ function withProvisioning(
   })
   return [...listed, ...pending.values()]
 }
+
+const memberNotFound = {
+  app: "App not found on this Relay",
+  database: "Database not found on this Relay",
+  instance: "Server not found on this Relay",
+} as const
+
+const memberStillRunning = {
+  app: "Your app was not stopped.",
+  database: "Your database was not stopped.",
+  instance: "Your server was not stopped.",
+} as const

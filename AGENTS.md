@@ -54,6 +54,12 @@ Before editing files for a substantial task:
   `error.fingerprint` that groups occurrences. They go to whichever OTLP
   backend `OTEL_EXPORTER_OTLP_ENDPOINT` names; Kiln's maintainers read traces
   in Tempo and logs in Loki through Grafana.
+- For live telemetry queries, first check the local shell environment for
+  `KILN_GRAFANA_URL` and `KILN_GRAFANA_TOKEN`. Use that URL's Grafana HTTP API
+  with the token as a Bearer credential; `/api/datasources` lists available
+  sources, and `/api/datasources/proxy/uid/<uid>/...` proxies their APIs.
+  Prefer this access before SSH or asking the user for connection details.
+  Check variable presence without printing the token, and never commit it.
 - Name spans with `Effect.fn("Area.operation")` or `Effect.withSpan`, keep
   names stable and put IDs in attributes. Give long-lived loops and workers no
   span of their own, span each unit of work instead, and use metrics, not
@@ -65,6 +71,16 @@ Before editing files for a substantial task:
   `apps/relay/src/operation-plans.ts`, and Relay-initiated work admits itself
   the same way, rather than adding a lock of its own. See
   [Relay operations](docs/relay-operations.md).
+- Every change Hearth makes is an operation: define it with `operation()`,
+  naming the lane keys it changes, and run it from the server function's
+  handler, rather than taking locks, tracing or auditing by hand. One that
+  must survive a restart is a durable operation. See
+  [Hearth operations](docs/hearth-operations.md).
+- Hearth and every Relay run the same Kiln version. Don't build for mixed
+  versions: no capability negotiation, feature flags for older peers,
+  optional protocol fields kept for compatibility, or fallbacks for a peer
+  that lacks something. The one exception is updating: an outdated Relay
+  must still be able to connect far enough for Hearth to update it.
 - The Relay drives Docker through its Engine API client
   (`apps/relay/src/docker-engine.ts`). Use the API for what the daemon does,
   run Docker's standalone binaries only for client-side work like Compose and
@@ -82,8 +98,9 @@ Add or keep a test only when it protects one of:
 - Security boundaries: authentication, permissions, credentials and secrets,
   path traversal, SSRF, parsing untrusted input.
 - Data loss: backups, restores, file writes, migrations, deletion ordering.
-- Formats other versions depend on: the Relay protocol, Docker labels, on-disk
-  and backup formats, CLI config, release manifests.
+- Formats that outlive a release: Docker labels, on-disk and backup formats,
+  stored data, CLI config, release manifests, and the update path an outdated
+  Relay uses.
 - Non-trivial state machines and concurrency: power state, crash recovery,
   reconnects, races, cancellation.
 - A regression you just fixed.
@@ -136,8 +153,9 @@ guide doesn't cover, search through the source code in `node_modules/effect/src`
 - Before changing core components, start `pnpm dev:docker` and confirm Hearth
   loads at the printed URL. Validate user-visible changes in the browser.
   Docs-only work does not need a stack.
-- Validate the changed behavior. Before pushing, run `vp check`,
-  `vp run typecheck`, and the tests for what you changed. Follow
+- Validate the changed behavior. Before pushing, run `pnpm verify`, the same
+  checks as CI including real-MySQL tests, builds, and generated routes. Use
+  individual verification stages or targeted tests while iterating. Follow
   [Contributing](CONTRIBUTING.md) for PR conventions. When asked to deliver a PR,
   commit, push, and open it ready for review. Never merge it yourself.
 - After merge, follow the cleanup instructions in the development guide.

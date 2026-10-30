@@ -1,8 +1,13 @@
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 
-import { Result } from "effect"
-import { defineConfig, lazyPlugins } from "vite-plus"
+import { Effect, Result } from "effect"
+import {
+  defineConfig,
+  isRunnableDevEnvironment,
+  lazyPlugins,
+  loadEnv,
+} from "vite-plus"
 import type { Plugin } from "vite-plus"
 import { devtools } from "@tanstack/devtools-vite"
 import { tanstackStart } from "@tanstack/react-start/plugin/vite"
@@ -24,7 +29,7 @@ const hearthStylesheet = resolve(
   "packages/ui/src/styles/globals.css"
 )
 const brandingDirectory = resolve(import.meta.dirname, "src/assets/branding")
-const reactScanProductionShim = resolve(
+const reactScanShim = resolve(
   import.meta.dirname,
   "node_modules/react-scan/dist/rsc-shim.mjs"
 )
@@ -39,9 +44,14 @@ const telemetryEnvironment = [
   "OTEL_TRACES_SAMPLER_ARG",
 ]
 
-const config = defineConfig(({ command }) => {
+const config = defineConfig(({ command, mode }) => {
   const sourceCommit = resolveBuildCommit()
   const buildCommit = command === "serve" ? "" : sourceCommit
+  const reactScanEnabled =
+    command === "serve" &&
+    (process.env.VITE_REACT_SCAN ??
+      loadEnv(mode, repositoryRoot, "VITE_REACT_SCAN").VITE_REACT_SCAN) ===
+      "true"
 
   return {
     run: {
@@ -75,6 +85,7 @@ const config = defineConfig(({ command }) => {
       },
     },
     define: {
+      "import.meta.env.VITE_REACT_SCAN": JSON.stringify(reactScanEnabled),
       "import.meta.env.VITE_KILN_BUILD_SHA": JSON.stringify(buildCommit),
       "import.meta.env.VITE_KILN_SOURCE_SHA": JSON.stringify(sourceCommit),
       "import.meta.env.VITE_KILN_VERSION": JSON.stringify(
@@ -94,16 +105,16 @@ const config = defineConfig(({ command }) => {
     },
     envDir: "../..",
     resolve: {
-      // Keep React Scan's instrumentation and toolbar out of production bundles.
-      alias:
-        command === "serve"
-          ? [
-              {
-                find: /^@workspace\/contracts$/,
-                replacement: contractsSource,
-              },
-            ]
-          : [{ find: /^react-scan$/, replacement: reactScanProductionShim }],
+      // The toolbar still loads and instruments React with enabled: false.
+      // Keep it off the startup path unless explicitly profiling in dev.
+      alias: [
+        ...(command === "serve"
+          ? [{ find: /^@workspace\/contracts$/, replacement: contractsSource }]
+          : []),
+        ...(reactScanEnabled
+          ? []
+          : [{ find: /^react-scan$/, replacement: reactScanShim }]),
+      ],
       tsconfigPaths: true,
     },
     ssr: {
@@ -118,10 +129,14 @@ const config = defineConfig(({ command }) => {
       host: "0.0.0.0",
     },
     plugins: lazyPlugins(() => [
+      relayControlUpgrades(),
       webAppManifest(),
       devtools(),
       tailwindcss(),
-      tanstackStart(),
+      // __root links the global stylesheet directly. The only side-effect
+      // CSS is xterm's client-only terminal; crawling the route graph for SSR
+      // styles adds an empty, render-blocking request to fresh dev loads.
+      tanstackStart({ dev: { ssrStyles: { enabled: false } } }),
       viteReact(),
     ]),
     test: {
@@ -197,8 +212,16 @@ function webAppManifest(): Plugin {
   const icons = [
     { file: "app-icon-192.png", sizes: "192x192", purpose: "any" },
     { file: "app-icon-512.png", sizes: "512x512", purpose: "any" },
-    { file: "app-icon-maskable-192.png", sizes: "192x192", purpose: "maskable" },
-    { file: "app-icon-maskable-512.png", sizes: "512x512", purpose: "maskable" },
+    {
+      file: "app-icon-maskable-192.png",
+      sizes: "192x192",
+      purpose: "maskable",
+    },
+    {
+      file: "app-icon-maskable-512.png",
+      sizes: "512x512",
+      purpose: "maskable",
+    },
   ]
   const manifest = (iconUrl: (file: string) => string) =>
     JSON.stringify({
@@ -244,6 +267,52 @@ function webAppManifest(): Plugin {
         type: "asset",
         fileName: "manifest.json",
         source: manifest((file) => `/${fileNames.get(file)}`),
+      })
+    },
+  }
+}
+
+// In development, Relays dialing Hearth (lib/relay-control-dial.server.ts)
+// reach it through Vite's server, as they do through serve.mjs once built.
+// The handler loads in the SSR environment's runner, beside the app's own
+// modules, so it shares their Relay connections.
+function relayControlUpgrades(): Plugin {
+  return {
+    name: "kiln:relay-control-upgrades",
+    configureServer(server) {
+      server.httpServer?.on("upgrade", (request, socket, head) => {
+        if (
+          !request.url?.startsWith("/api/relays/control") &&
+          !request.url?.startsWith("/api/relays/tunnel")
+        ) {
+          return
+        }
+        const environment = server.environments.ssr
+        if (!environment || !isRunnableDevEnvironment(environment)) {
+          socket.destroy()
+          return
+        }
+        Effect.runFork(
+          Effect.tryPromise(() =>
+            environment.runner.import<
+              typeof import("./src/lib/relay-control-dial.server")
+            >("/src/lib/relay-control-dial.server.ts")
+          ).pipe(
+            Effect.match({
+              onFailure: (cause) => {
+                server.config.logger.error(
+                  `Couldn't take a Relay's control connection: ${String(cause)}`
+                )
+                socket.destroy()
+              },
+              onSuccess: (module) => {
+                if (!module.handleRelayControlUpgrade(request, socket, head)) {
+                  socket.destroy()
+                }
+              },
+            })
+          )
+        )
       })
     },
   }

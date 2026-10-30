@@ -19,6 +19,7 @@ import {
   EllipsisVertical,
   KeyRound,
   LoaderCircle,
+  Network,
   Play,
   Plus,
   RotateCw,
@@ -29,6 +30,7 @@ import {
 
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
+import { cn } from "@workspace/ui/lib/utils"
 import {
   Dialog,
   DialogContent,
@@ -61,8 +63,15 @@ import {
 
 import {
   DataTableActionGroup,
+  DataTableInlineActions,
+  DataTablePhoneMenuItems,
   DataTableEmptyState,
   DataTableTextCell,
+  useRowMenuDialogs,
+  dataTableRowLinkClassName,
+  dataTableRowMenuTriggerClassName,
+  dataTablePhoneDetailCellClassName,
+  dataTablePhoneDetailWidth,
 } from "@/components/data-table"
 import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
 import {
@@ -175,7 +184,7 @@ export const DatabasesPage = React.memo(function DatabasesPage({
   const canCreate = data?.relays.some((relay) => relay.canCreate)
 
   return (
-    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-3 pb-3 sm:px-5 sm:pb-5">
+    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-2 pb-3 sm:px-5 sm:pb-5">
       <DataTableWorkspace
         toolbar={
           <DatabaseToolbar
@@ -352,12 +361,8 @@ const DatabaseTable = React.memo(function DatabaseTable({
             />
           ),
           meta: dataTableColumnMeta(
-            { width: { base: "2.5rem", sm: statusColumnWidth } },
-            {
-              cellClassName: "px-2 sm:px-3",
-              headerClassName: "px-2 sm:px-3",
-              headerLabelClassName: "shrink-0 overflow-visible text-clip",
-            }
+            { hideBelow: "md", width: statusColumnWidth },
+            { headerLabelClassName: "shrink-0 overflow-visible text-clip" }
           ),
         }
       ),
@@ -374,8 +379,8 @@ const DatabaseTable = React.memo(function DatabaseTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "1.75rem" } },
-          { cellClassName: "px-0", headerClassName: "px-0" }
+          { hideBelow: "md", width: "1.75rem" },
+          { cellClassName: "relative z-10 px-0", headerClassName: "px-0" }
         ),
       }),
       databaseTableColumnHelper.accessor((database) => database.name, {
@@ -392,7 +397,10 @@ const DatabaseTable = React.memo(function DatabaseTable({
                 // no other database shares its short ID.
                 params={{ databaseId: database.id }}
                 preload="intent"
-                className="group/database-link flex min-h-14 min-w-0 flex-1 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                className={cn(
+                  dataTableRowLinkClassName,
+                  "group/database-link flex min-h-14 min-w-0 flex-1 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                )}
               >
                 <InstanceCard
                   state={database.instanceState}
@@ -406,6 +414,8 @@ const DatabaseTable = React.memo(function DatabaseTable({
                   nameClassName="transition-colors group-hover/database-link:text-primary-ink"
                   meta={database.shortId}
                   metaClassName="font-mono"
+                  iconFavorite
+                  iconFavoriteClassName="md:hidden"
                   showFavorite={false}
                 />
               </Link>
@@ -426,10 +436,13 @@ const DatabaseTable = React.memo(function DatabaseTable({
         header: "Engine",
         sortFn: "text",
         cell: ({ row }) => <EngineBadge engine={row.original.engine} />,
-        meta: dataTableColumnMeta({
-          hideBelow: "md",
-          width: "8.5rem",
-        }),
+        meta: dataTableColumnMeta(
+          { width: { base: dataTablePhoneDetailWidth, md: "8.5rem" } },
+          {
+            cellClassName: dataTablePhoneDetailCellClassName,
+            headerClassName: dataTablePhoneDetailCellClassName,
+          }
+        ),
       }),
       databaseTableColumnHelper.accessor((database) => database.relayName, {
         id: "relay",
@@ -453,10 +466,10 @@ const DatabaseTable = React.memo(function DatabaseTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "8.5rem", sm: "9.5rem" } },
+          { width: { base: "3rem", md: "9.5rem" } },
           {
-            cellClassName: "px-1 sm:px-3",
-            headerClassName: "px-1 sm:px-3",
+            cellClassName: "relative z-10 px-0 md:px-3",
+            headerClassName: "px-1 md:px-3",
           }
         ),
       }),
@@ -563,43 +576,73 @@ const DatabaseActions = React.memo(function DatabaseActions({
   const canPower = available && can("database.power")
   const canDelete = can("database.delete")
   const hasOperationalActions = canPower || hasDumpActions
+  const canReadCredentials =
+    can("database.credentials.read") && database.hasCredentials
+  const canConnect = can("database.network.write")
+  const menu = useRowMenuDialogs()
+  const menuTriggerRef = React.useRef<HTMLButtonElement>(null)
+  const [networkOpen, setNetworkOpen] = React.useState(false)
+  // On phones the picker's own button is hidden, so when the menu opened it,
+  // focus goes back to the menu's button.
+  const networkFromMenuRef = React.useRef(false)
+  const openNetworkFromMenu = () => {
+    networkFromMenuRef.current = true
+    setNetworkOpen(true)
+  }
+  const returnNetworkFocus = React.useCallback((event: Event) => {
+    if (!networkFromMenuRef.current) return
+    networkFromMenuRef.current = false
+    event.preventDefault()
+    menuTriggerRef.current?.focus()
+  }, [])
+  const showCredentials = () => onDialog({ kind: "credentials", database })
+  const deleteDatabase = () => onDialog({ kind: "delete", database })
 
   return (
     <DataTableActionGroup>
-      {can("database.credentials.read") && database.hasCredentials ? (
-        <ActionIconButton
-          icon={KeyRound}
-          label={`View ${database.name} credentials`}
-          tooltip="Credentials"
-          onClick={() => onDialog({ kind: "credentials", database })}
-        />
-      ) : null}
-      {can("database.network.write") ? (
-        <DatabaseNetworkPicker database={database} />
-      ) : null}
-      {canDelete ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              aria-label={`Delete ${database.name}`}
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
-              disabled={busy}
-              size="icon-sm"
-              type="button"
-              variant="ghost"
-              onClick={() => onDialog({ kind: "delete", database })}
-            >
-              <Trash2 />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Delete</TooltipContent>
-        </Tooltip>
-      ) : null}
+      <DataTableInlineActions>
+        {canReadCredentials ? (
+          <ActionIconButton
+            icon={KeyRound}
+            label={`View ${database.name} credentials`}
+            tooltip="Credentials"
+            onClick={showCredentials}
+          />
+        ) : null}
+        {canConnect ? (
+          <DatabaseNetworkPicker
+            database={database}
+            open={networkOpen}
+            onCloseAutoFocus={returnNetworkFocus}
+            onOpenChange={setNetworkOpen}
+          />
+        ) : null}
+        {canDelete ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-label={`Delete ${database.name}`}
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive light:hover:bg-destructive/20"
+                disabled={busy}
+                size="icon-sm"
+                type="button"
+                variant="ghost"
+                onClick={deleteDatabase}
+              >
+                <Trash2 />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Delete</TooltipContent>
+          </Tooltip>
+        ) : null}
+      </DataTableInlineActions>
       <DropdownMenu>
         <Tooltip>
           <TooltipTrigger asChild>
             <DropdownMenuTrigger asChild>
               <Button
+                ref={menuTriggerRef}
+                className={dataTableRowMenuTriggerClassName}
                 aria-label={`More actions for ${database.name}`}
                 disabled={busy}
                 size="icon-sm"
@@ -616,7 +659,30 @@ const DatabaseActions = React.memo(function DatabaseActions({
           </TooltipTrigger>
           <TooltipContent side="bottom">More actions</TooltipContent>
         </Tooltip>
-        <DropdownMenuContent align="end" className="min-w-44">
+        <DropdownMenuContent
+          align="end"
+          className="min-w-44"
+          onCloseAutoFocus={menu.onCloseAutoFocus}
+        >
+          {canReadCredentials || canConnect ? (
+            <DataTablePhoneMenuItems>
+              {canReadCredentials ? (
+                <DropdownMenuItem
+                  onSelect={menu.openAfterClose(showCredentials)}
+                >
+                  <KeyRound /> Credentials
+                </DropdownMenuItem>
+              ) : null}
+              {canConnect ? (
+                <DropdownMenuItem
+                  onSelect={menu.openAfterClose(openNetworkFromMenu)}
+                >
+                  <Network /> Connect game servers
+                </DropdownMenuItem>
+              ) : null}
+              <DropdownMenuSeparator />
+            </DataTablePhoneMenuItems>
+          ) : null}
           <InstanceFavoriteMenuItem
             favorite={{
               id: database.id,
@@ -646,7 +712,9 @@ const DatabaseActions = React.memo(function DatabaseActions({
           ) : null}
           {canImport ? (
             <DropdownMenuItem
-              onSelect={() => onDialog({ kind: "import", database })}
+              onSelect={menu.openAfterClose(() =>
+                onDialog({ kind: "import", database })
+              )}
             >
               <Upload /> Import SQL
             </DropdownMenuItem>
@@ -654,6 +722,18 @@ const DatabaseActions = React.memo(function DatabaseActions({
           {hasOperationalActions ? <DropdownMenuSeparator /> : null}
           <CopyIdentifierMenuItem label="Database ID" value={database.id} />
           <CopyIdentifierMenuItem label="Relay ID" value={database.relayId} />
+          {canDelete ? (
+            <DataTablePhoneMenuItems>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={busy}
+                variant="destructive"
+                onSelect={menu.openAfterClose(deleteDatabase)}
+              >
+                <Trash2 /> Delete
+              </DropdownMenuItem>
+            </DataTablePhoneMenuItems>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
     </DataTableActionGroup>

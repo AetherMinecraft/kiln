@@ -7,8 +7,12 @@ import { Clock, Effect } from "effect"
 import { z } from "zod"
 
 import { Database, type DatabaseTransaction } from "@/effect/database"
-import { ensuringPromise, recoverPromise } from "@/effect/promise"
-import { reportAppError, runAppEffect, traceAppPromise } from "@/effect/runtime"
+import {
+  ensuringPromise,
+  promiseEffect,
+  recoverPromise,
+} from "@/effect/promise"
+import { reportAppError, runAppEffect } from "@/effect/runtime"
 import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import { loadPersistedRelay } from "@/lib/relay-registry"
@@ -16,6 +20,26 @@ import {
   advanceSubjectAcrossEnabledRelaysEffect,
   type AuthorizationScope,
 } from "@/lib/authorization-revision"
+import { exclusive } from "@/operations/lanes"
+import { inLanes } from "@/operations/operation"
+
+// What a Relay holds of who may do what reaches it in its own lane, one
+// change at a time, apart from the resources it guards: a revocation never
+// waits behind a long change to a server.
+const inAuthorizationLane = <A>(
+  kind: string,
+  relayId: string,
+  run: () => Promise<A>
+) =>
+  runAppEffect(
+    kind,
+    inLanes(
+      kind,
+      "Sending this Relay who may do what",
+      [exclusive(`relay:${relayId}#authorization`)],
+      promiseEffect(run)
+    )
+  )
 
 interface PendingDeliveryRow extends RowDataPacket {
   desired_revision: string
@@ -135,13 +159,16 @@ async function reconcileRelayIssuerGeneration(
   if (!Number.isSafeInteger(observedGeneration) || observedGeneration < 0) {
     throw new Error("Relay reported an invalid browser issuer generation")
   }
-  await traceAppPromise("authorization.generation.reconcile", async () => {
-    const now = Date.now()
-    // The acknowledgement predicate makes the rollback increment idempotent
-    // across concurrent/repeated control handshakes. Once an increment is
-    // pending, later observations only retain the lower acknowledgement.
-    await databasePool.execute(
-      `UPDATE ${databaseTable("relay")}
+  await inAuthorizationLane(
+    "authorization.generation.reconcile",
+    relayId,
+    async () => {
+      const now = Date.now()
+      // The acknowledgement predicate makes the rollback increment idempotent
+      // across concurrent/repeated control handshakes. Once an increment is
+      // pending, later observations only retain the lower acknowledgement.
+      await databasePool.execute(
+        `UPDATE ${databaseTable("relay")}
             SET issuer_generation = issuer_generation + 1,
                 acknowledged_issuer_generation = ?,
                 updated_at = ?
@@ -149,16 +176,16 @@ async function reconcileRelayIssuerGeneration(
             AND ? < issuer_generation
             AND acknowledged_issuer_generation >= issuer_generation
             AND issuer_generation < ?`,
-      [
-        observedGeneration,
-        now,
-        relayId,
-        observedGeneration,
-        Number.MAX_SAFE_INTEGER,
-      ]
-    )
-    await databasePool.execute(
-      `UPDATE ${databaseTable("relay")}
+        [
+          observedGeneration,
+          now,
+          relayId,
+          observedGeneration,
+          Number.MAX_SAFE_INTEGER,
+        ]
+      )
+      await databasePool.execute(
+        `UPDATE ${databaseTable("relay")}
             SET issuer_generation = GREATEST(issuer_generation, ?),
                 acknowledged_issuer_generation = IF(
                   ? >= issuer_generation,
@@ -167,16 +194,17 @@ async function reconcileRelayIssuerGeneration(
                 ),
                 updated_at = ?
           WHERE id = ?`,
-      [
-        observedGeneration,
-        observedGeneration,
-        observedGeneration,
-        observedGeneration,
-        now,
-        relayId,
-      ]
-    )
-  })
+        [
+          observedGeneration,
+          observedGeneration,
+          observedGeneration,
+          observedGeneration,
+          now,
+          relayId,
+        ]
+      )
+    }
+  )
 }
 
 /**
@@ -218,7 +246,16 @@ export async function reviseRelayIssuerGenerationNow(
   )
 }
 
-export async function synchronizeRelayIssuerGenerationMinimum(
+export function synchronizeRelayIssuerGenerationMinimum(
+  relayId: string,
+  minimumIssuerGeneration: number
+): Promise<number | null> {
+  return inAuthorizationLane("authorization.generation.revise", relayId, () =>
+    reviseIssuerGeneration(relayId, minimumIssuerGeneration)
+  )
+}
+
+async function reviseIssuerGeneration(
   relayId: string,
   minimumIssuerGeneration: number
 ): Promise<number | null> {
@@ -327,8 +364,10 @@ async function drain(
           ) {
             return
           }
-          const more = await traceAppPromise("authorization.deliver", () =>
-            deliverBatch(relayId)
+          const more = await inAuthorizationLane(
+            "authorization.deliver",
+            relayId,
+            () => deliverBatch(relayId)
           )
           if (more) state.wake = true
         },
@@ -423,18 +462,14 @@ async function deliverBatch(relayId: string): Promise<boolean> {
     }
   }
 
-  await traceAppPromise("authorization.ack", () =>
-    runAppEffect(
-      "authorization.delivery.ack",
-      Effect.gen(function* () {
-        const database = yield* Database
-        yield* database.transaction(
-          "authorization.delivery.ack",
-          (connection) =>
-            acknowledgeAuthorizationDeliveryEffect(connection, relayId, result)
-        )
-      })
-    )
+  await runAppEffect(
+    "authorization.delivery.ack",
+    Effect.gen(function* () {
+      const database = yield* Database
+      yield* database.transaction("authorization.delivery.ack", (connection) =>
+        acknowledgeAuthorizationDeliveryEffect(connection, relayId, result)
+      )
+    })
   )
   return pending.length === relayBrowserAuthorizationReviseMaxItems
 }

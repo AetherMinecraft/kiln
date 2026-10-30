@@ -1,50 +1,30 @@
-import {
-  createHash,
-  createPublicKey,
-  randomBytes,
-  randomUUID,
-  verify,
-} from "node:crypto"
-import { createReadStream } from "node:fs"
-import type { ReadStream } from "node:fs"
-import type { FileHandle } from "node:fs/promises"
-import type { Readable } from "node:stream"
-import {
-  constants as zlibConstants,
-  createGzip,
-  deflateRawSync,
-  gzipSync,
-} from "node:zlib"
-import { Effect, Fiber, Option, Result, Schema } from "effect"
+import { createPublicKey, randomBytes, randomUUID, verify } from "node:crypto"
+import { Effect, Fiber, Option, Schema } from "effect"
 import type { Tracer } from "effect"
 import { WebSocket, WebSocketServer } from "ws"
-import ZipStream from "zip-stream"
 
 import {
-  appIdFromFileRoot,
-  databaseIdFromFileRoot,
-  isRelayFileRoot,
   projectRelayInstanceOverview,
-  RelayBrowserCapabilitySchema,
   RelayBrowserRenewSchema,
   relayBrowserProofTranscript,
-  relayBrowserRequestProofTranscript,
   relayBrowserConsoleProtocol,
   relayBrowserConsoleProtocols,
   relayBrowserMaxFrameBytes,
   relayBrowserProtocol,
-  relayConsoleReadActions,
   relayInstanceLifecycleEventTime as lifecycleEventTime,
 } from "@workspace/contracts"
 import type {
   RelayBrowserAuthorizationRevision,
   RelayBrowserCapability,
-  RelayBrowserCapabilityV2,
-  RelayBrowserResourceKind,
   RelayConsole,
   RelayConsoleResource,
   RelayConsoleLine,
+  RelayInstance,
   RelayInstanceLifecycleEvent,
+  RelayInstanceResources,
+  RelayWorkloadResourceKind,
+  RelayWorkloadUsage,
+  RelayWorkloadUsageHistory,
 } from "@workspace/contracts"
 import {
   relayConsoleCommandSchema,
@@ -69,40 +49,35 @@ import {
   encodeNewestConsoleBatch,
 } from "./console-frames.js"
 import type { ConsoleSource, ConsoleSources } from "./console-sources.js"
-import { actionsForRole } from "./permissions.js"
-import { MAX_TRANSFER_BYTES } from "./files.js"
-import type {
-  ArchiveDownloadEntry,
-  FileRoot,
-  FilesystemDriver,
-} from "./files.js"
+import type { FileRoot, FilesystemDriver } from "./files.js"
 import type { LaneTicket, OperationLanes } from "./operation-lanes.js"
-import {
-  fileRootTransferLocks,
-  instanceLifecycleLocks,
-} from "./operation-plans.js"
+import { instanceLifecycleLocks } from "./operation-plans.js"
 import type { RelayIdentity } from "./effect/identity.js"
 import {
   ensuringPromise,
   forkPromise,
   recoverPromise,
 } from "./effect/promise.js"
-import type { RelayClientGrant, RelayStateStore } from "./effect/state.js"
+import type { RelayStateStore } from "./effect/state.js"
 import type { RelaySnapshotSample } from "./snapshot-hub.js"
 import type { RelayConfig } from "./config.js"
 import { BrowserOutbox, type BrowserOutboxKind } from "./browser-outbox.js"
 import {
   authorityFromCapability,
   BrowserSessionRegistry,
-  type BrowserSessionAuthority,
 } from "./browser-session-registry.js"
-import {
-  BROWSER_READ_LEASE_MAX_MS,
-  BROWSER_WRITE_LEASE_MAX_MS,
-  BROWSER_ISSUED_AT_SKEW_MS,
-  isCanonicalBrowserFileProofNonce,
-} from "./browser-security.js"
 import { requestUrl } from "./request-url.js"
+import {
+  browserAuthority,
+  BrowserPublicKeySchema,
+  browserKeyThumbprint,
+  capabilityResourceKind,
+  decodeCapability,
+  serverScopeId,
+  validateCapability,
+} from "./browser-capability.js"
+import { browserFileTransfers } from "./transfers/browser-files.js"
+import { TransferGate } from "./transfers/gate.js"
 import type { Server } from "node:http"
 import type { IncomingMessage, ServerResponse } from "node:http"
 
@@ -111,50 +86,16 @@ const AUTHENTICATION_WINDOW_MS = 10_000
 export const BROWSER_EARLY_MESSAGES_FEATURE = "early-messages"
 // A browser has one message to send behind its auth; a few are tolerated.
 const MAX_EARLY_BROWSER_MESSAGES = 4
-const HTTP_PROOF_WINDOW_MS = 30_000
 const HEARTBEAT_INTERVAL_MS = 15_000
-const MAX_DIRECT_TRANSFERS = 32
-const MAX_DIRECT_TRANSFERS_PER_CLIENT = 8
 const MAX_PENDING_CONSOLE_OPERATIONS_PER_SOCKET = 8
-const MAX_DOWNLOAD_FORM_BYTES = 2 * 1024 * 1024
-const MAX_ARCHIVE_SELECTION_PATHS = 5_000
-const COMPRESSION_SAMPLE_BYTES = 1024 * 1024
-const FILE_AUTHENTICATION_TIMEOUT_MS = 30_000
-
-type BrowserFileMethod = "GET" | "HEAD" | "POST" | "PUT"
-
-interface BrowserRequestCredentials {
-  authorization: string
-  nonce: string
-  proof: string
-  publicKey: string
-  requestedAt: string
-}
-
-interface BrowserDownloadForm {
-  archivePaths: ReadonlyArray<string> | null
-  compression: DownloadCompression
-  credentials: BrowserRequestCredentials
-  name: string
-  path: string
-}
-
-type DownloadCompression = "gzip" | "none" | "zip"
 
 const BrowserAuthSchema = Schema.Struct({
   capability: Schema.String,
-  publicKeyJwk: Schema.Struct({
-    crv: Schema.Literal("P-256"),
-    kty: Schema.Literal("EC"),
-    x: Schema.String,
-    y: Schema.String,
-  }),
+  publicKeyJwk: BrowserPublicKeySchema,
   signature: Schema.String,
   type: Schema.Literal("auth"),
   v: Schema.Literal(1),
 })
-
-const BrowserPublicKeySchema = BrowserAuthSchema.fields.publicKeyJwk
 
 const BrowserSubscribeSchema = Schema.Struct({
   instanceId: Schema.String,
@@ -224,6 +165,8 @@ export interface BrowserSocketOptions {
     readonly filesystem: FilesystemDriver
     readonly root: (databaseId: string) => Promise<FileRoot>
   }
+  /** Admits direct file transfers; shared with the Relay's other transfers. */
+  readonly gate?: TransferGate
   readonly identity: RelayIdentity
   /** The lanes console input and uploads wait in, with Hearth's requests. */
   readonly lanes: OperationLanes
@@ -235,6 +178,12 @@ export interface BrowserSocketOptions {
   readonly subscribeSnapshots: (
     listener: (sample: RelaySnapshotSample) => void
   ) => () => void
+  /** An App's or database's live usage, sampled on the snapshot loop. */
+  readonly workloadUsage: (
+    kind: RelayWorkloadResourceKind,
+    id: string,
+    history: RelayWorkloadUsageHistory
+  ) => RelayWorkloadUsage
 }
 
 export interface BrowserSocketServer {
@@ -259,13 +208,8 @@ export function attachBrowserSocket(
   const sockets = new Set<WebSocket>()
   const registry = new BrowserSessionRegistry(options.config.browserLimits)
   const outboxes = new Map<WebSocket, BrowserOutbox>()
-  const legacyRequestProofs = new Map<string, number>()
-  const pendingLegacyRequestProofs = new Set<string>()
-  const transfers = {
-    active: 0,
-    byClient: new Map<string, number>(),
-    pendingAuthentications: 0,
-  }
+  const gate = options.gate ?? new TransferGate()
+  const files = browserFileTransfers({ ...options, gate, registry })
   const hubs = new ConsoleHubRegistry(
     options.subscribeSnapshots,
     (socket, encoded, kind, action) =>
@@ -275,9 +219,12 @@ export function attachBrowserSocket(
   )
   const resourceHubs = new ResourceHubRegistry(
     options.docker,
+    options.workloadUsage,
     options.subscribeSnapshots,
     (socket, encoded, kind, action) =>
-      outboxes.get(socket)?.send(encoded, kind, action) ?? false
+      outboxes.get(socket)?.send(encoded, kind, action) ?? false,
+    (socket, bytes) =>
+      outboxes.get(socket)?.whenRoomFor(bytes) ?? Promise.resolve(false)
   )
   const wss = new WebSocketServer({
     clientTracking: false,
@@ -378,7 +325,7 @@ export function attachBrowserSocket(
   )
 
   return {
-    activeTransfers: () => transfers.active,
+    activeTransfers: () => gate.active("browser"),
     close: async () => {
       heartbeatFiber.interruptUnsafe()
       registry.close()
@@ -387,16 +334,7 @@ export function attachBrowserSocket(
       await closeSockets(sockets, "Relay shutting down")
       await Effect.runPromise(closeWebSocketServerEffect(wss))
     },
-    handleRequest: (request, response) =>
-      handleBrowserFileRequest(
-        request,
-        response,
-        options,
-        registry,
-        pendingLegacyRequestProofs,
-        legacyRequestProofs,
-        transfers
-      ),
+    handleRequest: files.handleRequest,
     reviseAuthorization: (issuer, items, issuerGeneration) =>
       registry.revise(issuer, items, issuerGeneration),
     revokeClient: (clientId) => registry.revokeIssuer(clientId),
@@ -578,16 +516,19 @@ function authenticateBrowser(
     const resourceSubscription = decodeBrowserResourceSubscription(value)
     if (Option.isSome(resourceSubscription)) {
       const subscription = resourceSubscription.value
+      // The capability decides the resource's kind, and the action that
+      // reads it.
+      const kind = capabilityResourceKind(capability)
       if (
-        capabilityResourceKind(capability) !== "instance" ||
+        !isResourceUsageKind(kind) ||
         subscription.instanceId !== capability.instanceId ||
         (capability.version === 2 && capability.operation !== "resources") ||
-        !registry.isActive(socket, "instance.read")
+        !registry.isActive(socket, resourceReadActions[kind])
       ) {
         socket.close(4403, "Resource capability does not allow this instance")
         return
       }
-      resourceHubs.subscribe(socket, subscription.instanceId)
+      resourceHubs.subscribe(socket, { id: subscription.instanceId, kind })
       return
     }
     const consoleWrite = decodeBrowserConsoleWrite(value)
@@ -1040,1180 +981,11 @@ async function executeConsoleCompletion(
   )
 }
 
-function decodeCapability(value: string): {
-  encoded: string
-  payload: RelayBrowserCapability
-  signature: string
-} {
-  if (value.length > 16_384) throw new Error("Capability is too large")
-  const [encoded, signature, extra] = value.split(".")
-  if (!encoded || !signature || extra) throw new Error("Invalid capability")
-  return {
-    encoded,
-    payload: Schema.decodeUnknownSync(RelayBrowserCapabilitySchema)(
-      JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as unknown
-    ),
-    signature,
-  }
-}
-
-function validateCapability(
-  capability: ReturnType<typeof decodeCapability>,
-  client: RelayClientGrant,
-  origin: string,
-  relayId: string,
-  requiredAction: string | null
-): void {
-  const now = Date.now()
-  const payload = capability.payload
-  if (payload.version === 2) validateCapabilityV2(payload, now)
-  // From the client's role, as the control socket does, so a client paired
-  // before an action existed still has every action its role grants.
-  const clientActions: ReadonlyArray<string> = actionsForRole(
-    client.role,
-    client.actions
-  )
-  if (
-    payload.audience !== relayId ||
-    payload.expiresAt <= now ||
-    payload.issuedAt > now + 5_000 ||
-    payload.origin !== origin ||
-    !client.origins.includes(origin) ||
-    payload.actions.length === 0 ||
-    (requiredAction !== null && !clientActions.includes(requiredAction)) ||
-    (requiredAction !== null && !payload.actions.includes(requiredAction)) ||
-    payload.actions.some((action) => !clientActions.includes(action)) ||
-    !verify(
-      null,
-      Buffer.from(capability.encoded),
-      client.publicKey,
-      Buffer.from(capability.signature, "base64url")
-    )
-  ) {
-    throw new Error("Browser capability is invalid")
-  }
-}
-
-function validateCapabilityV2(
-  capability: RelayBrowserCapabilityV2,
-  now: number
-): void {
-  const allowed = new Set(
-    browserCapabilityActions[capability.resourceKind ?? "instance"][
-      capability.operation
-    ]
-  )
-  const writes = capability.actions.some(
-    (action) =>
-      action === "instance.console.write" ||
-      action === "instance.files.upload" ||
-      action === "app.files.upload" ||
-      action === "relay.files.upload" ||
-      action === "database.dump.import"
-  )
-  const maximumLease = writes
-    ? BROWSER_WRITE_LEASE_MAX_MS
-    : BROWSER_READ_LEASE_MAX_MS
-  if (
-    !Number.isSafeInteger(capability.issuedAt) ||
-    !Number.isSafeInteger(capability.expiresAt) ||
-    !Number.isSafeInteger(capability.authorizationRevision) ||
-    !Number.isSafeInteger(capability.issuerGeneration) ||
-    capability.authorizationRevision < 0 ||
-    capability.issuerGeneration < 0 ||
-    capability.expiresAt <= capability.issuedAt ||
-    capability.expiresAt - capability.issuedAt > maximumLease ||
-    capability.issuedAt > now + BROWSER_ISSUED_AT_SKEW_MS ||
-    capability.actions.length > allowed.size ||
-    capability.actions.some((action) => !allowed.has(action)) ||
-    new Set(capability.actions).size !== capability.actions.length ||
-    capability.loginSessionId.length === 0 ||
-    capability.loginSessionId.length > 240 ||
-    capability.subject.length === 0 ||
-    capability.subject.length > 240 ||
-    capability.capabilityId.length === 0 ||
-    capability.capabilityId.length > 240 ||
-    (capability.operation === "file") !== (capability.path !== null) ||
-    (capability.path?.length ?? 0) > 2_048
-  ) {
-    throw new Error("Browser capability v2 is invalid")
-  }
-}
-
-// The actions a v2 capability may carry, by resource kind and operation.
-// Other kinds only read console output.
-const browserCapabilityActions: Record<
-  RelayBrowserResourceKind,
-  Record<RelayBrowserCapabilityV2["operation"], ReadonlyArray<string>>
-> = {
-  app: {
-    console: [relayConsoleReadActions.app],
-    file: ["app.files.download", "app.files.upload"],
-    resources: [],
-  },
-  // A database's files are its dumps (`database:<databaseId>`).
-  database: {
-    console: [relayConsoleReadActions.database],
-    file: ["database.dump.export", "database.dump.import"],
-    resources: [],
-  },
-  instance: {
-    console: [relayConsoleReadActions.instance, "instance.console.write"],
-    file: ["instance.files.download", "instance.files.upload"],
-    resources: ["instance.read"],
-  },
-  relay: {
-    console: [relayConsoleReadActions.relay],
-    file: ["relay.files.download", "relay.files.upload"],
-    resources: [],
-  },
-  platform: {
-    console: [relayConsoleReadActions.platform],
-    file: [],
-    resources: [],
-  },
-}
-
-// Capabilities name the kind of resource they are for; v1 capabilities and
-// v2 ones without a kind are for servers.
-function capabilityResourceKind(
-  capability: RelayBrowserCapability
-): RelayBrowserResourceKind {
-  return capability.version === 2
-    ? (capability.resourceKind ?? "instance")
-    : "instance"
-}
-
-// The server whose access revisions apply to the capability, if it is for
-// one. Other kinds are revised for the person across the Relay.
-function serverScopeId(capability: RelayBrowserCapability): string | null {
-  return capabilityResourceKind(capability) === "instance"
-    ? capability.instanceId
-    : null
-}
-
-function browserAuthority(
-  capability: RelayBrowserCapability
-): BrowserSessionAuthority {
-  if (capability.version === 2) return authorityFromCapability(capability)
-  return {
-    actions: new Set(capability.actions),
-    expiresAt: capability.expiresAt,
-    instanceId: capability.instanceId,
-    resourceKind: "instance",
-    issuer: capability.issuer,
-    issuerGeneration: 0,
-    keyThumbprint: capability.keyThumbprint,
-    loginSessionId: null,
-    operation: capability.actions.includes("instance.read")
-      ? "resources"
-      : "console",
-    origin: capability.origin,
-    revision: 0,
-    subject: capability.subject,
-    version: 1,
-  }
-}
-
 function renewalChallenge(capabilityExpiresAt: number) {
   return {
     nonce: randomBytes(32).toString("base64url"),
     nonceExpiresAt: capabilityExpiresAt,
   }
-}
-
-async function handleBrowserFileRequest(
-  request: IncomingMessage,
-  response: ServerResponse,
-  options: BrowserSocketOptions,
-  registry: BrowserSessionRegistry,
-  pendingLegacyRequestProofs: Set<string>,
-  legacyRequestProofs: Map<string, number>,
-  transfers: {
-    active: number
-    byClient: Map<string, number>
-    pendingAuthentications: number
-  }
-): Promise<boolean> {
-  const url = new URL(request.url ?? "/", "http://relay")
-  const match = url.pathname.match(/^\/v1\/browser\/files\/([^/]+)$/u)
-  if (!match) return false
-  const origin = request.headers.origin
-  if (!origin) {
-    browserJson(response, 403, { error: "Browser origin is required" })
-    return true
-  }
-  if (request.method === "OPTIONS") {
-    const clients = await options.runEffect(options.state.listClients())
-    if (!clients.some((client) => client.origins.includes(origin))) {
-      browserJson(response, 403, { error: "Browser origin is not paired" })
-      return true
-    }
-    response
-      .writeHead(
-        204,
-        browserCorsHeaders(origin, {
-          "Access-Control-Allow-Headers": [
-            "Authorization",
-            "Content-Type",
-            "X-Kiln-Nonce",
-            "X-Kiln-Proof",
-            "X-Kiln-Public-Key",
-            "X-Kiln-Requested-At",
-          ].join(", "),
-          "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
-          "Access-Control-Max-Age": "600",
-        })
-      )
-      .end()
-    return true
-  }
-  const method = request.method
-  if (
-    method !== "GET" &&
-    method !== "HEAD" &&
-    method !== "POST" &&
-    method !== "PUT"
-  ) {
-    browserJson(response, 405, { error: "Method not allowed" }, origin)
-    return true
-  }
-  const decodedInstanceId = Result.try(() => decodeURIComponent(match[1]))
-  if (Result.isFailure(decodedInstanceId)) {
-    browserJson(response, 400, { error: "Instance path is invalid" }, origin)
-    return true
-  }
-  const instanceId = decodedInstanceId.success
-  if (
-    transfers.pendingAuthentications >=
-    options.config.browserLimits.pendingFileAuthentications
-  ) {
-    browserJson(
-      response,
-      429,
-      { error: "Relay file authentication capacity reached" },
-      origin
-    )
-    return true
-  }
-  transfers.pendingAuthentications += 1
-  const clientConfiguration = registry.clientConfiguration
-  const attempted = Option.flatten(
-    await runBrowser(
-      browserFileAuthenticationEffect(request, async () => {
-        let downloadForm: BrowserDownloadForm | null = null
-        if (method === "POST") {
-          const parsedForm = await runBrowser(
-            browserOperation(() => readBrowserDownloadForm(request)).pipe(
-              Effect.option
-            )
-          )
-          if (Option.isNone(parsedForm)) return Option.none()
-          downloadForm = parsedForm.value
-        }
-        const path = downloadForm?.path ?? url.searchParams.get("path") ?? ""
-        const authenticated = await runBrowser(
-          timedBrowserOperation(
-            "Authenticate browser file request",
-            "relay.browser.file.auth",
-            () =>
-              authenticateBrowserRequest({
-                instanceId,
-                method,
-                options,
-                origin,
-                path,
-                request,
-                ...(downloadForm
-                  ? { credentials: downloadForm.credentials }
-                  : {}),
-                pendingLegacyRequestProofs,
-                legacyRequestProofs,
-              })
-          ).pipe(Effect.option)
-        )
-        return Option.some({ authenticated, downloadForm, path })
-      }).pipe(
-        Effect.option,
-        Effect.ensuring(
-          Effect.sync(() => {
-            transfers.pendingAuthentications -= 1
-          })
-        )
-      )
-    )
-  )
-  if (Option.isNone(attempted)) {
-    browserJson(response, 400, { error: "Download request is invalid" }, origin)
-    return true
-  }
-  const { authenticated, downloadForm, path } = attempted.value
-  if (
-    Option.isNone(authenticated) ||
-    clientConfiguration !== registry.clientConfiguration
-  ) {
-    browserJson(
-      response,
-      401,
-      { error: "Browser capability is invalid" },
-      origin
-    )
-    return true
-  }
-  const authentication = authenticated.value
-
-  const clientId = authentication.clientId
-  const clientTransfers = transfers.byClient.get(clientId) ?? 0
-  if (
-    transfers.active >= MAX_DIRECT_TRANSFERS ||
-    clientTransfers >= MAX_DIRECT_TRANSFERS_PER_CLIENT
-  ) {
-    browserJson(
-      response,
-      429,
-      { error: "Relay file transfer capacity reached" },
-      origin
-    )
-    return true
-  }
-  transfers.active += 1
-  transfers.byClient.set(clientId, clientTransfers + 1)
-  const transfer = registry.registerTransfer(
-    authentication.authority,
-    authentication.current,
-    () => {
-      if (!request.destroyed) request.destroy()
-      if (!response.destroyed) response.destroy()
-    }
-  )
-  if (!transfer.active()) {
-    transfer.release()
-    transfers.active -= 1
-    const remaining = (transfers.byClient.get(clientId) ?? 1) - 1
-    if (remaining > 0) transfers.byClient.set(clientId, remaining)
-    else transfers.byClient.delete(clientId)
-    browserJson(
-      response,
-      403,
-      { error: "Browser authorization changed" },
-      origin
-    )
-    return true
-  }
-
-  await runBrowser(
-    browserOperation(async () => {
-      const host = isRelayFileRoot(instanceId)
-      const appId = appIdFromFileRoot(instanceId)
-      const databaseId = databaseIdFromFileRoot(instanceId)
-      const filesystem = host
-        ? options.hostFiles?.filesystem
-        : appId
-          ? options.appFiles?.filesystem
-          : databaseId
-            ? options.databaseFiles?.filesystem
-            : options.filesystem
-      const instance = host
-        ? await options.hostFiles?.root(instanceId)
-        : appId
-          ? await options.appFiles?.root(appId)
-          : databaseId
-            ? await options.databaseFiles?.root(databaseId)
-            : await options.docker.findInstance(instanceId)
-      if (!instance || !filesystem) {
-        browserJson(response, 404, { error: "Instance not found" }, origin)
-        return
-      }
-      if (method === "PUT") {
-        const uploaded = await options.runEffect(
-          options.lanes.run(
-            {
-              label: "browser.file.upload",
-              // An App, database, or host root is addressed by its root ID;
-              // a game server by the full ID it was found under.
-              locks: fileRootTransferLocks(
-                host || appId || databaseId ? instanceId : instance.id
-              ),
-            },
-            filesystem.upload(instance, path, request, transfer.active)
-          )
-        )
-        void auditBrowserTransfer(
-          options,
-          authentication,
-          method,
-          uploaded.size
-        )
-        browserJson(response, 200, uploaded, origin)
-        return
-      }
-      if (downloadForm?.archivePaths) {
-        await options.runEffect(
-          filesystem.withArchiveDownload(
-            instance,
-            downloadForm.archivePaths,
-            (entries) =>
-              Effect.tryPromise({
-                try: async () => {
-                  const downloadName = normalizedDownloadName(
-                    downloadForm.name,
-                    "files.zip"
-                  )
-                  response.writeHead(
-                    200,
-                    browserCorsHeaders(origin, {
-                      "Cache-Control": "no-store",
-                      "Content-Disposition": contentDisposition(downloadName),
-                      "Content-Type": "application/zip",
-                      "X-Content-Type-Options": "nosniff",
-                      "X-Kiln-Download-Max-Size": String(MAX_TRANSFER_BYTES),
-                    })
-                  )
-                  const result = await streamArchiveDownload(entries, response)
-                  void auditBrowserTransfer(
-                    options,
-                    authentication,
-                    method,
-                    result.bytes,
-                    result.completed ? "completed" : "aborted"
-                  )
-                },
-                catch: (cause) => cause,
-              })
-          )
-        )
-        return
-      }
-      await options.runEffect(
-        filesystem.withDownload(instance, path, (download) =>
-          Effect.tryPromise({
-            try: async () => {
-              const compression = downloadForm?.compression ?? "none"
-              const range = parseRange(request.headers.range, download.size)
-              if (compression !== "none" && range) {
-                throw new Error("Compressed downloads do not support ranges")
-              }
-              const estimatedCompressedSizes =
-                method === "HEAD"
-                  ? await estimateCompressedSizes(
-                      download.file,
-                      download.name,
-                      download.size
-                    )
-                  : null
-              const downloadName = normalizedDownloadName(
-                downloadForm?.name,
-                compression === "zip"
-                  ? `${download.name}.zip`
-                  : compression === "gzip"
-                    ? `${download.name}.gz`
-                    : download.name
-              )
-              const headers = browserCorsHeaders(origin, {
-                ...(compression === "none" ? { "Accept-Ranges": "bytes" } : {}),
-                "Cache-Control": "no-store",
-                "Content-Disposition": contentDisposition(downloadName),
-                ...(compression === "none"
-                  ? {
-                      "Content-Length": String(
-                        range ? range.end - range.start + 1 : download.size
-                      ),
-                    }
-                  : {}),
-                "Content-Type":
-                  compression === "zip"
-                    ? "application/zip"
-                    : compression === "gzip"
-                      ? "application/gzip"
-                      : "application/octet-stream",
-                "Last-Modified": new Date(download.modifiedAt).toUTCString(),
-                "X-Content-Type-Options": "nosniff",
-                "X-Kiln-Download-Max-Size": String(MAX_TRANSFER_BYTES),
-                ...(estimatedCompressedSizes === null
-                  ? {}
-                  : {
-                      "X-Kiln-Compressed-Size-Estimate": String(
-                        estimatedCompressedSizes.zip
-                      ),
-                      "X-Kiln-Gzip-Size-Estimate": String(
-                        estimatedCompressedSizes.gzip
-                      ),
-                      "X-Kiln-Zip-Size-Estimate": String(
-                        estimatedCompressedSizes.zip
-                      ),
-                    }),
-              })
-              if (range) {
-                headers["Content-Range"] =
-                  `bytes ${range.start}-${range.end}/${download.size}`
-              }
-              response.writeHead(range ? 206 : 200, headers)
-              if (method === "HEAD") {
-                response.end()
-                void auditBrowserTransfer(
-                  options,
-                  authentication,
-                  method,
-                  0,
-                  "completed"
-                )
-                return
-              }
-              const streamOptions = range
-                ? { autoClose: false, end: range.end, start: range.start }
-                : { autoClose: false }
-              const result = await streamDownload(
-                download.file.createReadStream(streamOptions),
-                response,
-                compression,
-                download.name,
-                download.size
-              )
-              void auditBrowserTransfer(
-                options,
-                authentication,
-                method,
-                result.bytes,
-                result.completed ? "completed" : "aborted"
-              )
-            },
-            catch: (cause) => cause,
-          })
-        )
-      )
-    }).pipe(
-      Effect.catch((cause) =>
-        Effect.sync(() => {
-          reportRelayError(cause, {
-            operation:
-              method === "PUT"
-                ? "browser.file.upload"
-                : "browser.file.download",
-            attributes: { "kiln.relay_id": options.identity.fingerprint },
-          })
-          if (response.headersSent) {
-            response.destroy(cause instanceof Error ? cause : undefined)
-          } else {
-            browserJson(
-              response,
-              400,
-              { error: safeBrowserError(cause) },
-              origin
-            )
-          }
-        })
-      ),
-      Effect.ensuring(
-        Effect.sync(() => {
-          transfers.active -= 1
-          transfer.release()
-          const remaining = (transfers.byClient.get(clientId) ?? 1) - 1
-          if (remaining > 0) transfers.byClient.set(clientId, remaining)
-          else transfers.byClient.delete(clientId)
-        })
-      )
-    )
-  )
-  return true
-}
-
-// Transfers of an app's files (`app:<appId>`) need its own file actions, and
-// of a database's dumps (`database:<databaseId>`), its dump actions.
-function fileTransferAction(method: BrowserFileMethod, instanceId: string) {
-  if (isRelayFileRoot(instanceId))
-    return method === "PUT" ? "relay.files.upload" : "relay.files.download"
-  if (databaseIdFromFileRoot(instanceId) !== null)
-    return method === "PUT" ? "database.dump.import" : "database.dump.export"
-  const app = appIdFromFileRoot(instanceId) !== null
-  if (method === "PUT")
-    return app ? "app.files.upload" : "instance.files.upload"
-  return app ? "app.files.download" : "instance.files.download"
-}
-
-async function authenticateBrowserRequest(input: {
-  credentials?: BrowserRequestCredentials
-  instanceId: string
-  method: BrowserFileMethod
-  options: BrowserSocketOptions
-  origin: string
-  path: string
-  request: IncomingMessage
-  pendingLegacyRequestProofs: Set<string>
-  legacyRequestProofs: Map<string, number>
-}): Promise<{
-  authority: BrowserSessionAuthority
-  current: { issuerGeneration: number; minimumRevision: number }
-  capabilityId: string
-  clientId: string
-  instanceId: string
-  subject: string
-}> {
-  const authorization =
-    input.credentials?.authorization ?? header(input.request, "authorization")
-  if (!authorization.startsWith("Kiln ")) throw new Error("Missing capability")
-  const parsed = decodeCapability(authorization.slice(5))
-  const requiredAction = fileTransferAction(input.method, input.instanceId)
-  const publicKeyJwk = Schema.decodeUnknownSync(BrowserPublicKeySchema)(
-    JSON.parse(
-      Buffer.from(
-        input.credentials?.publicKey ??
-          header(input.request, "x-kiln-public-key"),
-        "base64url"
-      ).toString("utf8")
-    ) as unknown
-  )
-  if (browserKeyThumbprint(publicKeyJwk) !== parsed.payload.keyThumbprint) {
-    throw new Error("Browser key does not match capability")
-  }
-  const requestedAt = Number(
-    input.credentials?.requestedAt ??
-      header(input.request, "x-kiln-requested-at")
-  )
-  const nonce =
-    input.credentials?.nonce ?? header(input.request, "x-kiln-nonce")
-  if (
-    !Number.isSafeInteger(requestedAt) ||
-    Math.abs(Date.now() - requestedAt) > HTTP_PROOF_WINDOW_MS ||
-    !isCanonicalBrowserFileProofNonce(nonce)
-  )
-    throw new Error("Browser proof freshness is invalid")
-  for (const [key, expiresAt] of input.legacyRequestProofs) {
-    if (expiresAt <= Date.now()) input.legacyRequestProofs.delete(key)
-  }
-  const replayKey = `${parsed.payload.capabilityId}:${nonce}`
-  if (
-    parsed.payload.version === 1 &&
-    (input.legacyRequestProofs.has(replayKey) ||
-      input.pendingLegacyRequestProofs.has(replayKey))
-  )
-    throw new Error("Browser proof was replayed")
-  if (parsed.payload.version === 1) {
-    if (
-      input.legacyRequestProofs.size >=
-        input.options.config.browserLimits.fileReplayEntries ||
-      input.pendingLegacyRequestProofs.size >=
-        input.options.config.browserLimits.fileReplayEntries
-    ) {
-      throw new Error("Browser replay table is full")
-    }
-    input.pendingLegacyRequestProofs.add(replayKey)
-  }
-  return runBrowser(
-    browserOperation(async () => {
-      const client = await input.options.runEffect(
-        input.options.state.findClientById(parsed.payload.issuer)
-      )
-      if (!client) throw new Error("Capability issuer was revoked")
-      validateCapability(
-        parsed,
-        client,
-        input.origin,
-        input.options.identity.fingerprint,
-        requiredAction
-      )
-      if (parsed.payload.version === 2 && parsed.payload.operation !== "file") {
-        throw new Error("Capability is not for file requests")
-      }
-      if (
-        parsed.payload.instanceId !== input.instanceId ||
-        parsed.payload.path !== input.path
-      ) {
-        throw new Error("Capability scope does not match the file")
-      }
-
-      const browserKey = createPublicKey({ format: "jwk", key: publicKeyJwk })
-      const proof = Buffer.from(
-        input.credentials?.proof ?? header(input.request, "x-kiln-proof"),
-        "base64url"
-      )
-      const valid = verify(
-        "sha256",
-        Buffer.from(
-          relayBrowserRequestProofTranscript({
-            capabilityId: parsed.payload.capabilityId,
-            expiresAt: parsed.payload.expiresAt,
-            instanceId: input.instanceId,
-            method: input.method,
-            nonce,
-            path: input.path,
-            relayId: input.options.identity.fingerprint,
-            requestedAt,
-          })
-        ),
-        { dsaEncoding: "ieee-p1363", key: browserKey },
-        proof
-      )
-      if (!valid) throw new Error("Browser request proof is invalid")
-      let current = { issuerGeneration: 0, minimumRevision: 0 }
-      if (parsed.payload.version === 2) {
-        const authority = await input.options.runEffect(
-          input.options.state.browserAuthority({
-            instanceId: parsed.payload.instanceId,
-            issuer: parsed.payload.issuer,
-            loginSessionId: parsed.payload.loginSessionId,
-            subject: parsed.payload.subject,
-          })
-        )
-        if (
-          parsed.payload.issuerGeneration !== authority.issuerGeneration ||
-          parsed.payload.authorizationRevision < authority.minimumRevision
-        ) {
-          throw new Error("Browser authorization is stale")
-        }
-        current = authority
-        const reservation = await input.options.runEffect(
-          input.options.state.reserveBrowserFileReplay({
-            capabilityId: parsed.payload.capabilityId,
-            expiresAt: parsed.payload.expiresAt,
-            maxEntries: input.options.config.browserLimits.fileReplayEntries,
-            nonce,
-            now: Date.now(),
-          })
-        )
-        if (reservation !== "reserved") {
-          throw new Error(
-            reservation === "full"
-              ? "Browser replay table is full"
-              : "Browser proof was replayed"
-          )
-        }
-      } else {
-        input.legacyRequestProofs.set(replayKey, parsed.payload.expiresAt)
-      }
-      return {
-        authority: browserAuthority(parsed.payload),
-        current,
-        capabilityId: parsed.payload.capabilityId,
-        clientId: client.id,
-        instanceId: parsed.payload.instanceId,
-        subject: parsed.payload.subject,
-      }
-    }).pipe(
-      Effect.ensuring(
-        Effect.sync(() => input.pendingLegacyRequestProofs.delete(replayKey))
-      )
-    )
-  )
-}
-
-async function auditBrowserTransfer(
-  options: BrowserSocketOptions,
-  authentication: {
-    capabilityId: string
-    clientId: string
-    instanceId: string
-    subject: string
-  },
-  method: BrowserFileMethod,
-  bytes: number,
-  outcome: "aborted" | "completed" = "completed"
-): Promise<void> {
-  await runBrowser(
-    browserOperation(() =>
-      options.runEffect(
-        options.state.appendAudit({
-          clientId: authentication.clientId,
-          details: {
-            bytes,
-            instanceId: authentication.instanceId,
-            method,
-            outcome,
-            permission: fileTransferAction(method, authentication.instanceId),
-            subject: authentication.subject,
-          },
-          event:
-            method === "PUT" ? "browser.file.upload" : "browser.file.download",
-          id: randomUUID(),
-          occurredAt: Date.now(),
-          requestId: authentication.capabilityId,
-        })
-      )
-    ).pipe(
-      Effect.catch((cause) =>
-        Effect.sync(() => {
-          reportRelayError(cause, { operation: "browser.file.audit" })
-        })
-      )
-    )
-  )
-}
-
-function header(request: IncomingMessage, name: string): string {
-  const value = request.headers[name]
-  if (typeof value !== "string" || !value || value.length > 8_192) {
-    throw new Error(`${name} header is invalid`)
-  }
-  return value
-}
-
-function runBrowser<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
-  return Effect.runPromise(effect)
-}
-
-function browserCorsHeaders(
-  origin: string,
-  extra: Record<string, string> = {}
-): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": origin,
-    "Access-Control-Expose-Headers": [
-      "Content-Disposition",
-      "Content-Length",
-      "Content-Range",
-      "Last-Modified",
-      "X-Kiln-Compressed-Size-Estimate",
-      "X-Kiln-Download-Max-Size",
-      "X-Kiln-Gzip-Size-Estimate",
-      "X-Kiln-Zip-Size-Estimate",
-    ].join(", "),
-    Vary: "Origin",
-    ...extra,
-  }
-}
-
-function browserJson(
-  response: ServerResponse,
-  status: number,
-  value: unknown,
-  origin?: string
-): void {
-  if (response.destroyed || response.writableEnded) return
-  response
-    .writeHead(status, {
-      ...(origin ? browserCorsHeaders(origin) : {}),
-      "Cache-Control": "no-store",
-      "Content-Type": "application/json; charset=utf-8",
-    })
-    .end(JSON.stringify(value))
-}
-
-export function parseRange(
-  value: string | undefined,
-  size: number
-): { end: number; start: number } | null {
-  if (!value) return null
-  if (!Number.isSafeInteger(size) || size <= 0) {
-    throw new Error("Requested byte range is invalid")
-  }
-  const match = value.match(/^bytes=(\d*)-(\d*)$/u)
-  if (!match) throw new Error("Only a single byte range is supported")
-  if (!match[1] && !match[2]) throw new Error("Requested byte range is invalid")
-  if (!match[1]) {
-    const suffixLength = Number(match[2])
-    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
-      throw new Error("Requested byte range is invalid")
-    }
-    return { end: size - 1, start: Math.max(0, size - suffixLength) }
-  }
-  const start = Number(match[1])
-  const requestedEnd = match[2] ? Number(match[2]) : size - 1
-  const end = Math.min(requestedEnd, size - 1)
-  if (
-    !Number.isSafeInteger(start) ||
-    !Number.isSafeInteger(requestedEnd) ||
-    start < 0 ||
-    end < start ||
-    start >= size
-  ) {
-    throw new Error("Requested byte range is invalid")
-  }
-  return { end, start }
-}
-
-function contentDisposition(name: string): string {
-  const fallback = name.replace(/[^A-Za-z0-9._-]/gu, "_") || "download"
-  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`
-}
-
-function normalizedDownloadName(
-  requestedName: string | undefined,
-  fallback: string
-): string {
-  const name = requestedName?.trim() || fallback
-  if (
-    name.length > 255 ||
-    name === "." ||
-    name === ".." ||
-    Array.from(name).some((character) => {
-      const codePoint = character.codePointAt(0) ?? 0
-      return (
-        codePoint < 32 ||
-        codePoint === 127 ||
-        character === "/" ||
-        character === "\\"
-      )
-    })
-  ) {
-    throw new Error("Download name is invalid")
-  }
-  return name
-}
-
-async function readBrowserDownloadForm(
-  request: IncomingMessage
-): Promise<BrowserDownloadForm> {
-  if (
-    !request.headers["content-type"]?.startsWith(
-      "application/x-www-form-urlencoded"
-    )
-  ) {
-    throw new Error("Download request encoding is invalid")
-  }
-  const chunks: Array<Buffer> = []
-  let size = 0
-  for await (const chunk of request) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    size += bytes.byteLength
-    if (size > MAX_DOWNLOAD_FORM_BYTES) {
-      throw new Error("Download request is too large")
-    }
-    chunks.push(bytes)
-  }
-  const form = new URLSearchParams(Buffer.concat(chunks).toString("utf8"))
-  const required = (name: string) => {
-    const value = form.get(name)
-    if (!value) throw new Error(`Download ${name} is missing`)
-    return value
-  }
-  const compression = form.get("compression")
-  if (
-    compression !== "gzip" &&
-    compression !== "none" &&
-    compression !== "zip"
-  ) {
-    throw new Error("Download compression is invalid")
-  }
-  const path = required("path")
-  const serializedPaths = form.get("archivePaths")
-  const archivePaths = serializedPaths
-    ? Schema.decodeUnknownSync(Schema.Array(Schema.String))(
-        JSON.parse(serializedPaths)
-      )
-    : null
-  if (archivePaths) {
-    if (
-      compression !== "zip" ||
-      !archivePaths.length ||
-      archivePaths.length > MAX_ARCHIVE_SELECTION_PATHS ||
-      archivePaths.some(
-        (archivePath) => archivePath.length === 0 || archivePath.length > 2_048
-      ) ||
-      serializedPaths === null ||
-      path !== archiveSelectionRequestPath(serializedPaths)
-    ) {
-      throw new Error("Download archive selection is invalid")
-    }
-  }
-  return {
-    archivePaths,
-    compression,
-    credentials: {
-      authorization: required("authorization"),
-      nonce: required("nonce"),
-      proof: required("proof"),
-      publicKey: required("publicKey"),
-      requestedAt: required("requestedAt"),
-    },
-    name: required("name"),
-    path,
-  }
-}
-
-function archiveSelectionRequestPath(serializedPaths: string): string {
-  return `@archive/${createHash("sha256").update(serializedPaths).digest("hex")}`
-}
-
-async function estimateCompressedSizes(
-  file: FileHandle,
-  name: string,
-  size: number
-): Promise<{ gzip: number; zip: number }> {
-  const sampleSize = Math.min(size, COMPRESSION_SAMPLE_BYTES)
-  const zipOverhead =
-    114 + Buffer.byteLength(name) * 2 + (size > 0xffffffff ? 98 : 0)
-  if (sampleSize === 0) {
-    const gzip = gzipSync(Buffer.alloc(0), {
-      level: zlibConstants.Z_BEST_SPEED,
-    }).byteLength
-    return { gzip, zip: zipOverhead }
-  }
-  const sample = Buffer.allocUnsafe(sampleSize)
-  const { bytesRead } = await file.read(sample, 0, sampleSize, 0)
-  if (bytesRead === 0) {
-    const gzip = gzipSync(Buffer.alloc(0), {
-      level: zlibConstants.Z_BEST_SPEED,
-    }).byteLength
-    return { gzip, zip: zipOverhead }
-  }
-  const contents = sample.subarray(0, bytesRead)
-  const gzipSize = gzipSync(contents, {
-    level: zlibConstants.Z_BEST_SPEED,
-  }).byteLength
-  const zipSize = deflateRawSync(contents, {
-    level: zlibConstants.Z_BEST_SPEED,
-  }).byteLength
-  return {
-    gzip: Math.ceil((gzipSize / bytesRead) * size),
-    zip: Math.ceil((zipSize / bytesRead) * size) + zipOverhead,
-  }
-}
-
-function streamDownload(
-  stream: ReadStream,
-  response: ServerResponse,
-  compression: DownloadCompression,
-  entryName: string,
-  size: number
-): Promise<{ bytes: number; completed: boolean }> {
-  return new Promise((resolveStream, reject) => {
-    const archive =
-      compression === "zip"
-        ? new ZipStream({
-            forceZip64: size > 0xffffffff,
-            zlib: { level: zlibConstants.Z_BEST_SPEED },
-          })
-        : null
-    const output: Readable = archive
-      ? archive
-      : compression === "gzip"
-        ? stream.pipe(createGzip({ level: zlibConstants.Z_BEST_SPEED }))
-        : stream
-    let bytes = 0
-    let settled = false
-    const cleanup = () => {
-      stream.off("error", failed)
-      if (output !== stream) output.off("error", failed)
-      output.off("data", received)
-      response.off("finish", finished)
-      response.off("close", closed)
-    }
-    const received = (chunk: Buffer | string) => {
-      bytes += Buffer.byteLength(chunk)
-    }
-    const failed = (cause: Error) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      stream.destroy()
-      if (output !== stream) output.destroy()
-      if (!response.destroyed) response.destroy(cause)
-      reject(cause)
-    }
-    const finished = () => {
-      if (settled) return
-      settled = true
-      cleanup()
-      resolveStream({ bytes, completed: true })
-    }
-    const closed = () => {
-      if (settled) return
-      settled = true
-      stream.destroy()
-      archive?.destroy()
-      if (output !== stream) output.destroy()
-      cleanup()
-      resolveStream({ bytes, completed: false })
-    }
-    stream.once("error", failed)
-    if (output !== stream) output.once("error", failed)
-    output.on("data", received)
-    response.once("finish", finished)
-    response.once("close", closed)
-    output.pipe(response)
-    if (archive) {
-      archive.entry(stream, { name: entryName }, (cause) => {
-        if (cause) failed(cause)
-        else if (!settled) archive.finalize()
-      })
-    }
-  })
-}
-
-function streamArchiveDownload(
-  entries: ReadonlyArray<ArchiveDownloadEntry>,
-  response: ServerResponse
-): Promise<{ bytes: number; completed: boolean }> {
-  return new Promise((resolveStream, reject) => {
-    const archive = new ZipStream({
-      forceZip64: entries.some((entry) => entry.size > 0xffffffff),
-      zlib: { level: zlibConstants.Z_BEST_SPEED },
-    })
-    let activeSource: ReturnType<typeof createReadStream> | null = null
-    let bytes = 0
-    let settled = false
-    const cleanup = () => {
-      archive.off("error", failed)
-      archive.off("data", received)
-      response.off("finish", finished)
-      response.off("close", closed)
-      activeSource?.off("error", failed)
-    }
-    const complete = (completed: boolean) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      resolveStream({ bytes, completed })
-    }
-    const failed = (cause: Error) => {
-      if (settled) return
-      settled = true
-      activeSource?.destroy()
-      archive.destroy()
-      cleanup()
-      if (!response.destroyed) response.destroy(cause)
-      reject(cause)
-    }
-    const received = (chunk: Buffer | string) => {
-      bytes += Buffer.byteLength(chunk)
-    }
-    const finished = () => complete(true)
-    const closed = () => {
-      activeSource?.destroy()
-      archive.destroy()
-      complete(false)
-    }
-    archive.once("error", failed)
-    archive.on("data", received)
-    response.once("finish", finished)
-    response.once("close", closed)
-    archive.pipe(response)
-
-    const append = (index: number) => {
-      if (settled) return
-      const entry = entries[index]
-      if (!entry) {
-        archive.finalize()
-        return
-      }
-      if (entry.kind === "directory") {
-        archive.entry(null, { name: `${entry.name}/` }, (cause) => {
-          if (cause) failed(cause)
-          else append(index + 1)
-        })
-        return
-      }
-      const source = createReadStream(entry.absolute)
-      activeSource = source
-      source.once("error", failed)
-      archive.entry(source, { name: entry.name }, (cause) => {
-        source.off("error", failed)
-        activeSource = null
-        if (cause) failed(cause)
-        else append(index + 1)
-      })
-    }
-    append(0)
-  })
-}
-
-function safeBrowserError(cause: unknown): string {
-  if (!cause || typeof cause !== "object" || !("message" in cause)) {
-    return "File transfer failed"
-  }
-  const message = cause.message
-  return typeof message === "string" && message.length <= 200
-    ? message
-    : "File transfer failed"
 }
 
 type BrowserDelivery = (
@@ -2367,27 +1139,53 @@ class ConsoleHubRegistry {
   }
 }
 
+type ResourceUsageKind = "app" | "database" | "instance"
+
+// The action that reads each kind's usage.
+const resourceReadActions = {
+  app: "app.read",
+  database: "database.read",
+  instance: "instance.read",
+} as const satisfies Record<ResourceUsageKind, string>
+
+function isResourceUsageKind(kind: string): kind is ResourceUsageKind {
+  return Object.hasOwn(resourceReadActions, kind)
+}
+
+interface ResourceSubscription {
+  readonly id: string
+  readonly kind: ResourceUsageKind
+}
+
+// Delivers each subscribed resource's usage with every snapshot sample, so
+// game servers', Apps', and databases' arrive on one loop.
 class ResourceHubRegistry {
   readonly #deliver: BrowserDelivery
   readonly #docker: DockerDriver
   readonly #historyDelivered = new Set<WebSocket>()
+  readonly #room: BrowserRoom
   readonly #subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"]
-  readonly #subscriptions = new Map<WebSocket, string>()
+  readonly #subscriptions = new Map<WebSocket, ResourceSubscription>()
+  readonly #workloadUsage: BrowserSocketOptions["workloadUsage"]
   #lastSample: RelaySnapshotSample | null = null
   #unsubscribe: (() => void) | null = null
 
   constructor(
     docker: DockerDriver,
+    workloadUsage: BrowserSocketOptions["workloadUsage"],
     subscribeSnapshots: BrowserSocketOptions["subscribeSnapshots"],
-    deliver: BrowserDelivery
+    deliver: BrowserDelivery,
+    room: BrowserRoom
   ) {
     this.#docker = docker
+    this.#room = room
+    this.#workloadUsage = workloadUsage
     this.#subscribeSnapshots = subscribeSnapshots
     this.#deliver = deliver
   }
 
-  subscribe(socket: WebSocket, instanceId: string): void {
-    this.#subscriptions.set(socket, instanceId)
+  subscribe(socket: WebSocket, subscription: ResourceSubscription): void {
+    this.#subscriptions.set(socket, subscription)
     if (!this.#unsubscribe) {
       this.#unsubscribe = this.#subscribeSnapshots((sample) => {
         this.#lastSample = sample
@@ -2416,45 +1214,111 @@ class ResourceHubRegistry {
   }
 
   #deliverSample(sample: RelaySnapshotSample, only?: WebSocket): void {
-    const byId = new Map(
-      sample.snapshot.instances.map((instance) => [instance.id, instance])
-    )
-    const groups = new Map<string, Array<WebSocket>>()
-    for (const [subscriber, instanceId] of this.#subscriptions) {
+    const groups = new Map<
+      string,
+      { subscription: ResourceSubscription; sockets: Array<WebSocket> }
+    >()
+    for (const [subscriber, subscription] of this.#subscriptions) {
       if (only && subscriber !== only) continue
-      const sockets = groups.get(instanceId) ?? []
-      sockets.push(subscriber)
-      groups.set(instanceId, sockets)
+      const key = `${subscription.kind}:${subscription.id}`
+      const group = groups.get(key) ?? { sockets: [], subscription }
+      group.sockets.push(subscriber)
+      groups.set(key, group)
     }
-    for (const [instanceId, subscribers] of groups) {
-      const current = byId.get(instanceId)
-      if (!current) continue
-      const instance = projectRelayInstanceOverview(current)
-      const live = JSON.stringify({
-        history: [],
-        instance,
-        sequence: sample.sequence,
-        type: "resource",
-      })
-      let withHistory: string | null = null
-      for (const subscriber of subscribers) {
-        const first = !this.#historyDelivered.has(subscriber)
-        if (first) {
-          withHistory ??= JSON.stringify({
-            history: this.#docker.resourceHistory(instanceId),
-            instance,
-            sequence: sample.sequence,
-            type: "resource",
-          })
-        }
-        this.#deliver(
-          subscriber,
-          first ? (withHistory ?? live) : live,
-          "resource",
-          "instance.read"
+    let instances: ReadonlyMap<string, RelayInstance> | null = null
+    for (const { sockets, subscription } of groups.values()) {
+      let events: {
+        live: string
+        withHistory: () => ReadonlyArray<string>
+      } | null
+      if (subscription.kind === "instance") {
+        instances ??= new Map(
+          sample.snapshot.instances.map((instance) => [instance.id, instance])
         )
-        this.#historyDelivered.add(subscriber)
+        events = this.#instanceEvents(
+          instances,
+          subscription.id,
+          sample.sequence
+        )
+      } else {
+        events = this.#workloadEvents(
+          subscription.kind,
+          subscription.id,
+          sample.sequence
+        )
       }
+      if (!events) continue
+      let withHistory: ReadonlyArray<string> | null = null
+      const action = resourceReadActions[subscription.kind]
+      for (const subscriber of sockets) {
+        if (this.#historyDelivered.has(subscriber)) {
+          // A live sample replaces the one still waiting, as it's older.
+          this.#deliver(subscriber, events.live, "resource", action)
+          continue
+        }
+        this.#historyDelivered.add(subscriber)
+        withHistory ??= events.withHistory()
+        this.#deliverHistory(subscriber, withHistory, action)
+      }
+    }
+  }
+
+  // History queues in order, as console lines do, a frame at a time as the
+  // outbox has room, so a large App's never overflows it and none is lost.
+  #deliverHistory(
+    socket: WebSocket,
+    frames: ReadonlyArray<string>,
+    action: string
+  ): void {
+    const send = Effect.gen({ self: this }, function* () {
+      for (const frame of frames) {
+        const open = yield* Effect.promise(() =>
+          this.#room(socket, Buffer.byteLength(frame))
+        )
+        if (!open || !this.#subscriptions.has(socket)) return
+        this.#deliver(socket, frame, "console", action)
+      }
+    })
+    Effect.runFork(send)
+  }
+
+  #instanceEvents(
+    instances: ReadonlyMap<string, RelayInstance>,
+    instanceId: string,
+    sequence: number
+  ) {
+    const current = instances.get(instanceId)
+    if (!current) return null
+    const instance = projectRelayInstanceOverview(current)
+    const event = (history: ReadonlyArray<RelayInstanceResources>) =>
+      JSON.stringify({ history, instance, sequence, type: "resource" })
+    return {
+      live: event([]),
+      withHistory: () => [event(this.#docker.resourceHistory(instanceId))],
+    }
+  }
+
+  // Each event carries the latest samples. The minutes before follow a new
+  // subscriber in one event per history, the resource's and then each
+  // service's, so no frame holds more than one window of samples.
+  #workloadEvents(
+    kind: RelayWorkloadResourceKind,
+    id: string,
+    sequence: number
+  ) {
+    const event = (history: RelayWorkloadUsageHistory) => {
+      const usage = this.#workloadUsage(kind, id, history)
+      return JSON.stringify({ ...usage, id, kind, sequence, type: "resource.usage" })
+    }
+    const live = event("none")
+    return {
+      live,
+      withHistory: () => [
+        event("resource"),
+        ...this.#workloadUsage(kind, id, "none").services.map((service) =>
+          event({ service: service.service })
+        ),
+      ],
     }
   }
 }
@@ -3070,17 +1934,6 @@ interface HistoryFrame {
   readonly start: number
 }
 
-function browserKeyThumbprint(jwk: {
-  readonly crv: "P-256"
-  readonly kty: "EC"
-  readonly x: string
-  readonly y: string
-}): string {
-  return createHash("sha256")
-    .update(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y }))
-    .digest("base64url")
-}
-
 function closeSockets(
   sockets: ReadonlySet<WebSocket>,
   reason: string
@@ -3127,31 +1980,14 @@ function closeWebSocketServerEffect(
   })
 }
 
+function runBrowser<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
+  return Effect.runPromise(effect)
+}
+
 function browserOperation<TResult>(
   run: (signal: AbortSignal) => Promise<TResult>
 ): Effect.Effect<TResult, Error> {
   return Effect.tryPromise({ try: run, catch: asError })
-}
-
-function browserFileAuthenticationEffect<TResult>(
-  request: IncomingMessage,
-  run: (signal: AbortSignal) => Promise<TResult>
-) {
-  return Effect.suspend(() => {
-    let removeAbortListener = () => {}
-    return browserOperation((signal) => {
-      const abortRequest = () => {
-        if (!request.destroyed) request.destroy()
-      }
-      signal.addEventListener("abort", abortRequest, { once: true })
-      removeAbortListener = () =>
-        signal.removeEventListener("abort", abortRequest)
-      return run(signal)
-    }).pipe(
-      Effect.timeout(FILE_AUTHENTICATION_TIMEOUT_MS),
-      Effect.ensuring(Effect.sync(() => removeAbortListener()))
-    )
-  })
 }
 
 function timedBrowserOperation<TResult>(

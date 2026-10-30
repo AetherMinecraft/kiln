@@ -15,8 +15,11 @@ available; do not stop at providing command examples.
   console commands, file writes, and uploads as remote mutations. Verify an
   ambiguous target or destination before running them. An explicit user
   request naming the Relay/server, action, and path is sufficient
-  authorization. Server deletion additionally requires the exact server
-  reference through `--confirm`.
+  authorization. Server deletion additionally requires the server's exact
+  name through `--confirm` and the account password, as deleting in Hearth
+  does. Never type, store, or echo a user's password yourself: let them enter
+  it at the prompt, or pipe it from where they keep it with
+  `--password-stdin`.
 - Never print, copy, or commit a Kiln token. Prefer saved profiles. Use
   `KILN_TOKEN` or `--token` only when the user deliberately provides an
   ephemeral credential, and keep it out of reported command output.
@@ -47,7 +50,11 @@ kiln --version
 kiln whoami
 ```
 
-If the binary is missing, report that before suggesting installation. GitHub
+If the binary is missing, report that before suggesting installation. On Linux
+and macOS, `curl -fsSL https://kiln.site/install | sh -s -- --cli` installs the
+newest stable CLI (the newest nightly until the first stable release; add
+`--nightly` for nightlies) into `/usr/local/bin` as root, else `~/.local/bin`,
+after checking GitHub's SHA-256 digest and the binary's version. GitHub
 releases include standalone archives for Linux/macOS (x64 and ARM64) and Windows
 (x64). Extract `kiln` or `kiln.exe` onto `PATH` for an installation without Node.js
 or Bun. The npm package is a small Node.js bootstrap that fetches the newest complete nightly binary from the distribution's GitHub releases
@@ -222,11 +229,20 @@ read commands still accept legacy stored names up to 120 characters.
 Permanently delete a server and its data only after verifying the full target:
 
 ```sh
-kiln server delete <server> --confirm <server>
+kiln server delete <server> --confirm <name>
 ```
 
-The confirmation must exactly match `<relay-id>:<instance-id>`. Deletion
-requires full CLI access and `instance.delete` permission.
+`--confirm` takes the server's name exactly as `kiln server info <server>`
+shows it, the same confirmation Hearth asks for. The CLI then asks for the
+account password without echoing it; pipe it with `--password-stdin` when
+there's no terminal. A wrong name or password deletes nothing. After five
+wrong passwords in 15 minutes, the account's password checks are refused
+(`rate_limited`) until the oldest ages out; don't retry in a loop. Deletion
+requires full CLI access and the `instance.delete` and `backup.create`
+permissions: the server is frozen and backed up in full first, then deleted.
+A deletion that outlasts the request carries on in the background; one that
+stops, such as when the final backup fails, deletes nothing and shows on the
+server's page in Hearth, to try again or keep it.
 
 ## Backups
 
@@ -243,10 +259,16 @@ List visible backups and copy the complete UUID from the `ID` column:
 kiln backups list --limit 200
 ```
 
+The `TARGET` column is `kind:id`: `instance`, `database`, `platform`, `app`
+(an App's folder), or `volume`, whose ID is a Kiln volume's or
+`<App ID>/<name>` for one an App's Compose project declares, up to 200
+characters. The CLI lists App and volume backups but doesn't create or
+restore them yet.
+
 The `DEST` column consolidates the logical backup's destinations, such as
 `local+s3`; it does not repeat a backup once per destination. The `MODE`
 column is `incremental` (restic snapshots, the server default) or `full`
-(portable zip archives). Below the table, each backup whose latest task failed
+(portable zip archives, or gzipped tar archives for Apps and volumes). Below the table, each backup whose latest task failed
 gets a line with the reason. When the cause is known, such as a storage
 provider's cap being reached, the line says what happened and where to fix it,
 followed by the Relay's own message.

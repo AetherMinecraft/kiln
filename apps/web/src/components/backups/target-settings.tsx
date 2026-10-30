@@ -7,6 +7,7 @@ import {
   LoaderCircle,
   ShieldCheck,
 } from "lucide-react"
+import type { BackupTarget } from "@workspace/contracts"
 
 import { Button } from "@workspace/ui/components/button"
 import {
@@ -71,7 +72,7 @@ export function BackupTargetSettings({
   policy: BackupPolicy
   relayId: string
   storage: ReadonlyArray<BackupStorage>
-  target: { id: string; kind: "database" | "instance" | "platform" }
+  target: BackupTarget
 }) {
   const queryClient = useQueryClient()
   const initial = React.useMemo(
@@ -138,7 +139,7 @@ export function BackupTargetSettings({
               },
             })
           : null,
-        target.kind === "instance"
+        excludable(target.kind)
           ? updateBackupExcludes({
               data: {
                 exclude: draft.exclude
@@ -230,7 +231,7 @@ export function BackupTargetSettings({
             </Select>
           </SettingsRow>
         </SettingsPanel>
-        {target.kind === "instance" ? (
+        {excludable(target.kind) ? (
           <SettingsPanel icon={<FolderX />} title="Exclusions">
             <div className="p-4">
               <Textarea
@@ -409,4 +410,11 @@ function wholeAtLeastOne(value: string): boolean {
 
 function gibibytes(bytes: number): number {
   return Math.round((bytes / GIB) * 100) / 100
+}
+
+// A game server's folder, an App's, and a volume are archived file by file,
+// so their backups can leave paths out; a database's dump and Kiln's
+// bundle can't.
+function excludable(kind: BackupTarget["kind"]): boolean {
+  return kind === "instance" || kind === "app" || kind === "volume"
 }

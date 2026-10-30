@@ -1,12 +1,16 @@
+import { randomUUID } from "node:crypto"
+
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node"
 import type { z } from "zod"
-import { Context, Effect, Layer, Result, Schema } from "effect"
+import { Context, Effect, Layer, Predicate, Result, Schema } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import type {
   BackupFailureCode,
   BackupTaskInput,
   BackupTaskPhase,
   BackupTaskResult,
+  DatabaseConnectionMember,
+  DatabaseConnectionMemberKind,
   RelayBackupTask,
   RelayDesiredState,
   RelayInstanceLifecycleEvent,
@@ -60,6 +64,9 @@ export interface RelayClientRecord extends RelayClientGrant {
 
 export interface RelayInvitationInput {
   readonly actions: ReadonlyArray<string>
+  // The only Hearth client that may pair with it, by key fingerprint, as a
+  // join's invitation is; null for any holder of the token.
+  readonly clientId?: string | null
   readonly createdAt: number
   readonly expiresAt: number
   readonly id: string
@@ -69,6 +76,7 @@ export interface RelayInvitationInput {
 
 export interface RelayInvitation {
   readonly actions: ReadonlyArray<string>
+  readonly clientId: string | null
   readonly createdAt: number
   readonly expiresAt: number
   readonly id: string
@@ -126,13 +134,41 @@ export interface RelayStoredWebRoute extends RelayInstanceWebRoute {
   readonly service?: string
 }
 
+/**
+ * A member's connection to a database: a game server's, an App's (every
+ * service of it), or another database's. Game servers name the Relay the
+ * database is on; Apps and databases only connect to databases on theirs.
+ */
 export interface RelayStoredDatabaseConnection {
-  readonly instanceId: string
+  readonly memberKind: DatabaseConnectionMemberKind
+  readonly memberId: string
   readonly databaseId: string
   readonly relayId: string
 }
 
 export const DATABASE_CONNECTION_RECOVERY_KEY = "database_connections_recovered"
+
+/** A resource frozen for its deletion, and the deletion that froze it. */
+export interface RelayResourceFreezeRecord {
+  readonly deletionId: string
+  readonly id: string
+  readonly kind: "app" | "database" | "instance" | "volume"
+}
+
+/**
+ * What freezing changed that letting it go puts back: the restart policies
+ * of an App's containers, by container.
+ */
+export interface RelayResourceFreezeUndo {
+  readonly restartPolicies?: Readonly<
+    Record<
+      string,
+      { readonly maximumRetryCount: number; readonly name: string }
+    >
+  >
+}
+
+const OPERATION_JOURNAL_METADATA_KEY = "operation_journal_id"
 
 export interface RelayStoredInstanceName {
   readonly instanceId: string
@@ -142,6 +178,28 @@ export interface RelayStoredInstanceName {
 export interface RelayStoredVolumeName {
   readonly name: string
   readonly volumeId: string
+}
+
+/**
+ * A Kiln volume an App's configuration mounts, deployed or not, as the
+ * Hearth that keeps that configuration said.
+ */
+export interface RelayAppVolumeReference {
+  readonly appId: string
+  readonly clientId: string
+  readonly volumeId: string
+}
+
+/**
+ * That a Hearth has sent every App configuration it keeps for this Relay,
+ * but for those it couldn't read, which it still owes, on one of its
+ * control connections.
+ */
+export interface RelayVolumeReferenceImport {
+  readonly clientId: string
+  readonly connectionId: string
+  readonly importedAt: number
+  readonly unresolvedAppIds: ReadonlyArray<string>
 }
 
 /** Kinds of instance whose disk limit the Relay keeps here, not on Docker. */
@@ -170,7 +228,10 @@ const provisioningSchemas = {
     input: relayCreateDatabaseSchema,
     placeholder: relayManagedDatabaseSchema,
   },
-  server: { input: relayCreateInstanceSchema, placeholder: relayInstanceSchema },
+  server: {
+    input: relayCreateInstanceSchema,
+    placeholder: relayInstanceSchema,
+  },
 }
 
 export type RelayProvisioningKind = keyof typeof provisioningSchemas
@@ -188,7 +249,9 @@ export type RelayProvisioningJob<
     /** The ID of the instance it provisions. */
     readonly instanceId: string
     readonly kind: K
-    readonly placeholder: z.infer<(typeof provisioningSchemas)[K]["placeholder"]>
+    readonly placeholder: z.infer<
+      (typeof provisioningSchemas)[K]["placeholder"]
+    >
     readonly status: RelayProvisioningJobStatus
     readonly updatedAt: number
   }
@@ -256,6 +319,7 @@ const RelayClientRowSchema = Schema.Struct({
 
 const RelayInvitationRowSchema = Schema.Struct({
   actionsJson: Schema.String,
+  clientId: Schema.NullOr(Schema.String),
   createdAt: Schema.Number,
   expiresAt: Schema.Number,
   id: Schema.String,
@@ -278,13 +342,19 @@ const RelayAuditRowSchema = Schema.Struct({
 
 const RelayWebRouteRowSchema = Schema.Struct({
   hostname: Schema.String,
+  httpsRedirect: Schema.Number,
   id: Schema.String,
   instanceId: Schema.String,
+  isPrimary: Schema.Number,
   name: Schema.String,
   path: Schema.String,
+  redirectPermanent: Schema.Number,
+  redirectPreservePath: Schema.Number,
+  redirectTo: Schema.NullOr(Schema.String),
   service: Schema.NullOr(Schema.String),
   stripPrefix: Schema.Number,
-  targetPort: Schema.Number,
+  targetPort: Schema.NullOr(Schema.Number),
+  www: Schema.Literals(["none", "redirect", "serve"]),
 })
 
 const RelayInstancePortProtocolSchema = Schema.Literals(["tcp", "udp", "both"])
@@ -411,8 +481,12 @@ export class RelayStateStore extends Context.Service<
   RelayStateStore,
   {
     readonly schedules: RelayScheduleState
-    readonly listInstanceDatabaseConnections: (
-      instanceId: string
+    readonly listDatabaseConnections: () => Effect.Effect<
+      ReadonlyArray<RelayStoredDatabaseConnection>,
+      RelayStateError
+    >
+    readonly listMemberDatabaseConnections: (
+      member: DatabaseConnectionMember
     ) => Effect.Effect<
       ReadonlyArray<RelayStoredDatabaseConnection>,
       RelayStateError
@@ -421,12 +495,24 @@ export class RelayStateStore extends Context.Service<
       connection: RelayStoredDatabaseConnection,
       connected: boolean
     ) => Effect.Effect<void, RelayStateError>
+    /** Game servers' connections, recovered once from their containers. */
     readonly recoverDatabaseConnections: (
       connections: ReadonlyArray<RelayStoredDatabaseConnection>
     ) => Effect.Effect<void, RelayStateError>
-    readonly deleteInstanceDatabaseConnections: (
-      instanceId: string
+    /**
+     * Adds the connections not saved yet, keeping those that are, and none
+     * someone has connected or disconnected (`setDatabaseConnection`) since.
+     */
+    readonly importDatabaseConnections: (
+      connections: ReadonlyArray<RelayStoredDatabaseConnection>
+    ) => Effect.Effect<number, RelayStateError>
+    readonly deleteMemberDatabaseConnections: (
+      member: DatabaseConnectionMember
     ) => Effect.Effect<void, RelayStateError>
+    /**
+     * Forgets a deleted database: every member's connection to it, and its
+     * own connections to others.
+     */
     readonly deleteDatabaseConnections: (
       relayId: string,
       databaseId: string
@@ -466,6 +552,12 @@ export class RelayStateStore extends Context.Service<
     readonly pruneOperations: (
       finishedBefore: number
     ) => Effect.Effect<void, RelayStateError>
+    /**
+     * Names this journal of changes, made once with the Relay's state. A
+     * rebuilt state starts a new journal under a new ID, even for the same
+     * Relay and Hearth, so Hearth can tell "never ran" from "forgotten".
+     */
+    readonly operationJournalId: () => Effect.Effect<string, RelayStateError>
     /** The paired Hearths holding this Relay paused. */
     readonly listPauseHolds: () => Effect.Effect<
       ReadonlyArray<string>,
@@ -475,6 +567,36 @@ export class RelayStateStore extends Context.Service<
       clientId: string,
       paused: boolean,
       now: number
+    ) => Effect.Effect<void, RelayStateError>
+    /** The resources frozen for their deletion. */
+    readonly listResourceFreezes: () => Effect.Effect<
+      ReadonlyArray<
+        RelayResourceFreezeRecord & { readonly undo: RelayResourceFreezeUndo }
+      >,
+      RelayStateError
+    >
+    /** Records what freezing a resource changed, for letting it go. */
+    readonly setResourceFreezeUndo: (
+      freeze: RelayResourceFreezeRecord,
+      undo: RelayResourceFreezeUndo
+    ) => Effect.Effect<void, RelayStateError>
+    /**
+     * Freezes a resource for a deletion, or confirms it already is. Returns
+     * the deletion holding it, which is another one's when someone else
+     * froze it first.
+     */
+    readonly freezeResource: (
+      freeze: RelayResourceFreezeRecord,
+      now: number
+    ) => Effect.Effect<string, RelayStateError>
+    /** Lets a resource go, if the deletion still holds it. */
+    readonly unfreezeResource: (
+      freeze: RelayResourceFreezeRecord
+    ) => Effect.Effect<void, RelayStateError>
+    /** Drops a deleted resource's freeze, whichever deletion held it. */
+    readonly forgetResourceFreeze: (
+      kind: RelayResourceFreezeRecord["kind"],
+      id: string
     ) => Effect.Effect<void, RelayStateError>
     readonly createInvitation: (
       input: RelayInvitationInput
@@ -554,6 +676,25 @@ export class RelayStateStore extends Context.Service<
      * Records a task's result. A `prune` is queued with it, in the same
      * transaction, unless one for the same repository is already waiting.
      */
+    /**
+     * Marks a restore that startup recovery finished as succeeded: one a
+     * stop cut off while running, or one that failed while swapping its
+     * files in, which recovery finished, saying so.
+     */
+    /**
+     * Claims the queued backups of a stopped batch, which run in the stopped
+     * window its first claimed backup opened, oldest first.
+     */
+    readonly claimBatchBackupTasks: (
+      batchId: string,
+      now: number
+    ) => Effect.Effect<ReadonlyArray<RelayBackupTask>, RelayStateError>
+    readonly completeRecoveredRestore: (
+      taskId: string,
+      now: number,
+      /** Its warning, when it's not the one for finishing at startup. */
+      warning?: string | null
+    ) => Effect.Effect<boolean, RelayStateError>
     readonly completeBackupTask: (
       taskId: string,
       result: BackupTaskResult,
@@ -734,6 +875,65 @@ export class RelayStateStore extends Context.Service<
     ) => Effect.Effect<void, RelayStateError>
     readonly deleteVolumeName: (
       volumeId: string
+    ) => Effect.Effect<void, RelayStateError>
+    readonly listAppVolumeReferences: () => Effect.Effect<
+      ReadonlyArray<RelayAppVolumeReference>,
+      RelayStateError
+    >
+    readonly listVolumeReferenceImports: () => Effect.Effect<
+      ReadonlyArray<RelayVolumeReferenceImport>,
+      RelayStateError
+    >
+    /**
+     * Replaces the volumes one App's configuration names, as one Hearth
+     * keeps it. That Hearth read the configuration, so it no longer owes it.
+     */
+    readonly replaceAppVolumeReferences: (
+      clientId: string,
+      appId: string,
+      volumeIds: ReadonlyArray<string>
+    ) => Effect.Effect<void, RelayStateError>
+    /**
+     * Replaces every App configuration's volumes one Hearth sent before
+     * with these, and records that it sent them all but those it couldn't
+     * read, together.
+     */
+    readonly importAppVolumeReferences: (
+      clientId: string,
+      connectionId: string,
+      apps: ReadonlyArray<{
+        readonly appId: string
+        readonly volumeIds: ReadonlyArray<string>
+      }>,
+      unresolvedAppIds: ReadonlyArray<string>
+    ) => Effect.Effect<void, RelayStateError>
+    /**
+     * Forgets what one Hearth said a deleted App's configuration named, and
+     * that it couldn't read it; other Hearths' keep theirs until they send
+     * their configurations again.
+     */
+    readonly deleteAppVolumeReferences: (
+      clientId: string,
+      appId: string
+    ) => Effect.Effect<void, RelayStateError>
+    /**
+     * Forgets that a Hearth has sent its Apps' configurations, so deletion
+     * waits until it sends them again; what it named stays.
+     */
+    /**
+     * Notes that a person changed an App's power: started, stopped,
+     * restarted, deployed, or deleted it.
+     */
+    readonly bumpAppPowerRevision: (
+      appId: string,
+      now: number
+    ) => Effect.Effect<void, RelayStateError>
+    /** Each App's power revision; one never changed is 0, and left out. */
+    readonly listAppPowerRevisions: (
+      appIds: ReadonlyArray<string>
+    ) => Effect.Effect<ReadonlyMap<string, number>, RelayStateError>
+    readonly holdVolumeReferenceImport: (
+      clientId: string
     ) => Effect.Effect<void, RelayStateError>
     readonly deletePendingPrimaryPort: (
       instanceId: string
@@ -1286,7 +1486,199 @@ const migrations = SqliteMigrator.fromRecord({
     if (columns.some((column) => column.name === "maintenance_key")) return
     yield* sql`ALTER TABLE relay_backup_tasks ADD COLUMN maintenance_key TEXT`
   }),
+  // The Hearth client a join's invitation is for.
+  "26_invitation_client": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const columns = yield* sql<{
+      name: string
+    }>`PRAGMA table_info(relay_invitations)`
+    if (columns.some((column) => column.name === "client_id")) return
+    yield* sql`ALTER TABLE relay_invitations ADD COLUMN client_id TEXT`
+  }),
+  // Routes take a www counterpart, plain HTTP, a primary flag, and a
+  // redirect, which has no port.
+  "27_web_route_options": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`
+      CREATE TABLE relay_web_routes_next (
+        id TEXT PRIMARY KEY NOT NULL,
+        instance_id TEXT NOT NULL,
+        hostname TEXT NOT NULL,
+        path TEXT NOT NULL DEFAULT '',
+        strip_prefix INTEGER NOT NULL CHECK (strip_prefix IN (0, 1)),
+        target_port INTEGER
+          CHECK (target_port IS NULL OR target_port BETWEEN 1 AND 65535),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        service TEXT,
+        www TEXT NOT NULL DEFAULT 'none'
+          CHECK (www IN ('none', 'redirect', 'serve')),
+        https_redirect INTEGER NOT NULL DEFAULT 1
+          CHECK (https_redirect IN (0, 1)),
+        is_primary INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1)),
+        redirect_to TEXT,
+        redirect_permanent INTEGER NOT NULL DEFAULT 1
+          CHECK (redirect_permanent IN (0, 1)),
+        redirect_preserve_path INTEGER NOT NULL DEFAULT 1
+          CHECK (redirect_preserve_path IN (0, 1)),
+        CHECK ((redirect_to IS NULL) <> (target_port IS NULL)),
+        UNIQUE (hostname, path)
+      ) STRICT
+    `
+    yield* sql`
+      INSERT INTO relay_web_routes_next (
+        id, instance_id, hostname, path, strip_prefix, target_port,
+        created_at, updated_at, name, service
+      )
+      SELECT
+        id, instance_id, hostname, path, strip_prefix, target_port,
+        created_at, updated_at, name, service
+      FROM relay_web_routes
+    `
+    yield* sql`DROP TABLE relay_web_routes`
+    yield* sql`ALTER TABLE relay_web_routes_next RENAME TO relay_web_routes`
+    yield* sql`
+      CREATE INDEX relay_web_routes_instance
+      ON relay_web_routes (instance_id)
+    `
+  }),
+  // Connections name their member by kind: game servers, whose connections
+  // these all were, Apps, and databases. Choices remember every pair someone
+  // connected or disconnected, so a handover of Apps' old connections from
+  // a Hearth never overrules one.
+  "28_database_connection_members": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`
+      CREATE TABLE IF NOT EXISTS relay_database_connection_choices (
+        member_kind TEXT NOT NULL
+          CHECK (member_kind IN ('instance', 'app', 'database')),
+        member_id TEXT NOT NULL,
+        database_id TEXT NOT NULL,
+        PRIMARY KEY (member_kind, member_id, database_id)
+      ) STRICT
+    `
+    const columns = yield* sql<{
+      name: string
+    }>`PRAGMA table_info(relay_database_connections)`
+    if (columns.some((column) => column.name === "member_kind")) return
+    yield* sql`
+      CREATE TABLE relay_database_connections_next (
+        member_kind TEXT NOT NULL
+          CHECK (member_kind IN ('instance', 'app', 'database')),
+        member_id TEXT NOT NULL,
+        database_id TEXT NOT NULL,
+        relay_id TEXT NOT NULL,
+        PRIMARY KEY (member_kind, member_id, database_id),
+        CHECK (member_kind <> 'database' OR member_id <> database_id)
+      ) STRICT
+    `
+    yield* sql`
+      INSERT INTO relay_database_connections_next (
+        member_kind, member_id, database_id, relay_id
+      )
+      SELECT 'instance', instance_id, database_id, relay_id
+      FROM relay_database_connections
+    `
+    yield* sql`DROP TABLE relay_database_connections`
+    yield* sql`
+      ALTER TABLE relay_database_connections_next
+      RENAME TO relay_database_connections
+    `
+    yield* sql`
+      CREATE INDEX relay_database_connections_target
+      ON relay_database_connections (relay_id, database_id)
+    `
+  }),
+  // The Kiln volumes each App's configuration mounts, which the Hearth that
+  // keeps it says, so the Relay can refuse to delete one an App would mount
+  // when it next deploys; and which paired Hearths have sent all of theirs.
+  // Relays from before start empty and wait for each Hearth to send them.
+  "29_app_volume_references": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE IF NOT EXISTS relay_app_volume_references (
+      client_id TEXT NOT NULL,
+      app_id TEXT NOT NULL,
+      volume_id TEXT NOT NULL,
+      PRIMARY KEY (client_id, app_id, volume_id)
+    ) STRICT`
+    yield* sql`CREATE TABLE IF NOT EXISTS relay_volume_reference_imports (
+      client_id TEXT PRIMARY KEY NOT NULL,
+      connection_id TEXT NOT NULL,
+      imported_at INTEGER NOT NULL,
+      unresolved_json TEXT NOT NULL DEFAULT '[]'
+    ) STRICT`
+    yield* sql`
+      CREATE INDEX IF NOT EXISTS relay_app_volume_references_volume
+      ON relay_app_volume_references (volume_id)
+    `
+  }),
+  // How many times a person has changed each App's power, so a start a
+  // stopped backup owes from before isn't made over a later choice.
+  "30_app_power_revisions": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE IF NOT EXISTS relay_app_power_revisions (
+      app_id TEXT PRIMARY KEY NOT NULL,
+      revision INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    ) STRICT`
+  }),
+  // Resources being deleted, so a restart keeps refusing work on them.
+  "31_resource_freezes": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE IF NOT EXISTS relay_resource_freezes (
+      kind TEXT NOT NULL CHECK (kind IN ('app', 'database', 'instance')),
+      resource_id TEXT NOT NULL,
+      deletion_id TEXT NOT NULL,
+      frozen_at INTEGER NOT NULL,
+      undo TEXT NOT NULL DEFAULT '{}',
+      PRIMARY KEY (kind, resource_id)
+    ) STRICT`
+  }),
+  // Kiln volumes are frozen for their deletion too. The table is rebuilt to
+  // take the kind, keeping its rows; one that already takes it is left be.
+  "32_resource_freeze_volumes": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const [table] = yield* sql<{ sql: string }>`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'relay_resource_freezes'
+    `
+    if (table?.sql.includes("'volume'")) return
+    yield* sql`DROP TABLE IF EXISTS relay_resource_freezes_next`
+    yield* sql`CREATE TABLE relay_resource_freezes_next (
+      kind TEXT NOT NULL
+        CHECK (kind IN ('app', 'database', 'instance', 'volume')),
+      resource_id TEXT NOT NULL,
+      deletion_id TEXT NOT NULL,
+      frozen_at INTEGER NOT NULL,
+      undo TEXT NOT NULL DEFAULT '{}',
+      PRIMARY KEY (kind, resource_id)
+    ) STRICT`
+    yield* sql`
+      INSERT INTO relay_resource_freezes_next
+        (kind, resource_id, deletion_id, frozen_at, undo)
+      SELECT kind, resource_id, deletion_id, frozen_at, undo
+      FROM relay_resource_freezes
+    `
+    yield* sql`DROP TABLE relay_resource_freezes`
+    yield* sql`
+      ALTER TABLE relay_resource_freezes_next
+      RENAME TO relay_resource_freezes
+    `
+  }),
 })
+
+// The App IDs a Hearth still owes, as stored; anything unreadable owes
+// nothing it can name, so it's kept as it is.
+function decodeUnresolved(json: string): Array<string> {
+  return Result.getOrElse(
+    Result.try(() => {
+      const parsed = JSON.parse(json) as unknown
+      return Array.isArray(parsed) ? parsed.filter(Predicate.isString) : []
+    }),
+    () => []
+  )
+}
 
 function scrubBackupTaskInputJson(inputJson: string): string {
   return Result.getOrElse(
@@ -1327,6 +1719,43 @@ const makeRelayStateStore = Effect.gen(function* () {
         rows[0] ? { ...rows[0], retryable: rows[0].retryable === 1 } : null
       )
     )
+
+  const insertAppVolumeReferences = (
+    clientId: string,
+    appId: string,
+    volumeIds: ReadonlyArray<string>
+  ) =>
+    Effect.forEach(
+      new Set(volumeIds),
+      (volumeId) => sql`
+        INSERT INTO relay_app_volume_references (client_id, app_id, volume_id)
+        VALUES (${clientId}, ${appId}, ${volumeId})
+      `,
+      { discard: true }
+    )
+
+  // Takes Apps off what a Hearth still owes, or off every Hearth's.
+  const resolveAppVolumeReferences = (
+    clientId: string | null,
+    appIds: ReadonlySet<string>
+  ) =>
+    Effect.gen(function* () {
+      const rows = yield* sql<{ clientId: string; unresolvedJson: string }>`
+        SELECT client_id AS clientId, unresolved_json AS unresolvedJson
+        FROM relay_volume_reference_imports
+      `
+      for (const row of rows) {
+        if (clientId !== null && row.clientId !== clientId) continue
+        const unresolved = decodeUnresolved(row.unresolvedJson)
+        const remaining = unresolved.filter((appId) => !appIds.has(appId))
+        if (remaining.length === unresolved.length) continue
+        yield* sql`
+          UPDATE relay_volume_reference_imports
+          SET unresolved_json = ${JSON.stringify(remaining)}
+          WHERE client_id = ${row.clientId}
+        `
+      }
+    })
 
   const decodeClientRows = Schema.decodeUnknownEffect(
     Schema.Array(RelayClientRowSchema)
@@ -1771,10 +2200,16 @@ const makeRelayStateStore = Effect.gen(function* () {
             path,
             service,
             strip_prefix AS stripPrefix,
-            target_port AS targetPort
+            target_port AS targetPort,
+            www,
+            https_redirect AS httpsRedirect,
+            is_primary AS isPrimary,
+            redirect_to AS redirectTo,
+            redirect_permanent AS redirectPermanent,
+            redirect_preserve_path AS redirectPreservePath
           FROM relay_web_routes
           WHERE instance_id = ${instanceId}
-          ORDER BY created_at ASC
+          ORDER BY created_at ASC, rowid ASC
         `
       : yield* sql<Record<string, unknown>>`
           SELECT
@@ -1785,20 +2220,37 @@ const makeRelayStateStore = Effect.gen(function* () {
             path,
             service,
             strip_prefix AS stripPrefix,
-            target_port AS targetPort
+            target_port AS targetPort,
+            www,
+            https_redirect AS httpsRedirect,
+            is_primary AS isPrimary,
+            redirect_to AS redirectTo,
+            redirect_permanent AS redirectPermanent,
+            redirect_preserve_path AS redirectPreservePath
           FROM relay_web_routes
-          ORDER BY created_at ASC
+          ORDER BY created_at ASC, rowid ASC
         `
     const decoded = yield* decodeWebRouteRows(rows)
     return decoded.map((row) => ({
       hostname: row.hostname,
+      httpsRedirect: row.httpsRedirect === 1,
       id: row.id,
       instanceId: row.instanceId,
       name: row.name,
       path: row.path || null,
+      primary: row.isPrimary === 1,
+      redirect:
+        row.redirectTo === null
+          ? null
+          : {
+              permanent: row.redirectPermanent === 1,
+              preservePath: row.redirectPreservePath === 1,
+              to: row.redirectTo,
+            },
       ...(row.service === null ? {} : { service: row.service }),
       stripPrefix: row.stripPrefix === 1,
       targetPort: row.targetPort,
+      www: row.www,
     }))
   })
 
@@ -1882,35 +2334,61 @@ const makeRelayStateStore = Effect.gen(function* () {
 
   return RelayStateStore.of({
     schedules: makeRelayScheduleState(sql),
-    listInstanceDatabaseConnections: (instanceId) =>
+    listDatabaseConnections: () =>
       run(
-        "list_instance_database_connections",
+        "list_database_connections",
         sql<RelayStoredDatabaseConnection>`
-          SELECT instance_id AS instanceId, database_id AS databaseId,
-                 relay_id AS relayId
-          FROM relay_database_connections WHERE instance_id = ${instanceId}
+          SELECT member_kind AS memberKind, member_id AS memberId,
+                 database_id AS databaseId, relay_id AS relayId
+          FROM relay_database_connections
+          ORDER BY member_kind, member_id, database_id
+        `
+      ),
+    listMemberDatabaseConnections: (member) =>
+      run(
+        "list_member_database_connections",
+        sql<RelayStoredDatabaseConnection>`
+          SELECT member_kind AS memberKind, member_id AS memberId,
+                 database_id AS databaseId, relay_id AS relayId
+          FROM relay_database_connections
+          WHERE member_kind = ${member.kind} AND member_id = ${member.id}
           ORDER BY database_id
         `
       ),
     setDatabaseConnection: (connection, connected) =>
       run(
         "set_database_connection",
-        connected
-          ? sql`
-              INSERT INTO relay_database_connections (
-                instance_id, database_id, relay_id
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* connected
+              ? sql`
+                  INSERT INTO relay_database_connections (
+                    member_kind, member_id, database_id, relay_id
+                  ) VALUES (
+                    ${connection.memberKind}, ${connection.memberId},
+                    ${connection.databaseId}, ${connection.relayId}
+                  )
+                  ON CONFLICT (member_kind, member_id, database_id)
+                  DO UPDATE SET relay_id = excluded.relay_id
+                `
+              : sql`
+                  DELETE FROM relay_database_connections
+                  WHERE member_kind = ${connection.memberKind}
+                    AND member_id = ${connection.memberId}
+                    AND database_id = ${connection.databaseId}
+                    AND relay_id = ${connection.relayId}
+                `
+            yield* sql`
+              INSERT INTO relay_database_connection_choices (
+                member_kind, member_id, database_id
               ) VALUES (
-                ${connection.instanceId}, ${connection.databaseId}, ${connection.relayId}
+                ${connection.memberKind}, ${connection.memberId},
+                ${connection.databaseId}
               )
-              ON CONFLICT (instance_id, database_id)
-              DO UPDATE SET relay_id = excluded.relay_id
-            `.pipe(Effect.asVoid)
-          : sql`
-              DELETE FROM relay_database_connections
-              WHERE instance_id = ${connection.instanceId}
-                AND database_id = ${connection.databaseId}
-                AND relay_id = ${connection.relayId}
-            `.pipe(Effect.asVoid)
+              ON CONFLICT DO NOTHING
+            `
+          })
+        )
       ),
     recoverDatabaseConnections: (connections) =>
       run(
@@ -1925,11 +2403,12 @@ const makeRelayStateStore = Effect.gen(function* () {
             for (const connection of connections) {
               yield* sql`
                 INSERT INTO relay_database_connections (
-                  instance_id, database_id, relay_id
+                  member_kind, member_id, database_id, relay_id
                 ) VALUES (
-                  ${connection.instanceId}, ${connection.databaseId}, ${connection.relayId}
+                  ${connection.memberKind}, ${connection.memberId},
+                  ${connection.databaseId}, ${connection.relayId}
                 )
-                ON CONFLICT (instance_id, database_id) DO NOTHING
+                ON CONFLICT (member_kind, member_id, database_id) DO NOTHING
               `
             }
             yield* sql`
@@ -1939,20 +2418,69 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
-    deleteInstanceDatabaseConnections: (instanceId) =>
+    importDatabaseConnections: (connections) =>
       run(
-        "delete_instance_database_connections",
-        sql`
-          DELETE FROM relay_database_connections WHERE instance_id = ${instanceId}
-        `.pipe(Effect.asVoid)
+        "import_database_connections",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            let imported = 0
+            for (const connection of connections) {
+              // A pair someone chose since stays as they left it.
+              const rows = yield* sql<{ memberId: string }>`
+                INSERT INTO relay_database_connections (
+                  member_kind, member_id, database_id, relay_id
+                )
+                SELECT ${connection.memberKind}, ${connection.memberId},
+                       ${connection.databaseId}, ${connection.relayId}
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM relay_database_connection_choices
+                  WHERE member_kind = ${connection.memberKind}
+                    AND member_id = ${connection.memberId}
+                    AND database_id = ${connection.databaseId}
+                )
+                ON CONFLICT (member_kind, member_id, database_id) DO NOTHING
+                RETURNING member_id AS memberId
+              `
+              imported += rows.length
+            }
+            return imported
+          })
+        )
+      ),
+    deleteMemberDatabaseConnections: (member) =>
+      run(
+        "delete_member_database_connections",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            for (const table of [
+              "relay_database_connections",
+              "relay_database_connection_choices",
+            ]) {
+              yield* sql`
+                DELETE FROM ${sql(table)}
+                WHERE member_kind = ${member.kind} AND member_id = ${member.id}
+              `
+            }
+          })
+        )
       ),
     deleteDatabaseConnections: (relayId, databaseId) =>
       run(
         "delete_database_connections",
-        sql`
-          DELETE FROM relay_database_connections
-          WHERE relay_id = ${relayId} AND database_id = ${databaseId}
-        `.pipe(Effect.asVoid)
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              DELETE FROM relay_database_connections
+              WHERE (relay_id = ${relayId} AND database_id = ${databaseId})
+                 OR (member_kind = 'database' AND member_id = ${databaseId})
+            `
+            yield* sql`
+              DELETE FROM relay_database_connection_choices
+              WHERE database_id = ${databaseId}
+                 OR (member_kind = 'database' AND member_id = ${databaseId})
+            `
+          })
+        )
       ),
     startOperation: (input) =>
       run(
@@ -2014,6 +2542,22 @@ const makeRelayStateStore = Effect.gen(function* () {
           WHERE status <> 'running' AND started_at < ${finishedBefore}
         `.pipe(Effect.asVoid)
       ),
+    operationJournalId: () =>
+      run(
+        "operation_journal_id",
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO relay_metadata (key, value)
+            VALUES (${OPERATION_JOURNAL_METADATA_KEY}, ${randomUUID()})
+            ON CONFLICT (key) DO NOTHING
+          `
+          const rows = yield* sql<{ value: string }>`
+            SELECT value FROM relay_metadata
+            WHERE key = ${OPERATION_JOURNAL_METADATA_KEY}
+          `
+          return rows[0]!.value
+        })
+      ),
     listPauseHolds: () =>
       run(
         "list_pause_holds",
@@ -2039,6 +2583,65 @@ const makeRelayStateStore = Effect.gen(function* () {
           : sql`DELETE FROM relay_pause_holds WHERE client_id = ${clientId}`
         ).pipe(Effect.asVoid)
       ),
+    listResourceFreezes: () =>
+      run(
+        "list_resource_freezes",
+        sql<RelayResourceFreezeRecord & { readonly undo: string }>`
+          SELECT kind, resource_id AS id, deletion_id AS deletionId, undo
+            FROM relay_resource_freezes
+        `.pipe(
+          Effect.map((rows) =>
+            rows.map((row) => ({
+              ...row,
+              undo: JSON.parse(row.undo) as RelayResourceFreezeUndo,
+            }))
+          )
+        )
+      ),
+    setResourceFreezeUndo: (freeze, undo) =>
+      run(
+        "set_resource_freeze_undo",
+        sql`
+          UPDATE relay_resource_freezes SET undo = ${JSON.stringify(undo)}
+           WHERE kind = ${freeze.kind} AND resource_id = ${freeze.id}
+             AND deletion_id = ${freeze.deletionId}
+        `.pipe(Effect.asVoid)
+      ),
+    freezeResource: (freeze, now) =>
+      run(
+        "freeze_resource",
+        sql`
+          INSERT INTO relay_resource_freezes
+            (kind, resource_id, deletion_id, frozen_at)
+          VALUES (${freeze.kind}, ${freeze.id}, ${freeze.deletionId}, ${now})
+          ON CONFLICT (kind, resource_id) DO NOTHING
+        `.pipe(
+          Effect.andThen(
+            sql<{ deletionId: string }>`
+              SELECT deletion_id AS deletionId FROM relay_resource_freezes
+               WHERE kind = ${freeze.kind} AND resource_id = ${freeze.id}
+            `
+          ),
+          Effect.map((rows) => rows[0]?.deletionId ?? freeze.deletionId)
+        )
+      ),
+    unfreezeResource: (freeze) =>
+      run(
+        "unfreeze_resource",
+        sql`
+          DELETE FROM relay_resource_freezes
+           WHERE kind = ${freeze.kind} AND resource_id = ${freeze.id}
+             AND deletion_id = ${freeze.deletionId}
+        `.pipe(Effect.asVoid)
+      ),
+    forgetResourceFreeze: (kind, id) =>
+      run(
+        "forget_resource_freeze",
+        sql`
+          DELETE FROM relay_resource_freezes
+           WHERE kind = ${kind} AND resource_id = ${id}
+        `.pipe(Effect.asVoid)
+      ),
     appendAudit: (input) =>
       run(
         "append_audit",
@@ -2060,14 +2663,16 @@ const makeRelayStateStore = Effect.gen(function* () {
         "create_invitation",
         sql`
           INSERT INTO relay_invitations (
-            id, token_hash, role, actions_json, created_at, expires_at
+            id, token_hash, role, actions_json, created_at, expires_at,
+            client_id
           ) VALUES (
             ${input.id},
             ${input.tokenHash},
             ${input.role},
             ${JSON.stringify(input.actions)},
             ${input.createdAt},
-            ${input.expiresAt}
+            ${input.expiresAt},
+            ${input.clientId ?? null}
           )
         `.pipe(Effect.asVoid)
       ),
@@ -2204,6 +2809,44 @@ const makeRelayStateStore = Effect.gen(function* () {
               `
               return (yield* backupTasks({ taskId: row.taskId }))[0] ?? null
             }
+          })
+        )
+      ),
+    claimBatchBackupTasks: (batchId, now) =>
+      run(
+        "claim_batch_backup_tasks",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<{ taskId: string }>`
+              SELECT task_id AS taskId
+              FROM relay_backup_tasks
+              WHERE status = 'queued' AND input_refresh_required = 0
+                AND kind = 'create'
+                AND json_extract(input_json, '$.batch.id') = ${batchId}
+              ORDER BY created_at ASC, task_id ASC
+            `
+            const claimed: Array<RelayBackupTask> = []
+            for (const row of rows) {
+              yield* sql`
+                UPDATE relay_backup_tasks
+                SET status = 'running',
+                    started_at = COALESCE(started_at, ${now}),
+                    updated_at = ${now},
+                    error = NULL,
+                    error_code = NULL,
+                    phase = 'preparing',
+                    current_artifact_id = NULL,
+                    current_path = NULL,
+                    finished_at = NULL
+                WHERE task_id = ${row.taskId} AND status = 'queued'
+              `
+              const task = yield* backupTasks({ taskId: row.taskId }).pipe(
+                Effect.map((tasks) => tasks[0] ?? null),
+                Effect.orElseSucceed(() => null)
+              )
+              if (task) claimed.push(task)
+            }
+            return claimed
           })
         )
       ),
@@ -2371,6 +3014,47 @@ const makeRelayStateStore = Effect.gen(function* () {
             `
             yield* pruneSupersededExportTasks()
             if (prune) yield* insertBackupPrune(prune, now)
+            return true
+          })
+        )
+      ),
+    completeRecoveredRestore: (taskId, now, warning) =>
+      run(
+        "complete_recovered_restore",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<{ inputJson: string; status: string }>`
+              SELECT input_json AS inputJson, status
+              FROM relay_backup_tasks
+              WHERE task_id = ${taskId} AND kind = 'restore'
+                AND status IN ('running', 'failed')
+              LIMIT 1
+            `
+            const row = rows[0]
+            if (!row) return false
+            const result = {
+              warnings: [
+                warning ??
+                  (row.status === "failed"
+                    ? "Finished after the Relay restarted"
+                    : "Restore completed during Relay recovery"),
+              ],
+            }
+            yield* sql`
+              UPDATE relay_backup_tasks
+              SET status = 'succeeded',
+                  input_json = ${scrubBackupTaskInputJson(row.inputJson)},
+                  result_json = ${JSON.stringify(result)},
+                  error = NULL,
+                  error_code = NULL,
+                  phase = NULL,
+                  current_artifact_id = NULL,
+                  current_path = NULL,
+                  finished_at = ${now},
+                  updated_at = ${now}
+              WHERE task_id = ${taskId} AND kind = 'restore'
+                AND status IN ('running', 'failed')
+            `
             return true
           })
         )
@@ -2734,6 +3418,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               role,
               token_hash AS tokenHash,
               actions_json AS actionsJson,
+              client_id AS clientId,
               created_at AS createdAt,
               expires_at AS expiresAt
             FROM relay_invitations
@@ -2748,6 +3433,7 @@ const makeRelayStateStore = Effect.gen(function* () {
           if (!invitation) return null
           return {
             actions: yield* decodeJsonStringArray(invitation.actionsJson),
+            clientId: invitation.clientId,
             createdAt: invitation.createdAt,
             expiresAt: invitation.expiresAt,
             id: invitation.id,
@@ -2907,6 +3593,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               role,
               token_hash AS tokenHash,
               actions_json AS actionsJson,
+              client_id AS clientId,
               created_at AS createdAt,
               expires_at AS expiresAt
             FROM relay_invitations
@@ -2918,6 +3605,7 @@ const makeRelayStateStore = Effect.gen(function* () {
           if (!invitation) return null
           return {
             actions: yield* decodeJsonStringArray(invitation.actionsJson),
+            clientId: invitation.clientId,
             createdAt: invitation.createdAt,
             expiresAt: invitation.expiresAt,
             id: invitation.id,
@@ -3030,6 +3718,7 @@ const makeRelayStateStore = Effect.gen(function* () {
               role,
               token_hash AS tokenHash,
               actions_json AS actionsJson,
+              client_id AS clientId,
               created_at AS createdAt,
               expires_at AS expiresAt
             FROM relay_invitations
@@ -3043,6 +3732,7 @@ const makeRelayStateStore = Effect.gen(function* () {
             decodeJsonStringArray(invitation.actionsJson).pipe(
               Effect.map((actions) => ({
                 actions,
+                clientId: invitation.clientId,
                 createdAt: invitation.createdAt,
                 expiresAt: invitation.expiresAt,
                 id: invitation.id,
@@ -3367,6 +4057,135 @@ const makeRelayStateStore = Effect.gen(function* () {
           DELETE FROM relay_volume_names WHERE volume_id = ${volumeId}
         `.pipe(Effect.asVoid)
       ),
+    listAppVolumeReferences: () =>
+      run(
+        "list_app_volume_references",
+        sql<RelayAppVolumeReference>`
+          SELECT client_id AS clientId, app_id AS appId, volume_id AS volumeId
+          FROM relay_app_volume_references
+          ORDER BY client_id ASC, app_id ASC, volume_id ASC
+        `
+      ),
+    listVolumeReferenceImports: () =>
+      run(
+        "list_volume_reference_imports",
+        sql<{
+          clientId: string
+          connectionId: string
+          importedAt: number
+          unresolvedJson: string
+        }>`
+          SELECT client_id AS clientId, connection_id AS connectionId,
+            imported_at AS importedAt, unresolved_json AS unresolvedJson
+          FROM relay_volume_reference_imports
+          ORDER BY client_id ASC
+        `.pipe(
+          Effect.map((rows) =>
+            rows.map((row): RelayVolumeReferenceImport => ({
+              clientId: row.clientId,
+              connectionId: row.connectionId,
+              importedAt: row.importedAt,
+              unresolvedAppIds: decodeUnresolved(row.unresolvedJson),
+            }))
+          )
+        )
+      ),
+    replaceAppVolumeReferences: (clientId, appId, volumeIds) =>
+      run(
+        "replace_app_volume_references",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              DELETE FROM relay_app_volume_references
+              WHERE client_id = ${clientId} AND app_id = ${appId}
+            `
+            yield* insertAppVolumeReferences(clientId, appId, volumeIds)
+            yield* resolveAppVolumeReferences(clientId, new Set([appId]))
+          })
+        )
+      ),
+    importAppVolumeReferences: (
+      clientId,
+      connectionId,
+      apps,
+      unresolvedAppIds
+    ) =>
+      run(
+        "import_app_volume_references",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              DELETE FROM relay_app_volume_references
+              WHERE client_id = ${clientId}
+            `
+            for (const app of apps) {
+              yield* insertAppVolumeReferences(
+                clientId,
+                app.appId,
+                app.volumeIds
+              )
+            }
+            const unresolved = JSON.stringify([...new Set(unresolvedAppIds)])
+            yield* sql`
+              INSERT INTO relay_volume_reference_imports (
+                client_id, connection_id, imported_at, unresolved_json
+              ) VALUES (
+                ${clientId}, ${connectionId}, ${Date.now()}, ${unresolved}
+              )
+              ON CONFLICT (client_id) DO UPDATE
+              SET connection_id = excluded.connection_id,
+                  imported_at = excluded.imported_at,
+                  unresolved_json = excluded.unresolved_json
+            `
+          })
+        )
+      ),
+    deleteAppVolumeReferences: (clientId, appId) =>
+      run(
+        "delete_app_volume_references",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              DELETE FROM relay_app_volume_references
+              WHERE client_id = ${clientId} AND app_id = ${appId}
+            `
+            yield* resolveAppVolumeReferences(clientId, new Set([appId]))
+          })
+        )
+      ),
+    bumpAppPowerRevision: (appId, now) =>
+      run(
+        "bump_app_power_revision",
+        sql`
+          INSERT INTO relay_app_power_revisions (app_id, revision, updated_at)
+          VALUES (${appId}, 1, ${now})
+          ON CONFLICT (app_id) DO UPDATE
+          SET revision = revision + 1, updated_at = excluded.updated_at
+        `.pipe(Effect.asVoid)
+      ),
+    listAppPowerRevisions: (appIds) =>
+      appIds.length === 0
+        ? Effect.succeed(new Map<string, number>())
+        : run(
+            "list_app_power_revisions",
+            sql<{ appId: string; revision: number }>`
+              SELECT app_id AS appId, revision
+              FROM relay_app_power_revisions
+              WHERE app_id IN ${sql.in(appIds)}
+            `.pipe(
+              Effect.map(
+                (rows) => new Map(rows.map((row) => [row.appId, row.revision]))
+              )
+            )
+          ),
+    holdVolumeReferenceImport: (clientId) =>
+      run(
+        "hold_volume_reference_import",
+        sql`
+          DELETE FROM relay_volume_reference_imports
+          WHERE client_id = ${clientId}
+        `.pipe(Effect.asVoid)
+      ),
     deleteRuntimeRecovery: (instanceId) =>
       run(
         "delete_runtime_recovery",
@@ -3431,6 +4250,12 @@ const makeRelayStateStore = Effect.gen(function* () {
                   service,
                   strip_prefix,
                   target_port,
+                  www,
+                  https_redirect,
+                  is_primary,
+                  redirect_to,
+                  redirect_permanent,
+                  redirect_preserve_path,
                   created_at,
                   updated_at
                 ) VALUES (
@@ -3442,6 +4267,12 @@ const makeRelayStateStore = Effect.gen(function* () {
                   ${route.service ?? null},
                   ${route.stripPrefix ? 1 : 0},
                   ${route.targetPort},
+                  ${route.www},
+                  ${route.httpsRedirect ? 1 : 0},
+                  ${route.primary ? 1 : 0},
+                  ${route.redirect?.to ?? null},
+                  ${route.redirect?.permanent === false ? 0 : 1},
+                  ${route.redirect?.preservePath === false ? 0 : 1},
                   ${now},
                   ${now}
                 )

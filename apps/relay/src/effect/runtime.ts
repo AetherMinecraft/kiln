@@ -1,8 +1,9 @@
 import * as Telemetry from "@workspace/telemetry"
-import { Effect, Layer, ManagedRuntime, Option } from "effect"
-import type { Fiber, Tracer } from "effect"
+import { Effect, Layer, ManagedRuntime, Option, Tracer } from "effect"
+import type { Fiber } from "effect"
 import { Headers, HttpTraceContext } from "effect/http"
 
+import { loadOrCreateRelayIdentity } from "./identity.js"
 import { makeRelayStateLayer, RelayStateStore } from "./state.js"
 import { relayBuildCommit, relayBuildVersion } from "../build-info.js"
 import { relayStateDatabasePath, type RelayConfig } from "../config.js"
@@ -22,8 +23,10 @@ let runtime: ManagedRuntime.ManagedRuntime<RelayStateStore, unknown> | null =
 
 export function initializeRelayRuntime(config: RelayConfig): void {
   if (runtime) return
-  // The installation ID is the one saved when the Relay starts; one Hearth
-  // sends later is reported from the next start.
+  // The installation ID and Relay name are the ones saved when the Relay
+  // starts; changes to either are reported from the next start. Relays of one
+  // installation are told apart by their ID, the fingerprint Hearth knows
+  // them by, which never changes.
   const telemetry = Layer.unwrap(
     Effect.gen(function* () {
       const installationId = config.installationIdConfigured
@@ -31,6 +34,10 @@ export function initializeRelayRuntime(config: RelayConfig): void {
         : yield* savedInstallationId(yield* RelayStateStore).pipe(
             Effect.orElseSucceed(() => null)
           )
+      // Startup loads it again; this first load creates it on a new Relay.
+      const identity = yield* loadOrCreateRelayIdentity(config).pipe(
+        Effect.orElseSucceed(() => null)
+      )
       return Telemetry.layer(
         {
           serviceName: "relay",
@@ -41,6 +48,12 @@ export function initializeRelayRuntime(config: RelayConfig): void {
               : {}),
             ...(installationId
               ? { "kiln.installation_id": installationId }
+              : {}),
+            ...(identity
+              ? {
+                  "service.instance.id": identity.fingerprint,
+                  "kiln.relay.name": identity.name,
+                }
               : {}),
           },
         },
@@ -62,6 +75,17 @@ export function runRelayEffect<TResult, TError>(
   return activeRuntime().runPromise(
     Telemetry.withActiveParent(Effect.withSpan(effect, name))
   )
+}
+
+/**
+ * Runs an effect for a request the Relay serves, such as a direct transfer,
+ * which names its own span. Before the Relay runtime exists, as in tests,
+ * it runs without exporting.
+ */
+export function runRelayRequest<TResult, TError>(
+  effect: Effect.Effect<TResult, TError>
+): Promise<TResult> {
+  return runtime ? runtime.runPromise(effect) : Effect.runPromise(effect)
 }
 
 /** Runs a hot-path effect, such as a snapshot read, without tracing it. */
@@ -132,6 +156,20 @@ export function traceParentSpan(
     HttpTraceContext.w3c(Headers.fromInput({ traceparent }))
   )
 }
+
+/**
+ * A W3C `traceparent` for work another service does within the current
+ * span, such as another Relay's, or none when no traces are kept.
+ */
+export const currentTraceparent: Effect.Effect<string | undefined> = Effect.gen(
+  function* () {
+    if ((yield* Effect.tracer) === Tracer.nativeTracer) return undefined
+    const span = yield* Effect.option(Effect.currentSpan)
+    return Option.isSome(span)
+      ? HttpTraceContext.toHeaders(span.value).traceparent
+      : undefined
+  }
+)
 
 /**
  * Forks a long-lived worker. It gets no span of its own: a span only exports

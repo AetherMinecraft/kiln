@@ -24,6 +24,9 @@ export const relayFileRequestReplayV1Feature = "file-request-replay-v1"
 export const relayConsoleResourcesV1Feature = "console-resources-v1"
 // The Relay deploys apps: Docker images, Dockerfiles, and Compose projects.
 export const relayAppsV1Feature = "apps-v1"
+// The Relay samples Apps' and databases' usage as game servers', and streams
+// it to browsers (`resources` capabilities for those kinds).
+export const relayWorkloadUsageV1Feature = "workload-usage-v1"
 // The Relay serves its host's files under its own ID as a file root.
 export const relayHostFilesV1Feature = "relay-host-files-v1"
 // The Relay streams its own container's output as the `relay` console kind.
@@ -81,10 +84,47 @@ export const relayPlatformDatabaseV1Feature = "relay-platform-database-v1"
 // uploaded, which each import names for itself (`import-<random>`).
 export const relayDatabaseDumpFilesV1Feature = "database-dump-files-v1"
 export const relayDatabaseDumpExportFile = "export"
+// Reads and replaces the Relay's Kiln installation ID
+// (`relay.installation.read`, `relay.installation.replace`). Relays with it
+// adopt an ID from Hearth's authentication only when they have none.
+export const relayInstallationV1Feature = "relay-installation-v1"
+// The Relay lists what runs on its host (`relay.security.targets`) and
+// inventories its host and images with Syft (`relay.security.inventory`),
+// so Hearth can check them for known vulnerabilities.
+export const relaySecurityInventoryV1Feature = "security-inventory-v1"
+// Web routes take a www counterpart, plain HTTP, a primary flag, an optional
+// label, and redirects to another URL. Older Relays need a name and a port
+// on every route.
+export const relayWebRouteOptionsV1Feature = "web-route-options-v1"
+// The Relay answers `instance.icon.read` with a small image's bytes, from a
+// file root or from inside one of an app's containers.
+export const relayIconReadV1Feature = "icon-read-v1"
+// The Relay opens its control connection to Hearth when Hearth asks it to
+// (`auth.response`'s `dial`), as well as answering Hearth's.
+export const relayControlDialV1Feature = "control-dial-v1"
+// Where on Hearth a Relay opens its control connection.
+export const relayControlDialPath = "/api/relays/control"
+// The Relay opens a tunnel to its own listener on request
+// (`relay.tunnel.open`), so Hearth can reach a Relay that dials it.
+export const relayTunnelV1Feature = "tunnel-v1"
+// Where on Hearth a Relay opens those tunnels, and their subprotocol. The
+// upgrade names the tunnel with the token Hearth asked for it with
+// (`relayTunnelTokenHeader`), so Hearth turns away any other before taking
+// it; every frame is bytes to or from the Relay's listener.
+export const relayTunnelPath = "/api/relays/tunnel"
+export const relayTunnelProtocol = "kiln-relay-tunnel.v1" as const
+export const relayTunnelTokenHeader = "x-kiln-tunnel-token"
+// How Hearth closes a connection a Relay opened: it already has one to that
+// Relay it keeps, or it doesn't know the Relay.
+export const relayDialCloseCodes = {
+  duplicate: 4409,
+  unknownRelay: 4404,
+} as const
 export const relayBrowserAuthorizationReviseMaxItems = 256
 
 export const relayControlOperations = [
   "relay.snapshot",
+  "relay.tunnel.open",
   "relay.system.inspect",
   "relay.update.apply",
   "relay.update.status",
@@ -124,6 +164,8 @@ export const relayControlOperations = [
   "relay.volumes.create",
   "relay.volumes.rename",
   "relay.volumes.delete",
+  "relay.volumes.references.import",
+  "relay.volumes.references.hold",
   "relay.pairing.create",
   "relay.pairing.list",
   "relay.pairing.revoke",
@@ -135,11 +177,16 @@ export const relayControlOperations = [
   "relay.platform.action",
   "relay.platform.database.read",
   "relay.platform.database.write",
+  "relay.installation.read",
+  "relay.installation.replace",
+  "relay.security.targets",
+  "relay.security.inventory",
   "browser.authorization.revise",
   "brick.catalog",
   "brick.recipe",
   "database.list",
   "database.inspect",
+  "database.resources.read",
   "database.create",
   "database.provision.prepare",
   "database.provision.claim",
@@ -150,6 +197,7 @@ export const relayControlOperations = [
   "database.limits.write",
   "database.credentials.rotate",
   "database.network.write",
+  "database.network.import",
   "database.dump.export",
   "database.dump.import",
   "database.data.read",
@@ -161,6 +209,7 @@ export const relayControlOperations = [
   "database.terminal.claim",
   "database.terminal.restart",
   "app.list",
+  "app.resources.read",
   "app.create",
   "app.provision.prepare",
   "app.provision.claim",
@@ -169,7 +218,7 @@ export const relayControlOperations = [
   "app.deploy",
   "app.action",
   "app.limits.write",
-  "app.network.write",
+  "app.volumes.write",
   "app.network.routes.read",
   "app.deployment.read",
   "app.image.check",
@@ -182,8 +231,17 @@ export const relayControlOperations = [
   "app.terminal.restart",
   "backup.task.enqueue",
   "backup.task.cancel",
+  "backup.restore.resolve",
+  "backup.restore.unfinished",
   "backup.task.get",
   "backup.task.list",
+  "transfer.source.prepare",
+  "transfer.source.get",
+  "transfer.source.discard",
+  "transfer.pull.start",
+  "transfer.pull.get",
+  "transfer.pull.cancel",
+  "transfer.space",
   "schedule.apply",
   "schedule.run",
   "schedule.remove",
@@ -203,6 +261,7 @@ export const relayControlOperations = [
   "instance.files.search",
   "instance.files.stat",
   "instance.files.read",
+  "instance.icon.read",
   "instance.files.write",
   "instance.files.put",
   "instance.files.upload-url",
@@ -224,11 +283,13 @@ export const relayControlOperations = [
   "instance.network.routes.read",
   "instance.network.routes.write",
   "instance.network.databases.remove",
-  "hearth.tailscale.instance.detach",
+  "hearth.tailscale.member.detach",
   "hearth.database.terminal.output",
   "sftp.authorization.resolve",
   "operation.get",
   "relay.pause.write",
+  "resource.freeze",
+  "resource.unfreeze",
 ] as const
 
 export type RelayControlOperation = (typeof relayControlOperations)[number]
@@ -246,6 +307,8 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.volumes.create",
   "relay.volumes.rename",
   "relay.volumes.delete",
+  "relay.volumes.references.import",
+  "relay.volumes.references.hold",
   "relay.tailscale.install",
   "relay.tailscale.stack.apply",
   "relay.tailscale.stack.dns",
@@ -258,6 +321,7 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.platform.terminal.attach",
   "relay.platform.terminal.restart",
   "relay.platform.database.write",
+  "relay.installation.replace",
   "instance.create",
   "instance.provision.prepare",
   "instance.provision.claim",
@@ -286,6 +350,7 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "database.limits.write",
   "database.credentials.rotate",
   "database.network.write",
+  "database.network.import",
   "database.dump.export",
   "database.dump.import",
   "database.data.write",
@@ -299,15 +364,22 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "app.deploy",
   "app.action",
   "app.limits.write",
-  "app.network.write",
+  "app.volumes.write",
   "app.network.routes.write",
   "app.terminal.attach",
   "app.terminal.restart",
   "backup.task.enqueue",
   "backup.task.cancel",
+  "backup.restore.resolve",
+  "transfer.source.prepare",
+  "transfer.source.discard",
+  "transfer.pull.start",
+  "transfer.pull.cancel",
   "schedule.apply",
   "schedule.run",
   "schedule.remove",
+  "resource.freeze",
+  "resource.unfreeze",
 ])
 
 export function isAuditedRelayControlOperation(
@@ -326,6 +398,7 @@ export function relayControlOperationChanges(
 ): boolean {
   switch (operation) {
     case "relay.snapshot":
+    case "relay.tunnel.open":
     case "relay.system.inspect":
     case "relay.update.status":
     case "relay.resources.read":
@@ -341,20 +414,29 @@ export function relayControlOperationChanges(
     case "relay.pairing.list":
     case "relay.clients.list":
     case "relay.platform.read":
+    case "relay.installation.read":
     case "relay.platform.logs":
     case "relay.platform.database.read":
+    case "relay.security.targets":
+    case "relay.security.inventory":
     case "brick.catalog":
     case "brick.recipe":
     case "database.list":
     case "database.inspect":
+    case "database.resources.read":
     case "database.data.read":
     case "database.dump.export":
     case "app.list":
+    case "app.resources.read":
     case "app.network.routes.read":
     case "app.deployment.read":
     case "app.image.check":
     case "backup.task.get":
     case "backup.task.list":
+    case "backup.restore.unfinished":
+    case "transfer.source.get":
+    case "transfer.pull.get":
+    case "transfer.space":
     case "schedule.overview":
     case "instance.resources.read":
     case "instance.files.list":
@@ -363,6 +445,7 @@ export function relayControlOperationChanges(
     case "instance.files.search":
     case "instance.files.stat":
     case "instance.files.read":
+    case "instance.icon.read":
     case "instance.files.database.read":
     case "instance.console.history":
     case "instance.logs.latest":
@@ -391,7 +474,7 @@ export function relayControlOperationChanges(
     case "app.terminal.write":
     case "app.terminal.claim":
     case "app.terminal.restart":
-    case "hearth.tailscale.instance.detach":
+    case "hearth.tailscale.member.detach":
     case "hearth.database.terminal.output":
     case "sftp.authorization.resolve":
     case "operation.get":
@@ -412,12 +495,15 @@ export function relayControlOperationChanges(
     case "relay.volumes.create":
     case "relay.volumes.rename":
     case "relay.volumes.delete":
+    case "relay.volumes.references.import":
+    case "relay.volumes.references.hold":
     case "relay.pairing.create":
     case "relay.pairing.revoke":
     case "relay.clients.update":
     case "relay.clients.revoke":
     case "relay.platform.action":
     case "relay.platform.database.write":
+    case "relay.installation.replace":
     case "browser.authorization.revise":
     case "database.create":
     case "database.provision.prepare":
@@ -429,6 +515,7 @@ export function relayControlOperationChanges(
     case "database.limits.write":
     case "database.credentials.rotate":
     case "database.network.write":
+    case "database.network.import":
     case "database.dump.import":
     case "database.data.write":
     case "app.create":
@@ -439,10 +526,15 @@ export function relayControlOperationChanges(
     case "app.deploy":
     case "app.action":
     case "app.limits.write":
-    case "app.network.write":
+    case "app.volumes.write":
     case "app.network.routes.write":
     case "backup.task.enqueue":
     case "backup.task.cancel":
+    case "backup.restore.resolve":
+    case "transfer.source.prepare":
+    case "transfer.source.discard":
+    case "transfer.pull.start":
+    case "transfer.pull.cancel":
     case "schedule.apply":
     case "schedule.run":
     case "schedule.remove":
@@ -471,6 +563,8 @@ export function relayControlOperationChanges(
     case "instance.network.ports.write":
     case "instance.network.routes.write":
     case "instance.network.databases.remove":
+    case "resource.freeze":
+    case "resource.unfreeze":
       return true
   }
 }
@@ -508,6 +602,8 @@ export function relayControlOperationRefusedWhilePaused(
   if (
     operation === "relay.pause.write" ||
     operation === "browser.authorization.revise" ||
+    // Only adds protection, which restoring Hearth's database needs.
+    operation === "relay.volumes.references.hold" ||
     operation === "relay.clients.revoke" ||
     operation === "relay.pairing.revoke"
   ) {
@@ -537,8 +633,13 @@ export function relayControlDeadlineMs(
   if (operation === "relay.host.files.mount") return 60_000
   // A repair can wait for MySQL to become healthy.
   if (operation === "relay.platform.action") return 240_000
-  if (operation === "hearth.tailscale.instance.detach") return 60_000
+  // An inventory may first wait for the host to be less busy, then reads a
+  // whole image through Docker at the lowest priority.
+  if (operation === "relay.security.inventory") return 15 * 60_000
+  if (operation === "hearth.tailscale.member.detach") return 60_000
   if (operation === "instance.delete") return 360_000
+  // Freezing stops the resource first, as a stop does.
+  if (operation === "resource.freeze") return 240_000
   if (operation === "database.create") return 360_000
   if (operation === "database.delete") return 180_000
   if (operation === "app.delete") return 180_000
@@ -551,10 +652,16 @@ export function relayControlDeadlineMs(
   // Removing a limit recreates the container and waits for it to be ready.
   if (operation === "database.limits.write") return 240_000
   if (operation === "database.credentials.rotate") return 180_000
+  // Waits its turn behind changes to every App and database it names.
+  if (operation === "database.network.import") return 120_000
   // Dumps take as long as the database's data does.
   if (operation === "database.dump.export") return 60 * 60_000
+  // Finishing a restore stops what runs on its target and moves its files.
+  if (operation === "backup.restore.resolve") return 30 * 60_000
   // Docker walks every volume to measure them.
   if (operation === "database.inspect") return 75_000
+  // Measuring a root walks every file in it.
+  if (operation === "transfer.space") return 120_000
   if (operation === "database.wipe") return 120_000
   if (operation === "database.dump.import") return 60 * 60_000
   if (operation === "instance.action") return 180_000
@@ -594,7 +701,39 @@ export const relaySnapshotDeltaFeature = "relay.snapshot.delta.v1"
 export const relaySnapshotNodeResourcesFeature =
   "relay.snapshot.node-resources.v1"
 
+// On a connection the Relay opened, Hearth speaks first: the nonce the
+// Relay's challenge must carry. Hearth trusts no challenge it didn't ask
+// for, so a recorded one can't be replayed to it.
+export const RelayDialHelloSchema = Schema.Struct({
+  nonce: Schema.String.check(Schema.isPattern(/^[A-Za-z\d_-]{43}$/u)),
+  type: Schema.Literal("dial.hello"),
+  v: Schema.Literal(1),
+})
+
+export type RelayDialHello = typeof RelayDialHelloSchema.Type
+
+// What `relay.tunnel.open` asks and answers: the tunnel's token, and
+// whether the listener it reaches speaks TLS.
+export const RelayTunnelOpenSchema = Schema.Struct({
+  token: Schema.String.check(Schema.isPattern(/^[A-Za-z\d_-]{43}$/u)),
+})
+export const RelayTunnelOpenedSchema = Schema.Struct({ tls: Schema.Boolean })
+
+// What a challenge on a connection the Relay opened is bound to: the Hearth
+// client it's for, so one Hearth paired with a Relay can't pass its
+// challenge to another, Hearth's nonce, so it can't be replayed, and the
+// Hearth origin the Relay dialed, which Hearth doesn't hold it to: a Relay
+// still dialing an address Hearth moved from learns its new one.
+export const RelayDialBindingSchema = Schema.Struct({
+  clientId: Schema.String,
+  hearthNonce: Schema.String,
+  hearthOrigin: Schema.String,
+})
+
+export type RelayDialBinding = typeof RelayDialBindingSchema.Type
+
 export const RelayAuthChallengeSchema = Schema.Struct({
+  dial: Schema.optionalKey(RelayDialBindingSchema),
   expiresAt: Schema.Number,
   nonce: Schema.String,
   relayId: Schema.String,
@@ -617,6 +756,11 @@ export const RelayAuthResponseSchema = Schema.Struct({
   hearthContainer: Schema.optionalKey(
     Schema.Struct({ id: Schema.String, proof: Schema.String })
   ),
+  // Where the Relay should open its own control connection to this Hearth,
+  // or null to stop. Relays with `relayControlDialV1Feature` keep it.
+  dial: Schema.optionalKey(
+    Schema.NullOr(Schema.Struct({ url: Schema.String }))
+  ),
   signature: Schema.String,
   type: Schema.Literal("auth.response"),
   v: Schema.Literal(1),
@@ -629,6 +773,9 @@ export const RelayAuthReadySchema = Schema.Struct({
   ),
   clientId: Schema.String,
   features: Schema.optionalKey(Schema.Array(Schema.String)),
+  // The Relay's journal of changes, which `operation.get` answers from. A
+  // rebuilt Relay state starts a new one, which forgets every change.
+  journalId: Schema.optionalKey(Schema.String),
   protocol: Schema.Literal(relayControlProtocol),
   relayBuild: Schema.String,
   role: Schema.Literals(["full_access", "read_only", "custom"]),
@@ -757,7 +904,19 @@ export const RelayControlRequestSchema = Schema.Struct({
   // peers use timeoutMs so request enforcement does not depend on host clocks.
   deadline: Schema.Number,
   id: Schema.String,
+  // The journal the sender expects (`auth.ready`). The Relay refuses a
+  // request for another with `journal_changed`, so a change it forgot when
+  // its state was rebuilt isn't taken as one it never saw.
+  journalId: Schema.optionalKey(Schema.String),
   operation: RelayControlOperationSchema,
+  // The Hearth operation a change is a step of, and which step, for the
+  // Relay's traces and audit. It names the work; it grants nothing.
+  parent: Schema.optionalKey(
+    Schema.Struct({
+      operationId: Schema.String.check(Schema.isMaxLength(128)),
+      step: Schema.String.check(Schema.isMaxLength(256)),
+    })
+  ),
   payload: Schema.Unknown,
   // Names a change across reconnects; `id` names only this one frame. The
   // Relay records each change it runs under its operation ID and answers
@@ -896,6 +1055,14 @@ export function relayAuthChallengeTranscript(
     challenge.sessionId,
     challenge.nonce,
     challenge.expiresAt,
+    ...(challenge.dial
+      ? [
+          "dial",
+          challenge.dial.clientId,
+          challenge.dial.hearthNonce,
+          challenge.dial.hearthOrigin,
+        ]
+      : []),
   ])
 }
 

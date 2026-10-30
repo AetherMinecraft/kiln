@@ -133,6 +133,74 @@ A Compose project replaced this way deploys as before, under the app's own
 project name, so Compose keeps its volumes. While both copies run, the node
 reserves both copies' memory.
 
+## Volumes
+
+The Relay manages two kinds of Docker named volume, each with an ID that
+backups and deletion name it by:
+
+- **Kiln volumes**, made on the Relay's Volumes page and mounted from an
+  app's Volumes section. A Kiln volume's ID is the one it was made with. No
+  app owns one: any app's configuration may mount it.
+- **An app's Compose volumes**, those its Compose file declares. The app
+  owns them, and their ID is the app's ID and the volume's key in the file,
+  `<app ID>/<key>`. Compose labels each volume with its project and key, and
+  the Relay reads the owner from those labels, so the ID holds whatever
+  Docker name the file gives the volume.
+
+A redeploy keeps an app's Compose volumes: Compose runs under the app's own
+project name and finds them again. A rolled deployment runs as a project of
+its own, `<project>-<deployment>`, which would make new volumes, so a
+Compose file that keeps data in a volume never rolls; it deploys under the
+app's own project, as above. A rolled deployment therefore makes no volume
+an app's services use, and the app's volumes keep their data and IDs
+across deployments of either kind. If a file renames a volume's Docker name
+(its `name:`), the key's ID goes to the volume the app's containers mount,
+and the old one stays listed as the app's, without an ID, until the app is
+deleted.
+
+An app **uses** a volume when its configuration mounts it, deployed or not,
+or one of its containers mounts it now. Configurations live in Hearth, so
+the Relay keeps which Kiln volumes each app's configuration names, as each
+paired Hearth says. Each message replaces an app's whole set: before saving
+a configuration that mounts a new volume, Hearth sends the old and new
+configurations' volumes together, and a Relay that can't take them keeps
+the configuration from saving; after every save it sends the saved one's.
+Whenever Hearth connects to the Relay it sends every app's again, retrying
+with backoff until the Relay takes them, so a message a save couldn't
+deliver arrives. An app whose configuration Hearth can't read, as when the
+secret it was saved with is gone, is sent as unresolved. Any paired Hearth
+may send these, whatever its grant: they only add protection, and a Hearth's
+message replaces only what it sent itself. A read-only Hearth may still keep
+configurations from before its grant changed.
+
+A Kiln volume can't be deleted while any container mounts it or any app's
+configuration names it, nor while the Relay can't tell: until every paired
+Hearth has sent its apps' configurations on its current control connection,
+with none unresolved. What a Hearth sent counts only for the connection it
+sent it on, so its database changing under it, as a restore does, can't
+leave the Relay counting configurations it no longer holds: a Hearth
+restored offline connects anew. One that imports a Kiln database while
+running first tells every Relay to stop counting what it sent
+(`relay.volumes.references.hold`, which waits for deletions under way and
+works while the Relay is paused), refuses the import if any Relay can't be
+told, sends nothing while the import runs, and then reconnects to every
+Relay, which counts its configurations again once a new connection sends
+them. Deleting an App forgets only what its own Hearth said of it. After the Relay restarts, every Hearth
+owes them again. A Hearth paired since owes them before deletion works
+again; a revoked one no longer counts, nor does what it sent. The volumes
+page says what the Relay waits for.
+
+Deleting an app with its data removes only the volumes its own Compose
+projects made, never a Kiln volume, and never one of its volumes another
+container mounts, as another app's file can by naming it `external`.
+
+What an app's containers mount that no managed volume or the app's folder
+holds isn't covered by its backups, and the Relay's volume listing reports
+it per app: volumes Docker named itself, such as those an image declares,
+named volumes Kiln doesn't manage, and paths on the node outside the app's
+folder. Files an app's configuration mounts and a repository checkout don't
+count; each deployment writes them again.
+
 ## Recording
 
 Hearth records a deployment once its Relay accepts it, and follows it there

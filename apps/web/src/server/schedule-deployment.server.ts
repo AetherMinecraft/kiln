@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto"
 
 import { Clock, Effect, Result } from "effect"
-import type { RowDataPacket } from "mysql2/promise"
+import type { ResultSetHeader, RowDataPacket } from "mysql2/promise"
 import { z } from "zod"
 
 import {
+  relayScheduleDeploymentSchema,
   scheduleActionAppliesToTarget,
+  scheduleTargetKey,
   scheduleActionSchema,
   scheduleDefinitionSchema,
   scheduleRunSchema,
@@ -21,8 +23,12 @@ import {
   backupObjectKeyPrefix,
   loadBackupStorageCredentialEffect,
 } from "@/backups/destinations/s3"
-import { ensureBackupRepositoryEffect } from "@/effect/backups"
+import {
+  ensureBackupRepositoryEffect,
+  scheduledBackupAdmissionEffect,
+} from "@/effect/backups"
 import { Database, type DatabaseTransaction } from "@/effect/database"
+import { refuseResourcesBeingDeleted } from "@/effect/resource-deletions"
 import { kilnInstallationId } from "@/effect/installation"
 import { promiseEffect } from "@/effect/promise"
 import { runAppEffect } from "@/effect/runtime"
@@ -30,7 +36,9 @@ import { databasePool } from "@/lib/database"
 import { databaseTable } from "@/lib/database-config"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { relayRpc } from "@/lib/relay-connection"
-import { listPersistedRelays } from "@/lib/relay-registry"
+import { listPersistedRelays, type PersistedRelay } from "@/lib/relay-registry"
+import { appTargets, readRelayVolumes } from "@/server/app-backups.server"
+import type { RelayVolumes } from "@workspace/contracts"
 import { defaultKilnBackupsSettingId } from "@/migrations/0024_default_kiln_backups"
 
 // Saving schedules and handing them to their Relays, shared by the schedule
@@ -46,6 +54,7 @@ export function insertSchedule(
   now: number
 ) {
   return Effect.gen(function* () {
+    yield* refuseResourcesBeingDeleted(transaction, schedule.targets)
     yield* transaction.execute(
       `INSERT INTO ${databaseTable("schedule")}
          (id, name, cron_expression, timezone, enabled,
@@ -201,12 +210,22 @@ function isPendingMarker(value: unknown): boolean {
   return parsed.success && parsed.data.state === "pending"
 }
 
+/**
+ * Writes a schedule's actions and targets. A target whose deletion was asked
+ * for is refused, so a schedule saved while one is deleted can't keep it
+ * after its cleanup looked. Only that cleanup, rewriting a schedule without
+ * the deleted resource, keeps targets of other deletions: theirs remove them.
+ */
 export function insertScheduleParts(
   transaction: DatabaseTransaction,
   schedule: ScheduleDefinition,
-  now: number
+  now: number,
+  options: { readonly keepTargetsBeingDeleted?: boolean } = {}
 ) {
   return Effect.gen(function* () {
+    if (!options.keepTargetsBeingDeleted) {
+      yield* refuseResourcesBeingDeleted(transaction, schedule.targets)
+    }
     for (const [position, action] of schedule.actions.entries()) {
       yield* transaction.execute(
         `INSERT INTO ${databaseTable("schedule_action")}
@@ -277,12 +296,17 @@ export async function deployScheduleToRelay(
   const relayId = targets[0]?.relayId
   if (!relayId) return
   await upsertDeployment(schedule.id, relayId, schedule.revision, "pending")
+  // Claimed before anything it sends is read, so a change committed after
+  // this, which raises the generation too, is never undone by it arriving
+  // late.
+  const generation = await claimProjectionGeneration(schedule.id, relayId)
   if (!relay?.enabled) {
     await deploymentError(
       schedule.id,
       relayId,
       schedule.revision,
-      "Relay is unavailable"
+      "Relay is unavailable",
+      generation
     )
     return
   }
@@ -292,41 +316,52 @@ export async function deployScheduleToRelay(
         // Field by field: callers can pass a loaded schedule, with Hearth's
         // own fields, and Relays reject keys they don't know.
         const projection: RelayScheduleProjection = {
-          actions: await prepareRelayScheduleActions(schedule.actions, targets),
+          actions: await prepareRelayScheduleActions(
+            schedule.actions,
+            targets,
+            await scheduleOwner(schedule.id),
+            relay
+          ),
           // Older Relays reject unknown keys, so only send the option when on.
           ...(schedule.continueOnFailure ? { continueOnFailure: true } : {}),
           cron: schedule.cron,
           enabled: schedule.enabled,
+          generation,
           id: schedule.id,
           name: schedule.name,
           revision: schedule.revision,
           targets: [...targets],
           timezone: schedule.timezone,
         }
-        const result = z
-          .object({
-            acknowledgedRevision: z.number().int().positive(),
-            nextRunAt: z.number().int().nonnegative().nullable(),
-            scheduleId: z.uuid(),
-          })
-          .parse(
-            await relayRpc(relay, "schedule.apply", projection, 15_000, subject)
-          )
+        const result = relayScheduleDeploymentSchema.parse(
+          await relayRpc(relay, "schedule.apply", projection, 15_000, subject)
+        )
+        // Delivered only once the Relay holds the newest revision and
+        // generation Hearth has issued: an answer for an older send, or one
+        // overtaken by a change since, leaves it owed.
+        const acknowledgedGeneration = result.acknowledgedGeneration ?? 0
         await databasePool.execute(
           `UPDATE ${databaseTable("schedule_deployment")}
-          SET status = IF(? >= desired_revision, 'applied', status),
+          SET status = IF(? >= desired_revision AND ? >= desired_generation,
+                'applied', status),
               next_run_at = IF(? >= desired_revision, ?, next_run_at),
-              last_error = IF(? >= desired_revision, NULL, last_error),
+              last_error = IF(? >= desired_revision AND ? >= desired_generation,
+                NULL, last_error),
               acknowledged_revision = GREATEST(
                 COALESCE(acknowledged_revision, 0), ?),
+              acknowledged_generation = GREATEST(
+                COALESCE(acknowledged_generation, 0), ?),
               updated_at = ?
         WHERE schedule_id = ? AND relay_id = ?`,
           [
             result.acknowledgedRevision,
+            acknowledgedGeneration,
             result.acknowledgedRevision,
             result.nextRunAt,
             result.acknowledgedRevision,
+            acknowledgedGeneration,
             result.acknowledgedRevision,
+            acknowledgedGeneration,
             Date.now(),
             schedule.id,
             relayId,
@@ -340,42 +375,71 @@ export async function deployScheduleToRelay(
       schedule.id,
       relayId,
       schedule.revision,
-      errorMessage(deployed.failure)
+      errorMessage(deployed.failure),
+      generation
     )
   }
 }
 
+// The next generation of what's sent for a schedule to one Relay.
+async function claimProjectionGeneration(
+  scheduleId: string,
+  relayId: string
+): Promise<number> {
+  const [result] = await databasePool.execute<ResultSetHeader>(
+    `UPDATE ${databaseTable("schedule_deployment")}
+        SET desired_generation = LAST_INSERT_ID(desired_generation + 1)
+      WHERE schedule_id = ? AND relay_id = ?`,
+    [scheduleId, relayId]
+  )
+  return Number(result.insertId)
+}
+
+// Each backup step's execution on each target, admitted as a manual backup
+// would be (`scheduledBackupAdmissionEffect`): where it goes, or why it
+// doesn't run. A refused one is still sent, so the Relay stops running it
+// rather than keeping the last projection that let it.
 async function prepareRelayScheduleActions(
   actions: ReadonlyArray<ScheduleAction>,
-  targets: ReadonlyArray<ScheduleTarget>
+  targets: ReadonlyArray<ScheduleTarget>,
+  owner: string | null,
+  relay: PersistedRelay
 ): Promise<Array<RelayScheduleAction>> {
+  // An App's backup is of its folder and the volumes it owns, as the Relay
+  // lists them now; asked once for every App the schedule backs up.
+  let listing: Promise<RelayVolumes> | null = null
+  const members = async (target: ScheduleTarget) => {
+    if (target.kind !== "app") return [target]
+    listing ??= readRelayVolumes(relay, owner ?? undefined)
+    return appTargets(target.id, await listing).map(
+      ({ id, kind }): BackupMember => ({
+        id,
+        kind,
+        relayId: target.relayId,
+        ...(kind === "volume" ? { appId: target.id } : {}),
+      })
+    )
+  }
   return Effect.runPromise(
     Effect.forEach(
-      actions,
+      actions.map((action) => forRelayTargets(action, targets)),
       (action): Effect.Effect<RelayScheduleAction, unknown> => {
         if (action.type !== "backup") return Effect.succeed(action)
         return Effect.forEach(
           targets,
           (target) =>
             !scheduleActionAppliesToTarget(action, target)
-              ? Effect.succeed(null)
-              : promiseEffect(async () => ({
-                  destination:
-                    action.mode === "full"
-                      ? await scheduledFullBackupDestination(action, target)
-                      : await scheduledResticDestination(action, target),
-                  mode: action.mode,
-                  targetId: target.id,
-                  targetKind: target.kind,
-                })),
+              ? Effect.succeed([])
+              : promiseEffect(async () =>
+                  Promise.all(
+                    (await members(target)).map((member) =>
+                      scheduledBackupExecution(action, member, owner)
+                    )
+                  )
+                ),
           { concurrency: scheduleReconciliationConcurrency }
         ).pipe(
-          Effect.map((executions) => ({
-            ...action,
-            executions: executions.flatMap((execution) =>
-              execution ? [execution] : []
-            ),
-          }))
+          Effect.map((executions) => ({ ...action, executions: executions.flat() }))
         )
       },
       { concurrency: 1 }
@@ -383,9 +447,115 @@ async function prepareRelayScheduleActions(
   )
 }
 
+async function scheduledBackupExecution(
+  action: Extract<ScheduleAction, { type: "backup" }>,
+  target: BackupMember,
+  owner: string | null
+) {
+  const targetKind = target.kind === "relay" ? "platform" : target.kind
+  const execution = {
+    ...(target.appId ? { appId: target.appId } : {}),
+    mode: action.mode,
+    targetId: target.id,
+    targetKind: target.kind,
+  }
+  const admission = await runAppEffect(
+    "schedules.backupAdmission",
+    scheduledBackupAdmissionEffect({
+      mode: action.mode,
+      owner,
+      relayId: target.relayId,
+      storageId:
+        action.destination.kind === "storage"
+          ? action.destination.storageId
+          : null,
+      targetId: targetKind === "platform" ? kilnInstallationId() : target.id,
+      targetKind,
+    })
+  )
+  if (admission.refusal) {
+    return {
+      ...execution,
+      destination: null,
+      maxBytes: null,
+      refusal: admission.refusal,
+      repositoryId: null,
+    }
+  }
+  if (action.mode === "full") {
+    return {
+      ...execution,
+      destination: await scheduledFullBackupDestination(action, target),
+      maxBytes: admission.maxBytes,
+      refusal: null,
+      repositoryId: null,
+    }
+  }
+  const { repositoryId, ...destination } = await scheduledResticDestination(
+    action,
+    target
+  )
+  return {
+    ...execution,
+    destination,
+    maxBytes: admission.maxBytes,
+    refusal: null,
+    repositoryId,
+  }
+}
+
+async function scheduleOwner(scheduleId: string): Promise<string | null> {
+  const [rows] = await databasePool.query<
+    Array<{ created_by: string | null } & RowDataPacket>
+  >(
+    `SELECT created_by FROM ${databaseTable("schedule")} WHERE id = ? LIMIT 1`,
+    [scheduleId]
+  )
+  return rows[0]?.created_by ?? null
+}
+
+/**
+ * A step as one Relay runs it: the targets it names and the App services it
+ * runs in, of that Relay's targets only. A Relay refuses a step naming
+ * targets it doesn't have. A list emptied here stays empty, since no list
+ * would mean every target.
+ */
+function forRelayTargets(
+  action: ScheduleAction,
+  targets: ReadonlyArray<ScheduleTarget>
+): ScheduleAction {
+  if (action.type === "wait") return action
+  const keys = new Set(targets.map(scheduleTargetKey))
+  const scoped =
+    action.targetKeys === undefined
+      ? action
+      : {
+          ...action,
+          targetKeys: action.targetKeys.filter((key) => keys.has(key)),
+        }
+  if (scoped.type !== "console_command" || !scoped.services) return scoped
+  const services = Object.fromEntries(
+    Object.entries(scoped.services).filter(([key]) => keys.has(key))
+  )
+  const { services: _all, ...rest } = scoped
+  return Object.keys(services).length > 0 ? { ...rest, services } : rest
+}
+
+/**
+ * What one of a backup step's executions backs up: a schedule's target, or
+ * an App's folder or a volume it owns, admitted each as a manual backup of
+ * it would be.
+ */
+interface BackupMember {
+  readonly appId?: string
+  readonly id: string
+  readonly kind: Exclude<ScheduleTarget["kind"], "app"> | "app" | "volume"
+  readonly relayId: string
+}
+
 async function scheduledFullBackupDestination(
   action: Extract<ScheduleAction, { type: "backup" }>,
-  target: ScheduleTarget
+  target: BackupMember
 ) {
   if (action.destination.kind === "local") {
     return { kind: "local" as const }
@@ -420,7 +590,7 @@ async function scheduledFullBackupDestination(
 
 async function scheduledResticDestination(
   action: Extract<ScheduleAction, { type: "backup" }>,
-  target: ScheduleTarget
+  target: BackupMember
 ) {
   const storageId =
     action.destination.kind === "storage" ? action.destination.storageId : null
@@ -445,6 +615,7 @@ async function scheduledResticDestination(
   return {
     kind: "restic" as const,
     repository: location,
+    repositoryId: repository.id,
     repositoryPassword: repository.password,
   }
 }
@@ -489,7 +660,10 @@ export async function deploymentError(
   scheduleId: string,
   relayId: string,
   revision: number,
-  error: string
+  error: string,
+  // The generation that failed; a failure of an older send than the newest
+  // issued says nothing about the newest.
+  generation?: number
 ) {
   const now = Date.now()
   await databasePool.execute(
@@ -498,14 +672,25 @@ export async function deploymentError(
         created_at, updated_at)
      VALUES (?, ?, ?, 'error', ?, ?, ?)
      ON DUPLICATE KEY UPDATE
-       status = IF(VALUES(desired_revision) >= desired_revision,
+       status = IF(VALUES(desired_revision) >= desired_revision
+           AND ? >= desired_generation,
          'error', status),
-       last_error = IF(VALUES(desired_revision) >= desired_revision,
+       last_error = IF(VALUES(desired_revision) >= desired_revision
+           AND ? >= desired_generation,
          VALUES(last_error), last_error),
        desired_revision = GREATEST(desired_revision,
          VALUES(desired_revision)),
        updated_at = VALUES(updated_at)`,
-    [scheduleId, relayId, revision, error.slice(0, 2_000), now, now]
+    [
+      scheduleId,
+      relayId,
+      revision,
+      error.slice(0, 2_000),
+      now,
+      now,
+      generation ?? Number.MAX_SAFE_INTEGER,
+      generation ?? Number.MAX_SAFE_INTEGER,
+    ]
   )
 }
 
@@ -643,6 +828,44 @@ export async function loadSchedules() {
   })
 }
 
+// Sends under way, which Hearth waits for as it stops rather than closing
+// its database under them.
+const deliveries = new Set<Promise<void>>()
+// Once Hearth starts stopping, nothing new is sent: work still running, as
+// a deletion is, may mark schedules owed after that, and they stay owed for
+// the next Hearth's sweep.
+let deliveriesStopped = false
+
+/**
+ * Sends the schedules a change marked as owed, in the background, after the
+ * change committed (`invalidateScheduleDeploymentsEffect`). One whose Relay
+ * is away, or whose send fails, stays owed for the sweep, as does one asked
+ * for once Hearth is stopping.
+ */
+export function deliverPendingSchedules(): void {
+  if (deliveriesStopped) return
+  const delivery: Promise<void> = Effect.runPromise(
+    promiseEffect(redeployUnacknowledgedSchedules).pipe(
+      Effect.catch((cause) =>
+        Effect.sync(() =>
+          console.warn("[Kiln Schedules] Couldn't send schedules again:", cause)
+        )
+      ),
+      Effect.ensuring(Effect.sync(() => deliveries.delete(delivery)))
+    )
+  )
+  deliveries.add(delivery)
+}
+
+/**
+ * Stops sending schedules in the background, as Hearth stops, then waits for
+ * the sends under way to end.
+ */
+export async function stopScheduleDeliveries(): Promise<void> {
+  deliveriesStopped = true
+  await Promise.all(deliveries)
+}
+
 /**
  * Sends each Relay the schedules it hasn't acknowledged, as reconciling on
  * the Schedules page does, so a deploy that failed, such as a fresh
@@ -650,16 +873,23 @@ export async function loadSchedules() {
  */
 export async function redeployUnacknowledgedSchedules(): Promise<void> {
   const [rows] = await databasePool.query<
-    Array<{ relay_id: string; schedule_id: string } & RowDataPacket>
+    Array<
+      {
+        relay_id: string
+        schedule_id: string
+        desired_revision: number
+      } & RowDataPacket
+    >
   >(
-    `SELECT deployment.schedule_id, deployment.relay_id
+    `SELECT deployment.schedule_id, deployment.relay_id, deployment.desired_revision
        FROM ${databaseTable("schedule_deployment")} deployment
        JOIN ${databaseTable("schedule")} schedule
          ON schedule.id = deployment.schedule_id
-        AND schedule.deleted_at IS NULL
       WHERE deployment.status <> 'applied'
          OR COALESCE(deployment.acknowledged_revision, 0)
-              < deployment.desired_revision`
+              < deployment.desired_revision
+         OR COALESCE(deployment.acknowledged_generation, 0)
+              < deployment.desired_generation`
   )
   if (rows.length === 0) return
   const [schedules, relays] = await Promise.all([
@@ -673,12 +903,78 @@ export async function redeployUnacknowledgedSchedules(): Promise<void> {
   for (const row of rows) {
     const schedule = schedules.get(row.schedule_id)
     const relay = relays.get(row.relay_id)
-    if (!schedule || !relay?.enabled) continue
-    const targets = schedule.targets.filter(
+    if (!relay?.enabled) continue
+    const targets = (schedule?.targets ?? []).filter(
       (target) => target.relayId === row.relay_id
     )
-    if (targets.length > 0) {
+    if (schedule && targets.length > 0) {
       await deployScheduleToRelay(schedule, targets, relay)
+    } else {
+      await removeRelayProjections(row.schedule_id, row.desired_revision, [
+        row.relay_id,
+      ])
     }
   }
+}
+
+export async function removeRelayProjections(
+  scheduleId: string,
+  revision: number,
+  relayIds: ReadonlyArray<string>,
+  subject?: string
+) {
+  const relays = new Map(
+    (await listPersistedRelays()).map((relay) => [relay.id, relay])
+  )
+  await Promise.all(
+    relayIds.map(async (relayId) => {
+      await upsertDeployment(scheduleId, relayId, revision, "pending")
+      const [rows] = await databasePool.query<
+        Array<RowDataPacket & { desired_generation: number }>
+      >(
+        `SELECT desired_generation FROM ${databaseTable("schedule_deployment")}
+          WHERE schedule_id = ? AND relay_id = ? AND desired_revision = ?`,
+        [scheduleId, relayId, revision]
+      )
+      const generation = rows[0]?.desired_generation
+      if (generation === undefined) return
+      const relay = relays.get(relayId)
+      if (!relay?.enabled) {
+        await deploymentError(
+          scheduleId,
+          relayId,
+          revision,
+          "Relay is unavailable"
+        )
+        return
+      }
+      const removed = await Effect.runPromise(
+        Effect.result(
+          promiseEffect(async () => {
+            await relayRpc(
+              relay,
+              "schedule.remove",
+              { revision, scheduleId },
+              15_000,
+              subject
+            )
+            await databasePool.execute(
+              `DELETE FROM ${databaseTable("schedule_deployment")}
+            WHERE schedule_id = ? AND relay_id = ?
+              AND desired_revision = ? AND desired_generation = ?`,
+              [scheduleId, relayId, revision, generation]
+            )
+          })
+        )
+      )
+      if (Result.isFailure(removed)) {
+        await deploymentError(
+          scheduleId,
+          relayId,
+          revision,
+          errorMessage(removed.failure)
+        )
+      }
+    })
+  )
 }

@@ -1,3 +1,6 @@
+import type { IncomingMessage } from "node:http"
+import type { Duplex } from "node:stream"
+
 import { createStartHandler } from "@tanstack/react-start/server"
 import { createServerEntry } from "@tanstack/react-start/server-entry"
 import { Effect, Schedule } from "effect"
@@ -5,9 +8,14 @@ import { Effect, Schedule } from "effect"
 import { hearthStreamHandler } from "./app-server-handler"
 import { loadInstallationId } from "./effect/installation"
 import { migrateDatabase } from "./effect/migrations"
-import { disposeAppRuntime, reportAppError } from "./effect/runtime"
+import {
+  disposeAppRuntime,
+  forkAppEffect,
+  forkAppWorker,
+  reportAppError,
+} from "./effect/runtime"
 import { forkPromise } from "./effect/promise"
-import { startAccessInvitationDelivery } from "./lib/access-invitation-delivery"
+import { resumeInvitationDelivery } from "./lib/access-invitation-delivery"
 import { scheduleBackupCopyProcessing } from "./lib/backup-copy"
 import { stopWarmCacheRefreshes } from "./lib/cache"
 import { wakePendingAuthorizationDelivery } from "./lib/authorization-delivery"
@@ -26,13 +34,21 @@ import {
   startAppDeploymentPolling,
   stopAppDeploymentPolling,
 } from "./lib/app-deployments.server"
-import { scheduleTailscaleCleanupProcessing } from "./lib/tailscale-cleanup.server"
+import { resumeTailscaleNetworkDeletion } from "./lib/tailscale-cleanup.server"
+import { reconcileResourceDeletions } from "./lib/resource-deletion.server"
 import {
   startAppImageUpdateChecks,
   stopAppImageUpdateChecks,
 } from "./lib/app-image-updates.server"
+import {
+  startIconDetection,
+  stopIconDetection,
+} from "./lib/icon-detection.server"
 import { startDiskLimitWarnings } from "./lib/disk-limit-warnings.server"
 import { startNotificationPushes } from "./lib/notification-pushes.server"
+import { startDnsWorker } from "./lib/dns-worker.server"
+import { startOperationsEngine } from "./operations/startup"
+import { startServerMigrationResumption } from "./lib/server-migrations.server"
 import {
   startBackupMaintenance,
   stopBackupMaintenance,
@@ -42,7 +58,14 @@ import {
   maintainPersistedRelayConnections,
 } from "./lib/relay-registry"
 import { relayConnectionsCapacity } from "./lib/relay-connection"
+import { handleRelayControlUpgrade } from "./lib/relay-control-dial.server"
+import {
+  startSecurityScans,
+  stopSecurityScans,
+} from "./lib/security-scans.server"
 import { startRelayMetrics, stopRelayMetrics } from "./lib/relay-metrics"
+import { relayPassthroughUsages } from "./lib/relay-passthrough-limits.server"
+import { stopScheduleDeliveries } from "./server/schedule-deployment.server"
 
 await migrateDatabase()
 // Before the app runtime starts, so telemetry carries the ID, and before
@@ -52,7 +75,9 @@ startInstanceDirectorySync()
 startGitHubSyncPolling()
 startAppDeploymentPolling()
 startAppImageUpdateChecks()
-startRelayMetrics(relayConnectionsCapacity)
+startIconDetection()
+startSecurityScans()
+startRelayMetrics(relayConnectionsCapacity, relayPassthroughUsages)
 
 const pairRelayFromEnvironment = Effect.tryPromise({
   try: initializeRelayFromEnvironment,
@@ -89,7 +114,10 @@ await Effect.runPromise(
         // restarts beside it. Keep trying for half an hour.
         Effect.andThen(
           pairRelayFromEnvironment.pipe(
-            Effect.retry({ schedule: Schedule.spaced("15 seconds"), times: 120 }),
+            Effect.retry({
+              schedule: Schedule.spaced("15 seconds"),
+              times: 120,
+            }),
             Effect.delay("15 seconds"),
             Effect.catch((retryCause) =>
               Effect.sync(() => {
@@ -108,19 +136,59 @@ await Effect.runPromise(
   )
 )
 
-startAccessInvitationDelivery()
+// Invitations the old delivery worker hadn't sent go through the lanes.
+forkAppEffect(
+  "invitations.resumeDelivery",
+  resumeInvitationDelivery().pipe(
+    Effect.retry(Schedule.spaced("30 seconds")),
+    Effect.ignore
+  )
+)
 scheduleBackupCopyProcessing()
 scheduleInstancePostProvisionProcessing()
-scheduleTailscaleCleanupProcessing()
+// Deletions a previous Hearth, or the final-delete worker before it, left
+// running carry on, each as the operation it was, and any attempt recorded
+// but never admitted is admitted: now, then every half minute.
+forkAppWorker(
+  reconcileResourceDeletions().pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("Resource deletions weren't reconciled", cause)
+    ),
+    Effect.repeat(Schedule.spaced("30 seconds")),
+    Effect.asVoid
+  )
+)
+forkAppEffect(
+  "TailscaleCleanup.resume",
+  resumeTailscaleNetworkDeletion().pipe(
+    Effect.retry(Schedule.spaced("30 seconds")),
+    Effect.ignore
+  )
+)
 startKilnUpdateNotifications()
 startDiskLimitWarnings()
 startNotificationPushes()
 startBackupMaintenance()
+startServerMigrationResumption()
+startDnsWorker()
+startOperationsEngine()
 forkPromise(wakePendingAuthorizationDelivery, (cause) => {
   reportAppError(cause, { operation: "authorization.delivery.recover" })
 })
 
 const handleStartRequest = createStartHandler(hearthStreamHandler)
+
+/**
+ * Takes a WebSocket upgrade the fetch handler can't: a Relay opening its
+ * control connection to Hearth. False for any other.
+ */
+export function handleUpgrade(
+  request: IncomingMessage,
+  socket: Duplex,
+  head: Buffer
+): boolean {
+  return handleRelayControlUpgrade(request, socket, head)
+}
 
 let shutdownPromise: Promise<void> | undefined
 
@@ -131,9 +199,12 @@ export function shutdownHearth(): Promise<void> {
     stopGitHubSyncPolling(),
     stopAppDeploymentPolling(),
     stopAppImageUpdateChecks(),
+    stopIconDetection(),
     stopBackupMaintenance(),
     stopPollingWorkers(),
+    stopSecurityScans(),
     stopRelayMetrics(),
+    stopScheduleDeliveries(),
   ])
     .then(() => Effect.runPromise(stopWarmCacheRefreshes))
     .then(disposeAppRuntime)

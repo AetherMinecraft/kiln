@@ -1,32 +1,29 @@
 import { assert, layer } from "@effect/vitest"
-import { Effect } from "effect"
-import { vi } from "vite-plus/test"
+import { Effect, Layer, Schedule } from "effect"
+import { afterAll, vi } from "vite-plus/test"
 
 import { relayTailscaleStackSchema } from "@workspace/contracts"
 
 import {
-  recordTailscaleCleanupFinalizationFailureEffect,
   requestTailscaleNetworkCleanupEffect,
   type PersistedTailscaleDeployment,
 } from "@/effect/tailscale-cleanup"
+import { createTailscaleNetworkDefinitionEffect } from "@/effect/tailscale-networks"
 import {
-  createTailscaleNetworkDefinitionEffect,
-  saveTailscaleNetworkDefinitionEffect,
-} from "@/effect/tailscale-networks"
-import {
-  subscribeRealtimeChanges,
-  type RealtimeSourceEvent,
-} from "@/lib/realtime-source.server"
-import { processTailscaleCleanupJobs } from "@/lib/tailscale-cleanup.server"
+  deleteTailscaleNetwork,
+  startTailscaleNetworkDeletion,
+} from "@/lib/tailscale-cleanup.server"
+import { disposeAppRuntime } from "@/effect/runtime"
+import { loadOperation } from "@/operations/records"
+import { testOperationsEngine } from "@/operations/test/engine"
 import { TestDatabase, describeMysql, resetDatabase } from "@/test/database"
-import { insertRelay, insertRows, selectRows } from "@/test/seed"
+import { insertRelay, selectRows } from "@/test/seed"
 
 // The Relay and the Tailscale API are the only fakes: Relays holding
 // Tailscale stacks as `<relay>/<stack>`, and a tailnet with device hostnames
 // and split-DNS resolvers.
 const fake = vi.hoisted(() => ({
   relayStacks: new Set<string>(),
-  relayCommitFails: false,
   tailnetDevices: new Set<string>(),
   tailnetDns: new Map<string, ReadonlyArray<string>>(),
   tailnetDown: false,
@@ -45,8 +42,6 @@ vi.mock("@/lib/relay-connection", async (importOriginal) => ({
     }
     const { id, mode } = payload as { id: string; mode: "commit" | "prepare" }
     if (mode === "commit") {
-      if (fake.relayCommitFails)
-        throw new Error("Relay could not remove the stack")
       fake.relayStacks.delete(`${relay.id}/${id}`)
     }
     return { id, removed: mode === "commit" }
@@ -126,7 +121,6 @@ const seedNetworkBeingDeleted = Effect.gen(function* () {
     deployment(),
   ])
 
-  fake.relayCommitFails = false
   fake.relayStacks.clear()
   fake.relayStacks.add(stack)
   fake.tailnetDown = false
@@ -136,143 +130,54 @@ const seedNetworkBeingDeleted = Effect.gen(function* () {
   fake.tailnetDns.set(domain, ["100.64.0.10"])
 })
 
-const assertFullyRemoved = Effect.gen(function* () {
-  assert.isFalse(fake.relayStacks.has(stack))
-  assert.isFalse(fake.tailnetDevices.has(hostname))
-  assert.isFalse(fake.tailnetDns.has(domain))
-  assert.deepStrictEqual(yield* deploymentRows, [])
-  assert.deepStrictEqual(yield* networkRows, [])
-})
+afterAll(() => disposeAppRuntime())
 
-describeMysql("Tailscale cleanup worker", () => {
-  // Live clock: the worker under test reads real time through the app runtime.
-  layer(TestDatabase, { excludeTestServices: true })((it) => {
+const Cleanup = testOperationsEngine(deleteTailscaleNetwork.layer).pipe(
+  Layer.provideMerge(TestDatabase)
+)
+
+const until = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  done: (value: A) => boolean
+) =>
+  effect.pipe(
+    Effect.repeat({ schedule: Schedule.spaced("50 millis"), until: done }),
+    Effect.timeout("20 seconds")
+  )
+
+describeMysql("Tailscale network deletion", () => {
+  // Live clock: retries wait real time, and the engine keeps it.
+  layer(Cleanup, { excludeTestServices: true, timeout: 60_000 })((it) => {
     it.effect(
-      "removes the device, Relay stack, and network as soon as the last Relay is cleaned up",
+      "keeps the cleanup queued while Tailscale fails, then finishes on retry",
       () =>
         Effect.gen(function* () {
           yield* seedNetworkBeingDeleted
-          // An earlier failed attempt pushed the network's retry out an hour.
-          yield* recordTailscaleCleanupFinalizationFailureEffect(
-            networkId,
-            3_600,
-            "Tailscale timed out"
+          fake.tailnetDown = true
+
+          const id = yield* startTailscaleNetworkDeletion(networkId, "user-one")
+          const [queued] = yield* until(
+            deploymentRows,
+            ([row]) => row?.cleanup_attempts === 1
           )
 
-          yield* Effect.promise(processTailscaleCleanupJobs)
+          assert.isTrue(fake.relayStacks.has(stack))
+          assert.isNotNull(queued?.cleanup_last_error)
+          const [network] = yield* networkRows
+          assert.isNotNull(network?.cleanup_last_error)
+          assert.strictEqual((yield* loadOperation(id))?.state, "running")
 
-          yield* assertFullyRemoved
-        })
-    )
-
-    for (const failing of ["Tailscale", "the Relay"] as const) {
-      it.effect(
-        `keeps the cleanup queued while ${failing} fails, then finishes on retry`,
-        () =>
-          Effect.gen(function* () {
-            yield* seedNetworkBeingDeleted
-            vi.useFakeTimers({ now: Date.now(), toFake: ["Date"] })
-            if (failing === "Tailscale") fake.tailnetDown = true
-            else fake.relayCommitFails = true
-
-            yield* Effect.promise(processTailscaleCleanupJobs)
-
-            assert.isTrue(fake.relayStacks.has(stack))
-            const [queued] = yield* deploymentRows
-            assert.strictEqual(queued?.cleanup_attempts, 1)
-            assert.isNotNull(queued?.cleanup_last_error)
-            const [network] = yield* networkRows
-            assert.isNotNull(network?.cleanup_last_error)
-
-            fake.tailnetDown = false
-            fake.relayCommitFails = false
-            // The first retry is due two seconds later.
-            vi.setSystemTime(Date.now() + 3_000)
-
-            yield* Effect.promise(processTailscaleCleanupJobs)
-
-            yield* assertFullyRemoved
-          }).pipe(Effect.ensuring(Effect.sync(() => vi.useRealTimers())))
-      )
-    }
-
-    it.effect(
-      "finishes deleting a network with no Relays left once its retry is due",
-      () =>
-        Effect.gen(function* () {
-          yield* resetDatabase
-          yield* createTailscaleNetworkDefinitionEffect(
-            { domain, id: networkId, name: "Private Network" },
-            { clientId: "tailscale-client", scopes: [], tags: ["tag:kiln"] },
-            fake.tailnetSecret,
-            "user-one"
-          )
-          yield* requestTailscaleNetworkCleanupEffect(networkId, "user-one", [])
+          // The first retry is due two seconds later.
           fake.tailnetDown = false
-          fake.tailnetDns.clear()
-          fake.tailnetDns.set(domain, ["100.64.0.10"])
-          vi.useFakeTimers({ now: Date.now(), toFake: ["Date"] })
-          yield* recordTailscaleCleanupFinalizationFailureEffect(
-            networkId,
-            60,
-            "Tailscale timed out"
-          )
+          yield* until(loadOperation(id), (op) => op?.state === "succeeded")
 
-          yield* Effect.promise(processTailscaleCleanupJobs)
-
-          assert.lengthOf(yield* networkRows, 1)
-          assert.isTrue(fake.tailnetDns.has(domain))
-
-          vi.setSystemTime(Date.now() + 61_000)
-
-          yield* Effect.promise(processTailscaleCleanupJobs)
-
+          assert.isFalse(fake.relayStacks.has(stack))
+          assert.isFalse(fake.tailnetDevices.has(hostname))
           assert.isFalse(fake.tailnetDns.has(domain))
+          assert.deepStrictEqual(yield* deploymentRows, [])
           assert.deepStrictEqual(yield* networkRows, [])
-        }).pipe(Effect.ensuring(Effect.sync(() => vi.useRealTimers())))
-    )
-
-    it.effect(
-      "tells admins to refresh when every due cleanup row is corrupt",
-      () =>
-        Effect.gen(function* () {
-          yield* resetDatabase
-          yield* saveTailscaleNetworkDefinitionEffect({
-            cleanup: null,
-            domain,
-            id: networkId,
-            integration: null,
-            name: "Private Network",
-          }, "user-one")
-          yield* requestTailscaleNetworkCleanupEffect(networkId, "user-one", [])
-          yield* insertRows("tailscale_network_deployment", {
-            network_id: networkId,
-            relay_id: relayId,
-            deployment: JSON.stringify({ not: "a deployment" }),
-            cleanup_next_attempt_at: Date.now() - 1_000,
-            observed_at: Date.now() - 60_000,
-            updated_at: Date.now() - 60_000,
-          })
-          const events: Array<RealtimeSourceEvent> = []
-          const unsubscribe = subscribeRealtimeChanges((event) => {
-            events.push(event)
-          })
-
-          yield* Effect.promise(processTailscaleCleanupJobs).pipe(
-            Effect.ensuring(Effect.sync(unsubscribe))
-          )
-
-          assert.isTrue(
-            events.some(
-              (event) =>
-                event.type === "hearth.invalidate" &&
-                event.topics.includes("tailscale")
-            )
-          )
-          const [corrupt] = yield* deploymentRows
-          assert.include(String(corrupt?.cleanup_last_error), "invalid")
-          assert.lengthOf(yield* networkRows, 1)
-        })
+        }),
+      30_000
     )
   })
 })

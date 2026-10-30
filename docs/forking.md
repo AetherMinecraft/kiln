@@ -13,23 +13,23 @@ workflow. Custom application changes can still cause ordinary merge conflicts.
 
 Under **Settings → Secrets and variables → Actions → Variables**, configure:
 
-| Variable               | Purpose                                                                                                  | Kiln upstream value                |
-| ---------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| `PUBLISH_IMAGES`       | Set to `true` to publish releases and images. Unset means checks/builds only.                            | `true`                             |
-| `INITIAL_RELEASE_LINE` | Optional starting version before the first stable promotion; defaults to `0.1.0`.                        | Leave unset                        |
-| `NPM_PACKAGE`          | npm bootstrap package you own. Used only by Publish npm CLI bootstrap; binary releases are always attached.                  | `kiln-cli`                         |
-| `CLI_DEFAULT_URL`      | Optional default panel URL embedded in the CLI. Fork builds without this require a URL or saved profile. | `https://kiln.site`                |
-| `BUILD_RUNNER_AMD64`   | Optional Linux x64 runner label for push-triggered image builds and all native CLI checks/builds.        | `blacksmith-4vcpu-ubuntu-2404`     |
-| `BUILD_RUNNER_ARM64`   | Optional Linux ARM64 runner label for push-triggered image builds and all native CLI checks/builds.      | `blacksmith-4vcpu-ubuntu-2404-arm` |
-| `OTEL_*`               | Optional OpenTelemetry defaults baked into published images. See below.                                  | Kiln's telemetry backend           |
+| Variable               | Purpose                                                                                                     | Kiln upstream value                |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| `PUBLISH_IMAGES`       | Set to `true` to publish releases and images. Unset means checks/builds only.                               | `true`                             |
+| `INITIAL_RELEASE_LINE` | Optional starting version before the first stable promotion; defaults to `0.1.0`.                           | Leave unset                        |
+| `NPM_PACKAGE`          | npm bootstrap package you own. Used only by Publish npm CLI bootstrap; binary releases are always attached. | `kiln-cli`                         |
+| `CLI_DEFAULT_URL`      | Optional default panel URL embedded in the CLI. Fork builds without this require a URL or saved profile.    | `https://kiln.site`                |
+| `BUILD_RUNNER_AMD64`   | Optional Linux x64 runner label for push-triggered image builds and all native CLI checks/builds.           | `blacksmith-4vcpu-ubuntu-2404`     |
+| `BUILD_RUNNER_ARM64`   | Optional Linux ARM64 runner label for push-triggered image builds and all native CLI checks/builds.         | `blacksmith-4vcpu-ubuntu-2404-arm` |
+| `OTEL_*`               | Optional OpenTelemetry defaults baked into published images. See below.                                     | Kiln's telemetry backend           |
 
 Published images bake in defaults for these OpenTelemetry variables, read from
 repository variables of the same name: `OTEL_EXPORTER_OTLP_ENDPOINT`,
 `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`,
 `OTEL_METRICS_EXPORTER`, `OTEL_TRACES_SAMPLER_ARG`, and
 `OTEL_RESOURCE_ATTRIBUTES`. Any OTLP/HTTP backend works. Only the endpoint is
-required: traces and logs are then exported unless their `*_EXPORTER` variable
-is `none`, and metrics only when `OTEL_METRICS_EXPORTER` is `otlp`. Leave the
+required: traces, logs, and metrics are then exported unless their
+`*_EXPORTER` variable is `none`. Leave the
 endpoint unset to publish images without telemetry. No upstream telemetry
 destination is a fallback.
 
@@ -39,7 +39,12 @@ access to telemetry. Header values are URI-encoded: write a space as `%20` and
 `OTEL_SDK_DISABLED=true` turns telemetry off. Browser telemetry goes through
 Hearth, so it follows Hearth's configuration. Hearth, its browsers, and its
 Relays tag their telemetry with the `kiln.installation_id` resource attribute.
-A Relay reports an installation ID Hearth gives it from its next start.
+A Relay reports an installation ID Hearth gives it from its next start. Each
+Relay also sends its ID, the fingerprint Hearth knows it by, as
+`service.instance.id`, and its name as `kiln.relay.name`; a rename is reported
+from its next start. Prometheus's OTLP receiver turns `service.instance.id`
+into the `instance` label, so group Relays by it and join names from
+`target_info`.
 
 Normal GitHub `ubuntu-24.04` / `ubuntu-24.04-arm` runners are the default.
 Image PRs, manual image runs, and scheduled image builds retain GitHub runners.
@@ -76,15 +81,16 @@ canonical spelling.
    packages public. The nightly release deliberately fails before publication
    if Hearth or Relay cannot be pulled anonymously; rerun after fixing visibility.
 5. Download `distribution.env` from your release. Prepare `.env` from
-   `.env.hearth.example`, including the normal database/auth/bootstrap secrets
-   and public hostnames, then deploy from your fork checkout:
+   `.env.example` with your `KILN_URL`, then deploy from your fork checkout:
 
 ```sh
 docker compose --env-file .env --env-file distribution.env up -d
 ```
 
-The release asset supplies `KILN_GIT_REPO` and `KILN_IMAGE_PREFIX`, so Compose
-pulls the fork's images. `KILN_IMAGE_TAG` defaults to `latest`; use
+`compose.yaml` runs one Relay in platform mode, which installs the fork's
+Hearth, its database, and its cache, as it does for Kiln. The release asset
+supplies `KILN_GIT_REPO` and `KILN_IMAGE_PREFIX`, so Compose pulls the fork's
+Relay, and the Relay installs Hearth from the same place. `KILN_IMAGE_TAG` defaults to `latest`; use
 `latest-nightly` for the nightly channel. Exact versions and digest pins remain
 externally managed and do not enable in-panel updates.
 

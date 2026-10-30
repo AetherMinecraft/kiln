@@ -21,6 +21,13 @@ const CloudflareDnsRecordSchema = Schema.Struct({
   type: Schema.String,
 })
 
+const CloudflareListedRecordSchema = Schema.Struct({
+  comment: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  id: Schema.String,
+  name: Schema.String,
+  type: Schema.String,
+})
+
 const CloudflareDnsRecordBatchSchema = Schema.Struct({
   posts: Schema.Array(CloudflareDnsRecordSchema),
 })
@@ -151,19 +158,35 @@ export const cloudflareHostnameAvailableEffect = Effect.fn(
   return records.length === 0
 })
 
+/** The records Cloudflare has under a name, with what Kiln noted on them. */
+export const listCloudflareRecordsEffect = Effect.fn("cloudflare.dns.list")(
+  function* (apiToken: string, zoneId: string, hostname: string) {
+    const query = new URLSearchParams({
+      name: hostname,
+      page: "1",
+      per_page: "100",
+    })
+    return yield* requestCloudflareResult(
+      apiToken,
+      `/zones/${encodeURIComponent(zoneId)}/dns_records?${query}`,
+      Schema.Array(CloudflareListedRecordSchema)
+    )
+  }
+)
+
 export const createCloudflareAddressRecordEffect = Effect.fn(
   "cloudflare.dns.createAddress"
 )(function* (
   apiToken: string,
   zoneId: string,
   record: CloudflareAddressRecord,
-  instanceId: string
+  comment: string
 ) {
   return yield* mutateCloudflareRecord(
     apiToken,
     zoneId,
     undefined,
-    cloudflareAddressRecordBody(record, instanceId),
+    webAddressRecordBody(record, comment),
     "POST"
   )
 })
@@ -174,14 +197,14 @@ export const createCloudflareSrvRecordEffect = Effect.fn(
   apiToken: string,
   zoneId: string,
   record: CloudflareSrvRecord,
-  instanceId: string
+  comment: string
 ) {
   return yield* mutateCloudflareRecord(
     apiToken,
     zoneId,
     undefined,
     {
-      comment: `Managed by Kiln for server ${instanceId}`,
+      comment,
       data: {
         port: record.port,
         priority: record.priority,
@@ -203,13 +226,13 @@ export const updateCloudflareAddressRecordEffect = Effect.fn(
   zoneId: string,
   recordId: string,
   record: CloudflareAddressRecord,
-  instanceId: string
+  comment: string
 ) {
   return yield* mutateCloudflareRecord(
     apiToken,
     zoneId,
     recordId,
-    cloudflareAddressRecordBody(record, instanceId),
+    webAddressRecordBody(record, comment),
     "PATCH"
   )
 })
@@ -221,7 +244,7 @@ export const replaceCloudflareAddressRecordEffect = Effect.fn(
   zoneId: string,
   recordId: string,
   record: CloudflareAddressRecord,
-  instanceId: string
+  comment: string
 ) {
   const result = yield* requestCloudflareResult(
     apiToken,
@@ -230,7 +253,7 @@ export const replaceCloudflareAddressRecordEffect = Effect.fn(
     {
       body: JSON.stringify({
         deletes: [{ id: recordId }],
-        posts: [cloudflareAddressRecordBody(record, instanceId)],
+        posts: [webAddressRecordBody(record, comment)],
       }),
       headers: { "Content-Type": "application/json" },
       method: "POST",
@@ -252,14 +275,14 @@ export const updateCloudflareSrvRecordEffect = Effect.fn(
   zoneId: string,
   recordId: string,
   record: CloudflareSrvRecord,
-  instanceId: string
+  comment: string
 ) {
   return yield* mutateCloudflareRecord(
     apiToken,
     zoneId,
     recordId,
     {
-      comment: `Managed by Kiln for server ${instanceId}`,
+      comment,
       data: {
         port: record.port,
         priority: record.priority,
@@ -286,6 +309,104 @@ export const deleteCloudflareRecordEffect = Effect.fn("cloudflare.dns.delete")(
   }
 )
 
+// The longest comment Cloudflare takes on a DNS record.
+const COMMENT_LIMIT = 100
+
+/**
+ * The note on a record Kiln makes: what it's for, and its marker, by which
+ * Kiln finds the record again. Cloudflare refuses a comment over 100
+ * characters, so a note that doesn't fit is only the marker.
+ */
+export function kilnRecordComment(owner: string, marker: string): string {
+  const comment = `Kiln ${owner} (${marker})`
+  return comment.length <= COMMENT_LIMIT ? comment : `Kiln (${marker})`
+}
+
+/**
+ * A web hostname's record, pointing at its Relay. `comment` says what it's
+ * for, as Cloudflare's dashboard shows it.
+ */
+export const createCloudflareWebRecordEffect = Effect.fn(
+  "cloudflare.dns.createWeb"
+)(function* (
+  apiToken: string,
+  zoneId: string,
+  record: CloudflareAddressRecord,
+  comment: string
+) {
+  return yield* mutateCloudflareRecord(
+    apiToken,
+    zoneId,
+    undefined,
+    webAddressRecordBody(record, comment),
+    "POST"
+  )
+})
+
+/**
+ * Points a web hostname's record at another address of the same type. Null
+ * when the record no longer exists; any other failure fails.
+ */
+export const updateCloudflareWebRecordEffect = Effect.fn(
+  "cloudflare.dns.updateWeb"
+)(function* (
+  apiToken: string,
+  zoneId: string,
+  recordId: string,
+  record: CloudflareAddressRecord,
+  comment: string
+) {
+  return yield* requestCloudflareResult(
+    apiToken,
+    `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(recordId)}`,
+    Schema.NullOr(CloudflareDnsRecordSchema),
+    {
+      body: JSON.stringify(webAddressRecordBody(record, comment)),
+      headers: { "Content-Type": "application/json" },
+      method: "PATCH",
+    },
+    { notFoundResult: null }
+  )
+})
+
+/**
+ * Swaps a web hostname's record for one of another type, as an address
+ * changing between an IP and a name needs, in one batch. Null when the old
+ * record no longer exists; any other failure fails.
+ */
+export const replaceCloudflareWebRecordEffect = Effect.fn(
+  "cloudflare.dns.replaceWeb"
+)(function* (
+  apiToken: string,
+  zoneId: string,
+  recordId: string,
+  record: CloudflareAddressRecord,
+  comment: string
+) {
+  const result = yield* requestCloudflareResult(
+    apiToken,
+    `/zones/${encodeURIComponent(zoneId)}/dns_records/batch`,
+    Schema.NullOr(CloudflareDnsRecordBatchSchema),
+    {
+      body: JSON.stringify({
+        deletes: [{ id: recordId }],
+        posts: [webAddressRecordBody(record, comment)],
+      }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    { notFoundResult: null }
+  )
+  if (!result) return null
+  const replacement = result.posts[0]
+  if (!replacement) {
+    return yield* cloudflareFailure(
+      "Cloudflare did not return the replacement DNS record"
+    )
+  }
+  return replacement
+})
+
 function mutateCloudflareRecord(
   apiToken: string,
   zoneId: string,
@@ -306,12 +427,12 @@ function mutateCloudflareRecord(
   )
 }
 
-function cloudflareAddressRecordBody(
+function webAddressRecordBody(
   record: CloudflareAddressRecord,
-  instanceId: string
+  comment: string
 ) {
   return {
-    comment: `Managed by Kiln for server ${instanceId}`,
+    comment,
     content: record.content,
     name: record.name,
     proxied: false,

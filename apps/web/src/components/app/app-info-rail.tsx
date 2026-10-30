@@ -2,6 +2,7 @@ import * as React from "react"
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import {
+  Archive,
   ArrowRightLeft,
   GitCommitHorizontal,
   History,
@@ -43,7 +44,6 @@ import { warmSyntaxCodeEditorModule } from "@/lib/syntax-editor-module-preload"
 import {
   appConfigQueryOptions,
   appDeploymentSummaryQueryOptions,
-  appOwnerMinecraftProfileQueryOptions,
   appOwnerQueryOptions,
 } from "@/lib/query-options"
 
@@ -75,6 +75,15 @@ export function AppInfoRail({ app, routeId }: { app: App; routeId: string }) {
         >
           Databases
         </InfoRailLink>
+        {app.permissions.includes("app.read") ? (
+          <InfoRailLink
+            to="/backups/runs"
+            search={{ kind: "app", relay: app.relayId, server: app.id }}
+            leading={<Archive />}
+          >
+            Backups
+          </InfoRailLink>
+        ) : null}
         <AppEnvironmentRow app={app} routeId={routeId} />
       </InfoRailGroup>
       <AppOwner appId={app.id} relayId={app.relayId} />
@@ -180,10 +189,6 @@ const AppOwner = React.memo(function AppOwner({
 }) {
   const { data } = useQuery(appOwnerQueryOptions(relayId, appId))
   const owner = data?.owner
-  const { data: profileId } = useQuery({
-    ...appOwnerMinecraftProfileQueryOptions(relayId, appId, owner?.name ?? ""),
-    enabled: Boolean(owner),
-  })
   const [transferring, setTransferring] = React.useState(false)
   const [transferMounted, setTransferMounted] = React.useState(false)
   if (data === undefined) return null
@@ -207,7 +212,7 @@ const AppOwner = React.memo(function AppOwner({
         }
         email={owner?.email ?? null}
         name={owner?.name ?? null}
-        profileId={profileId}
+        userId={owner?.userId ?? null}
       />
       {transferMounted ? (
         <React.Suspense fallback={null}>

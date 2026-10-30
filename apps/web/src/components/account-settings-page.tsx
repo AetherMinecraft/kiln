@@ -33,6 +33,7 @@ import { showToast } from "@workspace/ui/components/sonner"
 import { cn } from "@workspace/ui/lib/utils"
 
 import { AccountAvatar } from "@/components/account-avatar"
+import { EditableIcon } from "@/components/icon-editor-dialog"
 import { RedactedText } from "@/components/redacted-text"
 import {
   SettingsEmptyState,
@@ -44,8 +45,12 @@ import { ensuringPromise, recoverPromise } from "@/effect/promise"
 import { authClient } from "@/lib/auth-client"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { clearAppearanceCache } from "@/lib/appearance"
-import { announceActiveAccount } from "@/lib/browser-accounts"
+import {
+  announceActiveAccount,
+  browserAccountsQueryKey,
+} from "@/lib/browser-accounts"
 import { DISPLAY_NAME_MAX_LENGTH, parseDisplayName } from "@/lib/display-name"
+import { isMinecraftUsername } from "@/lib/minecraft-profile"
 import { queryKeys } from "@/lib/query-options"
 import { getCliCredentials, revokeCliCredential } from "@/server/cli"
 import {
@@ -139,12 +144,36 @@ function ProfileCard({ user }: { user: AuthenticatedUser }) {
     >
       <div className="flex flex-wrap items-center gap-x-4 gap-y-4 p-4 sm:p-5">
         <div className="flex min-w-0 flex-1 basis-72 items-center gap-4">
-          <AccountAvatar
-            name={displayName}
-            size="lg"
-            className="data-[size=lg]:size-14"
-            fallbackClassName="text-base"
-          />
+          <EditableIcon
+            canEdit={!user.isDevelopmentBypass}
+            className="size-14 rounded-none border-0 bg-transparent"
+            editor={{
+              fallback: (
+                <AccountAvatar
+                  name={displayName}
+                  size="lg"
+                  className="size-full data-[size=lg]:size-full"
+                  fallbackClassName="text-base"
+                />
+              ),
+              fit: "cover",
+              // The name is often the person's Minecraft username already.
+              minecraftUsername: isMinecraftUsername(displayName)
+                ? displayName
+                : "",
+              noun: "picture",
+              subject: { kind: "user", id: user.id },
+              title: "Profile picture",
+            }}
+          >
+            <AccountAvatar
+              name={displayName}
+              size="lg"
+              className="data-[size=lg]:size-14"
+              fallbackClassName="text-base"
+              userId={user.id}
+            />
+          </EditableIcon>
           <div className="min-w-0">
             <h2 className="type-section-title break-words">{displayName}</h2>
             <div className="mt-1.5 min-w-0">
@@ -230,6 +259,7 @@ function DisplayNameAction({
     showToast({ message: "Display name updated.", type: "success" })
     await Promise.all([
       session.refetch(),
+      queryClient.invalidateQueries({ queryKey: browserAccountsQueryKey }),
       queryClient.invalidateQueries({ queryKey: queryKeys.auth.state }),
       queryClient.invalidateQueries({
         queryKey: queryKeys.access.capabilities,
@@ -298,6 +328,7 @@ function DisplayNameAction({
 }
 
 function EmailAddressAction({ currentEmail }: { currentEmail: string }) {
+  const queryClient = useQueryClient()
   const session = authClient.useSession()
   const [open, setOpen] = React.useState(false)
   const [email, setEmail] = React.useState(currentEmail)
@@ -374,7 +405,10 @@ function EmailAddressAction({ currentEmail }: { currentEmail: string }) {
 
     showToast({ message: "Email address changed.", type: "success" })
     changeOpen(false)
-    await session.refetch()
+    await Promise.all([
+      session.refetch(),
+      queryClient.invalidateQueries({ queryKey: browserAccountsQueryKey }),
+    ])
   }
 
   function changeOpen(nextOpen: boolean) {

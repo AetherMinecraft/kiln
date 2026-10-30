@@ -8,6 +8,7 @@ import type { AuthenticatedUser } from "@/lib/auth-session"
 import type { AccessGrant } from "@/lib/access-control"
 import { isPlatformAdmin } from "@/lib/access-control"
 import type { AccessPermission } from "@/lib/permissions"
+import { appBackupPermission } from "@/lib/backup-target-permissions"
 import { grantHasPermission } from "@/lib/permissions"
 
 type SchedulePowerAction = Extract<ScheduleAction, { type: "power" }>
@@ -30,13 +31,24 @@ export function scheduleActionPermission(
 ): AccessPermission | null {
   if (action.type === "wait") return null
   if (action.type === "console_command") {
-    return target.kind === "instance" ? "instance.console.write" : null
+    if (target.kind === "instance") return "instance.console.write"
+    // A shell in a database's container reaches past what the database
+    // grants, so it takes a terminal on its Relay.
+    if (target.kind === "database") return "relay.terminal"
+    // As the App's own terminal does.
+    if (target.kind === "app") return "app.terminal"
+    return null
   }
   if (action.type === "power") {
     if (target.kind === "instance") return `instance.power.${action.action}`
     if (target.kind === "database") return "database.power"
+    // As starting or stopping it by hand does.
+    if (target.kind === "app") return "app.manage"
     return null
   }
+  // An App's backups follow its files' permissions, as manual ones do;
+  // stopping it for one takes more, which the server checks.
+  if (target.kind === "app") return appBackupPermission("backup.create")
   return "backup.create"
 }
 
@@ -51,12 +63,17 @@ export function scheduleActionOptionPermissions(
 ): ReadonlyArray<AccessPermission> {
   if (type === "power") {
     if (target.kind === "instance") return instancePowerPermissions
+    if (target.kind === "app") return ["app.manage"]
     return target.kind === "database" ? ["database.power"] : []
   }
   const permission = scheduleActionPermission({ type }, target)
   return permission === null ? [] : [permission]
 }
 
+/**
+ * Whether grants allow a permission on a target: a grant on its Relay, or
+ * on the target itself. For an App that is what `hasAppPermission` checks.
+ */
 export function hasScheduleTargetPermission(input: {
   grants: ReadonlyArray<AccessGrant>
   permission: AccessPermission

@@ -14,9 +14,10 @@ import {
   relayAppTerminalClaimSchema,
   relayAppTerminalRestartSchema,
   relayAppTerminalWriteSchema,
-  relayAppWebRouteInputSchema,
+  relayAppWebRoutesWriteSchema,
   relayAppWebRouteStateSchema,
   relayIdSchema,
+  webRouteHostnames,
 } from "@workspace/contracts"
 import type { RelayApp } from "@workspace/contracts"
 import { Effect, Result } from "effect"
@@ -43,19 +44,35 @@ import {
   abandonPreparedProvisioning,
   claimPreparedProvisioning,
 } from "@/lib/provisioning.server"
+import { deleteConfirmationSchema } from "@/lib/delete-confirmation"
+import { requireDeleteConfirmation } from "@/lib/delete-confirmation.server"
+import {
+  awaitResourceDeletion,
+  requestResourceDeletion,
+} from "@/lib/resource-deletion.server"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
+import { webRoutesForRelay } from "@/server/web-route-compatibility.server"
 import { listPersistedRelays } from "@/lib/relay-registry"
 import {
   appConfigPatchSchema,
   authorizedApp,
+  authorizedAppFor,
   getAppConfigHandler,
   getAppOwnerHandler,
-  getAppOwnerMinecraftProfileIdHandler,
   hasAppPermission,
   updateAppConfigHandler,
 } from "@/server/app-access"
 import { requireEligibleResourceUser } from "@/server/auth"
+import { requireBackupTargetPermission } from "@/server/backup-target-access.server"
 import { databaseRpc, requiredRelay } from "@/server/managed-database-access"
+import type { AuthenticatedUser } from "@/lib/auth-session"
+import { dnsKey } from "@/lib/dns-operations"
+import { exclusive } from "@/operations/lanes"
+import {
+  operation,
+  runOperationPromise,
+  signedIn,
+} from "@/operations/operation"
 
 const appInputSchema = z.strictObject({
   appId: appIdSchema,
@@ -76,7 +93,8 @@ const appLimitsInputSchema = appInputSchema.extend({
 })
 const appRenameInputSchema = appInputSchema.extend({ name: appNameSchema })
 const appNetworkInputSchema = appInputSchema.extend({
-  databaseIds: z.array(databaseIdSchema).max(32),
+  connected: z.boolean(),
+  databaseId: databaseIdSchema,
 })
 
 const appPermissions = accessPermissions.filter((permission) =>
@@ -108,10 +126,7 @@ export const getAppDirectory = createServerFn({ method: "GET" }).handler(
     )
     return records.flatMap((record) => {
       const relayName = relayNames.get(record.relayId)
-      if (
-        !relayName ||
-        !hasAppPermission(user, grants, record, "app.read")
-      ) {
+      if (!relayName || !hasAppPermission(user, grants, record, "app.read")) {
         return []
       }
       return [
@@ -145,15 +160,6 @@ export const getAppOwner = createServerFn({ method: "GET" })
   .validator(appInputSchema)
   .handler(async ({ data }) =>
     getAppOwnerHandler(await requireEligibleResourceUser(), data)
-  )
-
-export const getAppOwnerMinecraftProfileId = createServerFn({ method: "GET" })
-  .validator(appInputSchema)
-  .handler(async ({ data }) =>
-    getAppOwnerMinecraftProfileIdHandler(
-      await requireEligibleResourceUser(),
-      data
-    )
   )
 
 const cancelledSchema = z.object({ cancelled: z.boolean() })
@@ -233,6 +239,7 @@ export const createApp = createServerFn({ method: "POST" })
         unregister,
       })
       publishAppChange(relay.id, true)
+      generateAppHostname(relay.id, id)
       return {
         id: placeholder.id,
         relayId: relay.id,
@@ -262,8 +269,22 @@ export const createApp = createServerFn({ method: "POST" })
       throw persisted.failure
     }
     publishAppChange(relay.id, true)
+    generateAppHostname(relay.id, id)
     return { id: created.id, relayId: relay.id, shortId: created.shortId }
   })
+
+// A new app gets an address under a vanity domain, as game servers do. In
+// the background: it calls Cloudflare, and the app opens without it.
+function generateAppHostname(relayId: string, appId: string) {
+  void import("@/server/web-hostname-access.server").then(
+    ({ generateAppHostnameBestEffort }) =>
+      generateAppHostnameBestEffort({
+        relayId,
+        resourceId: appId,
+        resourceType: "app",
+      })
+  )
+}
 
 export const updateAppConfig = createServerFn({ method: "POST" })
   .validator(appConfigInputSchema)
@@ -273,6 +294,8 @@ export const updateAppConfig = createServerFn({ method: "POST" })
       data
     )
     publishAppChange(data.relayId, false)
+    // Which volumes the app uses shows on the Relay's Volumes page.
+    if (data.config.mounts) publishRelayVolumesChange(data.relayId)
     return { config }
   })
 
@@ -297,9 +320,8 @@ export const deployApp = createServerFn({ method: "POST" })
   .validator(appInputSchema)
   .handler(async ({ data }) => {
     const { relay, user } = await authorizedApp(data, "app.manage")
-    const { startAppDeploymentEffect } = await import(
-      "@/lib/app-deployments.server"
-    )
+    const { startAppDeploymentEffect } =
+      await import("@/lib/app-deployments.server")
     const started = await runAppEffect(
       "apps.deploy",
       startAppDeploymentEffect({
@@ -322,9 +344,7 @@ export const updateAppLimits = createServerFn({ method: "POST" })
     if (!(await relayAppLimitsSupported(relay.id))) {
       throw new Error("Update this Relay to set app limits")
     }
-    const limits = appConfigSchema
-      .pick({ serviceLimits: true })
-      .parse(data)
+    const limits = appConfigSchema.pick({ serviceLimits: true }).parse(data)
     // Saved once the Relay applies them, so limits it refuses aren't used
     // by the next deployment, and into the config saved by then, so other
     // edits made meanwhile stay.
@@ -365,41 +385,21 @@ export const runAppAction = createServerFn({ method: "POST" })
     return app
   })
 
-// Connects the app to exactly these databases, now and on later deployments.
-// Each database connected or disconnected needs its own network permission.
+// Connects the app to a database or disconnects it, now and on later
+// deployments. The Relay keeps the connection; connecting or disconnecting
+// a database also needs that database's network permission.
 export const updateAppNetwork = createServerFn({ method: "POST" })
   .validator(appNetworkInputSchema)
   .handler(async ({ data }) => {
-    const { app, relay, user } = await authorizedApp(data, "app.manage")
-    const before = new Set(app.config.databaseIds)
-    const after = new Set(data.databaseIds)
-    for (const databaseId of new Set([...before, ...after])) {
-      if (before.has(databaseId) === after.has(databaseId)) continue
-      await requireRelayPermission({
-        databaseId,
-        permission: "database.network.write",
-        relayId: relay.id,
-        user,
-      })
-    }
-    const config = await runAppEffect(
-      "apps.network.save",
-      updateAppConfigEffect(relay.id, data.appId, (current) => ({
-        ...current,
-        databaseIds: [...after],
-      }))
-    )
-    const updated = relayAppSchema.parse(
-      await databaseRpc(
-        relay,
-        "app.network.write",
-        { appId: data.appId, databaseIds: config.databaseIds },
-        30_000,
-        user.id
-      )
-    )
-    publishAppChange(relay.id, false)
-    return updated
+    const { relay, user } = await authorizedApp(data, "app.manage")
+    const { writeDatabaseConnection } =
+      await import("@/server/database-connections.server")
+    return writeDatabaseConnection(user, {
+      connected: data.connected,
+      databaseId: data.databaseId,
+      member: { id: data.appId, kind: "app" },
+      relayId: relay.id,
+    })
   })
 
 export const getAppWebRoutes = createServerFn({ method: "GET" })
@@ -419,55 +419,118 @@ export const getAppWebRoutes = createServerFn({ method: "GET" })
 
 // Saves the app's routes. Bundled Traefik serves them right away; an
 // external Traefik once a deploy labels the app's containers.
+const appWebRoutesSchema = appInputSchema.extend({
+  routes: relayAppWebRoutesWriteSchema.shape.routes,
+})
+
+const saveAppWebRoutes = operation<z.infer<typeof appWebRoutesSchema>>()({
+  name: "webRoutes.app.save",
+  doing: "Changing this App's web routes",
+  authorize: ({ input, user }) =>
+    signedIn(user).pipe(
+      Effect.tap((person) =>
+        promiseEffect(() => authorizedAppFor(person, input, "app.manage"))
+      )
+    ),
+  locks: ({ input }) => [
+    exclusive(
+      dnsKey({
+        relayId: input.relayId,
+        resourceId: input.appId,
+        resourceType: "app",
+      })
+    ),
+  ],
+  run: ({ context: user, input }) =>
+    promiseEffect(() => updateAppWebRoutesHandler(user, input)),
+  audit: ({ input }) => ({
+    id: input.appId,
+    kind: "app",
+    relayId: input.relayId,
+  }),
+})
+
 export const updateAppWebRoutes = createServerFn({ method: "POST" })
+  .validator(appWebRoutesSchema)
+  .handler(async ({ data }) =>
+    runOperationPromise(saveAppWebRoutes, data, {
+      user: await requireEligibleResourceUser(),
+    })
+  )
+
+async function updateAppWebRoutesHandler(
+  user: AuthenticatedUser,
+  data: z.infer<typeof appWebRoutesSchema>
+) {
+  const { relay } = await authorizedAppFor(user, data, "app.manage")
+  const resource = {
+    relayId: relay.id,
+    resourceId: data.appId,
+    resourceType: "app" as const,
+  }
+  const { saveClaimingWebRouteHostnames, syncWebRouteHostnames } =
+    await import("@/server/web-hostname-access.server")
+  const state = await saveClaimingWebRouteHostnames(
+    user,
+    resource,
+    data.routes.flatMap(webRouteHostnames),
+    async () =>
+      relayAppWebRouteStateSchema.parse(
+        await databaseRpc(
+          relay,
+          "app.network.routes.write",
+          {
+            appId: data.appId,
+            routes: webRoutesForRelay(relay.id, data.routes),
+          },
+          240_000,
+          user.id
+        )
+      )
+  )
+  publishAppChange(relay.id, false)
+  // Kiln keeps the DNS records of hostnames in zones it manages.
+  await syncWebRouteHostnames(resource)
+  return state
+}
+
+export const deleteApp = createServerFn({ method: "POST" })
   .validator(
-    appInputSchema.extend({
-      routes: z.array(relayAppWebRouteInputSchema).max(16),
+    appInputSchema.extend(deleteConfirmationSchema.shape).extend({
+      createBackup: z.boolean().default(true),
+      storageId: z.uuid().nullable().optional(),
     })
   )
   .handler(async ({ data }) => {
-    const { relay, user } = await authorizedApp(data, "app.manage")
-    const state = relayAppWebRouteStateSchema.parse(
-      await databaseRpc(
-        relay,
-        "app.network.routes.write",
-        { appId: data.appId, routes: data.routes },
-        240_000,
-        user.id
+    const { app, relay, user } = await authorizedApp(data, "app.delete")
+    await requireDeleteConfirmation({
+      confirmation: data.confirmation,
+      name: app.name,
+      password: data.password,
+      user,
+    })
+    if (data.createBackup) {
+      await requireBackupTargetPermission(
+        user,
+        relay.id,
+        { id: data.appId, kind: "app" },
+        "backup.create"
       )
-    )
-    publishAppChange(relay.id, false)
-    return state
-  })
-
-export const deleteApp = createServerFn({ method: "POST" })
-  .validator(appInputSchema)
-  .handler(async ({ data }) => {
-    const { relay, user } = await authorizedApp(data, "app.delete")
-    const removed = await promiseResult(() =>
-      databaseRpc(
-        relay,
-        "app.delete",
-        { appId: data.appId, deleteData: true },
-        180_000,
-        user.id
-      )
-    )
-    // An app already gone from the Relay still loses its record.
-    if (
-      Result.isFailure(removed) &&
-      !(
-        removed.failure instanceof Error &&
-        removed.failure.message.includes("App not found")
-      )
-    ) {
-      throw removed.failure
     }
-    await runAppEffect(
-      "apps.record.delete",
-      deleteAppRecordEffect(relay.id, data.appId)
-    )
-    publishAppChange(relay.id, true)
+    // Frozen, its folder and the volumes only it uses backed up if asked,
+    // then deleted, as one operation that goes on in the background if it
+    // outlasts this request.
+    const deletion = await requestResourceDeletion({
+      finalBackup: data.createBackup,
+      kind: "app",
+      relayId: relay.id,
+      resourceId: data.appId,
+      user,
+      ...(data.createBackup && data.storageId !== undefined
+        ? { storageId: data.storageId }
+        : {}),
+    })
+    await awaitResourceDeletion(deletion)
     return { deleted: true }
   })
 
@@ -533,6 +596,15 @@ function publishAppChange(relayId: string, directoryChanged: boolean): void {
     audience: { kind: "relays", relayIds: [relayId] },
     scope: { relayId },
     topics: directoryChanged ? ["apps", "app-directory"] : ["apps"],
+    type: "hearth.invalidate",
+  })
+}
+
+function publishRelayVolumesChange(relayId: string): void {
+  publishRealtimeChange({
+    audience: { kind: "relays", relayIds: [relayId] },
+    scope: { relayId },
+    topics: ["relay-volumes"],
     type: "hearth.invalidate",
   })
 }

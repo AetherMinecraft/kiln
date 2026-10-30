@@ -25,6 +25,27 @@ import { resourceOwners } from "./0022_resource_owners"
 import { notificationDelivery } from "./0023_notification_delivery"
 import { defaultKilnBackups } from "./0024_default_kiln_backups"
 import { backupRetentionDays } from "./0025_backup_retention_days"
+import { relayJoins } from "./0026_relay_joins"
+import { security } from "./0027_security"
+import { kilnFavorite } from "./0028_kiln_favorite"
+import { serverMigrations } from "./0029_server_migrations"
+import { linkedBackups } from "./0030_linked_backups"
+import { securityReports } from "./0031_security_reports"
+import { icons } from "./0032_icons"
+import { relayControlDial } from "./0033_relay_control_dial"
+import { relayJoinPairing } from "./0034_relay_join_pairing"
+import { cloudflareConnections } from "./0035_cloudflare_connections"
+import { operations } from "./0036_operations"
+import { operationProgress } from "./0037_operation_progress"
+import { relayDatabaseConnectionImport } from "./0038_relay_database_connection_import"
+import { tailscaleMemberIds } from "./0039_tailscale_member_ids"
+import { backupResourceTargets } from "./0042_backup_resource_targets"
+import { scheduleProjectionGenerations } from "./0043_schedule_projection_generations"
+import { resourceDeletions } from "./0044_resource_deletions"
+import { backupBatches } from "./0045_backup_batches"
+import { scheduleAppTargets } from "./0046_schedule_app_targets"
+import { simpleOperations } from "./0047_simple_operations"
+import { operationLocks } from "./0048_operation_locks"
 
 // Append new migrations with the next id. Never edit or reorder applied ones.
 export const migrations: ReadonlyArray<Migration> = [
@@ -53,4 +74,25 @@ export const migrations: ReadonlyArray<Migration> = [
   notificationDelivery,
   defaultKilnBackups,
   backupRetentionDays,
+  relayJoins,
+  security,
+  kilnFavorite,
+  serverMigrations,
+  linkedBackups,
+  securityReports,
+  icons,
+  relayControlDial,
+  relayJoinPairing,
+  cloudflareConnections,
+  operations,
+  operationProgress,
+  relayDatabaseConnectionImport,
+  tailscaleMemberIds,
+  backupResourceTargets,
+  scheduleProjectionGenerations,
+  resourceDeletions,
+  backupBatches,
+  scheduleAppTargets,
+  simpleOperations,
+  operationLocks,
 ]

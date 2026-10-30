@@ -1,8 +1,8 @@
 import { createServerFn } from "@tanstack/react-start"
-import { Effect } from "effect"
 import {
   relayConnectionSettingsSchema,
   relayIdSchema as relayFingerprintSchema,
+  relayJoinIdPattern,
   relayNameSchema,
   relayHostAccessSchema,
   relayProxyDiagnosticsSchema,
@@ -14,8 +14,6 @@ import {
 } from "@workspace/contracts"
 import { z } from "zod"
 
-import { resolveMinecraftProfileEffect } from "@/effect/minecraft-profile"
-import { listInvitedRelaysEffect } from "@/server/invited-relays.server"
 import {
   attachRelayOwnersEffect,
   type RelayOwnerFields,
@@ -36,21 +34,12 @@ import {
 } from "@workspace/contracts"
 import { grantHasPermission } from "@/lib/permissions"
 import { runAppEffect } from "@/effect/runtime"
-import {
-  isMinecraftUsername,
-  minecraftUsernameKey,
-} from "@/lib/minecraft-profile"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { requireEligibleResourceUser } from "@/server/auth"
 import { removeRelayThenCleanup } from "@/server/relay-removal"
 
 export type ManagedRelay = PersistedRelay & RelayOwnerFields
-
-export interface RelayOwnerMinecraftProfile {
-  displayName: string
-  profileId: string
-}
 
 const relayIdSchema = z.object({
   id: relayFingerprintSchema,
@@ -75,11 +64,12 @@ const relayTailscaleInstallInputSchema = relayTailscaleInstallSchema.extend({
 })
 const relayRoleSchema = z.enum(["custom", "full_access", "read_only"])
 const createRelaySchema = z.object({
+  installation: z.enum(["keep", "use"]),
   pairingUri: z.string().trim().min(64).max(32_768),
 })
-const updateRelaySchema = relayIdSchema.extend(
-  relayConnectionSettingsSchema.shape
-)
+const updateRelaySchema = relayIdSchema
+  .extend(relayConnectionSettingsSchema.shape)
+  .extend({ controlDial: z.enum(["hearth", "relay"]).optional() })
 const renameRelaySchema = z.object({
   name: relayNameSchema,
   relayId: relayFingerprintSchema,
@@ -167,52 +157,6 @@ export const getRelays = createServerFn({ method: "GET" }).handler(async () => {
   return attachRelayOwners(await managedRelays(user), isPlatformAdmin(user))
 })
 
-export const getRelayOwnerMinecraftProfiles = createServerFn({
-  method: "GET",
-}).handler(async () => {
-  const user = await requireEligibleResourceUser()
-  // Only stored display names reach Mojang, never email-derived fallbacks.
-  // Pending Relay invitations show their owner too.
-  const [relays, invitedRelays] = await Promise.all([
-    managedRelays(user).then((managed) => attachRelayOwners(managed, false)),
-    runAppEffect(
-      "resourceInvitations.invitedRelays",
-      listInvitedRelaysEffect(user.id, false)
-    ),
-  ])
-  const displayNames = [
-    ...new Map(
-      [...relays, ...invitedRelays].flatMap((relay) =>
-        relay.ownerName && isMinecraftUsername(relay.ownerName)
-          ? [[minecraftUsernameKey(relay.ownerName), relay.ownerName] as const]
-          : []
-      )
-    ).values(),
-  ]
-  const profiles = await runAppEffect(
-    "minecraft.relayOwnerProfiles.resolve",
-    Effect.forEach(
-      displayNames,
-      (displayName) =>
-        resolveMinecraftProfileEffect(displayName).pipe(
-          Effect.map((profile) =>
-            profile
-              ? ({
-                  displayName,
-                  profileId: profile.id,
-                } satisfies RelayOwnerMinecraftProfile)
-              : null
-          ),
-          Effect.catch(() => Effect.succeed(null))
-        ),
-      { concurrency: 4 }
-    )
-  )
-  return profiles.filter(
-    (profile): profile is RelayOwnerMinecraftProfile => profile !== null
-  )
-})
-
 export const addRelay = createServerFn({ method: "POST" })
   .validator(createRelaySchema)
   .handler(async ({ data }) => {
@@ -223,11 +167,18 @@ export const addRelay = createServerFn({ method: "POST" })
     if (preview.mode === "repair") {
       await requireRelayAdministrator(preview.relayFingerprint)
     }
-    const relay = await pairPersistedRelay(data.pairingUri, {
-      canManageAnyRelay: isPlatformAdmin(user),
-      userId: user.id,
-    })
-    return (await attachRelayOwners([relay], isPlatformAdmin(user)))[0]!
+    const { installationWarning, relay } = await pairPersistedRelay(
+      data.pairingUri,
+      {
+        canManageAnyRelay: isPlatformAdmin(user),
+        userId: user.id,
+      },
+      data.installation
+    )
+    return {
+      installationWarning,
+      relay: (await attachRelayOwners([relay], isPlatformAdmin(user)))[0]!,
+    }
   })
 
 function attachRelayOwners(
@@ -246,6 +197,28 @@ export const updateRelay = createServerFn({ method: "POST" })
     await requireRelayAdministrator(data.id)
     const { updatePersistedRelay } = await import("@/lib/relay-registry")
     return updatePersistedRelay(data)
+  })
+
+// Which side opened the Relay's control connection, while it's connected,
+// and whether the Relay can open it itself.
+export const getRelayConnection = createServerFn({ method: "GET" })
+  .validator(relayIdSchema)
+  .handler(async ({ data }) => {
+    await requireRelayAdministrator(data.id, "relay.read")
+    const [
+      { relayConnectionDials, relayConnectionOpener },
+      { relayPassthroughUsage },
+    ] = await Promise.all([
+      import("@/lib/relay-connection"),
+      import("@/lib/relay-passthrough-limits.server"),
+    ])
+    return {
+      openedBy: relayConnectionOpener(data.id),
+      relayDials: relayConnectionDials(data.id),
+      // What Hearth carried for it, for transfers browsers can't send it
+      // directly, since Hearth started.
+      throughHearth: relayPassthroughUsage(data.id),
+    }
   })
 
 export const checkRelay = createServerFn({ method: "POST" })
@@ -285,14 +258,96 @@ export const removeRelay = createServerFn({ method: "POST" })
           )
         },
         removeManagedDomains: async () => {
-          const { removeRelayManagedDomainsEffect } =
-            await import("@/server/domains.server")
-          return runAppEffect(
+          const [
+            { removeRelayManagedDomainsEffect },
+            { removeRelayWebHostnamesEffect },
+          ] = await Promise.all([
+            import("@/server/domains.server"),
+            import("@/server/web-hostnames.server"),
+          ])
+          // One after the other: each lets go of the Relay's names the
+          // other no longer uses.
+          const domains = await runAppEffect(
             "domains.relay.removeAssignments",
             removeRelayManagedDomainsEffect(data.id, data.removeVanityDomains)
           )
+          const hostnames = await runAppEffect(
+            "webHostnames.removeRelay",
+            removeRelayWebHostnamesEffect(data.id, data.removeVanityDomains)
+          )
+          return domains + hostnames
         },
       }
+    )
+  })
+
+const relayJoinIdSchema = z.object({
+  joinId: z.string().regex(relayJoinIdPattern),
+})
+const confirmRelayJoinSchema = relayJoinIdSchema.extend({
+  envelopeDigest: z.string().regex(/^[\da-f]{64}$/u),
+  installation: z.enum(["keep", "use"]),
+  name: z.string().trim().max(120).nullable(),
+})
+
+/** The person's join for the Add Relay dialog's install command. */
+export const openRelayJoin = createServerFn({ method: "POST" })
+  .validator(relayJoinIdSchema.partial())
+  .handler(async ({ data }) => {
+    const user = await requireRelayCreationAccess()
+    const { openRelayJoinEffect } = await import("@/server/relay-join.server")
+    return runAppEffect(
+      "relay.join.open",
+      openRelayJoinEffect(user.id, data.joinId)
+    )
+  })
+
+export const getRelayJoin = createServerFn({ method: "GET" })
+  .validator(relayJoinIdSchema)
+  .handler(async ({ data }) => {
+    const user = await requireRelayCreationAccess()
+    const { relayJoinViewEffect } = await import("@/server/relay-join.server")
+    return runAppEffect(
+      "relay.join.get",
+      relayJoinViewEffect(user.id, data.joinId)
+    )
+  })
+
+export const refreshRelayJoin = createServerFn({ method: "POST" })
+  .validator(relayJoinIdSchema)
+  .handler(async ({ data }) => {
+    const user = await requireRelayCreationAccess()
+    const { refreshRelayJoinEffect } =
+      await import("@/server/relay-join.server")
+    return runAppEffect(
+      "relay.join.refresh",
+      refreshRelayJoinEffect(user.id, data.joinId)
+    )
+  })
+
+export const confirmRelayJoin = createServerFn({ method: "POST" })
+  .validator(confirmRelayJoinSchema)
+  .handler(async ({ data }) => {
+    const user = await requireRelayCreationAccess()
+    const { confirmRelayJoinEffect, relayJoinViewEffect } =
+      await import("@/server/relay-join.server")
+    const join = await runAppEffect(
+      "relay.join.get",
+      relayJoinViewEffect(user.id, data.joinId)
+    )
+    // Adding a Relay Hearth already has replaces its credentials.
+    const existing = join.announcement?.existingRelay
+    if (existing) await requireRelayAdministrator(existing.id)
+    return runAppEffect(
+      "relay.join.confirm",
+      confirmRelayJoinEffect({
+        canManageAnyRelay: isPlatformAdmin(user),
+        envelopeDigest: data.envelopeDigest,
+        installation: data.installation,
+        joinId: data.joinId,
+        name: data.name,
+        userId: user.id,
+      })
     )
   })
 
@@ -408,9 +463,8 @@ export const getRelayWebRoutes = createServerFn({ method: "GET" })
   .validator(relayIdSchema)
   .handler(async ({ data }) => {
     const user = await requireEligibleResourceUser()
-    const { relayWebRoutesHandler } = await import(
-      "@/server/relay-web-routes.server"
-    )
+    const { relayWebRoutesHandler } =
+      await import("@/server/relay-web-routes.server")
     return relayWebRoutesHandler(user, data.id)
   })
 

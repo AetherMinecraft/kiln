@@ -5,19 +5,21 @@ import {
 } from "@tanstack/react-query"
 import type { QueryClient } from "@tanstack/react-query"
 import type {
-  BackupTarget,
   RelayPlatformTarget,
   RelayConsoleResource,
   RelayFileEntry,
   RelayInstance,
 } from "@workspace/contracts"
 
+import type { BackupTarget } from "@workspace/contracts"
 import { getAccessCapabilities, getInvitationPreview } from "@/server/access"
 import { getActivity } from "@/server/activity"
 import {
+  getAppBackups,
   getBackupPolicy,
   getBackupRunsPage,
   getBackupUsage,
+  getUnfinishedRestores,
 } from "@/server/backups"
 import { getBackupStorage } from "@/server/backup-storage"
 import { getKilnPlatform, getKilnPlatformLogs } from "@/server/platform"
@@ -41,7 +43,12 @@ import {
   listGitHubFolders,
   listGitHubRepositories,
 } from "@/server/github-sync"
-import { getDomainSettings, getInstanceDomain } from "@/server/domains"
+import {
+  getDomainSettings,
+  getInstanceDomain,
+  getManualWebHostnames,
+  getResourceWebHostnames,
+} from "@/server/domains"
 import { getHearthEdge } from "@/server/hearth-edge"
 import { getResourceLimitsCapacity } from "@/server/resource-limits"
 import {
@@ -49,20 +56,17 @@ import {
   getManagedDatabaseContainer,
   getManagedDatabaseDirectory,
 } from "@/server/databases"
-import {
-  isMinecraftUsername,
-  minecraftUsernameKey,
-} from "@/lib/minecraft-profile"
 import { getUiPreferences } from "@/server/preferences"
 import {
   getInstanceFavorites,
   setInstanceFavorite,
 } from "@/server/instance-favorites"
+import { getIconDetails, getIconIndex } from "@/server/icons"
+import { iconSubjectKey, type IconSubject } from "@/lib/icons"
 import {
   instanceFavoriteKey,
   type InstanceFavorite,
 } from "@/lib/instance-favorites"
-import { getMinecraftProfile } from "@/server/minecraft"
 import { getRelayResources } from "@/server/relay-host"
 import { getRelayVolumes } from "@/server/relay-volumes"
 import { isDatabaseFilePath } from "@/lib/database-files"
@@ -83,8 +87,8 @@ import {
   getRelayTree,
 } from "@/server/relay"
 import {
-  getRelayOwnerMinecraftProfiles,
   getRelayProxy,
+  getRelayConnection,
   getRelayWebRoutes,
   getRelayHostFiles,
   getRelayTailscale,
@@ -100,7 +104,6 @@ import {
 } from "@/server/updates"
 import {
   getResourceOwner,
-  getResourceOwnerMinecraftProfileId,
   getResourceUserCount,
 } from "@/server/resource-access"
 import { getScheduleOptions, getSchedules } from "@/server/schedules"
@@ -121,7 +124,6 @@ import {
   getAppConfig,
   getAppDirectory,
   getAppOwner,
-  getAppOwnerMinecraftProfileId,
   getAppWebRoutes,
 } from "@/server/apps"
 import {
@@ -146,12 +148,6 @@ export const queryKeys = {
   auth: {
     state: ["auth", "state"] as const,
   },
-  minecraft: {
-    profile: (displayName: string) =>
-      ["minecraft", "profile", displayName] as const,
-    relayOwners: (ownerNames: string) =>
-      ["minecraft", "relay-owner-profiles", ownerNames] as const,
-  },
   access: {
     capabilities: ["access", "capabilities"] as const,
     invitation: (token: string) => ["access", "invitation", token] as const,
@@ -162,6 +158,11 @@ export const queryKeys = {
     policy: (relayId: string, target: BackupTarget) =>
       ["backups", "policy", relayId, target.kind, target.id] as const,
     storage: ["backups", "storage"] as const,
+    /** An App's backup settings. */
+    app: (relayId: string, appId: string) =>
+      ["backups", "app", relayId, appId] as const,
+    /** Restores whose swap didn't finish, on every Relay. */
+    unfinished: ["backups", "unfinished"] as const,
     usage: (relayId: string, target: BackupTarget) =>
       ["backups", "usage", relayId, target.kind, target.id] as const,
   },
@@ -174,6 +175,11 @@ export const queryKeys = {
   brickVersions: (type: string, variant: string) =>
     ["bricks", "versions", type, variant] as const,
   domains: {
+    hostnames: (
+      relayId: string,
+      resourceType: "app" | "instance",
+      resourceId: string
+    ) => ["domains", "hostnames", relayId, resourceType, resourceId] as const,
     instance: (relayId: string, instanceId: string) =>
       ["domains", "instances", relayId, instanceId] as const,
     settings: ["domains", "settings"] as const,
@@ -277,6 +283,8 @@ export const queryKeys = {
   },
   relays: ["relays"] as const,
   relayProxy: (relayId: string) => ["relays", "proxy", relayId] as const,
+  relayControlDial: (relayId: string) =>
+    ["relays", "control-dial", relayId] as const,
   relayVolumes: (relayId: string) => ["relays", "volumes", relayId] as const,
   relayProxyModes: ["relays", "proxy-modes"] as const,
   // Beside each game server's own routes, so route changes refresh both.
@@ -295,6 +303,11 @@ export const queryKeys = {
   relayRelease: (relayId: string, version: string) =>
     ["updates", "relay", relayId, version] as const,
   instanceFavorites: ["instance-favorites"] as const,
+  icons: {
+    index: ["icons", "index"] as const,
+    details: ["icons", "details"] as const,
+    detail: (key: string) => ["icons", "details", key] as const,
+  },
   notifications: ["notifications"] as const,
   notificationPreferences: ["notification-preferences"] as const,
   uiPreferences: ["ui", "preferences"] as const,
@@ -357,30 +370,6 @@ export function authStateQueryOptions() {
     queryKey: queryKeys.auth.state,
     queryFn: () => getAuthState(),
     staleTime: 30_000,
-  })
-}
-
-export function minecraftProfileQueryOptions(displayName: string) {
-  const username = minecraftUsernameKey(displayName)
-  return queryOptions({
-    queryKey: queryKeys.minecraft.profile(username),
-    queryFn: ({ signal }) => getMinecraftProfile({ signal }),
-    enabled: isMinecraftUsername(displayName),
-    gcTime: 60 * 60_000,
-    retry: false,
-    staleTime: 60 * 60_000,
-  })
-}
-
-/** Keyed by the visible owners so pairing or sharing a Relay refetches. */
-export function relayOwnerMinecraftProfilesQueryOptions(ownerNames: string) {
-  return queryOptions({
-    queryKey: queryKeys.minecraft.relayOwners(ownerNames),
-    queryFn: ({ signal }) => getRelayOwnerMinecraftProfiles({ signal }),
-    enabled: ownerNames.length > 0,
-    gcTime: 60 * 60_000,
-    retry: false,
-    staleTime: 60 * 60_000,
   })
 }
 
@@ -458,35 +447,6 @@ export function resourceOwnerQueryOptions(scope: {
     queryFn: () => getResourceOwner({ data: scope }),
     retry: false,
     staleTime: 30_000,
-  })
-}
-
-// The owner's Minecraft head, apart from the owner so their card shows
-// before Mojang answers. Keyed by the owner's name too, so a new owner or
-// name looks the head up again.
-export function resourceOwnerMinecraftProfileQueryOptions(
-  scope: {
-    relayId: string
-    resourceId: string
-    resourceType: "database" | "instance" | "relay"
-  },
-  ownerName: string
-) {
-  return queryOptions({
-    queryKey: [
-      "resource-access",
-      scope.relayId,
-      scope.resourceType,
-      scope.resourceId,
-      "owner",
-      "minecraft",
-      ownerName,
-    ] as const,
-    queryFn: ({ signal }) =>
-      getResourceOwnerMinecraftProfileId({ data: scope, signal }),
-    gcTime: 60 * 60_000,
-    retry: false,
-    staleTime: 60 * 60_000,
   })
 }
 
@@ -711,23 +671,6 @@ export function appOwnerQueryOptions(relayId: string, appId: string) {
   })
 }
 
-// The owner's Minecraft head, keyed by their name so a new name looks it up
-// again.
-export function appOwnerMinecraftProfileQueryOptions(
-  relayId: string,
-  appId: string,
-  ownerName: string
-) {
-  return queryOptions({
-    queryKey: ["app-owner", relayId, appId, "minecraft", ownerName] as const,
-    queryFn: ({ signal }) =>
-      getAppOwnerMinecraftProfileId({ data: { appId, relayId }, signal }),
-    gcTime: 60 * 60_000,
-    retry: false,
-    staleTime: 60 * 60_000,
-  })
-}
-
 export function appConfigQueryOptions(relayId: string, appId: string) {
   return queryOptions({
     queryKey: queryKeys.apps.config(relayId, appId),
@@ -819,6 +762,22 @@ export function invitationPreviewQueryOptions(token: string) {
   return queryOptions({
     queryKey: queryKeys.access.invitation(token),
     queryFn: () => getInvitationPreview({ data: { token } }),
+    staleTime: 30_000,
+  })
+}
+
+export function iconIndexQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.icons.index,
+    queryFn: () => getIconIndex(),
+    staleTime: Infinity,
+  })
+}
+
+export function iconDetailsQueryOptions(subject: IconSubject) {
+  return queryOptions({
+    queryKey: queryKeys.icons.detail(iconSubjectKey(subject)),
+    queryFn: () => getIconDetails({ data: { subject } }),
     staleTime: 30_000,
   })
 }
@@ -923,14 +882,61 @@ export function relayWebRoutesQueryOptions(relayId: string) {
 
 // Sizes are Docker's last measure, taken in the background; changes
 // refresh the list through the `relay-volumes` topic.
+// An App's backup settings: what's backed up and what isn't. Checked often while
+// a backup of it runs.
+export function appBackupsQueryOptions(relayId: string, appId: string) {
+  return queryOptions({
+    queryFn: () => getAppBackups({ data: { appId, relayId } }),
+    queryKey: queryKeys.backups.app(relayId, appId),
+    refetchInterval: (query) =>
+      query.state.data?.targets.some(
+        (target) =>
+          target.latest?.taskStatus === "queued" ||
+          target.latest?.taskStatus === "running" ||
+          target.restore?.taskStatus === "queued" ||
+          target.restore?.taskStatus === "running"
+      )
+        ? 3_000
+        : false,
+    staleTime: 15_000,
+  })
+}
+
+// Restores whose swap didn't finish, each fencing its App's folder or
+// volume until someone finishes or abandons it.
+export function unfinishedRestoresQueryOptions() {
+  return queryOptions({
+    queryFn: () => getUnfinishedRestores(),
+    queryKey: queryKeys.backups.unfinished,
+    staleTime: 30_000,
+  })
+}
+
 export function relayVolumesQueryOptions(relayId: string) {
   return queryOptions({
     queryFn: () => getRelayVolumes({ data: { relayId } }),
     queryKey: queryKeys.relayVolumes(relayId),
-    // Docker measures sizes in the background; check back until it's done.
-    refetchInterval: (query) => (query.state.data?.measuring ? 2_000 : false),
+    // Docker measures sizes in the background, and other Hearths send which
+    // volumes their Apps name; check back until both are done.
+    refetchInterval: (query) =>
+      query.state.data?.measuring
+        ? 2_000
+        : query.state.data?.protection.ready === false
+          ? 10_000
+          : false,
     retry: false,
     staleTime: 30_000,
+  })
+}
+
+// Which side opened the Relay's control connection. It changes only when
+// the connection does, so it's read now and then while someone looks.
+export function relayControlDialQueryOptions(relayId: string) {
+  return queryOptions({
+    queryFn: () => getRelayConnection({ data: { id: relayId } }),
+    queryKey: queryKeys.relayControlDial(relayId),
+    refetchInterval: 30_000,
+    staleTime: 10_000,
   })
 }
 
@@ -1080,6 +1086,19 @@ export function domainSettingsQueryOptions() {
   })
 }
 
+/**
+ * Web route hostnames on no connected domain, read from the Relays. Under
+ * the settings key, so whatever refreshes the page refreshes these too.
+ */
+export function manualWebHostnamesQueryOptions() {
+  return queryOptions({
+    queryKey: [...queryKeys.domains.settings, "manual"] as const,
+    queryFn: () => getManualWebHostnames(),
+    retry: false,
+    staleTime: 30_000,
+  })
+}
+
 export function githubSyncOverviewQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.github.overview,
@@ -1206,6 +1225,26 @@ export function hearthEdgeQueryOptions() {
     queryKey: queryKeys.hearthEdge,
     queryFn: () => getHearthEdge(),
     staleTime: Infinity,
+  })
+}
+
+/** The DNS records Kiln keeps for a game server's or app's web routes. */
+export function resourceWebHostnamesQueryOptions(
+  relayId: string,
+  resourceType: "app" | "instance",
+  resourceId: string
+) {
+  return queryOptions({
+    queryKey: queryKeys.domains.hostnames(relayId, resourceType, resourceId),
+    queryFn: () =>
+      getResourceWebHostnames({
+        data:
+          resourceType === "app"
+            ? { relayId, resourceId, resourceType }
+            : { relayId, resourceId, resourceType },
+      }),
+    retry: false,
+    staleTime: 10_000,
   })
 }
 

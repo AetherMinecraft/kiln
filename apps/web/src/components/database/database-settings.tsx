@@ -1,6 +1,6 @@
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import type { BackupTarget, ResourceLimits } from "@workspace/contracts"
+import type { ResourceLimits } from "@workspace/contracts"
 import {
   ArrowRight,
   Cable,
@@ -31,9 +31,12 @@ import {
   engineProductLabel,
   type ManagedDatabase,
 } from "@/components/database/database-presentation"
+import type { BackupTarget } from "@workspace/contracts"
+import { EditableIcon } from "@/components/icon-editor-dialog"
 import {
   InfoCopyValue,
   InfoFact,
+  InfoProfile,
   InfoSecretValue,
   InfoSection,
   InfoSectionLink,
@@ -67,11 +70,27 @@ export function DatabaseGeneralSettings({
   canRename: boolean
   database: ManagedDatabase
 }) {
+  const editor = React.useMemo(
+    () => ({
+      fallback: <DatabaseKindIcon />,
+      fit: "contain" as const,
+      noun: "database",
+      subject: {
+        kind: "database" as const,
+        relayId: database.relayId,
+        id: database.id,
+      },
+      title: "Database icon",
+    }),
+    [database.id, database.relayId]
+  )
   return (
-    <InfoSection
-      icon={<DatabaseKindIcon />}
-      title="Database"
-      action={
+    <InfoProfile
+      icon={<EditableIcon canEdit={canRename} editor={editor} />}
+      id={database.id}
+      idLabel="database ID"
+      name={database.name}
+      actions={
         <>
           {canRename ? <DatabaseRenameButton database={database} /> : null}
           <InstanceFavoriteButton
@@ -82,16 +101,6 @@ export function DatabaseGeneralSettings({
         </>
       }
     >
-      <InfoFact label="Name">
-        <InfoCopyValue
-          label="database name"
-          mono={false}
-          value={database.name}
-        />
-      </InfoFact>
-      <InfoFact label="Kiln ID">
-        <InfoCopyValue label="database ID" value={database.id} />
-      </InfoFact>
       <InfoFact label="Engine">
         <InfoCopyValue
           label="engine"
@@ -99,7 +108,7 @@ export function DatabaseGeneralSettings({
           value={engineProductLabel(database)}
         />
       </InfoFact>
-    </InfoSection>
+    </InfoProfile>
   )
 }
 
@@ -463,8 +472,8 @@ export function SqlImportDropZone({
   )
 }
 
-// How game servers reach the database: only from inside the Relay, once
-// they're connected on its network.
+// How game servers, Apps, and other databases reach the database: only from
+// inside the Relay, once they're connected on its network.
 export function DatabaseConnectionSettings({
   canViewNetwork,
   database,
@@ -474,7 +483,7 @@ export function DatabaseConnectionSettings({
   database: ManagedDatabase
   routeId: string
 }) {
-  const connected = database.connectedInstanceIds.length
+  const connected = database.members.length
   return (
     <InfoSection
       icon={<Cable />}
@@ -496,9 +505,9 @@ export function DatabaseConnectionSettings({
           value={`${database.hostname}:${database.internalPort}`}
         />
       </InfoFact>
-      <InfoFact label="Game servers">
+      <InfoFact label="Connections">
         <span className={connected === 0 ? "text-muted-foreground" : undefined}>
-          {connected === 0 ? "None connected" : `${connected} connected`}
+          {connected === 0 ? "None" : connected}
         </span>
       </InfoFact>
     </InfoSection>

@@ -9,9 +9,11 @@ import type {
   RelayInstancePortAllocation,
   RelayInstancePortProtocol,
   RelayInstanceTailscale,
+  RelayJoinLink,
   ResourceLimits,
 } from "@workspace/contracts"
 import {
+  decodeRelayJoinLink,
   isKilnInstallationId,
   kilnGitRepositoryRawUrl,
   resolveKilnGitRepository,
@@ -110,6 +112,9 @@ export interface RelayConfig {
   brickCatalogUrl: string
   bootstrapToken: string | null
   browserOrigin: string
+  // From KILN_RELAY_JOIN: the join link from Hearth's Add Relay dialog this
+  // Relay pairs with Hearth by (effect/join.ts). It holds a secret.
+  join: RelayJoinLink | null
   browserLimits: {
     fileReplayEntries: number
     outboxBytes: number
@@ -167,6 +172,9 @@ export interface RelayConfig {
    * mode can't identify it from its mounts (Podman, Docker in Docker).
    */
   selfContainer: string | null
+  // The Syft binary the Relay inventories its host and images with, in its
+  // own image, where its helpers run it too.
+  syftPath: string
   serverIdLabel: string
   nodeId: string
   nodeName: string
@@ -288,6 +296,7 @@ export function loadConfig(
         ? legacyFileCatalogUrl.href
         : kilnGitRepositoryRawUrl(gitRepository, "apps/bricks/catalog.yml"),
     bootstrapToken: bootstrapToken(environment),
+    join: joinLink(environment),
     browserOrigin:
       proxyMode === "traefik"
         ? `https://${formatUrlHost(advertisedHost)}`
@@ -323,6 +332,7 @@ export function loadConfig(
       environment.MCLOGS_API_URL?.trim() || "https://api.mclo.gs/1/log",
     mode,
     selfContainer: environment.KILN_RELAY_CONTAINER?.trim() || null,
+    syftPath: environment.KILN_RELAY_SYFT_PATH?.trim() || "/usr/local/bin/syft",
     nodeId: "kiln-relay",
     nodeName: environment.KILN_RELAY_NAME?.trim() || "",
     port,
@@ -715,6 +725,18 @@ async function discoverPublicIp(): Promise<string> {
   const address = addresses[0]
   if (!address) throw new Error("Public DNS returned no address")
   return address
+}
+
+function joinLink(environment: NodeJS.ProcessEnv): RelayJoinLink | null {
+  const value = environment.KILN_RELAY_JOIN?.trim()
+  if (!value) return null
+  const link = decodeRelayJoinLink(value)
+  if (!link) {
+    throw new Error(
+      "KILN_RELAY_JOIN must be the join link from Hearth's Add Relay dialog"
+    )
+  }
+  return link
 }
 
 function bootstrapToken(environment: NodeJS.ProcessEnv): string | null {

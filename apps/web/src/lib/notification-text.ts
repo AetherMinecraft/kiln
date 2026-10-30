@@ -3,6 +3,7 @@ import type {
   NotificationResource,
 } from "@/lib/notifications"
 import { formatBytes } from "@/lib/format-bytes"
+import { securitySeverityLabels } from "@/lib/security"
 import { kilnReleaseLabel } from "@/lib/release-version"
 
 // What a notification says in a line or two, shared by the inbox and the
@@ -66,6 +67,23 @@ export function notificationTitle(content: NotificationContent): string {
         : content.update
           ? "Your App has been updated"
           : "Your App has been deployed"
+    case "security.report":
+      return content.count === 1
+        ? "1 new vulnerability found"
+        : `${content.count} new vulnerabilities found`
+    case "server.migration": {
+      const action = content.mode === "migrate" ? "move" : "copy"
+      switch (content.outcome) {
+        case "completed":
+          return content.mode === "migrate"
+            ? "Your Game Server was moved"
+            : "Your Game Server was duplicated"
+        case "failed":
+          return `Your Game Server couldn't ${action}`
+        case "cancelled":
+          return `Your Game Server ${action} was cancelled`
+      }
+    }
   }
 }
 
@@ -91,5 +109,24 @@ export function notificationDetail(
       return content.status === "failed"
         ? `${content.resource.name} couldn't deploy`
         : `${content.resource.name} has deployed successfully`
+    case "security.report": {
+      // "Up to critical in Survival and 2 more, 1 exploited".
+      const { count, knownExploited, resources, severity } = content
+      const label = securitySeverityLabels[severity]
+      const others = resources.length - 1
+      const where = `${resources[0]?.name ?? ""}${others ? ` and ${others} more` : ""}`
+      const exploited = !knownExploited
+        ? ""
+        : count === 1
+          ? ", exploited"
+          : `, ${knownExploited} exploited`
+      return `${count === 1 ? label : `Up to ${label.toLowerCase()}`} in ${where}${exploited}`
+    }
+    case "server.migration":
+      return content.outcome === "failed"
+        ? `${content.source.name} - ${content.error ?? "The copy stopped"}`
+        : content.sourceDeleting && !content.sourceDeleted
+          ? `${content.source.name} to ${content.destination.name} - the old server is deleted after its final backup`
+          : `${content.source.name} to ${content.destination.name}`
   }
 }

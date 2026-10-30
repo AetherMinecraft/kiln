@@ -39,6 +39,195 @@ const readOnlyCliCalls: Record<string, string> = {
   revokeCliCredentialEffect: "Signs this CLI out",
 }
 
+// Deleting a game server, database, App, or volume asks its name and the
+// account password, from the browser and the CLI alike: each of these must
+// reach the one check that does.
+const confirmedDeletions = [
+  "relay.ts:deleteInstance",
+  "databases.ts:deleteManagedDatabase",
+  "apps.ts:deleteApp",
+  "relay-volumes.ts:deleteRelayVolume",
+  "resource-deletions.ts:retryResourceDeletion",
+  // A move that deletes the old server it leaves.
+  "server-migrations.ts:startServerMigration",
+]
+const confirmedCliDeletions = ["deleteCliServerEffect"]
+
+// Mutating server functions that don't run as operations yet. Move them
+// area by area; never add one.
+const notYetOperations = new Set<string>([
+  "app-deployments.ts:redeployAppDeployment",
+  "app-deployments.ts:saveAppGitHubSource",
+  "app-image-updates.ts:checkAppImageUpdate",
+  "app-image-updates.ts:deployAppImageUpdate",
+  "app-image-updates.ts:saveAppImageUpdatePolicy",
+  "app-image-updates.ts:skipAppImageUpdate",
+  "apps.ts:claimAppTerminal",
+  "apps.ts:createApp",
+  "apps.ts:deployApp",
+  "apps.ts:renameApp",
+  "apps.ts:restartAppTerminal",
+  "apps.ts:runAppAction",
+  "apps.ts:updateAppConfig",
+  "apps.ts:updateAppLimits",
+  "apps.ts:updateAppNetwork",
+  "apps.ts:writeAppTerminal",
+  "backup-storage.ts:deleteBackupStorage",
+  "backup-storage.ts:saveBackupStorage",
+  "backup-storage.ts:setPreferredBackupStorage",
+  "backups.ts:cancelBackup",
+  "backups.ts:copyBackupToDestination",
+  "backups.ts:createAppBackups",
+  "backups.ts:createDatabaseBackup",
+  "backups.ts:createInstanceBackup",
+  "backups.ts:createPlatformBackup",
+  "backups.ts:createResourceBackup",
+  "backups.ts:deleteBackup",
+  "backups.ts:getBackupDownloadUrl",
+  "backups.ts:renameBackup",
+  "backups.ts:resolveUnfinishedRestore",
+  "backups.ts:restoreDatabaseBackup",
+  "backups.ts:restoreInstanceBackup",
+  "backups.ts:restoreResourceBackup",
+  "backups.ts:syncBackupRuns",
+  "backups.ts:updateBackupExcludes",
+  "backups.ts:updateBackupLimits",
+  "brick-catalogs.ts:addBrickCatalog",
+  "brick-catalogs.ts:deleteBrickCatalog",
+  "brick-catalogs.ts:setBrickCatalogCommunity",
+  "bricks.ts:configureBrickNetworking",
+  "bricks.ts:createBrickInstance",
+  "bricks.ts:loadBrickRecipe",
+  "bricks.ts:saveCustomBrick",
+  "bricks.ts:updateInstanceStartup",
+  "browser-accounts.ts:rememberActiveBrowserAccountSession",
+  "browser-accounts.ts:signOutBrowserAccountSession",
+  "cli.ts:approveCliAuthorization",
+  "cli.ts:denyCliAuthorization",
+  "cli.ts:revokeCliCredential",
+  "databases.ts:claimDatabaseTerminal",
+  "databases.ts:createManagedDatabase",
+  "databases.ts:exportManagedDatabase",
+  "databases.ts:getManagedDatabaseRows",
+  "databases.ts:importManagedDatabase",
+  "databases.ts:mutateManagedDatabase",
+  "databases.ts:renameManagedDatabase",
+  "databases.ts:restartDatabaseTerminal",
+  "databases.ts:rotateManagedDatabasePassword",
+  "databases.ts:runManagedDatabaseAction",
+  "databases.ts:runManagedDatabaseQuery",
+  "databases.ts:updateManagedDatabaseLimits",
+  "databases.ts:updateManagedDatabaseNetwork",
+  "databases.ts:wipeManagedDatabase",
+  "databases.ts:writeDatabaseTerminal",
+  "domains.ts:discoverCloudflareDomains",
+  "domains.ts:releaseWebHostname",
+  "domains.ts:resyncDomainAssignments",
+  "github-sync.ts:deleteGitHubConnection",
+  "github-sync.ts:deleteGitHubSync",
+  "github-sync.ts:runGitHubSync",
+  "github-sync.ts:saveGitHubSync",
+  "github-sync.ts:startGitHubConnection",
+  "icons.ts:detectIcon",
+  "icons.ts:fetchIconSource",
+  "icons.ts:fetchMinecraftHead",
+  "icons.ts:linkIconFile",
+  "icons.ts:readIconSourceFile",
+  "icons.ts:readPictureSourceFile",
+  "icons.ts:removeCustomIcon",
+  "icons.ts:saveCustomIcon",
+  "instance-favorites.ts:setInstanceFavorite",
+  "instance-inventory.ts:getInstanceInventory",
+  "kiln-database.ts:getKilnDatabaseRows",
+  "kiln-database.ts:importKilnDatabase",
+  "kiln-database.ts:mutateKilnDatabase",
+  "kiln-database.ts:runKilnDatabaseQuery",
+  "notifications.ts:acknowledgeNotificationsSeen",
+  "notifications.ts:clearNotifications",
+  "notifications.ts:dismissNotification",
+  "notifications.ts:markNotificationsRead",
+  "notifications.ts:saveNotificationPreferences",
+  "platform.ts:claimKilnTerminal",
+  "platform.ts:restartKilnTerminal",
+  "platform.ts:runKilnPlatformAction",
+  "platform.ts:writeKilnTerminal",
+  "preferences.ts:updateAppearancePreferences",
+  "push-notifications.ts:subscribePushNotifications",
+  "push-notifications.ts:unsubscribePushNotifications",
+  "relay-capability.ts:issueBrowserCapabilities",
+  "relay-capability.ts:issueConsoleCapability",
+  "relay-capability.ts:issueFileCapability",
+  "relay-capability.ts:issueResourceCapability",
+  "relay-host.ts:claimRelayTerminal",
+  "relay-host.ts:mountRelayHostFiles",
+  "relay-host.ts:restartRelay",
+  "relay-host.ts:restartRelayHost",
+  "relay-host.ts:restartRelayTerminal",
+  "relay-host.ts:writeRelayTerminal",
+  "relays.ts:addRelay",
+  "relays.ts:checkRelay",
+  "relays.ts:confirmRelayJoin",
+  "relays.ts:createRelayInvitation",
+  "relays.ts:installRelayTailscale",
+  "relays.ts:openRelayJoin",
+  "relays.ts:previewRelayPairing",
+  "relays.ts:refreshRelayJoin",
+  "relays.ts:removeRelay",
+  "relays.ts:renameRelay",
+  "relays.ts:revokeHearthClient",
+  "relays.ts:revokeRelayInvitation",
+  "relays.ts:setRelayEnabled",
+  "relays.ts:updateRelay",
+  "relays.ts:updateRelayClient",
+  "relays.ts:updateRelayProxy",
+  "relays.ts:updateRelayTailscale",
+  "relay-transfers.ts:cancelRelayTransfer",
+  "relay-transfers.ts:getRelayTransfer",
+  "relay-transfers.ts:preflightRelayTransfer",
+  "relay-transfers.ts:startRelayTransfer",
+  "relay.ts:completeRelayConsoleCommand",
+  "relay.ts:getFreshRelayConnectionState",
+  "relay.ts:getFreshRelayInstance",
+  "relay.ts:getRelayDatabaseRows",
+  "relay.ts:getRelayDirectorySizes",
+  "relay.ts:getRelayInstances",
+  "relay.ts:getRelaySnapshot",
+  "relay.ts:mutateRelayDatabase",
+  "relay.ts:mutateRelayFiles",
+  "relay.ts:performRelayAction",
+  "relay.ts:recordRelayFileView",
+  "relay.ts:releaseInstancePort",
+  "relay.ts:removeInstanceDatabaseConnection",
+  "relay.ts:reserveInstancePort",
+  "relay.ts:runRelayDatabaseQuery",
+  "relay.ts:saveRelayFile",
+  "relay.ts:sendRelayConsoleCommand",
+  "relay.ts:updateInstanceName",
+  "relay.ts:updateInstancePorts",
+  "relay.ts:updateRelayFilePin",
+  "relay.ts:uploadConsoleLogToMclogs",
+  "relay.ts:uploadToMclogs",
+  "relay-volumes.ts:createRelayVolume",
+  "relay-volumes.ts:renameRelayVolume",
+  "schedules.ts:createSchedule",
+  "schedules.ts:deleteSchedule",
+  "schedules.ts:runScheduleNow",
+  "schedules.ts:updateSchedule",
+  "security.ts:scanSecurityNow",
+  "server-migrations.ts:cancelServerMigration",
+  "server-migrations.ts:previewServerMigration",
+  "sessions.ts:revokeActiveSession",
+  "tailscale.ts:configureTailscaleIntegration",
+  "tailscale.ts:createTailscaleNetwork",
+  "tailscale.ts:getTailscaleIntegrationStatus",
+  "tailscale.ts:previewTailscaleIntegration",
+  "tailscale.ts:saveTailscaleStack",
+  "tailscale.ts:syncTailscaleIntegration",
+  "updates.ts:checkForKilnReleases",
+  "updates.ts:getSystemUpdateStatus",
+  "updates.ts:startSystemUpdates",
+])
+
 // The session checks every handler must reach.
 const sessionChecks = new Set([
   "getCurrentUser",
@@ -52,7 +241,13 @@ const sessionChecks = new Set([
 const webRoot = resolve(import.meta.dirname, "../..")
 const authFile = resolve(webRoot, "src/server/auth.ts")
 const cliAccessFile = resolve(webRoot, "src/effect/cli-access.ts")
+const operationFile = resolve(webRoot, "src/operations/operation.ts")
+const durableOperationFile = resolve(webRoot, "src/operations/durable.ts")
 const cliRouteFile = resolve(webRoot, "src/routes/api.cli.v1.$.ts")
+const deleteConfirmationFile = resolve(
+  webRoot,
+  "src/lib/delete-confirmation.server.ts"
+)
 
 describe("API authentication", () => {
   const { program, checker } = loadProgram()
@@ -75,60 +270,29 @@ describe("API authentication", () => {
     expect(stale).toEqual([])
   })
 
-  it(
-    "does not count a guard that is only imported",
-    { timeout: 60_000 },
-    () => {
-      const fixture = resolve(webRoot, "src/server/auth-coverage-fixture.ts")
-      const fixtureProgram = loadProgram({
-        [fixture]: `
-        import { createServerFn } from "@tanstack/react-start"
-        import { requireVerifiedUser as staticGuard } from "@/server/auth"
-
-        export const destructured = createServerFn({ method: "POST" }).handler(
-          async () => {
-            const { requireVerifiedUser } = await import("@/server/auth")
-            return null
-          }
-        )
-        export const renamed = createServerFn({ method: "POST" }).handler(
-          async () => {
-            const { requireVerifiedUser: guard } = await import("@/server/auth")
-            return null
-          }
-        )
-        export const staticOnly = createServerFn({ method: "POST" }).handler(
-          async () => null
-        )
-        export const called = createServerFn({ method: "POST" }).handler(
-          async () => {
-            const { requireVerifiedUser } = await import("@/server/auth")
-            return requireVerifiedUser()
-          }
-        )
-        export const calledStatic = createServerFn({ method: "POST" }).handler(
-          async () => staticGuard()
-        )
-      `,
-      })
-      const reaches = reachabilityChecker(
-        fixtureProgram.checker,
-        isSessionCheck
+  // Every change runs as an operation (docs/hearth-operations.md), so it
+  // takes its lanes, and is traced and audited, like every other. Those
+  // still to move are listed below, and the list only shrinks.
+  it("runs every change as an operation", { timeout: 60_000 }, () => {
+    const reaches = reachabilityChecker(checker, isOperationRun)
+    const handlers = serverFunctionHandlers(program).filter(
+      (handler) => handler.mutating && !(handler.id in publicServerFunctions)
+    )
+    const runs = new Set(
+      handlers.filter(({ handler }) => reaches(handler)).map(({ id }) => id)
+    )
+    expect(
+      handlers
+        .filter(({ id }) => !runs.has(id) && !notYetOperations.has(id))
+        .map(({ id }) => id)
+    ).toEqual([])
+    // One that moved, or went, comes off the list.
+    expect(
+      [...notYetOperations].filter(
+        (id) => runs.has(id) || !handlers.some((handler) => handler.id === id)
       )
-      const results = Object.fromEntries(
-        serverFunctionHandlers(fixtureProgram.program)
-          .filter(({ id }) => id.startsWith("auth-coverage-fixture.ts:"))
-          .map(({ id, handler }) => [id.split(":")[1], reaches(handler)])
-      )
-      expect(results).toEqual({
-        destructured: false,
-        renamed: false,
-        staticOnly: false,
-        called: true,
-        calledStatic: true,
-      })
-    }
-  )
+    ).toEqual([])
+  })
 
   // Read-only CLI links must not change anything, so every Effect the CLI
   // API runs for POST, PUT, PATCH, or DELETE must reach `requireCliWrite`.
@@ -145,13 +309,30 @@ describe("API authentication", () => {
       .map(({ name }) => name)
     expect(unchecked).toEqual([])
   })
+
+  it(
+    "asks the same confirmation before every deletion",
+    { timeout: 60_000 },
+    () => {
+      const reaches = reachabilityChecker(checker, isDeleteConfirmation)
+      const handlers = serverFunctionHandlers(program)
+      const unconfirmed = confirmedDeletions.filter((id) => {
+        const handler = handlers.find((candidate) => candidate.id === id)
+        return !handler || !reaches(handler.handler)
+      })
+      expect(unconfirmed).toEqual([])
+
+      const cliCalls = mutatingCliCalls(program, checker)
+      const unconfirmedCli = confirmedCliDeletions.filter((name) => {
+        const call = cliCalls.find((candidate) => candidate.name === name)
+        return !call || !reaches(call.declaration)
+      })
+      expect(unconfirmedCli).toEqual([])
+    }
+  )
 })
 
-// Programs in this file share parsed (and bound) source files, as the language
-// service does, so the fixture program doesn't re-read the app it imports.
-const parsedFiles = new Map<string, ts.SourceFile>()
-
-function loadProgram(virtualFiles: Record<string, string> = {}) {
+function loadProgram() {
   const configPath = resolve(webRoot, "tsconfig.json")
   const config = ts.getParsedCommandLineOfConfigFile(
     configPath,
@@ -166,29 +347,11 @@ function loadProgram(virtualFiles: Record<string, string> = {}) {
     }
   )
   if (!config) throw new Error("Could not read apps/web/tsconfig.json")
-  const host = ts.createCompilerHost(config.options)
-  const { fileExists, getSourceFile, readFile } = host
-  host.fileExists = (file) => file in virtualFiles || fileExists(file)
-  host.readFile = (file) => virtualFiles[file] ?? readFile(file)
-  host.getSourceFile = (file, language, ...rest) => {
-    if (file in virtualFiles) {
-      return ts.createSourceFile(file, virtualFiles[file], language, true)
-    }
-    const cached = parsedFiles.get(file)
-    if (cached) return cached
-    const parsed = getSourceFile(file, language, ...rest)
-    if (parsed) parsedFiles.set(file, parsed)
-    return parsed
-  }
-  const virtualNames = Object.keys(virtualFiles)
   const program = ts.createProgram({
-    rootNames: virtualNames.length
-      ? virtualNames
-      : config.fileNames.filter(
-          (file) => file.includes("/src/") && !/\.test\.tsx?$/.test(file)
-        ),
+    rootNames: config.fileNames.filter(
+      (file) => file.includes("/src/") && !/\.test\.tsx?$/.test(file)
+    ),
     options: config.options,
-    host,
   })
   return { program, checker: program.getTypeChecker() }
 }
@@ -196,6 +359,7 @@ function loadProgram(virtualFiles: Record<string, string> = {}) {
 interface ServerFunctionHandler {
   readonly id: string
   readonly handler: ts.Node
+  readonly mutating: boolean
 }
 
 function serverFunctionHandlers(program: ts.Program) {
@@ -219,6 +383,7 @@ function serverFunctionHandlers(program: ts.Program) {
         handlers.push({
           id: `${file.fileName.split("/").at(-1)}:${node.name.text}`,
           handler,
+          mutating: postsServerFunction(node.initializer),
         })
       }
       ts.forEachChild(node, visit)
@@ -226,6 +391,32 @@ function serverFunctionHandlers(program: ts.Program) {
     visit(file)
   }
   return handlers
+}
+
+// `createServerFn({ method: "POST" })`, however it continues.
+function postsServerFunction(node: ts.Expression): boolean {
+  if (ts.isCallExpression(node)) {
+    if (ts.isIdentifier(node.expression)) {
+      const [options] = node.arguments
+      return (
+        node.expression.text === "createServerFn" &&
+        options !== undefined &&
+        ts.isObjectLiteralExpression(options) &&
+        options.properties.some(
+          (property) =>
+            ts.isPropertyAssignment(property) &&
+            ts.isIdentifier(property.name) &&
+            property.name.text === "method" &&
+            ts.isStringLiteral(property.initializer) &&
+            property.initializer.text === "POST"
+        )
+      )
+    }
+    return postsServerFunction(node.expression)
+  }
+  return ts.isPropertyAccessExpression(node)
+    ? postsServerFunction(node.expression)
+    : false
 }
 
 function createsServerFunction(node: ts.Expression): boolean {
@@ -431,10 +622,34 @@ function isDeclarationName(identifier: ts.Identifier) {
   return false
 }
 
+function isOperationRun(declaration: ts.Node) {
+  const file = declaration.getSourceFile().fileName
+  const name =
+    (ts.isVariableDeclaration(declaration) ||
+      ts.isFunctionDeclaration(declaration)) &&
+    declaration.name &&
+    ts.isIdentifier(declaration.name)
+      ? declaration.name.text
+      : null
+  return (
+    (file === operationFile && name === "runOperationPromise") ||
+    (file === durableOperationFile && name === "startDurableOperation")
+  )
+}
+
 function isCliWriteCheck(declaration: ts.Node) {
   return (
     declaration.getSourceFile().fileName === cliAccessFile &&
     ts.isFunctionDeclaration(declaration) &&
     declaration.name?.text === "requireCliWrite"
+  )
+}
+
+function isDeleteConfirmation(declaration: ts.Node) {
+  return (
+    declaration.getSourceFile().fileName === deleteConfirmationFile &&
+    ts.isVariableDeclaration(declaration) &&
+    ts.isIdentifier(declaration.name) &&
+    declaration.name.text === "requireDeleteConfirmationEffect"
   )
 }

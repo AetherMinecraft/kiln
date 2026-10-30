@@ -40,7 +40,7 @@ import {
   RelayKindIcon,
   ServerKindIcon,
 } from "@/components/instance-kind-icon"
-import { instanceFavoriteKey } from "@/lib/instance-favorites"
+import { instanceFavoriteKey, kilnFavorite } from "@/lib/instance-favorites"
 import {
   availableInstancePickerFilters,
   defaultInstancePickerFilterIdsSnapshot,
@@ -118,6 +118,7 @@ const kindOrder: ReadonlyArray<InstancePickerKind> = [
 ]
 const emptyGroups: ReadonlySet<InstancePickerGroup> = new Set()
 const emptyGroupList: ReadonlyArray<InstancePickerGroup> = []
+const emptyFilterList: ReadonlyArray<InstancePickerFilter> = []
 
 export const InstancePickerContent = React.memo(function InstancePickerContent({
   ariaLabel = "Instances",
@@ -146,7 +147,7 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
       favoriteKeys.size === 0
         ? sourceItems
         : sourceItems.map((item) =>
-            favoriteKeys.has(instanceFavoriteKey(item.identity))
+            favoriteKeys.has(instancePickerFavoriteKey(item))
               ? { ...item, favorite: true }
               : item
           ),
@@ -171,16 +172,20 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
     [activeFilters]
   )
   const favoritesOnly = activeFilters.includes(favoriteInstancePickerFilter)
-  const noFavorites =
-    favoritesOnly && !items.some((item) => item.favorite === true)
   const showKind = typeFilters.length > 0
   const query = search.trim().toLocaleLowerCase()
-  const visibleItems = React.useMemo(() => {
-    const filtered = filterInstancePickerItems(items, activeFilters)
-    return query
-      ? filtered.filter((item) => matchesInstancePickerSearch(item, query))
-      : filtered
-  }, [activeFilters, items, query])
+  // Search looks through everything; the saved filters return when it clears.
+  const appliedFilters = query ? emptyFilterList : activeFilters
+  const noFavorites =
+    appliedFilters.includes(favoriteInstancePickerFilter) &&
+    !items.some((item) => item.favorite === true)
+  const visibleItems = React.useMemo(
+    () =>
+      query
+        ? items.filter((item) => matchesInstancePickerSearch(item, query))
+        : filterInstancePickerItems(items, activeFilters),
+    [activeFilters, items, query]
+  )
   const selectableIndexes = React.useMemo(
     () => visibleItems.flatMap((item, index) => (item.disabled ? [] : [index])),
     [visibleItems]
@@ -285,10 +290,17 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
     () => visibleItems.flatMap((item) => (item.disabled ? [] : [item.key])),
     [visibleItems]
   )
-  const activeKind =
+  const filteredKind =
     activeTypeFilters.length === 1
       ? (activeTypeFilters[0]?.id as InstancePickerKind)
       : undefined
+  // Search results span every type, so a type filter can't name them.
+  const activeKind = query ? undefined : filteredKind
+  // "View all" follows the top search result, then the type filter.
+  const viewAllKind = query
+    ? (visibleItems.find((item) => !isKilnIdentity(item.identity))?.identity
+        .kind ?? filteredKind)
+    : filteredKind
   const activeItem = visibleItems[activeItemIndex]
   // In a phone drawer the search field sits last, next to the keyboard, and
   // the list fills the drawer.
@@ -427,7 +439,7 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
       ) : (
         <InstancePickerEmptyState
           favoritesOnly={noFavorites}
-          filtered={activeFilters.length > 0 && items.length > 0}
+          filtered={appliedFilters.length > 0 && items.length > 0}
           message={items.length === 0 ? emptyMessage : undefined}
           searching={query.length > 0}
           onClearFilters={noFavorites ? toggleFavorites : clearFilters}
@@ -435,7 +447,7 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
       )}
       {viewAll ? (
         <InstancePickerViewAll
-          activeKind={activeKind}
+          activeKind={viewAllKind}
           items={items}
           search={search.trim()}
           onNavigate={onNavigate}
@@ -474,6 +486,14 @@ function useInstancePickerFilterIds() {
     [userId]
   )
   return { filterIds, setFilterIds }
+}
+
+const kilnFavoriteKey = instanceFavoriteKey(kilnFavorite)
+
+function instancePickerFavoriteKey(item: InstancePickerItem): string {
+  return isKilnIdentity(item.identity)
+    ? kilnFavoriteKey
+    : instanceFavoriteKey(item.identity)
 }
 
 function matchesInstancePickerSearch(
@@ -774,6 +794,7 @@ const InstancePickerRowButton = React.memo(function InstancePickerRowButton({
         metaClassName="font-mono"
         name={item.name}
         nameClassName="type-control-sm"
+        status={item.status}
         statusClassName="ring-popover"
       />
       {pending ? (
@@ -824,7 +845,7 @@ const groupPresentation: Record<
   { Icon: React.ComponentType<LucideProps>; label: string }
 > = {
   all: { Icon: Layers, label: "All instances" },
-  app: { Icon: AppKindIcon, label: "All apps" },
+  app: { Icon: AppKindIcon, label: "All Apps" },
   database: { Icon: DatabaseKindIcon, label: "All databases" },
   relay: { Icon: RelayKindIcon, label: "All Relays" },
   server: { Icon: ServerKindIcon, label: "All game servers" },
@@ -929,7 +950,11 @@ const InstancePickerViewAll = React.memo(function InstancePickerViewAll({
   onNavigate?: () => void
   search: string
 }) {
-  const kind = activeKind ?? items[0]?.identity.kind ?? "server"
+  // Kiln shows as a Relay, but isn't one to list.
+  const kind =
+    activeKind ??
+    items.find((item) => !isKilnIdentity(item.identity))?.identity.kind ??
+    "server"
   const destination = viewAllDestinations[kind]
   const { Icon } = kindPresentation[kind]
 

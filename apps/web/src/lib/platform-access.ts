@@ -2,6 +2,7 @@ import { Clock, Effect } from "effect"
 import type { RowDataPacket } from "mysql2/promise"
 
 import { Database, type DatabaseTransaction } from "@/effect/database"
+import { starKilnForAdministratorEffect } from "@/effect/instance-favorites"
 import { isPlatformAdmin } from "@/lib/access-control"
 import {
   lockAccessActorEffect,
@@ -104,6 +105,9 @@ export function assignPlatformAccessEffect(input: {
               target.role,
               platformRole
             )
+            if (platformRole === "admin") {
+              yield* starKilnForAdministratorEffect(transaction, input.userId)
+            }
           }
         })
     )
@@ -234,6 +238,33 @@ const ownedResources = {
     write: `UPDATE ${databaseTable("relay")} SET created_by = ? WHERE id = ? AND id = ?`,
   },
 } as const
+
+/**
+ * Refuses all but the owner or an administrator a resource's transfer, as
+ * the transfer does again while it holds the resource: checked before the
+ * transfer takes its lanes.
+ */
+export function requireTransferableEffect(
+  user: AuthenticatedUser,
+  scope: ResourceScope
+) {
+  const resource = ownedResources[scope.resourceType]
+  return Effect.gen(function* () {
+    const database = yield* Database
+    const ownerId = yield* database.transaction(
+      "access.resource.transferable",
+      (transaction) =>
+        lockAccessScopeEffect(transaction, scope).pipe(
+          Effect.map((target) => target.owner_id)
+        )
+    )
+    if (!isPlatformAdmin(user) && ownerId !== user.id) {
+      return yield* Effect.fail(
+        new Error(`Only the ${resource.label} owner can transfer ownership`)
+      )
+    }
+  })
+}
 
 /**
  * Makes `userId` the owner of a Relay, game server, database or app. Only an
@@ -463,6 +494,9 @@ export function acceptPlatformInvitationEffect(
         yield* advanceSubjectAcrossEnabledRelaysEffect(tx, user.id, [
           { kind: "subject_relay" },
         ])
+        if (role === "admin" && subject.role !== "admin") {
+          yield* starKilnForAdministratorEffect(tx, user.id)
+        }
       })
     )
   })

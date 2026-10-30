@@ -15,10 +15,20 @@ import {
 } from "./resource-limits.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
 import {
+  webRouteEndpoints,
+  webRouteHostnames,
+  wwwCounterpart,
+} from "./web-routes.js"
+import {
   databaseReadRequestSchema,
   databaseWriteRequestSchema,
 } from "./database-browser.js"
-import { fileRootIdSchema, tailscaleMemberIdSchema } from "./app-keys.js"
+import {
+  appServiceNameSchema,
+  fileRootIdSchema,
+  legacyTailscaleMemberId,
+  tailscaleMemberIdSchema,
+} from "./app-keys.js"
 import {
   relayTailscaleDomainSchema,
   relayTailscaleHostnameSchema,
@@ -26,15 +36,20 @@ import {
 } from "./tailscale.js"
 
 export * from "./access-permissions.js"
+export * from "./web-routes.js"
 export * from "./relay-protocol.js"
+export * from "./relay-transfers.js"
 export * from "./installation-id.js"
 export * from "./container-identity.js"
+export * from "./relay-join.js"
 export * from "./release-version.js"
 export * from "./minecraft-java.js"
 export * from "./cli.js"
 export * from "./instance-limits.js"
 export * from "./resource-limits.js"
+export * from "./security.js"
 export * from "./instance-overview.js"
+export * from "./icon-images.js"
 export * from "./instance-state.js"
 export * from "./instance-inventory.js"
 export * from "./instance-lifecycle.js"
@@ -152,9 +167,46 @@ export const databaseIdSchema = z.string().regex(/^[a-f0-9]{40}$/u)
 
 export const relayDatabaseNameSchema = z.string().trim().min(1).max(120)
 
+// What joins a database's network, by its kind's code name: a game server,
+// an App (every service of it), or another database.
+export const databaseConnectionMemberKindSchema = z.enum([
+  "instance",
+  "app",
+  "database",
+])
+
+export const databaseConnectionMemberSchema = z
+  .object({
+    // Game servers, Apps, and databases all have 40-character IDs.
+    id: z.string().regex(/^[a-f0-9]{40}$/u),
+    kind: databaseConnectionMemberKindSchema,
+  })
+  .strict()
+
+// One member of a database's network: what the Relay keeps connected to it,
+// what its network holds now, or both.
+export const relayDatabaseMemberSchema = z
+  .object({
+    // Whether its containers are on the database's network now.
+    attached: z.boolean(),
+    // The names its containers answer to there now: `server-<id>` for a
+    // game server, `database-<id>` for a database, and each App service's
+    // alias.
+    hostnames: z.array(z.string().min(1).max(253)),
+    id: z.string().regex(/^[a-f0-9]{40}$/u),
+    kind: databaseConnectionMemberKindSchema,
+    // Names it doesn't answer to yet: it takes them when its containers
+    // join, or, for one that joined before members had names, when it next
+    // starts, restarts, or deploys.
+    pendingHostnames: z.array(z.string().min(1).max(253)),
+    // Whether the Relay keeps the connection, joining its containers
+    // whenever they change.
+    saved: z.boolean(),
+  })
+  .strict()
+
 export const relayManagedDatabaseSchema = z
   .object({
-    connectedInstanceIds: z.array(z.string().regex(/^[a-f0-9]{40}$/u)),
     containerId: z.string().nullable(),
     createdAt: z.string().datetime(),
     databaseName: z.string().regex(/^[a-z][a-z0-9_]{0,47}$/u),
@@ -163,6 +215,7 @@ export const relayManagedDatabaseSchema = z
     id: databaseIdSchema,
     image: z.string().min(1).max(512),
     internalPort: z.number().int().min(1).max(65_535),
+    members: z.array(relayDatabaseMemberSchema),
     // Relays before resource-limits-v1 report neither.
     limits: observedResourceLimitsSchema.default(NO_RESOURCE_LIMITS),
     /** The data volume's size when the Relay last measured it. */
@@ -178,6 +231,8 @@ export const relayManagedDatabaseSchema = z
     /** Where its provisioning is, until the database exists. */
     provisioning: provisioningStateSchema.optional(),
     shortId: z.string().regex(/^[a-f0-9]{8}$/u),
+    /** When its container last started; null while it isn't running. */
+    startedAt: z.string().datetime().nullable().default(null),
     status: z.string().min(1).max(280),
     supportsImportExport: z.boolean(),
   })
@@ -204,7 +259,7 @@ export const relayProvisionDatabaseSchema = z
 
 export const relayDatabaseActionSchema = z
   .object({
-    action: z.enum(["start", "stop", "restart"]),
+    action: z.enum(["start", "stop", "restart", "kill"]),
     databaseId: databaseIdSchema,
   })
   .strict()
@@ -223,6 +278,23 @@ export const relayDeleteDatabaseSchema = z
   })
   .strict()
 
+/**
+ * A game server, App, database, or Kiln volume being deleted, by its full
+ * ID. Frozen, it's quiet (a database keeps running for its live dump), and
+ * the Relay refuses every change to it but its final backup and its
+ * deletion; unfrozen, it is a resource like any other again.
+ */
+export const relayResourceFreezeSchema = z
+  .object({
+    deletionId: z.uuid(),
+    id: z.string().regex(/^[a-f0-9]{40}$/u),
+    // A volume is a Kiln volume, by its ID; an App's own volumes go with it.
+    kind: z.enum(["app", "database", "instance", "volume"]),
+  })
+  .strict()
+
+export type RelayResourceFreeze = z.infer<typeof relayResourceFreezeSchema>
+
 export const relayRotateDatabaseCredentialsSchema = z
   .object({
     currentPassword: z.string().min(24).max(256),
@@ -232,12 +304,42 @@ export const relayRotateDatabaseCredentialsSchema = z
   })
   .strict()
 
+// Connects one member to a database, or disconnects it. The Relay keeps the
+// connection, and joins the member to it whenever its containers change.
 export const relayDatabaseNetworkSchema = z
   .object({
     connected: z.boolean(),
     databaseId: databaseIdSchema,
-    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    member: databaseConnectionMemberSchema,
   })
+  .strict()
+  .refine(
+    (input) =>
+      input.member.kind !== "database" || input.member.id !== input.databaseId,
+    "A database can't connect to itself"
+  )
+
+// Hands the Relay the database connections Hearth kept in Apps' configs,
+// once per Relay. Repeating it changes nothing more: the Relay adds what it
+// doesn't have, for Apps and databases it still has.
+export const relayDatabaseNetworkImportSchema = z
+  .object({
+    apps: z
+      .array(
+        z
+          .object({
+            appId: z.string().regex(/^[a-f0-9]{40}$/u),
+            databaseIds: z.array(databaseIdSchema).min(1).max(32),
+          })
+          .strict()
+      )
+      .min(1)
+      .max(100),
+  })
+  .strict()
+
+export const relayDatabaseNetworkImportResultSchema = z
+  .object({ imported: z.number().int().nonnegative() })
   .strict()
 
 // A database's login, for the Relay to act on the database as its own user.
@@ -303,6 +405,8 @@ export const databaseTerminalEndReasonSchema = z.enum([
   "timed-out",
   // Someone asked for a fresh session.
   "restarted",
+  // The database is being deleted, which ends every session on it.
+  "deleting",
   // The client could not be started, as when the container has no shell, or
   // its connection failed.
   "failed",
@@ -511,10 +615,36 @@ export const relayHostAccessSchema = z.object({
   dataDirectory: z.string().min(1).optional(),
 })
 
-// A Docker named volume on a Relay: one Kiln made, named
-// `kiln-<short ID>-<slug>` after its ID and the name it was made with, or the
-// Relay's own data volume, which it keeps.
+// A Docker named volume on a Relay. Kiln manages two kinds, each with a
+// stable ID that names it to backups and deletion:
+//
+// - `kiln`: one Kiln made for Apps to share, named `kiln-<short ID>-<slug>`
+//   after its ID and the name it was made with. No App owns it; any App's
+//   configuration may mount it.
+// - `app`: one an App's Compose project declares, owned by that App. Its ID
+//   is `<App ID>/<name in the Compose file>`, which redeploys keep.
+//
+// The Relay's own data volume, kind `relay`, is the platform backup's and
+// has no ID.
 export const relayVolumeIdSchema = z.string().regex(/^[a-f0-9]{40}$/u)
+// The key a Compose file declares a volume under.
+export const composeVolumeNameSchema = z
+  .string()
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/u)
+  .max(128)
+const volumeAppIdSchema = z.string().regex(/^[a-f0-9]{40}$/u)
+export const appVolumeIdSchema = z
+  .string()
+  .regex(/^[a-f0-9]{40}\/[a-zA-Z0-9][a-zA-Z0-9_.-]*$/u)
+  .max(169)
+export const relayManagedVolumeIdSchema = z.union([
+  relayVolumeIdSchema,
+  appVolumeIdSchema,
+])
+/** The ID of the volume an App's Compose project declares under `name`. */
+export function appVolumeId(appId: string, name: string): string {
+  return `${appId}/${name}`
+}
 export const RELAY_VOLUME_NAME_MAX_LENGTH = 64
 export const relayVolumeNameSchema = z
   .string()
@@ -532,22 +662,57 @@ export const relayVolumeMountSchema = z.object({
   resourceId: z.string().nullable(),
   running: z.boolean(),
 })
+// An App that uses a volume: its configuration names it, deployed or not,
+// or one of its containers mounts it now.
+export const relayVolumeUserSchema = z.object({
+  appId: volumeAppIdSchema,
+  configured: z.boolean(),
+  mounted: z.boolean(),
+})
 export const relayVolumeSchema = z.object({
   createdAt: z.string().nullable(),
   dockerName: z.string().min(1),
-  // Null for the Relay's own data volume, which Kiln didn't make.
-  id: relayVolumeIdSchema.nullable(),
-  kind: z.enum(["relay", "volume"]),
+  // Null for the Relay's own data volume, and for a volume an App's project
+  // made under a name another of its volumes now holds, such as after the
+  // Compose file renamed it.
+  id: relayManagedVolumeIdSchema.nullable(),
+  kind: z.enum(["app", "kiln", "relay"]),
   // Where its files are on the host.
   mountpoint: z.string().nullable(),
   mounts: z.array(relayVolumeMountSchema),
   name: z.string(),
+  // The App whose Compose project made it, and the name it has there.
+  owner: z
+    .object({ appId: volumeAppIdSchema, volume: composeVolumeNameSchema })
+    .nullable(),
   // Null until Docker has measured it.
   sizeBytes: z.number().int().nonnegative().nullable(),
+  users: z.array(relayVolumeUserSchema),
+})
+// What an App's containers mount that no managed volume or the App's folder
+// holds, so backups can't cover it: a volume Docker named itself, a named
+// volume Kiln doesn't manage, or a path on the node outside the App's
+// folder.
+export const relayUncoveredMountSchema = z.object({
+  appId: volumeAppIdSchema,
+  container: z.string(),
+  destination: z.string(),
+  kind: z.enum(["anonymous", "bind", "volume"]),
+  service: z.string(),
+  // The volume's Docker name, or the path on the node.
+  source: z.string(),
 })
 export const relayVolumesSchema = z.object({
   // Whether Docker is measuring the volumes, so sizes are on their way.
   measuring: z.boolean(),
+  // Whether every paired Hearth that can configure Apps has told the Relay
+  // which volumes its Apps' configurations name. Until they have, `users`
+  // may leave some out and deletion is refused, for `reason`.
+  protection: z.object({
+    ready: z.boolean(),
+    reason: z.string().nullable(),
+  }),
+  uncovered: z.array(relayUncoveredMountSchema),
   volumes: z.array(relayVolumeSchema),
 })
 // The part of a volume's Docker name its name gives: lowercase letters,
@@ -571,8 +736,29 @@ export const relayVolumeRenameSchema = relayVolumeCreateSchema
 export const relayVolumeDeleteSchema = z.strictObject({
   id: relayVolumeIdSchema,
 })
+// Every Kiln volume an App's configuration mounts, replacing those the same
+// Hearth sent for it before. Hearth sends the configuration's and the
+// saved one's together before saving one that adds a volume, so up to
+// twice a configuration's 32 mounts, and the saved one's after each save.
+export const relayAppVolumesWriteSchema = z.strictObject({
+  appId: volumeAppIdSchema,
+  volumeIds: z.array(relayVolumeIdSchema).max(64),
+})
+// Every App configuration's volumes one Hearth keeps for the Relay,
+// replacing all it sent before, and the Apps whose configurations it
+// couldn't read, which keep deletion waiting until it can.
+export const relayAppVolumesImportSchema = z.strictObject({
+  apps: z.array(relayAppVolumesWriteSchema).max(10_000),
+  unresolvedAppIds: z.array(volumeAppIdSchema).max(10_000),
+})
+// The Relay's refusal while it waits for that import, followed by why.
+export const RELAY_VOLUME_REFERENCES_PENDING =
+  "The Relay doesn't know yet which Apps use its volumes"
 export type RelayVolume = z.infer<typeof relayVolumeSchema>
+export type RelayVolumes = z.infer<typeof relayVolumesSchema>
 export type RelayVolumeMount = z.infer<typeof relayVolumeMountSchema>
+export type RelayVolumeUser = z.infer<typeof relayVolumeUserSchema>
+export type RelayUncoveredMount = z.infer<typeof relayUncoveredMountSchema>
 
 // Relay to Hearth: output for one attachment, in order. `ended` arrives with
 // the session's last output. Not strict: a Relay newer than its Hearth may
@@ -600,11 +786,6 @@ export const appIdSchema = z.string().regex(/^[a-f0-9]{40}$/u)
 
 export const appNameSchema = relayDatabaseNameSchema
 
-// A Compose service's name; image and Dockerfile apps have one service, `app`.
-export const appServiceNameSchema = z
-  .string()
-  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$/u)
-
 // GitHub builds a Dockerfile or runs a Compose file from a repository. Hearth
 // keeps which repository; the Relay gets the commit to deploy with each
 // deployment.
@@ -629,7 +810,9 @@ export const appRepositoryPathSchema = z
       !path.includes("\0") &&
       path
         .split("/")
-        .every((segment) => segment !== "" && segment !== "." && segment !== ".."),
+        .every(
+          (segment) => segment !== "" && segment !== "." && segment !== ".."
+        ),
     "Use a path inside the repository, like Dockerfile or deploy/compose.yaml"
   )
 
@@ -722,7 +905,6 @@ export const appConfigSchema = z
     // Replaces the image's command, for images and Dockerfiles.
     command: z.string().max(4_000),
     compose: z.string().max(400_000),
-    databaseIds: z.array(databaseIdSchema).max(32),
     dockerfile: z.string().max(200_000),
     // KEY=VALUE lines, as in an env file.
     environment: z.string().max(65_536),
@@ -738,7 +920,6 @@ export const appConfigSchema = z
 export const defaultAppConfig: z.infer<typeof appConfigSchema> = {
   command: "",
   compose: "",
-  databaseIds: [],
   dockerfile: "",
   environment: "",
   image: "",
@@ -800,6 +981,7 @@ export const relayAppDeploymentSchema = z.object({
 })
 
 export const relayAppSchema = z.object({
+  // Databases whose networks its containers are on now.
   connectedDatabaseIds: z.array(databaseIdSchema),
   containers: z.array(relayAppContainerSchema),
   // The app's folder on the Relay's host: a pasted Compose file's project
@@ -819,6 +1001,8 @@ export const relayAppSchema = z.object({
   ]),
   /** Where its provisioning is, until the app exists. */
   provisioning: provisioningStateSchema.optional(),
+  // Databases the Relay keeps it connected to, joined on every deploy.
+  savedDatabaseIds: z.array(databaseIdSchema),
   shortId: z.string().regex(/^[a-f0-9]{8}$/u),
   status: z.string().min(1).max(280),
 })
@@ -831,9 +1015,7 @@ export const relayPrepareAppSchema = relayCreateAppSchema.extend({
   idempotencyKey: z.uuid(),
 })
 
-export const relayProvisionAppSchema = z
-  .object({ appId: appIdSchema })
-  .strict()
+export const relayProvisionAppSchema = z.object({ appId: appIdSchema }).strict()
 
 /** A manifest digest, as registries name an image's exact content. */
 export const imageDigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/u)
@@ -858,7 +1040,10 @@ export const relayAppImageCheckSchema = z
     apps: z
       .array(
         z
-          .object({ appId: appIdSchema, image: z.string().trim().min(1).max(512) })
+          .object({
+            appId: appIdSchema,
+            image: z.string().trim().min(1).max(512),
+          })
           .strict()
       )
       .min(1)
@@ -908,20 +1093,19 @@ export const relayAppLimitsSchema = z
 
 export const relayAppActionSchema = z
   .object({
-    action: z.enum(["start", "stop", "restart"]),
+    action: z.enum(["start", "stop", "restart", "kill"]),
     appId: appIdSchema,
   })
   .strict()
 
 export const relayDeleteAppSchema = z
-  .object({ appId: appIdSchema, deleteData: z.boolean().default(true) })
-  .strict()
-
-// Connects the app's running containers to exactly these databases.
-export const relayAppNetworkSchema = z
   .object({
     appId: appIdSchema,
-    databaseIds: z.array(databaseIdSchema).max(32),
+    deleteData: z.boolean().default(true),
+    // The App's own volumes its deletion may take, by ID: those it planned
+    // to, and backed up if asked. Any other stays. Left out, every volume
+    // only the App's own Compose projects made and nothing mounts goes.
+    volumeIds: z.array(appVolumeIdSchema).max(256).optional(),
   })
   .strict()
 
@@ -1302,8 +1486,9 @@ export const relayTailscaleStackBindingInputSchema = z
   .object({
     enabled: z.boolean().default(true),
     hostname: relayTailscaleSubdomainSchema,
-    // A server, or an app's service (see `appTailscaleMemberId`).
-    instanceId: tailscaleMemberIdSchema,
+    // A game server, an App's service, or a database (see
+    // `tailscaleMemberIdSchema`).
+    memberId: tailscaleMemberIdSchema,
   })
   .strict()
 
@@ -1469,12 +1654,34 @@ export const relayInstanceWebRouteIdSchema = z.union([
   z.uuid(),
 ])
 
-export const relayInstanceWebRouteNameSchema = z.string().trim().min(1).max(32)
+// A label shown beside the hostname. Empty when the route has none.
+export const relayInstanceWebRouteNameSchema = z.string().trim().max(32)
+
+// Whether the hostname's www counterpart (www.example.com for example.com,
+// or example.com for www.example.com) redirects to it or serves the same.
+export const relayWebRouteWwwSchema = z.enum(["none", "redirect", "serve"])
+
+// A route that sends its visitors to another URL instead of a port.
+export const relayWebRouteRedirectSchema = z
+  .object({
+    permanent: z.boolean().default(true),
+    preservePath: z.boolean().default(true),
+    to: z
+      .url({
+        hostname: z.regexes.domain,
+        normalize: true,
+        protocol: /^https?$/u,
+      })
+      .max(2_048),
+  })
+  .strict()
 
 const relayInstanceWebRouteConfigurationSchema = z
   .object({
     hostname: webRouteHostnameSchema,
-    name: relayInstanceWebRouteNameSchema,
+    // Whether plain HTTP requests redirect to HTTPS, or are served as well.
+    httpsRedirect: z.boolean().default(true),
+    name: relayInstanceWebRouteNameSchema.default(""),
     path: z
       .string()
       .trim()
@@ -1486,8 +1693,13 @@ const relayInstanceWebRouteConfigurationSchema = z
         "Use an encoded URL path without spaces or routing metacharacters"
       )
       .nullable(),
+    // The domain shown for the server or app, such as in its header.
+    primary: z.boolean().default(false),
+    redirect: relayWebRouteRedirectSchema.nullable().default(null),
     stripPrefix: z.boolean().default(true),
-    targetPort: z.number().int().min(1).max(65_535),
+    // The port it serves; none for a redirect.
+    targetPort: z.number().int().min(1).max(65_535).nullable(),
+    www: relayWebRouteWwwSchema.default("none"),
   })
   .strict()
 
@@ -1501,24 +1713,67 @@ export const relayInstanceWebRouteSchema =
     id: relayInstanceWebRouteIdSchema,
   })
 
+// Whether a redirect lands back on the route it came from. With the path
+// kept, the destination's path is followed by the request's, which starts
+// with the route's own path.
+function redirectsToItself(
+  route: { readonly hostname: string; readonly path: string | null },
+  target: URL,
+  preservePath: boolean
+): boolean {
+  if (!webRouteHostnames(route).includes(target.hostname)) return false
+  const prefix = route.path ?? "/"
+  const landing = preservePath
+    ? `${target.pathname.replace(/\/$/u, "")}${prefix}`
+    : target.pathname
+  return landing.startsWith(prefix)
+}
+
 function relayInstanceWebRouteArraySchema<
-  Route extends z.ZodType<{ hostname: string; path: string | null }>,
+  Route extends z.ZodType<
+    z.output<typeof relayInstanceWebRouteConfigurationSchema>
+  >,
 >(route: Route) {
   return z
     .array(route)
     .max(16)
     .superRefine((routes, context) => {
       const seen = new Set<string>()
+      let primary = false
       routes.forEach((item, index) => {
-        const key = `${item.hostname}\n${item.path ?? ""}`
-        if (seen.has(key)) {
-          context.addIssue({
-            code: "custom",
-            message: "Each hostname and path combination must be unique",
-            path: [index, "hostname"],
-          })
+        const issue = (message: string, field: string) =>
+          context.addIssue({ code: "custom", message, path: [index, field] })
+        if (item.www !== "none" && wwwCounterpart(item.hostname) === null) {
+          issue(`${item.hostname} has no www counterpart`, "www")
         }
-        seen.add(key)
+        for (const endpoint of webRouteEndpoints(item)) {
+          if (seen.has(endpoint)) {
+            issue(`${endpoint} is already routed`, "hostname")
+          }
+          seen.add(endpoint)
+        }
+        if (item.redirect) {
+          if (item.targetPort !== null) {
+            issue("A redirect has no port", "targetPort")
+          }
+          const target = new URL(item.redirect.to)
+          if (redirectsToItself(item, target, item.redirect.preservePath)) {
+            issue("A route can't redirect to itself", "redirect")
+          }
+          if (item.redirect.preservePath && (target.search || target.hash)) {
+            issue(
+              "Remove the query from the destination, or don't keep the path",
+              "redirect"
+            )
+          }
+          if (item.primary) issue("A redirect can't be primary", "primary")
+        } else if (item.targetPort === null) {
+          issue("Enter the port the route serves", "targetPort")
+        }
+        if (item.primary) {
+          if (primary) issue("Only one route can be primary", "primary")
+          primary = true
+        }
       })
     })
 }
@@ -1596,9 +1851,14 @@ export const relayProxyConfigurationSchema = z.object({
         service: z.string().nullable(),
       }),
       path: z.string().nullable(),
+      // Absent from older Relays.
+      primary: z.boolean().default(false),
+      redirect: relayWebRouteRedirectSchema.nullable().default(null),
       stripPrefix: z.boolean(),
-      targetPort: z.number().int(),
+      targetPort: z.number().int().nullable(),
+      // Where requests go: the upstream it proxies to, or a redirect's URL.
       upstream: z.string(),
+      www: relayWebRouteWwwSchema.default("none"),
     })
   ),
   staticConfiguration: z.string().nullable(),
@@ -1863,6 +2123,46 @@ export const relayTailscaleStackBindingSchema =
     address: z.ipv4(),
   })
 
+/**
+ * Rewrites a stack saved before members were typed: its bindings named the
+ * member `instanceId`, a game server by its bare ID. Returns the stack with
+ * `memberId` in their place, or null when it has nothing to rewrite. The
+ * Relay's `stack.json` and removal snapshots and Hearth's deployments
+ * share this shape. Migrations only; everything else reads typed IDs.
+ */
+export function migrateLegacyTailscaleBindings(
+  stack: unknown
+): Record<string, unknown> | null {
+  if (!stack || typeof stack !== "object" || Array.isArray(stack)) return null
+  const { bindings } = stack as { bindings?: unknown }
+  if (!Array.isArray(bindings)) return null
+  if (
+    !bindings.some(
+      (binding) =>
+        binding && typeof binding === "object" && "instanceId" in binding
+    )
+  )
+    return null
+  return {
+    ...stack,
+    bindings: bindings.map((binding: unknown) => {
+      if (!binding || typeof binding !== "object" || !("instanceId" in binding))
+        return binding
+      const { instanceId, ...rest } = binding as Record<string, unknown>
+      const memberId =
+        typeof instanceId === "string"
+          ? legacyTailscaleMemberId(instanceId)
+          : null
+      if (!memberId) {
+        throw new Error(
+          `Tailscale binding names an unknown member: ${String(instanceId)}`
+        )
+      }
+      return { ...rest, memberId }
+    }),
+  }
+}
+
 export const relayTailscaleStackConfigSchema = z
   .object({
     bindings: z
@@ -1979,6 +2279,7 @@ export const relayNodeSchema = z.object({
   bootedAt: z.string().datetime().optional(),
   cpu: z.object({
     cores: z.number().int().positive(),
+    /** One-minute load as a percentage of all cores, not 100% per core. */
     loadPercent: z.number().min(0),
     /**
      * Like "AMD EPYC 7763 64-Core Processor". Absent when the CPU doesn't
@@ -2139,6 +2440,24 @@ export const relayPlatformActionInputSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("repair") }),
 ])
 
+/** A Relay's Kiln installation ID, and whether it can change (`relay.installation.read`). */
+export const relayInstallationSchema = z.object({
+  /** Whether KILN_INSTALLATION_ID or the Relay's platform state fixes it. */
+  fixed: z.boolean(),
+  installationId: z.string().min(1).max(120).nullable(),
+})
+
+/**
+ * Sets the Relay's installation ID, only while it's still `expected` (null
+ * for none). Repeating it once applied succeeds.
+ */
+export const relayInstallationReplaceInputSchema = z.object({
+  expectedInstallationId: z.string().min(1).max(120).nullable(),
+  installationId: z.string().min(1).max(120),
+})
+
+export type RelayInstallation = z.infer<typeof relayInstallationSchema>
+
 export type RelayPlatformManagement = z.infer<
   typeof relayPlatformManagementSchema
 >
@@ -2230,10 +2549,13 @@ const relaySnapshotRelaySchema = z.object({
    * Present when Kiln's own services run on this Relay's Docker host. See
    * `relay.platform.read`.
    */
-  platform: z
-    .object({ management: relayPlatformManagementSchema })
-    .optional(),
+  platform: z.object({ management: relayPlatformManagementSchema }).optional(),
   proxyMode: relayProxyModeSchema.optional(),
+  /**
+   * The address players and web visitors reach this Relay's node at, as
+   * game servers advertise it. Absent from Relays that predate it.
+   */
+  publicHost: z.string().min(1).max(253).optional(),
   sftp: relaySftpSnapshotSchema,
   tls: z
     .object({
@@ -2439,6 +2761,48 @@ export const relayFilePutResultSchema = z.union([
     .strict(),
 ])
 
+// The largest image `instance.icon.read` returns. Its base64 stays well
+// under `relayControlMaxFrameBytes`.
+export const relayIconMaxBytes = 512 * 1024
+
+/**
+ * An image for an icon: a file under a file root (a game server's files, or
+ * an app's data directory), or a file inside one of an app's containers, by
+ * its absolute path there.
+ */
+export const relayIconReadInputSchema = z.union([
+  z
+    .object({
+      instanceId: fileRootIdSchema,
+      path: relayFileMutationPathSchema,
+    })
+    .strict(),
+  z
+    .object({
+      appId: appIdSchema,
+      service: appServiceNameSchema,
+      path: z
+        .string()
+        .min(2)
+        .max(1_024)
+        .refine(
+          (path) => path.startsWith("/") && !path.includes("\0"),
+          "Enter an absolute path inside the container"
+        ),
+    })
+    .strict(),
+])
+
+/** The image's bytes, or null when nothing is at the path. */
+export const relayIconReadResultSchema = z
+  .object({
+    contentBase64: z.base64().max(Math.ceil(relayIconMaxBytes / 3) * 4),
+    modifiedAt: z.number().int().nonnegative(),
+    size: z.number().int().nonnegative().max(relayIconMaxBytes),
+  })
+  .strict()
+  .nullable()
+
 export const relayFileMutationInputSchema = z.discriminatedUnion("operation", [
   z.object({
     operation: z.literal("rename"),
@@ -2581,6 +2945,56 @@ export const relayResourceStreamEventSchema = z.object({
   sequence: z.number().int().nonnegative(),
 })
 
+// A resource's usage now, null while nothing of it runs, and over the last
+// minutes.
+export const relayResourceUsageSchema = z.object({
+  history: z
+    .array(relayInstanceResourcesSchema)
+    .max(relayResourceHistoryMaxSamples)
+    .default([]),
+  resources: relayInstanceResourcesSchema.nullable(),
+})
+
+export const relayWorkloadResourceKindSchema = z.enum(["app", "database"])
+
+// An App's or database's usage; an App's by service too.
+export const relayWorkloadUsageSchema = relayResourceUsageSchema.extend({
+  services: z
+    .array(relayResourceUsageSchema.extend({ service: appServiceNameSchema }))
+    .max(64)
+    .default([]),
+})
+
+// Which history a read of an App's or database's usage carries: the
+// resource's, one service's, or none, so no answer holds more than one
+// window of it.
+export const relayWorkloadUsageHistorySchema = z
+  .union([
+    z.enum(["none", "resource"]),
+    z.object({ service: appServiceNameSchema }).strict(),
+  ])
+  .default("resource")
+
+export const relayWorkloadUsageReadSchema = z
+  .object({ appId: appIdSchema, history: relayWorkloadUsageHistorySchema })
+  .strict()
+
+export const relayDatabaseUsageReadSchema = z
+  .object({
+    databaseId: databaseIdSchema,
+    history: z.enum(["none", "resource"]).default("resource"),
+  })
+  .strict()
+
+// What a browser following an App's or database's usage receives: history
+// with the first event, the latest sample with each.
+export const relayWorkloadUsageEventSchema = relayWorkloadUsageSchema.extend({
+  id: z.string().min(1).max(64),
+  kind: relayWorkloadResourceKindSchema,
+  sequence: z.number().int().nonnegative(),
+  type: z.literal("resource.usage"),
+})
+
 export const relayInstanceResourceSnapshotSchema = z.object({
   instance: relayInstanceSchema,
   history: z
@@ -2706,7 +3120,17 @@ export type RelayDeleteDatabase = z.infer<typeof relayDeleteDatabaseSchema>
 export type RelayRotateDatabaseCredentials = z.infer<
   typeof relayRotateDatabaseCredentialsSchema
 >
+export type DatabaseConnectionMember = z.infer<
+  typeof databaseConnectionMemberSchema
+>
+export type DatabaseConnectionMemberKind = z.infer<
+  typeof databaseConnectionMemberKindSchema
+>
+export type RelayDatabaseMember = z.infer<typeof relayDatabaseMemberSchema>
 export type RelayDatabaseNetwork = z.infer<typeof relayDatabaseNetworkSchema>
+export type RelayDatabaseNetworkImport = z.infer<
+  typeof relayDatabaseNetworkImportSchema
+>
 export type RelayDatabaseExport = z.infer<typeof relayDatabaseExportSchema>
 export type RelayDatabaseImport = z.infer<typeof relayDatabaseImportSchema>
 export type RelayDatabaseContainer = z.infer<
@@ -2759,7 +3183,6 @@ export type RelayAppImageCheckResult = z.infer<
 >
 export type RelayAppAction = z.infer<typeof relayAppActionSchema>
 export type RelayDeleteApp = z.infer<typeof relayDeleteAppSchema>
-export type RelayAppNetwork = z.infer<typeof relayAppNetworkSchema>
 export type RelayAppWebRoute = z.infer<typeof relayAppWebRouteSchema>
 export type RelayAppWebRouteInput = z.infer<typeof relayAppWebRouteInputSchema>
 export type RelayAppWebRouteState = z.infer<typeof relayAppWebRouteStateSchema>
@@ -3059,6 +3482,8 @@ export type RelayRemoteFileUploadResult = z.infer<
 >
 export type RelayFilePutInput = z.infer<typeof relayFilePutInputSchema>
 export type RelayFilePutResult = z.infer<typeof relayFilePutResultSchema>
+export type RelayIconReadInput = z.infer<typeof relayIconReadInputSchema>
+export type RelayIconReadResult = z.infer<typeof relayIconReadResultSchema>
 export type RelayFileActivityEntry = z.infer<
   typeof relayFileActivityEntrySchema
 >
@@ -3075,6 +3500,17 @@ export type RelayConsoleStreamEvent = z.infer<
 >
 export type RelayResourceStreamEvent = z.infer<
   typeof relayResourceStreamEventSchema
+>
+export type RelayResourceUsage = z.infer<typeof relayResourceUsageSchema>
+export type RelayWorkloadResourceKind = z.infer<
+  typeof relayWorkloadResourceKindSchema
+>
+export type RelayWorkloadUsage = z.infer<typeof relayWorkloadUsageSchema>
+export type RelayWorkloadUsageHistory = z.infer<
+  typeof relayWorkloadUsageHistorySchema
+>
+export type RelayWorkloadUsageEvent = z.infer<
+  typeof relayWorkloadUsageEventSchema
 >
 export type RelayConsoleCommand = z.infer<typeof relayConsoleCommandSchema>
 export type RelayConsoleCommandResult = z.infer<

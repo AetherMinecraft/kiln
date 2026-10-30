@@ -3,6 +3,8 @@
 #
 #   curl -fsSL https://kiln.site/install | sh
 #   curl -fsSL https://kiln.site/install | sh -s -- --node
+#   curl -fsSL https://kiln.site/install | sh -s -- --node --join '<link>'
+#   curl -fsSL https://kiln.site/install | sh -s -- --cli
 #
 # kiln.site serves this file at /install (apps/marketing/src/routes/install.ts),
 # so it's live once the marketing site deploys from main.
@@ -10,7 +12,11 @@
 # It starts one Relay in platform mode, which installs Hearth, its MySQL
 # database, and its cache, pairs with that Hearth, and keeps them running.
 # With --node it starts a plain Relay instead, to add this machine to an
-# existing Kiln. Run it again to see an installation's status.
+# existing Kiln, behind its own Traefik on ports 80 and 443 when they're
+# free; with the --join link from Hearth's Add Relay dialog, that Relay
+# connects to Hearth by itself. Run it again to see an installation's
+# status. With --cli it installs only the kiln command, on Linux or macOS,
+# and needs no Docker.
 #
 # The terminal shows one line per step. Everything each step ran and printed
 # goes to the install log (~/kiln-install.log), for when something fails.
@@ -24,6 +30,7 @@ set -eu
 main() {
 
 image_prefix="ghcr.io/kiln-site"
+repository="kiln-site/kiln"
 channel="latest"
 container="kiln-relay"
 volume="kiln-relay-data"
@@ -31,6 +38,7 @@ mode="platform"
 url=""
 port="3000"
 relay_host=""
+join=""
 game_host=""
 image=""
 hearth_image=""
@@ -40,6 +48,8 @@ sftp_port="2022"
 assume_yes=0
 install_docker_allowed=1
 asked=0
+cli=0
+stored=""
 proxy=""
 
 usage() {
@@ -51,7 +61,11 @@ Usage: curl -fsSL https://kiln.site/install | sh -s -- [options]
                      machine's public IP>)
   --proxy MODE       What serves Kiln over HTTPS: traefik (started on
                      ports 80 and 443), coolify (Coolify's proxy), or none
-                     (default: coolify on a Coolify server, else traefik)
+                     (default: coolify on a Coolify server, else traefik).
+                     With --node: traefik, none for the Relay's own
+                     HTTPS on port 4100, or hearth to open no ports and
+                     connect to Kiln instead (default: traefik when 80 and
+                     443 are free)
   --port PORT        Host port Kiln also listens on, without HTTPS
                      (default: 3000)
   --game-host HOST   Address players connect to game servers at
@@ -69,6 +83,12 @@ Usage: curl -fsSL https://kiln.site/install | sh -s -- [options]
                      Relay and print the invitation to pair it with
   --relay-host HOST  With --node: the address Kiln reaches this Relay at
                      (default: this machine's public IP)
+  --join LINK        Join the Kiln whose Add Relay dialog gave this link,
+                     instead of printing an invitation (implies --node)
+  --cli              Install only the kiln command-line tool, to manage
+                     Kiln from this computer (Linux or macOS). With
+                     --nightly, the newest nightly; with --url, it shows
+                     how to sign in to that Kiln
   --skip-docker-install
                      Don't install Docker if it's missing; stop instead
   -y, --yes          Don't ask; use the defaults for anything not given,
@@ -88,6 +108,7 @@ while [ "$#" -gt 0 ]; do
     --port) port="${2:?--port needs a value}"; shift 2 ;;
     --game-host) game_host="${2:?--game-host needs a value}"; shift 2 ;;
     --relay-host) relay_host="${2:?--relay-host needs a value}"; shift 2 ;;
+    --join) join="${2:?--join needs a value}"; mode="node"; shift 2 ;;
     --image) image="${2:?--image needs a value}"; shift 2 ;;
     --hearth-image) hearth_image="${2:?--hearth-image needs a value}"; shift 2 ;;
     --bind) bind_address="${2:?--bind needs a value}"; shift 2 ;;
@@ -95,12 +116,34 @@ while [ "$#" -gt 0 ]; do
     --namespace) namespace="${2:?--namespace needs a value}"; shift 2 ;;
     --nightly) channel="latest-nightly"; shift ;;
     --node) mode="node"; shift ;;
+    --cli) cli=1; shift ;;
     --skip-docker-install) install_docker_allowed=0; shift ;;
     -y | --yes) assume_yes=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; printf 'kiln: unknown option %s\n' "$1" >&2; exit 1 ;;
   esac
 done
+
+if [ "$cli" -eq 1 ]; then
+  [ "$mode" = "platform" ] || {
+    printf 'kiln: --cli installs only the CLI. Add a Relay without it.\n' >&2
+    exit 1
+  }
+  mode="cli"
+fi
+
+# The link from Hearth's Add Relay dialog: its address, then #kj1. and a
+# code. The Relay checks it fully; this only catches a wrong paste early.
+if [ -n "$join" ]; then
+  case "$join" in
+    http://*'#kj1.'* | https://*'#kj1.'*) ;;
+    *)
+      printf 'kiln: "%s" isn'"'"'t a join link.\n' "$join" >&2
+      printf 'Copy the whole command from Add Relay in Hearth; it includes the link.\n' >&2
+      exit 1
+      ;;
+  esac
+fi
 
 [ -n "$image" ] || image="$image_prefix/relay:$channel"
 prefix="${namespace:+$namespace-}"
@@ -142,13 +185,15 @@ say() { printf '%s\n' "$*"; }
 logo() {
   if [ "$unicode" -eq 1 ]; then
     printf '\n'
-    printf '%s        ▄▄▄%s\n' "$orange" "$reset"
-    printf '%s      ▄▄▄▄▄▄▄%s\n' "$orange" "$reset"
-    printf '%s   ▐▀▀▀▀▀▀▀▀▀▀▀▌%s\n' "$orange" "$reset"
-    printf '%s   ▐ ▬▬▬     ■ ▌%s   %sKiln%s\n' "$orange" "$reset" "$bold" "$reset"
-    printf '%s   ▐ ▬▬▬     ■ ▌%s   %s%s%s\n' "$orange" "$reset" "$dim" "$1" "$reset"
-    printf '%s   ▐ ▬▬▬     ■ ▌%s\n' "$orange" "$reset"
-    printf '%s  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀%s\n\n' "$orange" "$reset"
+    printf '%s       ▆▆▆▆▆▆▆▆%s\n' "$orange" "$reset"
+    printf '%s        ▆▆▆▆▆▆%s\n' "$orange" "$reset"
+    printf '%s    ▅▅▅▅▅▅▅▅▅▅▅▅▅▅%s\n' "$orange" "$reset"
+    printf '%s    █▆▆▆▆▆█████▃▃█%s\n' "$orange" "$reset"
+    printf '%s    ▅▅▅▅▅▅▅▅▅▅▅▅▅▅%s     %sKiln%s\n' "$orange" "$reset" "$bold" "$reset"
+    printf '%s    █▆▆▆▆▆█████▃▃█%s     %s%s%s\n' "$orange" "$reset" "$dim" "$1" "$reset"
+    printf '%s    ▅▅▅▅▅▅▅▅▅▅▅▅▅▅%s\n' "$orange" "$reset"
+    printf '%s    █▆▆▆▆▆█████▃▃█%s\n' "$orange" "$reset"
+    printf '%s  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇%s\n\n' "$orange" "$reset"
   else
     printf '\nKiln - %s\n\n' "$1"
   fi
@@ -234,6 +279,7 @@ on_exit() {
   code=$?
   if [ -n "$step_pid" ]; then kill_tree "$step_pid"; fi
   if [ -n "${sudo_keeper:-}" ]; then kill "$sudo_keeper" 2>/dev/null || true; fi
+  if [ -n "${cli_work:-}" ]; then rm -rf "$cli_work"; fi
   if [ "$fancy" -eq 1 ]; then printf '\033[?25h'; fi
   exit "$code"
 }
@@ -306,8 +352,12 @@ step() {
   if [ "$status" -ne 0 ]; then
     log "(failed with status $status)"
     printf '%s  %s%s%s %-26s %s%s%s\n' "$clear_line" "$red" "$cross" "$reset" "$label" "$dim" "$took" "$reset"
-    # The reason, when the step gave one: its own `kiln:` line, or its last.
-    reason=$(tail -n +"$((step_log_start + 1))" "$log_file" | sed -n 's/^kiln: //p' | tail -n 1)
+    # The reason: the step's own `kiln:` line, else the error Docker or a
+    # command gave, so it isn't only in the log.
+    output=$(tail -n +"$((step_log_start + 1))" "$log_file")
+    reason=$(printf '%s\n' "$output" | sed -n 's/^kiln: //p' | tail -n 1)
+    [ -n "$reason" ] || reason=$(printf '%s\n' "$output" |
+      sed -n 's/.*Error response from daemon: //p; s/^\(.*[Ee]rror: .*\)$/\1/p' | tail -n 1)
     [ -n "$reason" ] || reason="$label didn't finish."
     fail "$reason"
   fi
@@ -343,15 +393,14 @@ confirm() {
   esac
 }
 
-# A line of text from the terminal, or the default.
+# A line of text from the terminal, or the default, left in $answer. It
+# reads in this shell rather than a $( ) one: sudo passes ^C on only to the
+# shell it started, which can't stop while it waits on a subshell.
 ask() {
-  if [ "$assume_yes" -eq 1 ] || ! has_terminal; then
-    printf '%s' "$2"
-    return
-  fi
+  answer=$2
+  if [ "$assume_yes" -eq 1 ] || ! has_terminal; then return; fi
   printf '  %s ' "$1" >/dev/tty
   read -r answer </dev/tty || answer=""
-  printf '%s' "$answer"
 }
 
 public_ip() {
@@ -579,9 +628,38 @@ wait_healthy() {
   dk inspect --format '{{.Name}} {{.Config.Image}} healthy' "$name"
 }
 
+# Where `docker run` writes the ID of the container it created, so a run
+# that fails after creating it, as when a port is taken, removes that one
+# container and no other: not a Relay another install started meanwhile.
+relay_cidfile=""
+new_relay_cidfile() {
+  relay_cidfile=$(mktemp -u "${TMPDIR:-/tmp}/kiln-relay-cid.XXXXXX")
+}
+
+# Removes that file as whoever ran Docker, which wrote it.
+remove_relay_cidfile() {
+  case "$docker_cmd" in
+    sudo*) sudo rm -f "$relay_cidfile" ;;
+    *) rm -f "$relay_cidfile" ;;
+  esac
+}
+
+# The container the failed run created, if it never ran. The run fails.
+remove_unstarted() {
+  created=$(cat "$relay_cidfile" 2>/dev/null || true)
+  remove_relay_cidfile
+  if [ -n "$created" ] &&
+    [ "$(dk inspect --format '{{.State.Status}}' "$created" 2>/dev/null)" = "created" ]; then
+    # Not forced, so Docker refuses if it started after all.
+    dk rm "$created" >/dev/null 2>&1 || true
+  fi
+  return 1
+}
+
 start_platform_relay() {
   dk volume create "$volume" >/dev/null
-  dk run --detach --name "$container" --restart unless-stopped \
+  new_relay_cidfile
+  dk run --detach --cidfile "$relay_cidfile" --name "$container" --restart unless-stopped \
     --volume /var/run/docker.sock:/var/run/docker.sock \
     --volume "$volume:/data" \
     --publish "$sftp_port:2022" \
@@ -595,19 +673,36 @@ start_platform_relay() {
     ${hearth_image:+--env KILN_PLATFORM_HEARTH_IMAGE="$hearth_image"} \
     ${namespace:+--env KILN_RELAY_RESOURCE_NAMESPACE="$namespace"} \
     ${game_host:+--env KILN_RELAY_GAME_HOST="$game_host"} \
-    "$image"
+    "$image" || remove_unstarted
+  remove_relay_cidfile
 }
 
 start_node_relay() {
   dk volume create "$volume" >/dev/null
-  dk run --detach --name "$container" --restart unless-stopped \
+  # Behind Traefik, Kiln reaches the Relay on 443 and nothing else needs
+  # 4100; the Relay joins once its HTTPS works, from join_when_https.
+  relay_port="--publish 4100:4100"
+  relay_join=$join
+  if [ "$proxy" = "traefik" ]; then
+    relay_port=""
+    relay_join=""
+  fi
+  # Connecting to Kiln itself, the Relay needs no port of its own.
+  [ "$proxy" != "hearth" ] || relay_port=""
+  new_relay_cidfile
+  # shellcheck disable=SC2086 # the port's flag and value
+  dk run --detach --cidfile "$relay_cidfile" --name "$container" --restart unless-stopped \
     --volume /var/run/docker.sock:/var/run/docker.sock \
     --volume "$volume:/data" \
-    --publish 4100:4100 --publish "$sftp_port:2022" \
+    $relay_port --publish "$sftp_port:2022" \
     --env KILN_RELAY_HOST="$relay_host" \
+    ${proxy:+--env KILN_RELAY_PROXY="$proxy"} \
+    ${KILN_ACME_CA_SERVER:+--env KILN_RELAY_ACME_CA_SERVER="$KILN_ACME_CA_SERVER"} \
+    ${relay_join:+--env KILN_RELAY_JOIN="$relay_join"} \
     ${namespace:+--env KILN_RELAY_RESOURCE_NAMESPACE="$namespace"} \
     ${game_host:+--env KILN_RELAY_GAME_HOST="$game_host"} \
-    "$image"
+    "$image" || remove_unstarted
+  remove_relay_cidfile
   waited=0
   until [ "$(dk inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null)" = "healthy" ]; do
     waited=$((waited + 2))
@@ -619,27 +714,272 @@ start_node_relay() {
   done
 }
 
+# A joining Relay's lines: its container's log, or the `pair join` run on a
+# Relay that was already here. The link itself never shows in either.
+join_output=""
+join_lines() {
+  if [ -n "$join_output" ]; then
+    cat "$join_output" 2>/dev/null || true
+  else
+    dk logs "$container" 2>&1 || true
+  fi
+}
+
+# Waits for a line saying the join got as far as $1, or ended. A join
+# that ended badly leaves the Relay's reason as the step's.
+wait_join() {
+  waited=0
+  while [ "$waited" -lt "$2" ]; do
+    lines=$(join_lines)
+    case "$lines" in
+      *"$1"* | *"Paired with Hearth"*) return 0 ;;
+      *"join expired"* | *"already joined with this link"* | *"Joining needs"* | *"isn't a join link"*)
+        printf 'kiln: %s\n' "$(printf '%s\n' "$lines" | grep -E "expired|already joined|Joining needs|join link" | tail -n 1)"
+        return 1
+        ;;
+    esac
+    sleep 2
+    waited=$((waited + 2))
+  done
+  printf 'kiln: %s\n' "The Relay didn't hear from Hearth. Its last line: $(printf '%s\n' "$lines" | tail -n 1)"
+  return 1
+}
+wait_announced() { wait_join "Confirm this Relay in Hearth:" 600; }
+wait_confirmed() { wait_join "Paired with Hearth" 1900; }
+
+# Joins Hearth: until Hearth has the Relay, where to confirm it, until
+# someone does, then done.
+join_hearth() {
+  step "Reaching Hearth" wait_announced
+  confirm_url=$(join_lines | sed -n 's/.*Confirm this Relay in Hearth: //p' | tail -n 1)
+  fingerprint=$(join_lines | sed -n 's/^Joining .* as //p' | tail -n 1)
+  if [ -n "$confirm_url" ]; then
+    say ""
+    say "  Confirm this Relay in Hearth:"
+    say "  $arrow $bold$confirm_url$reset"
+    [ -z "$fingerprint" ] || say "  ${dim}Fingerprint $fingerprint$reset"
+    say ""
+    step "Waiting for confirmation" wait_confirmed
+  fi
+  say ""
+  say "  ${green}${bold}Relay added$reset ${dim}in $(duration $(($(now) - started_at)))$reset"
+  say ""
+  say "  ${dim}Install log: $log_file$reset"
+  say ""
+}
+
 # Whether a domain resolves to this machine's address.
 points_here() {
   command -v getent >/dev/null 2>&1 || return 0
   getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | grep -qxF "$address"
 }
 
-# What's listening on ports 80 or 443: a container's name, "another
-# program", or nothing.
+# What's listening on a port: a container's name, "another program", or
+# nothing.
+port_owner() {
+  owner=$(dk ps --filter "publish=$1" --format '{{.Names}}' 2>/dev/null | head -n 1)
+  if [ -n "$owner" ]; then
+    printf '%s' "$owner"
+    return
+  fi
+  # Listening sockets, by port in hex: 0050 is 80.
+  if awk 'NR > 1 && $4 == "0A" { split($2, local, ":"); print local[2] }' \
+    /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -qx "$(printf '%04X' "$1")"; then
+    printf 'another program'
+  fi
+}
+
+# What's listening on ports 80 or 443, the same way.
 web_ports_owner() {
   for published in 80 443; do
-    owner=$(dk ps --filter "publish=$published" --format '{{.Names}}' 2>/dev/null | head -n 1)
+    owner=$(port_owner "$published")
     if [ -n "$owner" ]; then
       printf '%s' "$owner"
       return
     fi
   done
-  # Listening sockets, by port in hex: 0050 is 80, 01BB is 443.
-  if awk 'NR > 1 && $4 == "0A" { split($2, local, ":"); print local[2] }' \
-    /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -qx -e 0050 -e 01BB; then
-    printf 'another program'
+}
+
+# Stops before starting anything when a port the Relay publishes is taken,
+# naming what has it, rather than failing halfway through.
+check_ports() {
+  if [ "$mode" = "node" ] && [ "$proxy" = "traefik" ]; then
+    owner=$(web_ports_owner)
+    [ -z "$owner" ] ||
+      fail "Port 80 or 443 is in use by $owner, and the Relay's Traefik needs them. Run this again with --proxy none added to use port 4100 instead."
+  elif [ "$mode" = "node" ] && [ "$proxy" = "none" ]; then
+    owner=$(port_owner 4100)
+    [ -z "$owner" ] ||
+      fail "Port 4100 is in use by $owner, and a Relay needs it for Kiln to reach it."
   fi
+  owner=$(port_owner "$sftp_port")
+  [ -n "$owner" ] || return 0
+  free=$((sftp_port + 1))
+  while [ -n "$(port_owner "$free")" ] && [ "$free" -lt $((sftp_port + 100)) ]; do
+    free=$((free + 1))
+  done
+  fail "Port $sftp_port, for SFTP, is in use by $owner. Run this again with --sftp-port $free added to use $free instead."
+}
+
+# How Kiln reaches an added machine's Relay: through the Relay's own
+# Traefik on ports 80 and 443, with a Let's Encrypt certificate for its
+# address, or at the Relay's own HTTPS on port 4100 when something else has
+# 80 or 443. A Relay's data from before keeps how it was reached.
+choose_node_proxy() {
+  case "$proxy" in
+    traefik | none | hearth | "") ;;
+    *) fail "--proxy with --node must be traefik, none, or hearth." ;;
+  esac
+  stored=$(stored_proxy_mode)
+  if [ -n "$stored" ]; then
+    log "the Relay's data keeps proxy mode $stored"
+    proxy=$stored
+    return 0
+  fi
+  # The installer checks the Relay's HTTPS with curl before it joins.
+  if [ "$proxy" = "traefik" ] && ! command -v curl >/dev/null 2>&1; then
+    fail "Checking the Relay's HTTPS needs curl. Install curl, or run this again with --proxy none."
+  fi
+  [ -z "$proxy" ] || return 0
+  # Let's Encrypt checks a name or an IPv4 address.
+  case "$relay_host" in
+    *:*)
+      proxy=none
+      return 0
+      ;;
+  esac
+  if ! command -v curl >/dev/null 2>&1; then
+    log "no curl to check HTTPS with"
+    say "  curl isn't installed, so Kiln will reach this Relay at"
+    say "  port 4100 instead."
+    asked=1
+    proxy=none
+    return 0
+  fi
+  owner=$(web_ports_owner)
+  if [ -z "$owner" ]; then
+    proxy=traefik
+    return 0
+  fi
+  log "ports 80/443 are used by: $owner"
+  say "  Port 80 or 443 is in use by $owner, so Kiln will reach"
+  say "  this Relay at port 4100 instead."
+  asked=1
+  proxy=none
+}
+
+# The proxy mode a Relay's data here already has, or nothing: read with the
+# Relay's own image, whose entrypoint is Node.
+stored_proxy_mode() {
+  docker_reachable || return 0
+  dk volume inspect "$volume" >/dev/null 2>&1 || return 0
+  dk run --rm --network none --volume "$volume:/data:ro" "$image" \
+    -e 'try { process.stdout.write(JSON.parse(require("fs").readFileSync("/data/proxy.json", "utf8")).mode) } catch {}' \
+    2>>"$log_file" | grep -Ex 'none|hearth|traefik|coolify' || true
+}
+
+# Waits for the Relay's address to answer over HTTPS with a certificate for
+# it, asking this machine's Traefik directly: a router may not send a
+# machine's own public address back to it.
+wait_relay_https() {
+  insecure=""
+  # A test directory's certificates aren't trusted.
+  [ -z "${KILN_ACME_CA_SERVER:-}" ] || insecure="-k"
+  waited=0
+  until curl -sS $insecure --max-time 5 -o /dev/null \
+    --connect-to "$relay_host:443:127.0.0.1:443" "https://$relay_host/" 2>/dev/null; do
+    waited=$((waited + 3))
+    if [ "$waited" -ge 180 ]; then
+      curl -sS $insecure --max-time 5 -o /dev/null \
+        --connect-to "$relay_host:443:127.0.0.1:443" "https://$relay_host/" || true
+      stop "HTTPS isn't working yet."
+    fi
+    sleep 3
+  done
+}
+
+# Let's Encrypt couldn't check the Relay's address, as when ports 80 and
+# 443 there reach another machine. A Relay this install just made, which
+# hasn't joined anything, starts again connecting to Kiln itself when its
+# release can and it's joining, else at port 4100.
+use_direct_port() {
+  say ""
+  say "  Let's Encrypt couldn't reach this machine at $relay_host"
+  say "  on port 80."
+  if [ "$volume_created" -eq 1 ] && [ -n "$join" ] &&
+    relay_feature control-dial; then
+    say "  It will connect to Kiln itself instead, with no ports"
+    say "  opened, and its consoles and files will go through Kiln."
+    say ""
+    proxy=hearth
+    step "Switching to connecting to Kiln" remove_new_relay
+    step "Starting the Relay" start_node_relay
+    return 0
+  fi
+  say "  Ports 80 and 443 there have to lead here."
+  if [ "$volume_created" -eq 1 ] && [ -z "$(port_owner 4100)" ] &&
+    confirm "Use port 4100 instead?"; then
+    say ""
+    proxy=none
+    step "Switching to port 4100" remove_new_relay
+    step "Starting the Relay" start_node_relay
+    return 0
+  fi
+  fail "Forward ports 80 and 443 at $relay_host to this machine, then run this again."
+}
+
+# Removes the Relay this install just started, its Traefik, and its new
+# volume.
+remove_new_relay() {
+  dk rm -f "$container" >/dev/null
+  traefik=$(dk container inspect --format \
+    '{{.Id}} {{index .Config.Labels "kiln.relay.infrastructure"}}' \
+    "${prefix}kiln-traefik" 2>/dev/null || true)
+  case "$traefik" in
+    *" traefik") dk rm -f "${traefik%% *}" >/dev/null ;;
+  esac
+  dk volume rm "$volume" >/dev/null
+}
+
+# Whether the downloaded Relay release can do $1, from the features its
+# image is labeled with.
+relay_feature() {
+  features=$(dk image inspect \
+    --format '{{index .Config.Labels "io.kiln.relay.features"}}' "$image" 2>/dev/null || true)
+  for feature in $(printf '%s' "$features" | tr ',' ' '); do
+    [ "$feature" != "$1" ] || return 0
+  done
+  return 1
+}
+
+# Downloads the release and starts the Relay here afresh from it. A Relay
+# it can't replace, as when the release is older or can't be downloaded,
+# stays as it is.
+refresh_relay() {
+  step_progress=pull_progress
+  step_soft=1
+  step "Downloading Kiln" pull_relay || return 0
+  if ! relay_feature replace; then
+    log "this Relay release can't replace a Relay; leaving it as it is"
+    return 0
+  fi
+  step_soft=1
+  step "Restarting the Relay" replace_relay && return 0
+  reason=$(tail -n +"$((step_log_start + 1))" "$log_file" | sed -n 's/^kiln: //p' | tail -n 1)
+  [ -n "$reason" ] || reason="The Relay couldn't be restarted, so it stays as it was."
+  say ""
+  say "  $reason"
+  say "  ${dim}Install log: $log_file$reset"
+  say ""
+}
+
+# Replaces the Relay here with one from the downloaded image, keeping its
+# settings and data: the image does it as Kiln updates a Relay, and puts
+# the old one back if the new one doesn't become healthy. Ctrl-C stops
+# waiting for it, not the replacement.
+replace_relay() {
+  dk run --rm --sig-proxy=false --network none --volumes-from "$container" \
+    "$image" dist/src/replace-relay.mjs "$container" "$image"
 }
 
 # Which proxy gives Kiln HTTPS: Coolify's on a Coolify server, otherwise
@@ -686,7 +1026,7 @@ choose_url() {
   asked=1
   printf '  Kiln will open at %s%s%s\n' "$bold" "$default" "$reset" >/dev/tty
   while :; do
-    answer=$(ask "Press Enter, or type a domain you've pointed here:" "")
+    ask "Press Enter, or type a domain you've pointed here:" ""
     case "$answer" in
       "") url=$default; break ;;
       http://* | https://*) url=$answer; break ;;
@@ -721,8 +1061,272 @@ wait_https() {
   done
 }
 
+# -------------------------------------------------------------------- CLI
+
+# This machine's CLI build, as releases name it, or nothing. A shell under
+# Rosetta reports x86_64 on Apple silicon, which has its own build.
+cli_platform() {
+  case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    *) return 0 ;;
+  esac
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=x64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *) return 0 ;;
+  esac
+  if [ "$os" = "darwin" ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+    arch=arm64
+  fi
+  printf '%s-%s' "$os" "$arch"
+}
+
+# Where the CLI goes: a directory root's PATH has, else the user's own, so
+# `kiln update` can replace it without sudo.
+cli_directory() {
+  if [ "$(id -u)" -eq 0 ]; then
+    printf '/usr/local/bin'
+  else
+    printf '%s/.local/bin' "$HOME"
+  fi
+}
+
+# Asks GitHub for releases, into $cli_work/answer, and prints the HTTP
+# status: 000 when GitHub didn't answer.
+github_releases() {
+  curl -sSL --max-time 30 -H 'Accept: application/vnd.github+json' \
+    -o "$cli_work/answer" -w '%{http_code}' \
+    "https://api.github.com/repos/$repository/$1" 2>>"$log_file" || true
+}
+
+# The CLI builds for this machine in GitHub's answer, one line each: tag,
+# whether it's a prerelease, size, SHA-256 digest, and URL. Every key starts
+# a line first, so this doesn't depend on how GitHub lays out its JSON.
+cli_builds() {
+  tr '\n' ' ' <"$cli_work/answer" | awk '{ gsub(/"[a-z_]+"[ ]*:/, "\n&"); print }' |
+    awk -v platform="$cli_platform" '
+      function value(line) {
+        sub(/^"[a-z_]+"[ ]*:[ ]*/, "", line)
+        if (line ~ /^"/) { line = substr(line, 2); sub(/".*$/, "", line) }
+        else sub(/[^a-z0-9]+.*$/, "", line)
+        return line
+      }
+      /^"tag_name"/ { tag = value($0) }
+      /^"draft"/ { draft = value($0) }
+      /^"prerelease"/ { prerelease = value($0) }
+      /^"name"/ { name = value($0); size = ""; digest = "" }
+      /^"size"/ { size = value($0) }
+      /^"digest"/ { digest = value($0) }
+      /^"browser_download_url"/ {
+        if (draft == "false" && name == "kiln-" tag "-" platform)
+          print tag, prerelease, size, digest, value($0)
+      }
+    '
+}
+
+# Picks the newest stable CLI, or with --nightly the newest nightly. Until
+# Kiln's first stable release, the newest nightly stands in for it, as the
+# images' `latest` tag does. A release can be up before its CLI builds
+# are, so it's the newest one with this machine's build.
+find_cli() {
+  status=404
+  [ "$channel" != "latest" ] || status=$(github_releases releases/latest)
+  nightly=false
+  if [ "$status" = 404 ]; then
+    nightly=true
+    status=$(github_releases 'releases?per_page=100')
+  fi
+  log "GitHub answered HTTP $status"
+  case "$status" in
+    200) ;;
+    403 | 429) stop "GitHub is limiting requests from this address. Try again in an hour." ;;
+    000) stop "Couldn't reach GitHub. Check this computer is online." ;;
+    *) stop "GitHub didn't list Kiln's releases (HTTP $status). Try again later." ;;
+  esac
+  release=$(cli_builds | awk -v nightly="$nightly" '
+    $2 == nightly && $1 ~ /^v[0-9]+\.[0-9]+\.[0-9]+(-nightly\.[0-9]+\.[0-9]+)?$/ &&
+      ($1 ~ /-nightly\./) == (nightly == "true") { print; exit }
+  ')
+  [ -n "$release" ] ||
+    stop "There's no CLI for $cli_platform in the newest release yet. Try again in a few minutes."
+  # shellcheck disable=SC2086 # the release's fields
+  set -- $release
+  case "$3" in "" | *[!0-9]*) stop "GitHub listed the CLI without its size." ;; esac
+  printf '%s\n' "$4" | grep -Eq '^sha256:[0-9a-f]{64}$' ||
+    stop "GitHub listed the CLI without its SHA-256 digest."
+  [ "$5" = "https://github.com/$repository/releases/download/$1/kiln-$1-$cli_platform" ] ||
+    stop "GitHub listed the CLI at an unexpected address."
+  printf '%s\n' "$release" >"$cli_work/release"
+  log "release: $release"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{ print $NF }'
+  else
+    stop "Checking the CLI needs sha256sum, shasum, or openssl."
+  fi
+}
+
+# How much of the CLI has arrived, as a bar.
+cli_progress() {
+  [ -f "$cli_work/kiln" ] || return 0
+  progress_bar "$(wc -c <"$cli_work/kiln" | tr -d ' ')" "$cli_size"
+}
+
+# Downloads the CLI and checks it's the build GitHub listed, and that it runs
+# here and is the version it should be.
+download_cli() {
+  curl -fsSL --max-time 600 -o "$cli_work/kiln" "$cli_url" ||
+    stop "Couldn't download the CLI. Check this computer can reach github.com."
+  [ "$(wc -c <"$cli_work/kiln" | tr -d ' ')" = "$cli_size" ] &&
+    [ "sha256:$(sha256_of "$cli_work/kiln")" = "$cli_digest" ] ||
+    stop "The CLI didn't download intact. Run this again."
+  chmod 755 "$cli_work/kiln"
+  reported=$("$cli_work/kiln" --version 2>&1) ||
+    stop "The CLI doesn't run on this computer: $reported"
+  [ "$reported" = "kiln $cli_version" ] ||
+    stop "The CLI reports \"$reported\", not kiln $cli_version."
+}
+
+# Into place in one step, so a `kiln` running meanwhile keeps working. A
+# link there goes first: mv would follow one to a directory, and `kiln
+# update` replaces the file a link points to, which may need sudo.
+place_cli() {
+  [ ! -L "$cli_dir/kiln" ] || rm -f "$cli_dir/kiln"
+  mv -f "$cli_work/kiln" "$cli_dir/kiln" ||
+    stop "Couldn't install the CLI into $cli_dir."
+}
+
+# Whether release version $1 is newer than $2, ordered as Kiln orders them:
+# by number, then a stable release after its nightlies, then the newer
+# nightly.
+newer_version() {
+  awk -v left="$1" -v right="$2" '
+    function key(version,   part, count, rank) {
+      count = split(version, part, "[.-]")
+      rank = count == 3 ? 2 : count == 6 ? 1 : 0
+      return sprintf("%010d%010d%010d%d%010d%010d", part[1], part[2], part[3], rank, part[5], part[6])
+    }
+    BEGIN { exit !(key(left) > key(right)) }
+  '
+}
+
+# The version of the CLI already in $cli_dir, or nothing. Only a binary of
+# its own counts, not a link to one elsewhere.
+installed_cli() {
+  [ -f "$cli_dir/kiln" ] && [ ! -L "$cli_dir/kiln" ] && [ -x "$cli_dir/kiln" ] || return 0
+  "$cli_dir/kiln" --version 2>/dev/null | sed -n 's/^kiln //p' | head -n 1 |
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-nightly\.[0-9]+(\.[0-9]+)?)?$' || true
+}
+
+install_cli() {
+  cli_platform=$(cli_platform)
+  [ -n "$cli_platform" ] ||
+    fail "Kiln's CLI runs on Linux and macOS (x64 or ARM64), not $(uname -sm). On Windows, download kiln.exe from https://github.com/$repository/releases"
+  # Its Linux builds need glibc, which musl systems such as Alpine don't have.
+  case "$cli_platform" in
+    linux-*)
+      getconf GNU_LIBC_VERSION >/dev/null 2>&1 ||
+        fail "Kiln's CLI needs glibc, which this system doesn't have (as on Alpine)."
+      ;;
+  esac
+  command -v curl >/dev/null 2>&1 || fail "Installing the CLI needs curl."
+  cli_dir=$(cli_directory)
+  log "cli: $cli_platform into $cli_dir"
+  mkdir -p "$cli_dir" 2>/dev/null && [ -w "$cli_dir" ] ||
+    fail "Can't write to $cli_dir. Run this again as root, or as its owner."
+  if [ -d "$cli_dir/kiln" ] && [ ! -L "$cli_dir/kiln" ]; then
+    fail "$cli_dir/kiln is a directory. Move it, then run this again."
+  fi
+  # Beside where it goes, so moving it there can't be a copy across disks.
+  cli_work=$(mktemp -d "$cli_dir/.kiln-install.XXXXXX") ||
+    fail "Can't write to $cli_dir."
+
+  step "Finding the newest CLI" find_cli
+  # shellcheck disable=SC2046 # the release's fields
+  set -- $(cat "$cli_work/release")
+  cli_version=${1#v} cli_size=$3 cli_digest=$4 cli_url=$5
+
+  # A newer CLI stays, such as a nightly when this found a stable release.
+  installed=$(installed_cli)
+  if [ "$installed" = "$cli_version" ]; then
+    say ""
+    say "  ${green}${bold}Kiln CLI $cli_version$reset is already installed in $cli_dir."
+  elif [ -n "$installed" ] && newer_version "$installed" "$cli_version"; then
+    say ""
+    say "  ${green}${bold}Kiln CLI $installed$reset is already installed in $cli_dir."
+    say "  It's newer than $cli_version, so it stays. To install that"
+    say "  version instead, delete $cli_dir/kiln and run this again."
+  else
+    step_progress=cli_progress
+    step "Downloading the CLI" download_cli
+    step "Installing the CLI" place_cli
+    say ""
+    say "  ${green}${bold}Kiln CLI $cli_version is ready$reset ${dim}in $(duration $(($(now) - started_at)))$reset"
+  fi
+  say ""
+
+  # The kiln this shell finds first, if not this one.
+  case ":$PATH:" in
+    *":$cli_dir:"*)
+      found=$(command -v kiln 2>/dev/null || true)
+      if [ -n "$found" ] && [ "$found" != "$cli_dir/kiln" ]; then
+        say "  ${dim}Another kiln comes first on your PATH: $found$reset"
+        say "  ${dim}Remove it to use this one.$reset"
+        say ""
+      fi
+      ;;
+    *)
+      # shellcheck disable=SC2088 # shown, not expanded
+      case "${SHELL:-}" in
+        */zsh) profile="~/.zshrc" ;;
+        */bash)
+          profile="~/.bashrc"
+          # macOS's Terminal starts bash as a login shell, which reads the
+          # first of these it finds and not ~/.bashrc.
+          if [ "$(uname -s)" = "Darwin" ]; then
+            profile="~/.bash_profile"
+            for file in .bash_profile .bash_login .profile; do
+              if [ -f "$HOME/$file" ]; then
+                profile="~/$file"
+                break
+              fi
+            done
+          fi
+          ;;
+        *) profile="your shell's profile" ;;
+      esac
+      say "  $cli_dir isn't on your PATH yet. Add this line to $profile,"
+      say "  then open a new terminal:"
+      say "  $arrow ${bold}export PATH=\"$cli_dir:\$PATH\"$reset"
+      say ""
+      ;;
+  esac
+  if [ -n "$url" ]; then
+    say "  Sign in to $url:"
+    say "  $arrow ${bold}kiln login $url$reset"
+  else
+    say "  Sign in with your Kiln's address:"
+    say "  $arrow ${bold}kiln login https://kiln.example.com$reset"
+  fi
+  say ""
+  say "  ${dim}Update it later with kiln update. Install log: $log_file$reset"
+  say ""
+}
+
 # ------------------------------------------------------------------- main
 
+if [ "$mode" = "cli" ]; then
+  logo "Install the CLI"
+  install_cli
+  exit 0
+fi
 if [ "$mode" = "node" ]; then logo "Add this machine"; else logo "Install"; fi
 
 plan_docker
@@ -738,16 +1342,43 @@ address=$(public_ip)
 [ -n "$address" ] || address="localhost"
 log "public address: $address"
 
-# Already here: say so, and show where it's at.
+# A Relay container that never started, left by an install that failed
+# before it could, isn't a Relay; its volume, if any, stays. Removed by the
+# ID inspected, and not forced, so Docker refuses if another install
+# started it meanwhile.
+if docker_reachable; then
+  unstarted=$(dk inspect --format '{{if eq .State.Status "created"}}{{.Id}}{{end}}' "$container" 2>/dev/null || true)
+  if [ -n "$unstarted" ]; then
+    log "removing $container, which never started"
+    dk rm "$unstarted" >/dev/null 2>&1 || true
+  fi
+fi
+
+# Already here: the Relay starts afresh from the downloaded image, keeping
+# its settings and data, so running this again updates and restarts it.
+# Then it joins Kiln, or this says where it's at.
 if docker_reachable && dk container inspect "$container" >/dev/null 2>&1; then
+  say "  A Relay is already installed here. It restarts with this"
+  say "  release, keeping its settings and data."
+  say ""
+  refresh_relay
+  if [ -n "$join" ]; then
+    [ "$(dk inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" = "true" ] ||
+      fail "A Relay is installed here but stopped. Start it with \`docker start $container\`, then run this again."
+    dk exec "$container" kiln-relay pair join --check >/dev/null 2>&1 ||
+      fail "This Relay is older than joining needs. Update it, or pair it by hand: run \`docker exec $container kiln-relay pair create\` and paste the link into Hearth's Pairing link tab."
+    join_output=$(mktemp)
+    dk exec "$container" kiln-relay pair join "$join" >"$join_output" 2>&1 &
+    join_hearth
+    exit 0
+  fi
   if [ "$mode" = "node" ]; then
-    say "  A Relay is already running here. A new invitation to pair it"
-    say "  (it expires in 15 minutes):"
+    say ""
+    say "  A new invitation to pair it (it expires in 15 minutes):"
     say ""
     dk exec "$container" kiln-relay pair create 2>>"$log_file"
     exit 0
   fi
-  say "  Kiln is already installed here."
   say ""
   dk exec "$container" kiln-relay platform status 2>>"$log_file" | sed 's/^/  /'
   setup=$(dk exec "$container" kiln-relay platform setup-url 2>>"$log_file" || true)
@@ -761,10 +1392,15 @@ if docker_reachable && dk container inspect "$container" >/dev/null 2>&1; then
 fi
 
 if [ "$mode" = "node" ]; then
-  if [ -z "$relay_host" ] && [ "$assume_yes" -eq 0 ] && has_terminal; then asked=1; fi
-  [ -n "$relay_host" ] ||
-    relay_host=$(ask "Address Kiln will reach this machine at [$address]:" "")
+  # Joining, Hearth's Add Relay dialog already asked, and filled in
+  # --relay-host when someone changed it.
+  if [ -z "$relay_host" ] && [ -z "$join" ]; then
+    if [ "$assume_yes" -eq 0 ] && has_terminal; then asked=1; fi
+    ask "Address Kiln will reach this machine at [$address]:" ""
+    relay_host=$answer
+  fi
   [ -n "$relay_host" ] || relay_host=$address
+  choose_node_proxy
 else
   choose_proxy
   choose_url
@@ -781,11 +1417,61 @@ if [ "$docker_missing" -eq 1 ]; then
   docker_reachable || fail "Docker didn't start."
 fi
 step "Checking Docker" check_docker
+check_ports
 step_progress=pull_progress
 step "Downloading Kiln" pull_relay
 
+# Behind Traefik at an IP address, the Relay needs a release that gets a
+# certificate for one; an older one is reached at port 4100, as before.
+if [ "$mode" = "node" ] && [ "$proxy" = "traefik" ] && [ -z "$stored" ]; then
+  case "$relay_host" in
+    *[!0-9.]*) ;;
+    *)
+      if ! relay_feature ip-certificates; then
+        log "this Relay release can't get a certificate for an address"
+        owner=$(port_owner 4100)
+        [ -z "$owner" ] ||
+          fail "Port 4100 is in use by $owner, and a Relay needs it for Kiln to reach it."
+        say ""
+        say "  This Relay version can't get HTTPS for an address yet, so"
+        say "  Kiln will reach it at port 4100."
+        proxy=none
+      fi
+      ;;
+  esac
+fi
+
 if [ "$mode" = "node" ]; then
+  volume_created=0
+  dk volume inspect "$volume" >/dev/null 2>&1 || volume_created=1
   step "Starting the Relay" start_node_relay
+  # Kiln can't reach a Relay behind Traefik until Traefik has its
+  # certificate, so it joins only then.
+  # A Relay whose data already chose Traefik is checked only with curl.
+  if [ "$proxy" = "traefik" ] && command -v curl >/dev/null 2>&1; then
+    step_soft=1
+    step "Turning on HTTPS" wait_relay_https || use_direct_port
+  fi
+  # A Relay release older than joining starts fine but ignores the link,
+  # so it's asked first and falls back to an invitation to paste.
+  if [ -n "$join" ] && ! dk exec "$container" kiln-relay pair join --check >/dev/null 2>&1; then
+    log "this Relay can't join; printing an invitation instead"
+    join=""
+    say ""
+    say "  This Relay version can't join by itself yet."
+  fi
+fi
+
+if [ "$mode" = "node" ] && [ -n "$join" ]; then
+  if [ "$proxy" = "traefik" ]; then
+    join_output=$(mktemp)
+    dk exec "$container" kiln-relay pair join "$join" >"$join_output" 2>&1 &
+  fi
+  join_hearth
+  exit 0
+fi
+
+if [ "$mode" = "node" ]; then
   paired=$(dk exec "$container" kiln-relay pair create 2>>"$log_file" || true)
   # Not the invitation itself: it grants full access to this Relay.
   log "$(printf '%s\n' "$paired" | grep -v '^kiln-relay://' || true)"

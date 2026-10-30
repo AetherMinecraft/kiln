@@ -55,13 +55,28 @@ export interface ScheduleOccurrence {
 export type RelayScheduleState = ReturnType<typeof makeRelayScheduleState>
 
 const historyLimit = 1_000
-export const relayTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+export const relayTimezone =
+  Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
 
 const deployment = (
   scheduleId: string,
   acknowledgedRevision: number,
-  nextRunAt: number | null
-): RelayScheduleDeployment => ({ scheduleId, acknowledgedRevision, nextRunAt })
+  nextRunAt: number | null,
+  acknowledgedGeneration?: number
+): RelayScheduleDeployment => ({
+  ...(acknowledgedGeneration === undefined ? {} : { acknowledgedGeneration }),
+  acknowledgedRevision,
+  nextRunAt,
+  scheduleId,
+})
+
+// The generation of what Hearth last sent for a schedule, if it sent one.
+const storedGeneration = (row: ScheduleRow): number | undefined => {
+  const generation = (
+    JSON.parse(row.definition_json) as { generation?: unknown }
+  ).generation
+  return typeof generation === "number" ? generation : undefined
+}
 
 const readDefinition = (row: ScheduleRow) =>
   relayScheduleProjectionSchema.parse(JSON.parse(row.definition_json))
@@ -202,8 +217,11 @@ export function makeRelayScheduleState(sql: SqlClient) {
           })
         )
       ),
-    // Revisions only move forward. A stale apply or remove acknowledges the
-    // newer revision this Relay already holds instead of failing.
+    // Revisions only move forward, and within one revision so do
+    // generations: Hearth resends a schedule when what decides it changes,
+    // such as a destination being disabled, and an older send arriving late
+    // mustn't undo that. A stale apply or remove acknowledges what this
+    // Relay already holds instead of failing.
     apply: (definition: RelayScheduleProjection, nextRunAt: number | null) =>
       run(
         "apply",
@@ -218,11 +236,18 @@ export function makeRelayScheduleState(sql: SqlClient) {
             const current = yield* sql<ScheduleRow>`
               SELECT schedule_id, revision, next_run_at, definition_json
               FROM relay_schedules WHERE schedule_id = ${definition.id}`
-            if (current[0] && current[0].revision > definition.revision) {
+            if (
+              current[0] &&
+              (current[0].revision > definition.revision ||
+                (current[0].revision === definition.revision &&
+                  (storedGeneration(current[0]) ?? 0) >
+                    (definition.generation ?? 0)))
+            ) {
               return deployment(
                 definition.id,
                 current[0].revision,
-                current[0].next_run_at
+                current[0].next_run_at,
+                storedGeneration(current[0])
               )
             }
             yield* sql`INSERT INTO relay_schedules (schedule_id, revision, enabled, next_run_at, definition_json)
@@ -230,7 +255,12 @@ export function makeRelayScheduleState(sql: SqlClient) {
         ON CONFLICT(schedule_id) DO UPDATE SET revision = excluded.revision, enabled = excluded.enabled,
           next_run_at = excluded.next_run_at, definition_json = excluded.definition_json`
             yield* sql`DELETE FROM relay_schedule_tombstones WHERE schedule_id = ${definition.id}`
-            return deployment(definition.id, definition.revision, nextRunAt)
+            return deployment(
+              definition.id,
+              definition.revision,
+              nextRunAt,
+              definition.generation
+            )
           })
         )
       ),
@@ -341,7 +371,9 @@ export function makeRelayScheduleState(sql: SqlClient) {
               FROM relay_schedules WHERE schedule_id = ${input.scheduleId}`
             const row = rows[0]
             if (!row) {
-              return { error: "Schedule is not deployed on this Relay" } as const
+              return {
+                error: "Schedule is not deployed on this Relay",
+              } as const
             }
             if (row.revision !== input.revision) {
               return { error: "Schedule deployment is out of date" } as const
@@ -376,6 +408,18 @@ export function makeRelayScheduleState(sql: SqlClient) {
           Effect.asVoid
         )
       ),
+    /**
+     * Records how far a running occurrence has got, so a restart that
+     * interrupts it keeps what it had done and what may have run.
+     */
+    recordProgress: (record: ScheduleRun) =>
+      run(
+        "record_progress",
+        sql`UPDATE relay_schedule_runs
+      SET sequence_attempts_json = ${JSON.stringify(record.sequenceAttempts)},
+        target_runs_json = ${JSON.stringify(record.targetRuns)}
+      WHERE run_id = ${record.id} AND status = 'running'`.pipe(Effect.asVoid)
+      ),
     completeRun: (record: ScheduleRun) =>
       run(
         "complete_run",
@@ -392,9 +436,18 @@ export function makeRelayScheduleState(sql: SqlClient) {
         sql.withTransaction(
           Effect.gen(function* () {
             const ids = scheduleIds ? JSON.stringify(scheduleIds) : null
+            // With the generation Hearth last sent each, which Hearth's
+            // import acknowledges as a reply to sending it would; an
+            // unreadable definition has none.
             const schedules = yield* sql<
-              Omit<ScheduleRow, "definition_json">
-            >`SELECT schedule_id, revision, next_run_at FROM relay_schedules
+              Omit<ScheduleRow, "definition_json"> & {
+                generation: number | null
+              }
+            >`SELECT schedule_id, revision, next_run_at,
+          CASE WHEN json_valid(definition_json)
+            THEN json_extract(definition_json, '$.generation') END
+            AS generation
+        FROM relay_schedules
         WHERE ${ids} IS NULL OR schedule_id IN (SELECT value FROM json_each(${ids}))`
             const rows = yield* sql<RunRow>`SELECT * FROM relay_schedule_runs
         WHERE ${ids} IS NULL OR schedule_id IN (SELECT value FROM json_each(${ids}))
@@ -412,7 +465,14 @@ export function makeRelayScheduleState(sql: SqlClient) {
             }
             return {
               deployments: schedules.map((row) =>
-                deployment(row.schedule_id, row.revision, row.next_run_at)
+                deployment(
+                  row.schedule_id,
+                  row.revision,
+                  row.next_run_at,
+                  typeof row.generation === "number"
+                    ? row.generation
+                    : undefined
+                )
               ),
               runs,
             }

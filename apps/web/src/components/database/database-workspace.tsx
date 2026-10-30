@@ -1,3 +1,4 @@
+import { resourceDeletionQueryOptions } from "@/lib/resource-deletion-queries"
 import { NO_RESOURCE_LIMITS } from "@workspace/contracts"
 import { DatabaseKindIcon } from "@/components/instance-kind-icon"
 import { instanceInventoryScope } from "@/lib/instance-inventory"
@@ -32,6 +33,7 @@ import {
   type ResourceWorkspaceQuery,
 } from "@/components/resource-workspace"
 import { WorkspaceFrame } from "@/components/workspace-frame"
+import { WorkloadResourceMeters } from "@/components/workload-resource-meters"
 import { recoverPromise } from "@/effect/promise"
 import {
   WorkspaceCopyValueButton,
@@ -180,11 +182,12 @@ function useDatabaseWorkspaceQuery(
         // Without a Relay record the workspace still opens, so the database
         // can be inspected and deleted.
         ...(detail ?? {
-          connectedInstanceIds: [],
           containerId: null,
           diskUsedBytes: null,
           limits: NO_RESOURCE_LIMITS,
+          members: [],
           observedState: "failed" as const,
+          startedAt: null,
           status: "Unavailable",
         }),
         ...directory,
@@ -207,6 +210,9 @@ function useDatabaseWorkspaceQuery(
     isError: directory.isError,
   })
 }
+
+// A database runs one container, with no services to choose between.
+const noServices: ReadonlyArray<string> = []
 
 const DatabaseWorkspaceHeader = React.memo(function DatabaseWorkspaceHeader({
   workspace,
@@ -256,6 +262,17 @@ const DatabaseWorkspaceHeader = React.memo(function DatabaseWorkspaceHeader({
           />
         </WorkspaceIdentity>
       }
+      center={
+        <WorkloadResourceMeters
+          id={database.id}
+          kind="database"
+          relayConnected={databaseRelayAvailable(database)}
+          relayId={database.relayId}
+          running={database.observedState === "running"}
+          services={noServices}
+          startedAt={database.startedAt}
+        />
+      }
       actions={
         <DatabasePowerControls
           key={`${database.relayId}:${database.id}`}
@@ -278,7 +295,12 @@ function DatabasePowerControls({
 }) {
   const { database } = workspace
   const queryClient = useQueryClient()
-  const canPower = database.permissions.includes("database.power")
+  const { data: deletion } = useQuery(resourceDeletionQueryOptions({
+    kind: "database",
+    relayId: database.relayId,
+    resourceId: database.id,
+  }))
+  const canPower = !deletion && database.permissions.includes("database.power")
   const powerPermissions = React.useMemo(
     () => ({ kill: false, restart: canPower, start: canPower, stop: canPower }),
     [canPower]

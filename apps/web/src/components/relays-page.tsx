@@ -15,7 +15,7 @@ import {
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query"
-import { Link } from "@tanstack/react-router"
+import { Link, useNavigate } from "@tanstack/react-router"
 
 import { InfraSyncButton } from "@/components/infra-sync-button"
 import { Effect } from "effect"
@@ -24,12 +24,16 @@ import {
   EllipsisVertical,
   ListTodo,
   LoaderCircle,
+  Pause,
+  Play,
   Plus,
   Settings2,
+  Trash2,
   UserRound,
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
+import { cn } from "@workspace/ui/lib/utils"
 import {
   Dialog,
   DialogContent,
@@ -42,6 +46,7 @@ import { Input } from "@workspace/ui/components/input"
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
@@ -72,10 +77,13 @@ import {
 import {
   RelayDeleteButton,
   RelayPauseButton,
+  RelayPauseDialog,
+  RemoveRelayDialog,
   invalidateRelayRuntimeQueries,
   messageFrom,
   showRelayError,
   updateRelayCache,
+  useRelayPauseToggle,
 } from "@/components/relay/relay-actions"
 import { CopyIdentifierMenuItem } from "@/components/copy-identifier-menu-item"
 import {
@@ -89,7 +97,14 @@ import {
 import {
   DataTableActionGroup,
   DataTableEmptyState,
+  DataTableInlineActions,
+  DataTablePhoneMenuItems,
   DataTableTextCell,
+  useRowMenuDialogs,
+  dataTableRowLinkClassName,
+  dataTableRowMenuTriggerClassName,
+  dataTablePhoneDetailCellClassName,
+  dataTablePhoneDetailWidth,
 } from "@/components/data-table"
 import { DataTable } from "@/components/data-table-view"
 import {
@@ -105,20 +120,10 @@ import {
 } from "@/components/relay-memory-cell"
 import { UserIdentity } from "@/components/user-identity"
 import { relaysCollectionOptions } from "@/lib/collections/relays"
-import {
-  minecraftUsernameKey,
-  relayOwnerNamesKey,
-  selectOwnerProfileIds,
-} from "@/lib/minecraft-profile"
 import { relayAddress } from "@/lib/relay-route"
-import {
-  myInvitationsQueryOptions,
-  type ResourceInvitation,
-} from "@/lib/resource-invitation-query"
 import {
   accessCapabilitiesQueryOptions,
   queryKeys,
-  relayOwnerMinecraftProfilesQueryOptions,
   relayProxyQueryOptions,
   relaysQueryOptions,
 } from "@/lib/query-options"
@@ -147,13 +152,9 @@ import {
 } from "@/lib/infra-table-source"
 import type { ManagedRelay } from "@/server/relays"
 
-const noOwnerProfileIds: ReadonlyMap<string, string> = new Map()
-// Owner cells read profiles from context so avatars never rebuild columns.
-const RelayOwnerProfileIdsContext =
-  React.createContext<ReadonlyMap<string, string>>(noOwnerProfileIds)
-
 type RelayRegistryTableItem = Pick<
   ManagedRelay,
+  | "createdBy"
   | "enabled"
   | "hostname"
   | "id"
@@ -187,6 +188,7 @@ const relayTableSearchFields = [
 ] as const
 
 interface RelayEditView {
+  controlDial: "hearth" | "relay"
   enabled: boolean
   hostname: string
   id: string
@@ -196,14 +198,30 @@ interface RelayEditView {
 }
 
 export const RelaysPage = React.memo(function RelaysPage({
+  joinId,
   searchStore,
 }: {
+  // A join to confirm, which opens Add Relay at it.
+  joinId?: string
   searchStore: DataTableSearchStore
 }) {
-  const [dialogStore] = React.useState(createRelayDialogStore)
+  const [dialogStore] = React.useState(() =>
+    createRelayDialogStore(joinId ? { kind: "add" } : closedRelayDialogState)
+  )
+  // The dialog keeps the linked join; the address goes back to just Relays.
+  const [linkedJoinId] = React.useState(joinId)
+  const navigate = useNavigate()
+  React.useEffect(() => {
+    if (!joinId) return
+    void navigate({
+      replace: true,
+      search: (previous) => ({ ...previous, join: undefined }),
+      to: "/infra/relays",
+    })
+  }, [joinId, navigate])
 
   return (
-    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-3 pb-3 sm:px-5 sm:pb-5">
+    <div className="mx-auto flex h-full min-h-[34rem] w-full max-w-[90rem] flex-col px-2 pb-3 sm:px-5 sm:pb-5">
       <DataTableWorkspace
         toolbar={
           <RelayToolbar searchStore={searchStore} onAdd={dialogStore.openAdd} />
@@ -227,7 +245,7 @@ export const RelaysPage = React.memo(function RelaysPage({
         </React.Suspense>
       </DataTableWorkspace>
 
-      <RelayDialogHost store={dialogStore} />
+      <RelayDialogHost joinId={linkedJoinId} store={dialogStore} />
     </div>
   )
 })
@@ -248,8 +266,8 @@ interface RelayDialogStore {
 
 const closedRelayDialogState: RelayDialogState = { kind: "closed" }
 
-function createRelayDialogStore(): RelayDialogStore {
-  let state = closedRelayDialogState
+function createRelayDialogStore(initial: RelayDialogState): RelayDialogStore {
+  let state = initial
   const listeners = new Set<() => void>()
 
   function publish(nextState: RelayDialogState) {
@@ -330,8 +348,10 @@ const RelayAddButton = React.memo(function RelayAddButton({
 })
 
 const RelayDialogHost = React.memo(function RelayDialogHost({
+  joinId,
   store,
 }: {
+  joinId?: string
   store: RelayDialogStore
 }) {
   const state = React.useSyncExternalStore(
@@ -345,6 +365,7 @@ const RelayDialogHost = React.memo(function RelayDialogHost({
       const relay = relays.find((item) => item.id === state.relayId)
       return relay
         ? {
+            controlDial: relay.controlDial,
             enabled: relay.enabled,
             hostname: relay.hostname,
             id: relay.id,
@@ -364,6 +385,7 @@ const RelayDialogHost = React.memo(function RelayDialogHost({
   return (
     <>
       <AddRelayDialog
+        joinId={joinId}
         open={state.kind === "add"}
         onOpenChange={(open) => {
           if (!open) store.close()
@@ -399,6 +421,7 @@ const FilteredRelayTable = React.memo(function FilteredRelayTable({
         .orderBy(({ relay }) => relay.name)
         .orderBy(({ relay }) => relay.createdAt)
         .select(({ relay }) => ({
+          createdBy: relay.createdBy,
           enabled: relay.enabled,
           hostname: relay.hostname,
           id: relay.id,
@@ -412,46 +435,17 @@ const FilteredRelayTable = React.memo(function FilteredRelayTable({
           useTls: relay.useTls,
         })),
   })
-  const { data: invitedOwners = noInvitedOwners } = useQuery({
-    ...myInvitationsQueryOptions(),
-    select: selectInvitedOwners,
-  })
-  const ownerNames = React.useMemo(
-    () => relayOwnerNamesKey([...data, ...invitedOwners]),
-    [data, invitedOwners]
-  )
   const source = useInfraTableSource({ rows: data, reference: relayReference })
 
   return (
-    <RelayOwnerProfilesProvider ownerNames={ownerNames}>
-      <RelayTable
-        source={source}
-        searchStore={searchStore}
-        onAdd={onAdd}
-        onEdit={onEdit}
-      />
-    </RelayOwnerProfilesProvider>
+    <RelayTable
+      source={source}
+      searchStore={searchStore}
+      onAdd={onAdd}
+      onEdit={onEdit}
+    />
   )
 })
-
-/** Owns the avatar query so profile updates only reach owner cells. */
-function RelayOwnerProfilesProvider({
-  children,
-  ownerNames,
-}: {
-  children: React.ReactNode
-  ownerNames: string
-}) {
-  const { data: ownerProfileIds = noOwnerProfileIds } = useQuery({
-    ...relayOwnerMinecraftProfilesQueryOptions(ownerNames),
-    select: selectOwnerProfileIds,
-  })
-  return (
-    <RelayOwnerProfileIdsContext.Provider value={ownerProfileIds}>
-      {children}
-    </RelayOwnerProfileIdsContext.Provider>
-  )
-}
 
 const RelaySyncButton = React.memo(function RelaySyncButton() {
   const queryClient = useQueryClient()
@@ -529,12 +523,8 @@ function RelayTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "2.5rem", sm: statusColumnWidth } },
-          {
-            cellClassName: "px-2 sm:px-3",
-            headerClassName: "px-2 sm:px-3",
-            headerLabelClassName: "shrink-0 overflow-visible text-clip",
-          }
+          { hideBelow: "md", width: statusColumnWidth },
+          { headerLabelClassName: "shrink-0 overflow-visible text-clip" }
         ),
       }),
       relayTableColumnHelper.display({
@@ -550,8 +540,8 @@ function RelayTable({
           />
         ),
         meta: dataTableColumnMeta(
-          { width: { base: "1.75rem" } },
-          { cellClassName: "px-0", headerClassName: "px-0" }
+          { hideBelow: "md", width: "1.75rem" },
+          { cellClassName: "relative z-10 px-0", headerClassName: "px-0" }
         ),
       }),
       relayTableColumnHelper.accessor((relay) => relay.name, {
@@ -568,7 +558,10 @@ function RelayTable({
                 // other Relay shares its short ID.
                 params={{ relayId: relay.id }}
                 preload="intent"
-                className="group/relay-link flex min-h-14 min-w-0 flex-1 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                className={cn(
+                  dataTableRowLinkClassName,
+                  "group/relay-link flex min-h-14 min-w-0 flex-1 items-center outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                )}
               >
                 <InstanceCard
                   state={relay.instanceState}
@@ -583,6 +576,8 @@ function RelayTable({
                   metaClassName="font-mono"
                   name={relay.name}
                   nameClassName="transition-colors group-hover/relay-link:text-primary-ink"
+                  iconFavorite
+                  iconFavoriteClassName="md:hidden"
                   showFavorite={false}
                 />
               </Link>
@@ -635,10 +630,19 @@ function RelayTable({
             />
           )
         },
-        meta: dataTableColumnMeta({
-          hideBelow: "lg",
-          width: "minmax(0,1fr)",
-        }),
+        meta: dataTableColumnMeta(
+          {
+            width: {
+              base: dataTablePhoneDetailWidth,
+              md: "minmax(0,0.9fr)",
+              lg: "minmax(0,1fr)",
+            },
+          },
+          {
+            cellClassName: dataTablePhoneDetailCellClassName,
+            headerClassName: dataTablePhoneDetailCellClassName,
+          }
+        ),
       }),
       relayTableColumnHelper.accessor(
         (relay) =>
@@ -649,6 +653,7 @@ function RelayTable({
           sortFn: "text",
           cell: ({ row }) => (
             <RelayOwnerCell
+              createdBy={row.original.createdBy}
               ownerEmail={row.original.ownerEmail}
               ownerName={row.original.ownerName}
             />
@@ -667,15 +672,10 @@ function RelayTable({
           <RelayActions relay={row.original} onEdit={onEdit} />
         ),
         meta: dataTableColumnMeta(
+          { width: { base: "3rem", md: "10rem" } },
           {
-            width: {
-              base: "9rem",
-              sm: "10rem",
-            },
-          },
-          {
-            cellClassName: "px-1 sm:px-3",
-            headerClassName: "px-1 sm:px-3",
+            cellClassName: "relative z-10 px-0 md:px-3",
+            headerClassName: "px-1 md:px-3",
           }
         ),
       }),
@@ -726,30 +726,83 @@ const RelayActions = React.memo(function RelayActions({
   relay: RelayTableItem
   onEdit: (relayId: string) => void
 }) {
+  const menu = useRowMenuDialogs()
+  const [dialog, setDialog] = React.useState<"pause" | "remove" | null>(null)
+  const pause = useRelayPauseToggle(relay)
+  const togglePaused = () =>
+    relay.enabled ? setDialog("pause") : void pause.toggle()
+  const removeRelay = () => setDialog("remove")
+
   return (
     <DataTableActionGroup>
-      <RelayEditButton relay={relay} onEdit={onEdit} />
-      <RelayPauseButton relay={relay} />
-      <RelayDeleteButton relayId={relay.id} name={relay.name} />
+      <DataTableInlineActions>
+        <RelayEditButton relay={relay} onEdit={onEdit} />
+        <RelayPauseButton
+          enabled={relay.enabled}
+          name={relay.name}
+          pending={pause.pending}
+          onClick={togglePaused}
+        />
+        <RelayDeleteButton name={relay.name} onClick={removeRelay} />
+      </DataTableInlineActions>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
             size="icon-sm"
             variant="ghost"
+            className={dataTableRowMenuTriggerClassName}
             aria-label={`More actions for ${relay.name}`}
           >
             <EllipsisVertical />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-44">
+        <DropdownMenuContent
+          align="end"
+          className="min-w-44"
+          onCloseAutoFocus={menu.onCloseAutoFocus}
+        >
+          <DataTablePhoneMenuItems>
+            <DropdownMenuItem
+              onSelect={menu.openAfterClose(() => onEdit(relay.id))}
+            >
+              <Settings2 /> Configure
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={pause.pending}
+              onSelect={menu.openAfterClose(togglePaused)}
+            >
+              {relay.enabled ? <Pause /> : <Play />}
+              {relay.enabled ? "Pause" : "Resume"}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </DataTablePhoneMenuItems>
           <InstanceFavoriteMenuItem
             favorite={{ id: relay.id, kind: "relay", relayId: relay.id }}
           />
           <DropdownMenuSeparator />
           <CopyIdentifierMenuItem label="Relay ID" value={relay.id} />
+          <DataTablePhoneMenuItems>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              variant="destructive"
+              onSelect={menu.openAfterClose(removeRelay)}
+            >
+              <Trash2 /> Remove
+            </DropdownMenuItem>
+          </DataTablePhoneMenuItems>
         </DropdownMenuContent>
       </DropdownMenu>
+      {dialog === "pause" ? (
+        <RelayPauseDialog relay={relay} onClose={() => setDialog(null)} />
+      ) : null}
+      {dialog === "remove" ? (
+        <RemoveRelayDialog
+          name={relay.name}
+          relayId={relay.id}
+          onOpenChange={(open) => setDialog(open ? "remove" : null)}
+        />
+      ) : null}
     </DataTableActionGroup>
   )
 })
@@ -790,14 +843,6 @@ const RelayEditButton = React.memo(function RelayEditButton({
   )
 })
 
-const noInvitedOwners: ReadonlyArray<{ ownerName: string | null }> = []
-// Owners only, so a pending Relay's new memory reading doesn't re-render the
-// table.
-const selectInvitedOwners = (invitations: Array<ResourceInvitation>) =>
-  invitations.flatMap((invitation) =>
-    invitation.relay ? [{ ownerName: invitation.relay.ownerName }] : []
-  )
-
 // A pending Relay shows what its row will once accepted.
 const relayPendingCells: PendingInvitationCells = {
   relay: (invitation) => <PendingInvitationCard invitation={invitation} />,
@@ -818,6 +863,7 @@ const relayPendingCells: PendingInvitationCells = {
   owner: ({ relay }) =>
     relay ? (
       <RelayOwnerCell
+        createdBy={relay.createdBy}
         ownerEmail={relay.ownerEmail}
         ownerName={relay.ownerName}
       />
@@ -825,17 +871,17 @@ const relayPendingCells: PendingInvitationCells = {
 }
 
 const RelayOwnerCell = React.memo(function RelayOwnerCell({
+  createdBy,
   ownerEmail,
   ownerName,
-}: Pick<RelayTableItem, "ownerEmail" | "ownerName">) {
-  const profileIds = React.useContext(RelayOwnerProfileIdsContext)
+}: Pick<RelayTableItem, "createdBy" | "ownerEmail" | "ownerName">) {
   return ownerName ? (
     <UserIdentity
       className="w-full"
       emailClassName={pendingRowDetailClassName}
       email={ownerEmail}
       name={ownerName}
-      profileId={profileIds.get(minecraftUsernameKey(ownerName))}
+      userId={createdBy}
     />
   ) : (
     <IdentityName
@@ -969,6 +1015,8 @@ export function EditRelayDialog({
           }
           await updateConnection.mutateAsync({
             data: {
+              controlDial:
+                form.get("controlDial") === "hearth" ? "hearth" : "relay",
               id: relay.id,
               ...parsedConnection.data,
             },
@@ -1057,6 +1105,28 @@ export function EditRelayDialog({
               />
             </Field>
           </div>
+
+          <Field
+            label="Who connects"
+            htmlFor={`relay-control-dial-${relay.id}`}
+          >
+            <Select name="controlDial" defaultValue={relay.controlDial}>
+              <SelectTrigger
+                id={`relay-control-dial-${relay.id}`}
+                className="type-control-sm h-8 w-full"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="relay">
+                  The Relay connects to Hearth
+                </SelectItem>
+                <SelectItem value="hearth">
+                  Hearth connects to the Relay
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
 
           <div className="border-t border-border/70 pt-4">
             <p className="type-technical-label mb-3 text-primary-ink">Proxy</p>

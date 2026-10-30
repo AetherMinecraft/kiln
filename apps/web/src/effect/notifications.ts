@@ -12,8 +12,9 @@ import {
   loadUserNotificationPreferencesEffect,
 } from "@/effect/notification-preferences"
 import {
-  notificationContentSchema,
+  formerNotificationKinds,
   notificationHistoryLimit,
+  storedNotificationContentSchema,
   type InvitationOutcome,
   type KilnNotification,
   type NotificationContent,
@@ -110,6 +111,58 @@ export const notifyUsersEffect = Effect.fn("notifications.notify")(function* (
   // MySQL counts an inserted row as 1 and an untouched duplicate as 0.
   return result.affectedRows
 })
+
+/**
+ * Delivers the user a notification that takes the place of their open ones
+ * of its kind, or of a kind it replaced, as a running report does: those are
+ * cleared, and the new one arrives as news. `content` gets the unread ones,
+ * oldest first, to fold in what they said. Inside a transaction it commits
+ * with it; then `publishNotificationChange`.
+ */
+export const replaceNotificationEffect = Effect.fn("notifications.replace")(
+  function* (
+    userId: string,
+    kind: NotificationKind,
+    content: (unread: ReadonlyArray<NotificationContent>) => NotificationContent
+  ) {
+    const database = yield* Database
+    const table = databaseTable("notification")
+    const now = yield* Clock.currentTimeMillis
+    return yield* database.transaction("notifications.replace", (tx) =>
+      Effect.gen(function* () {
+        const kinds = [kind, ...(formerNotificationKinds[kind] ?? [])]
+        const open = yield* tx.queryRows<NotificationRow>(
+          `SELECT id, kind, data, created_at, read_at FROM ${table}
+            WHERE user_id = ? AND dismissed_at IS NULL
+              AND kind IN (${kinds.map(() => "?").join(", ")})
+            ORDER BY created_at DESC, id DESC
+            FOR UPDATE`,
+          [userId, ...kinds]
+        )
+        // Oldest first, as they arrived.
+        const unread = open
+          .filter((row) => row.read_at === null)
+          .reverse()
+          .flatMap((row) =>
+            Option.toArray(decodeNotificationContent(row.kind, row.data))
+          )
+        if (open.length)
+          yield* tx.execute(
+            `UPDATE ${table}
+                SET dismissed_at = ?, read_at = COALESCE(read_at, ?),
+                    push_pending = NULL
+              WHERE id IN (${open.map(() => "?").join(", ")})`,
+            [now, now, ...open.map((row) => row.id)]
+          )
+        yield* notifyUsersEffect(
+          [userId],
+          `${kind}:${randomUUID()}`,
+          content(unread)
+        )
+      })
+    )
+  }
+)
 
 /**
  * Clears notifications that no longer apply, as an update on offer once it's
@@ -219,6 +272,34 @@ export const resolveInvitationNotificationsEffect = Effect.fn(
       ...invitationIds.map((id) => `access.invited:${id}`),
     ]
   )
+})
+
+/**
+ * Records on finished moves that the server they left is gone, so their
+ * notifications stop offering to delete it. Returns whose notifications
+ * changed.
+ */
+export const resolveMigrationSourceNotificationsEffect = Effect.fn(
+  "notifications.resolveMigrationSource"
+)(function* (relayId: string, instanceId: string) {
+  const database = yield* Database
+  const rows = yield* database.queryRows<RowDataPacket & { user_id: string }>(
+    "notifications.migrationSource.find",
+    `SELECT DISTINCT user_id FROM ${databaseTable("notification")}
+      WHERE kind = 'server.migration'
+        AND data->>'$.source.relayId' = ? AND data->>'$.source.id' = ?`,
+    [relayId, instanceId]
+  )
+  if (!rows.length) return []
+  yield* database.execute(
+    "notifications.migrationSource.resolve",
+    `UPDATE ${databaseTable("notification")}
+        SET data = JSON_SET(data, '$.sourceDeleted', true)
+      WHERE kind = 'server.migration'
+        AND data->>'$.source.relayId' = ? AND data->>'$.source.id' = ?`,
+    [relayId, instanceId]
+  )
+  return rows.map((row) => row.user_id)
 })
 
 /**
@@ -425,7 +506,10 @@ export function decodeNotificationContent(
   return value.pipe(
     Option.filter(Predicate.isObject),
     Option.flatMap((value) => {
-      const parsed = notificationContentSchema.safeParse({ ...value, kind })
+      const parsed = storedNotificationContentSchema.safeParse({
+        ...value,
+        kind,
+      })
       return parsed.success ? Option.some(parsed.data) : Option.none()
     })
   )

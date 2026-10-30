@@ -47,6 +47,7 @@ export default defineConfig({
       alwaysBundle: [
         "@workspace/contracts",
         "@workspace/contracts/schedules",
+        "@workspace/operations",
         "@workspace/telemetry",
       ],
       onlyBundle: ["cron-parser", "luxon"],
@@ -56,7 +57,10 @@ export default defineConfig({
     entry: {
       "src/index": "src/index.ts",
       "src/updater": "src/updater.ts",
+      "src/replace-relay": "src/replace-relay.ts",
       "src/host-files-helper": "src/host-files-helper.ts",
+      "src/security-inventory-helper": "src/security-inventory-helper.ts",
+      "src/tar-restore-helper": "src/tar-restore-helper.ts",
       "src/database-browser-worker": "src/database-browser-worker.ts",
     },
     format: "esm",

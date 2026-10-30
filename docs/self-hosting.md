@@ -46,17 +46,19 @@ the platform administrator. Everything each step ran and printed goes to
 `--port`, `--game-host`, or `--nightly` to skip the questions, and `--help`
 for the rest. Running it again prints the installation's status and setup link.
 
-The script runs one container:
+The script runs one container, `kiln-relay`, on the `kiln-relay-data`
+volume. [`compose.yaml`](../compose.yaml) runs the same container with
+Compose, for those who keep their services there: copy `.env.example` to
+`.env`, set `KILN_URL`, then
 
 ```sh
-docker run --detach --name kiln-relay --restart unless-stopped \
-  --volume /var/run/docker.sock:/var/run/docker.sock \
-  --volume kiln-relay-data:/data \
-  --publish 2022:2022 \
-  --env KILN_RELAY_MODE=platform \
-  --env KILN_URL=https://kiln.example.com \
-  ghcr.io/kiln-site/relay:latest
+docker compose up -d
+docker exec kiln-relay kiln-relay platform setup-url
 ```
+
+The second prints the setup link the installer would. Either way the Relay
+installs and updates the rest; don't run Hearth, its database, or the Relay
+by hand, since that drifts from what Kiln sets up and supports.
 
 `kiln-relay-data` is the installation: it holds the Relay's state, Kiln's
 generated secrets, and the record of what the Relay installed. Back it up, or
@@ -64,15 +66,104 @@ at least export the recovery kit (see [Recovery](#recovery)).
 
 ### Adding machines
 
-On each other machine:
+In Hearth, open **Relays** and choose **Add Relay**. It shows a command to
+run on the new machine:
 
 ```sh
-curl -fsSL https://kiln.site/install | sh -s -- --node
+curl -fsSL https://kiln.site/install | sh -s -- --join 'https://kiln.example.com/#kj1.<code>'
 ```
 
-It starts a Relay that publishes ports 4100 and 2022 and prints a pairing
-invitation. In Hearth, open **Relays**, choose **Add Relay**, and paste it.
-Hearth must be able to reach the machine on port 4100.
+The link carries Hearth's address and a code that lasts 30 minutes (**New
+command** in the dialog makes another and retires the old). When ports 80
+and 443 are free, the Relay runs its own Traefik on them, like a platform
+install, and Kiln reaches it at `https://<public IP>` with a Let's Encrypt
+certificate (the six-day one for an IP address). Apps on that machine get
+their domains and HTTPS from the same Traefik. The installer waits for the
+certificate before the Relay announces itself to Hearth. When Let's Encrypt
+can't reach the machine on port 80, as when a router sends 80 and 443 to
+another machine, the Relay opens no ports at all and connects to Kiln
+instead (below); `--proxy hearth` asks for that from the start. When
+something else already has 80 or 443, or the machine has no curl to check
+HTTPS with, the Relay uses port 4100 and its own certificate: `--proxy
+none` asks for that.
+
+Once the Relay announces itself, the installer prints a link to confirm it
+in Hearth, which opens the dialog on that Relay, and its fingerprint, which
+the dialog shows too. Confirming takes an optional name; left blank, the
+Relay gets the next free default name (K100, then K101, and so on). The
+machine must be able to reach Hearth at `KILN_URL`. Hearth needn't be able
+to reach the machine: when it can't, the dialog says so, and the Relay
+pairs through its announcements and connects to Hearth itself. Hearth holds
+each announcement until it has news for the Relay, and answers the Relay's
+reply only once it saved the Relay, which then connects at once: adding it
+takes about a second after confirming. For another
+address, such as a domain or an internal address,
+add `--relay-host <address>` to the command; for another SFTP port, add
+`--sftp-port <port>`. The installer stops before starting anything when a
+port it needs is taken, and names what has it. A machine whose Relay data
+is already there keeps the way it was reached.
+
+The install command is the supported way to add a machine: it sets up the
+Relay's container, volume, and settings the way Kiln expects and keeps them
+that way across updates, so a machine set up by hand can drift from what
+Kiln supports.
+
+- **Pairing link** pairs a Relay that's already running without a join:
+  run `docker exec kiln-relay kiln-relay pair create` on it and paste what
+  it prints.
+- On a machine that already runs a Relay, the install command joins that
+  Relay instead (`kiln-relay pair join '<link>'`), and Hearth reconnects it
+  if it already has it.
+
+Joining needs the Relay's own HTTPS (the default). The link's secret never
+leaves the two machines: the Relay proves it holds it, and Hearth answers
+in kind, so the dialog asks first when Hearth's address is plain HTTP,
+where someone on the network could still get in the way.
+
+#### Relays Hearth can't reach
+
+A Relay's control connection can be opened from either end. Hearth opens
+it to the Relay, or the Relay opens it to Hearth (`/api/relays/control` on
+`KILN_URL`), and each Relay saved in Hearth prefers one, with the other as a
+fallback: Relays joined since Kiln could do this prefer to connect
+themselves, and older ones are still reached by Hearth. Every Relay keeps
+connecting to Hearth as a standby, so one whose address stops working
+reconnects on its own.
+
+When Hearth can't reach a joining Relay, it also puts the Relay in
+`hearth` proxy mode. Its consoles, file uploads and downloads, and backup
+downloads then go through Hearth: Hearth asks the Relay, over its
+connection, to open a tunnel back to Hearth for each one, and passes the
+traffic through unchanged. That traffic counts against Hearth's bandwidth.
+Websites and game ports on such a machine still need a port forwarded, or a
+Relay that browsers and players can reach to enter through.
+
+Set `KILN_RELAY_DIAL_URL` on Hearth when Relays should connect to another
+address than `KILN_URL`. Hearth doesn't ask Relays to connect when
+`KILN_URL` is on `localhost`.
+
+#### Installation IDs
+
+A Relay takes the installation ID of the first Hearth that pairs it and
+keeps it. Another Hearth pairing the same Relay, as when two Kiln
+installations share one machine, is asked whether to replace the Relay's ID
+with its own or keep it. The ID decides whose Kiln services and backups the
+Relay finds; it doesn't separate anything else, since every Hearth paired
+with full access can manage the Relay. `KILN_INSTALLATION_ID`, or a Relay
+that installed Kiln itself, fixes the ID.
+
+### The CLI
+
+To manage Kiln from a terminal, install the `kiln` command on your own
+computer (Linux or macOS), then sign in with your Kiln's address:
+
+```sh
+curl -fsSL https://kiln.site/install | sh -s -- --cli
+kiln login https://kiln.example.com
+```
+
+It needs no Docker. See [the CLI's README](../apps/cli/README.md#install) for
+where it goes, `--nightly`, and other ways to install it.
 
 ## Platform mode
 
@@ -111,9 +202,9 @@ is an IP address, since browsers send no name for one. The Relay itself
 stays in `hearth` proxy mode. If the ports are taken, the Relay logs it and
 Hearth is still at its own port.
 
-Containers carry the same `io.kiln.installation` and `io.kiln.resource` labels
-as the Compose stack, so platform backups and Kiln's updates work as they do
-there, plus `io.kiln.platform.role` and a hash of their settings.
+Containers carry Kiln's `io.kiln.installation` and `io.kiln.resource` labels,
+which platform backups and Kiln's updates find them by, plus
+`io.kiln.platform.role` and a hash of their settings.
 
 ### Settings
 
@@ -217,8 +308,8 @@ Hearth updates from the Updates dialog as with Compose.
 | `stop-hearth`            | Holds Hearth stopped; the database and cache keep running                  |
 | `start-hearth`           | Lets Hearth run again                                                      |
 | `recover --confirm <id>` | Starts an empty database after its volume was lost, holding Hearth stopped |
-| `export-kit`             | Prints the recovery kit                                                     |
-| `import-kit <path>`      | Installs from a recovery kit on a new Relay                                 |
+| `export-kit`             | Prints the recovery kit                                                    |
+| `import-kit <path>`      | Installs from a recovery kit on a new Relay                                |
 | `pair`                   | Prints an invitation for the installed Hearth, such as after a restore     |
 
 Run them with `docker exec kiln-relay kiln-relay platform <command>`. If the
@@ -303,15 +394,19 @@ Hearth it installed. A Traefik that Coolify or something else runs shows as
 managed elsewhere: its logs, but no restart or shell. These need a Relay with
 `relay-platform-v2`; older ones show the latest log lines only.
 
-## Existing Compose and Coolify installs
+## Installs that run Hearth by hand
 
-They keep working as before, and Kiln's own pages (the **Kiln** button beside
-**Updates** in Infrastructure) show their Hearth, database, cache, and any
-Traefik in front of them read-only: their logs, but no restarts or shells.
+Kiln once documented running Hearth, its database, its cache, and a Relay as
+separate Compose services or Coolify resources. Set up new installs with the
+installer or `compose.yaml` instead, which run one platform Relay that sets
+up and updates the rest. Installs made the old way keep working, and Kiln's
+own pages (the **Kiln** button beside **Updates** in Infrastructure) show
+their Hearth, database, cache, and any Traefik in front of them read-only:
+their logs, but no restarts or shells.
 
 A Relay on the same Docker host finds them by Kiln's labels
-(`io.kiln.installation` and `io.kiln.resource`, which `compose.yaml` sets), or
-else from Hearth itself. Each time Hearth connects it names the container it
+(`io.kiln.installation` and `io.kiln.resource`, which Kiln's old Compose file
+set), or else from Hearth itself. Each time Hearth connects it names the container it
 runs in, proven with an HMAC keyed by its `BETTER_AUTH_SECRETS`, which the
 Relay checks against that container's environment. The Relay then finds the
 database and cache that Hearth's `DB_HOST` and `CACHE_HOST` name on a Docker
@@ -321,15 +416,37 @@ same containers. The Relay saves which ones they were, so it can still
 restore a backup after Coolify removes Hearth's container to stop it, and it
 refuses while any container with Hearth's `BETTER_AUTH_SECRETS` runs.
 
-To move one under a platform Relay:
+### From Kiln's old compose.yaml
+
+`compose.yaml` used to be that stack, and now runs one platform Relay
+instead, so it isn't an upgrade of an install started from the old file.
+Pulling it and running `docker compose up -d` leaves the old stack running:
+the new Relay is a service of another name (`kiln-relay`), and it stops on
+the ports the old one holds. Remove the container it made with
+`docker rm -f kiln-relay`, then either:
+
+- **Keep running it as before.** Save the old file and use it from now on:
+
+  ```sh
+  git show 18b90d3:compose.yaml > compose.legacy.yaml
+  docker compose -f compose.legacy.yaml up -d
+  ```
+
+- **Move it under a platform Relay**, as below.
+
+### Moving under a platform Relay
 
 1. Create a platform backup of it, and note its `KILN_INSTALLATION_ID`,
    `BETTER_AUTH_SECRETS`, and `KILN_PLATFORM_BACKUP_KEY`. Hearth encrypts
    saved credentials with `BETTER_AUTH_SECRETS`, so the new Hearth needs the
    same value to read them.
 2. Start a platform Relay on a fresh data volume with those three variables
-   set, along with `KILN_RELAY_MODE=platform` and `KILN_URL`. On its first
-   start it uses them instead of generating its own.
+   set, along with `KILN_URL`. On its first start it uses them instead of
+   generating its own. With Compose, put all four in `.env` and start
+   `compose.yaml`; the Relay reads everything in `.env`. A custom SFTP
+   port from the old `.env` (`KILN_RELAY_SFTP_PORT`) becomes
+   `KILN_SFTP_PORT`. On the same machine, stop the old deployment first,
+   since the new one needs its ports.
 3. Once Hearth is up, run `kiln-relay platform stop-hearth`, restore the backup
    with `kiln-relay platform-backup restore`, and run `start-hearth`.
 4. Stop the old deployment, so two tools don't manage the same Hearth. If

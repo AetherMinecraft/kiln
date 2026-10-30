@@ -12,6 +12,11 @@ const APP_FILE_ROOT_PREFIX = "app:"
 const DATABASE_FILE_ROOT_PREFIX = "database:"
 const resourceIdPattern = /^[a-f0-9]{40}$/u
 
+// A Compose service's name; image and Dockerfile apps have one service, `app`.
+export const appServiceNameSchema = z
+  .string()
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$/u)
+
 // A Relay's host files use its fingerprint, scoped by the Relay connection.
 export const fileRootIdSchema = z
   .string()
@@ -50,17 +55,40 @@ export function isServerFileRoot(id: string): boolean {
   )
 }
 
-// An app's service joins a Tailscale network as `app:<appId>:<service>`
-// wherever a server would be named by its ID.
+// Tailscale network members are named by kind: a game server as
+// `instance:<id>`, an App's service as `app:<appId>:<service>`, and a
+// database as `database:<id>`.
+const instanceMemberPattern = /^instance:([a-f0-9]{40})$/u
+const databaseMemberPattern = /^database:([a-f0-9]{40})$/u
 const appMemberPattern =
   /^app:([a-f0-9]{40}):([a-zA-Z0-9][a-zA-Z0-9_.-]{0,62})$/u
 
 export const tailscaleMemberIdSchema = z
   .string()
-  .regex(/^(?:[a-f0-9]{40}|app:[a-f0-9]{40}:[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62})$/u)
+  .regex(
+    /^(?:instance:[a-f0-9]{40}|database:[a-f0-9]{40}|app:[a-f0-9]{40}:[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62})$/u
+  )
+
+export function instanceTailscaleMemberId(instanceId: string): string {
+  return `instance:${instanceId}`
+}
+
+export function databaseTailscaleMemberId(databaseId: string): string {
+  return `database:${databaseId}`
+}
+
+/** The database a member ID names, if it names one. */
+export function databaseTailscaleMember(id: string): string | null {
+  return databaseMemberPattern.exec(id)?.[1] ?? null
+}
 
 export function appTailscaleMemberId(appId: string, service: string): string {
   return `app:${appId}:${service}`
+}
+
+/** The game server a member ID names, if it names one. */
+export function instanceTailscaleMember(id: string): string | null {
+  return instanceMemberPattern.exec(id)?.[1] ?? null
 }
 
 export function appTailscaleMember(
@@ -68,4 +96,13 @@ export function appTailscaleMember(
 ): { appId: string; service: string } | null {
   const match = appMemberPattern.exec(id)
   return match ? { appId: match[1]!, service: match[2]! } : null
+}
+
+/**
+ * A member ID as bindings saved before typed IDs named it: a game server by
+ * its bare ID. Only migrations read these.
+ */
+export function legacyTailscaleMemberId(id: string): string | null {
+  if (/^[a-f0-9]{40}$/u.test(id)) return instanceTailscaleMemberId(id)
+  return tailscaleMemberIdSchema.safeParse(id).success ? id : null
 }

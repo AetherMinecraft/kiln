@@ -52,8 +52,10 @@ const MAX_REMEMBERED_ENDINGS = 1_000
 const PID_FILE_PREFIX = "/tmp/.kiln-terminal-"
 // Hang up first so the client can restore its terminal; psql's readline
 // catches SIGHUP and SIGTERM and may stay, so it is killed after a second.
+// Hangs up a client by its PID file, killing it if it lingers, and removes
+// the file only once it's gone, so a client that survives is found again.
 const HANG_UP_FUNCTION =
-  'hang_up() { pid=$(cat "$1") && kill -HUP "$pid" 2>/dev/null && sleep 1 && kill -KILL "$pid" 2>/dev/null; rm -f "$1"; }'
+  'hang_up() { pid=$(cat "$1") || return 0; if kill -HUP "$pid" 2>/dev/null; then sleep 1; kill -KILL "$pid" 2>/dev/null; for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done; fi; kill -0 "$pid" 2>/dev/null || rm -f "$1"; }'
 // Both packages ship UMD bundles that ESM loaders don't all unwrap the same
 // way, so they load through Node's own CommonJS loader.
 const require = createRequire(import.meta.url)
@@ -202,6 +204,22 @@ export class ContainerTerminals {
       if (session) await this.#end(session, "restarted")
       return { restarted: true }
     })
+  }
+
+  /**
+   * Ends everyone's sessions on a target and hangs up every terminal client
+   * left in its container, as freezing a database for its deletion does.
+   * Best effort: work a client already sent may still finish.
+   */
+  async endTarget(targetKey: string, containerId: string | null): Promise<void> {
+    await Promise.all(
+      [...this.#sessions.entries()]
+        .filter(([key]) => key.endsWith(`\u0000${targetKey}`))
+        .map(([key, session]) =>
+          this.#exclusive(key, () => this.#end(session, "deleting"))
+        )
+    )
+    if (containerId !== null) await this.sweep([containerId])
   }
 
   #exclusive<T>(key: string, task: () => Promise<T>): Promise<T> {

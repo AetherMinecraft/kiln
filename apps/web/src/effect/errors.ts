@@ -115,6 +115,12 @@ export class AuthenticationError extends Schema.TaggedError<AuthenticationError>
   }
 ) {}
 
+/** Too many wrong account passwords lately: none is checked until it passes. */
+export class PasswordAttemptsError extends Schema.TaggedError<PasswordAttemptsError>()(
+  "PasswordAttemptsError",
+  { message: Schema.String }
+) {}
+
 export class RelayUnavailableError extends Schema.TaggedError<RelayUnavailableError>()(
   "RelayUnavailableError",
   {
@@ -157,6 +163,25 @@ export class ResourceNotFoundError extends Schema.TaggedError<ResourceNotFoundEr
 export class DomainConfigurationError extends Schema.TaggedError<DomainConfigurationError>()(
   "DomainConfigurationError",
   { message: Schema.String }
+) {}
+
+/**
+ * A hostname that's taken: by another game server or app (its `holder`), or
+ * by a DNS record Kiln didn't make.
+ */
+export class HostnameInUseError extends Schema.TaggedError<HostnameInUseError>()(
+  "HostnameInUseError",
+  {
+    holder: Schema.NullOr(
+      Schema.Struct({
+        relayId: Schema.String,
+        resourceId: Schema.String,
+        resourceType: Schema.Literals(["app", "instance"]),
+      })
+    ),
+    hostname: Schema.String,
+    message: Schema.String,
+  }
 ) {}
 
 export class ExternalServiceError extends Schema.TaggedError<ExternalServiceError>()(

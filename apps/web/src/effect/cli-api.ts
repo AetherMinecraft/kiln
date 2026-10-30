@@ -84,6 +84,7 @@ import {
   requireRelayPermissionEffect,
 } from "@/lib/access-control"
 import { hasBackupPermission } from "@/lib/backup-access"
+import type { BackupAction } from "@/lib/backup-target-permissions"
 import { publishBackupChange } from "@/lib/backup-realtime.server"
 import { signLocalBackupDownload } from "@/backups/destinations/local"
 import { signS3BackupDownload } from "@/backups/destinations/s3"
@@ -95,7 +96,14 @@ import {
   dispatchBackupTask,
   reconcileRelayBackups,
 } from "@/lib/backup-reconciliation"
-import { deleteInstanceWithFinalBackup } from "@/lib/final-instance-deletion"
+import {
+  instanceDeletionNameEffect,
+  requireDeleteConfirmationEffect,
+} from "@/lib/delete-confirmation.server"
+import {
+  awaitResourceDeletion,
+  requestResourceDeletion,
+} from "@/lib/resource-deletion.server"
 import { kilnInstallationId } from "@/effect/installation"
 import {
   listPersistedRelaysEffect,
@@ -655,11 +663,10 @@ export const deleteCliBackupEffect = Effect.fn("cli.api.backups.delete")(
       "Hearth could not reserve backup deletion."
     )
     yield* Effect.sync(() => publishBackupChange(relay.id, backup.id))
-    const relayAccepted = yield* enqueueCliBackupEffect(
-      principal,
-      relay,
-      dispatch
-    )
+    // Null when another backup still shares the archive: only the record goes.
+    const relayAccepted = dispatch
+      ? yield* enqueueCliBackupEffect(principal, relay, dispatch)
+      : true
     return cliDeleteBackupResponseSchema.parse({
       backupId: backup.id,
       relayAccepted,
@@ -992,21 +999,39 @@ export const deleteCliServerEffect = Effect.fn("cli.api.servers.delete")(
   function* (principal: CliPrincipal, unknownInput: unknown) {
     yield* requireCliWrite(principal)
     const input = yield* parseInput(cliDeleteServerRequestSchema, unknownInput)
-    if (input.confirmation !== `${input.relayId}:${input.instanceId}`) {
-      return yield* forbidden(
-        "The server confirmation did not match the requested server."
-      )
-    }
     const relay = yield* authorizeTarget(principal, input, "instance.delete")
     yield* authorizeTarget(principal, input, "backup.create")
+    // As deleting it in the browser asks: its name, and the password.
+    yield* requireDeleteConfirmationEffect({
+      confirmation: input.confirmation,
+      name: yield* instanceDeletionNameEffect(relay, input.instanceId),
+      password: input.password,
+      user: principal.user,
+    }).pipe(
+      Effect.catchTag("AuthenticationError", (error) =>
+        Effect.fail(forbidden(error.message))
+      ),
+      Effect.catchTag("PasswordAttemptsError", (error) =>
+        Effect.fail(
+          CliAccessError.make({
+            code: "rate_limited",
+            message: error.message,
+            retryable: true,
+          })
+        )
+      )
+    )
     yield* Effect.tryPromise({
-      try: () =>
-        deleteInstanceWithFinalBackup({
-          instanceId: input.instanceId,
-          relay,
-          requestedBy: principal.user.id,
-          user: principal.user,
-        }),
+      try: async () =>
+        awaitResourceDeletion(
+          await requestResourceDeletion({
+            finalBackup: true,
+            kind: "instance",
+            relayId: relay.id,
+            resourceId: input.instanceId,
+            user: principal.user,
+          })
+        ),
       catch: (cause) => cause,
     })
     const deleted = { deleted: true as const, instanceId: input.instanceId }
@@ -1490,7 +1515,7 @@ const loadCliBackupForAction = Effect.fn("cli.api.backups.action.authorize")(
   function* (
     principal: CliPrincipal,
     backupId: string,
-    permission: AccessPermission
+    permission: BackupAction
   ) {
     const backup = (yield* loadCliBackupCatalogEffect()).find(
       (candidate) => candidate.id === backupId

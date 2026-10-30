@@ -19,6 +19,7 @@ import {
   scheduleDeterministicUuid,
   scheduleRunSchema,
   scheduleStableId,
+  scheduleTargetKey,
   type RelayScheduleAction,
   type RelayScheduleProjection,
   type ScheduleActionAttempt,
@@ -32,18 +33,29 @@ import {
   relayTimezone,
   type RelayScheduleState,
 } from "./effect/schedule-state.js"
+import type {
+  ContainerCommandResult,
+  ContainerCommandTarget,
+} from "./container-commands.js"
 import { ensuringPromise, promiseEffect } from "./effect/promise.js"
 import { LaneRejectedError } from "./operation-lanes.js"
+import type { PowerResourceKind } from "./operation-plans.js"
+import type { PowerAction } from "./resource-power.js"
 
 type TargetScheduleAction = Exclude<RelayScheduleAction, { type: "wait" }>
 
 interface TargetExecutionState {
   readonly activeKey: string | null
   readonly attempts: Array<ScheduleActionAttempt>
-  /** The game server's power intent when the occurrence began. */
+  /** The target's power intent when the occurrence began. */
   readonly powerIntent: string
   error: string | null
   failure: string | null
+  /**
+   * A command that may be running, recorded as unknown until it ends, so a
+   * restart that interrupts it reports it that way.
+   */
+  inFlight: ScheduleActionAttempt | null
   missing: boolean
   readonly startedAt: number
   readonly target: ScheduleTarget
@@ -54,6 +66,8 @@ const scheduledBackupPollIntervalMs = 500
 const scheduledBackupWaitTimeoutMs = 6 * 60 * 60 * 1_000
 const maximumTimerDurationMs = 2_147_483_647
 const targetExecutionConcurrency = 8
+// How many times a command's record is tried again before it's refused.
+const progressWriteRetries = 3
 const scheduleTickIntervalMs = 1_000
 
 class ScheduledBackupWaitError extends Data.TaggedError(
@@ -72,30 +86,40 @@ export interface ScheduleManagerOptions {
     effect: Effect.Effect<void, never>
   ) => Fiber.Fiber<void, unknown>
   readonly getBackup: (taskId: string) => Promise<RelayBackupTask | null>
+  readonly listAppOwnedVolumeIds: (
+    appId: string
+  ) => Promise<ReadonlyArray<string>>
+  readonly listAppIds: () => Promise<ReadonlySet<string>>
   readonly listDatabaseIds: () => Promise<ReadonlySet<string>>
   // Read per run: Hearth can give the Relay its installation ID at any time.
   readonly platformTargetId: () => string
   readonly reportError?: (message: string, cause: unknown) => void
   readonly relayId: string
-  readonly runDatabasePower: (
-    databaseId: string,
-    action: "restart" | "start" | "stop"
-  ) => Promise<void>
   /**
-   * Runs a power step unless someone changed the server's power since
+   * Runs a command in a database's container or an App's service. It
+   * rejects when the command didn't run, and otherwise answers with how it
+   * went, which may be unknown.
+   */
+  readonly runContainerCommand: (
+    target: ContainerCommandTarget,
+    command: string
+  ) => Promise<ContainerCommandResult>
+  /**
+   * Runs a power step unless someone changed the target's power since
    * `powerIntent` was read, in which case it rejects with a superseded
    * LaneRejectedError.
    */
-  readonly runInstancePower: (
-    instanceId: string,
-    action: "kill" | "restart" | "start" | "stop",
+  readonly runPower: (
+    kind: PowerResourceKind,
+    id: string,
+    action: PowerAction,
     powerIntent: string
   ) => Promise<void>
   /**
-   * A token that changes whenever someone changes a game server's power or
-   * replaces it, read when an occurrence begins.
+   * A token that changes whenever someone changes a game server's, App's,
+   * or database's power or replaces it, read when an occurrence begins.
    */
-  readonly instancePowerIntent: (instanceId: string) => string
+  readonly powerIntent: (kind: PowerResourceKind, id: string) => string
   /** A paused Relay runs no schedule actions; they're recorded as not run. */
   readonly isPaused: () => boolean
   readonly sendConsoleCommand: (
@@ -253,7 +277,10 @@ export class ScheduleManager {
         )
         for (const occurrence of due.occurrences) {
           if (occurrence.run.status === "running")
-            this.#launchOccurrence(occurrence.definition, occurrence.scheduledAt)
+            this.#launchOccurrence(
+              occurrence.definition,
+              occurrence.scheduledAt
+            )
         }
         if (due.failure) return this.#claimFailed(due.failure.cause)
         this.#claimFailures = 0
@@ -304,11 +331,12 @@ export class ScheduleManager {
           activeKey: overlapping ? null : activeKey,
           attempts: [],
           powerIntent:
-            target.kind === "instance"
-              ? this.#options.instancePowerIntent(target.id)
-              : "",
+            target.kind === "relay"
+              ? ""
+              : this.#options.powerIntent(target.kind, target.id),
           error: null,
           failure: null,
+          inFlight: null,
           missing: false,
           startedAt: Date.now(),
           target,
@@ -317,6 +345,55 @@ export class ScheduleManager {
     )
     const sequenceAttempts: Array<ScheduleActionAttempt> = []
     let sequenceFailure: string | null = null
+    const runId = scheduleStableId(
+      schedule.id,
+      scheduledAt,
+      this.#options.relayId
+    )
+    // Progress is written whole and in order, so the last write is the
+    // latest state of every target. A required write, which a command waits
+    // for before it's sent, is tried again briefly; it answers whether it
+    // landed.
+    const progressPermit = Semaphore.makeUnsafe(1)
+    const recordProgress = (required: boolean) =>
+      Effect.runPromise(
+        progressPermit
+          .withPermit(
+            Effect.suspend(() =>
+              this.#options.state.recordProgress(
+                scheduleRunSchema.parse({
+                  finishedAt: Date.now(),
+                  id: runId,
+                  revision: schedule.revision,
+                  scheduleId: schedule.id,
+                  scheduledAt,
+                  sequenceAttempts,
+                  startedAt,
+                  status: "running",
+                  targetRuns: targetStates.map((state) =>
+                    targetRun(schedule.id, scheduledAt, state)
+                  ),
+                })
+              )
+            )
+          )
+          .pipe(
+            Effect.retry({
+              schedule: Schedule.exponential("200 millis"),
+              times: required ? progressWriteRetries : 0,
+            }),
+            Effect.as(true),
+            Effect.catch((cause) =>
+              Effect.sync(() => {
+                this.#options.reportError?.(
+                  "Relay schedule progress write failed",
+                  cause
+                )
+                return false
+              })
+            )
+          )
+      )
     const targetRuns = await ensuringPromise(
       async () => {
         await Effect.runPromise(
@@ -417,6 +494,7 @@ export class ScheduleManager {
                     state,
                     scheduledAt,
                     sequenceFailure,
+                    recordProgress,
                     signal
                   )
                 ),
@@ -447,7 +525,7 @@ export class ScheduleManager {
     )
     const run = scheduleRunSchema.parse({
       finishedAt: Date.now(),
-      id: scheduleStableId(schedule.id, scheduledAt, this.#options.relayId),
+      id: runId,
       revision: schedule.revision,
       scheduleId: schedule.id,
       scheduledAt,
@@ -493,6 +571,7 @@ export class ScheduleManager {
     state: TargetExecutionState,
     scheduledAt: number,
     sequenceFailure: string | null,
+    recordProgress: (required: boolean) => Promise<boolean>,
     signal?: AbortSignal
   ) {
     if (state.activeKey === null) return
@@ -581,36 +660,16 @@ export class ScheduleManager {
       )
       return
     }
-    const executed = await Effect.runPromise(
-      Effect.result(
-        promiseEffect(() =>
-          this.#executeAction(
-            schedule,
-            action,
-            state.target,
-            scheduledAt,
-            state.powerIntent,
-            signal
-          )
-        )
-      )
-    )
-    // Someone changed the server's power while the schedule ran, so its
-    // later power steps give way rather than undo that. Or the Relay was
-    // paused while the step waited its turn.
-    if (
-      Result.isFailure(executed) &&
-      executed.failure instanceof LaneRejectedError &&
-      (executed.failure.reason === "superseded" ||
-        executed.failure.reason === "paused")
-    ) {
+    // Hearth refuses a scheduled backup where it would refuse a manual
+    // one, as when backups are off for the target, its destination is
+    // disabled, or it's being deleted, and says so in the schedule it sends.
+    const refusal =
+      action.type === "backup" ? backupRefusal(action, state.target) : null
+    if (refusal) {
       state.attempts.push(
         attempt({
           action,
-          error:
-            executed.failure.reason === "paused"
-              ? "Not run: the Relay is paused"
-              : "Not run: the server's power was changed during the schedule",
+          error: `Not run: ${refusal}`,
           scheduledAt,
           scheduleId: schedule.id,
           startedAt: actionStartedAt,
@@ -620,31 +679,137 @@ export class ScheduleManager {
       )
       return
     }
+    // A command may run from the moment it's sent, so it's recorded as
+    // unknown first: a restart before it ends leaves it that way, and the
+    // interrupted occurrence never runs again.
+    const inContainer =
+      action.type === "console_command" && state.target.kind !== "instance"
+    if (inContainer) {
+      state.inFlight = attempt({
+        action,
+        error:
+          "The Relay stopped before this command finished, so it may have run",
+        scheduledAt,
+        scheduleId: schedule.id,
+        startedAt: actionStartedAt,
+        status: "unknown",
+        target: state.target,
+      })
+      // Sent only once a restart would report it, so it can't run unseen.
+      if (!(await recordProgress(true))) {
+        state.inFlight = null
+        const failure =
+          "Not run: the Relay couldn't record the command before sending it"
+        if (!state.failure) {
+          state.failure = failure
+          state.error = failure
+        }
+        state.attempts.push(
+          attempt({
+            action,
+            error: failure,
+            scheduledAt,
+            scheduleId: schedule.id,
+            startedAt: actionStartedAt,
+            status: "failed",
+            target: state.target,
+          })
+        )
+        return
+      }
+    }
+    const executed = await ensuringPromise(
+      () =>
+        Effect.runPromise(
+          Effect.result(
+            promiseEffect(() =>
+              this.#executeAction(
+                schedule,
+                action,
+                state.target,
+                scheduledAt,
+                state.powerIntent,
+                signal
+              )
+            )
+          )
+        ),
+      () => {
+        state.inFlight = null
+      }
+    )
+    // Someone changed the target's power while the schedule ran, so its
+    // later power steps give way rather than undo that. Or the Relay was
+    // paused while the step waited its turn, or the target is being
+    // deleted, which refuses every change to it.
+    if (
+      Result.isFailure(executed) &&
+      executed.failure instanceof LaneRejectedError &&
+      (executed.failure.reason === "superseded" ||
+        executed.failure.reason === "paused" ||
+        executed.failure.reason === "refused")
+    ) {
+      state.attempts.push(
+        attempt({
+          action,
+          error:
+            executed.failure.reason === "paused"
+              ? "Not run: the Relay is paused"
+              : executed.failure.reason === "refused"
+                ? `Not run: ${executed.failure.message}`
+                : `Not run: ${powerOwner(state.target)} power was changed during the schedule`,
+          scheduledAt,
+          scheduleId: schedule.id,
+          startedAt: actionStartedAt,
+          status: "not_run",
+          target: state.target,
+        })
+      )
+      if (inContainer) await recordProgress(false)
+      return
+    }
+    const result = Result.isSuccess(executed) ? executed.success : undefined
     const failure = Result.isFailure(executed)
       ? errorMessage(executed.failure)
-      : null
+      : result?.unknown
+        ? result.unknown
+        : result && result.exitCode !== 0
+          ? `The command exited with code ${result.exitCode}`
+          : null
     // The first failure stays the target's error when later actions continue.
     if (failure && !state.failure) {
       state.failure = failure
       state.error = failure
     }
-    state.attempts.push(
-      attempt({
+    state.attempts.push({
+      ...attempt({
         action,
         error: failure,
         scheduledAt,
         scheduleId: schedule.id,
         startedAt: actionStartedAt,
-        status: failure ? "failed" : "succeeded",
+        status: result?.unknown ? "unknown" : failure ? "failed" : "succeeded",
         target: state.target,
-      })
-    )
+      }),
+      ...(result && {
+        result: {
+          exitCode: result.exitCode,
+          output: result.output,
+          truncated: result.truncated,
+        },
+      }),
+    })
+    // A restart later in the occurrence keeps how the command went.
+    if (inContainer) await recordProgress(false)
   }
 
   async #targetExists(target: ScheduleTarget) {
     if (target.kind === "relay") return target.id === this.#options.relayId
     if (target.kind === "instance") {
       return (await this.#options.findInstance(target.id)) !== null
+    }
+    if (target.kind === "app") {
+      return (await this.#options.listAppIds()).has(target.id)
     }
     return (await this.#options.listDatabaseIds()).has(target.id)
   }
@@ -656,34 +821,44 @@ export class ScheduleManager {
     scheduledAt: number,
     powerIntent: string,
     signal?: AbortSignal
-  ) {
-    if (action.type === "console_command" && target.kind === "instance") {
-      await this.#options.sendConsoleCommand(target.id, action.command)
-      return
-    }
-    if (action.type === "power") {
+  ): Promise<ContainerCommandResult | undefined> {
+    if (action.type === "console_command") {
       if (target.kind === "instance") {
-        await this.#options.runInstancePower(
-          target.id,
-          action.action,
-          powerIntent
-        )
+        await this.#options.sendConsoleCommand(target.id, action.command)
         return
       }
       if (target.kind === "database") {
-        if (action.action === "kill") {
-          throw new Error("Kill is not supported for databases")
+        return this.#options.runContainerCommand(
+          { id: target.id, kind: "database" },
+          action.command
+        )
+      }
+      if (target.kind === "app") {
+        const service = action.services?.[scheduleTargetKey(target)]
+        if (!service) {
+          throw new Error("No service was chosen to run the command")
         }
-        await this.#options.runDatabasePower(target.id, action.action)
-        return
+        return this.#options.runContainerCommand(
+          { id: target.id, kind: "app", service },
+          action.command
+        )
       }
     }
-    if (action.type === "backup") {
-      const execution = action.executions.find(
-        (candidate) =>
-          candidate.targetId === target.id &&
-          candidate.targetKind === target.kind
+    if (action.type === "power" && target.kind !== "relay") {
+      await this.#options.runPower(
+        target.kind,
+        target.id,
+        action.action,
+        powerIntent
       )
+      return
+    }
+    if (action.type === "backup") {
+      if (target.kind === "app") {
+        await this.#backUpApp(schedule, action, target, scheduledAt, signal)
+        return
+      }
+      const execution = backupExecution(action, target)
       const deployedDestination =
         execution?.destination ??
         (action.mode === "full" && action.destination.kind === "local"
@@ -716,21 +891,12 @@ export class ScheduleManager {
             : targetKind === "database"
               ? ("database_dump" as const)
               : ("platform_bundle" as const)
-      const destination =
-        deployedDestination.kind === "s3"
-          ? {
-              accessKeyId: deployedDestination.accessKeyId,
-              allowPrivateNetwork: deployedDestination.allowPrivateNetwork,
-              artifactId,
-              bucket: deployedDestination.bucket,
-              endpoint: deployedDestination.endpoint,
-              forcePathStyle: deployedDestination.forcePathStyle,
-              kind: "s3" as const,
-              objectKey: `${deployedDestination.objectKeyPrefix}/${backupId}/${backupArtifactFilename(backupId, artifactKind)}`,
-              region: deployedDestination.region,
-              secretAccessKey: deployedDestination.secretAccessKey,
-            }
-          : { ...deployedDestination, artifactId }
+      const destination = scheduledBackupDestination(
+        deployedDestination,
+        backupId,
+        artifactId,
+        artifactKind
+      )
       const input: BackupTaskInput = {
         artifactKind,
         backupId,
@@ -743,6 +909,9 @@ export class ScheduleManager {
             scheduleName: schedule.name,
             timestamp: scheduledAt,
           }),
+          ...(action.mode === "incremental" && execution?.repositoryId
+            ? { repositoryId: execution.repositoryId }
+            : {}),
           storageId:
             action.destination.kind === "storage"
               ? action.destination.storageId
@@ -751,7 +920,7 @@ export class ScheduleManager {
         destination,
         exclude: [],
         kind: "create",
-        maxBytes: null,
+        maxBytes: execution?.maxBytes ?? null,
         mode: action.mode,
         reason: "scheduled",
         target: {
@@ -769,6 +938,122 @@ export class ScheduleManager {
         signal ? { signal } : undefined
       )
     }
+  }
+
+  /**
+   * Backs up an App as Hearth projected it: its folder and each volume its
+   * Compose project owns, each a backup of its own, started together.
+   * Stopped, they share one stopped window, so the App stops once and its
+   * folder and volumes agree.
+   */
+  async #backUpApp(
+    schedule: RelayScheduleProjection,
+    action: Extract<TargetScheduleAction, { type: "backup" }>,
+    target: ScheduleTarget,
+    scheduledAt: number,
+    signal?: AbortSignal
+  ) {
+    const executions = appBackupExecutions(action, target)
+    if (
+      executions.length === 0 ||
+      executions.some((execution) => !execution.destination)
+    ) {
+      throw new Error("Scheduled backup destination is not deployed")
+    }
+    const owned = await this.#options.listAppOwnedVolumeIds(target.id)
+    const projected = new Set(
+      executions
+        .filter((execution) => execution.targetKind === "volume")
+        .map((execution) => execution.targetId)
+    )
+    if (
+      owned.length !== projected.size ||
+      owned.some((id) => !projected.has(id))
+    ) {
+      throw new Error(
+        "App backup coverage changed; waiting for Hearth to refresh the schedule"
+      )
+    }
+    const runId = scheduleStableId(
+      schedule.id,
+      scheduledAt,
+      this.#options.relayId
+    )
+    const batchId = scheduleDeterministicUuid(
+      "schedule-backup-batch",
+      schedule.id,
+      scheduledAt,
+      target.id,
+      action.id
+    )
+    const stopped = action.consistency === "stopped"
+    const inputs = executions.map((execution): BackupTaskInput => {
+      const backupId = scheduleDeterministicUuid(
+        "schedule-backup",
+        schedule.id,
+        scheduledAt,
+        execution.targetKind,
+        execution.targetId,
+        action.id
+      )
+      return {
+        artifactKind: "tar_archive",
+        backupId,
+        catalog: {
+          batchId,
+          name: resolveScheduleBackupName(action.name, {
+            backupId,
+            instanceId: target.id,
+            runId,
+            scheduleId: schedule.id,
+            scheduleName: schedule.name,
+            timestamp: scheduledAt,
+          }),
+          storageId:
+            action.destination.kind === "storage"
+              ? action.destination.storageId
+              : null,
+        },
+        appCoverage: {
+          appId: target.id,
+          volumeIds: executions
+            .filter((entry) => entry.targetKind === "volume")
+            .map((entry) => entry.targetId),
+        },
+        ...(stopped ? { consistency: "stopped" as const } : {}),
+        ...(executions.length >= 2
+          ? { batch: { id: batchId, size: executions.length } }
+          : {}),
+        destination: scheduledBackupDestination(
+          execution.destination!,
+          backupId,
+          scheduleDeterministicUuid("artifact", backupId),
+          "tar_archive"
+        ),
+        exclude: [],
+        kind: "create",
+        maxBytes: execution.maxBytes ?? null,
+        mode: "full",
+        reason: "scheduled",
+        target: {
+          id: execution.targetId,
+          kind: execution.targetKind === "volume" ? "volume" : "app",
+        },
+        taskId: scheduleDeterministicUuid("task", backupId),
+      }
+    })
+    // Every member is queued before any is waited for, as a stopped
+    // window starts only once its whole batch has arrived.
+    const queued = await Promise.all(
+      inputs.map((input) => this.#options.enqueueBackup(input))
+    )
+    await Effect.runPromise(
+      Effect.all(
+        queued.map((task) => this.#waitForBackup(task)),
+        { concurrency: "unbounded", discard: true }
+      ),
+      signal ? { signal } : undefined
+    )
   }
 
   #waitForBackup(initial: RelayBackupTask) {
@@ -863,8 +1148,9 @@ function attempt(input: {
     | "skipped_policy"
     | "skipped_unsupported"
     | "succeeded"
+    | "unknown"
   target: ScheduleTarget
-}) {
+}): ScheduleActionAttempt {
   return {
     actionId: input.action.id,
     actionType: input.action.type as ScheduleActionType,
@@ -919,7 +1205,9 @@ function targetRun(
 ): ScheduleRun["targetRuns"][number] {
   const succeeded = state.attempts.some((entry) => entry.status === "succeeded")
   return {
-    attempts: state.attempts,
+    attempts: state.inFlight
+      ? [...state.attempts, state.inFlight]
+      : state.attempts,
     error: state.error,
     finishedAt: Date.now(),
     id: scheduleStableId(
@@ -932,11 +1220,13 @@ function targetRun(
     status:
       state.activeKey === null
         ? "skipped_overlap"
-        : state.failure || state.missing
-          ? "failed"
-          : succeeded
-            ? "succeeded"
-            : "noop",
+        : state.inFlight
+          ? "interrupted"
+          : state.failure || state.missing
+            ? "failed"
+            : succeeded
+              ? "succeeded"
+              : "noop",
     target: state.target,
   }
 }
@@ -968,7 +1258,9 @@ function readScheduleState(path: string) {
         })
       ),
       Effect.catch((cause) =>
-        hasErrorCode(cause, "ENOENT") ? Effect.succeed(null) : Effect.fail(cause)
+        hasErrorCode(cause, "ENOENT")
+          ? Effect.succeed(null)
+          : Effect.fail(cause)
       )
     )
   )
@@ -978,6 +1270,80 @@ function hasErrorCode(cause: unknown, code: string) {
   return cause instanceof Error && "code" in cause && cause.code === code
 }
 
+function powerOwner(target: ScheduleTarget) {
+  return target.kind === "database"
+    ? "the database's"
+    : target.kind === "app"
+      ? "the App's"
+      : "the server's"
+}
+
 function errorMessage(cause: unknown) {
   return cause instanceof Error ? cause.message : "Unknown schedule error"
+}
+
+// What Hearth admitted of a backup step for one target.
+function backupExecution(
+  action: Extract<TargetScheduleAction, { type: "backup" }>,
+  target: ScheduleTarget
+) {
+  return action.executions.find(
+    (candidate) =>
+      candidate.targetId === target.id && candidate.targetKind === target.kind
+  )
+}
+
+// What Hearth admitted of an App's backup: its folder's and each owned
+// volume's.
+function appBackupExecutions(
+  action: Extract<TargetScheduleAction, { type: "backup" }>,
+  target: ScheduleTarget
+) {
+  return action.executions.filter(
+    (candidate) =>
+      (candidate.targetKind === "app" && candidate.targetId === target.id) ||
+      (candidate.targetKind === "volume" && candidate.appId === target.id)
+  )
+}
+
+// Why Hearth refused a backup step for a target, as it would a manual one.
+// An App's is refused whole when any of its backups is.
+function backupRefusal(
+  action: Extract<TargetScheduleAction, { type: "backup" }>,
+  target: ScheduleTarget
+): string | null {
+  const executions =
+    target.kind === "app"
+      ? appBackupExecutions(action, target)
+      : [backupExecution(action, target)]
+  return executions.find((execution) => execution?.refusal)?.refusal ?? null
+}
+
+// Where a scheduled backup goes: its local or S3 destination, with the
+// artifact's identity and, on S3, its object key.
+function scheduledBackupDestination(
+  deployed: NonNullable<
+    Extract<
+      TargetScheduleAction,
+      { type: "backup" }
+    >["executions"][number]["destination"]
+  >,
+  backupId: string,
+  artifactId: string,
+  artifactKind: Extract<BackupTaskInput, { kind: "create" }>["artifactKind"]
+) {
+  return deployed.kind === "s3"
+    ? {
+        accessKeyId: deployed.accessKeyId,
+        allowPrivateNetwork: deployed.allowPrivateNetwork,
+        artifactId,
+        bucket: deployed.bucket,
+        endpoint: deployed.endpoint,
+        forcePathStyle: deployed.forcePathStyle,
+        kind: "s3" as const,
+        objectKey: `${deployed.objectKeyPrefix}/${backupId}/${backupArtifactFilename(backupId, artifactKind)}`,
+        region: deployed.region,
+        secretAccessKey: deployed.secretAccessKey,
+      }
+    : { ...deployed, artifactId }
 }

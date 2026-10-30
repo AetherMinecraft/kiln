@@ -45,6 +45,7 @@ import {
   type DatabaseReadRequest,
   type DatabaseWriteRequest,
   relaySnapshotSchema,
+  webRouteHostnames,
 } from "@workspace/contracts"
 import { z } from "zod"
 
@@ -85,10 +86,16 @@ import {
   provisionInstanceDomainBestEffort,
 } from "@/server/domains.server"
 import { syncInstanceDomainAfterPortUpdateBestEffort } from "@/server/relay-port-update.server"
+import { webRoutesForRelay } from "@/server/web-route-compatibility.server"
+import { deleteConfirmationSchema } from "@/lib/delete-confirmation"
 import {
-  deleteInstanceWithoutFinalBackup,
-  deleteInstanceWithFinalBackup,
-} from "@/lib/final-instance-deletion"
+  instanceDeletionName,
+  requireDeleteConfirmation,
+} from "@/lib/delete-confirmation.server"
+import {
+  awaitResourceDeletion,
+  requestResourceDeletion,
+} from "@/lib/resource-deletion.server"
 import {
   cachedRelayFallbackJsonEffect,
   cachedRelayJsonEffect,
@@ -123,6 +130,14 @@ import {
   resolveRelayInstance,
 } from "@/lib/relay-selectors"
 import { updateInstanceSourceName } from "@/lib/instance-registry"
+import { dnsKey } from "@/lib/dns-operations"
+import { exclusive } from "@/operations/lanes"
+import {
+  operation,
+  runOperationPromise,
+  signedIn,
+} from "@/operations/operation"
+import { promiseEffect } from "@/effect/promise"
 
 const instanceInputSchema = z.object({
   instanceId: z.string().min(1),
@@ -157,12 +172,12 @@ const instanceNameInputSchema = instanceInputSchema.extend({
   name: relayInstanceNameSchema,
 })
 
-const deleteInstanceInputSchema = instanceInputSchema.extend({
-  confirmation: z.string().max(64),
-  createBackup: z.boolean().default(true),
-  password: z.string().max(128),
-  storageId: z.uuid().nullable().optional(),
-})
+const deleteInstanceInputSchema = instanceInputSchema
+  .extend(deleteConfirmationSchema.shape)
+  .extend({
+    createBackup: z.boolean().default(true),
+    storageId: z.uuid().nullable().optional(),
+  })
 
 const deleteInstanceResultSchema = z.object({
   deleted: z.literal(true),
@@ -545,35 +560,27 @@ export const deleteInstance = createServerFn({ method: "POST" })
       user,
     })
     authorization.require("instance.delete")
-    if (data.confirmation !== data.instanceId) {
-      throw AuthenticationError.make({
-        message: "The server ID confirmation did not match.",
-      })
-    }
-    const { requireAccountPassword } = await import("@/lib/auth-password")
-    await requireAccountPassword(user, data.password)
-
-    if (data.createBackup) {
-      authorization.require("backup.create")
-      await deleteInstanceWithFinalBackup({
-        instanceId: data.instanceId,
-        relay,
-        requestedBy: user.id,
-        user,
-        ...(data.storageId === undefined ? {} : { storageId: data.storageId }),
-      })
-    } else {
-      await deleteInstanceWithoutFinalBackup({
-        instanceId: data.instanceId,
-        relay,
-        requestedBy: user.id,
-      })
-    }
-    publishRealtimeChange({
-      instanceId: data.instanceId,
-      relayId: relay.id,
-      type: "instance.delete",
+    await requireDeleteConfirmation({
+      confirmation: data.confirmation,
+      name: await instanceDeletionName(relay, data.instanceId),
+      password: data.password,
+      user,
     })
+
+    if (data.createBackup) authorization.require("backup.create")
+    // Frozen, backed up if asked, then deleted, as one operation that goes
+    // on in the background if it outlasts this request.
+    const deletion = await requestResourceDeletion({
+      finalBackup: data.createBackup,
+      kind: "instance",
+      relayId: relay.id,
+      resourceId: data.instanceId,
+      user,
+      ...(data.createBackup && data.storageId !== undefined
+        ? { storageId: data.storageId }
+        : {}),
+    })
+    await awaitResourceDeletion(deletion)
     return {
       ...deleteInstanceResultSchema.parse({
         deleted: true,
@@ -677,30 +684,99 @@ export const getRelayInstanceResources = createServerFn({ method: "GET" })
     }
   })
 
+const instanceWebRoutesSchema = webRoutesInputSchema
+
+const saveInstanceWebRoutes = operation<
+  z.infer<typeof instanceWebRoutesSchema>
+>()({
+  name: "webRoutes.instance.save",
+  doing: "Changing this game server's web routes",
+  authorize: ({ input, user }) =>
+    signedIn(user).pipe(
+      Effect.tap((person) =>
+        promiseEffect(() =>
+          requireRelayPermission({
+            instanceId: input.instanceId,
+            permission: "instance.network.write",
+            relayId: input.relayId,
+            user: person,
+          })
+        )
+      )
+    ),
+  locks: ({ input }) => [
+    exclusive(
+      dnsKey({
+        relayId: input.relayId,
+        resourceId: input.instanceId,
+        resourceType: "instance",
+      })
+    ),
+  ],
+  run: ({ context: user, input }) =>
+    promiseEffect(() => updateInstanceWebRoutesHandler(user, input)),
+  audit: ({ input }) => ({
+    id: input.instanceId,
+    kind: "instance",
+    relayId: input.relayId,
+  }),
+})
+
 export const updateInstanceWebRoutes = createServerFn({ method: "POST" })
-  .validator(webRoutesInputSchema)
-  .handler(async ({ data }) => {
-    const value = await relayRequest(
-      `/v1/instances/${encodeURIComponent(data.instanceId)}/web-routes`,
-      {
-        body: JSON.stringify({ routes: data.routes }),
-        headers: { "Content-Type": "application/json" },
-        method: "PUT",
-      },
-      "instance.network.write",
-      data.instanceId,
-      data.relayId,
-      240_000
-    )
-    const routes = relayInstanceWebRouteStateSchema.parse(value)
-    publishRealtimeChange({
-      audience: { kind: "relays", relayIds: [data.relayId] },
-      scope: { instanceId: data.instanceId, relayId: data.relayId },
-      topics: ["instance-web-routes"],
-      type: "hearth.invalidate",
+  .validator(instanceWebRoutesSchema)
+  .handler(async ({ data }) =>
+    runOperationPromise(saveInstanceWebRoutes, data, {
+      user: await requireEligibleResourceUser(),
     })
-    return routes
+  )
+
+async function updateInstanceWebRoutesHandler(
+  user: AuthenticatedUser,
+  data: z.infer<typeof instanceWebRoutesSchema>
+) {
+  // Checked as the operation was authorized. The person is passed in: code
+  // inside an operation never reads the request's session.
+  const relay = await activeRelay(data.relayId)
+  const resource = {
+    relayId: data.relayId,
+    resourceId: data.instanceId,
+    resourceType: "instance" as const,
+  }
+  const { saveClaimingWebRouteHostnames, syncWebRouteHostnames } =
+    await import("@/server/web-hostname-access.server")
+  const routes = await saveClaimingWebRouteHostnames(
+    user,
+    resource,
+    data.routes.flatMap(webRouteHostnames),
+    async () =>
+      relayInstanceWebRouteStateSchema.parse(
+        await (
+          await relayFetch(
+            relay,
+            `/v1/instances/${encodeURIComponent(data.instanceId)}/web-routes`,
+            {
+              body: JSON.stringify({
+                routes: webRoutesForRelay(data.relayId, data.routes),
+              }),
+              headers: { "Content-Type": "application/json" },
+              method: "PUT",
+            },
+            240_000,
+            user.id
+          )
+        ).json()
+      )
+  )
+  publishRealtimeChange({
+    audience: { kind: "relays", relayIds: [data.relayId] },
+    scope: { instanceId: data.instanceId, relayId: data.relayId },
+    topics: ["instance-web-routes"],
+    type: "hearth.invalidate",
   })
+  // Kiln keeps the DNS records of hostnames in zones it manages.
+  await syncWebRouteHostnames(resource)
+  return routes
+}
 
 export const updateInstancePorts = createServerFn({ method: "POST" })
   .validator(portsInputSchema)

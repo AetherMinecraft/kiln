@@ -9,7 +9,8 @@ import type { PersistedRelay } from "@/lib/relay-registry"
 
 export async function signLocalBackupDownload(
   relay: PersistedRelay,
-  backup: Pick<BackupCatalogRecord, "id">,
+  backup: Pick<BackupCatalogRecord, "id"> &
+    Partial<Pick<BackupCatalogRecord, "linkedFrom">>,
   filename: string,
   subject: string,
   expiresInSeconds: number
@@ -19,12 +20,14 @@ export async function signLocalBackupDownload(
   }
   const { loadRelayCredentials } = await import("@/lib/relay-registry")
   const credentials = await loadRelayCredentials(relay.id)
+  // A linked backup's archive is kept under the backup it was made as.
+  const archiveId = backup.linkedFrom?.backupId ?? backup.id
   const now = Date.now()
   const expiresAt = now + expiresInSeconds * 1_000
   const payload = backupDownloadCapabilityPayloadSchema.parse({
     action: "backup.download",
     audience: relay.id,
-    backupId: backup.id,
+    backupId: archiveId,
     capabilityId: randomUUID(),
     expiresAt,
     filename,
@@ -39,10 +42,22 @@ export async function signLocalBackupDownload(
     Buffer.from(encoded),
     credentials.clientPrivateKeyPem
   ).toString("base64url")
-  const url = new URL(
-    `/v1/browser/backups/${encodeURIComponent(backup.id)}`,
-    relay.browserOrigin
-  )
+  // A Relay browsers can't reach serves its backups through Hearth. So does
+  // one Hearth hasn't heard from yet, as while it reconnects: Hearth reaches
+  // any Relay it can serve the link from.
+  const { relayConnectionProxyMode } = await import("@/lib/relay-connection")
+  const { kilnPublicUrl } = await import("@/lib/environment")
+  const mode = relayConnectionProxyMode(relay.id)
+  const url =
+    mode === "hearth" || mode === null
+      ? new URL(
+          `/api/relays/${encodeURIComponent(relay.id)}/browser/backups/${encodeURIComponent(archiveId)}`,
+          kilnPublicUrl()
+        )
+      : new URL(
+          `/v1/browser/backups/${encodeURIComponent(archiveId)}`,
+          relay.browserOrigin
+        )
   url.searchParams.set("token", `${encoded}.${signature}`)
   return { expiresAt: new Date(expiresAt).toISOString(), url: url.toString() }
 }

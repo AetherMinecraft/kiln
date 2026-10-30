@@ -38,6 +38,7 @@ const backup = {
   createdBy: "another-user",
   filename: "backup.zip",
   id: "15e6df81-575f-421d-a666-e3eaabaafc3b",
+  linkedFrom: null,
   name: "Backup",
   objectKey: null,
   reason: "manual",
@@ -60,6 +61,8 @@ const backup = {
   taskStatus: "succeeded",
   taskUpdatedAt: "2026-08-10T00:00:00.000Z",
   warnings: [],
+  batchId: null,
+  consistency: null,
 } satisfies BackupCatalogRecord
 
 describe("backup access", () => {

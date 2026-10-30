@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process"
 import {
+  lstat,
   mkdir,
   readdir,
   readFile,
@@ -21,7 +22,6 @@ import type {
   RelayAppContainer,
   RelayAppDeployment,
   RelayAppLimits,
-  RelayAppNetwork,
   RelayConsoleLevel,
   RelayConsoleLine,
   ProvisioningWorkPhase,
@@ -35,6 +35,7 @@ import type {
 } from "@workspace/contracts"
 import {
   appServiceNameSchema,
+  appVolumeId,
   CPU_LIMIT_MILLIS_PER_CORE,
   NO_RESOURCE_LIMITS,
   relayAppSchema,
@@ -51,6 +52,7 @@ import {
 import type { RelayConfig } from "./config.js"
 import { consoleLineCharacters } from "./console-frames.js"
 import { parseConsoleLine } from "./console-parsing.js"
+import type { DatabaseConnections } from "./database-connections.js"
 import { databaseNetworkName } from "./databases.js"
 import {
   MAX_CONSOLE_HISTORY_CHARACTERS,
@@ -78,6 +80,7 @@ import {
 } from "./operation-lanes.js"
 import { appLifecycleLocks } from "./operation-plans.js"
 import { provisioningStatus } from "./provisioning.js"
+import { containerPower } from "./resource-power.js"
 import {
   checkOutRepository,
   checkoutDirectory,
@@ -97,7 +100,7 @@ import {
   relayResourceNames,
   type RelayResourceNames,
 } from "./relay-resources.js"
-import { relayVolumeDockerName } from "./volumes.js"
+import { appVolumeOwner, relayVolumeDockerName } from "./volumes.js"
 
 // Apps are found by their labels, like databases: the Relay keeps nothing
 // about them besides their data directory and the logs of their recent
@@ -212,6 +215,11 @@ export interface AppLimitStores {
 }
 
 export interface AppNetworking {
+  /**
+   * Puts an app's services back at their addresses on their Tailscale
+   * networks, logging any it can't.
+   */
+  readonly reattachTailscale: (appId: string) => Promise<void>
   readonly routes: (appId: string) => Promise<AppRoutePlan>
   readonly tailscale: (
     appId: string
@@ -237,8 +245,14 @@ export class AppDriver {
   readonly #restoring = new Map<string, Promise<void>>()
   // Wakes whatever follows an app when its deployment or containers change.
   readonly #waiters = new Map<string, Set<() => void>>()
+  // How many deployments began replacing each app's containers this run.
+  readonly #replacements = new Map<string, number>()
   readonly #lanes: OperationLanes
   readonly #limits: AppLimitStores
+  readonly #connections: DatabaseConnections
+  readonly #volumeIds: (
+    dockerNames: ReadonlyArray<string>
+  ) => Promise<ReadonlyArray<string>>
 
   /**
    * Callers hold the App's lane locks for each change; a deployment's build
@@ -249,8 +263,14 @@ export class AppDriver {
     hostDataDirectory: () => Promise<string>,
     networking: AppNetworking,
     lanes: OperationLanes,
-    limits: AppLimitStores
+    limits: AppLimitStores,
+    connections: DatabaseConnections,
+    /** The managed volumes with these Docker names, by ID. */
+    volumeIds: (
+      dockerNames: ReadonlyArray<string>
+    ) => Promise<ReadonlyArray<string>>
   ) {
+    this.#volumeIds = volumeIds
     this.#config = config
     this.#engine = new DockerEngine(config.dockerSocket)
     this.#resources = relayResourceNames(config)
@@ -258,6 +278,18 @@ export class AppDriver {
     this.#lanes = lanes
     this.#limits = limits
     this.#networking = networking
+    this.#connections = connections
+    // Every service of a connected app joins the database's network, under
+    // its name on the app's own.
+    connections.useMembers("app", async (appId) => {
+      const containers = await this.#appContainers(appId)
+      if (containers.length === 0 && !(await this.#networks()).includes(appId))
+        return null
+      return containers.filter(joinsNetworks).map((container) => ({
+        alias: this.#serviceAlias(appId, container.service),
+        container: container.id,
+      }))
+    })
     // Every container counts its memory and CPU.
     limits.allocations.register(APP_KIND, async () =>
       (await this.#existing()).flatMap((app) =>
@@ -306,6 +338,7 @@ export class AppDriver {
     return relayAppSchema.parse({
       connectedDatabaseIds: [],
       containers: [],
+      savedDatabaseIds: [],
       dataDirectory: this.#appDirectory(input.id),
       deployment: null,
       hostname: this.#hostname(input.id),
@@ -499,27 +532,105 @@ export class AppDriver {
     return this.get(input.appId)
   }
 
+  /**
+   * How many deployments have begun replacing an app's containers since the
+   * Relay started. A schedule's power steps give way once it moves, as they
+   * do when someone changes the app's power.
+   */
+  replacements(appId: string): number {
+    return this.#replacements.get(appId) ?? 0
+  }
+
+  #noteReplacement(appId: string): void {
+    this.#replacements.set(appId, this.replacements(appId) + 1)
+  }
+
   /** Stops a running deployment, so a delete doesn't wait for its build. */
   abortDeployment(appId: string): void {
     this.#deployments.get(appId)?.abort.abort()
   }
 
+  /**
+   * Stops an App being deleted and keeps Docker from starting it again on
+   * its own. Each container's restart policy is passed to `record` before
+   * it's changed, so a Relay that stops partway can still put it back.
+   */
+  async quietForDeletion(
+    appId: string,
+    record: (
+      policies: Record<string, { maximumRetryCount: number; name: string }>
+    ) => Promise<void>
+  ): Promise<void> {
+    // Freezing is a power decision too. Persist it before stopping anything,
+    // so a stopped backup from before the deletion cannot restart this App
+    // after the deletion is cancelled, even across a Relay restart.
+    await Effect.runPromise(
+      this.#limits.state.bumpAppPowerRevision(appId, Date.now())
+    )
+    const containers = await this.#appContainers(appId)
+    for (const { id } of containers) {
+      const inspected = await docker(this.#engine.inspectContainer(id))
+      const policy = inspected.HostConfig?.RestartPolicy
+      if (!policy?.Name || policy.Name === "no") continue
+      await record({
+        [id]: {
+          maximumRetryCount: policy.MaximumRetryCount ?? 0,
+          name: policy.Name,
+        },
+      })
+      await docker(this.#engine.setRestartPolicy(id, "no"))
+    }
+    if (containers.some((container) => container.running)) {
+      await this.action({ action: "stop", appId })
+    }
+  }
+
+  /**
+   * Gives an App's containers back the restart policies freezing took. A
+   * container that's gone has nothing to give back; any other failure is
+   * thrown, so the freeze stays for letting it go again.
+   */
+  async restoreRestartPolicies(
+    policies: Readonly<
+      Record<
+        string,
+        { readonly maximumRetryCount: number; readonly name: string }
+      >
+    >
+  ): Promise<void> {
+    for (const [container, policy] of Object.entries(policies)) {
+      await docker(
+        this.#engine
+          .setRestartPolicy(
+            container,
+            policy.name,
+            policy.name === "on-failure" ? policy.maximumRetryCount : undefined
+          )
+          .pipe(
+            Effect.catchIf(
+              (error) => error.status === 404,
+              () => Effect.void
+            )
+          )
+      )
+    }
+  }
+
   async action(input: RelayAppAction): Promise<RelayApp> {
     const containers = await this.#appContainers(input.appId)
     if (containers.length === 0) throw new Error("Deploy the app first")
+    // A service that lost its Tailscale address takes it again as it starts.
+    if (input.action !== "stop") {
+      await this.#networking.reattachTailscale(input.appId)
+    }
     const engine = this.#engine
     await docker(
       Effect.forEach(
-        containers,
-        ({ id }) =>
-          input.action === "stop"
-            ? engine.stopContainer(id, { seconds: 30, timeout: 90_000 })
-            : input.action === "start"
-              ? engine.startContainer(id, { timeout: 120_000 })
-              : engine.restartContainer(id, {
-                  seconds: 30,
-                  timeout: 150_000,
-                }),
+        // Docker refuses to kill a stopped container; it's already down.
+        input.action === "kill"
+          ? containers.filter((container) => container.running)
+          : containers,
+        ({ id }) => containerPower(engine, id, input.action),
         { concurrency: "unbounded", discard: true }
       )
     )
@@ -716,18 +827,19 @@ export class AppDriver {
       await this.delete({ appId, deleteData: true })
       return
     }
+    await this.#connections.forgetMember({ id: appId, kind: "app" })
     await rm(this.#appDirectory(appId), { force: true, recursive: true })
   }
 
+  /**
+   * Deletes an App: its containers, networks, the volumes of its own it may
+   * take, built images, and its folder. Safe to run again after it stopped
+   * partway, as when the Relay stopped after its containers went: each step
+   * finds what's left. Says it's deleted only once its folder is gone.
+   */
   async delete(input: RelayDeleteApp) {
     this.abortDeployment(input.appId)
     const containers = await this.#appContainers(input.appId)
-    if (
-      containers.length === 0 &&
-      !(await this.#networks()).includes(input.appId)
-    ) {
-      throw new Error("App not found")
-    }
     const engine = this.#engine
     await docker(
       Effect.forEach(
@@ -741,19 +853,42 @@ export class AppDriver {
         { concurrency: "unbounded", discard: true }
       )
     )
-    const project = [
-      `com.docker.compose.project=${this.#composeProject(input.appId)}`,
-    ]
     // Rolled deployments' projects too.
     await this.#removeComposeNetworks(input.appId, null)
     if (input.deleteData) {
-      for (const volume of await docker(
-        engine.listVolumes({ filters: { label: project } })
-      )) {
+      // Only the volumes the App's own Compose projects made, never a Kiln
+      // volume it mounted. One another App's containers mount, as a file
+      // that names it can, stays: it's that App's data now too. With a
+      // list, only those on it go, as its deletion planned and backed them
+      // up; the list never adds one.
+      const allowed = input.volumeIds ? new Set(input.volumeIds) : null
+      const [volumes, remaining] = await docker(
+        Effect.all([
+          engine.listVolumes({ filters: { label: [COMPOSE_PROJECT_LABEL] } }),
+          engine.listContainers({ all: true }),
+        ])
+      )
+      const mounted = new Set(
+        remaining.flatMap((container) =>
+          (container.Mounts ?? []).flatMap((mount) =>
+            mount.Type === "volume" && mount.Name ? [mount.Name] : []
+          )
+        )
+      )
+      for (const volume of volumes) {
+        const owner = appVolumeOwner(this.#config, volume.Labels)
+        if (
+          owner?.appId !== input.appId ||
+          mounted.has(volume.Name) ||
+          (allowed && !allowed.has(appVolumeId(owner.appId, owner.volume)))
+        ) {
+          continue
+        }
         await docker(engine.removeVolume(volume.Name).pipe(Effect.ignore))
       }
     }
     await this.#removeNetwork(this.#networkName(input.appId))
+    await this.#connections.forgetMember({ id: input.appId, kind: "app" })
     // Built images are only cleanup; failing to remove them doesn't stop
     // the app's removal.
     await docker(
@@ -780,6 +915,9 @@ export class AppDriver {
         force: true,
         recursive: true,
       })
+      if (await pathExists(this.#appDirectory(input.appId))) {
+        throw new Error("The App's folder is still there; delete it again")
+      }
     }
     await rm(this.#deploymentDirectory(input.appId), {
       force: true,
@@ -792,40 +930,6 @@ export class AppDriver {
     this.#deployments.delete(input.appId)
     this.#wake(input.appId)
     return { appId: input.appId, deleted: true }
-  }
-
-  async updateNetwork(input: RelayAppNetwork): Promise<RelayApp> {
-    await this.get(input.appId)
-    const desired = await this.#databaseNetworks(input.databaseIds)
-    const missing = input.databaseIds.filter((id) => !desired.has(id))
-    if (missing.length > 0) {
-      throw new Error(`Database ${missing[0]!.slice(0, 8)} was not found`)
-    }
-    const wanted = new Set(desired.values())
-    for (const container of await this.#appContainers(input.appId)) {
-      if (!joinsNetworks(container)) continue
-      const attached = container.networks.filter((network) =>
-        this.#isDatabaseNetwork(network)
-      )
-      for (const network of wanted) {
-        if (attached.includes(network)) continue
-        await docker(
-          this.#engine.connectNetwork(network, container.id, {
-            aliases: [this.#serviceAlias(input.appId, container.service)],
-          })
-        )
-      }
-      for (const network of attached) {
-        if (wanted.has(network)) continue
-        await docker(
-          this.#engine
-            .disconnectNetwork(network, container.id)
-            .pipe(Effect.ignore)
-        )
-      }
-    }
-    this.#wake(input.appId)
-    return this.get(input.appId)
   }
 
   // The newest container of one of an app's services, for its terminal.
@@ -988,9 +1092,8 @@ export class AppDriver {
           const mounts = await this.#configMounts(input, deployment, host)
           const checkout =
             config.sourceType === "github" && input.github
-              ? await traceRelayPromise(
-                  "relay.apps.deployment.checkout",
-                  () => this.#checkOut(input, deployment)
+              ? await traceRelayPromise("relay.apps.deployment.checkout", () =>
+                  this.#checkOut(input, deployment)
                 )
               : null
           if (
@@ -1510,11 +1613,7 @@ export class AppDriver {
     const name = this.#containerName(input.appId, null, deployment.id)
     const hostname = this.#hostname(input.appId)
     const environment = this.#environment(input.appId, deployment, config)
-    const databases = await this.#connectableDatabases(
-      input.appId,
-      deployment,
-      config.databaseIds
-    )
+    const databases = await this.#connectableDatabases(input.appId, deployment)
     const routes = await this.#networking.routes(input.appId)
     const tailscale = (await this.#networking.tailscale(input.appId)).filter(
       (membership) => membership.service === APP_SERVICE
@@ -1534,6 +1633,7 @@ export class AppDriver {
     if (running && blocker) {
       log(`Stopping the running container first, since ${blocker}`)
     }
+    this.#noteReplacement(input.appId)
     await docker(
       createContainer(this.#engine, {
         command: shellWords(config.command),
@@ -1757,6 +1857,7 @@ export class AppDriver {
     created: ReadonlyArray<string>,
     start: () => Promise<void>
   ) {
+    this.#noteReplacement(appId)
     const running = previous.filter((container) => container.running)
     for (const container of running) {
       this.#log(appId, deployment, `Stopping ${container.name}`)
@@ -1904,109 +2005,168 @@ export class AppDriver {
       )
     log("Reading Compose file")
     const normalized = await readConfig(base)
-    const databases = await this.#connectableDatabases(
+    await this.#holdingComposeVolumes(
       input.appId,
-      deployment,
-      input.config.databaseIds
-    )
-    const routes = await this.#networking.routes(input.appId)
-    const tailscale = await this.#networking.tailscale(input.appId)
-    const options = {
-      appId: input.appId,
-      binds,
-      commit: deployment.commit,
-      databases,
-      deploymentId: deployment.id,
-      mounts,
-      routes,
-      serviceLimits: input.config.serviceLimits,
-      tailscale,
-    }
-    const previous = await this.#appContainers(input.appId)
-    const running = previous.some((container) => container.running)
-    const blocker =
-      mountsRollingBlocker(mounts) ??
-      composeRollingBlocker(normalized, tailscale)
-    if (running && blocker) {
-      log(`Stopping the running containers first, since ${blocker}`)
-    }
-    // Every service counts, with the limits the Compose file sets for those
-    // Kiln leaves alone.
-    const reserve = (
-      prepared: ComposeProject,
-      apply: (surge: boolean) => Promise<void>,
-      surge = false
-    ) =>
-      this.#reserving(
-        input.appId,
-        Object.values(prepared.services).map(composeServiceLimits),
-        (fits) =>
-          traceRelayPromise("relay.apps.deployment.composeUp", () =>
-            apply(fits)
-          ),
-        { surge }
-      )
-    if (running && blocker === null) {
-      // Its own project, so its networks and containers stand apart from
-      // the running ones until it takes over.
-      const project = `${base}-${deployment.id}`
-      const prepared = this.#prepareCompose(await readConfig(project), {
-        ...options,
-        deferAliases: true,
-      })
-      log(`Services: ${Object.keys(prepared.services).join(", ")}`)
-      let rolled = false
-      await reserve(
-        prepared,
-        async (surge) => {
-          if (!surge) {
-            log(
-              "Stopping the running containers first, since the node can't hold both copies at once"
-            )
+      base,
+      normalized,
+      async () => {
+        const databases = await this.#connectableDatabases(
+          input.appId,
+          deployment
+        )
+        const routes = await this.#networking.routes(input.appId)
+        const tailscale = await this.#networking.tailscale(input.appId)
+        const options = {
+          appId: input.appId,
+          binds,
+          commit: deployment.commit,
+          databases,
+          deploymentId: deployment.id,
+          mounts,
+          routes,
+          serviceLimits: input.config.serviceLimits,
+          tailscale,
+        }
+        const previous = await this.#appContainers(input.appId)
+        const running = previous.some((container) => container.running)
+        const blocker =
+          mountsRollingBlocker(mounts) ??
+          composeRollingBlocker(normalized, tailscale)
+        if (running && blocker) {
+          log(`Stopping the running containers first, since ${blocker}`)
+        }
+        // Every service counts, with the limits the Compose file sets for those
+        // Kiln leaves alone.
+        const reserve = (
+          prepared: ComposeProject,
+          apply: (surge: boolean) => Promise<void>,
+          surge = false
+        ) =>
+          this.#reserving(
+            input.appId,
+            Object.values(prepared.services).map(composeServiceLimits),
+            (fits) =>
+              traceRelayPromise("relay.apps.deployment.composeUp", () =>
+                apply(fits)
+              ),
+            { surge }
+          )
+        if (running && blocker === null) {
+          // Its own project, so its networks and containers stand apart from
+          // the running ones until it takes over.
+          const project = `${base}-${deployment.id}`
+          const prepared = this.#prepareCompose(await readConfig(project), {
+            ...options,
+            deferAliases: true,
+          })
+          log(`Services: ${Object.keys(prepared.services).join(", ")}`)
+          let rolled = false
+          await reserve(
+            prepared,
+            async (surge) => {
+              if (!surge) {
+                log(
+                  "Stopping the running containers first, since the node can't hold both copies at once"
+                )
+                return
+              }
+              rolled = await this.#rollCompose(
+                input,
+                deployment,
+                composeArguments(project),
+                environment,
+                prepared,
+                previous
+              )
+            },
+            true
+          )
+          if (rolled) {
+            deployment.rolling = true
+            await this.#removeComposeNetworks(input.appId, project)
             return
           }
-          rolled = await this.#rollCompose(
-            input,
-            deployment,
-            composeArguments(project),
-            environment,
-            prepared,
-            previous
-          )
-        },
-        true
-      )
-      if (rolled) {
-        deployment.rolling = true
-        await this.#removeComposeNetworks(input.appId, project)
-        return
-      }
-    }
-    deployment.rolling = false
-    const prepared = this.#prepareCompose(normalized, {
-      ...options,
-      deferAliases: false,
-    })
-    if (!running || blocker) {
-      log(`Services: ${Object.keys(prepared.services).join(", ")}`)
-    }
-    // Containers from an image or Dockerfile deployment, or a rolled one,
-    // aren't the project's, so Compose's --remove-orphans can't see them.
-    const outside = previous.filter(
-      (container) => container.labels[COMPOSE_PROJECT_LABEL] !== base
-    )
-    await reserve(prepared, () =>
-      this.#replacing(input.appId, deployment, outside, [], () =>
-        this.#composeUp(
-          input,
-          deployment,
-          composeArguments(base),
-          environment,
-          prepared
+        }
+        deployment.rolling = false
+        const prepared = this.#prepareCompose(normalized, {
+          ...options,
+          deferAliases: false,
+        })
+        if (!running || blocker) {
+          log(`Services: ${Object.keys(prepared.services).join(", ")}`)
+        }
+        // Containers from an image or Dockerfile deployment, or a rolled one,
+        // aren't the project's, so Compose's --remove-orphans can't see them.
+        const outside = previous.filter(
+          (container) => container.labels[COMPOSE_PROJECT_LABEL] !== base
         )
+        await reserve(prepared, () =>
+          this.#replacing(input.appId, deployment, outside, [], () =>
+            this.#composeUp(
+              input,
+              deployment,
+              composeArguments(base),
+              environment,
+              prepared
+            )
+          )
+        )
+        await this.#removeComposeNetworks(input.appId, base)
+      }
+    )
+  }
+
+  /**
+   * Runs what makes and starts an App's containers holding, shared, every
+   * managed volume its Compose file declares, by the Docker name Compose
+   * gives it: one named as external, one it names without (Compose reuses
+   * a volume that's already there), and one it names after the project. A
+   * Kiln volume, another App's, or its own: a restore of one holds it
+   * alone, so it comes wholly before or after, and one whose restore didn't
+   * finish refuses the deployment. Kiln's own mounts were held when it was
+   * admitted.
+   */
+  async #holdingComposeVolumes<A>(
+    appId: string,
+    project: string,
+    normalized: ComposeProject,
+    run: () => Promise<A>
+  ): Promise<A> {
+    const projectName = Predicate.isString(normalized.name)
+      ? normalized.name
+      : project
+    const names = Object.entries(normalized.volumes ?? {}).map(
+      ([key, volume]) => {
+        if (!Predicate.isObject(volume)) return `${projectName}_${key}`
+        const external = volume.external
+        if (Predicate.isObject(external) && Predicate.isString(external.name)) {
+          return external.name
+        }
+        if (Predicate.isString(volume.name)) return volume.name
+        return external === true ? key : `${projectName}_${key}`
+      }
+    )
+    if (names.length === 0) return run()
+    const locks = (await this.#volumeIds(names)).map((id) =>
+      shared(laneKeys.volume(id))
+    )
+    const refused = () => this.#lanes.refusalFor("app.deployment", locks)
+    const before = refused()
+    if (before) throw new Error(before)
+    return Effect.runPromise(
+      traceRelayEffect(
+        "relay.apps.deployment.volumes",
+        this.#lanes.runNested(
+          { label: "app.deployment.volumes", locks },
+          Effect.suspend(() => {
+            // A restore it waited for may have left one unfinished.
+            const after = refused()
+            return after ? Effect.fail(new Error(after)) : promiseEffect(run)
+          })
+        ),
+        { "relay.app_id": appId }
       )
     )
-    await this.#removeComposeNetworks(input.appId, base)
   }
 
   async #composeUp(
@@ -2059,6 +2219,7 @@ export class AppDriver {
     prepared: ComposeProject,
     previous: ReadonlyArray<AppContainer>
   ): Promise<boolean> {
+    this.#noteReplacement(input.appId)
     const run = (command: ReadonlyArray<string>) =>
       this.#stream(
         input.appId,
@@ -2311,7 +2472,7 @@ export class AppDriver {
         ),
         labels: {
           ...service.labels,
-          ...options.routes.labels(name),
+          ...composeLiteralLabels(options.routes.labels(name)),
           ...this.#containerLabels(
             options.appId,
             name,
@@ -2374,12 +2535,15 @@ export class AppDriver {
     }
   }
 
-  // The networks of the app's databases that exist, logging any that don't.
+  // The networks of the databases the app is connected to that exist,
+  // logging any that don't. Those stay connected, and join once they do.
   async #connectableDatabases(
     appId: string,
-    deployment: Deployment,
-    databaseIds: ReadonlyArray<string>
+    deployment: Deployment
   ): Promise<Array<string>> {
+    const databaseIds = (
+      await this.#connections.list({ id: appId, kind: "app" })
+    ).map((connection) => connection.databaseId)
     const networks = await this.#databaseNetworks(databaseIds)
     for (const id of databaseIds) {
       if (networks.has(id)) {
@@ -2388,7 +2552,7 @@ export class AppDriver {
         this.#log(
           appId,
           deployment,
-          `Database ${id.slice(0, 8)} was not found; skipping it`,
+          `Database ${id.slice(0, 8)} has no network now; it joins on a later deploy`,
           "warn"
         )
       }
@@ -2559,6 +2723,9 @@ export class AppDriver {
     ]
     return relayAppSchema.parse({
       connectedDatabaseIds,
+      savedDatabaseIds: this.#connections
+        .saved({ id, kind: "app" })
+        .map((connection) => connection.databaseId),
       containers: [...containers]
         .sort(
           (left, right) =>
@@ -2665,8 +2832,7 @@ export class AppDriver {
         mounts: (container.Mounts ?? []).map((mount) => ({
           destination: mount.Destination ?? "",
           readOnly: mount.RW === false,
-          source:
-            (mount.Type === "volume" ? mount.Name : mount.Source) ?? "",
+          source: (mount.Type === "volume" ? mount.Name : mount.Source) ?? "",
           type: mount.Type,
         })),
         name: container.Name.replace(/^\//u, ""),
@@ -2724,7 +2890,7 @@ export class AppDriver {
   }
 
   #composeProject(appId: string): string {
-    return `${this.#prefix()}kiln-app-${appId}`
+    return this.#resources.appComposeProject(appId)
   }
 
   #hostname(appId: string): string {
@@ -2903,6 +3069,20 @@ interface ComposeProject {
   secrets?: Record<string, { file?: unknown; [key: string]: unknown }>
   services: Record<string, ComposeService>
   [key: string]: unknown
+}
+
+// Labels as Compose writes them literally: it interpolates the project it
+// reads back, where a route's redirect such as `https://example.com${1}`
+// would be a variable, so each $ is doubled.
+function composeLiteralLabels(
+  labels: Readonly<Record<string, string>>
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(labels).map(([key, value]) => [
+      key,
+      value.replaceAll("$", "$$$$"),
+    ])
+  )
 }
 
 // What `docker-compose config` makes of a Compose file, interpolated and in
@@ -3177,7 +3357,9 @@ function isoTime(value: string | undefined): string | null {
 // One app's containers' limits as one allocation: their memory adds up,
 // and CPU, shared, is its widest.
 function combinedLimits(
-  services: ReadonlyArray<Pick<ServiceResourceLimits, "cpuMillis" | "memoryBytes">>
+  services: ReadonlyArray<
+    Pick<ServiceResourceLimits, "cpuMillis" | "memoryBytes">
+  >
 ): ResourceLimits {
   return {
     cpuMillis: services.reduce<number | null>(
@@ -3228,9 +3410,7 @@ function deploymentStamp(earlier: ReadonlyArray<string | undefined>): string {
     .match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/u)!
     .slice(1)
     .map(Number)
-  return stamp(
-    Date.UTC(year!, month! - 1, day, hour, minute, second! + 1)
-  )
+  return stamp(Date.UTC(year!, month! - 1, day, hour, minute, second! + 1))
 }
 
 // A directory's deployment logs, newest first: their names are their UTC
@@ -3382,4 +3562,19 @@ function withProvisioning(
     }
   })
   return [...listed, ...pending.values()]
+}
+
+// Only a path that isn't there counts as gone; anything else unreadable
+// fails.
+async function pathExists(path: string): Promise<boolean> {
+  return Effect.runPromise(
+    Effect.tryPromise({ try: () => lstat(path), catch: (cause) => cause }).pipe(
+      Effect.as(true),
+      Effect.catchIf(
+        (cause) =>
+          cause instanceof Error && "code" in cause && cause.code === "ENOENT",
+        () => Effect.succeed(false)
+      )
+    )
+  )
 }

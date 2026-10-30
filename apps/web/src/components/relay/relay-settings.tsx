@@ -16,10 +16,12 @@ import { InstanceFavoriteButton } from "@/components/instance-favorite"
 import { RelayKindIcon } from "@/components/instance-kind-icon"
 import { useRelayLiveStatus } from "@/components/relay/relay-presentation"
 import { RelayVersion } from "@/components/relay/relay-version"
+import { formatBytes } from "@/lib/format-bytes"
 import { canAccessRelayPermission } from "@/lib/navigation-destinations"
 import type { AccessPermission } from "@/lib/permissions"
 import {
   accessCapabilitiesQueryOptions,
+  relayControlDialQueryOptions,
   relayHostFilesQueryOptions,
   relaySnapshotQueryOptions,
 } from "@/lib/query-options"
@@ -99,6 +101,9 @@ export function RelayGeneralSettings({
       <InfoFact label="Version">
         <RelayVersion relay={relay} />
       </InfoFact>
+      <InfoFact label="Connection">
+        <RelayConnectionFact relay={relay} />
+      </InfoFact>
       <InfoFact label="TLS">
         <InfoDetails title="TLS" trigger={tlsLabel(relay)}>
           <p>{tlsDescription(relay)}</p>
@@ -174,6 +179,66 @@ export function RelayConfigureButton({
         </React.Suspense>
       ) : null}
     </>
+  )
+}
+
+// Which side opened the control connection, against which one Hearth
+// prefers; the other stays a fallback.
+function RelayConnectionFact({ relay }: { relay: RelayDirectoryEntry }) {
+  const { connected } = useRelayLiveStatus(relay)
+  const { data } = useQuery({
+    ...relayControlDialQueryOptions(relay.id),
+    enabled: connected,
+  })
+  const openedBy = connected ? (data?.openedBy ?? null) : null
+  const carried = data?.throughHearth
+  return (
+    <InfoDetails
+      title="Connection"
+      trigger={
+        openedBy === null
+          ? "Not connected"
+          : openedBy === "relay"
+            ? "The Relay connects to Hearth"
+            : "Hearth connects to the Relay"
+      }
+    >
+      <p>
+        {relay.controlDial === "relay"
+          ? "This Relay connects to Hearth itself, so it works behind a router without forwarding ports. When it can't, Hearth connects to it instead."
+          : "Hearth connects to this Relay. When it can't, a Relay that can connects to Hearth instead."}
+      </p>
+      <InfoDetailRow
+        label="Prefers"
+        value={
+          relay.controlDial === "relay"
+            ? "The Relay connecting"
+            : "Hearth connecting"
+        }
+      />
+      <p>Configure changes which side Hearth prefers.</p>
+      {carried &&
+      (carried.open > 0 ||
+        carried.bytesToRelay + carried.bytesFromRelay > 0 ||
+        carried.refused > 0) ? (
+        <>
+          <InfoDetailRow
+            label="Through Hearth"
+            value={`${carried.open} open · ${formatBytes(carried.bytesToRelay + carried.bytesFromRelay)} carried`}
+          />
+          {carried.refused > 0 ? (
+            <InfoDetailRow
+              label="Turned away"
+              value={`${carried.refused} while Hearth was full`}
+            />
+          ) : null}
+          <p>
+            Transfers browsers can't send this Relay directly pass through
+            Hearth. Counted since Hearth last started.
+          </p>
+        </>
+      ) : null}
+    </InfoDetails>
   )
 }
 

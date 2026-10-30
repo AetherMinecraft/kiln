@@ -59,6 +59,7 @@ import type {
   BackupDialogStore,
   BackupFilters,
   BackupNameStore,
+  BackupTargetIdentity,
 } from "@/components/backups/state"
 import { formatBytes } from "@/lib/format-bytes"
 
@@ -82,7 +83,7 @@ type BackupAvailabilityState =
   | "working"
 type BackupTargetPresentation = {
   id: string
-  kindLabel: "Database" | "Game Server" | "Kiln"
+  kindLabel: string
   name: string
 }
 const activeStatuses = new Set(["queued", "running", "deleting"])
@@ -416,7 +417,9 @@ export const BackupRowActions = React.memo(function BackupRowActions({
     (backup.targetKind === "instance" ||
       backup.targetKind === "database" ||
       (backup.targetKind === "platform" &&
-        backup.artifactKind === "platform_bundle"))
+        backup.artifactKind === "platform_bundle") ||
+      ((backup.targetKind === "app" || backup.targetKind === "volume") &&
+        backup.artifactKind === "tar_archive"))
   const restore = (
     <Button
       aria-label={`Restore ${backup.name}`}
@@ -905,49 +908,54 @@ function BackupMissingTargetTooltip({
 
 export const BackupTargetLink = React.memo(function BackupTargetLink({
   available,
-  displayId,
   instance,
-  kindLabel,
-  name,
   relayId,
   targetId,
   targetKind,
 }: {
   available: boolean
-  displayId: string
-  instance?: InstanceNameInstance
-  kindLabel: BackupTargetPresentation["kindLabel"]
-  name: string
+  instance?: BackupTargetIdentity
   relayId: string
   targetId: string
   targetKind: Backup["targetKind"]
 }) {
+  const target = backupTargetPresentation(
+    { relayId, targetId, targetKind },
+    instance?.name ?? targetId
+  )
   const fallback: InstanceNameInstance =
     targetKind === "platform"
       ? { id: relayId, kind: "relay", platform: true, relayId }
       : {
           id: targetId,
-          kind: targetKind === "database" ? "database" : "server",
+          kind:
+            targetKind === "database"
+              ? "database"
+              : targetKind === "app"
+                ? "app"
+                : "server",
           relayId,
         }
   const identity = (
     <InstanceCard
       className="w-full"
       instance={instance ?? fallback}
-      name={name}
+      // A volume has no live state of its own to show.
+      showStatus={targetKind !== "volume"}
+      name={target.name}
       nameClassName={
         available
           ? "transition-colors group-hover/target-link:text-primary-ink"
           : "text-muted-foreground"
       }
-      meta={`${kindLabel} · ${displayId.slice(0, 8)}`}
+      meta={`${target.kindLabel} · ${target.id.slice(0, 8)}`}
       metaClassName="font-mono"
     />
   )
   const targetContent = available ? (
     <BackupTargetAnchor
       relayId={relayId}
-      searchId={displayId}
+      searchId={target.id}
       targetId={targetId}
       targetKind={targetKind}
     >
@@ -1009,6 +1017,38 @@ const BackupTargetAnchor = React.memo(function BackupTargetAnchor({
         preload="intent"
         search={{ search: searchId }}
         to="/infra/databases"
+      >
+        {children}
+      </Link>
+    )
+  }
+
+  // App targets open their App's Info page; Kiln volumes open the Relay.
+  const owner =
+    targetKind === "app"
+      ? targetId
+      : targetKind === "volume"
+        ? /^([a-f0-9]{40})\//u.exec(targetId)?.[1]
+        : undefined
+  if (owner) {
+    return (
+      <Link
+        className={className}
+        params={{ appId: owner }}
+        preload="intent"
+        to="/app/$appId/info"
+      >
+        {children}
+      </Link>
+    )
+  }
+  if (targetKind === "volume") {
+    return (
+      <Link
+        className={className}
+        params={{ relayId }}
+        preload="intent"
+        to="/relay/$relayId/volumes"
       >
         {children}
       </Link>
@@ -1113,23 +1153,33 @@ export function backupMatchesStatusFilter(
 }
 
 const BackupModeBadge = React.memo(function BackupModeBadge({
+  consistency,
   mode,
 }: {
+  consistency: Backup["consistency"]
   mode: Backup["backupMode"]
 }) {
   return (
     <Badge variant="outline" className="type-meta shrink-0 px-1.5 py-0">
       {mode === "incremental" ? "Incremental" : "Full"}
+      {consistency === "stopped"
+        ? " · Stopped"
+        : consistency === "live"
+          ? " · Live"
+          : ""}
     </Badge>
   )
 })
 
 export const BackupSizeDetails = React.memo(function BackupSizeDetails({
   bytes,
+  consistency = null,
   mode,
   warnings,
 }: {
   bytes: number | null
+  /** An App's folder or a volume: taken live, or with what uses it stopped. */
+  consistency?: Backup["consistency"]
   mode: Backup["backupMode"]
   warnings: ReadonlyArray<string>
 }) {
@@ -1138,7 +1188,7 @@ export const BackupSizeDetails = React.memo(function BackupSizeDetails({
       <span className="whitespace-nowrap">
         {bytes === null ? "—" : formatBytes(bytes)}
       </span>
-      <BackupModeBadge mode={mode} />
+      <BackupModeBadge consistency={consistency} mode={mode} />
       {warnings.length > 0 ? <BackupWarnings warnings={warnings} /> : null}
     </div>
   )
@@ -1188,8 +1238,8 @@ export function backupTargetName(
   )
 }
 
-export function backupTargetPresentation(
-  backup: Backup,
+function backupTargetPresentation(
+  backup: Pick<Backup, "relayId" | "targetId" | "targetKind">,
   targetName: string
 ): BackupTargetPresentation {
   if (backup.targetKind === "platform") {
@@ -1199,16 +1249,52 @@ export function backupTargetPresentation(
       name: "Kiln",
     }
   }
-  const shortId = backup.targetId.slice(0, 8)
+  // An App's own volume is named by the App and its name in Compose.
+  const ownVolume =
+    backup.targetKind === "volume"
+      ? /^[a-f0-9]{40}\/(.+)$/u.exec(backup.targetId)?.[1]
+      : undefined
+  const shortId = ownVolume ?? backup.targetId.slice(0, 8)
   return {
     id: backup.targetId,
-    kindLabel: backup.targetKind === "database" ? "Database" : "Game Server",
+    kindLabel: targetKindLabels[backup.targetKind],
     name: targetName === backup.targetId ? shortId : targetName,
   }
 }
 
+/**
+ * Compose volume identities include their owning App. Once it is gone,
+ * its volumes cannot be restored in place. Kiln volumes follow the Relay.
+ */
+export function backupTargetAvailable(
+  backup: Pick<Backup, "relayId" | "targetId" | "targetKind">,
+  availableRelayIds: ReadonlySet<string>,
+  availableTargetKeys: ReadonlySet<string>
+): boolean {
+  if (backup.targetKind === "volume" && backup.targetId.includes("/")) {
+    return availableTargetKeys.has(
+      targetKey("app", backup.relayId, backup.targetId.split("/")[0]!)
+    )
+  }
+  return backup.targetKind === "platform" || backup.targetKind === "volume"
+    ? availableRelayIds.has(backup.relayId)
+    : availableTargetKeys.has(
+        targetKey(backup.targetKind, backup.relayId, backup.targetId)
+      )
+}
+
+const targetKindLabels: Record<Backup["targetKind"], string> = {
+  app: "App",
+  database: "Database",
+  instance: "Game Server",
+  platform: "Kiln",
+  volume: "Volume",
+}
+
 function missingTargetMessage(kind: Backup["targetKind"]): string {
   if (kind === "database") return "This database no longer exists"
+  if (kind === "app") return "This App no longer exists"
+  if (kind === "volume") return "This volume no longer exists"
   if (kind === "platform") return "The Relay Kiln was backed up on is gone"
   return "This game server no longer exists"
 }
@@ -1418,7 +1504,7 @@ function availabilityStateLabel(state: BackupAvailabilityState): string {
 }
 
 export function targetKey(
-  kind: "database" | "instance" | "platform",
+  kind: Backup["targetKind"],
   relayId: string,
   targetId: string
 ): string {

@@ -15,33 +15,32 @@ import { pathToFileURL } from "node:url"
 
 import {
   appTailscaleMember,
-  brickRecipeSchema,
-  relayCreateInstanceSchema,
-  type BrickRecipe,
+  databaseTailscaleMemberId,
+  instanceTailscaleMemberId,
+  type RelayApp,
   type RelayInstance,
-  type ResourceLimitsInput,
+  type RelayManagedDatabase,
 } from "@workspace/contracts"
-import { Effect, Fiber, ManagedRuntime } from "effect"
+import { Effect, ManagedRuntime } from "effect"
 import { onTestFinished } from "vite-plus/test"
 
-import { appProvisioning } from "../app-provisioning.js"
+import { RelayVolumes } from "../volumes.js"
 import { AppDriver } from "../apps.js"
 import { BrickCatalog } from "../bricks.js"
 import { loadConfig, type RelayConfig } from "../config.js"
+import { ContainerCommands } from "../container-commands.js"
 import { DatabaseConnections } from "../database-connections.js"
-import { databaseProvisioning } from "../database-provisioning.js"
 import { DatabaseDriver } from "../databases.js"
 import { DockerDriver } from "../docker.js"
+import { DockerEngine } from "../docker-engine.js"
 import { makeRelayStateLayer, RelayStateStore } from "../effect/state.js"
 import { LifecycleDriver } from "../lifecycle.js"
 import { OperationLanes } from "../operation-lanes.js"
-import {
-  hostProvisioningCapacity,
-  ProvisioningManager,
-} from "../provisioning.js"
+import { ResourceFreezes } from "../resource-freezes.js"
 import { appRouteOwner, relayResourceNames } from "../relay-resources.js"
+import { ResourcePower } from "../resource-power.js"
 import { RuntimeRecoveryManager } from "../runtime-recovery.js"
-import { serverProvisioning } from "../server-provisioning.js"
+import { ScheduleManager } from "../schedules.js"
 import { type ContainerSeed, type FakeContainer, fakeDocker } from "./docker.js"
 
 export const TEST_NAMESPACE = "kiln-test"
@@ -49,11 +48,19 @@ export const TEST_NAMESPACE = "kiln-test"
 export interface RelayDrivers {
   readonly apps: AppDriver
   readonly bricks: BrickCatalog
+  readonly commands: ContainerCommands
   readonly databaseConnections: DatabaseConnections
   readonly databases: DatabaseDriver
+  readonly volumes: RelayVolumes
   readonly docker: DockerDriver
+  readonly freezes: ResourceFreezes
   readonly lanes: OperationLanes
   readonly lifecycle: LifecycleDriver
+  readonly power: ResourcePower<{
+    app: RelayApp
+    database: RelayManagedDatabase
+    instance: RelayInstance
+  }>
   readonly runtimeRecovery: RuntimeRecoveryManager
 }
 
@@ -63,21 +70,11 @@ export interface RelayHarness extends RelayDrivers {
   readonly state: RelayStateStore["Service"]
   /** New drivers over the same data directory and SQLite file. */
   readonly restart: () => Promise<RelayDrivers>
-  /** Publishes a recipe in the local catalog and returns its source URL. */
-  readonly publishRecipe: (recipe: BrickRecipe) => Promise<string>
   /**
    * Seeds a server container the way Relay creates one, for scenarios that
    * need state provisioning cannot produce (legacy labels, past sessions).
    */
   readonly seedServer: (input: ServerSeed) => Promise<FakeContainer>
-  /** Provisions a server through Relay's real create path. */
-  readonly createServer: (input: {
-    id: string
-    limits?: ResourceLimitsInput
-    recipe?: BrickRecipe
-    start?: boolean
-    variables?: Record<string, string>
-  }) => Promise<RelayInstance>
 }
 
 export interface ServerSeed extends Partial<ContainerSeed> {
@@ -112,7 +109,8 @@ export async function relayHarness(
 
   const drivers = async (): Promise<RelayDrivers> => {
     const bricks = new BrickCatalog(config.brickCatalogUrl, dataDirectory)
-    const lanes = new OperationLanes()
+    const freezes = await Effect.runPromise(ResourceFreezes.load(state))
+    const lanes = new OperationLanes({ frozen: freezes })
     const runtimeRecovery = new RuntimeRecoveryManager(config, state, lanes)
     await Effect.runPromise(runtimeRecovery.initialize())
     const databaseConnections = new DatabaseConnections(config, state)
@@ -132,10 +130,21 @@ export async function relayHarness(
       lanes
     )
     lifecycles.push(lifecycle)
+    // What a deployment's external volumes are, as the Relay's own finds.
+    const volumes = new RelayVolumes(
+      config,
+      new DockerEngine(config.dockerSocket),
+      state,
+      () => lifecycle.hostDataDirectory()
+    )
     const apps = new AppDriver(
       config,
       () => lifecycle.hostDataDirectory(),
       {
+        reattachTailscale: (appId) =>
+          lifecycle.reattachTailscaleMembers(
+            (memberId) => appTailscaleMember(memberId)?.appId === appId
+          ),
         routes: async (appId) =>
           lifecycle.appRoutePlan(
             await Effect.runPromise(
@@ -153,20 +162,65 @@ export async function relayHarness(
           })),
       },
       lanes,
-      { allocations: docker.allocations, state }
+      { allocations: docker.allocations, state },
+      databaseConnections,
+      (dockerNames) => Effect.runPromise(volumes.idsByDockerName(dockerNames))
     )
     lifecycle.useAppServiceContainers(async (appId, service) => {
       await apps.get(appId)
       return (await apps.serviceContainer(appId, service))?.name ?? null
     })
+    const databases = new DatabaseDriver(config, docker, databaseConnections)
+    lifecycle.useDatabaseContainers((databaseId) =>
+      databases.containerOf(databaseId)
+    )
+    runtimeRecovery.useTailscaleAddresses((instanceId) =>
+      lifecycle.reattachTailscaleMember(instanceTailscaleMemberId(instanceId))
+    )
+    databases.useTailscaleAddresses((databaseId) =>
+      lifecycle.reattachTailscaleMember(databaseTailscaleMemberId(databaseId))
+    )
     return {
+      volumes,
       apps,
       bricks,
+      commands: new ContainerCommands({
+        apps,
+        databases,
+        engine: new DockerEngine(config.dockerSocket),
+        lanes,
+      }),
       databaseConnections,
-      databases: new DatabaseDriver(config, docker, databaseConnections),
+      databases,
       docker,
+      freezes,
       lanes,
       lifecycle,
+      power: new ResourcePower({
+        adapters: {
+          app: (appId, action) => apps.action({ action, appId }),
+          database: (databaseId, action) =>
+            databases.action({ action, databaseId }),
+          instance: async (instanceId, action) => {
+            const instance = await docker.findInstance(instanceId)
+            if (!instance) throw new Error("Instance not found")
+            const [routes, pendingPrimaryPort] = await Effect.runPromise(
+              Effect.all([
+                state.listInstanceRoutes(instanceId),
+                state.getPendingPrimaryPort(instanceId),
+              ])
+            )
+            return lifecycle.runInstanceAction(
+              instance,
+              action,
+              routes,
+              pendingPrimaryPort
+            )
+          },
+        },
+        lanes,
+        replacements: { app: (appId) => apps.replacements(appId) },
+      }),
       runtimeRecovery,
     }
   }
@@ -179,36 +233,12 @@ export async function relayHarness(
     fakeDocker.reset()
   })
 
-  const initial = await drivers()
-  const publishRecipe = async (recipe: BrickRecipe) => {
-    const path = join(catalogDirectory, `${recipe.metadata.id}.json`)
-    await writeFile(path, JSON.stringify(recipe))
-    return pathToFileURL(path).href
-  }
   return {
-    ...initial,
+    ...(await drivers()),
     config,
     resources,
     state,
     restart: drivers,
-    publishRecipe,
-    createServer: async ({
-      id,
-      limits,
-      recipe = serverRecipe(),
-      start = false,
-      variables = {},
-    }) =>
-      initial.lifecycle.createInstanceWithId(
-        id,
-        relayCreateInstanceSchema.parse({
-          diskLimitBytes: 1024 ** 3,
-          limits,
-          recipe: await publishRecipe(recipe),
-          start,
-          variables,
-        })
-      ),
     seedServer: async ({ id, labels, ...seed }) => {
       const directory = join(config.rootDirectory, id)
       await mkdir(directory, { recursive: true })
@@ -243,69 +273,41 @@ export async function relayHarness(
   }
 }
 
-/** A small direct-networked Brick with one TCP game port. */
-export function serverRecipe(
-  overrides: Partial<BrickRecipe> = {}
-): BrickRecipe {
-  return brickRecipeSchema.parse({
-    format: "kiln.brick/v1",
-    metadata: {
-      author: "Kiln",
-      description: "A test Brick recipe.",
-      game: "Example Game",
-      id: "example",
-      name: "Example",
-    },
-    network: {
-      hostname: "{{ brick.id }}",
-      mode: "direct",
-      ports: [{ container: 25_565, name: "game", protocol: "tcp" }],
-      primaryPort: "game",
-    },
-    runtime: {
-      environment: { VERSION: "{{ variables.version }}" },
-      image: "registry.example.com/example/server:{{ variables.version }}",
-      name: "Example {{ variables.version }}",
-      resources: { memory: "512M", memoryReservation: "512M", pids: 128 },
-      storage: { mount: "/server" },
-    },
-    variables: {
-      version: {
-        default: "1.2.3",
-        description: "Release to install.",
-        label: "Version",
-        required: true,
-        rules: { pattern: "^[0-9.]+$" },
-        type: "string",
-      },
-    },
-    ...overrides,
-  })
-}
-
 /**
- * The Relay's provisioning queue and its worker over a harness's drivers,
- * as Relay startup builds them. The worker stops when the test finishes.
+ * The Relay's schedule worker over a harness's drivers, wired as index.ts
+ * wires it. It stops when the test finishes.
  */
-export async function provisioningWorker(
-  harness: RelayHarness
-): Promise<ProvisioningManager> {
-  const manager = await Effect.runPromise(
-    ProvisioningManager.make({
-      adapters: {
-        app: appProvisioning(harness.apps),
-        database: databaseProvisioning(harness.databases),
-        server: serverProvisioning({
-          lifecycle: harness.lifecycle,
-          refreshSnapshot: async () => undefined,
-          state: harness.state,
-        }),
-      },
-      capacity: hostProvisioningCapacity(),
-      lanes: harness.lanes,
-    }).pipe(Effect.provideService(RelayStateStore, harness.state))
-  )
-  const worker = Effect.runFork(manager.run())
-  onTestFinished(() => Effect.runPromise(Fiber.interrupt(worker)))
+export async function scheduleWorker(harness: RelayHarness) {
+  const directory = await mkdtemp(join(tmpdir(), "kiln-relay-schedules-"))
+  const manager = await ScheduleManager.make({
+    enqueueBackup: async () => {
+      throw new Error("not used")
+    },
+    findInstance: (instanceId) => harness.docker.findInstance(instanceId),
+    getBackup: async () => null,
+    isPaused: () => harness.lanes.paused,
+    listAppOwnedVolumeIds: (appId) =>
+      Effect.runPromise(harness.volumes.ownedAppVolumeIds(appId)),
+    listAppIds: async () =>
+      new Set((await harness.apps.list()).map(({ id }) => id)),
+    listDatabaseIds: async () =>
+      new Set((await harness.databases.list()).map(({ id }) => id)),
+    platformTargetId: () => "platform",
+    powerIntent: (kind, id) => harness.power.intent(kind, id),
+    relayId: "relay-a",
+    runContainerCommand: (target, command) =>
+      harness.commands.run(target, command),
+    runPower: (kind, id, action, powerIntent) =>
+      harness.power.scheduled(kind, id, action, powerIntent),
+    sendConsoleCommand: async () => {
+      throw new Error("not used")
+    },
+    state: harness.state.schedules,
+    stateDirectory: directory,
+  })
+  onTestFinished(async () => {
+    manager.close()
+    await rm(directory, { force: true, recursive: true })
+  })
   return manager
 }

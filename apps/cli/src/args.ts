@@ -25,6 +25,7 @@ export interface CliArguments {
   name?: string
   noOpen: boolean
   plan: boolean
+  passwordStdin: boolean
   profile?: string
   safetyBackup: boolean
   storage?: string
@@ -59,6 +60,7 @@ export function parseArguments(argv: Array<string>): CliArguments {
   let name: string | undefined
   let noOpen = false
   let plan = false
+  let passwordStdin = false
   let profile: string | undefined
   let safetyBackup = true
   let storage: string | undefined
@@ -130,6 +132,7 @@ export function parseArguments(argv: Array<string>): CliArguments {
     else if (flag === "--plan") plan = true
     else if (flag === "--no-safety-backup") safetyBackup = false
     else if (flag === "--no-start") start = false
+    else if (flag === "--password-stdin") passwordStdin = true
     else if (flag === "--version" || flag === "-v") version = true
     else if (flag === "--limit") {
       const parsed = z.coerce
@@ -202,6 +205,7 @@ export function parseArguments(argv: Array<string>): CliArguments {
     ...(name ? { name } : {}),
     noOpen,
     plan,
+    passwordStdin,
     ...(profile ? { profile } : {}),
     safetyBackup,
     ...(storage ? { storage } : {}),

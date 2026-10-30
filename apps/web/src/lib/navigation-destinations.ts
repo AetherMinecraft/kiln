@@ -17,10 +17,12 @@ import {
   Palette,
   Rocket,
   ScrollText,
+  ShieldAlert,
   SlidersHorizontal,
   Table2,
   TerminalSquare,
   Waypoints,
+  Workflow,
 } from "lucide-react"
 import {
   accessPermissionSupported,
@@ -50,6 +52,7 @@ export interface NavigationDestination {
 export type InfrastructureDestinationAccess =
   | "app-read"
   | "database-read"
+  | "domains"
   | "instance-read"
   | "manage-relays"
   | "platform-admin"
@@ -126,10 +129,10 @@ export const infrastructureDestinations = [
     to: "/infra/tailscale",
   },
   {
-    access: "platform-admin",
+    access: "domains",
     group: "network",
     icon: Globe2,
-    keywords: ["infrastructure", "cloudflare", "urls"],
+    keywords: ["infrastructure", "cloudflare", "urls", "dns", "vanity"],
     label: "Domains",
     to: "/infra/domains",
   },
@@ -205,7 +208,7 @@ export const settingsDestinations = [
   },
   {
     icon: Bell,
-    keywords: ["settings", "push", "alerts"],
+    keywords: ["settings", "push", "alerts", "security", "vulnerabilities"],
     label: "Notifications",
     to: "/settings/notifications",
   },
@@ -611,7 +614,13 @@ export const relayDestinations = [
   },
 ] as const satisfies ReadonlyArray<RelayDestination>
 
-export type KilnDestinationId = "info" | "logs" | "terminal" | "viewer"
+export type KilnDestinationId =
+  | "info"
+  | "logs"
+  | "operations"
+  | "security"
+  | "terminal"
+  | "viewer"
 
 export interface KilnDestination extends NavigationDestination {
   id: KilnDestinationId
@@ -639,6 +648,38 @@ export const kilnDestinations = [
     ],
     label: "Info",
     to: "/kiln/info",
+  },
+  {
+    icon: ShieldAlert,
+    id: "security",
+    keywords: [
+      "kiln",
+      "security",
+      "vulnerabilities",
+      "cve",
+      "sbom",
+      "images",
+      "hosts",
+    ],
+    label: "Security",
+    to: "/kiln/security",
+  },
+  {
+    icon: Workflow,
+    id: "operations",
+    keywords: [
+      "kiln",
+      "hearth",
+      "operations",
+      "lanes",
+      "locks",
+      "queue",
+      "waiting",
+      "running",
+      "stuck",
+    ],
+    label: "Operations",
+    to: "/kiln/operations",
   },
   {
     icon: Table2,
@@ -726,6 +767,20 @@ export function canAccessInfrastructureDestination(
     // Sources feed syncs. Each person's sources are their own.
     return canUseSyncs(capabilities)
   }
+  if (destination.access === "domains") {
+    // Each person's Cloudflare connections are their own, for the game
+    // servers and apps they reach.
+    return (
+      capabilities.isPlatformAdmin ||
+      hasScopedPermission(capabilities, "instance.read", [
+        "instance",
+        "relay",
+      ]) ||
+      hasScopedPermission(capabilities, "instance.create", ["relay"]) ||
+      hasScopedPermission(capabilities, "app.read", ["relay", "app"]) ||
+      hasScopedPermission(capabilities, "app.create", ["relay"])
+    )
+  }
   // Each list also opens for people who can only create there; its create
   // action is what they came for.
   if (destination.access === "app-read") {
@@ -799,7 +854,10 @@ function canUseSyncs(capabilities: NavigationAccessCapabilities): boolean {
 export function canAccessBackups(
   capabilities: NavigationAccessCapabilities
 ): boolean {
-  return hasScopedPermission(capabilities, "backup.read")
+  return (
+    hasScopedPermission(capabilities, "backup.read") ||
+    hasScopedPermission(capabilities, "app.read", ["relay", "app"])
+  )
 }
 
 export function canAccessActivity(

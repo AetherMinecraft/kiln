@@ -65,7 +65,11 @@ const hearthRealtimeQueryScopes = {
     prefix(["backups", "usage"]),
   ],
   "backup-storage": [exact(queryKeys.backups.storage)],
-  backups: [prefix(["backups", "usage"])],
+  backups: [
+    prefix(["backups", "usage"]),
+    prefix(["backups", "app"]),
+    exact(queryKeys.backups.unfinished),
+  ],
   "database-credentials": [prefix(["databases"])],
   "database-directory": [
     exact(queryKeys.databases.directory),
@@ -78,6 +82,8 @@ const hearthRealtimeQueryScopes = {
     prefix(["domains"]),
   ],
   favorites: [exact(queryKeys.instanceFavorites)],
+  icons: [exact(queryKeys.icons.index), prefix(queryKeys.icons.details)],
+  "server-migrations": [prefix(["server-migrations"])],
   "file-activity": [prefix(["file-activity"])],
   "github-sync": [prefix(["github-sync"])],
   "instance-directory": [
@@ -87,6 +93,7 @@ const hearthRealtimeQueryScopes = {
   ],
   "instance-web-routes": [prefix(["web-routes"])],
   notifications: [exact(queryKeys.notifications)],
+  operations: [prefix(["operations"])],
   preferences: [exact(queryKeys.uiPreferences)],
   "relay-health": [
     exact(queryKeys.relays),
@@ -116,7 +123,9 @@ const hearthRealtimeQueryScopes = {
     prefix(["relays", "proxy"]),
     exact(queryKeys.relayProxyModes),
   ],
+  "resource-deletions": [prefix(["resource-deletion"])],
   schedules: [exact(queryKeys.schedules.all)],
+  security: [prefix(["security"])],
   tailscale: [
     exact(queryKeys.tailscaleStacks),
     prefix(["tailscale", "relays"]),

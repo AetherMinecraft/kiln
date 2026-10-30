@@ -7,10 +7,7 @@ import { afterAll } from "vite-plus/test"
 import { disposeAppRuntime } from "@/effect/runtime"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import type { AccessPermission } from "@/lib/permissions"
-import {
-  getAppOwnerHandler,
-  getAppOwnerMinecraftProfileIdHandler,
-} from "@/server/app-access"
+import { getAppOwnerHandler } from "@/server/app-access"
 import { TestDatabase, describeMysql, resetDatabase } from "@/test/database"
 import { insertGrant, insertRelay, insertRows, insertUser } from "@/test/seed"
 
@@ -104,21 +101,6 @@ const ownerFor = (userId: string, id = appId) =>
 describeMysql("app owner", () => {
   layer(TestDatabase)((it) => {
     it.effect(
-      "someone who can read the Relay's people sees the owner's email",
-      () =>
-        Effect.gen(function* () {
-          yield* seed
-
-          const owner = yield* ownerFor("manager")
-
-          assert.deepStrictEqual(owner, {
-            canTransfer: false,
-            owner: { email: "owner@example.test", name: "Steve" },
-          })
-        })
-    )
-
-    it.effect(
       "someone who can only read apps gets the owner's name alone",
       () =>
         Effect.gen(function* () {
@@ -128,7 +110,7 @@ describeMysql("app owner", () => {
 
           assert.deepStrictEqual(owner, {
             canTransfer: false,
-            owner: { email: null, name: "Steve" },
+            owner: { email: null, name: "Steve", userId: "owner" },
           })
         })
     )
@@ -141,12 +123,6 @@ describeMysql("app owner", () => {
           const user = sessionUser(userId)
           assert.instanceOf(
             yield* refusal(getAppOwnerHandler(user, target(appId))),
-            Error
-          )
-          assert.instanceOf(
-            yield* refusal(
-              getAppOwnerMinecraftProfileIdHandler(user, target(appId))
-            ),
             Error
           )
         }
@@ -166,29 +142,6 @@ describeMysql("app owner", () => {
           ),
           Error
         )
-      })
-    )
-
-    it.effect("an app whose owner is gone has no owner", () =>
-      Effect.gen(function* () {
-        yield* seed
-
-        const owner = yield* ownerFor("viewer", orphanedId)
-
-        assert.isNull(owner.owner)
-      })
-    )
-
-    it.effect("the owner sees their app and may hand it on", () =>
-      Effect.gen(function* () {
-        yield* seed
-
-        const owner = yield* ownerFor("owner")
-
-        assert.deepStrictEqual(owner, {
-          canTransfer: true,
-          owner: { email: null, name: "Steve" },
-        })
       })
     )
   })

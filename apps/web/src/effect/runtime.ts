@@ -1,5 +1,5 @@
 import * as Telemetry from "@workspace/telemetry"
-import { Effect, Layer, ManagedRuntime } from "effect"
+import { Cause, Effect, Exit, Layer, ManagedRuntime } from "effect"
 import type { Fiber, Tracer } from "effect"
 
 import type { AppCache } from "./cache"
@@ -7,7 +7,12 @@ import { AppCacheLive } from "./cache"
 import type { Database } from "./database"
 import { DatabaseLive } from "./database"
 import { loadedKilnInstallationId } from "./installation"
+import {
+  OperationsEngineLive,
+  type OperationsEngineService,
+} from "../operations/engine-service"
 import { isExpectedAppError } from "../observability/error-policy"
+import { inCurrentOperation } from "../operations/current"
 
 declare const __KILN_TELEMETRY_DEFAULTS__: Telemetry.TelemetryDefaults
 
@@ -38,37 +43,54 @@ const TelemetryLive = Layer.unwrap(
   })
 )
 
-const AppLive = Layer.mergeAll(DatabaseLive, AppCacheLive, TelemetryLive)
+/** What every effect run on Hearth's runtime may use. */
+export type AppServices = AppCache | Database | OperationsEngineService
+
+const ServicesLive = Layer.mergeAll(DatabaseLive, AppCacheLive)
+const AppLive = Layer.mergeAll(
+  OperationsEngineLive.pipe(Layer.provideMerge(ServicesLive)),
+  TelemetryLive
+)
 const runtime = ManagedRuntime.make(AppLive)
 
 /** Runtime-owned workers span individual jobs, rather than their lifetime. */
-export function forkAppWorker(
-  effect: Effect.Effect<void, never, AppCache | Database>
-) {
+export function forkAppWorker(effect: Effect.Effect<void, never, AppServices>) {
   return runtime.runFork(effect)
 }
 
-export function runAppEffect<TResult, TError>(
+export async function runAppEffect<TResult, TError>(
   name: string,
-  effect: Effect.Effect<TResult, TError, AppCache | Database>,
+  effect: Effect.Effect<TResult, TError, AppServices>,
   options?: { signal?: AbortSignal }
 ): Promise<TResult> {
-  return runtime.runPromise(
-    Telemetry.withActiveParent(Effect.withSpan(effect, name)),
+  const exit = await runtime.runPromiseExit(
+    inCurrentOperation(
+      Telemetry.withActiveParent(Effect.withSpan(effect, name))
+    ),
     options
   )
+  if (Exit.isSuccess(exit)) return exit.value
+  // Stopped only because whoever asked gave up, as a browser does when it
+  // leaves the page: an abort, which isn't reported, rather than a failure.
+  // Anything that went wrong as well is still thrown and reported.
+  if (options?.signal?.aborted && Cause.hasInterruptsOnly(exit.cause)) {
+    throw new DOMException("The request was aborted", "AbortError")
+  }
+  throw Cause.squash(exit.cause)
 }
 
 /** Runs a background check, such as a worker's idle poll, without tracing it. */
 export function runAppEffectUntraced<TResult, TError>(
-  effect: Effect.Effect<TResult, TError, AppCache | Database>
+  effect: Effect.Effect<TResult, TError, AppServices>
 ): Promise<TResult> {
-  return runtime.runPromise(Effect.withTracerEnabled(effect, false))
+  return runtime.runPromise(
+    inCurrentOperation(Effect.withTracerEnabled(effect, false))
+  )
 }
 
 export function forkAppEffect<TResult, TError>(
   name: string,
-  effect: Effect.Effect<TResult, TError, AppCache | Database>
+  effect: Effect.Effect<TResult, TError, AppServices>
 ): Fiber.Fiber<TResult, unknown> {
   return runtime.runFork(effect.pipe(Effect.withSpan(name)))
 }
@@ -79,7 +101,7 @@ export function forkAppEffect<TResult, TError>(
  */
 export function forkAppEffectInTrace<TResult, TError>(
   name: string,
-  effect: Effect.Effect<TResult, TError, AppCache | Database>
+  effect: Effect.Effect<TResult, TError, AppServices>
 ): Fiber.Fiber<TResult, unknown> {
   return runtime.runFork(
     Telemetry.withActiveParent(effect.pipe(Effect.withSpan(name)))

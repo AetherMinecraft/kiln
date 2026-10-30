@@ -36,7 +36,14 @@ import {
   relayAppsV1Feature,
   relayLogsV1Feature,
   relayProxyConfigurationV1Feature,
+  relayWorkloadUsageV1Feature,
+  relayWebRouteOptionsV1Feature,
   relayHostFilesV1Feature,
+  relayLinkedBackupsV1Feature,
+  relayTransferSpaceV1Feature,
+  relayPeerTransfersV1Feature,
+  relayControlDialV1Feature,
+  relayTunnelV1Feature,
   relayRestartV1Feature,
   relayResourcesV1Feature,
   relayFilePutV1Feature,
@@ -45,10 +52,13 @@ import {
   relayAppLimitsV1Feature,
   relayAppGitHubV1Feature,
   relayAppImageUpdatesV1Feature,
+  relaySecurityInventoryV1Feature,
+  relayIconReadV1Feature,
   relayPlatformV1Feature,
   relayPlatformV2Feature,
   relayPlatformDatabaseV1Feature,
   relayDatabaseDumpFilesV1Feature,
+  relayInstallationV1Feature,
   relayVolumesV1Feature,
   relayDatabaseProvisioningV1Feature,
   relayAppProvisioningV1Feature,
@@ -69,6 +79,7 @@ import type {
   RelayControlRequest,
   RelayControlResponse,
   RelayControlOperation,
+  RelayDialBinding,
   RelayOperationLookup,
   RelaySnapshot,
 } from "@workspace/contracts"
@@ -84,6 +95,7 @@ import {
 import {
   actionsForRole,
   fileMutationAction,
+  fileTransferAction,
   isActionAllowed,
 } from "./permissions.js"
 import { relayBuildLabel } from "./build-info.js"
@@ -99,6 +111,7 @@ import {
 } from "./operation-lanes.js"
 import type { RelayIdentity } from "./effect/identity.js"
 import { countRelayRefusal, type ControlCapacity } from "./relay-capacity.js"
+import { InstallationReplaceError } from "./installation.js"
 import type {
   RelayClientGrant,
   RelayOperationRecord,
@@ -137,6 +150,12 @@ export interface ControlSocketOptions {
    * wait for the build it is about to remove.
    */
   readonly beforeRun?: (request: RelayControlRequest) => void
+  /**
+   * Runs as a Hearth's control connection authenticates, before it takes
+   * requests, with an ID that connection alone has; `execute` gets it with
+   * each request the connection sent.
+   */
+  readonly clientConnected?: (clientId: string, connectionId: string) => void
   readonly execute: (
     request: RelayControlRequest,
     client: RelayClientGrant,
@@ -147,10 +166,14 @@ export interface ControlSocketOptions {
       timeoutMs: number
     ) => Promise<unknown>,
     /** What the connected Hearth announced it understands. */
-    hearthFeatures: ReadonlySet<string>
+    hearthFeatures: ReadonlySet<string>,
+    /** The control connection the request came on (`clientConnected`). */
+    connectionId: string
   ) => Promise<unknown>
   readonly identity: RelayIdentity
   readonly initialSnapshot: () => Promise<unknown>
+  /** This Relay's journal of changes (`RelayStateStore.operationJournalId`). */
+  readonly journalId: string
   /** The lanes every Relay mutation waits in. */
   readonly lanes: OperationLanes
   /**
@@ -160,15 +183,35 @@ export interface ControlSocketOptions {
   readonly requestLocks: (
     request: RelayControlRequest
   ) => ReadonlyArray<LaneLock> | Promise<ReadonlyArray<LaneLock>> | null
+  /**
+   * Whether a request waits only for what holds its locks, not for what
+   * waits in line, as work something running waits on does.
+   */
+  readonly requestContinues?: (request: RelayControlRequest) => boolean
   readonly subscribeSnapshots: (
     listener: (snapshot: unknown) => void
   ) => () => void
   readonly runEffect: <T, E>(effect: EffectType.Effect<T, E>) => Promise<T>
+  /**
+   * Keeps where an authenticated Hearth asked the Relay to open its own
+   * control connection (`auth.response`'s `dial`), or forgets it on null.
+   */
+  readonly saveDial?: (clientId: string, url: string | null) => void
   readonly server: Server
   readonly state: RelayStateStore["Service"]
 }
 
 export interface ControlSocketServer {
+  /**
+   * Serves a control connection the Relay opened to a Hearth, once Hearth
+   * said hello: the same session as one Hearth opened, but its challenge
+   * is bound to `binding` and only that Hearth client may answer it.
+   */
+  readonly adoptDialed: (
+    socket: WebSocket,
+    binding: RelayDialBinding,
+    peerAddress: string | undefined
+  ) => void
   /** How full the control sessions are, across every Hearth session. */
   readonly capacity: () => ControlCapacity
   readonly close: () => Promise<void>
@@ -230,7 +273,12 @@ export function attachControlSocket(
     })
   })
 
-  wss.on("connection", (socket, request) => {
+  // Every control connection, whichever side opened it.
+  const serve = (
+    socket: WebSocket,
+    peerAddress: string | undefined,
+    dial: RelayDialBinding | null
+  ) => {
     if (sockets.size >= MAX_CONTROL_SESSIONS) {
       socket.close(1013, "Relay control session capacity reached")
       return
@@ -245,7 +293,8 @@ export function attachControlSocket(
       reverseRequesters,
       operations,
       capacity,
-      request.socket.remoteAddress
+      peerAddress,
+      dial
     )
     socket.once("close", () => {
       sockets.delete(socket)
@@ -254,6 +303,10 @@ export function attachControlSocket(
       authenticatedSockets.delete(socket)
       reverseRequesters.delete(socket)
     })
+  }
+
+  wss.on("connection", (socket, request) => {
+    serve(socket, request.socket.remoteAddress, null)
   })
 
   const heartbeatFiber = Effect.runFork(
@@ -276,6 +329,9 @@ export function attachControlSocket(
   )
 
   return {
+    adoptDialed: (socket, binding, peerAddress) => {
+      serve(socket, peerAddress, binding)
+    },
     capacity: () => {
       const now = Date.now()
       let inFlight = 0
@@ -401,9 +457,11 @@ function authenticateSocket(
   >,
   operations: OperationRegistry,
   capacity: CapacityTracking,
-  peerAddress: string | undefined
+  peerAddress: string | undefined,
+  dial: RelayDialBinding | null
 ): void {
   const unsignedChallenge = {
+    ...(dial ? { dial } : {}),
     expiresAt: Date.now() + relayAuthenticationWindowMs,
     nonce: randomBytes(32).toString("base64url"),
     relayId: options.identity.fingerprint,
@@ -422,6 +480,7 @@ function authenticateSocket(
   send(socket, challenge)
 
   let authenticatedClient: RelayClientGrant | null = null
+  const connectionId = randomUUID()
   let unsubscribeSnapshots: (() => void) | null = null
   let eventSequence = 0
   let previousSnapshot: RelaySnapshot | null = null
@@ -479,6 +538,15 @@ function authenticateSocket(
           message.installationId,
           message.hearthContainer
         ).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              if (message.dial === undefined || !authenticatedClient) return
+              options.saveDial?.(
+                authenticatedClient.id,
+                message.dial?.url ?? null
+              )
+            })
+          ),
           Effect.catch(() =>
             Effect.sync(() => {
               socket.close(4401, "Authentication failed")
@@ -543,6 +611,20 @@ function authenticateSocket(
       )
       return
     }
+    // Sent for a journal this Relay no longer keeps: the change, or the
+    // outcome asked about, may be one it forgot when its state was rebuilt.
+    if (
+      message.journalId !== undefined &&
+      message.journalId !== options.journalId
+    ) {
+      sendError(
+        socket,
+        message.id,
+        "journal_changed",
+        "This Relay's state was rebuilt since that change was sent"
+      )
+      return
+    }
     const client = authenticatedClient
     const receivedAt = Date.now()
     const controller = new AbortController()
@@ -563,7 +645,11 @@ function authenticateSocket(
     const ticket =
       locks === null
         ? null
-        : options.lanes.admit({ label: message.operation, locks })
+        : options.lanes.admit({
+            continuation: options.requestContinues?.(message) ?? false,
+            label: message.operation,
+            locks,
+          })
     const request: InFlightRequest = {
       controller,
       fiber: null,
@@ -663,6 +749,10 @@ function authenticateSocket(
           "Expired or consumed authentication challenge"
         )
       }
+      // On a connection the Relay opened, only the client it opened it for.
+      if (dial && dial.clientId !== clientId) {
+        return yield* controlFailure("Invalid Hearth identity proof")
+      }
       const client = yield* promiseOperation(() =>
         options.runEffect(options.state.findClientById(clientId))
       )
@@ -748,11 +838,16 @@ function authenticateSocket(
             yield* Effect.sync(() => sendResponse(request, lookup))
             return
           }
-          const issuerInternal =
-            request.operation === "browser.authorization.revise"
+          const issuerInternal = anyClientOperations.has(request.operation)
+          const memberActions = memberActionsForRequest(request)
           if (
             !issuerInternal &&
-            (!action || !isActionAllowed(actions, action))
+            (!action ||
+              !isActionAllowed(actions, action) ||
+              memberActions === null ||
+              !memberActions.every((member) =>
+                isActionAllowed(actions, member)
+              ))
           ) {
             yield* Effect.sync(() => {
               sendError(
@@ -779,7 +874,8 @@ function authenticateSocket(
                       timeoutMs,
                       request.subject
                     ),
-                  hearthFeatures
+                  hearthFeatures,
+                  connectionId
                 ),
               { "relay.operation": request.operation }
             )
@@ -856,6 +952,12 @@ function authenticateSocket(
         "relay.operation": request.operation,
         ...(request.operationId
           ? { "relay.operation_id": request.operationId }
+          : {}),
+        ...(request.parent
+          ? {
+              "kiln.operation.id": request.parent.operationId,
+              "kiln.operation.step": request.parent.step,
+            }
           : {}),
       },
       traceParentSpan(request.traceparent)
@@ -1167,6 +1269,7 @@ function authenticateSocket(
           relayAppsV1Feature,
           relayLogsV1Feature,
           relayProxyConfigurationV1Feature,
+          relayWorkloadUsageV1Feature,
           relayHostFilesV1Feature,
           relayRestartV1Feature,
           relayResourcesV1Feature,
@@ -1183,13 +1286,24 @@ function authenticateSocket(
           relayPlatformV2Feature,
           relayPlatformDatabaseV1Feature,
           relayDatabaseDumpFilesV1Feature,
+          relayInstallationV1Feature,
+          relaySecurityInventoryV1Feature,
+          relayWebRouteOptionsV1Feature,
+          relayPeerTransfersV1Feature,
+          relayIconReadV1Feature,
+          relayLinkedBackupsV1Feature,
+          relayTransferSpaceV1Feature,
+          relayControlDialV1Feature,
+          relayTunnelV1Feature,
         ],
+        journalId: options.journalId,
         protocol: relayControlProtocol,
         relayBuild: relayBuildLabel(),
         role: client.role,
         type: "auth.ready",
         v: 1,
       }
+      options.clientConnected?.(client.id, connectionId)
       send(socket, ready)
       const initialSnapshot = (yield* promiseOperation(
         options.initialSnapshot
@@ -1314,7 +1428,7 @@ function reverseRequestCancellationGraceMs(
   operation: RelayControlOperation,
   duration: number
 ): number {
-  if (operation === "hearth.tailscale.instance.detach") {
+  if (operation === "hearth.tailscale.member.detach") {
     // A cancelled prepare may be inside one 60s peer RPC, then needs one
     // additional peer-RPC window to restore every node already changed.
     return Math.min(130_000, duration * 2 + 1_000)
@@ -1327,6 +1441,10 @@ function auditDetailsForRequest(
   result: unknown
 ): Readonly<Record<string, unknown>> {
   const details: Record<string, unknown> = { operation: request.operation }
+  if (request.parent) {
+    details.hearthOperationId = request.parent.operationId
+    details.hearthOperationStep = request.parent.step
+  }
   const permission = actionForRequest(request)
   if (permission) {
     details.permission = permission
@@ -1480,6 +1598,50 @@ function appFileAction(operation: RelayControlOperation): RelayAction {
   }
 }
 
+/**
+ * What a request needs besides its action, of the other resource it
+ * changes: a database connection changes its member as well as the
+ * database. Null refuses a request that doesn't say what it changes.
+ */
+function memberActionsForRequest(
+  request: RelayControlRequest
+): ReadonlyArray<RelayAction> | null {
+  switch (request.operation) {
+    case "database.network.write": {
+      const member =
+        request.payload && typeof request.payload === "object"
+          ? (request.payload as Record<string, unknown>).member
+          : undefined
+      switch (objectString(member, "kind")) {
+        case "instance":
+          return ["instance.network.write"]
+        case "app":
+          return ["app.manage"]
+        case "database":
+          return ["database.network.write"]
+        default:
+          return null
+      }
+    }
+    // It connects Apps.
+    case "database.network.import":
+      return ["app.manage"]
+    default:
+      return []
+  }
+}
+
+// Requests any paired Hearth may send, whatever its grant: revising browser
+// authority it issued, and saying which volumes its own Apps' configurations
+// name, or that what it said no longer counts, which only adds protection
+// or replaces what it said before.
+const anyClientOperations = new Set<RelayControlOperation>([
+  "browser.authorization.revise",
+  "relay.volumes.references.import",
+  "relay.volumes.references.hold",
+  "app.volumes.write",
+])
+
 function actionForRequest(request: RelayControlRequest): RelayAction | null {
   if (
     request.operation.startsWith("instance.files.") &&
@@ -1499,6 +1661,9 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
   }
   switch (request.operation) {
     case "relay.snapshot":
+    // A tunnel reaches only the Relay's listener, which checks every
+    // request it carries for itself.
+    case "relay.tunnel.open":
     case "relay.system.inspect":
     case "relay.update.status":
     case "relay.resources.read":
@@ -1553,6 +1718,8 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "relay.database.read"
     case "relay.host.read":
     case "relay.proxy.read":
+    case "relay.security.targets":
+    case "relay.security.inventory":
       return "relay.read"
     case "relay.host.files.mount":
       return "relay.files.mount"
@@ -1566,6 +1733,9 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "relay.volumes.rename":
     case "relay.volumes.delete":
       return "relay.configure"
+    case "relay.volumes.references.import":
+    case "relay.volumes.references.hold":
+      return null
     case "relay.pairing.create":
       return "relay.pairing.create"
     case "relay.pairing.list":
@@ -1586,6 +1756,10 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "relay.platform.database.read":
     case "relay.platform.database.write":
       return "relay.update"
+    // Only full access, which the handler checks too.
+    case "relay.installation.read":
+    case "relay.installation.replace":
+      return "relay.update"
     case "relay.clients.update":
       return "relay.clients.update"
     case "relay.clients.revoke":
@@ -1597,6 +1771,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "brick.read"
     case "database.list":
     case "database.inspect":
+    case "database.resources.read":
       return "database.read"
     // Limits are part of what a database is created with, as a game
     // server's startup settings are.
@@ -1615,6 +1790,8 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "database.credentials.rotate":
       return "database.credentials.rotate"
     case "database.network.write":
+    // Hearth hands over the connections it kept for Apps.
+    case "database.network.import":
       return "database.network.write"
     case "database.dump.export":
       return "database.dump.export"
@@ -1634,6 +1811,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "database.terminal.restart":
       return "database.dump.import"
     case "app.list":
+    case "app.resources.read":
     case "app.network.routes.read":
     case "app.image.check":
       return "app.read"
@@ -1646,12 +1824,28 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "app.provision.cancel":
     case "app.delete":
       return "app.delete"
+    // Freezing a resource, or letting it go, is part of deleting it.
+    case "resource.freeze":
+    case "resource.unfreeze": {
+      const kind = objectString(request.payload, "kind")
+      return kind === "instance"
+        ? "instance.delete"
+        : kind === "database"
+          ? "database.delete"
+          : kind === "app"
+            ? "app.delete"
+            : // A Kiln volume, as deleting it takes.
+              kind === "volume"
+              ? "relay.configure"
+              : null
+    }
     case "app.deploy":
     case "app.action":
     case "app.limits.write":
-    case "app.network.write":
     case "app.network.routes.write":
       return "app.manage"
+    case "app.volumes.write":
+      return null
     case "app.terminal.attach":
     case "app.terminal.heartbeat":
     case "app.terminal.detach":
@@ -1669,9 +1863,42 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     }
     case "backup.task.cancel":
       return "backup.create"
+    // Finishing a restore writes its target as the restore would.
+    case "backup.restore.resolve":
+      return "backup.restore"
     case "backup.task.get":
     case "backup.task.list":
+    case "backup.restore.unfinished":
       return "backup.read"
+    // Copying files between Relays is downloading them from the source and
+    // uploading them to the destination.
+    case "transfer.source.prepare":
+    case "transfer.source.get":
+    case "transfer.source.discard":
+      return fileTransferAction(
+        objectString(request.payload, "rootId") ?? "",
+        "download"
+      )
+    // Free disk is the Relay's state; measuring a root reads what a
+    // transfer of it would download.
+    case "transfer.space": {
+      const rootId = objectString(request.payload, "rootId")
+      return rootId === null
+        ? "relay.read"
+        : fileTransferAction(rootId, "download")
+    }
+    case "transfer.pull.start":
+      return fileTransferAction(
+        objectString(objectRecord(request.payload, "target") ?? {}, "rootId") ??
+          "",
+        "upload"
+      )
+    case "transfer.pull.get":
+    case "transfer.pull.cancel":
+      return fileTransferAction(
+        objectString(request.payload, "rootId") ?? "",
+        "upload"
+      )
     case "schedule.apply":
     case "schedule.run":
     case "schedule.remove":
@@ -1722,6 +1949,16 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "instance.files.sync"
     case "instance.files.database.read":
       return "instance.files.read"
+    // An icon is read like a file under its root. One inside an app's
+    // container takes reading the app's files; the Relay returns only
+    // images from either.
+    case "instance.icon.read": {
+      if (objectString(request.payload, "appId")) return "app.files.read"
+      const root = objectString(request.payload, "instanceId") ?? ""
+      if (isRelayFileRoot(root)) return "relay.files.read"
+      if (appIdFromFileRoot(root)) return "app.files.read"
+      return "instance.files.read"
+    }
     case "instance.files.database.write":
       return "instance.files.write"
     case "instance.console.history":
@@ -1743,12 +1980,18 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "instance.network.databases.remove":
     case "instance.network.routes.write":
       return "instance.network.write"
-    case "hearth.tailscale.instance.detach":
+    case "hearth.tailscale.member.detach":
       return null
     case "sftp.authorization.resolve":
       return "instance.sftp.connect"
   }
   return null
+}
+
+function objectRecord(value: unknown, key: string): object | null {
+  if (!value || typeof value !== "object" || !(key in value)) return null
+  const field = (value as Record<string, unknown>)[key]
+  return field && typeof field === "object" ? field : null
 }
 
 function objectString(value: unknown, key: string): string | null {
@@ -2037,6 +2280,16 @@ function controlFailureFor(
   if (cause instanceof LaneRejectedError && cause.reason === "paused") {
     return { code: "relay_paused", message: cause.message, retryable: false }
   }
+  // Refused while something the Relay keeps says it mustn't run, such as an
+  // unfinished restore or the resource's deletion: expected, not an error to
+  // report.
+  if (cause instanceof LaneRejectedError && cause.reason === "refused") {
+    return {
+      code: "operation_refused",
+      message: cause.message,
+      retryable: false,
+    }
+  }
   // Withdrawn from its lane before it ran, as when Hearth disconnected.
   if (cause instanceof LaneRejectedError && cause.reason === "cancelled") {
     return {
@@ -2054,6 +2307,9 @@ function controlFailureFor(
   }
   if (cause instanceof RelayNotFoundError) {
     return { code: "not_found", message: cause.message, retryable: false }
+  }
+  if (cause instanceof InstallationReplaceError) {
+    return { code: cause.code, message: cause.message, retryable: false }
   }
   if (cause instanceof LaneRejectedError && cause.reason === "busy") {
     return {

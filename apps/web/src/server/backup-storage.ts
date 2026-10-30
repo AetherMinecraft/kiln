@@ -3,12 +3,12 @@ import { randomUUID } from "node:crypto"
 import { createServerFn } from "@tanstack/react-start"
 import { z } from "zod"
 
+import { type BackupTarget, backupTargetSchema } from "@workspace/contracts"
+
 import {
-  backupTargetSchema,
   relayIdSchema,
   resticS3BucketSchema,
   resticS3RegionSchema,
-  type BackupTarget,
 } from "@workspace/contracts"
 
 import {
@@ -20,12 +20,9 @@ import {
   setBackupPolicyStorageEffect,
   type BackupStorageRecord,
 } from "@/backups/destinations/s3"
+import { ensuringPromise } from "@/effect/promise"
 import { runAppEffect } from "@/effect/runtime"
-import {
-  hasPlatformPermission,
-  isPlatformAdmin,
-  requireRelayPermission,
-} from "@/lib/access-control"
+import { hasPlatformPermission, isPlatformAdmin } from "@/lib/access-control"
 import {
   publishBackupSettingsChange,
   publishBackupStorageChange,
@@ -155,6 +152,9 @@ export const saveBackupStorage = createServerFn({ method: "POST" })
       })
     )
     publishBackupStorageChange(ownerUserId)
+    // Schedules carry its credentials and whether it may be used; saving
+    // marked them owed.
+    await deliverSchedules()
     return { id, verified: true }
   })
 
@@ -173,9 +173,15 @@ export const deleteBackupStorage = createServerFn({ method: "POST" })
     ) {
       throw new Error("You cannot delete this backup destination")
     }
-    await runAppEffect(
-      "backupStorage.delete",
-      deleteBackupStorageEffect(data.id)
+    // Marking it deleted marks the schedules backing up to it owed; they're
+    // sent whether or not purging it then succeeds.
+    await ensuringPromise(
+      () =>
+        runAppEffect(
+          "backupStorage.delete",
+          deleteBackupStorageEffect(data.id)
+        ),
+      () => void deliverSchedules()
     )
     publishBackupStorageChange(existing.ownerUserId)
     return { deleted: true }
@@ -202,14 +208,14 @@ export const setPreferredBackupStorage = createServerFn({ method: "POST" })
         throw new Error("Backup destination is unavailable")
       }
       if (storage.ownerUserId !== null && target.kind !== "platform") {
-        await requireRelayPermission({
-          ...(target.kind === "database"
-            ? { databaseId: target.id }
-            : { instanceId: target.id }),
-          permission: "backup.download",
-          relayId: data.relayId,
+        const { requireBackupTargetPermission } =
+          await import("@/server/backup-target-access.server")
+        await requireBackupTargetPermission(
           user,
-        })
+          data.relayId,
+          target,
+          "backup.download"
+        )
       }
     }
     await runAppEffect(
@@ -235,14 +241,14 @@ async function requireBackupPolicyTarget(
     }
     return { id: kilnInstallationId(), kind: "platform" }
   }
-  await requireRelayPermission({
-    ...(input.target.kind === "database"
-      ? { databaseId: input.target.id }
-      : { instanceId: input.target.id }),
-    permission: "backup.create",
-    relayId: input.relayId,
+  const { requireBackupTargetPermission } =
+    await import("@/server/backup-target-access.server")
+  await requireBackupTargetPermission(
     user,
-  })
+    input.relayId,
+    input.target,
+    "backup.create"
+  )
   return input.target
 }
 
@@ -260,4 +266,10 @@ function canUseStorage(
   userId: string
 ): boolean {
   return storage.ownerUserId === null || storage.ownerUserId === userId
+}
+
+async function deliverSchedules() {
+  const { deliverPendingSchedules } =
+    await import("@/server/schedule-deployment.server")
+  deliverPendingSchedules()
 }

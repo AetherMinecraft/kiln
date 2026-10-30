@@ -1,24 +1,26 @@
+import { RELAY_VOLUME_REFERENCES_PENDING } from "@workspace/contracts"
 import { Effect } from "effect"
-import { afterEach, describe, expect, it, vi } from "vite-plus/test"
+import { describe, expect, it } from "vite-plus/test"
 
 import { DockerEngine } from "./docker-engine.js"
 import { fakeDocker } from "./test/docker.js"
-import { relayHarness, TEST_NAMESPACE } from "./test/relay.js"
+import {
+  relayHarness,
+  TEST_NAMESPACE,
+  type RelayHarness,
+} from "./test/relay.js"
 import { RelayVolumes } from "./volumes.js"
 
 const volumeId = "3f9a21c4".padEnd(40, "0")
 const appId = "a".repeat(40)
 
-afterEach(() => {
-  vi.unstubAllEnvs()
-})
-
-async function relayVolumes() {
-  const harness = await relayHarness()
+async function relayVolumes(harness?: RelayHarness) {
+  const relay = harness ?? (await relayHarness())
   return new RelayVolumes(
-    harness.config,
-    new DockerEngine(harness.config.dockerSocket),
-    harness.state
+    relay.config,
+    new DockerEngine(relay.config.dockerSocket),
+    relay.state,
+    () => relay.lifecycle.hostDataDirectory()
   )
 }
 
@@ -26,18 +28,48 @@ function run<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
   return Effect.runPromise(effect)
 }
 
-async function listed(volumes: RelayVolumes) {
-  return (await run(volumes.list())).volumes
+// A Hearth's control connection, as the control socket reports one; each
+// call is a new connection.
+function connect(volumes: RelayVolumes, clientId: string): string {
+  const connectionId = `${clientId}-${Math.random().toString(16).slice(2)}`
+  volumes.clientConnected(clientId, connectionId)
+  return connectionId
 }
 
-// Lists until Docker's measure is done; it's real I/O against the fake.
-async function measured(volumes: RelayVolumes) {
-  let latest = await run(volumes.list())
-  for (let tries = 0; tries < 100 && latest.measuring; tries += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    latest = await run(volumes.list())
-  }
-  return latest
+// A Hearth paired with the Relay, as the control socket pairs one.
+async function pairHearth(
+  harness: RelayHarness,
+  id: string,
+  role: "full_access" | "read_only" = "full_access"
+) {
+  const now = Date.now()
+  await run(
+    harness.state.createInvitation({
+      actions: [],
+      createdAt: now,
+      expiresAt: now + 60_000,
+      id: `invitation-${id}`,
+      role,
+      tokenHash: `hash-${id}`,
+    })
+  )
+  await run(
+    harness.state.pairClient({
+      actions: [],
+      id,
+      invitationId: `invitation-${id}`,
+      name: id,
+      origins: [],
+      pairedAt: now,
+      publicKey: `key-${id}`,
+      role,
+      sourceCidrs: [],
+    })
+  )
+}
+
+async function listed(volumes: RelayVolumes) {
+  return (await run(volumes.list())).volumes
 }
 
 describe("Relay volumes", () => {
@@ -57,155 +89,10 @@ describe("Relay volumes", () => {
       expect.objectContaining({
         dockerName,
         id: volumeId,
-        kind: "volume",
+        kind: "kiln",
         mountpoint: `/var/lib/docker/volumes/${dockerName}/_data`,
         mounts: [],
         name: "Postgres Data!",
-      }),
-    ])
-  })
-
-  it("answers a repeated create with the volume it made, and refuses a name another volume holds", async () => {
-    const volumes = await relayVolumes()
-    await run(volumes.create(volumeId, "data"))
-
-    await expect(run(volumes.create(volumeId, "data"))).resolves.toMatchObject({
-      id: volumeId,
-    })
-    // Another ID with the same short ID, whose name a volume already has.
-    fakeDocker.addVolume({ name: `${TEST_NAMESPACE}-kiln-3f9a21c4-cache` })
-    await expect(
-      run(volumes.create("3f9a21c4".padEnd(40, "1"), "cache"))
-    ).rejects.toThrow("already exists")
-  })
-
-  it("refuses a second volume under an ID another volume has", async () => {
-    const volumes = await relayVolumes()
-    await run(volumes.create(volumeId, "data"))
-
-    await expect(run(volumes.create(volumeId, "uploads"))).rejects.toThrow(
-      "Another volume already has this ID"
-    )
-    expect(
-      [...fakeDocker.volumes.values()].filter(
-        (volume) => volume.labels["kiln.volume.id"] === volumeId
-      )
-    ).toHaveLength(1)
-  })
-
-  it("lists volumes without waiting on Docker to measure them, then reports their sizes", async () => {
-    const volumes = await relayVolumes()
-    const created = await run(volumes.create(volumeId, "data"))
-    fakeDocker.volumes.get(created.dockerName)!.files.set("/a", "hello")
-
-    const first = await run(volumes.list())
-    expect(first).toMatchObject({
-      measuring: true,
-      volumes: [{ sizeBytes: null }],
-    })
-
-    expect(await measured(volumes)).toMatchObject({
-      measuring: false,
-      volumes: [{ sizeBytes: 5 }],
-    })
-  })
-
-  it("measures a volume made since the last measure right away", async () => {
-    const volumes = await relayVolumes()
-    await run(volumes.create(volumeId, "data"))
-    await measured(volumes)
-
-    const later = await run(volumes.create("b".repeat(40), "cache"))
-    fakeDocker.volumes.get(later.dockerName)!.files.set("/a", "hi")
-
-    expect((await run(volumes.list())).measuring).toBe(true)
-    expect(await measured(volumes)).toMatchObject({
-      measuring: false,
-      volumes: [
-        { name: "cache", sizeBytes: 2 },
-        { name: "data", sizeBytes: 0 },
-      ],
-    })
-  })
-
-  it("stops measuring once Docker leaves a volume out of its measure", async () => {
-    const volumes = await relayVolumes()
-    const created = await run(volumes.create(volumeId, "data"))
-    // As Docker leaves out volumes of other drivers, such as NFS.
-    fakeDocker.volumes.get(created.dockerName)!.driver = "nfs"
-
-    expect(await measured(volumes)).toMatchObject({
-      measuring: false,
-      volumes: [{ sizeBytes: null }],
-    })
-    expect((await run(volumes.list())).measuring).toBe(false)
-  })
-
-  it("stops measuring for a while once Docker fails to, so callers stop waiting", async () => {
-    const volumes = await relayVolumes()
-    await run(volumes.create(volumeId, "data"))
-    fakeDocker.failNext({ command: "system df" }, "context deadline exceeded")
-
-    expect((await run(volumes.list())).measuring).toBe(true)
-
-    expect(await measured(volumes)).toMatchObject({
-      measuring: false,
-      volumes: [{ sizeBytes: null }],
-    })
-    expect((await run(volumes.list())).measuring).toBe(false)
-  })
-
-  it("lists only its own volumes, with the containers that mount each", async () => {
-    const volumes = await relayVolumes()
-    const created = await run(volumes.create(volumeId, "shared"))
-    fakeDocker.addVolume({ name: "someone-elses" })
-    fakeDocker.addVolume({
-      labels: {
-        "kiln.relay.owner": "another-relay",
-        "kiln.resource.kind": "volume",
-        "kiln.volume.id": "b".repeat(40),
-      },
-      name: "another-relay-kiln-bbbbbbbb-shared",
-    })
-    fakeDocker.addContainer({
-      labels: { "kiln.app.id": appId, "kiln.resource.kind": "app" },
-      mounts: [
-        {
-          destination: "/srv",
-          readOnly: true,
-          source: created.dockerName,
-          type: "volume",
-        },
-      ],
-      name: "web",
-      running: true,
-    })
-
-    const [shared, ...others] = await listed(volumes)
-
-    expect(others).toEqual([])
-    expect(shared?.mounts).toEqual([
-      {
-        container: "web",
-        destination: "/srv",
-        kind: "app",
-        readOnly: true,
-        resourceId: appId,
-        running: true,
-      },
-    ])
-  })
-
-  it("keeps a new name while Docker keeps the volume's own", async () => {
-    const volumes = await relayVolumes()
-    const created = await run(volumes.create(volumeId, "data"))
-
-    await run(volumes.rename(volumeId, "Uploads"))
-
-    expect(await listed(volumes)).toEqual([
-      expect.objectContaining({
-        dockerName: created.dockerName,
-        name: "Uploads",
       }),
     ])
   })
@@ -232,34 +119,86 @@ describe("Relay volumes", () => {
     expect(await listed(volumes)).toEqual([])
   })
 
-  it("lists the Relay's own data volume, which no request can name to delete", async () => {
+  it("refuses to delete a volume an App's configuration names, though the App isn't deployed", async () => {
     const harness = await relayHarness()
-    const volumes = new RelayVolumes(
-      harness.config,
-      new DockerEngine(harness.config.dockerSocket),
-      harness.state
-    )
-    fakeDocker.addVolume({ name: "kiln_relay-data" })
-    const relay = fakeDocker.addContainer({
-      mounts: [
-        {
-          destination: harness.config.dataDirectory,
-          source: "kiln_relay-data",
-          type: "volume",
-        },
-      ],
-      name: "kiln-relay-1",
-      running: true,
-    })
-    vi.stubEnv("HOSTNAME", relay.id.slice(0, 12))
+    const volumes = await relayVolumes(harness)
+    await pairHearth(harness, "hearth-a")
+    await harness.apps.create({ id: appId, name: "Website" })
+    const created = await run(volumes.create(volumeId, "media"))
 
-    expect(await listed(volumes)).toEqual([
-      expect.objectContaining({
-        dockerName: "kiln_relay-data",
-        id: null,
-        kind: "relay",
-        mounts: [expect.objectContaining({ kind: "relay" })],
-      }),
-    ])
+    // Until the Hearth has said which configurations name which volumes,
+    // none can be deleted.
+    await expect(run(volumes.delete(volumeId))).rejects.toThrow(
+      RELAY_VOLUME_REFERENCES_PENDING
+    )
+    await run(
+      volumes.importAppReferences(
+        "hearth-a",
+        connect(volumes, "hearth-a"),
+        [{ appId, volumeIds: [volumeId] }],
+        []
+      )
+    )
+    await expect(run(volumes.delete(volumeId))).rejects.toThrow(
+      "An App's configuration mounts this volume"
+    )
+    // Nor frozen for its deletion.
+    await expect(run(volumes.requireDeletable(volumeId))).rejects.toThrow(
+      "An App's configuration mounts this volume"
+    )
+    expect(fakeDocker.volumes.has(created.dockerName)).toBe(true)
+
+    await run(volumes.writeAppReferences("hearth-a", appId, []))
+    await run(volumes.delete(volumeId))
+
+    expect(fakeDocker.volumes.has(created.dockerName)).toBe(false)
+  })
+
+  it("waits for every paired Hearth, even a read-only one, and forgets a revoked one", async () => {
+    const harness = await relayHarness()
+    const volumes = await relayVolumes(harness)
+    await pairHearth(harness, "hearth-a")
+    // Read-only now, it may still keep configurations from before.
+    await pairHearth(harness, "hearth-b", "read_only")
+    await harness.apps.create({ id: appId, name: "Website" })
+    const created = await run(volumes.create(volumeId, "media"))
+
+    // Hearth A's import says nothing about Hearth B's Apps.
+    await run(
+      volumes.importAppReferences(
+        "hearth-a",
+        connect(volumes, "hearth-a"),
+        [],
+        []
+      )
+    )
+    await expect(run(volumes.delete(volumeId))).rejects.toThrow(
+      "waiting for hearth-b to connect"
+    )
+    // Hearth B's undeployed App names the volume.
+    await run(
+      volumes.importAppReferences(
+        "hearth-b",
+        connect(volumes, "hearth-b"),
+        [{ appId, volumeIds: [volumeId] }],
+        []
+      )
+    )
+    await expect(run(volumes.delete(volumeId))).rejects.toThrow(
+      "An App's configuration mounts this volume"
+    )
+
+    // A Hearth paired since owes its configurations before anything goes.
+    await pairHearth(harness, "hearth-c")
+    await run(harness.state.revokeClient("hearth-b", Date.now()))
+    const hearthC = connect(volumes, "hearth-c")
+    await expect(run(volumes.delete(volumeId))).rejects.toThrow(
+      "waiting for hearth-c to send"
+    )
+    await run(volumes.importAppReferences("hearth-c", hearthC, [], []))
+
+    // What revoked Hearth B said no longer keeps the volume.
+    await run(volumes.delete(volumeId))
+    expect(fakeDocker.volumes.has(created.dockerName)).toBe(false)
   })
 })

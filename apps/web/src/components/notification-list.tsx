@@ -1,23 +1,33 @@
 import * as React from "react"
-import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import type { QueryClient } from "@tanstack/react-query"
 import { Link, useNavigate } from "@tanstack/react-router"
 import {
+  ArrowRightLeft,
+  ChevronDown,
   CloudUpload,
   HardDrive,
   PackageCheck,
   PackagePlus,
   Rocket,
+  ShieldAlert,
   UserMinus,
   UserPlus,
   X,
 } from "lucide-react"
 
 import { Button } from "@workspace/ui/components/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@workspace/ui/components/dropdown-menu"
 import { showToast } from "@workspace/ui/components/sonner"
 import { cn } from "@workspace/ui/lib/utils"
 
 import { RelativeTime } from "@/components/relative-time"
+import { ServerDeleteDialog } from "@/components/server-delete-dialog"
 import {
   acceptedInvitationHref,
   useResourceInvitationDecision,
@@ -35,7 +45,11 @@ import type {
   NotificationResource,
 } from "@/lib/notifications"
 import { notificationDetail, notificationTitle } from "@/lib/notification-text"
-import { appDirectoryQueryOptions } from "@/lib/query-options"
+import {
+  accessCapabilitiesQueryOptions,
+  appDirectoryQueryOptions,
+} from "@/lib/query-options"
+import { securityScopeKey } from "@/lib/security"
 
 export type NotificationListItem =
   | { key: string; kind: "group"; label: string }
@@ -244,7 +258,148 @@ function NotificationActions({
           onNavigate={onNavigate}
         />
       )
+    case "security.report":
+      return (
+        <SecurityReportButton
+          resources={content.resources}
+          onNavigate={onNavigate}
+        />
+      )
+    case "server.migration":
+      if (content.outcome !== "completed") {
+        return (
+          <OpenResourceButton
+            resource={content.source}
+            onNavigate={onNavigate}
+          />
+        )
+      }
+      return (
+        <div className="relative flex shrink-0 items-center gap-1.5">
+          {content.mode === "migrate" &&
+          !content.sourceDeleted &&
+          !content.sourceDeleting ? (
+            <DeleteMovedServerButton server={content.source} />
+          ) : null}
+          <OpenResourceButton
+            resource={content.destination}
+            onNavigate={onNavigate}
+          />
+        </div>
+      )
   }
+}
+
+// A finished move leaves the old server stopped where it was; deleting it
+// is up to the person, and permanent, as the dialog says.
+function DeleteMovedServerButton({ server }: { server: NotificationResource }) {
+  const [open, setOpen] = React.useState(false)
+  return (
+    <>
+      <Button variant="destructive" size="xs" onClick={() => setOpen(true)}>
+        Delete old server
+      </Button>
+      {open ? (
+        <ServerDeleteDialog
+          open
+          target={{
+            backupAvailable: true,
+            id: server.id,
+            name: server.name,
+            relayId: server.relayId,
+          }}
+          onOpenChange={setOpen}
+        />
+      ) : null}
+    </>
+  )
+}
+
+// Opens Kiln's Security page, narrowed to the one resource a report is
+// about. The page is for platform administrators; anyone else opens one of
+// the resources, whose Info page says what it has.
+function SecurityReportButton({
+  onNavigate,
+  resources,
+}: {
+  onNavigate?: () => void
+  resources: ReadonlyArray<NotificationResource>
+}) {
+  const { data: platformAdmin = false } = useQuery({
+    ...accessCapabilitiesQueryOptions(),
+    select: selectPlatformAdmin,
+  })
+  const only = resources.length === 1 ? resources[0] : undefined
+  if (!platformAdmin)
+    return only ? (
+      <OpenResourceButton resource={only} onNavigate={onNavigate} />
+    ) : (
+      <OpenResourceMenu resources={resources} onNavigate={onNavigate} />
+    )
+  return (
+    <Button asChild variant="outline" size="xs" className="relative shrink-0">
+      <Link
+        to="/kiln/security"
+        search={
+          only
+            ? { scope: securityScopeKey(only.type, only.relayId, only.id) }
+            : {}
+        }
+        onClick={onNavigate}
+      >
+        Review
+      </Link>
+    </Button>
+  )
+}
+
+// Each resource a report names, for people the Security page isn't open to.
+function OpenResourceMenu({
+  onNavigate,
+  resources,
+}: {
+  onNavigate?: () => void
+  resources: ReadonlyArray<NotificationResource>
+}) {
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="xs" className="relative shrink-0">
+          Open
+          <ChevronDown aria-hidden />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {resources.map((resource) => (
+          <DropdownMenuItem
+            key={`${resource.type}:${resource.relayId}:${resource.id}`}
+            onSelect={() => {
+              onNavigate?.()
+              void navigate({ href: resourceHref(queryClient, resource) })
+            }}
+          >
+            {resource.name}
+            <span className="ml-auto pl-3 text-xs text-muted-foreground">
+              {resourceTypeLabels[resource.type]}
+            </span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+const resourceTypeLabels = {
+  app: "App",
+  database: "Database",
+  instance: "Game Server",
+  relay: "Relay",
+} satisfies Record<NotificationResource["type"], string>
+
+function selectPlatformAdmin(capabilities: { isPlatformAdmin: boolean }) {
+  return capabilities.isPlatformAdmin
 }
 
 // Opens the Updates dialog's changelog.
@@ -328,21 +483,25 @@ function OpenResourceButton({
       className="relative shrink-0"
       onClick={() => {
         onNavigate?.()
-        void navigate({
-          href:
-            resource.type === "app"
-              ? appHref(queryClient, resource.id)
-              : acceptedInvitationHref(queryClient, {
-                  relayId: resource.relayId,
-                  resourceId: resource.id,
-                  resourceType: resource.type,
-                }),
-        })
+        void navigate({ href: resourceHref(queryClient, resource) })
       }}
     >
       Open
     </Button>
   )
+}
+
+function resourceHref(
+  queryClient: QueryClient,
+  resource: NotificationResource
+) {
+  return resource.type === "app"
+    ? appHref(queryClient, resource.id)
+    : acceptedInvitationHref(queryClient, {
+        relayId: resource.relayId,
+        resourceId: resource.id,
+        resourceType: resource.type,
+      })
 }
 
 // The app's own page, by its short ID when the cached directory can tell it
@@ -388,6 +547,8 @@ const notificationIcons = {
   "resource.disk-limit": HardDrive,
   "app.image-update": PackagePlus,
   "app.deployed": CloudUpload,
+  "security.report": ShieldAlert,
+  "server.migration": ArrowRightLeft,
 } satisfies Record<
   NotificationContent["kind"],
   React.ComponentType<{ className?: string }>

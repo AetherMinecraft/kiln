@@ -7,10 +7,16 @@ import type {
   IdentityNameProps,
   IdentityStatusPresentation,
 } from "@/components/identity-name"
+import { SubjectIcon } from "@/components/icon-image"
 import { instanceKindIcons } from "@/components/instance-kind-icon"
 import { LiveServerBrickIcon } from "@/components/server-brick-icon"
-import { InstanceFavoriteStar } from "@/components/instance-favorite"
+import {
+  InstanceFavoriteBadge,
+  InstanceFavoriteStar,
+} from "@/components/instance-favorite"
 import { StatusIndicator } from "@/components/status-indicator"
+import type { InstanceIconSubject } from "@/lib/icons"
+import { kilnFavorite } from "@/lib/instance-favorites"
 import { useInstanceState, type InstanceState } from "@/lib/instance-state"
 import { instanceStatePresentation } from "@/lib/instance-state-presentation"
 
@@ -27,6 +33,12 @@ export interface InstanceCardProps extends Omit<
   "icon" | "status"
 > {
   instance: InstanceIdentity
+  /**
+   * Marks a favorite with a star on the icon's corner. Tables pass `md:hidden`
+   * to `iconFavoriteClassName`, where their favorite column takes over.
+   */
+  iconFavorite?: boolean
+  iconFavoriteClassName?: string
   iconSizeClassName?: string
   showFavorite?: boolean
   showStatus?: boolean
@@ -74,6 +86,8 @@ function LiveInstanceCard(props: InstanceCardProps) {
 
 const InstanceCardView = React.memo(function InstanceCardView({
   instance,
+  iconFavorite = false,
+  iconFavoriteClassName,
   iconSizeClassName,
   showFavorite = true,
   showStatus = true,
@@ -83,34 +97,53 @@ const InstanceCardView = React.memo(function InstanceCardView({
   status,
   ...props
 }: InstanceCardProps) {
-  const Icon = instanceKindIcons[instance.kind]
   const kiln = isKilnIdentity(instance)
+  const iconSubject = React.useMemo(
+    () =>
+      kiln
+        ? null
+        : instanceIconSubject({
+            id: instance.id,
+            kind: instance.kind,
+            relayId: instance.relayId,
+          }),
+    [instance.id, instance.kind, instance.relayId, kiln]
+  )
+  // Kiln shows through its host's Relay but is starred on its own.
+  const favorite = kiln ? kilnFavorite : instance
   return (
     <IdentityName
       {...props}
       meta={meta}
-      icon={
-        instance.kind === "server" && instance.implementation ? (
-          <LiveServerBrickIcon
-            brickId={instance.brickId}
-            brickSource={instance.brickSource}
-            implementation={instance.implementation}
-            className={iconSizeClassName}
+      iconBadge={
+        iconFavorite ? (
+          <InstanceFavoriteBadge
+            className={iconFavoriteClassName}
+            id={favorite.id}
+            kind={favorite.kind}
+            relayId={favorite.relayId}
           />
-        ) : kiln ? (
-          <HearthMark className={iconSizeClassName ?? "size-4"} />
-        ) : (
-          <Icon className={iconSizeClassName ?? "size-4"} aria-hidden="true" />
-        )
+        ) : undefined
+      }
+      icon={
+        <SubjectIcon
+          fallback={
+            <InstanceFallbackIcon
+              iconSizeClassName={iconSizeClassName}
+              instance={instance}
+              kiln={kiln}
+            />
+          }
+          subject={iconSubject}
+        />
       }
       nameAccessory={
-        // Kiln isn't one of the Relay's instances to favorite.
-        showFavorite && !kiln ? (
+        showFavorite ? (
           <>
             <InstanceFavoriteStar
-              id={instance.id}
-              kind={instance.kind}
-              relayId={instance.relayId}
+              id={favorite.id}
+              kind={favorite.kind}
+              relayId={favorite.relayId}
             />
             {nameAccessory}
           </>
@@ -125,6 +158,31 @@ const InstanceCardView = React.memo(function InstanceCardView({
   )
 })
 
+// The kind's or Brick's own icon, for an instance without one of its own.
+function InstanceFallbackIcon({
+  iconSizeClassName,
+  instance,
+  kiln,
+}: {
+  iconSizeClassName: string | undefined
+  instance: InstanceIdentity
+  kiln: boolean
+}) {
+  const Icon = instanceKindIcons[instance.kind]
+  return instance.kind === "server" && instance.implementation ? (
+    <LiveServerBrickIcon
+      brickId={instance.brickId}
+      brickSource={instance.brickSource}
+      implementation={instance.implementation}
+      className={iconSizeClassName}
+    />
+  ) : kiln ? (
+    <HearthMark className={iconSizeClassName ?? "size-4"} />
+  ) : (
+    <Icon className={iconSizeClassName ?? "size-4"} aria-hidden="true" />
+  )
+}
+
 /** Kiln itself, shown through the Relay on its host. */
 export function isKilnIdentity(instance: InstanceIdentity): boolean {
   return (
@@ -132,4 +190,13 @@ export function isKilnIdentity(instance: InstanceIdentity): boolean {
     "platform" in instance &&
     instance.platform === true
   )
+}
+
+/** What an instance's own icon belongs to; Relays have none. */
+export function instanceIconSubject(
+  instance: Pick<InstanceReference, "id" | "kind" | "relayId">
+): InstanceIconSubject | null {
+  return instance.kind === "relay"
+    ? null
+    : { kind: instance.kind, relayId: instance.relayId, id: instance.id }
 }

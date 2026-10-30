@@ -34,7 +34,6 @@ const hearthUrl = orbstack
 const relayHost = orbstack ? `relay.${stack}.orb.local` : "relay"
 const relayUrl = orbstack ? `https://${relayHost}` : `https://${relayHost}:4100`
 const composeFiles = [
-  resolve(worktreeRoot, "compose.yaml"),
   resolve(worktreeRoot, "compose.dev.yaml"),
   ...(orbstack ? [resolve(worktreeRoot, "compose.dev.orbstack.yaml")] : []),
 ]
@@ -109,8 +108,12 @@ switch (command) {
   case "test":
     // Web tests, including the real-MySQL suites, against this stack's MySQL.
     run(
-      "pnpm",
-      ["exec", "vp", "test", "run", ...process.argv.slice(3)],
+      process.execPath,
+      [
+        resolve(worktreeRoot, "scripts/verify.mjs"),
+        "hearth",
+        ...process.argv.slice(3),
+      ],
       {
         ...process.env,
         KILN_TEST_MYSQL: "1",
@@ -120,7 +123,7 @@ switch (command) {
         DB_USERNAME: "root",
         DB_PASSWORD: "kiln-root",
       },
-      resolve(worktreeRoot, "apps/web")
+      worktreeRoot
     )
     break
   case "list":
@@ -278,7 +281,9 @@ function printStack() {
 
 function setupEnvironment() {
   if (!existsSync(environmentFile)) {
-    const example = resolve(primaryRoot, ".env.hearth.example")
+    // This checkout's template: the primary checkout may be on another
+    // revision. The .env it makes is shared.
+    const example = resolve(worktreeRoot, ".env.dev.example")
     if (!existsSync(example)) fail(`Missing environment template: ${example}`)
     writeFileSync(environmentFile, readFileSync(example, "utf8"), {
       mode: 0o600,

@@ -1,3 +1,4 @@
+import { FinalBackupFields } from "@/components/final-backup-fields"
 import { instanceInventoryScope } from "@/lib/instance-inventory"
 import { useInstanceState } from "@/lib/instance-state"
 import * as React from "react"
@@ -24,12 +25,19 @@ import {
 import { Input } from "@workspace/ui/components/input"
 import { showToast } from "@workspace/ui/components/sonner"
 
-import { databaseFileRootId } from "@workspace/contracts"
+import {
+  databaseEngineSupportsLogicalBackups,
+  databaseFileRootId,
+} from "@workspace/contracts"
 
 import {
   showDatabaseOperationError,
   type ManagedDatabase,
 } from "@/components/database/database-presentation"
+import {
+  DeleteConfirmationFields,
+  useDeleteConfirmation,
+} from "@/components/delete-confirmation-fields"
 import { downloadRelayFile, uploadRelayFile } from "@/lib/relay-file-transfer"
 import {
   managedDatabaseCredentialQueryOptions,
@@ -539,10 +547,22 @@ export function DeleteDatabaseDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const queryClient = useQueryClient()
+  const confirmation = useDeleteConfirmation(database.name)
+  const supportsBackup = databaseEngineSupportsLogicalBackups(database.engine)
+  const [createBackup, setCreateBackup] = React.useState(supportsBackup)
+  const [backupDestination, setBackupDestination] = React.useState("default")
   const remove = useMutation({
     mutationFn: () =>
       deleteManagedDatabase({
-        data: { databaseId: database.id, relayId: database.relayId },
+        data: {
+          ...confirmation.input,
+          createBackup: supportsBackup && createBackup,
+          ...(createBackup && backupDestination !== "default"
+            ? { storageId: backupDestination === "local" ? null : backupDestination }
+            : {}),
+          databaseId: database.id,
+          relayId: database.relayId,
+        },
       }),
     onSuccess: async () => {
       onDeleted?.()
@@ -557,46 +577,75 @@ export function DeleteDatabaseDialog({
     },
   })
 
+  // Not while it's deleting: the request carries on either way.
+  const close = (next: boolean) => {
+    if (!remove.isPending) onOpenChange(next)
+  }
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={close}>
       <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Delete {database.name}?</DialogTitle>
-          <DialogDescription>
-            The container, isolated network, persistent data volume,
-            credentials, and access grants will be permanently removed.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs light:bg-destructive/10">
-          <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
-          This action cannot be undone. Export a SQL dump first if you need a
-          recovery copy.
-        </div>
-        {remove.error ? (
-          <p className="text-xs text-destructive">{remove.error.message}</p>
-        ) : null}
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="ghost"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
-          <Button
+        <form
+          className="grid gap-4"
+          onSubmit={(event) => {
+            event.preventDefault()
+            if (confirmation.ready && !remove.isPending) remove.mutate()
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>Delete {database.name}?</DialogTitle>
+            <DialogDescription>
+              The container, isolated network, persistent data volume,
+              credentials, and access grants will be permanently removed.
+              Schedules left with nothing else to run on are deleted too.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs light:bg-destructive/10">
+            <CircleAlert className="mt-0.5 size-4 shrink-0 text-destructive" />
+            This action cannot be undone.
+          </div>
+          <FinalBackupFields
+            available={supportsBackup}
+            createBackup={createBackup}
+            destination={backupDestination}
+            hint="A live dump, while the database is running. Connected Apps and game servers can still write until it is deleted; later writes may not be backed up."
+            label="Back up database before deleting"
+            open={open}
+            pending={remove.isPending}
+            unavailable="This database engine does not support logical backups."
+            onCreateBackupChange={setCreateBackup}
+            onDestinationChange={setBackupDestination}
+          />
+          <DeleteConfirmationFields
+            confirmation={confirmation}
             disabled={remove.isPending}
-            type="button"
-            variant="destructive"
-            onClick={() => remove.mutate()}
-          >
-            {remove.isPending ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <Trash2 />
-            )}
-            Delete database
-          </Button>
-        </DialogFooter>
+          />
+          {remove.error ? (
+            <p className="text-xs text-destructive">{remove.error.message}</p>
+          ) : null}
+          <DialogFooter>
+            <Button
+              disabled={remove.isPending}
+              type="button"
+              variant="ghost"
+              onClick={() => close(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              disabled={remove.isPending || !confirmation.ready}
+              type="submit"
+              variant="destructive"
+            >
+              {remove.isPending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Trash2 />
+              )}
+              Delete database
+            </Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   )

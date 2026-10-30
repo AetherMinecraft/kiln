@@ -407,6 +407,16 @@ function serviceSpecs(
     },
     image: state.hearth.image,
     labels: { ...labels("hearth"), ...coolifyLabels(state, config) },
+    // Grype's vulnerability database, about 3 GB, kept across Hearth's
+    // updates. It's a cache Hearth downloads again when it's missing, so
+    // backups leave it out.
+    mounts: [
+      {
+        source: `${names.hearth}-data`,
+        target: "/var/lib/kiln",
+        type: "volume",
+      },
+    ],
     name: names.hearth,
     network: { aliases: [names.hearth], name: names.network },
     ports: [
@@ -627,9 +637,10 @@ export const reconcilePlatform = Effect.fn("Relay.platform.reconcile")(
         if (invitationId && !state.ownerInvitationIds.includes(invitationId)) {
           state = {
             ...state,
-            ownerInvitationIds: [...state.ownerInvitationIds, invitationId].slice(
-              -OWNER_INVITATIONS_KEPT
-            ),
+            ownerInvitationIds: [
+              ...state.ownerInvitationIds,
+              invitationId,
+            ].slice(-OWNER_INVITATIONS_KEPT),
           }
           yield* writePlatformState(config.dataDirectory, state)
         }
@@ -740,12 +751,10 @@ export const ownContainer = Effect.fnUntraced(function* (
     Effect.catch(() => Effect.succeed(false))
   )
   if (!written) return null
-  const proven = yield* engine
-    .containerPathExists(id, proof)
-    .pipe(
-      Effect.catch(() => Effect.succeed(false)),
-      Effect.ensuring(Effect.promise(() => rm(proof, { force: true })))
-    )
+  const proven = yield* engine.containerPathExists(id, proof).pipe(
+    Effect.catch(() => Effect.succeed(false)),
+    Effect.ensuring(Effect.promise(() => rm(proof, { force: true })))
+  )
   return proven ? candidate : null
 })
 
@@ -2104,7 +2113,8 @@ export const runPlatformCli = Effect.fn("Relay.platform.cli")(function* (
     if (!path) return yield* new PlatformError({ reason: CLI_USAGE })
     if (state) {
       return yield* new PlatformError({
-        reason: "This Relay already has an installation; import a kit on a new Relay",
+        reason:
+          "This Relay already has an installation; import a kit on a new Relay",
       })
     }
     const imported = yield* importPlatformKit(config, path)
@@ -2144,7 +2154,8 @@ export const runPlatformCli = Effect.fn("Relay.platform.cli")(function* (
       return
     case "repair": {
       const result = yield* reconcilePlatform(context)
-      if (result.issue) return yield* new PlatformError({ reason: result.issue })
+      if (result.issue)
+        return yield* new PlatformError({ reason: result.issue })
       print("Kiln's services are running")
       return
     }
@@ -2155,7 +2166,8 @@ export const runPlatformCli = Effect.fn("Relay.platform.cli")(function* (
         current.phase === phase ? current : { ...current, phase }
       )
       const result = yield* reconcilePlatform(context)
-      if (result.issue) return yield* new PlatformError({ reason: result.issue })
+      if (result.issue)
+        return yield* new PlatformError({ reason: result.issue })
       print(
         phase === "maintenance"
           ? "Hearth is stopped and stays stopped until `kiln-relay platform start-hearth`"
@@ -2176,7 +2188,8 @@ export const runPlatformCli = Effect.fn("Relay.platform.cli")(function* (
         phase: "maintenance",
       }))
       const result = yield* reconcilePlatform(context)
-      if (result.issue) return yield* new PlatformError({ reason: result.issue })
+      if (result.issue)
+        return yield* new PlatformError({ reason: result.issue })
       print(
         `Hearth's database is empty and Hearth is held stopped. Restore a platform backup with \`kiln-relay platform-backup restore <backup> --confirm ${state.installationId}\`, then run \`kiln-relay platform start-hearth\`.`
       )

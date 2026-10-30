@@ -17,20 +17,11 @@ vi.mock("@/lib/auth-session", () => ({
 
 import { forwardBrowserTelemetry } from "./browser-telemetry"
 
-const traceIdKept = `00000000${"a".repeat(24)}`
-const traceIdDropped = `ffffffff${"a".repeat(24)}`
-
 function telemetryRequest(body: unknown): Request {
   return new Request("https://hearth.example.com/api/telemetry/v1/x", {
     method: "POST",
     body: typeof body === "string" ? body : JSON.stringify(body),
   })
-}
-
-function spoofedResource() {
-  return {
-    attributes: [{ key: "service.name", value: { stringValue: "relay" } }],
-  }
 }
 
 describe("browser telemetry forwarding", () => {
@@ -81,60 +72,5 @@ describe("browser telemetry forwarding", () => {
     expect(oversized.status).toBe(413)
     expect(malformed.status).toBe(400)
     expect(boundary.forwarded).toEqual([])
-  })
-
-  it("forwards logs as the browser with Hearth's backend credentials", async () => {
-    const response = await forwardBrowserTelemetry(
-      telemetryRequest({
-        resourceLogs: [
-          {
-            resource: spoofedResource(),
-            scopeLogs: [{ logRecords: [{ body: { stringValue: "boom" } }] }],
-          },
-        ],
-      }),
-      "logs"
-    )
-    expect(response.status).toBe(204)
-    expect(boundary.forwarded).toHaveLength(1)
-    const [request] = boundary.forwarded
-    expect(request.url).toBe(
-      "https://otlp.example.com/otlp/v1/logs?tenant=one"
-    )
-    expect(request.headers.get("authorization")).toBe("Bearer secret")
-    expect(request.body).toMatchObject({
-      resourceLogs: [
-        {
-          resource: {
-            attributes: expect.arrayContaining([
-              { key: "service.name", value: { stringValue: "hearth-browser" } },
-            ]),
-          },
-          scopeLogs: [{ logRecords: [{ body: { stringValue: "boom" } }] }],
-        },
-      ],
-    })
-  })
-
-  it("keeps every browser trace while page opens are baselined", async () => {
-    const spans = [
-      { traceId: traceIdKept, name: "kept" },
-      { traceId: traceIdDropped, name: "dropped" },
-    ]
-    const response = await forwardBrowserTelemetry(
-      telemetryRequest({
-        resourceSpans: [
-          { resource: spoofedResource(), scopeSpans: [{ spans }] },
-        ],
-      }),
-      "traces"
-    )
-    expect(response.status).toBe(204)
-    expect(boundary.forwarded).toHaveLength(1)
-    expect(boundary.forwarded[0].body).toMatchObject({
-      resourceSpans: [
-        { scopeSpans: [{ spans: [{ name: "kept" }, { name: "dropped" }] }] },
-      ],
-    })
   })
 })

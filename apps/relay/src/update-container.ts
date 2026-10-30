@@ -152,6 +152,14 @@ export function replaceContainerEffect(
       delete preservedConfig.Cmd
       delete preservedConfig.Entrypoint
       delete preservedConfig.Healthcheck
+      // The join link a Relay was installed with is spent once it joined,
+      // and holds a secret: a replacement starts without it.
+      if (Array.isArray(current.Config.Env)) {
+        preservedConfig.Env = current.Config.Env.filter(
+          (entry: unknown) =>
+            typeof entry !== "string" || !entry.startsWith("KILN_RELAY_JOIN=")
+        )
+      }
       // Docker's default hostname is the old container ID. Let Docker
       // regenerate it after the old container becomes the backup.
       if (isDockerGeneratedHostname(current.Config.Hostname, current.Id)) {
@@ -183,12 +191,14 @@ export function replaceContainerEffect(
           },
           NetworkingConfig: {
             EndpointsConfig: {
-              [primaryNetwork]: {
-                Aliases: networkAliases(
-                  networks[primaryNetwork]?.Aliases,
-                  input.targetContainer
-                ),
-              },
+              [primaryNetwork]: userDefinedNetwork(primaryNetwork)
+                ? {
+                    Aliases: networkAliases(
+                      networks[primaryNetwork]?.Aliases,
+                      input.targetContainer
+                    ),
+                  }
+                : {},
             },
           },
         })
@@ -203,12 +213,18 @@ export function replaceContainerEffect(
         (network) =>
           updateOperation(
             "replace.connectNetwork",
-            docker.connectNetwork(network, input.targetContainer, {
-              aliases: networkAliases(
-                networks[network]?.Aliases,
-                input.targetContainer
-              ),
-            })
+            docker.connectNetwork(
+              network,
+              input.targetContainer,
+              userDefinedNetwork(network)
+                ? {
+                    aliases: networkAliases(
+                      networks[network]?.Aliases,
+                      input.targetContainer
+                    ),
+                  }
+                : {}
+            )
           ),
         { discard: true }
       )
@@ -480,6 +496,15 @@ export function isDockerGeneratedHostname(
   containerId: string
 ): boolean {
   return hostname === containerId.slice(0, 12) || hostname === containerId
+}
+
+// Docker's own bridge, host, and none networks take no aliases: a Relay
+// the installer started without a proxy is on the bridge.
+export function userDefinedNetwork(network: string): boolean {
+  return (
+    !["bridge", "host", "none"].includes(network) &&
+    !network.startsWith("container:")
+  )
 }
 
 export function networkAliases(

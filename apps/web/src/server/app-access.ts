@@ -7,7 +7,6 @@ import {
   loadAppConfigEffect,
   updateAppConfigEffect,
 } from "@/effect/managed-apps"
-import { resolveMinecraftProfileEffect } from "@/effect/minecraft-profile"
 import { ownerDisplayName } from "@/effect/relay-owners"
 import { runAppEffect } from "@/effect/runtime"
 import {
@@ -36,7 +35,7 @@ export async function authorizedApp(
   return authorizedAppFor(await requireEligibleResourceUser(), data, permission)
 }
 
-async function authorizedAppFor(
+export async function authorizedAppFor(
   user: AuthenticatedUser,
   data: { appId: string; relayId: string },
   permission: AccessPermission
@@ -56,13 +55,12 @@ async function authorizedAppFor(
   return { app, relay, user }
 }
 
-// What an edit may change. Databases change through the network, which also
-// connects running containers, and limits through their own update, which
-// applies them to running ones; everything else waits for the next
-// deployment. Mounts have no default, so an edit that leaves them out keeps
-// them.
+// What an edit may change. Limits change through their own update, which
+// applies them to running containers, and databases through the network,
+// which the Relay keeps; everything else waits for the next deployment.
+// Mounts have no default, so an edit that leaves them out keeps them.
 export const appConfigPatchSchema = appConfigSchema
-  .omit({ databaseIds: true, serviceLimits: true })
+  .omit({ serviceLimits: true })
   .partial()
   .extend({ mounts: appMountsSchema.optional() })
 
@@ -216,7 +214,7 @@ export async function getAppOwnerHandler(
   data: { appId: string; relayId: string }
 ): Promise<{
   canTransfer: boolean
-  owner: { email: string | null; name: string } | null
+  owner: { email: string | null; name: string; userId: string } | null
 }> {
   const { canReadPeople, row } = await readableAppOwner(user, data)
   return {
@@ -225,6 +223,8 @@ export async function getAppOwnerHandler(
       ? {
           email: canReadPeople ? row.email : null,
           name: ownerDisplayName(row, canReadPeople),
+          // For their picture.
+          userId: row.id,
         }
       : null,
   }
@@ -235,12 +235,11 @@ export async function getAppOwnerHandler(
  * an administrator or the app's owner, and a new owner with Relay access.
  * Asking by email keeps the Relay's people out of the owner's view.
  */
-export async function transferAppOwnershipHandler(
+/** Refuses all but an App's owner or an administrator its transfer. */
+export async function requireAppTransferable(
   user: AuthenticatedUser,
-  data: { appId: string; email: string; relayId: string }
-): Promise<{ previousOwnerId: string | null; userId: string }> {
-  // Only the owner or an administrator learns anything about the email; the
-  // transfer checks this again while it holds the app.
+  data: { appId: string; relayId: string }
+): Promise<void> {
   const [apps] = await databasePool.query<
     Array<RowDataPacket & { owner_id: string | null }>
   >(
@@ -250,6 +249,15 @@ export async function transferAppOwnershipHandler(
   if (!apps[0]) throw new Error("App not found")
   if (!isPlatformAdmin(user) && apps[0].owner_id !== user.id)
     throw new Error("Only the app owner can transfer ownership")
+}
+
+export async function transferAppOwnershipHandler(
+  user: AuthenticatedUser,
+  data: { appId: string; email: string; relayId: string }
+): Promise<{ previousOwnerId: string | null; userId: string }> {
+  // Only the owner or an administrator learns anything about the email; the
+  // transfer checks this again while it holds the app.
+  await requireAppTransferable(user, data)
   const [rows] = await databasePool.query<
     Array<RowDataPacket & { id: string }>
   >(`SELECT id FROM ${databaseTable("user")} WHERE email = ? LIMIT 1`, [
@@ -276,22 +284,4 @@ export async function transferAppOwnershipHandler(
     )
   )
   return { previousOwnerId: result.previousOwnerId, userId: recipient.id }
-}
-
-// The owner's Minecraft profile ID, for their avatar. Only a stored display
-// name reaches Mojang, never one derived from an email.
-export async function getAppOwnerMinecraftProfileIdHandler(
-  user: AuthenticatedUser,
-  data: { appId: string; relayId: string }
-): Promise<string | null> {
-  const { row } = await readableAppOwner(user, data)
-  const name = row?.name?.trim()
-  if (!name) return null
-  const profile = await runAppEffect(
-    "minecraft.appOwnerProfile.resolve",
-    resolveMinecraftProfileEffect(name).pipe(
-      Effect.catch(() => Effect.succeed(null))
-    )
-  )
-  return profile?.id ?? null
 }

@@ -10,6 +10,7 @@ import {
 } from "node:crypto"
 import { request as httpRequest } from "node:http"
 import { request as httpsRequest } from "node:https"
+import type { LookupFunction } from "node:net"
 import { TLSSocket } from "node:tls"
 import type { RowDataPacket } from "mysql2/promise"
 import { Clock, Effect, Result } from "effect"
@@ -28,12 +29,17 @@ import type {
   RelayPairingResponseContract,
 } from "@workspace/contracts"
 
-import { Database } from "@/effect/database"
+import { Database, type DatabaseTransaction } from "@/effect/database"
+import { loadedKilnInstallationId } from "@/effect/installation"
 import {
   mapPairingHttpResponse,
   mapPairingTransportError,
+  unreachablePairingError,
 } from "@/lib/relay-pairing-errors"
-import { relayPairingOrigin } from "@/lib/relay-control-endpoint"
+import {
+  relayPairingOrigin,
+  type RelayControlDirection,
+} from "@/lib/relay-control-endpoint"
 import { relayNameForNewPairing } from "@/lib/relay-names"
 import { CredentialError, ResourceNotFoundError } from "@/effect/errors"
 import { runAppEffect } from "@/effect/runtime"
@@ -44,7 +50,6 @@ import {
   backfillInstanceSourceNames,
   syncInstanceRegistry,
 } from "@/lib/instance-registry"
-import { wakePollingWorker } from "@/lib/polling-worker"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 
 import { decryptWithKeyring, encryptWithKeyring } from "../../keyring.mjs"
@@ -56,6 +61,9 @@ export interface PersistedRelay {
   actions: ReadonlyArray<string>
   browserOrigin: string
   clientId: string
+  // Which side opens the control connection when both can: Hearth, or the
+  // Relay dialing out to Hearth. The other stays a fallback.
+  controlDial: RelayControlDirection
   createdAt: string
   createdBy: string | null
   enabled: boolean
@@ -134,13 +142,14 @@ export interface RelayAdministration {
   service: z.infer<typeof relaySnapshotSchema>["relay"]
 }
 
-interface RelayRow extends RowDataPacket {
+export interface RelayRow extends RowDataPacket {
   browser_origin: string
   client_actions: string
   client_id: string
   client_private_key_ciphertext: string
   client_public_key: string
   client_role: "custom" | "full_access" | "read_only"
+  control_dial: RelayControlDirection
   created_at: number
   created_by: string | null
   enabled: number
@@ -157,6 +166,7 @@ interface RelayRow extends RowDataPacket {
   port: number
   relay_ca_certificate: string | null
   relay_public_key: string
+  send_installation_id?: number
   use_tls: number
 }
 
@@ -165,6 +175,14 @@ const pairingEnvelopeSchema = z.object({
   caCertificatePem: z.string().max(16_384).nullable(),
   controlEndpoint: z.url().max(512),
   expiresAt: z.number().int().positive(),
+  // The Relay's installation ID; older Relays leave it out.
+  installation: z
+    .object({
+      fixed: z.boolean(),
+      id: z.string().min(1).max(120).nullable(),
+      replace: z.boolean(),
+    })
+    .optional(),
   invitationId: z.uuid(),
   relayFingerprint: z.string().regex(/^[A-Za-z\d_-]{43}$/u),
   relayName: z.string().trim().min(1).max(120),
@@ -173,7 +191,7 @@ const pairingEnvelopeSchema = z.object({
   version: z.literal(1),
 })
 
-const pairingResponseSchema = z.object({
+export const pairingResponseSchema = z.object({
   actions: z.array(z.string().min(1).max(120)).max(128),
   clientId: z.string().regex(/^[A-Za-z\d_-]{43}$/u),
   expiresAt: z.number().int().positive(),
@@ -236,12 +254,14 @@ export async function loadPersistedRelay(
   return row ? toPersistedRelay(row) : null
 }
 
-async function findPersistedRelayRow(id: string): Promise<RelayRow | null> {
+export async function findPersistedRelayRow(
+  id: string
+): Promise<RelayRow | null> {
   const [rows] = await databasePool.query<Array<RelayRow>>(
     `SELECT id, name, hostname, port, use_tls, browser_origin,
             client_id, client_role, client_actions, issuer_generation, enabled,
             last_connected_at, last_error, managed_ember_count,
-            node_arch, node_platform, node_version,
+            node_arch, node_platform, node_version, control_dial,
             relay_public_key, relay_ca_certificate,
             client_public_key, client_private_key_ciphertext, created_by, created_at
        FROM ${databaseTable("relay")}
@@ -259,7 +279,7 @@ export const listPersistedRelaysEffect = Effect.fn("relays.list")(function* () {
     `SELECT id, name, hostname, port, use_tls, browser_origin,
             client_id, client_role, client_actions, issuer_generation, enabled,
             last_connected_at, last_error, managed_ember_count,
-            node_arch, node_platform, node_version,
+            node_arch, node_platform, node_version, control_dial,
             relay_public_key, relay_ca_certificate,
             client_public_key, client_private_key_ciphertext, created_by, created_at
        FROM ${databaseTable("relay")}
@@ -277,7 +297,7 @@ export const loadEnabledRelayForIssuanceEffect = Effect.fn(
     `SELECT id, name, hostname, port, use_tls, browser_origin,
             client_id, client_role, client_actions, issuer_generation, enabled,
             last_connected_at, last_error, managed_ember_count,
-            node_arch, node_platform, node_version,
+            node_arch, node_platform, node_version, control_dial,
             relay_public_key, relay_ca_certificate,
             client_public_key, client_private_key_ciphertext, created_by, created_at
        FROM ${databaseTable("relay")}
@@ -304,12 +324,18 @@ export const decryptRelayIssuanceCredentialsEffect = Effect.fn(
   return yield* decryptRelayCredentialsEffect(material.encryptedCredentials)
 })
 
+/**
+ * Pairs a Relay from a pairing link, and applies the choice about its
+ * installation ID: "use" sets this Kiln's, "keep" leaves the Relay's.
+ * Returns why the ID wasn't replaced, when replacing it failed.
+ */
 export async function pairPersistedRelay(
   pairingUri: string,
-  actor: RelayPairingActor
-) {
+  actor: RelayPairingActor,
+  installation: "keep" | "use"
+): Promise<{ installationWarning: string | null; relay: PersistedRelay }> {
   const envelope = decodePairingUri(pairingUri)
-  return pairWithEnvelope(
+  const relay = await pairWithEnvelope(
     envelope,
     {
       bootstrapProof: null,
@@ -317,7 +343,44 @@ export async function pairPersistedRelay(
     },
     undefined,
     actor.userId,
-    actor.canManageAnyRelay ? null : actor.userId
+    actor.canManageAnyRelay ? null : actor.userId,
+    // An older Relay reports no ID, and replaces its own with any it's sent,
+    // so it's sent only when someone said to.
+    installation === "use"
+  )
+  const reported = envelope.installation
+  const hearthInstallationId = loadedKilnInstallationId()
+  if (
+    installation !== "use" ||
+    !reported?.replace ||
+    reported.id === null ||
+    hearthInstallationId === null ||
+    reported.id === hearthInstallationId
+  ) {
+    return { installationWarning: null, relay }
+  }
+  const { relayRpc } = await import("@/lib/relay-connection")
+  return Effect.runPromise(
+    Effect.tryPromise(() =>
+      relayRpc(
+        relay,
+        "relay.installation.replace",
+        {
+          expectedInstallationId: reported.id,
+          installationId: hearthInstallationId,
+        },
+        30_000,
+        actor.userId
+      )
+    ).pipe(
+      Effect.as({ installationWarning: null, relay }),
+      Effect.catch((cause) =>
+        Effect.succeed({
+          installationWarning: `The Relay kept its installation ID: ${cause instanceof Error ? cause.message : String(cause)}`,
+          relay,
+        })
+      )
+    )
   )
 }
 
@@ -329,6 +392,9 @@ export async function previewPairingUri(pairingUri: string) {
     controlEndpoint: envelope.controlEndpoint,
     existingRelayName: existing?.name ?? null,
     expiresAt: envelope.expiresAt,
+    hearthInstallationId: loadedKilnInstallationId(),
+    // Null for an older Relay, which doesn't say.
+    installation: envelope.installation ?? null,
     managedTls: envelope.caCertificatePem !== null,
     mode: existing ? ("repair" as const) : ("add" as const),
     relayFingerprint: envelope.relayFingerprint,
@@ -636,7 +702,8 @@ async function pairWithEnvelope(
   credential: { bootstrapProof: string | null; token: string | null },
   enrollmentOrigin?: URL,
   subject?: string,
-  creatorUserId: string | null = null
+  creatorUserId: string | null = null,
+  sendInstallationId?: boolean
 ) {
   if (envelope.expiresAt <= Date.now()) {
     throw new Error("This Relay pairing invitation has expired")
@@ -677,6 +744,23 @@ async function pairWithEnvelope(
   }
   if (creatorUserId && existing && existing.created_by !== creatorUserId) {
     throw new Error("You can only manage Relays you created")
+  }
+  // One Relay per address: a machine set up again under a new identity
+  // still has its old one here.
+  const [holders] = await databasePool.query<Array<RelayRow>>(
+    `SELECT name FROM ${databaseTable("relay")}
+      WHERE hostname = ? AND port = ? AND id <> ?
+      LIMIT 1`,
+    [
+      controlEndpoint.hostname,
+      effectivePort(controlEndpoint),
+      envelope.relayFingerprint,
+    ]
+  )
+  if (holders[0]) {
+    throw new Error(
+      `${holders[0].name} is already at this Relay's address; remove it first`
+    )
   }
   // A Relay keeps this fingerprint when its SQLite state is rebuilt. Reuse
   // Hearth's client identity so Relay can enroll it again without replacing
@@ -770,6 +854,7 @@ async function pairWithEnvelope(
       port: effectivePort(controlEndpoint),
       relayCaCertificate: envelope.caCertificatePem,
       relayPublicKey: envelope.relayPublicKeyPem,
+      ...(sendInstallationId === undefined ? {} : { sendInstallationId }),
       useTls: controlEndpoint.protocol === "wss:",
     })
   )
@@ -812,6 +897,11 @@ interface PairedRelayOwnershipRow extends RowDataPacket {
 }
 
 export function persistPairedRelayEffect(input: {
+  // Run in the same transaction, as a join recording that its Relay is
+  // saved: when it fails, nothing is saved.
+  alsoInTransaction?: (
+    transaction: DatabaseTransaction
+  ) => Effect.Effect<void, Error>
   browserOrigin: string
   clientActions: string
   clientId: string
@@ -827,6 +917,12 @@ export function persistPairedRelayEffect(input: {
   port: number
   relayCaCertificate: string | null
   relayPublicKey: string
+  // Which side opens the control connection; left as it was on a saved
+  // Relay when not given, and Hearth for a new one.
+  controlDial?: RelayControlDirection
+  // Whether Hearth sends its installation ID when it connects; left as it
+  // was on a saved Relay when not given.
+  sendInstallationId?: boolean
   useTls: boolean
 }) {
   return Effect.gen(function* () {
@@ -869,6 +965,8 @@ export function persistPairedRelayEffect(input: {
                       client_public_key = ?, client_private_key_ciphertext = ?,
                       client_role = ?, client_actions = ?, enabled = TRUE,
                       issuer_generation = issuer_generation + 1,
+                      send_installation_id = COALESCE(?, send_installation_id),
+                      control_dial = COALESCE(?, control_dial),
                       last_error = NULL, updated_at = ?
                 WHERE id = ?`,
             [
@@ -884,6 +982,8 @@ export function persistPairedRelayEffect(input: {
               input.clientPrivateKeyCiphertext,
               input.clientRole,
               input.clientActions,
+              input.sendInstallationId ?? null,
+              input.controlDial ?? null,
               now,
               input.id,
             ]
@@ -895,8 +995,8 @@ export function persistPairedRelayEffect(input: {
                 relay_public_key, relay_ca_certificate,
                 client_id, client_public_key, client_private_key_ciphertext,
                 client_role, client_actions, enabled, created_by,
-                created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?)`,
+                send_installation_id, control_dial, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?, ?, ?)`,
             [
               input.id,
               input.name,
@@ -912,10 +1012,15 @@ export function persistPairedRelayEffect(input: {
               input.clientRole,
               input.clientActions,
               input.createdBy,
+              input.sendInstallationId ?? true,
+              input.controlDial ?? "hearth",
               now,
               now,
             ]
           )
+        }
+        if (input.alsoInTransaction) {
+          yield* input.alsoInTransaction(transaction)
         }
       })
     )
@@ -923,20 +1028,36 @@ export function persistPairedRelayEffect(input: {
 }
 
 export async function updatePersistedRelay(input: {
+  // Which side opens the control connection; left as it was when not given.
+  controlDial?: RelayControlDirection
   hostname: string
   id: string
   port: number
   useTls: boolean
 }): Promise<PersistedRelay> {
+  const before = await loadPersistedRelay(input.id)
   const [result] = await databasePool.execute<
     import("mysql2/promise").ResultSetHeader
   >(
     `UPDATE ${databaseTable("relay")}
-        SET hostname = ?, port = ?, use_tls = ?, updated_at = ?
+        SET hostname = ?, port = ?, use_tls = ?,
+            control_dial = COALESCE(?, control_dial), updated_at = ?
       WHERE id = ?`,
-    [input.hostname, input.port, input.useTls, Date.now(), input.id]
+    [
+      input.hostname,
+      input.port,
+      input.useTls,
+      input.controlDial ?? null,
+      Date.now(),
+      input.id,
+    ]
   )
   if (result.affectedRows !== 1) throw new Error("Relay not found")
+  // Connecting again, the side it now prefers opens the connection.
+  if (input.controlDial && input.controlDial !== before?.controlDial) {
+    const { closeRelayConnection } = await import("@/lib/relay-connection")
+    closeRelayConnection(input.id)
+  }
   const relay = await inspectPersistedRelay(input.id)
   publishRelayCollectionChange(relay.id)
   return relay
@@ -1003,9 +1124,6 @@ export const deletePersistedRelayEffect = Effect.fn("relay.deletePersisted")(
   function* (id: string) {
     const database = yield* Database
     const now = yield* Clock.currentTimeMillis
-    // Whether a network being deleted had this as its last Relay, so is
-    // ready to finish deleting.
-    let finalizesNetwork = false
     yield* database.transaction("relay.deletePersisted", (transaction) =>
       Effect.gen(function* () {
         yield* transaction.execute(
@@ -1020,7 +1138,20 @@ export const deletePersistedRelayEffect = Effect.fn("relay.deletePersisted")(
           `DELETE FROM ${databaseTable("access_grant")} WHERE relay_id = ?`,
           [id]
         )
-        const finalizable = yield* transaction.execute(
+        // A join still adding this Relay can't finish without it: it ends,
+        // its worker stops at its next write, and the Relay may join again.
+        yield* transaction.execute(
+          `UPDATE ${databaseTable("relay_join")}
+              SET state = 'revoked', claimed_fingerprint = NULL,
+                  lease_until = NULL, claim_generation = claim_generation + 1,
+                  client_private_key_ciphertext = NULL, updated_at = ?
+            WHERE claimed_fingerprint = ?
+              AND state IN ('confirming', 'needs_review')`,
+          [now, id]
+        )
+        // A network being deleted that had this as its last Relay is ready
+        // to finish deleting, at its operation's next round.
+        yield* transaction.execute(
           `UPDATE ${databaseTable("tailscale_network")} network
              JOIN ${databaseTable("tailscale_network_deployment")} target
                ON target.network_id = network.id
@@ -1038,7 +1169,6 @@ export const deletePersistedRelayEffect = Effect.fn("relay.deletePersisted")(
               )`,
           [id, now, now, id]
         )
-        finalizesNetwork = finalizable.affectedRows > 0
         yield* transaction.execute(
           `DELETE FROM ${databaseTable("tailscale_network_deployment")}
             WHERE relay_id = ?`,
@@ -1053,9 +1183,6 @@ export const deletePersistedRelayEffect = Effect.fn("relay.deletePersisted")(
         }
       })
     )
-    if (finalizesNetwork) {
-      yield* Effect.sync(() => wakePollingWorker("TailscaleCleanup"))
-    }
   }
 )
 
@@ -1110,7 +1237,9 @@ export async function checkPersistedRelay(id: string): Promise<PersistedRelay> {
   return checked
 }
 
-async function inspectPersistedRelay(id: string): Promise<PersistedRelay> {
+export async function inspectPersistedRelay(
+  id: string
+): Promise<PersistedRelay> {
   const relay = (await listPersistedRelays()).find((item) => item.id === id)
   if (!relay) throw new Error("Relay not found")
   if (!relay.enabled) return relay
@@ -1159,7 +1288,7 @@ async function inspectPersistedRelay(id: string): Promise<PersistedRelay> {
   return checked
 }
 
-function publishRelayCollectionChange(
+export function publishRelayCollectionChange(
   relayId: string,
   userIds: Array<string> = []
 ): void {
@@ -1191,8 +1320,19 @@ export const resolveDefaultRelayEffect = Effect.fn("relays.resolveDefault")(
   }
 )
 
-export function loadRelayCredentials(id: string): Promise<RelayCredentials> {
+export function loadRelayCredentials(
+  id: string
+): Promise<RelayConnectionCredentials> {
   return runAppEffect("relays.credentials", loadRelayCredentialsEffect(id))
+}
+
+/**
+ * What Hearth connects to a Relay with: its credentials, and whether it
+ * sends its installation ID (`send_installation_id`), which a Relay with
+ * none saves as its own.
+ */
+export type RelayConnectionCredentials = RelayCredentials & {
+  sendInstallationId: boolean
 }
 
 export const loadRelayCredentialsEffect = Effect.fn("relays.credentials")(
@@ -1203,9 +1343,10 @@ export const loadRelayCredentialsEffect = Effect.fn("relays.credentials")(
       `SELECT id, name, hostname, port, use_tls, browser_origin,
               client_id, client_role, client_actions, issuer_generation, enabled,
               last_connected_at, last_error, managed_ember_count,
-              node_arch, node_platform, node_version,
+              node_arch, node_platform, node_version, control_dial,
               relay_public_key, relay_ca_certificate,
-              client_public_key, client_private_key_ciphertext
+              client_public_key, client_private_key_ciphertext,
+              send_installation_id
          FROM ${databaseTable("relay")} WHERE id = ? LIMIT 1`,
       [id]
     )
@@ -1218,7 +1359,10 @@ export const loadRelayCredentialsEffect = Effect.fn("relays.credentials")(
         })
       )
     }
-    return yield* decryptRelayCredentialsEffect(encryptedRelayCredentials(row))
+    return {
+      ...(yield* decryptRelayCredentialsEffect(encryptedRelayCredentials(row))),
+      sendInstallationId: Boolean(row.send_installation_id),
+    } satisfies RelayConnectionCredentials
   }
 )
 
@@ -1292,21 +1436,28 @@ function decodePairingUri(value: string) {
   )
 }
 
-async function postPairingRequest(
+export async function postPairingRequest(
   url: URL,
   caCertificatePem: string | null,
-  body: RelayPairingRequestContract
+  body: RelayPairingRequestContract,
+  // Resolves the Relay's name, for a caller that limits where it may be.
+  lookup?: LookupFunction
 ): Promise<unknown> {
   const encoded = Buffer.from(JSON.stringify(body))
   const request = url.protocol === "https:" ? httpsRequest : httpRequest
   return new Promise((resolve, reject) => {
     const fail = (cause: unknown) => {
-      reject(mapPairingTransportError(cause) ?? cause)
+      reject(
+        mapPairingTransportError(cause) ??
+          unreachablePairingError(cause, url) ??
+          cause
+      )
     }
     const outgoing = request(
       url,
       {
         ca: caCertificatePem ?? undefined,
+        ...(lookup && { lookup }),
         headers: {
           Accept: "application/json",
           "Content-Length": encoded.length,
@@ -1418,8 +1569,11 @@ function registryOperation<A>(
   })
 }
 
-function verifyPairingResponse(
-  envelope: z.infer<typeof pairingEnvelopeSchema>,
+export function verifyPairingResponse(
+  envelope: Pick<
+    z.infer<typeof pairingEnvelopeSchema>,
+    "relayFingerprint" | "relayPublicKeyPem"
+  >,
   nonce: string,
   response: RelayPairingResponseContract
 ): void {
@@ -1454,6 +1608,7 @@ function toPersistedRelay(row: RelayRow): PersistedRelay {
       ),
     browserOrigin: row.browser_origin,
     clientId: row.client_id,
+    controlDial: row.control_dial,
     createdAt: new Date(row.created_at).toISOString(),
     createdBy: row.created_by,
     enabled: Boolean(row.enabled),
@@ -1500,7 +1655,7 @@ export async function activeRelay(
 
 const requiredPersistedRelay = (id: string) => activeRelay(id)
 
-function publicKeyFingerprint(publicKeyPem: string): string {
+export function publicKeyFingerprint(publicKeyPem: string): string {
   return createHash("sha256")
     .update(
       createPublicKey(publicKeyPem).export({ format: "der", type: "spki" })
@@ -1519,7 +1674,7 @@ function formatHost(hostname: string): string {
     : hostname
 }
 
-function encryptPrivateKey(privateKey: string): string {
+export function encryptPrivateKey(privateKey: string): string {
   return encryptWithKeyring(
     privateKey,
     betterAuthSecrets(),
@@ -1527,7 +1682,7 @@ function encryptPrivateKey(privateKey: string): string {
   )
 }
 
-function decryptPrivateKey(value: string) {
+export function decryptPrivateKey(value: string) {
   return decryptWithKeyring(
     value,
     betterAuthSecrets(),

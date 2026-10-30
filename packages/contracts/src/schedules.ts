@@ -2,7 +2,9 @@ import { CronExpressionParser } from "cron-parser"
 import { Result } from "effect"
 import { z } from "zod"
 
+import { appServiceNameSchema } from "./app-keys.js"
 import {
+  backupConsistencySchema,
   backupLocalDestinationSchema,
   backupModeSchema,
   backupObjectKeySchema,
@@ -20,6 +22,14 @@ export const scheduleActionTypeSchema = z.enum([
 export type ScheduleActionType = z.infer<typeof scheduleActionTypeSchema>
 
 const scheduleActionIdSchema = z.uuid()
+/**
+ * Set by Hearth on the command and power steps it saves, once it has checked
+ * the authority each database or App the step names needs. Steps stored before
+ * commands and kills reached databases lack it, whatever their
+ * `targetKeys`, because they were never checked for it; they keep running
+ * only where they ran before.
+ */
+export const scheduleActionAuthorizedTargetsSchema = z.literal(2).optional()
 const scheduleActionTargetKeysSchema = z
   .array(z.string().trim().min(1).max(512))
   .max(2_000)
@@ -27,8 +37,19 @@ const scheduleActionTargetKeysSchema = z
 
 export const scheduleConsoleCommandActionSchema = z
   .object({
+    authorizedTargets: scheduleActionAuthorizedTargetsSchema,
     command: z.string().trim().min(1).max(4_096),
     id: scheduleActionIdSchema,
+    // The service each App target runs the command in, by target key. A
+    // game server's command goes to its console, and a database's to its
+    // only container.
+    services: z
+      .record(z.string().trim().min(1).max(512), appServiceNameSchema)
+      .refine(
+        (services) => Object.keys(services).length <= 2_000,
+        "Too many App services"
+      )
+      .optional(),
     targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("console_command"),
   })
@@ -36,6 +57,12 @@ export const scheduleConsoleCommandActionSchema = z
 
 export const scheduleBackupActionSchema = z
   .object({
+    /**
+     * Whether an App is backed up live or stopped, its folder and each
+     * volume it owns within one stopped window. Other kinds are always
+     * backed up live; absent is live.
+     */
+    consistency: backupConsistencySchema.optional(),
     destination: z
       .discriminatedUnion("kind", [
         z.object({ kind: z.literal("local") }).strict(),
@@ -63,6 +90,7 @@ export const scheduleBackupActionSchema = z
 export const schedulePowerActionSchema = z
   .object({
     action: z.enum(["start", "stop", "restart", "kill"]),
+    authorizedTargets: scheduleActionAuthorizedTargetsSchema,
     id: scheduleActionIdSchema,
     targetKeys: scheduleActionTargetKeysSchema,
     type: z.literal("power"),
@@ -101,10 +129,17 @@ export const scheduleActionSchema = z.discriminatedUnion("type", [
 
 export type ScheduleAction = z.infer<typeof scheduleActionSchema>
 
+export const scheduleTargetKindSchema = z.enum([
+  "instance",
+  "database",
+  "app",
+  "relay",
+])
+
 export const scheduleTargetSchema = z
   .object({
     id: z.string().min(1).max(120),
-    kind: z.enum(["instance", "database", "relay"]),
+    kind: scheduleTargetKindSchema,
     name: z.string().trim().min(1).max(120),
     relayId: z.string().min(1).max(120),
   })
@@ -217,6 +252,32 @@ export const scheduleDefinitionSchema = scheduleInputSchema
       })
     }
     for (const [actionIndex, action] of schedule.actions.entries()) {
+      if (action.type === "console_command") {
+        const appTargets = schedule.targets.filter(
+          (target) =>
+            target.kind === "app" &&
+            scheduleActionAppliesToTarget(action, target)
+        )
+        const appKeys = new Set(appTargets.map(scheduleTargetKey))
+        for (const target of appTargets) {
+          if (!action.services?.[scheduleTargetKey(target)]) {
+            context.addIssue({
+              code: "custom",
+              message: `Choose the service of ${target.name} that runs the command`,
+              path: ["actions", actionIndex, "services"],
+            })
+          }
+        }
+        for (const key of Object.keys(action.services ?? {})) {
+          if (!appKeys.has(key)) {
+            context.addIssue({
+              code: "custom",
+              message: "Command services must name the App targets it runs on",
+              path: ["actions", actionIndex, "services"],
+            })
+          }
+        }
+      }
       if (action.type === "wait") continue
       if (action.targetKeys === undefined) continue
       const seenTargetKeys = new Set<string>()
@@ -249,16 +310,32 @@ export const relayScheduleS3DestinationSchema = backupS3CredentialSchema
   })
   .strict()
 
+// One target's scheduled backup, as Hearth admitted it when it last sent
+// the schedule: where it goes, or, when Hearth would refuse it as it would
+// a manual one, why not, in which case the Relay doesn't run it.
 const relayScheduleBackupExecutionSchema = z
   .object({
-    destination: z.discriminatedUnion("kind", [
-      backupLocalDestinationSchema,
-      backupResticDestinationSchema,
-      relayScheduleS3DestinationSchema,
-    ]),
+    destination: z
+      .discriminatedUnion("kind", [
+        backupLocalDestinationSchema,
+        backupResticDestinationSchema,
+        relayScheduleS3DestinationSchema,
+      ])
+      .nullable(),
+    /** The most it may write, from the target's size ceilings. */
+    maxBytes: z.number().int().positive().nullable().optional(),
     mode: backupModeSchema,
+    /** Why it may not run; null when it may. */
+    refusal: z.string().min(1).max(300).nullable().optional(),
+    /** An incremental backup's repository, which catalogs it. */
+    repositoryId: z.uuid().nullable().optional(),
+    /**
+     * The App target an App's backup is of. Its folder's and each owned
+     * volume's backups are executions of their own, run together.
+     */
+    appId: z.string().min(1).max(120).optional(),
     targetId: z.string().min(1).max(120),
-    targetKind: z.enum(["instance", "database", "relay"]),
+    targetKind: z.enum(["instance", "database", "relay", "app", "volume"]),
   })
   .strict()
 
@@ -283,6 +360,13 @@ export type RelayScheduleAction = z.infer<typeof relayScheduleActionSchema>
 export const relayScheduleProjectionSchema = scheduleDefinitionSchema
   .safeExtend({
     actions: z.array(relayScheduleActionSchema).min(1).max(32),
+    /**
+     * Which version of what Hearth sends for this schedule and Relay: it
+     * rises with every send and every change to what decides it, such as a
+     * destination being disabled, without the schedule's revision changing.
+     * A Relay keeps the newest and turns away older ones arriving late.
+     */
+    generation: z.number().int().nonnegative().optional(),
   })
   .strict()
 
@@ -298,7 +382,24 @@ export const scheduleAttemptStatusSchema = z.enum([
   "skipped_policy",
   "interrupted",
   "not_run",
+  // A command Kiln lost track of after it may have started. It is never run
+  // again on its own.
+  "unknown",
 ])
+
+/**
+ * How a command run in a container went: its exit code, null when Kiln lost
+ * track of it, and the end of what it printed.
+ */
+export const scheduleCommandResultSchema = z
+  .object({
+    exitCode: z.number().int().nullable(),
+    output: z.string().max(4_096),
+    truncated: z.boolean(),
+  })
+  .strict()
+
+export type ScheduleCommandResult = z.infer<typeof scheduleCommandResultSchema>
 
 export const scheduleTargetRunStatusSchema = z.enum([
   "succeeded",
@@ -325,6 +426,8 @@ export const scheduleActionAttemptSchema = z
     error: z.string().max(2_000).nullable(),
     finishedAt: z.number().int().nonnegative(),
     id: z.string().min(1).max(128),
+    // Commands run in an App's or database's container.
+    result: scheduleCommandResultSchema.optional(),
     startedAt: z.number().int().nonnegative(),
     status: scheduleAttemptStatusSchema,
   })
@@ -362,6 +465,8 @@ export type ScheduleRun = z.infer<typeof scheduleRunSchema>
 
 export const relayScheduleDeploymentSchema = z
   .object({
+    /** The generation the Relay now holds, which may be newer than sent. */
+    acknowledgedGeneration: z.number().int().nonnegative().optional(),
     acknowledgedRevision: z.number().int().positive(),
     nextRunAt: z.number().int().nonnegative().nullable(),
     scheduleId: z.uuid(),
@@ -440,13 +545,11 @@ export function scheduleActionSupportsTarget(
   target: Pick<ScheduleTarget, "kind">
 ): boolean {
   if (action.type === "wait") return true
-  if (action.type === "console_command") return target.kind === "instance"
-  if (action.type === "power") {
-    return (
-      target.kind !== "relay" &&
-      !(target.kind === "database" && action.action === "kill")
-    )
-  }
+  // A game server's goes to its console; a database's runs in its
+  // container's shell, and an App's in one of its services'.
+  if (action.type === "console_command") return target.kind !== "relay"
+  if (action.type === "power") return target.kind !== "relay"
+  // An App's folder and owned volumes are archives, never restic snapshots.
   if (action.mode === "incremental") return target.kind === "instance"
   return true
 }
@@ -457,8 +560,32 @@ export function scheduleTargetKey(
   return `${target.relayId}:${target.kind}:${target.id}`
 }
 
+/**
+ * Whether a step runs on a target only when Hearth checked it there: its
+ * `targetKeys` names the target and it carries `authorizedTargets`.
+ * Commands and kills reach databases and Apps now, but stored steps were
+ * saved, and authorized, when they skipped them, even ones whose
+ * `targetKeys` named a database, so they still skip them. A step reaches a
+ * database or App only once someone names it and Hearth saves it,
+ * authorizing it then.
+ */
+export function scheduleActionNeedsNamedTarget(
+  action: {
+    action?: "kill" | "restart" | "start" | "stop"
+    type: ScheduleActionType
+  },
+  target: Pick<ScheduleTarget, "kind">
+): boolean {
+  return (
+    (target.kind === "database" || target.kind === "app") &&
+    (action.type === "console_command" ||
+      (action.type === "power" && action.action === "kill"))
+  )
+}
+
 export function scheduleActionAppliesToTarget(
   action: {
+    authorizedTargets?: 2
     targetKeys?: ReadonlyArray<string>
     action?: "kill" | "restart" | "start" | "stop"
     mode?: "full" | "incremental"
@@ -467,9 +594,29 @@ export function scheduleActionAppliesToTarget(
   target: ScheduleTarget
 ) {
   if (action.type === "wait") return true
+  if (!scheduleActionSupportsTarget(action, target)) return false
+  if (scheduleActionNeedsNamedTarget(action, target)) {
+    return (
+      action.authorizedTargets === 2 &&
+      action.targetKeys?.includes(scheduleTargetKey(target)) === true
+    )
+  }
   return (
-    scheduleActionSupportsTarget(action, target) &&
-    (action.targetKeys === undefined ||
-      action.targetKeys.includes(scheduleTargetKey(target)))
+    action.targetKeys === undefined ||
+    action.targetKeys.includes(scheduleTargetKey(target))
+  )
+}
+
+/**
+ * Marks the command and power steps Hearth is saving as checked, before it
+ * authorizes them, so the check covers every target they reach.
+ */
+export function scheduleActionsForSave<
+  Action extends { readonly type: ScheduleActionType },
+>(actions: ReadonlyArray<Action>): Array<Action> {
+  return actions.map((action) =>
+    action.type === "console_command" || action.type === "power"
+      ? { ...action, authorizedTargets: 2 as const }
+      : action
   )
 }
