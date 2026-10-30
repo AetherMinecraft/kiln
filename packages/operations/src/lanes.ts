@@ -24,6 +24,8 @@ export class LaneRejectedError extends Schema.TaggedError<LaneRejectedError>()(
       "superseded",
     ]),
     message: Schema.String,
+    /** The labels of the operations in the way, when it was refused as busy. */
+    blockedBy: Schema.optional(Schema.Array(Schema.String)),
   }
 ) {}
 
@@ -48,6 +50,13 @@ export interface LaneAdmission {
    * for it in turn.
    */
   readonly continuation?: boolean
+  /**
+   * Whether to wait for the locks (the default) or be refused at once with
+   * what's in the way, when an operation holds a conflicting lock or one
+   * admitted before is waiting for one. For a person's change, which says
+   * so rather than queue. Needs its locks up front.
+   */
+  readonly whenBusy?: "refuse" | "wait"
 }
 
 export interface LaneTicket {
@@ -61,6 +70,11 @@ export interface LaneTicket {
   ) => Effect.Effect<A, E | LaneRejectedError>
   /** Withdraws an operation that hasn't started. Running ones are unaffected. */
   readonly cancel: () => void
+  /**
+   * Whether it was granted as it was admitted. One that wasn't waited, and
+   * whatever it read before may have changed.
+   */
+  readonly grantedAtOnce: boolean
 }
 
 /** What the lanes hold and what waits on what, for diagnostics. */
@@ -297,11 +311,43 @@ export class OperationLanes {
         )
       }
       this.#grant()
+      if (admission.whenBusy === "refuse" && waiter.state === "waiting") {
+        this.#refuseBusy(waiter, queue)
+      }
     }
     return {
       cancel: () => this.#cancel(waiter),
+      grantedAtOnce: waiter.state === "granted",
       run: (effect) => this.#run(waiter, effect),
     }
+  }
+
+  // Turns away an operation that wasn't granted as it arrived, naming what
+  // holds or waits ahead for its locks.
+  #refuseBusy(waiter: Waiter, queue: Array<Waiter>) {
+    const index = queue.indexOf(waiter)
+    const occupant = (other: Waiter) => ({
+      id: other.label,
+      locks: other.locks ?? [],
+    })
+    const blockedBy = [
+      ...new Set(
+        explainWait(
+          waiter.locks ?? [],
+          [...this.#active].map(occupant),
+          queue.slice(0, Math.max(index, 0)).map(occupant)
+        ).map((reason) => reason.id)
+      ),
+    ]
+    this.#remove(waiter)
+    this.#reject(
+      waiter,
+      new LaneRejectedError({
+        blockedBy,
+        message: `${waiter.label} is waiting on ${blockedBy.join(", ")}`,
+        reason: "busy",
+      })
+    )
   }
 
   // What waits that arrived on its own, continuations included; nested work
