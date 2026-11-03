@@ -40,7 +40,7 @@ import {
   NO_RESOURCE_LIMITS,
   relayAppSchema,
 } from "@workspace/contracts"
-import { Effect, Predicate, Result } from "effect"
+import { Effect, Predicate, Result, Semaphore } from "effect"
 
 import { commandLines } from "./command.js"
 import {
@@ -58,6 +58,7 @@ import {
   MAX_CONSOLE_HISTORY_CHARACTERS,
   type DockerConsoleSession,
 } from "./docker.js"
+import type { DockerCleanup } from "./docker-cleanup.js"
 import { createContainer, ramInBytes } from "./docker-container-spec.js"
 import {
   DockerEngine,
@@ -96,6 +97,7 @@ import {
 import {
   APP_SERVICE,
   relayOwnerLabel,
+  relayOwnerLabels,
   relayOwnsLabels,
   relayResourceNames,
   type RelayResourceNames,
@@ -248,8 +250,12 @@ export class AppDriver {
   // How many deployments began replacing each app's containers this run.
   readonly #replacements = new Map<string, number>()
   readonly #lanes: OperationLanes
+  // Registries asked at once, whatever asks: overlapping checks share these
+  // rather than each asking four.
+  readonly #registryLookups = Semaphore.makeUnsafe(4)
   readonly #limits: AppLimitStores
   readonly #connections: DatabaseConnections
+  readonly #cleanup: DockerCleanup
   readonly #volumeIds: (
     dockerNames: ReadonlyArray<string>
   ) => Promise<ReadonlyArray<string>>
@@ -268,8 +274,10 @@ export class AppDriver {
     /** The managed volumes with these Docker names, by ID. */
     volumeIds: (
       dockerNames: ReadonlyArray<string>
-    ) => Promise<ReadonlyArray<string>>
+    ) => Promise<ReadonlyArray<string>>,
+    cleanup: DockerCleanup
   ) {
+    this.#cleanup = cleanup
     this.#volumeIds = volumeIds
     this.#config = config
     this.#engine = new DockerEngine(config.dockerSocket)
@@ -898,12 +906,20 @@ export class AppDriver {
           Effect.flatMap((images) =>
             Effect.forEach(
               images,
-              (image) => engine.removeImage(image.Id).pipe(Effect.ignore),
+              (image) =>
+                engine
+                  .removeImage(image.Id, { force: false })
+                  .pipe(Effect.ignore),
               { discard: true }
             )
           ),
           Effect.ignore
         )
+    )
+    await Effect.runPromise(
+      this.#limits.state
+        .forgetAppDeploymentImages(input.appId, null)
+        .pipe(Effect.ignore)
     )
     await rm(this.#dockerfilePath(input.appId), { force: true })
     await rm(this.#mountDirectory(input.appId), {
@@ -1149,7 +1165,28 @@ export class AppDriver {
         : errorMessage(outcome.failure)
     if (message === null) log(`Deployment finished in ${seconds}s`)
     else log(`Deployment failed after ${seconds}s: ${message}`, "error")
+    if (message === null) {
+      // Its images are kept while it's among the newest few; older
+      // deployments' go once it's finished, in the background
+      // (docker-cleanup.ts).
+      const imageIds = (await this.#appContainers(input.appId)).flatMap(
+        (container) =>
+          container.deploymentId === deployment.id && container.imageId
+            ? [container.imageId]
+            : []
+      )
+      await Effect.runPromise(
+        this.#cleanup.recordDeployment({
+          appId: input.appId,
+          deploymentId: deployment.id,
+          imageIds,
+        })
+      )
+    }
     await this.#finishDeployment(input.appId, deployment, message)
+    if (message === null) {
+      Effect.runFork(this.#cleanup.pruneAppImages(input.appId))
+    }
   }
 
   async #finishDeployment(
@@ -1327,11 +1364,13 @@ export class AppDriver {
         Effect.forEach(
           [...wanted],
           (name) =>
-            this.#engine.distributionDigest(name).pipe(
-              Effect.result,
-              Effect.map((result) => [name, result] as const)
-            ),
-          { concurrency: 4 }
+            this.#registryLookups
+              .withPermits(1)(this.#engine.distributionDigest(name))
+              .pipe(
+                Effect.result,
+                Effect.map((result) => [name, result] as const)
+              ),
+          { concurrency: "unbounded" }
         ),
         signal
       )
@@ -1594,6 +1633,16 @@ export class AppDriver {
         timeout: BUILD_TIMEOUT_MS,
       }
     )
+    // The build is the App's from now, whatever becomes of the deployment,
+    // so a failed one's stays its day (docker-cleanup.ts).
+    await Effect.runPromise(
+      this.#engine.inspectImage(tag).pipe(
+        Effect.flatMap((image) =>
+          this.#cleanup.noteBuild(input.appId, image.Id)
+        ),
+        Effect.ignore
+      )
+    )
     return tag
   }
 
@@ -1740,7 +1789,7 @@ export class AppDriver {
     if (Result.isFailure(switched)) {
       for (const container of await this.#appContainers(appId)) {
         if (container.deploymentId !== deployment.id) continue
-        await this.#removeContainer(container.id)
+        await this.#removeContainer(appId, container.id)
       }
       this.#log(appId, deployment, "Keeping the running containers", "warn")
       throw switched.failure
@@ -1756,7 +1805,7 @@ export class AppDriver {
         )
       }
       this.#log(appId, deployment, `Removing ${container.name}`)
-      await this.#removeContainer(container.id)
+      await this.#removeContainer(appId, container.id)
     }
   }
 
@@ -1880,7 +1929,7 @@ export class AppDriver {
               .map((container) => container.id)
           : []
       for (const container of new Set([...created, ...failed])) {
-        await this.#removeContainer(container)
+        await this.#removeContainer(appId, container)
       }
       for (const container of running) {
         this.#log(appId, deployment, `Restarting ${container.name}`, "warn")
@@ -1894,21 +1943,20 @@ export class AppDriver {
     }
     for (const container of previous) {
       this.#log(appId, deployment, `Removing ${container.name}`)
-      await this.#removeContainer(container.id)
+      await this.#removeContainer(appId, container.id)
     }
   }
 
   // With its anonymous volumes, such as those its image declares: a
   // container keeps nothing past its replacement but what the config mounts.
-  async #removeContainer(container: string) {
-    await docker(
-      this.#engine
-        .removeContainer(container, {
-          force: true,
-          timeout: 90_000,
-          volumes: true,
-        })
-        .pipe(Effect.ignore)
+  // One Docker won't remove is tried again later (docker-cleanup.ts).
+  async #removeContainer(appId: string, container: string) {
+    await Effect.runPromise(
+      this.#cleanup.removeContainer(container, {
+        owner: { id: appId, kind: "app" },
+        reason: "replaced by a deployment",
+        volumes: true,
+      })
     )
   }
 
@@ -2239,15 +2287,7 @@ export class AppDriver {
       )
     const discard = async () => {
       for (const container of await created()) {
-        await docker(
-          this.#engine
-            .removeContainer(container.id, {
-              force: true,
-              timeout: 90_000,
-              volumes: true,
-            })
-            .pipe(Effect.ignore)
-        )
+        await this.#removeContainer(input.appId, container.id)
       }
       await this.#removeComposeNetworks(input.appId, null, project)
     }
@@ -3007,8 +3047,10 @@ export class AppDriver {
     return labels
   }
 
+  // Whose build it is, so a cleanup on a host with another Relay leaves
+  // that one's alone (docker-cleanup.ts).
   #imageLabels(appId: string): Record<string, string> {
-    return { [ID_LABEL]: appId }
+    return { [ID_LABEL]: appId, ...relayOwnerLabels(this.#config) }
   }
 
   #containerLabels(

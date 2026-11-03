@@ -53,180 +53,68 @@ const confirmedDeletions = [
 ]
 const confirmedCliDeletions = ["deleteCliServerEffect"]
 
-// Mutating server functions that don't run as operations yet. Move them
-// area by area; never add one.
-const notYetOperations = new Set<string>([
-  "app-deployments.ts:redeployAppDeployment",
-  "app-deployments.ts:saveAppGitHubSource",
-  "app-image-updates.ts:checkAppImageUpdate",
-  "app-image-updates.ts:deployAppImageUpdate",
-  "app-image-updates.ts:saveAppImageUpdatePolicy",
-  "app-image-updates.ts:skipAppImageUpdate",
-  "apps.ts:claimAppTerminal",
-  "apps.ts:createApp",
-  "apps.ts:deployApp",
-  "apps.ts:renameApp",
-  "apps.ts:restartAppTerminal",
-  "apps.ts:runAppAction",
-  "apps.ts:updateAppConfig",
-  "apps.ts:updateAppLimits",
-  "apps.ts:updateAppNetwork",
-  "apps.ts:writeAppTerminal",
-  "backup-storage.ts:deleteBackupStorage",
-  "backup-storage.ts:saveBackupStorage",
-  "backup-storage.ts:setPreferredBackupStorage",
-  "backups.ts:cancelBackup",
-  "backups.ts:copyBackupToDestination",
-  "backups.ts:createAppBackups",
-  "backups.ts:createDatabaseBackup",
-  "backups.ts:createInstanceBackup",
-  "backups.ts:createPlatformBackup",
-  "backups.ts:createResourceBackup",
-  "backups.ts:deleteBackup",
-  "backups.ts:getBackupDownloadUrl",
-  "backups.ts:renameBackup",
-  "backups.ts:resolveUnfinishedRestore",
-  "backups.ts:restoreDatabaseBackup",
-  "backups.ts:restoreInstanceBackup",
-  "backups.ts:restoreResourceBackup",
-  "backups.ts:syncBackupRuns",
-  "backups.ts:updateBackupExcludes",
-  "backups.ts:updateBackupLimits",
-  "brick-catalogs.ts:addBrickCatalog",
-  "brick-catalogs.ts:deleteBrickCatalog",
-  "brick-catalogs.ts:setBrickCatalogCommunity",
-  "bricks.ts:configureBrickNetworking",
-  "bricks.ts:createBrickInstance",
-  "bricks.ts:loadBrickRecipe",
-  "bricks.ts:saveCustomBrick",
-  "bricks.ts:updateInstanceStartup",
-  "browser-accounts.ts:rememberActiveBrowserAccountSession",
-  "browser-accounts.ts:signOutBrowserAccountSession",
-  "cli.ts:approveCliAuthorization",
-  "cli.ts:denyCliAuthorization",
-  "cli.ts:revokeCliCredential",
-  "databases.ts:claimDatabaseTerminal",
-  "databases.ts:createManagedDatabase",
-  "databases.ts:exportManagedDatabase",
-  "databases.ts:getManagedDatabaseRows",
-  "databases.ts:importManagedDatabase",
-  "databases.ts:mutateManagedDatabase",
-  "databases.ts:renameManagedDatabase",
-  "databases.ts:restartDatabaseTerminal",
-  "databases.ts:rotateManagedDatabasePassword",
-  "databases.ts:runManagedDatabaseAction",
-  "databases.ts:runManagedDatabaseQuery",
-  "databases.ts:updateManagedDatabaseLimits",
-  "databases.ts:updateManagedDatabaseNetwork",
-  "databases.ts:wipeManagedDatabase",
-  "databases.ts:writeDatabaseTerminal",
-  "domains.ts:discoverCloudflareDomains",
-  "domains.ts:releaseWebHostname",
-  "domains.ts:resyncDomainAssignments",
-  "github-sync.ts:deleteGitHubConnection",
-  "github-sync.ts:deleteGitHubSync",
-  "github-sync.ts:runGitHubSync",
-  "github-sync.ts:saveGitHubSync",
-  "github-sync.ts:startGitHubConnection",
-  "icons.ts:detectIcon",
-  "icons.ts:fetchIconSource",
-  "icons.ts:fetchMinecraftHead",
-  "icons.ts:linkIconFile",
-  "icons.ts:readIconSourceFile",
-  "icons.ts:readPictureSourceFile",
-  "icons.ts:removeCustomIcon",
-  "icons.ts:saveCustomIcon",
-  "instance-favorites.ts:setInstanceFavorite",
-  "instance-inventory.ts:getInstanceInventory",
-  "kiln-database.ts:getKilnDatabaseRows",
-  "kiln-database.ts:importKilnDatabase",
-  "kiln-database.ts:mutateKilnDatabase",
-  "kiln-database.ts:runKilnDatabaseQuery",
-  "notifications.ts:acknowledgeNotificationsSeen",
-  "notifications.ts:clearNotifications",
-  "notifications.ts:dismissNotification",
-  "notifications.ts:markNotificationsRead",
-  "notifications.ts:saveNotificationPreferences",
-  "platform.ts:claimKilnTerminal",
-  "platform.ts:restartKilnTerminal",
-  "platform.ts:runKilnPlatformAction",
-  "platform.ts:writeKilnTerminal",
-  "preferences.ts:updateAppearancePreferences",
-  "push-notifications.ts:subscribePushNotifications",
-  "push-notifications.ts:unsubscribePushNotifications",
-  "relay-capability.ts:issueBrowserCapabilities",
-  "relay-capability.ts:issueConsoleCapability",
-  "relay-capability.ts:issueFileCapability",
-  "relay-capability.ts:issueResourceCapability",
-  "relay-host.ts:claimRelayTerminal",
-  "relay-host.ts:mountRelayHostFiles",
-  "relay-host.ts:restartRelay",
-  "relay-host.ts:restartRelayHost",
-  "relay-host.ts:restartRelayTerminal",
-  "relay-host.ts:writeRelayTerminal",
-  "relays.ts:addRelay",
-  "relays.ts:checkRelay",
-  "relays.ts:confirmRelayJoin",
-  "relays.ts:createRelayInvitation",
-  "relays.ts:installRelayTailscale",
-  "relays.ts:openRelayJoin",
-  "relays.ts:previewRelayPairing",
-  "relays.ts:refreshRelayJoin",
-  "relays.ts:removeRelay",
-  "relays.ts:renameRelay",
-  "relays.ts:revokeHearthClient",
-  "relays.ts:revokeRelayInvitation",
-  "relays.ts:setRelayEnabled",
-  "relays.ts:updateRelay",
-  "relays.ts:updateRelayClient",
-  "relays.ts:updateRelayProxy",
-  "relays.ts:updateRelayTailscale",
-  "relay-transfers.ts:cancelRelayTransfer",
-  "relay-transfers.ts:getRelayTransfer",
-  "relay-transfers.ts:preflightRelayTransfer",
-  "relay-transfers.ts:startRelayTransfer",
-  "relay.ts:completeRelayConsoleCommand",
-  "relay.ts:getFreshRelayConnectionState",
-  "relay.ts:getFreshRelayInstance",
-  "relay.ts:getRelayDatabaseRows",
-  "relay.ts:getRelayDirectorySizes",
-  "relay.ts:getRelayInstances",
-  "relay.ts:getRelaySnapshot",
-  "relay.ts:mutateRelayDatabase",
-  "relay.ts:mutateRelayFiles",
-  "relay.ts:performRelayAction",
-  "relay.ts:recordRelayFileView",
-  "relay.ts:releaseInstancePort",
-  "relay.ts:removeInstanceDatabaseConnection",
-  "relay.ts:reserveInstancePort",
-  "relay.ts:runRelayDatabaseQuery",
-  "relay.ts:saveRelayFile",
-  "relay.ts:sendRelayConsoleCommand",
-  "relay.ts:updateInstanceName",
-  "relay.ts:updateInstancePorts",
-  "relay.ts:updateRelayFilePin",
-  "relay.ts:uploadConsoleLogToMclogs",
-  "relay.ts:uploadToMclogs",
-  "relay-volumes.ts:createRelayVolume",
-  "relay-volumes.ts:renameRelayVolume",
-  "schedules.ts:createSchedule",
-  "schedules.ts:deleteSchedule",
-  "schedules.ts:runScheduleNow",
-  "schedules.ts:updateSchedule",
-  "security.ts:scanSecurityNow",
-  "server-migrations.ts:cancelServerMigration",
-  "server-migrations.ts:previewServerMigration",
-  "sessions.ts:revokeActiveSession",
-  "tailscale.ts:configureTailscaleIntegration",
-  "tailscale.ts:createTailscaleNetwork",
-  "tailscale.ts:getTailscaleIntegrationStatus",
-  "tailscale.ts:previewTailscaleIntegration",
-  "tailscale.ts:saveTailscaleStack",
-  "tailscale.ts:syncTailscaleIntegration",
-  "updates.ts:checkForKilnReleases",
-  "updates.ts:getSystemUpdateStatus",
-  "updates.ts:startSystemUpdates",
-])
+// Reads that stay POST, for an input too large or too secret for a URL,
+// where it would land in proxy logs and request-line limits.
+const readsOverPost: Record<string, string> = {
+  "bricks.ts:loadBrickRecipe": "Its source URL may be signed, kept out of URLs",
+  "databases.ts:getManagedDatabaseRows":
+    "Its filters carry row values, kept out of URLs",
+  "domains.ts:discoverCloudflareDomains": "Carries the pasted API token",
+  "icons.ts:fetchIconSource": "Its image URL may be signed, kept out of URLs",
+  "icons.ts:readIconSourceFile":
+    "A file path of up to 1,024 characters, too long for a URL",
+  "icons.ts:readPictureSourceFile":
+    "A file path of up to 1,024 characters, too long for a URL",
+  "instance-inventory.ts:getInstanceInventory":
+    "Up to 128 resources, too many for a URL",
+  "kiln-database.ts:getKilnDatabaseRows":
+    "Its filters carry row values, kept out of URLs",
+  "relay-transfers.ts:preflightRelayTransfer":
+    "Up to 5,000 paths, too many for a URL",
+  "relay.ts:completeRelayConsoleCommand":
+    "Carries what the person is typing, kept out of URLs",
+  "relay.ts:getRelayDatabaseRows":
+    "Its filters carry row values, kept out of URLs",
+  "relay.ts:getRelayDirectorySizes": "Up to 128 paths, too many for a URL",
+  "relays.ts:checkRelay":
+    "Probes the Relay, recording only what it saw, as its connection does",
+  "relays.ts:previewRelayPairing": "Carries the pairing link's secret",
+  "tailscale.ts:previewTailscaleIntegration": "Carries the OAuth client secret",
+}
+
+// Server functions that change nothing an operation orders: sessions,
+// keystrokes, and signing what the browser takes to a Relay.
+const notOperations: Record<string, string> = {
+  "apps.ts:claimAppTerminal": "Takes over this person's terminal session",
+  "apps.ts:restartAppTerminal": "Restarts this person's terminal session",
+  "apps.ts:writeAppTerminal": "Keystrokes, streamed to the Relay",
+  "browser-accounts.ts:rememberActiveBrowserAccountSession":
+    "Sets this browser's account cookie",
+  "databases.ts:claimDatabaseTerminal":
+    "Takes over this person's terminal session",
+  "databases.ts:restartDatabaseTerminal":
+    "Restarts this person's terminal session",
+  "databases.ts:writeDatabaseTerminal": "Keystrokes, streamed to the Relay",
+  "github-sync.ts:startGitHubConnection":
+    "Signs the state for GitHub's redirect; changes nothing",
+  "platform.ts:claimKilnTerminal": "Takes over this person's terminal session",
+  "platform.ts:restartKilnTerminal": "Restarts this person's terminal session",
+  "platform.ts:writeKilnTerminal": "Keystrokes, streamed to the Relay",
+  "relay-capability.ts:issueBrowserCapabilities":
+    "Signs short-lived capabilities; changes nothing",
+  "relay-capability.ts:issueFileCapability":
+    "Signs a short-lived capability; changes nothing",
+  "relay-desktop.ts:openRelayDesktop":
+    "Opens this person's desktop session, coordinated by the Relay's own registry",
+  "relay-desktop.ts:closeRelayDesktop": "Ends this person's desktop session",
+  "relay-host.ts:claimRelayTerminal":
+    "Takes over this person's terminal session",
+  "relay-host.ts:restartRelayTerminal":
+    "Restarts this person's terminal session",
+  "relay-host.ts:writeRelayTerminal": "Keystrokes, streamed to the Relay",
+  "relay.ts:sendRelayConsoleCommand":
+    "Console input, which the Relay orders in the game server's lifecycle lane",
+}
 
 // The session checks every handler must reach.
 const sessionChecks = new Set([
@@ -271,8 +159,7 @@ describe("API authentication", () => {
   })
 
   // Every change runs as an operation (docs/hearth-operations.md), so it
-  // takes its lanes, and is traced and audited, like every other. Those
-  // still to move are listed below, and the list only shrinks.
+  // takes its lanes, and is traced and audited, like every other.
   it("runs every change as an operation", { timeout: 60_000 }, () => {
     const reaches = reachabilityChecker(checker, isOperationRun)
     const handlers = serverFunctionHandlers(program).filter(
@@ -283,12 +170,15 @@ describe("API authentication", () => {
     )
     expect(
       handlers
-        .filter(({ id }) => !runs.has(id) && !notYetOperations.has(id))
+        .filter(
+          ({ id }) =>
+            !runs.has(id) && !(id in readsOverPost) && !(id in notOperations)
+        )
         .map(({ id }) => id)
     ).toEqual([])
-    // One that moved, or went, comes off the list.
+    // An exception that moved, went, or stopped being POST comes off its list.
     expect(
-      [...notYetOperations].filter(
+      [...Object.keys(readsOverPost), ...Object.keys(notOperations)].filter(
         (id) => runs.has(id) || !handlers.some((handler) => handler.id === id)
       )
     ).toEqual([])
@@ -633,7 +523,8 @@ function isOperationRun(declaration: ts.Node) {
       : null
   return (
     (file === operationFile && name === "runOperationPromise") ||
-    (file === durableOperationFile && name === "startDurableOperation")
+    (file === durableOperationFile &&
+      (name === "startDurableOperation" || name === "queueDurableOperation"))
   )
 }
 

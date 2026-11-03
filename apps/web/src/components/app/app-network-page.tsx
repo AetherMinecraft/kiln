@@ -42,6 +42,7 @@ import { TailscaleMembershipSection } from "@/components/tailscale-network-membe
 import type { IdentityStatusPresentation } from "@/components/identity-name"
 import {
   WebRoutesSection,
+  type WebRouteProxyChange,
   type WebRouteRow,
   type WebRouteServiceOption,
 } from "@/components/web-routes-section"
@@ -58,6 +59,7 @@ import {
   updateAppNetwork,
   updateAppWebRoutes,
 } from "@/server/apps"
+import { useAppDeployState } from "@/components/app/use-app-deploy-state"
 
 export function AppNetworkPage() {
   const { app } = useAppWorkspace()
@@ -155,10 +157,11 @@ function AppWebRoutes({
     [app, compose]
   )
   const save = React.useCallback(
-    async (routes: Array<WebRouteRow>) => {
+    async (routes: Array<WebRouteRow>, proxy?: WebRouteProxyChange) => {
       const next = await updateAppWebRoutes({
         data: {
           appId: app.id,
+          proxy,
           relayId: app.relayId,
           routes: routes.map((route) => ({
             ...route,
@@ -254,11 +257,15 @@ function AppDeployButton({ app }: { app: App }) {
   const deploy = useMutation({
     mutationFn: () =>
       deployApp({ data: { appId: app.id, relayId: app.relayId } }),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.apps.all }),
+    onSuccess: () => {
+      showToast({ message: "Deploy queued", type: "success" })
+      return queryClient.invalidateQueries({ queryKey: queryKeys.apps.all })
+    },
     onError: (error) => showAppOperationError("Deploy failed", error),
   })
-  const deploying = deploy.isPending || app.deployment?.state === "running"
+  // Asked during a build, it applies once that ends; once asked, it waits.
+  const queued = useAppDeployState(app.id)?.queuedId != null
+  const deploying = deploy.isPending || queued
   return (
     <Button
       disabled={deploying}
@@ -268,7 +275,7 @@ function AppDeployButton({ app }: { app: App }) {
       onClick={() => deploy.mutate()}
     >
       {deploying ? <LoaderCircle className="animate-spin" /> : <Rocket />}
-      Deploy to apply
+      {queued ? "Deploy queued" : "Deploy to apply"}
     </Button>
   )
 }

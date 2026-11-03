@@ -54,9 +54,19 @@ export interface LaneAdmission {
    * Whether to wait for the locks (the default) or be refused at once with
    * what's in the way, when an operation holds a conflicting lock or one
    * admitted before is waiting for one. For a person's change, which says
-   * so rather than queue. Needs its locks up front.
+   * so rather than queue. Needs its locks up front. Or decided by what's in
+   * the way: waiting behind some work, refused by other.
    */
-  readonly whenBusy?: "refuse" | "wait"
+  readonly whenBusy?:
+    | "refuse"
+    | "wait"
+    | ((inTheWay: ReadonlyArray<WaitReason<string>>) => "refuse" | "wait")
+  /**
+   * Admitted and kept in line while paused, for upkeep a pause doesn't stop,
+   * such as restoring a network's forwarding rules. It still waits its turn
+   * and is refused, withdrawn, or cancelled like any other.
+   */
+  readonly carriesOnWhilePaused?: boolean
 }
 
 export interface LaneTicket {
@@ -70,6 +80,11 @@ export interface LaneTicket {
   ) => Effect.Effect<A, E | LaneRejectedError>
   /** Withdraws an operation that hasn't started. Running ones are unaffected. */
   readonly cancel: () => void
+  /**
+   * Withdraws it if it hasn't started, in the same step as finding so, and
+   * says whether it did: one that has started runs to the end.
+   */
+  readonly withdraw: () => boolean
   /**
    * Whether it was granted as it was admitted. One that wasn't waited, and
    * whatever it read before may have changed.
@@ -101,6 +116,8 @@ interface Waiter {
   readonly nested: boolean
   // Arrived on its own, so a pause withdraws it while it waits.
   readonly continuation: boolean
+  // Upkeep a pause neither refuses nor withdraws.
+  readonly carriesOnWhilePaused: boolean
   locks: ReadonlyArray<LaneLock> | null
   readonly precondition: (() => boolean) | undefined
   readonly granted: Deferred.Deferred<void, LaneRejectedError>
@@ -198,19 +215,27 @@ export class OperationLanes {
   /**
    * While paused, nothing new starts: work admitted now is refused, and work
    * still waiting, or granted but not yet started, is withdrawn. Work already
-   * running finishes, and can take the nested locks it needs to.
+   * running finishes, and can take the nested locks it needs to. Upkeep
+   * that carries on while paused is admitted and runs as before.
    */
   setPaused(paused: boolean): void {
     this.#paused = paused
     if (!paused) return
-    const continuations = this.#nested.filter((waiter) => waiter.continuation)
-    for (const waiter of continuations) this.#remove(waiter)
-    for (const waiter of [...this.#waiting.splice(0), ...continuations]) {
+    const withdrawn = [
+      ...this.#waiting,
+      ...this.#nested.filter((waiter) => waiter.continuation),
+    ].filter((waiter) => !waiter.carriesOnWhilePaused)
+    for (const waiter of withdrawn) {
+      this.#remove(waiter)
       waiter.state = "done"
       Deferred.doneUnsafe(waiter.granted, Exit.fail(this.#pausedError(waiter)))
     }
     for (const waiter of this.#active) {
-      if ((waiter.nested && !waiter.continuation) || waiter.state !== "granted")
+      if (
+        (waiter.nested && !waiter.continuation) ||
+        waiter.carriesOnWhilePaused ||
+        waiter.state !== "granted"
+      )
         continue
       waiter.refusal = this.#pausedError(waiter)
       this.#release(waiter)
@@ -269,6 +294,7 @@ export class OperationLanes {
     const continuation = !inside && admission.continuation === true
     const nested = inside || continuation
     const waiter: Waiter = {
+      carriesOnWhilePaused: admission.carriesOnWhilePaused === true,
       continuation,
       granted: Deferred.makeUnsafe<void, LaneRejectedError>(),
       label: admission.label,
@@ -278,7 +304,7 @@ export class OperationLanes {
       state: "waiting",
     }
     const queue = nested ? this.#nested : this.#waiting
-    if (!inside && this.#paused) {
+    if (!inside && this.#paused && !waiter.carriesOnWhilePaused) {
       this.#reject(waiter, this.#pausedError(waiter))
     } else if (!inside && this.#waitingOnTheirOwn() >= this.#maxWaiting) {
       this.#reject(
@@ -311,34 +337,43 @@ export class OperationLanes {
         )
       }
       this.#grant()
-      if (admission.whenBusy === "refuse" && waiter.state === "waiting") {
-        this.#refuseBusy(waiter, queue)
+      if (admission.whenBusy !== undefined && waiter.state === "waiting") {
+        const inTheWay = this.#inTheWay(waiter, queue)
+        const whenBusy =
+          typeof admission.whenBusy === "function"
+            ? admission.whenBusy(inTheWay)
+            : admission.whenBusy
+        if (whenBusy === "refuse") this.#refuseBusy(waiter, inTheWay)
       }
     }
     return {
-      cancel: () => this.#cancel(waiter),
+      cancel: () => {
+        this.#cancel(waiter)
+      },
+      withdraw: () => this.#cancel(waiter),
       grantedAtOnce: waiter.state === "granted",
       run: (effect) => this.#run(waiter, effect),
     }
   }
 
-  // Turns away an operation that wasn't granted as it arrived, naming what
-  // holds or waits ahead for its locks.
-  #refuseBusy(waiter: Waiter, queue: Array<Waiter>) {
+  // What holds or waits ahead for the locks of an operation that wasn't
+  // granted as it arrived.
+  #inTheWay(waiter: Waiter, queue: Array<Waiter>) {
     const index = queue.indexOf(waiter)
     const occupant = (other: Waiter) => ({
       id: other.label,
       locks: other.locks ?? [],
     })
-    const blockedBy = [
-      ...new Set(
-        explainWait(
-          waiter.locks ?? [],
-          [...this.#active].map(occupant),
-          queue.slice(0, Math.max(index, 0)).map(occupant)
-        ).map((reason) => reason.id)
-      ),
-    ]
+    return explainWait(
+      waiter.locks ?? [],
+      [...this.#active].map(occupant),
+      queue.slice(0, Math.max(index, 0)).map(occupant)
+    )
+  }
+
+  // Turns it away, naming what's in its way.
+  #refuseBusy(waiter: Waiter, inTheWay: ReadonlyArray<WaitReason<string>>) {
+    const blockedBy = [...new Set(inTheWay.map((reason) => reason.id))]
     this.#remove(waiter)
     this.#reject(
       waiter,
@@ -408,7 +443,8 @@ export class OperationLanes {
     )
   }
 
-  #cancel(waiter: Waiter) {
+  // Withdraws one that hasn't started; reports whether it did.
+  #cancel(waiter: Waiter): boolean {
     if (waiter.state === "waiting") {
       this.#remove(waiter)
       this.#reject(
@@ -419,9 +455,13 @@ export class OperationLanes {
         })
       )
       this.#grant()
-    } else if (waiter.state === "granted") {
-      this.#release(waiter)
+      return true
     }
+    if (waiter.state === "granted") {
+      this.#release(waiter)
+      return true
+    }
+    return false
   }
 
   #reject(waiter: Waiter, error: LaneRejectedError) {

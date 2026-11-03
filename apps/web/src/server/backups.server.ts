@@ -32,6 +32,7 @@ import {
   type BackupCatalogRecord,
   type BackupCatalogPageRecord,
   type BackupDispatch,
+  backupExportStateEffect,
 } from "@/effect/backups"
 import { listManagedDatabaseRecordsEffect } from "@/effect/managed-databases"
 import { loadBackupStorageEffect } from "@/backups/destinations/s3"
@@ -674,9 +675,9 @@ export async function getBackupDownloadUrlHandler(
   }
   if (backup.artifactKind === "restic_snapshot") {
     return resticBackupDownload({
+      afterExport: data.afterExport,
       backup,
       expiresInSeconds: data.expiresInSeconds,
-      poll: data.poll,
       preview: data.preview,
       user,
     })
@@ -737,9 +738,30 @@ export async function getBackupDownloadUrlHandler(
   return { expiresAt: download.expiresAt, url: shareUrl.toString() }
 }
 
+// Reads how a snapshot's export is coming along, starting nothing: one that
+// failed or expired is prepared again by asking for the download again.
+export async function getBackupExportStateHandler(
+  user: AuthenticatedUser,
+  data: BackupIdInput
+) {
+  const backup = await runAppEffect(
+    "backups.getForExportState",
+    getBackupCatalogRecordEffect(data.backupId)
+  )
+  if (!backup) throw new Error("Backup is not available")
+  const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+  if (!hasBackupPermission(user, grants, backup, "backup.download")) {
+    throw new Error("You do not have permission to download this backup")
+  }
+  return runAppEffect("backups.exportState", backupExportStateEffect(backup.id))
+}
+
 export async function restoreInstanceBackupHandler(
   user: AuthenticatedUser,
-  data: BackupRestoreInput
+  data: BackupRestoreInput,
+  // Where its safety backup goes, when settled before; the target's
+  // preferred destination otherwise.
+  settledSafetyStorageIds?: ReadonlyArray<string | null>
 ) {
   const backup = await runAppEffect(
     "backups.getForRestore",
@@ -783,6 +805,7 @@ export async function restoreInstanceBackupHandler(
   const safetyStorageIds = data.safetyBackup
     ? await resolveAuthorizedBackupStorageSelection({
         relayId: relay.id,
+        storageIds: settledSafetyStorageIds,
         targetId: backup.targetId,
         targetKind: "instance",
         user,
@@ -842,7 +865,10 @@ export async function restoreInstanceBackupHandler(
 
 export async function restoreDatabaseBackupHandler(
   user: AuthenticatedUser,
-  data: BackupRestoreInput
+  data: BackupRestoreInput,
+  // Where its safety backup goes, when settled before; the target's
+  // preferred destination otherwise.
+  settledSafetyStorageIds?: ReadonlyArray<string | null>
 ) {
   const backup = await runAppEffect(
     "backups.getForDatabaseRestore",
@@ -883,6 +909,7 @@ export async function restoreDatabaseBackupHandler(
   const safetyStorageIds = data.safetyBackup
     ? await resolveAuthorizedBackupStorageSelection({
         relayId: relay.id,
+        storageIds: settledSafetyStorageIds,
         targetId: backup.targetId,
         targetKind: "database",
         user,
@@ -944,7 +971,10 @@ export async function restoreDatabaseBackupHandler(
  */
 export async function restoreResourceBackupHandler(
   user: AuthenticatedUser,
-  data: BackupRestoreInput
+  data: BackupRestoreInput,
+  // Where its safety backup goes, when settled before; the target's
+  // preferred destination otherwise.
+  settledSafetyStorageIds?: ReadonlyArray<string | null>
 ) {
   const backup = await runAppEffect(
     "backups.getForResourceRestore",
@@ -968,6 +998,7 @@ export async function restoreResourceBackupHandler(
   const safetyStorageIds = data.safetyBackup
     ? await resolveAuthorizedBackupStorageSelection({
         relayId: relay.id,
+        storageIds: settledSafetyStorageIds,
         targetId: target.id,
         targetKind: target.kind,
         user,
@@ -1092,9 +1123,9 @@ async function requireBackupPolicyTarget(
 }
 
 async function resticBackupDownload(input: {
+  afterExport: boolean
   backup: BackupCatalogRecord
   expiresInSeconds: number
-  poll: boolean
   preview: boolean
   user: AuthenticatedUser
 }): Promise<
@@ -1104,9 +1135,9 @@ async function resticBackupDownload(input: {
     "backups.reserveExport",
     reserveBackupExportEffect({
       backupId: input.backup.id,
-      replaceFailed: !input.poll,
+      replaceFailed: true,
       requestedBy: input.user.id,
-      requireFullTtl: !input.poll,
+      requireFullTtl: !input.afterExport,
       taskId: randomUUID(),
       ttlMs: input.expiresInSeconds * 1_000,
     })

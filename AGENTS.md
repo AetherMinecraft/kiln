@@ -66,21 +66,29 @@ Before editing files for a substantial task:
   spans, for hot paths.
 - Avoid patching framework/library internals unless explicitly given permission.
 - Use Sonner for transient feedback and shared tooltips
-- Every change the Relay makes to a game server, App, or database runs in its
-  operation lanes. A new control operation declares the locks it takes in
-  `apps/relay/src/operation-plans.ts`, and Relay-initiated work admits itself
-  the same way, rather than adding a lock of its own. See
+- Every change the Relay makes to a game server, App, database, or shared
+  infrastructure runs in its operation lanes, naming the lane keys it
+  changes, never a lock, queue or busy flag of its own. Hearth's control
+  requests declare their locks in `apps/relay/src/operation-plans.ts`; the
+  Relay's own timers and workers use `operation()` and `runOperation`
+  (`apps/relay/src/operations/operation.ts`) where several share admission,
+  tracing and metrics. A Semaphore is only for throughput, persistence order
+  or admission pressure, listed with its reason in
+  `apps/relay/src/operations/coverage.test.ts`. See
   [Relay operations](docs/relay-operations.md).
 - Every change Hearth makes is an operation: define it with `operation()`,
   naming the lane keys it changes, and run it from the server function's
   handler, rather than taking locks, tracing or auditing by hand. One that
-  must survive a restart is a durable operation. See
+  must survive a restart is a durable operation.
+  `apps/web/src/server/auth-coverage.test.ts` checks every one does. See
   [Hearth operations](docs/hearth-operations.md).
 - Hearth and every Relay run the same Kiln version. Don't build for mixed
   versions: no capability negotiation, feature flags for older peers,
   optional protocol fields kept for compatibility, or fallbacks for a peer
   that lacks something. The one exception is updating: an outdated Relay
-  must still be able to connect far enough for Hearth to update it.
+  must still be able to connect far enough for Hearth to update it. Some
+  older compatibility code remains; don't add to it, and remove it when you
+  touch it.
 - The Relay drives Docker through its Engine API client
   (`apps/relay/src/docker-engine.ts`). Use the API for what the daemon does,
   run Docker's standalone binaries only for client-side work like Compose and

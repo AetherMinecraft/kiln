@@ -87,6 +87,7 @@ import type {
 import { RelayNotFoundError } from "./effect/errors.js"
 import { promiseEffect } from "./effect/promise.js"
 import {
+  logRelayEvent,
   reportRelayError,
   traceParentSpan,
   traceRelayEffect,
@@ -183,11 +184,6 @@ export interface ControlSocketOptions {
   readonly requestLocks: (
     request: RelayControlRequest
   ) => ReadonlyArray<LaneLock> | Promise<ReadonlyArray<LaneLock>> | null
-  /**
-   * Whether a request waits only for what holds its locks, not for what
-   * waits in line, as work something running waits on does.
-   */
-  readonly requestContinues?: (request: RelayControlRequest) => boolean
   readonly subscribeSnapshots: (
     listener: (snapshot: unknown) => void
   ) => () => void
@@ -316,6 +312,7 @@ export function attachControlSocket(
           for (const socket of sockets) {
             const tracked = socket as TrackedWebSocket
             if (tracked.kilnAlive === false) {
+              tracked.kilnUnresponsive = true
               socket.terminate()
               continue
             }
@@ -417,6 +414,8 @@ export function attachControlSocket(
 
 interface TrackedWebSocket extends WebSocket {
   kilnAlive?: boolean
+  // Set when the heartbeat dropped it for not answering a ping.
+  kilnUnresponsive?: boolean
 }
 
 interface InFlightRequest {
@@ -504,7 +503,17 @@ function authenticateSocket(
     )
   )
 
+  // What the log says about this session when it closes.
+  const openedAt = Date.now()
+  let authenticatedAt: number | null = null
+  let lastPongAt = openedAt
+  let socketError: string | null = null
+  socket.on("error", (cause) => {
+    socketError ??= cause.message
+  })
+
   socket.on("pong", () => {
+    lastPongAt = Date.now()
     ;(socket as TrackedWebSocket).kilnAlive = true
   })
   ;(socket as TrackedWebSocket).kilnAlive = true
@@ -646,7 +655,6 @@ function authenticateSocket(
       locks === null
         ? null
         : options.lanes.admit({
-            continuation: options.requestContinues?.(message) ?? false,
             label: message.operation,
             locks,
           })
@@ -710,7 +718,10 @@ function authenticateSocket(
     )
   })
 
-  socket.once("close", () => {
+  socket.once("close", (code, reason) => {
+    if (authenticatedClient) {
+      logSessionClosed(code, reason.toString())
+    }
     authenticationTimeoutFiber.interruptUnsafe()
     authenticationAttempt?.interruptUnsafe()
     authenticationAttempt = null
@@ -735,6 +746,47 @@ function authenticateSocket(
     }
     reversePending.clear()
   })
+
+  // One line for every session that authenticated, so a brief drop leaves
+  // a record on the Relay of who closed it and why. Hearth logs its side
+  // under the same session ID.
+  function sessionLogAttributes() {
+    return {
+      "kiln.hearth.client_id": authenticatedClient?.id ?? null,
+      "kiln.relay.connection_id": connectionId,
+      "kiln.relay.control.opener": dial ? "relay" : "hearth",
+      "kiln.relay.session_id": challenge.sessionId,
+      "network.peer.address": peerAddress ?? null,
+    }
+  }
+
+  function logSessionClosed(code: number, reason: string): void {
+    const now = Date.now()
+    const unresponsive = (socket as TrackedWebSocket).kilnUnresponsive === true
+    // Ones that closed cleanly, such as Hearth moving to another socket or
+    // the Relay shutting down, aren't drops.
+    const clean = !unresponsive && (code === 1000 || code === 1001)
+    logRelayEvent(
+      clean ? "info" : "warning",
+      unresponsive
+        ? "Dropped Hearth's control connection: it stopped answering pings"
+        : "Hearth's control connection closed",
+      {
+        ...sessionLogAttributes(),
+        "kiln.relay.control.close_cause": unresponsive
+          ? "heartbeat"
+          : socketError
+            ? "error"
+            : "closed",
+        "kiln.relay.control.error": socketError,
+        "kiln.relay.control.in_flight": inFlight.size,
+        "kiln.relay.control.last_pong_ms": now - lastPongAt,
+        "kiln.relay.control.session_ms": now - (authenticatedAt ?? openedAt),
+        "websocket.close.code": code,
+        "websocket.close.reason": reason || null,
+      }
+    )
+  }
 
   function authenticateClientEffect(
     clientId: string,
@@ -825,11 +877,6 @@ function authenticateSocket(
             })
             return
           }
-          const action = actionForRequest(request)
-          const actions = actionsForRole(
-            currentClient.role,
-            currentClient.actions
-          )
           if (request.operation === "operation.get") {
             const lookup = yield* lookupOperation(
               currentClient.id,
@@ -838,17 +885,7 @@ function authenticateSocket(
             yield* Effect.sync(() => sendResponse(request, lookup))
             return
           }
-          const issuerInternal = anyClientOperations.has(request.operation)
-          const memberActions = memberActionsForRequest(request)
-          if (
-            !issuerInternal &&
-            (!action ||
-              !isActionAllowed(actions, action) ||
-              memberActions === null ||
-              !memberActions.every((member) =>
-                isActionAllowed(actions, member)
-              ))
-          ) {
+          if (!requestAllowed(request, currentClient)) {
             yield* Effect.sync(() => {
               sendError(
                 socket,
@@ -859,29 +896,53 @@ function authenticateSocket(
             })
             return
           }
-          const execution = promiseOperation(() => {
-            const running = traceRelayPromise(
-              "relay.control.execute",
-              () =>
-                options.execute(
-                  request,
-                  currentClient,
-                  controller.signal,
-                  (operation, requestPayload, timeoutMs) =>
-                    requestClient(
-                      operation,
-                      requestPayload,
-                      timeoutMs,
-                      request.subject
-                    ),
-                  hearthFeatures,
-                  connectionId
-                ),
-              { "relay.operation": request.operation }
-            )
-            onWork(running)
-            return running
-          })
+          const execute = (client: RelayClientGrant) =>
+            promiseOperation(() => {
+              const running = traceRelayPromise(
+                "relay.control.execute",
+                () =>
+                  options.execute(
+                    request,
+                    client,
+                    controller.signal,
+                    (operation, requestPayload, timeoutMs) =>
+                      requestClient(
+                        operation,
+                        requestPayload,
+                        timeoutMs,
+                        request.subject
+                      ),
+                    hearthFeatures,
+                    connectionId
+                  ),
+                { "relay.operation": request.operation }
+              )
+              onWork(running)
+              return running
+            })
+          // One that waited its turn is checked again as it starts, so a
+          // client revoked, or stripped of the action, while it waited
+          // changes nothing.
+          const execution =
+            ticket?.grantedAtOnce === false
+              ? promiseOperation(() =>
+                  options.runEffect(
+                    options.state.findClientById(sessionClient.id)
+                  )
+                ).pipe(
+                  Effect.flatMap((client) =>
+                    client && requestAllowed(request, client)
+                      ? execute(client)
+                      : Effect.fail(
+                          new RecordedFailure(
+                            "forbidden",
+                            "Relay permission denied",
+                            false
+                          )
+                        )
+                  )
+                )
+              : execute(currentClient)
           if (
             options.lanes.paused &&
             relayControlOperationRefusedWhilePaused(request.operation)
@@ -1241,6 +1302,12 @@ function authenticateSocket(
         })
       }
       authenticatedClient = client
+      authenticatedAt = Date.now()
+      logRelayEvent(
+        "info",
+        "Hearth's control connection opened",
+        sessionLogAttributes()
+      )
       yield* Fiber.interrupt(authenticationTimeoutFiber)
       yield* promiseOperation(() =>
         options.runEffect(
@@ -1395,9 +1462,7 @@ function authenticateSocket(
           v: 1,
         })
         return yield* Deferred.await(response).pipe(
-          Effect.timeout(
-            reverseRequestCancellationGraceMs(operation, duration)
-          ),
+          Effect.timeout(1_000),
           Effect.catchTag("TimeoutError", () =>
             controlFailure(
               `Hearth request timed out after ${duration}ms and did not confirm cancellation`
@@ -1415,6 +1480,24 @@ function authenticateSocket(
   }
 }
 
+// Whether the client's grant lets it send the request: checked as the
+// request arrives, and again once it has waited its turn.
+function requestAllowed(
+  request: RelayControlRequest,
+  client: RelayClientGrant
+): boolean {
+  if (anyClientOperations.has(request.operation)) return true
+  const action = actionForRequest(request)
+  const actions = actionsForRole(client.role, client.actions)
+  const memberActions = memberActionsForRequest(request)
+  return (
+    action !== null &&
+    isActionAllowed(actions, action) &&
+    memberActions !== null &&
+    memberActions.every((member) => isActionAllowed(actions, member))
+  )
+}
+
 // Runs a request in its lane; the lane notes on the request's span how long
 // it waited for its turn.
 function runInLane<A, E>(
@@ -1422,18 +1505,6 @@ function runInLane<A, E>(
   execution: EffectType.Effect<A, E>
 ): EffectType.Effect<A, E | LaneRejectedError> {
   return ticket ? ticket.run(execution) : execution
-}
-
-function reverseRequestCancellationGraceMs(
-  operation: RelayControlOperation,
-  duration: number
-): number {
-  if (operation === "hearth.tailscale.member.detach") {
-    // A cancelled prepare may be inside one 60s peer RPC, then needs one
-    // additional peer-RPC window to restore every node already changed.
-    return Math.min(130_000, duration * 2 + 1_000)
-  }
-  return 1_000
 }
 
 function auditDetailsForRequest(
@@ -1686,6 +1757,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "relay.configure"
     case "relay.tailscale.read":
     case "relay.tailscale.stack.list":
+    case "relay.tailscale.stack.state":
       return "instance.network.read"
     case "relay.tailscale.install":
     case "relay.tailscale.write":
@@ -1702,6 +1774,12 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "relay.terminal.write":
     case "relay.terminal.claim":
     case "relay.terminal.restart":
+      return "relay.terminal"
+    // Watching and driving the node's desktop is as much as a host shell.
+    case "relay.desktop.read":
+    case "relay.desktop.attach":
+    case "relay.desktop.heartbeat":
+    case "relay.desktop.detach":
       return "relay.terminal"
     // A shell in Kiln's own containers is as much as a host shell.
     case "relay.platform.terminal.attach":
@@ -1727,11 +1805,23 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "instance.network.read"
     case "relay.proxy.write":
       return "relay.configure"
+    // Has Traefik ask again for a route's certificate: what changing that
+    // route takes. Hearth checks the person may.
+    case "relay.certificates.check": {
+      const kind = objectString(objectRecord(request.payload, "owner"), "kind")
+      return kind === "app"
+        ? "app.manage"
+        : kind === "server"
+          ? "instance.network.write"
+          : null
+    }
     case "relay.volumes.read":
+    case "relay.docker.storage":
       return "relay.read"
     case "relay.volumes.create":
     case "relay.volumes.rename":
     case "relay.volumes.delete":
+    case "relay.docker.cleanup":
       return "relay.configure"
     case "relay.volumes.references.import":
     case "relay.volumes.references.hold":
@@ -1823,6 +1913,8 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
       return "app.create"
     case "app.provision.cancel":
     case "app.delete":
+    // Stopping its build is the first step of deleting it.
+    case "app.deployment.abort":
       return "app.delete"
     // Freezing a resource, or letting it go, is part of deleting it.
     case "resource.freeze":
@@ -1980,8 +2072,6 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "instance.network.databases.remove":
     case "instance.network.routes.write":
       return "instance.network.write"
-    case "hearth.tailscale.member.detach":
-      return null
     case "sftp.authorization.resolve":
       return "instance.sftp.connect"
   }

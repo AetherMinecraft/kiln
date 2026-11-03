@@ -22,6 +22,8 @@ import {
   saveDomainConnectionHandler,
 } from "@/server/domain-settings.server"
 import {
+  adoptWebHostnameRecordHandler,
+  checkWebCertificateHandler,
   getResourceWebHostnamesHandler,
   releaseWebHostnameHandler,
 } from "@/server/web-hostname-access.server"
@@ -92,6 +94,23 @@ const resourceWebHostnamesInputSchema = z.discriminatedUnion("resourceType", [
 
 const releaseWebHostnameInputSchema = z.object({ id: domainIdSchema })
 
+const adoptWebHostnameRecordInputSchema = z.object({
+  id: domainIdSchema,
+  /** Whether the record goes through Cloudflare's proxy once Kiln has it. */
+  proxied: z.boolean(),
+  /** The record as the person saw it and agreed to hand it over. */
+  record: z.object({
+    content: z.string().max(255),
+    id: z.string().regex(/^[a-f0-9]{32}$/u),
+    proxied: z.boolean(),
+    type: z.enum(["A", "AAAA", "CNAME"]),
+  }),
+})
+
+const checkWebCertificateInputSchema = resourceWebHostnamesInputSchema.and(
+  z.object({ hostname: z.string().trim().toLowerCase().min(1).max(253) })
+)
+
 export type SaveDomainConnectionInput = z.infer<
   typeof saveDomainConnectionInputSchema
 >
@@ -114,6 +133,12 @@ export type ResourceWebHostnamesInput = z.infer<
 >
 export type ReleaseWebHostnameInput = z.infer<
   typeof releaseWebHostnameInputSchema
+>
+export type AdoptWebHostnameRecordInput = z.infer<
+  typeof adoptWebHostnameRecordInputSchema
+>
+export type CheckWebCertificateInput = z.infer<
+  typeof checkWebCertificateInputSchema
 >
 
 export interface InstanceDomainOverview {
@@ -160,15 +185,32 @@ export interface ManagedDomainOverview {
 
 /** A web route hostname, and the DNS record Kiln keeps for it, if any. */
 export interface WebHostnameOverview {
+  /**
+   * Whether the person may have Kiln take over its existing record: they
+   * may change its routes and own its Cloudflare connection.
+   */
+  canAdopt: boolean
   /** Whether the person may release it. */
   canManage: boolean
   /** The connection's name, when it's one the person sees. */
   connectionName: string | null
+  /**
+   * While `external`, the one address record Cloudflare already had, as
+   * Kiln last saw it; null when it had none, or several.
+   */
+  existingRecord: {
+    content: string
+    id: string
+    proxied: boolean
+    type: "A" | "AAAA" | "CNAME"
+  } | null
   /** Kiln's generated address for an app. */
   generated: boolean
   hostname: string
   id: string
   lastError: string | null
+  /** Through Cloudflare's proxy; null when Kiln doesn't know. */
+  proxied: boolean | null
   /** Used by a web route, so it goes with the route. */
   routed: boolean
   relayId: string
@@ -190,6 +232,8 @@ export interface WebHostnameOverview {
         /** The `/server/$serverId` param. */
         routeId: string
       }
+  /** What its certificate waits for; null once it has one. */
+  certificate: WebHostnameCertificate | null
   /** `manual`: on no connected domain, so its owner points it by hand. */
   status: "active" | "error" | "external" | "manual" | "pending" | "removing"
   /** The Relay address its record points at. */
@@ -200,6 +244,36 @@ export interface WebHostnameOverview {
   zoneName: string | null
 }
 
+/**
+ * What a web route hostname's certificate waits for, as its Relay's bundled
+ * Traefik last said. None waits on a Relay behind another proxy, which
+ * keeps its own certificates.
+ */
+export interface WebHostnameCertificate {
+  /** A check or a request already failed, so the Relay is retrying. */
+  failed: boolean
+  /** `dns`: its name doesn't resolve yet. */
+  waitingFor: "certificate" | "dns"
+}
+
+/** What checking a hostname's certificate now found. */
+export interface WebCertificateCheck {
+  /** Whether its Relay had Traefik ask Let's Encrypt; its limits may not allow. */
+  asked: boolean
+  /** What it still waits for; null once it has a certificate. */
+  certificate: WebHostnameCertificate | null
+}
+
+/** A game server's or app's web hostnames, for its network page. */
+export interface ResourceWebHostnames {
+  /** Whether the person may change its routes. */
+  canChange: boolean
+  /** Its web route hostnames still waiting on a certificate. */
+  certificates: Array<WebHostnameCertificate & { hostname: string }>
+  /** The DNS records Kiln keeps for them. */
+  hostnames: Array<ResourceWebHostname>
+}
+
 /** A web hostname as a game server's or app's network page shows it. */
 export interface ResourceWebHostname {
   canRelease: boolean
@@ -207,6 +281,8 @@ export interface ResourceWebHostname {
   hostname: string
   id: string
   lastError: string | null
+  /** Through Cloudflare's proxy; null when Kiln doesn't know. */
+  proxied: boolean | null
   status: Exclude<WebHostnameOverview["status"], "manual">
 }
 
@@ -260,6 +336,16 @@ export const getResourceWebHostnames = createServerFn({ method: "GET" })
   .validator(resourceWebHostnamesInputSchema)
   .handler(({ data }) => getResourceWebHostnamesHandler(data))
 
+/** Has the hostname's Relay check its name and certificate again now. */
+export const checkWebCertificate = createServerFn({ method: "POST" })
+  .validator(checkWebCertificateInputSchema)
+  .handler(({ data }) => checkWebCertificateHandler(data))
+
 export const releaseWebHostname = createServerFn({ method: "POST" })
   .validator(releaseWebHostnameInputSchema)
   .handler(({ data }) => releaseWebHostnameHandler(data))
+
+/** Has Kiln take over the record Cloudflare already had for a hostname. */
+export const adoptWebHostnameRecord = createServerFn({ method: "POST" })
+  .validator(adoptWebHostnameRecordInputSchema)
+  .handler(({ data }) => adoptWebHostnameRecordHandler(data))

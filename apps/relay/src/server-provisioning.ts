@@ -16,10 +16,10 @@ export function serverProvisioning(options: {
     kind: "server",
     announce: options.refreshSnapshot,
     label: "instance.provision",
+    // The create takes the routes itself, once its image is downloaded, for
+    // what every game server shares: the game network, the Relay's CoreDNS,
+    // and their private hostnames.
     locks: instanceReplaceLocks,
-    // Creating a game server changes what they all share: the game network,
-    // the Relay's DNS records, and their private hostnames.
-    oneAtATime: true,
     withState: (placeholder, state) => ({
       ...placeholder,
       observedState: state.phase === "failed" ? "failed" : "provisioning",

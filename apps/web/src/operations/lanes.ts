@@ -2,6 +2,8 @@
  * Hearth's operation lanes (docs/hearth-operations.md): the same in-memory
  * kernel each Relay runs, one per process, since Hearth runs as one.
  */
+import { createHash } from "node:crypto"
+
 import {
   OperationLanes,
   exclusive,
@@ -100,6 +102,15 @@ export const resourceKey = (
 ) => `${kind}:${relayId}/${id}`
 
 /**
+ * A Relay as a whole. Removing or pairing it takes it exclusively; a change
+ * to one part of it, such as its proxy, takes that part (`partKey`).
+ */
+export const relayKey = (id: string) => `relay:${id}`
+
+/** Hearth itself: updating it replaces its container. */
+export const hearthKey = "hearth"
+
+/**
  * Who may do what on a game server, database, App, or Relay: its people,
  * invitations and owner.
  */
@@ -108,12 +119,20 @@ export const accessKey = (
   relayId: string,
   id: string
 ) =>
-  kind === "relay"
-    ? `relay:${relayId}#access`
-    : partKey(resourceKey(kind, relayId, id), "access")
+  partKey(
+    kind === "relay" ? relayKey(relayId) : resourceKey(kind, relayId, id),
+    "access"
+  )
 
 /** A person's account and what they may do. */
 export const userKey = (id: string) => `user:${id}`
+
+/**
+ * An address someone is invited at, before or without an account. Hashed:
+ * lane keys reach spans, logs and the Operations page, an address mustn't.
+ */
+export const emailKey = (email: string) =>
+  `email:${createHash("sha256").update(email).digest("hex").slice(0, 32)}`
 
 /**
  * A part of something with a key of its own, such as a game server's DNS
@@ -121,6 +140,24 @@ export const userKey = (id: string) => `user:${id}`
  * so taking the whole exclusively waits for, or turns away, every part.
  */
 export const partKey = (whole: string, part: string) => `${whole}#${part}`
+
+/**
+ * How a change holds what it changes (docs/hearth-operations.md):
+ * - `"whole"`: replacing or removing it. Everything else on it is turned
+ *   away until it ends.
+ * - `{ part }`: one kind of everyday change that another of its kind
+ *   mustn't interleave with, such as `"power"`. Another of the same kind
+ *   waits for it; other work on it doesn't.
+ * - `"shared"`: everyday work the Relay or the database already keeps in
+ *   order. Only replacing or removing it stops it.
+ */
+export type LockPolicy = "shared" | "whole" | { readonly part: string }
+
+export function lockAs(key: string, policy: LockPolicy): LaneLock {
+  if (policy === "whole") return exclusive(key)
+  if (policy === "shared") return shared(key)
+  return exclusive(partKey(key, policy.part))
+}
 
 /** `locks`, with the whole shared for each part, normalized. */
 export function withWholes(

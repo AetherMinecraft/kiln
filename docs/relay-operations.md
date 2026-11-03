@@ -6,7 +6,8 @@ built on the lane rules in `packages/operations` that Hearth shares).
 Hearth's requests, the browser's direct console and uploads, SFTP, schedules,
 crash recovery, and the Relay's own workers all go through them, so a feature
 gets ordering and exclusion by naming the resources it touches instead of
-adding a lock of its own.
+adding a lock of its own. Port reservations are the one exception: they take
+a reservation lock of their own rather than a lane.
 
 ## Lanes
 
@@ -25,22 +26,24 @@ A resource and its parts are separate keys. Work on a part takes the whole
 resource shared and the part exclusive; work that replaces the resource takes
 it exclusive, which waits for every part.
 
-| Key                                                | Taken by                                                                                                                                                                                                                                         |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `instance:<id>`                                    | Shared by every change to a game server; exclusive to replace it (restore, reinstall, delete)                                                                                                                                                    |
-| `instance:<id>/lifecycle`                          | Exclusive to power actions, console input, crash recovery, the disk-quota stop, and container recreation for ports, routes, and database connections                                                                                             |
-| `instance:<id>/files`                              | Exclusive to Hearth file writes                                                                                                                                                                                                                  |
-| `instance:<id>/metadata`                           | Exclusive to renames                                                                                                                                                                                                                             |
-| `app:<id>`, `app:<id>/lifecycle`, `app:<id>/files` | The same shape for Apps; a deployment's build, connecting the App to a database, and a scheduled command hold the lifecycle lock                                                                                                                  |
-| `app:<id>/volumes`                                 | Exclusive to recording which Kiln volumes an App's configuration mounts, apart from its lifecycle so saving a configuration never waits behind a deployment                                                                                      |
-| `database:<id>`                                    | Exclusive to database changes, connecting a member to it, and connecting it to another; shared by power, commands, dumps, backups, and Hearth's handover of Apps' connections                                                                    |
-| `database:<id>/lifecycle`                          | Exclusive to power actions and scheduled commands; shared by dumps and backups, so neither stops or runs in a database mid-dump                                                                                                                 |
-| `relay:routes`                                     | Shared by starts; exclusive to route, port, proxy, and networking writes                                                                                                                                                                         |
-| `relay:tailscale`                                  | Exclusive to the Relay's Tailscale settings; shared by stack changes                                                                                                                                                                             |
-| `relay:allocations`                                | Exclusive to anything that reserves the node's memory, CPU, or disk: limit changes, a deployment's container start, and a game server's check before it's created or replaced, whose reservation stands in for it until its new container exists |
-| `relay:host-files`                                 | The host file root                                                                                                                                                                                                                               |
-| `volume:<id>`                                      | Exclusive to creating, renaming, and deleting one of the Relay's named volumes; shared by deployments that mount it and by recording that configurations mount it, so a deletion sees both                                                       |
-| `relay:platform`                                   | Exclusive to each pass over Kiln's own services and to restarting or repairing them, when the Relay hosts them ([Self-hosting](self-hosting.md))                                                                                                 |
+| Key                                                | Taken by                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `instance:<id>`                                    | Shared by every change to a game server; exclusive to replace it (restore, reinstall, delete)                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `instance:<id>/lifecycle`                          | Exclusive to power actions, console input, crash recovery, the disk-quota stop, and container recreation for ports, routes, and database connections                                                                                                                                                                                                                                                                                                                                                                                      |
+| `instance:<id>/files`                              | Exclusive to Hearth file writes, SFTP changes, and putting a browser upload in place                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `instance:<id>/metadata`                           | Exclusive to renames                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `app:<id>`, `app:<id>/lifecycle`, `app:<id>/files` | The same shape for Apps; a deployment's build, connecting the App to a database, and a scheduled command hold the lifecycle lock                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `app:<id>/volumes`                                 | Exclusive to recording which Kiln volumes an App's configuration mounts, apart from its lifecycle so saving a configuration never waits behind a deployment                                                                                                                                                                                                                                                                                                                                                                               |
+| `database:<id>`                                    | Exclusive to database changes, connecting a member to it, and connecting it to another; shared by power, commands, dumps, backups, and Hearth's handover of Apps' connections                                                                                                                                                                                                                                                                                                                                                             |
+| `database:<id>/lifecycle`                          | Exclusive to power actions and scheduled commands; shared by dumps and backups, so neither stops or runs in a database mid-dump                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `relay:routes`                                     | Shared by starts; exclusive to route, port, proxy, networking, and Tailscale settings writes, to rewriting bundled Traefik's routes when which certificates it asks for changes, to the step of creating, provisioning, reconfiguring, and deleting a game server that rewrites the Relay's CoreDNS, to the pass that keeps Coolify's Traefik attached to routed servers (skipped while busy or paused), and to repairing bundled Traefik for Hearth after a platform pass                                                                |
+| `relay:tailscale`                                  | Exclusive to the Relay's Tailscale settings; shared by stack changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `relay:allocations`                                | Exclusive to checking limits and reserving the node's memory and disk (CPU is shared, so each limit need only fit the node): limit changes, a deployment's container start, and a game server's check before it's created or replaced, whose reservation stands in for it until its new container exists                                                                                                                                                                                                                                  |
+| `relay:desktop`                                    | Exclusive to attaching to the node's desktop, which starts its streamer, and to stopping the streamer once it's idle                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `relay:host-files`                                 | The host file root                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `volume:<id>`                                      | Exclusive to creating, renaming, and deleting one of the Relay's named volumes; shared by deployments that mount it and by recording that configurations mount it, so a deletion sees both                                                                                                                                                                                                                                                                                                                                                |
+| `relay:platform`                                   | Exclusive to each pass over Kiln's own services, to restarting or repairing them, and to replacing the installation; shared by writes to Kiln's own database and by its backups, when the Relay hosts them ([Self-hosting](self-hosting.md))                                                                                                                                                                                                                                                                                              |
+| `relay:docker-cleanup`                             | Exclusive to each cleanup pass over what finished updates left and Hearth's and the Relay's old images, to each pass over images no Kiln container has used for a day, to removing an App's old images (which holds the App shared, beside its deployments), and to retrying the removal of a leftover container no resource owns; shared by an update writing its records before it pulls; a leftover an App, database, or game server owned is retried in its lifecycle lane instead ([Relay runtime](relay-runtime.md#docker-cleanup)) |
 
 A database connection (`database.network.write`) names its member by kind:
 a game server, an App (every service of it), or another database. It locks
@@ -80,41 +83,113 @@ recovery included, and all of them do when the Relay starts, so one its
 container lost, as when the Relay stopped between replacing a container and
 reattaching it, comes back. A start can attach a member at the same time as
 an apply that keeps it, since that apply holds the member only shared; each
-accepts the endpoint the other put there. Deleting any of them
-asks Hearth to rewrite its networks' DNS on every node first
-(`hearth.tailscale.member.detach`), then takes it off them, and puts the DNS
-back if that fails. Applying a network (`relay.tailscale.stack.apply`) holds
+accepts the endpoint the other put there. Deleting any of them takes it
+off its networks once the resource itself is deleted; Hearth has already
+written their DNS without it. Applying a network (`relay.tailscale.stack.apply`) holds
 the network's own stack exclusively and
-takes the lifecycle lock of each member it joins or takes off, so it waits
+takes the lifecycle lock of each game server or App it joins or takes off
+(a database it holds whole), so it waits
 for that member's power changes as they wait for it; a member it leaves as it
 is is held shared, so it isn't deleted or replaced meanwhile. Removing a
 network does the same for all its members. The locks are planned from the
 members the network has when the change is admitted, and the change refuses
-to run if they've changed by its turn. A game server's, App's, or
-database's deletion holds it while Hearth rewrites its networks' DNS for it,
-and a change to the network queued behind the deletion waits for it in turn.
-So while a deletion
-waits on a network's DNS, rewriting that DNS (`relay.tailscale.stack.dns`)
-waits only for what holds its locks, not for what waits in line, and counts
-toward the lanes' waiting limit and is refused, as by an unfinished
-restore's fence, like any request; at any other time it takes
-its turn like any change.
+to run if they've changed by its turn. Taking a deleted resource's members
+off its networks rereads each network's configuration inside the network's
+own exclusive lane, so deletions at the same time can't overwrite each
+other's bindings.
 
-A deletion asks Hearth for DNS before taking the stack's own exclusive
-lane, so that its DNS continuation can finish. The local detach then
-rereads the configuration inside that lane, shared with apply and removal,
-so concurrent deletions cannot overwrite each other's bindings. A rollback
-takes the same lane and restores only the members its detach removed into
-the current configuration, preserving other deletions and applies.
+Hearth alone writes a network's DNS records (`relay.tailscale.stack.dns`),
+each time from what the network's Relays hold then
+(`relay.tailscale.stack.state`). It asks only those: the ones a save is
+applying it to, or, for a deletion, the ones Hearth recorded when it last
+saved it. Records are the enabled members of nodes not being removed,
+leaving out members whose resource is frozen for its deletion. Each node keeps the records Hearth
+last sent and serves them again whenever it recreates its DNS container;
+it never makes up records of its own. In Hearth, saving a network,
+connecting it to Tailscale, syncing it and rewriting its DNS all take its
+`tailscale-network:<id>#settings`, so they go one after the other and the
+last one read the latest state; creating or removing it takes it whole. A
+resource's deletion rewrites its networks' DNS as its own durable operation
+(`tailscale.network.dns`) right after freezing it, and waits for that to
+succeed before backing it up or asking its Relay to delete it; keeping it
+rewrites them again once it's let go. A member's DNS is gone from the
+moment its resource is frozen: a database stays running for its final
+backup, but its hostname no longer resolves. A failure leaves it frozen
+and nothing deleted.
 Relays rewrite bindings saved with a
 game server's bare ID when they start, and Hearth its copies of them in a
 migration.
 
-`apps/relay/src/operation-plans.ts` maps each control operation to its keys.
-Its switch is exhaustive, so a new operation can't compile until it declares
-what it locks, or that it locks nothing.
+The Relay's own CoreDNS (`infrastructure/coredns/Corefile` and its
+container) answers for every game server's private hostname, under the
+networking or Tailscale settings. Each change that rewrites it reads the
+game servers and settings, writes the file, and restarts or recreates the
+container while it holds `relay:routes` exclusively, so none can write a
+list or settings read before another's change landed. Networking and
+Tailscale settings writes, Tailscale's install, and port writes hold the
+routes for the whole change. A game server's create, provisioning, startup
+change, and deletion hold only the server as they arrive, and take the
+routes in a nested step (`instance.dns`) for the part that reads them: a
+create or startup change downloads its image first, and a deletion stops
+and removes the container and its data first, so route and port changes,
+other creates and deletions, and game server starts don't wait for that.
+A startup change stops the old container first but removes it only in
+that step, so its ports and Tailscale address stay claimed while it
+downloads, and no other create takes them. Holding the routes, the step
+reads the game servers and settings again, makes the container from them, and rewrites CoreDNS before it lets go;
+whatever changed the server list before it, a deletion's removal
+included, is in what it reads. A start that recreates a game server with
+its first game port refreshes CoreDNS too, holding the routes only shared:
+whatever changes what it reads rewrites CoreDNS holding them exclusively
+afterwards, so the last file written is current. A direct create
+(`instance.create`) chooses the new server's ID as its request arrives, so
+it waits in that server's lane like a provisioning job.
 
-Reads take no locks. They never wait, and they may see a resource mid-change.
+### How work is admitted
+
+Work reaches the lanes one of three ways, each naming the keys it changes:
+
+- **Hearth's requests.** The control socket admits each as its frame
+  arrives (see [Arrival order](#arrival-order)), with the keys
+  `apps/relay/src/operation-plans.ts` maps its operation to. Its switch is
+  exhaustive, so a new operation can't compile until it declares what it
+  locks, or that it locks nothing.
+- **The browser, SFTP, schedules, crash recovery and the workers.** Each
+  entry point admits its own work with the shared lock helpers in
+  `operation-plans.ts`, since it owns what admission means there: the moment
+  a frame arrives, one SFTP request, a backup task a cancel withdraws, a
+  provisioning job held for its whole create.
+- **Upkeep run by `runOperation`.** Timers and workers that share
+  admission, tracing and metrics define their work once with `operation()`
+  in `apps/relay/src/operations/operation.ts`, as Hearth's is: its stable
+  name, the keys it changes, whether it still applies (`precondition`,
+  checked as it's granted), whether it's only worth doing now
+  (`onlyIfFree`, turned away rather than waiting), whether a pause leaves
+  it running (`carriesOnWhilePaused`), and its work. `runOperation` admits
+  it to the lanes, gives it a span (`RelayOperations.<name>`) and its
+  duration and refusal metrics, and runs it to the end once started. Work
+  it reaches runs inside it, under the locks it holds, and must need
+  nothing more: one that would take another lock there dies naming it, so
+  the outer operation declares it. A refusal fails with
+  `LaneRejectedError`, which its caller turns into whatever its entry point
+  says: a skipped pass for upkeep. The edge upkeep behind Coolify's
+  Traefik, the repair of bundled Traefik for Hearth, and the repair of
+  Tailscale forwarding rules run this way. Use it for new upkeep, and for
+  work whose callers would otherwise each repeat their own admission, span
+  and metrics; an entry point that owns its admission keeps admitting
+  directly.
+
+`apps/relay/src/operations/coverage.test.ts` lists each place that admits
+itself directly and each semaphore the Relay keeps, with its purpose; a new
+one fails it until it's listed, and so does a listed one that's gone. A
+semaphore is only for what lanes don't order: throughput, the order of
+the Relay's own saves, or pressure on admission, such as one SFTP
+session's changes waiting one at a time. It can't see a change that never
+enters the lanes at all.
+
+Most reads take no locks: they never wait, and they may see a resource
+mid-change. Reads that must see it whole, such as a database dump or completing
+a console command, take its locks shared.
 
 ### Arrival order
 
@@ -126,6 +201,18 @@ admitted after it is granted until the lookup settles.
 
 Browser console input is admitted the same way when its frame arrives.
 
+### Checking the client again
+
+A Hearth client can lose a request's grant while the request waits its
+turn: `kiln-relay hearth revoke` and re-pairing with a new invitation leave
+its session open, and changing or revoking it from Hearth closes the session
+only a moment later. So a request that wasn't granted as it arrived reads
+the client again as its turn comes, before it does anything, and applies the
+same check it passed on arrival. One whose client is gone, or no longer has
+the action, answers `forbidden` and changes nothing; with an operation ID,
+its journal records it as failed. A request granted as it arrived was
+checked after its turn came, so it isn't checked twice.
+
 ### Disconnects and timeouts
 
 A request still waiting when its Hearth disconnects, cancels, or times out
@@ -136,8 +223,10 @@ locks early would let conflicting work run against a half-changed resource.
 
 ### Work that runs in the background
 
-Requests that hand work to a background worker take no locks themselves; the
-worker locks the work when it runs it:
+Requests that hand work to a background worker, such as queueing a backup,
+provisioning or a transfer, take no locks themselves; the worker locks the
+work when it runs it. A deployment is checked and recorded under the App's
+lifecycle lock, which its build takes again when it runs:
 
 - **Backups** run alongside other work on their target (shared lock). A
   **restore** runs alone (exclusive), so it waits for file writes and power
@@ -154,17 +243,17 @@ worker locks the work when it runs it:
   or deleting an App holds every managed volume it mounts shared, and a
   deployment holds every one its Compose file declares too, by Docker name, in a
   nested step before it makes containers, checked against the same fences.
-- **Provisioning** holds the new server exclusively while it's created.
+- **Provisioning** holds the new server exclusively while it's created,
+  and a game server takes the routes once its image is downloaded, for
+  what game servers share: the game network, the Relay's CoreDNS, and
+  their private hostnames.
   Jobs for different instances run at once, up to half the host's cores
   (two to four), so a slow image download or install doesn't hold up the
   creates queued behind it. Past the first job, another starts only while
   the host's load average is under one per core, so provisioning doesn't
   slow running game servers; while it isn't, the worker checks again every
   five seconds or when a job finishes. Jobs start in the order they were
-  queued, except that game servers are created one at a time, since creating
-  one changes what they all share (the game network, the Relay's DNS records,
-  and private hostnames); databases and Apps queued after a waiting game
-  server go ahead of it.
+  queued.
 - **App deployments** hold the App's lifecycle lock for the whole build. An
   App delete stops a running deployment before it waits, so it doesn't wait
   for the build it's removing.
@@ -173,6 +262,12 @@ worker locks the work when it runs it:
   does (`transferInstallLocks`), so no upload or SFTP write changes the
   folder while it's written. Serving and fetching the artifact take no
   lock. See [Relay transfers](relay-transfers.md#between-relays).
+- **Tailscale forwarding rules** are checked every 10 seconds and restored
+  once a network's stack container has started again. Each network's
+  repair (`relay.tailscale.stack.firewall`) holds its stack exclusively, as
+  applying or removing it does, and reads its configuration again once it
+  holds it, so it never puts back rules a change has since replaced. A
+  network something else holds is skipped until the next check.
 
 Exports, prunes, and backup deletes touch only stored artifacts and take no
 lock.
@@ -194,7 +289,8 @@ kills its containers with the same Docker calls, and keeps what's its own
 around them: a game server's stop command and container recreation, a
 database's wait until its engine answers, and an App's every container (a
 kill reaches those still running). A power action takes the resource shared
-and its lifecycle exclusive, and a game server's start the routes shared too
+and its lifecycle exclusive, and a game server's start or restart the routes
+shared too
 (`resourcePowerLocks`).
 
 ### Schedules
@@ -253,12 +349,22 @@ was sent is backed up from the next time Hearth sends it.
 
 ### Files over SFTP and uploads
 
-SFTP changes and browser uploads run alongside other file work on their
-server, and wait for anything replacing it. An SFTP file handle notes how many
-times its server had been replaced when it opened; once a restore, reinstall,
-or delete has replaced it since, further writes through that handle fail and
-the client must reopen the file. Nothing holds a lock between SFTP calls, so
-an idle SFTP session never blocks a restore.
+Every Kiln writer to a game server's or an App's files takes its files lock
+for the moment it changes them, so a save that checks the file is unchanged
+(`instance.files.put`) either sees another writer's change and reports a
+conflict, or lands before it. Each SFTP change (opening a file to write,
+writing, renaming, removing, making or removing a folder, or changing a
+mode) takes the lock for that one request, and a session's changes take
+their turns one at a time. A browser upload streams beside other file work
+and takes the lock only to put the file in place (`fileRootCommitLocks`).
+Both wait for anything replacing the server. Host uploads already wait for
+the host's file writes, and nothing saves into a database's dumps.
+
+An SFTP file handle notes how many times its server had been replaced when
+it opened; once a restore, reinstall, or delete has replaced it since,
+further writes through that handle fail and the client must reopen the
+file. Nothing holds a lock between SFTP calls, so an idle SFTP session never
+blocks a restore or a save.
 
 ## Operation IDs
 
@@ -344,11 +450,10 @@ stays `unknown` rather than `not_run`.
 
 Console commands and file transfers go from the browser straight to the
 Relay, so Hearth never sees them; the Relay records them in its own audit,
-which Hearth's activity reads with `relay.audit.list`. An audit page would
-show both. Changes Hearth makes on its own, such as backup reconciliation,
-aren't audited here; the Relay's journal and audit still record them. There's
-no page for the audit yet: `listAuditEvents` reads it, newest first,
-optionally for one resource.
+which Hearth's activity reads with `relay.audit.list`. Changes Hearth makes
+on its own, such as backup reconciliation, aren't audited here; the Relay's
+journal and audit still record them. `listAuditEvents` reads the audit,
+newest first, optionally for one resource.
 
 ## Paused Relays
 
@@ -389,7 +494,9 @@ While paused:
 It still takes pausing and resuming, and access revocations, which must reach
 it whatever its state, and terminal heartbeats and detaching. Reads, the
 snapshot loop, and network upkeep such as Tailscale forwarding rules carry
-on.
+on. That upkeep is admitted with `carriesOnWhilePaused`, so the pause neither
+refuses nor withdraws it, but it still waits its turn behind work holding its
+locks and is refused for a frozen or fenced resource like any other.
 
 Hearth also sends a paused Relay no changes: `relayRpc` refuses them with the
 same `relay_paused` error, and `activeRelay` in `lib/relay-registry.ts` is
@@ -450,7 +557,8 @@ A change is one trace from Hearth to the Relay, sampled once at its start:
 - `hearth.relay.request` on Hearth, with `relay.audit.wait` before it sends
   and `relay.audit.start` and `relay.audit.finish` for the audit row.
 - `relay.control.request` on the Relay covers the whole request: the client
-  check, the journal (`relay.state.get_operation`,
+  check (`relay.state.find_client_by_id`, read again at the start of its turn
+  if it waited), the journal (`relay.state.get_operation`,
   `relay.state.start_operation`, `relay.state.finish_operation`), the turn in
   the lanes, and the reply.
 - `relay.control.execute` is the work itself.
@@ -474,32 +582,9 @@ request that claimed it:
 
 ## Transfers through Hearth
 
-A Relay browsers can't reach, such as one that dials Hearth from behind a
-home router, has its file transfers and backup downloads passed through
-Hearth (`/api/relays/<id>/browser/...`), as are copies another Relay pulls
-from it when it can't reach it (`/api/relays/<id>/peer/...`). Hearth
-reaches the Relay through a tunnel when the Relay dialed it, and directly
-otherwise.
-
-- **Tickets.** Before it spends anything on a request, Hearth checks that
-  the credential it carries is one Hearth signed for that Relay: a browser
-  capability, in the `Authorization` header or a native download's form, a
-  backup link's token, or a copy's grant. It must name this Relay and this
-  file root, backup or copy, and not have expired. Anything else gets 401 before a tunnel is
-  opened. The Relay still checks all it does for a direct request, such as
-  the browser's proof, nonces, revocation and paths.
-- **Slots.** Hearth carries at most 8 transfers to one Relay at once, and
-  64 for all Relays together (`KILN_RELAY_PASSTHROUGH_MAX`). Past that, a
-  request waits up to 5 seconds for a slot, then gets 503 with
-  `Retry-After`. Control connections don't count against these.
-- **Stalls.** A transfer through Hearth that moves no bytes either way for
-  60 seconds is ended, freeing its slot.
-- **Rate.** `KILN_RELAY_PASSTHROUGH_BYTES_PER_SECOND` caps all transfers
-  through Hearth together, for a Hearth on a metered or small server. It's
-  off unless set.
-- **Meters.** Hearth counts what it carries for each Relay: transfers open,
-  bytes each way, and those turned away. The Relay's page shows them, and
-  they're recorded as `hearth.relay.passthrough.*` metrics.
+When Hearth carries a transfer for a Relay browsers or other Relays can't
+reach, its tickets, slots and limits are in
+[Relay transfers](relay-transfers.md#through-hearth).
 
 ## Limits
 

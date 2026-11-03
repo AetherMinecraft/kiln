@@ -4,13 +4,15 @@ import {
   HOST_TERMINAL_KEY,
   HostAccessDisabledError,
 } from "./host-shell.js"
+import { Desktop } from "./desktop.js"
 import { createServer as createHttpServer } from "node:http"
 import { createServer as createHttpsServer } from "node:https"
 import { createHmac, randomBytes, randomUUID } from "node:crypto"
 import { mkdir } from "node:fs/promises"
 import { hostname } from "node:os"
 import { join } from "node:path"
-import { Effect, Predicate, Schema } from "effect"
+import { Cause, Effect, Predicate, Schema } from "effect"
+import { logException } from "@workspace/telemetry"
 
 import {
   RelayInventoryLookupSchema,
@@ -53,6 +55,7 @@ import {
   relayAppWebRouteStateSchema,
   relayAppWebRoutesWriteSchema,
   relayDeleteAppSchema,
+  relayAppDeploymentAbortSchema,
   relayAppDeploymentReadSchema,
   relayAppImageCheckSchema,
   relaySecurityInventoryRequestSchema,
@@ -66,6 +69,8 @@ import {
   relayDatabaseTerminalAttachSchema,
   relayDatabaseTerminalDetachSchema,
   relayDatabaseTerminalHeartbeatSchema,
+  relayDesktopDetachSchema,
+  relayDesktopHeartbeatSchema,
   relayDatabaseTerminalClaimSchema,
   relayDatabaseTerminalRestartSchema,
   relayDatabaseTerminalWriteSchema,
@@ -96,10 +101,13 @@ import {
   relayNetworkingSchema,
   relayProxyBrowserMetadataSchema,
   relayProxyReadInputSchema,
+  relayCertificateCheckInputSchema,
+  relayCertificateCheckResultSchema,
   relayProxyConfigurationSchema,
   relayProxySettingsSchema,
   relayVolumeCreateSchema,
   relayVolumeDeleteSchema,
+  relayDockerCleanupRequestSchema,
   relayAppVolumesImportSchema,
   relayAppVolumesWriteSchema,
   relayVolumeRenameSchema,
@@ -202,11 +210,14 @@ import {
   traefikStaticConfiguration,
 } from "./traefik.js"
 import {
-  ensuringPromise,
-  forkPromise,
-  promiseEffect,
-  recoverPromise,
-} from "./effect/promise.js"
+  type CertificateCheck,
+  nameResolver,
+  networkDnsQueries,
+  WebCertificates,
+  webCertificateStorePath,
+} from "./web-certificates.js"
+import { forkPromise, promiseEffect, recoverPromise } from "./effect/promise.js"
+import { DockerCleanup } from "./docker-cleanup.js"
 import { DockerEngine } from "./docker-engine.js"
 import { RelayVolumes } from "./volumes.js"
 import {
@@ -223,11 +234,12 @@ import {
   loadInstallationId,
   replaceInstallationId,
 } from "./installation.js"
-import { LifecycleDriver } from "./lifecycle.js"
+import { LifecycleDriver, newInstanceId } from "./lifecycle.js"
 import { nodeSnapshot } from "./node.js"
 import { reportRelayMemoryMetrics } from "./relay-memory.js"
 import { sampleRelayCapacity } from "./relay-capacity.js"
-import { RelayPairingError } from "./effect/errors.js"
+import { sampleNodeMetrics, watchContainerEvents } from "./node-metrics.js"
+import { RelayPairingError, RelaySystemUpdateError } from "./effect/errors.js"
 import {
   loadOrCreateRelayIdentity,
   renameRelayIdentity,
@@ -271,10 +283,11 @@ import {
   laneKeys,
   LaneRejectedError,
   OperationLanes,
+  shared,
   type LaneAdmission,
 } from "./operation-lanes.js"
+import { operation, runOperation } from "./operations/operation.js"
 import {
-  controlRequestContinues,
   controlRequestLocks,
   databaseReadLocks,
   instanceLifecycleLocks,
@@ -451,23 +464,57 @@ const operationPruneFiber = forkRelayEffect(
   )
 )
 const databaseConnections = new DatabaseConnections(config, startupCore.state)
+// Removes containers Relay is done with, trying again what Docker refuses,
+// and what finished updates leave. See docker-cleanup.ts.
+const dockerCleanup = new DockerCleanup({
+  config,
+  engine: new DockerEngine(config.dockerSocket),
+  lanes,
+  state: startupCore.state,
+  updates: () => systemUpdates.cleanupState(),
+})
 const docker = new DockerDriver(
   config,
   runtimeRecovery,
   bricks,
   startupCore.state,
   databaseConnections,
-  lanes
+  lanes,
+  dockerCleanup
 )
 const databases = new DatabaseDriver(config, docker, databaseConnections)
 const hostShell = new HostShell(config)
+const desktop = new Desktop(config, hostShell, lanes)
 const relayEngine = new DockerEngine(config.dockerSocket)
 const terminals = new ContainerTerminals(config)
 // The config itself, not a copy: it reads the installation ID Hearth gives
 // the Relay later.
+// An update batch's records are written in their turn after a Docker
+// cleanup deciding which images to remove, so it either sees them or is
+// done before the batch pulls its images (docker-cleanup.ts).
+const recordUpdate = operation<Effect.Effect<void, RelaySystemUpdateError>>()({
+  name: "relay.update.record",
+  locks: () => [shared(laneKeys.dockerCleanup)],
+  carriesOnWhilePaused: true,
+  run: ({ input }) => input,
+})
 const systemUpdates = new SystemUpdateManager(config, {
   refuseTarget: (container) =>
     platformUpdateRefusal(config.dataDirectory, container),
+  recordOperations: (write) =>
+    runOperation(lanes, recordUpdate, write, { kind: "worker" }).pipe(
+      Effect.catchIf(
+        (cause) => cause instanceof LaneRejectedError,
+        (cause) =>
+          Effect.fail(
+            new RelaySystemUpdateError({
+              phase: "start.record",
+              reason: cause.message,
+              rollbackFailures: [],
+            })
+          )
+      )
+    ),
 })
 // Set once a restart of the Relay or its host is under way, so a second
 // request in the moment before the Relay goes down doesn't start another.
@@ -511,7 +558,11 @@ const lifecycle = new LifecycleDriver(
   docker,
   bricks,
   databaseConnections,
-  lanes
+  lanes,
+  new WebCertificates({
+    resolve: nameResolver(networkDnsQueries),
+    storePath: webCertificateStorePath(config),
+  })
 )
 // Before anything reads a Tailscale stack.
 await lifecycle.migrateTailscaleStackMembers()
@@ -533,23 +584,9 @@ await databases.recoverReplacements()
 // What each queued change to a Tailscale stack planned its locks from, so it
 // can tell, once it runs, whether the stack changed meanwhile.
 const tailscaleStackPlans = new WeakMap<object, string>()
-// The Tailscale networks whose DNS a deletion is waiting on Hearth to
-// rewrite, by how many deletions wait on each (`controlRequestContinues`).
-const awaitedTailscaleDns = new Map<string, number>()
-async function awaitingTailscaleDns<A>(
-  stackIds: ReadonlyArray<string>,
-  run: () => Promise<A>
-): Promise<A> {
-  for (const id of stackIds)
-    awaitedTailscaleDns.set(id, (awaitedTailscaleDns.get(id) ?? 0) + 1)
-  return ensuringPromise(run, () => {
-    for (const id of stackIds) {
-      const waiting = (awaitedTailscaleDns.get(id) ?? 1) - 1
-      if (waiting > 0) awaitedTailscaleDns.set(id, waiting)
-      else awaitedTailscaleDns.delete(id)
-    }
-  })
-}
+// The ID each queued game server create will make, chosen as it arrives so
+// it waits in the new server's lane.
+const newInstanceIds = new WeakMap<object, string>()
 const volumes = new RelayVolumes(
   config,
   new DockerEngine(config.dockerSocket),
@@ -585,7 +622,8 @@ const apps = new AppDriver(
   { allocations: docker.allocations, state: startupCore.state },
   databaseConnections,
   (dockerNames) =>
-    runRelayEffect("relay.apps.volumes", volumes.idsByDockerName(dockerNames))
+    runRelayEffect("relay.apps.volumes", volumes.idsByDockerName(dockerNames)),
+  dockerCleanup
 )
 lifecycle.useAppServiceContainers(async (appId, service) => {
   await apps.get(appId)
@@ -622,6 +660,7 @@ const databaseDumpFilesystem = new FilesystemDriver({
 // sessions swept with the rest. Only the Relay itself sweeps: a CLI command
 // runs beside it, often from one of those sessions.
 if (!hostShell.enabled && cliArguments.length === 0) {
+  forkPromise(() => desktop.remove())
   forkPromise(() => hostShell.remove())
 }
 if (cliArguments.length === 0)
@@ -924,6 +963,13 @@ const transferSweepFiber = forkRelayEffect(
     Effect.forever
   )
 )
+// A minute after starting, then hourly, and sooner while the disk is
+// nearly full. A pass after a Relay's own update finds its helper still
+// running, and leaves what the update left to the next.
+const dockerCleanupFiber = forkRelayEffect(
+  "relay.docker.cleanup",
+  dockerCleanup.run()
+)
 // Every power change to a game server, App, or database, whoever asks.
 const power = new ResourcePower({
   adapters: {
@@ -933,8 +979,7 @@ const power = new ResourcePower({
       await notePowerChange(appId)
       return apps.action({ action, appId })
     },
-    database: (databaseId, action) =>
-      databases.action({ action, databaseId }),
+    database: (databaseId, action) => databases.action({ action, databaseId }),
     instance: runInstancePower,
   },
   lanes,
@@ -1390,16 +1435,12 @@ const controlSocket = attachControlSocket({
   journalId: startup.journalId,
   initialSnapshot: () => snapshotHub.read(),
   lanes,
-  requestContinues: (request) =>
-    controlRequestContinues(
-      request.operation,
-      lockFields(request.payload),
-      (stackId) => awaitedTailscaleDns.has(stackId)
-    ),
   requestLocks: (request) =>
     controlRequestLocks(
       request.operation,
-      lockFields(request.payload),
+      request.operation === "instance.create"
+        ? { instanceId: plannedInstanceId(request) }
+        : lockFields(request.payload),
       resolveInstanceReference,
       (appId) =>
         runRelayEffect("relay.apps.volumes", volumes.appVolumeIds(appId)),
@@ -1429,6 +1470,7 @@ const controlDials = startControlDials({
     : {}),
 })
 rejectMalformedUpgrades(server)
+desktop.attachServer(server)
 const browserSocket = attachBrowserSocket({
   config,
   gate: transferGate,
@@ -1490,6 +1532,15 @@ const capacityMetricsFiber = forkRelayEffect(
     })
   )
 )
+// What the node and its containers spend, for its metrics.
+const nodeMetricsFiber = forkRelayEffect(
+  "relay.node.metrics",
+  sampleNodeMetrics(() => config.nodeId, relayEngine, config)
+)
+const containerEventsFiber = forkRelayEffect(
+  "relay.container.events",
+  watchContainerEvents(() => config.nodeId, relayEngine, config)
+)
 let startingSftpServer: Awaited<ReturnType<typeof attachSftpServer>> | null =
   null
 let healthServer: HttpServer | null = null
@@ -1535,9 +1586,12 @@ const sftpServer = await Effect.runPromise(
       Effect.sync(() => {
         tailscaleFirewallFiber.interruptUnsafe()
         capacityMetricsFiber.interruptUnsafe()
+        nodeMetricsFiber.interruptUnsafe()
+        containerEventsFiber.interruptUnsafe()
         operationPruneFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
         transferSweepFiber.interruptUnsafe()
+        dockerCleanupFiber.interruptUnsafe()
         provisioningFiber.interruptUnsafe()
         scheduleFiber.interruptUnsafe()
         scheduleManager.close()
@@ -1631,6 +1685,11 @@ const platformContext: PlatformContext = {
   engine: relayEngine,
 }
 const platformFiber = forkRelayEffect("relay.platform", platformLoop())
+// See web-certificates.ts.
+const certificateFiber = forkRelayEffect(
+  "relay.certificates",
+  certificateLoop()
+)
 
 let shutdownStarted = false
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
@@ -1819,12 +1878,16 @@ function shutdownRelay(signal: NodeJS.Signals): Promise<void> {
         healthServer?.closeAllConnections()
         tailscaleFirewallFiber.interruptUnsafe()
         capacityMetricsFiber.interruptUnsafe()
+        nodeMetricsFiber.interruptUnsafe()
+        containerEventsFiber.interruptUnsafe()
         operationPruneFiber.interruptUnsafe()
         tlsRefreshFiber.interruptUnsafe()
         joinFiber?.interruptUnsafe()
         platformFiber.interruptUnsafe()
+        certificateFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
         transferSweepFiber.interruptUnsafe()
+        dockerCleanupFiber.interruptUnsafe()
         provisioningFiber.interruptUnsafe()
         scheduleFiber.interruptUnsafe()
         scheduleManager.close()
@@ -1918,6 +1981,7 @@ async function relaySnapshot() {
     ),
     relay: {
       browserOrigin: config.browserOrigin,
+      certificates: lifecycle.certificates.pending(),
       id: relayIdentity.fingerprint,
       name: relayIdentity.name,
       paused: lanes.paused,
@@ -2040,9 +2104,7 @@ async function executeControlRequest(
           AbortSignal.timeout(relayControlDeadlineMs("relay.update.apply"))
         )
       )
-      // The updates are running now, so failing to audit them must not
-      // tell Hearth they didn't start.
-      const audits = await Promise.allSettled(
+      await Promise.all(
         operations.map((operation) =>
           appendRelayAudit("system.update_started", client.id, request.id, {
             batchId: operation.batchId,
@@ -2053,13 +2115,6 @@ async function executeControlRequest(
           })
         )
       )
-      for (const audit of audits) {
-        if (audit.status === "rejected") {
-          reportRelayError(audit.reason, {
-            operation: "relay.update.apply.audit",
-          })
-        }
-      }
       return batched ? operations : operations[0]
     }
     case "relay.update.status":
@@ -2118,6 +2173,8 @@ async function executeControlRequest(
       )
     case "relay.tailscale.stack.list":
       return lifecycle.tailscaleStacks()
+    case "relay.tailscale.stack.state":
+      return lifecycle.tailscaleStackStates()
     case "relay.tailscale.stack.apply": {
       const input = relayTailscaleStackApplySchema.parse(request.payload)
       const stack = await lifecycle.applyTailscaleStack(
@@ -2181,6 +2238,17 @@ async function executeControlRequest(
           requestHearth("hearth.database.terminal.output", output, timeoutMs)
       )
     }
+    case "relay.desktop.read":
+      return desktop.read()
+    case "relay.desktop.attach":
+      return desktop.attach()
+    case "relay.desktop.heartbeat":
+      return desktop.heartbeat(
+        relayDesktopHeartbeatSchema.parse(request.payload).tickets
+      )
+    case "relay.desktop.detach":
+      desktop.detach(relayDesktopDetachSchema.parse(request.payload).ticket)
+      return { detached: true }
     case "relay.terminal.heartbeat": {
       const input = relayDatabaseTerminalHeartbeatSchema.parse(request.payload)
       return terminals.heartbeat(
@@ -2245,7 +2313,12 @@ async function executeControlRequest(
       const bundled = settings.mode === "traefik"
       return relayProxyConfigurationSchema.parse({
         dynamicConfiguration: bundled
-          ? traefikDynamicConfiguration(config, routes, settings)
+          ? traefikDynamicConfiguration(
+              config,
+              routes,
+              settings,
+              lifecycle.certificates.gate()
+            )
           : null,
         // An older Hearth reads only routes with a port.
         routes: (hearthFeatures.has(relayWebRouteOptionsV1Feature)
@@ -2288,8 +2361,37 @@ async function executeControlRequest(
       await snapshotHub.refresh()
       return proxy
     }
+    case "relay.certificates.check": {
+      const { hostname, owner } = relayCertificateCheckInputSchema.parse(
+        request.payload
+      )
+      const name = hostname.toLowerCase()
+      // Hearth checks the person may change `owner`'s routes; the Relay
+      // refuses a hostname those routes don't serve.
+      const checked = await lifecycle.certificates.check({
+        hostname: name,
+        owner,
+      })
+      await applyCertificateCheck(checked)
+      return relayCertificateCheckResultSchema.parse({
+        asked: checked.asked,
+        pending:
+          lifecycle.certificates
+            .pending()
+            .find((pending) => pending.hostname === name) ?? null,
+      })
+    }
     case "relay.volumes.read":
       return runRelayEffect("relay.volumes.read", volumes.list())
+    case "relay.docker.storage":
+      return runRelayEffect("relay.docker.storage", dockerCleanup.storage())
+    case "relay.docker.cleanup":
+      return runRelayEffect(
+        "relay.docker.cleanup",
+        dockerCleanup.startCleanup(
+          relayDockerCleanupRequestSchema.parse(request.payload)
+        )
+      )
     case "relay.volumes.create": {
       const input = relayVolumeCreateSchema.parse(request.payload)
       return runRelayEffect(
@@ -2536,7 +2638,11 @@ async function executeControlRequest(
       )
     case "database.resources.read": {
       const input = relayDatabaseUsageReadSchema.parse(request.payload)
-      return workloadResources.usage("database", input.databaseId, input.history)
+      return workloadResources.usage(
+        "database",
+        input.databaseId,
+        input.history
+      )
     }
     case "database.create":
       return databases.create(relayCreateDatabaseSchema.parse(request.payload))
@@ -2595,21 +2701,24 @@ async function executeControlRequest(
         await resourceFreezes.forget("database", input.databaseId)
         return { databaseId: input.databaseId, deleted: true }
       }
-      // Hearth removes its DNS records from every node first.
+      // Hearth removed its DNS records from every node first. One already
+      // gone still leaves its networks, so a deletion sent again finishes.
       const member = databaseTailscaleMemberId(input.databaseId)
-      await lifecycle.detachFromTailscale(
-        (memberId) => memberId === member,
-        async ({ memberId, mode, stackIds }) => {
-          await awaitingTailscaleDns(stackIds, () =>
-            requestHearth(
-              "hearth.tailscale.member.detach",
-              { memberId, mode, stackIds },
-              60_000
-            )
-          )
+      const leaveTailscale = () =>
+        lifecycle.removeFromTailscale((memberId) => memberId === member)
+      const deleted = await recoverPromise(
+        () => databases.delete(input),
+        async (cause) => {
+          if (
+            cause instanceof Error &&
+            cause.message === "Database not found"
+          ) {
+            await leaveTailscale()
+          }
+          throw cause
         }
       )
-      const deleted = await databases.delete(input)
+      await leaveTailscale()
       await resourceFreezes.forget("database", input.databaseId)
       return deleted
     }
@@ -2800,20 +2909,11 @@ async function executeControlRequest(
         await resourceFreezes.forget("app", input.appId)
         return { appId: input.appId, deleted: true }
       }
-      // Hearth removes its services' DNS records from every node first.
-      await lifecycle.detachFromTailscale(
-        (memberId) => appTailscaleMember(memberId)?.appId === input.appId,
-        async ({ memberId, mode, stackIds }) => {
-          await awaitingTailscaleDns(stackIds, () =>
-            requestHearth(
-              "hearth.tailscale.member.detach",
-              { memberId, mode, stackIds },
-              60_000
-            )
-          )
-        }
-      )
       const deleted = await apps.delete(input)
+      // Hearth removed its services' DNS records from every node first.
+      await lifecycle.removeFromTailscale(
+        (memberId) => appTailscaleMember(memberId)?.appId === input.appId
+      )
       // What its configuration mounted no longer keeps those volumes.
       await runRelayEffect(
         "relay.apps.volumes.forget",
@@ -2844,6 +2944,11 @@ async function executeControlRequest(
       return apps.readDeployment(
         relayAppDeploymentReadSchema.parse(request.payload)
       )
+    case "app.deployment.abort": {
+      const { appId } = relayAppDeploymentAbortSchema.parse(request.payload)
+      apps.abortDeployment(appId)
+      return { aborted: true }
+    }
     case "app.image.check":
       return apps.checkImages(
         relayAppImageCheckSchema.parse(request.payload),
@@ -3134,7 +3239,10 @@ async function executeControlRequest(
         throw new Error("New server provisioning is disabled on this Relay")
       }
       const input = relayCreateInstanceSchema.parse(request.payload)
-      const instance = await lifecycle.createInstance(input)
+      const instance = await lifecycle.createInstanceWithId(
+        plannedInstanceId(request),
+        input
+      )
       const name = input.name ?? instance.name
       await Effect.runPromise(
         relayOperation(() =>
@@ -3262,23 +3370,7 @@ async function executeControlRequest(
         await resourceFreezes.forget("instance", instanceId)
         return { deleted: true, instanceId }
       }
-      await lifecycle.deleteInstance(
-        instanceId,
-        payload.deleteData === true,
-        async ({ mode, stackIds }) => {
-          await awaitingTailscaleDns(stackIds, () =>
-            requestHearth(
-              "hearth.tailscale.member.detach",
-              {
-                memberId: instanceTailscaleMemberId(instanceId),
-                mode,
-                stackIds,
-              },
-              60_000
-            )
-          )
-        }
-      )
+      await lifecycle.deleteInstance(instanceId, payload.deleteData === true)
       await runRelayEffect(
         "relay.instance.deleteName",
         startup.state.deleteInstanceName(instanceId)
@@ -3287,6 +3379,7 @@ async function executeControlRequest(
         "relay.instance.deletePendingPrimaryPort",
         startup.state.deletePendingPrimaryPort(instanceId)
       )
+      // Its routes go with it, so their hostnames are free again.
       await withRoutesLock("instance.delete.routes", async () => {
         await runRelayEffect(
           "relay.network.routes.deleteInstance",
@@ -4013,10 +4106,24 @@ function notePlatformPass(result: PlatformPassResult): void {
   }
 }
 
+// Starts bundled Traefik for Hearth, or joins it to Kiln's network, after a
+// platform pass. It changes the routes and reads Kiln's services.
+const repairPlatformEdge = operation<void>()({
+  name: "relay.platform.edge",
+  locks: () => [exclusive(laneKeys.routes), shared(laneKeys.platform)],
+  run: () =>
+    Effect.tryPromise(() => lifecycle.reconcilePlatformEdge()).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("Traefik couldn't serve Hearth", cause)
+      )
+    ),
+})
+
 /**
  * Passes over Kiln's services every 30 seconds in platform mode. Otherwise
- * looks once a minute for a Hearth beside this Relay, to report it. Each pass
- * waits its turn in the lanes, so a paused Relay leaves them alone.
+ * looks once a minute for a Hearth beside this Relay, to report it. A
+ * platform-mode pass waits its turn in the lanes, so a paused Relay leaves
+ * Kiln's services alone.
  */
 function platformLoop() {
   if (!platformStartup.state) {
@@ -4033,13 +4140,12 @@ function platformLoop() {
     )
     .pipe(
       Effect.tap((result) => Effect.sync(() => notePlatformPass(result))),
-      // Kiln's network exists once a pass has run; Traefik retries here.
-      Effect.tap(() =>
-        Effect.tryPromise(() => lifecycle.reconcilePlatformEdge()).pipe(
-          Effect.catch((cause) =>
-            Effect.logWarning("Traefik couldn't serve Hearth", cause)
-          )
-        )
+      // Kiln's network exists once a pass has run; Traefik retries here, in
+      // its own turn, since it changes the routes and reads Kiln's services.
+      Effect.andThen(
+        runOperation(lanes, repairPlatformEdge, undefined, {
+          kind: "timer",
+        })
       ),
       Effect.catchIf(
         (cause) => cause instanceof LaneRejectedError,
@@ -4048,6 +4154,49 @@ function platformLoop() {
       Effect.andThen(Effect.sleep("30 seconds")),
       Effect.forever
     )
+}
+
+// Every 15 seconds, or when a route newly waits: lookups outside the lane,
+// changes inside it.
+function certificateLoop() {
+  return Effect.tryPromise(() => lifecycle.certificates.lookUp()).pipe(
+    Effect.flatMap((lookups) =>
+      lookups.due
+        ? lanes.run(
+            {
+              label: "web.certificates.refresh",
+              locks: [exclusive(laneKeys.routes)],
+            },
+            Effect.tryPromise(async () =>
+              applyCertificateCheck(await lifecycle.certificates.apply(lookups))
+            )
+          )
+        : Effect.void
+    ),
+    Effect.catch((cause) =>
+      cause instanceof LaneRejectedError
+        ? Effect.void
+        : Effect.logWarning("Checking web route certificates failed", cause)
+    ),
+    Effect.andThen(
+      Effect.raceFirst(
+        Effect.sleep("15 seconds"),
+        Effect.promise(() => lifecycle.certificates.woken())
+      )
+    ),
+    Effect.forever
+  )
+}
+
+// Rewrites Traefik's routes when owed and refreshes the snapshot. The caller
+// holds the routes lock.
+async function applyCertificateCheck(result: CertificateCheck): Promise<void> {
+  if (result.rewrite) {
+    await traceRelayPromise("relay.certificates.refresh", () =>
+      lifecycle.refreshTraefikCertificates()
+    )
+  }
+  if (result.changed || result.rewrite) await snapshotHub.refresh()
 }
 
 /**
@@ -4123,6 +4272,8 @@ function relayActionSelection(value: unknown): ReadonlyArray<RelayAction> {
   return relayActions.filter((action) => selected.has(action))
 }
 
+// Recorded once a change is made, so failing to record it is logged rather
+// than telling Hearth the change failed.
 async function appendRelayAudit(
   event: string,
   clientId: string | null,
@@ -4131,14 +4282,22 @@ async function appendRelayAudit(
 ): Promise<void> {
   await runRelayEffect(
     `relay.audit.${event}`,
-    startup.state.appendAudit({
-      clientId,
-      details,
-      event,
-      id: randomUUID(),
-      occurredAt: Date.now(),
-      requestId,
-    })
+    startup.state
+      .appendAudit({
+        clientId,
+        details,
+        event,
+        id: randomUUID(),
+        occurredAt: Date.now(),
+        requestId,
+      })
+      .pipe(
+        Effect.catchCause((cause) =>
+          logException(Cause.squash(cause), {
+            operation: `relay.audit.${event}`,
+          })
+        )
+      )
   )
 }
 
@@ -4156,6 +4315,16 @@ function scheduleClientRevocation(clientId: string): void {
       Effect.andThen(Effect.sync(() => controlSocket.revokeClient(clientId)))
     )
   )
+}
+
+// The ID a game server create planned its locks for, chosen once.
+function plannedInstanceId(request: RelayControlRequest): string {
+  let id = newInstanceIds.get(request)
+  if (id === undefined) {
+    id = newInstanceId()
+    newInstanceIds.set(request, id)
+  }
+  return id
 }
 
 // The fields a request's locks come from. A malformed payload takes no
@@ -4445,7 +4614,9 @@ function retainingInstance<T>(
 }
 
 // Clears or rewrites web routes from inside an operation that already holds
-// its resource's locks, such as a delete.
+// its resource's locks, such as a delete. Never from one that holds the
+// routes itself: the lanes don't know it's the same operation, so it would
+// wait for itself.
 function withRoutesLock<T>(
   label: string,
   mutate: () => Promise<T>
@@ -4459,7 +4630,7 @@ function withRoutesLock<T>(
 }
 
 // Pauses or resumes the lanes to match the Hearths holding the Relay paused.
-// Work that waited out a pause starts again once none does.
+// Resuming also restarts the backup and provisioning work a pause deferred.
 async function applyPauseHolds(): Promise<void> {
   const holds = await runRelayEffect(
     "relay.pauseHolds",
@@ -4468,6 +4639,8 @@ async function applyPauseHolds(): Promise<void> {
   const paused = holds.length > 0
   if (paused === lanes.paused) return
   lanes.setPaused(paused)
+  // A stream takes input, which a paused Relay refuses.
+  if (paused) desktop.closeStreams()
   if (!paused) {
     await runRelayEffect(
       "relay.resume",

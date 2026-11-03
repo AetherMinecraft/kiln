@@ -211,7 +211,9 @@ export function backupTaskLocks(
   if (kind === "database") {
     return restore ? databaseLocks(id) : databaseReadLocks(id)
   }
-  return []
+  // Kiln's own database is dumped beside writes to it, as they are beside
+  // each other, but never while a pass restarts or repairs it.
+  return [restore ? exclusive(laneKeys.platform) : shared(laneKeys.platform)]
 }
 
 /**
@@ -230,9 +232,10 @@ export function backupCoverageLocks(input: BackupTaskInput): Array<LaneLock> {
 }
 
 /**
- * Streaming a file into a root, as a browser upload or SFTP write does. It
- * runs alongside other file work and waits only for work that replaces the
- * whole root, such as a restore or delete. `rootId` is the full ID.
+ * Streaming a file into a root, as a browser upload does. It runs alongside
+ * other file work and waits only for work that replaces the whole root, such
+ * as a restore or delete; putting the file in place then takes
+ * `fileRootCommitLocks`. `rootId` is the full ID.
  */
 export function fileRootTransferLocks(rootId: string): Array<LaneLock> {
   if (isRelayFileRoot(rootId)) return [shared(laneKeys.hostFiles)]
@@ -242,6 +245,22 @@ export function fileRootTransferLocks(rootId: string): Array<LaneLock> {
   if (databaseId) return databaseReadLocks(databaseId)
   const appId = appIdFromFileRoot(rootId)
   return [shared(appId ? laneKeys.app(appId) : laneKeys.instance(rootId))]
+}
+
+/**
+ * Putting a streamed upload in place, from inside its transfer. It waits for
+ * the root's other writers, so a save that checks the file is unchanged
+ * either sees the upload or is replaced by it, never loses it. A host upload
+ * already waits for them, and nothing saves into a database's dumps.
+ */
+export function fileRootCommitLocks(rootId: string): Array<LaneLock> {
+  if (isRelayFileRoot(rootId) || databaseIdFromFileRoot(rootId)) return []
+  const appId = appIdFromFileRoot(rootId)
+  return [
+    exclusive(
+      appId ? laneKeys.appFiles(appId) : laneKeys.instanceFiles(rootId)
+    ),
+  ]
 }
 
 /**
@@ -351,26 +370,6 @@ function requestedTailscaleBindings(
 }
 
 /**
- * Whether a request waits only for what holds its locks, not for what waits
- * in line. A game server's, App's, or database's deletion holds it while it
- * waits for Hearth to rewrite its Tailscale networks' DNS
- * (`hearth.tailscale.member.detach`), and Hearth does that with
- * `relay.tailscale.stack.dns`. A change to the network queued behind the
- * deletion waits for it in turn, so while the deletion waits on that
- * network's DNS, its DNS goes ahead of the line; at any other time it takes
- * its turn like any change.
- */
-export function controlRequestContinues(
-  operation: RelayControlOperation,
-  payload: Readonly<Record<string, unknown>>,
-  awaitedDns: (stackId: string) => boolean
-): boolean {
-  if (operation !== "relay.tailscale.stack.dns") return false
-  const stackId = stringField(payload, "id")
-  return stackId !== null && awaitedDns(stackId)
-}
-
-/**
  * Resolves a game server reference to its full ID. Requests normally carry
  * the full ID, which needs no lookup; a short ID or name is looked up.
  */
@@ -442,11 +441,13 @@ export function controlRequestLocks(
     case "relay.update.status":
     case "relay.resources.read":
     case "relay.volumes.read":
+    case "relay.docker.storage":
     case "relay.rename":
     case "relay.audit.list":
     case "relay.networking.read":
     case "relay.tailscale.read":
     case "relay.tailscale.stack.list":
+    case "relay.tailscale.stack.state":
     case "relay.host.read":
     case "relay.database.read":
     case "relay.proxy.read":
@@ -495,6 +496,15 @@ export function controlRequestLocks(
     case "instance.network.ports.release":
       return null
 
+    // The streamer is shared infrastructure; its tickets and streams are
+    // interactive sessions like terminals.
+    case "relay.desktop.attach":
+      return [exclusive(laneKeys.desktop)]
+    case "relay.desktop.read":
+    case "relay.desktop.heartbeat":
+    case "relay.desktop.detach":
+      return null
+
     // Terminals are interactive sessions, coordinated by their own registry.
     case "relay.terminal.attach":
     case "relay.terminal.heartbeat":
@@ -540,6 +550,10 @@ export function controlRequestLocks(
     case "relay.host.files.mount":
       return null
 
+    // Each part of a cleanup admits itself (docker-cleanup.ts).
+    case "relay.docker.cleanup":
+      return null
+
     // Background work locks itself when the worker runs it.
     case "backup.task.enqueue":
     case "backup.task.cancel":
@@ -574,9 +588,11 @@ export function controlRequestLocks(
     case "app.provision.cancel":
       return null
 
-    // A new game server gets an ID only the create itself knows.
+    // A new game server's ID is chosen as its request arrives (index.ts).
+    // Its create takes the routes itself, once its image is downloaded, to
+    // rewrite the Relay's CoreDNS.
     case "instance.create":
-      return null
+      return instance(instanceReplaceLocks)
 
     // Looks up how an earlier change went.
     case "operation.get":
@@ -588,13 +604,14 @@ export function controlRequestLocks(
       return null
 
     // Requests the Relay sends Hearth, never the other way.
-    case "hearth.tailscale.member.detach":
     case "hearth.database.terminal.output":
     case "sftp.authorization.resolve":
       return null
 
     case "relay.networking.write":
     case "relay.proxy.write":
+    // May write the bundled Traefik's routes again.
+    case "relay.certificates.check":
       return [exclusive(laneKeys.routes)]
     case "relay.volumes.create":
     case "relay.volumes.rename":
@@ -617,9 +634,10 @@ export function controlRequestLocks(
         )
       )
     }
+    // Both rewrite the Relay's CoreDNS, as networking changes do.
     case "relay.tailscale.install":
     case "relay.tailscale.write":
-      return [exclusive(laneKeys.tailscale)]
+      return [exclusive(laneKeys.tailscale), exclusive(laneKeys.routes)]
     // DNS records change nothing of a stack's members.
     case "relay.tailscale.stack.dns":
       return instance(
@@ -716,6 +734,10 @@ export function controlRequestLocks(
 
     case "app.create":
       return app(appReplaceLocks, "id")
+    // Stops the running build beside it, which holds the App's lifecycle,
+    // so a deletion needn't wait for the build it removes.
+    case "app.deployment.abort":
+      return app((id) => [shared(laneKeys.app(id))])
     // Clears its routes once the App is gone, in a nested step; it waits
     // for any restore of a volume it mounts or owns.
     case "app.delete":
@@ -743,7 +765,8 @@ export function controlRequestLocks(
       ])
 
     // These replace the server's container or files, so they wait for
-    // everything else on it, live backups included.
+    // everything else on it, live backups included. Each takes the routes
+    // itself for the step that rewrites the Relay's CoreDNS.
     case "instance.startup.write":
     case "instance.delete":
       return instance(instanceReplaceLocks)

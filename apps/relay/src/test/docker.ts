@@ -220,6 +220,12 @@ export class FakeDocker {
   readonly execs = new Map<string, FakeExec>()
   /** Local images and their labels. */
   readonly images = new Map<string, Record<string, string>>()
+  /** When each local image was made, in seconds; 0 unless a test says. */
+  readonly imageCreated = new Map<string, number>()
+  /** Local images no tag names any longer, as after a pull moved the tag. */
+  readonly untaggedImages = new Set<string>()
+  /** BuildKit's cache records, for `docker system df` and its prune. */
+  buildCache: Array<{ InUse: boolean; Size: number }> = []
   /**
    * Programs that fail when a container runs them, with what they print to
    * stderr; they exit with code 1.
@@ -304,6 +310,9 @@ export class FakeDocker {
     this.networks.clear()
     this.volumes.clear()
     this.images.clear()
+    this.imageCreated.clear()
+    this.untaggedImages.clear()
+    this.buildCache = []
     this.pulls.clear()
     this.imageConfigs.clear()
     this.imageTags.clear()
@@ -577,6 +586,7 @@ export class FakeDocker {
       else if (argument === "--file" || argument === "--progress") index += 1
     }
     this.images.set(tag, labels)
+    this.imageCreated.set(tag, Math.floor(Date.now() / 1000))
     return {
       stderr: `#0 building with "default" instance using docker driver\n#1 naming to docker.io/library/${tag} done\n`,
       stdout: "",
@@ -853,7 +863,8 @@ export class FakeDocker {
         },
       },
       Id: container.id,
-      Image: `sha256:${container.image}`,
+      // The local image's ID, as listing images reports it.
+      Image: `sha256:${this.#imageKey(container.image) ?? container.image}`,
       Mounts: container.mounts.map((mount) => ({
         Destination: mount.destination,
         Name: mount.type === "volume" ? mount.source : undefined,
@@ -1697,7 +1708,10 @@ export class FakeDocker {
           .filter((container) =>
             filters.every((filter) => this.#matchesFilter(container, filter))
           )
-          .map((container) => containerSummary(container))
+          .map((container) => ({
+            ...containerSummary(container),
+            ImageID: `sha256:${this.#imageKey(container.image) ?? container.image}`,
+          }))
       )
     }
     if (method === "POST" && path === "/containers/create") {
@@ -2028,9 +2042,29 @@ export class FakeDocker {
           })),
       })
     }
-    // Each volume is as big as the files written into it.
+    // Each volume is as big as the files written into it. Images are a
+    // megabyte each, sharing nothing.
     if (method === "GET" && path === "/system/df") {
       await this.#checkpoint("system df")
+      const types = url.searchParams.getAll("type")
+      if (types.length > 0 && !types.includes("volume")) {
+        return json(200, {
+          BuildCache: types.includes("build-cache") ? this.buildCache : [],
+          Images: [...this.images].map(([image, labels]) => ({
+            Containers: [...this.containers.values()].filter(
+              (container) => this.#imageKey(container.image) === image
+            ).length,
+            Created: this.imageCreated.get(image) ?? 0,
+            Id: `sha256:${image}`,
+            Labels: labels,
+            RepoDigests: [...(this.#repoDigests.get(image) ?? [])],
+            RepoTags: this.untaggedImages.has(image) ? [] : [image],
+            SharedSize: 0,
+            Size: 1_000_000,
+          })),
+          LayersSize: this.images.size * 1_000_000,
+        })
+      }
       return json(200, {
         Volumes: [...this.volumes.values()].map((volume) => ({
           Name: volume.name,
@@ -2042,6 +2076,17 @@ export class FakeDocker {
             ),
           },
         })),
+      })
+    }
+    if (method === "POST" && path === "/build/prune") {
+      await this.#checkpoint("builder prune")
+      const unused = this.buildCache.filter((record) => !record.InUse)
+      this.buildCache = this.buildCache.filter((record) => record.InUse)
+      return json(200, {
+        SpaceReclaimed: unused.reduce(
+          (total, record) => total + record.Size,
+          0
+        ),
       })
     }
     if (method === "GET" && (parameters = route(/^\/volumes\/([^/]+)$/u))) {
@@ -2111,9 +2156,12 @@ export class FakeDocker {
         [...this.images]
           .filter(([, labels]) => this.#labelled(labels, filters, "image ls"))
           .map(([image, labels]) => ({
+            Created: this.imageCreated.get(image) ?? 0,
             Id: `sha256:${image}`,
             Labels: labels,
-            RepoTags: [image],
+            RepoDigests: [...(this.#repoDigests.get(image) ?? [])],
+            RepoTags: this.untaggedImages.has(image) ? [] : [image],
+            Size: 1_000_000,
           }))
       )
     }
@@ -2128,7 +2176,20 @@ export class FakeDocker {
           candidate === reference || `sha256:${candidate}` === reference
       )
       if (!image) throw new DockerFailure(`No such image: ${reference}`, 404)
+      await this.#checkpoint("image rm", image)
+      // Unforced, Docker keeps an image any container uses, even a stopped one.
+      const user = [...this.containers.values()].find(
+        (container) => this.#imageKey(container.image) === image
+      )
+      if (user && !flag("force")) {
+        throw new DockerFailure(
+          `conflict: unable to delete ${image} (must be forced) - image is being used by stopped container ${user.id}`,
+          409
+        )
+      }
       this.images.delete(image)
+      this.imageCreated.delete(image)
+      this.untaggedImages.delete(image)
       return json(200, [{ Deleted: `sha256:${image}` }])
     }
     if (method === "GET" && (parameters = route(/^\/images\/(.+)\/json$/u))) {
@@ -2169,9 +2230,7 @@ export class FakeDocker {
     const digests = this.#repoDigests.get(image) ?? new Set<string>()
     digests.add(`${repository}@${pulled}`)
     this.#repoDigests.set(image, digests)
-    const messages = [
-      { status: `Status: Downloaded newer image for ${image}` },
-    ]
+    const messages = [{ status: `Status: Downloaded newer image for ${image}` }]
     return {
       kind: "stream",
       write: (response) => {
@@ -2800,7 +2859,7 @@ function apiFilters(url: URL): Array<string> {
   )
 }
 
-function containerSummary(container: FakeContainer): unknown {
+function containerSummary(container: FakeContainer): Record<string, unknown> {
   return {
     Id: container.id,
     Image: container.image,

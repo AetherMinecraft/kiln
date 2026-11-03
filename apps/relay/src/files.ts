@@ -672,8 +672,7 @@ export class FilesystemDriver {
               modifiedAt: metadata.mtimeMs,
             }
           }),
-        (handle) =>
-          Effect.tryPromise(() => handle.close()).pipe(Effect.ignore)
+        (handle) => Effect.tryPromise(() => handle.close()).pipe(Effect.ignore)
       )
       if (!read) {
         return yield* filesystemFailure(
@@ -910,7 +909,7 @@ export class FilesystemDriver {
     }).pipe(Effect.withSpan("relay.files.downloadArchive"))
   }
 
-  upload(
+  upload<E = never>(
     instance: FileRoot,
     requestedPath: string,
     source: AsyncIterable<Uint8Array>,
@@ -920,7 +919,14 @@ export class FilesystemDriver {
      * milliseconds still matches, or null for a file that must not exist.
      * Otherwise the upload fails with `file_changed`.
      */
-    unchangedSince?: number | null
+    unchangedSince?: number | null,
+    /**
+     * Runs the commit, which puts the received file in place, so it can wait
+     * for the root's other writers without holding them up while it streams.
+     */
+    inCommit: (
+      commit: Effect.Effect<void, RelayFilesystemError>
+    ) => Effect.Effect<void, RelayFilesystemError | E> = (commit) => commit
   ) {
     return Effect.gen({ self: this }, function* () {
       yield* requireLinuxDescriptorAnchoring()
@@ -947,7 +953,8 @@ export class FilesystemDriver {
               requestedPath,
               source,
               authorizeCommit,
-              unchangedSince
+              unchangedSince,
+              inCommit
             )
           )
         )
@@ -1783,14 +1790,19 @@ const openParentPath = Effect.fn("relay.files.openParentPath")(function* (
   return parentHandle
 })
 
-const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
+const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* <
+  E,
+>(
   root: string,
   parentHandle: FileHandle,
   name: string,
   requestedPath: string,
   source: AsyncIterable<Uint8Array>,
   authorizeCommit: () => boolean,
-  unchangedSince: number | null | undefined
+  unchangedSince: number | null | undefined,
+  inCommit: (
+    commit: Effect.Effect<void, RelayFilesystemError>
+  ) => Effect.Effect<void, RelayFilesystemError | E>
 ) {
   const anchoredParent = fileDescriptorPath(parentHandle)
   const resolvedParent = yield* filesystemOperation(
@@ -1855,43 +1867,48 @@ const uploadIntoParent = Effect.fn("relay.files.uploadIntoParent")(function* (
         yield* filesystemOperation("upload.sync", () => file.sync()).pipe(
           Effect.uninterruptible
         )
-        const currentParent = yield* filesystemOperation(
-          "upload.verifyParent",
-          () => realpath(anchoredParent)
+        yield* inCommit(
+          Effect.gen(function* () {
+            const currentParent = yield* filesystemOperation(
+              "upload.verifyParent",
+              () => realpath(anchoredParent)
+            )
+            yield* ensureContained(root, currentParent)
+            if (!authorizeCommit()) {
+              return yield* filesystemFailure(
+                "io_error",
+                "upload.authorizeCommit",
+                "Upload authorization changed before commit"
+              )
+            }
+            if (unchangedSince === null) {
+              // Linking fails if the file appeared meanwhile, so nothing the
+              // instance created is replaced.
+              yield* filesystemOperation("upload.create", () =>
+                link(temporary, target)
+              ).pipe(
+                Effect.catchIf(
+                  (error) => isAlreadyExists(error.cause),
+                  () => uploadChangedFailure()
+                ),
+                Effect.uninterruptible
+              )
+              return
+            }
+            if (unchangedSince !== undefined) {
+              // POSIX has no compare-and-swap rename. Kiln's other writers
+              // to the root wait for this one, so only the instance itself
+              // can change the file between this check and the rename.
+              const current = yield* optionalFileMetadata(target)
+              if (!current || Math.floor(current.mtimeMs) !== unchangedSince) {
+                return yield* uploadChangedFailure()
+              }
+            }
+            yield* filesystemOperation("upload.replace", () =>
+              rename(temporary, target)
+            ).pipe(Effect.uninterruptible)
+          })
         )
-        yield* ensureContained(root, currentParent)
-        if (!authorizeCommit()) {
-          return yield* filesystemFailure(
-            "io_error",
-            "upload.authorizeCommit",
-            "Upload authorization changed before commit"
-          )
-        }
-        if (unchangedSince === null) {
-          // Linking fails if the file appeared meanwhile, so nothing the
-          // instance created is replaced.
-          yield* filesystemOperation("upload.create", () =>
-            link(temporary, target)
-          ).pipe(
-            Effect.catchIf(
-              (error) => isAlreadyExists(error.cause),
-              () => uploadChangedFailure()
-            ),
-            Effect.uninterruptible
-          )
-          return
-        }
-        if (unchangedSince !== undefined) {
-          // POSIX has no compare-and-swap rename; checking last leaves only
-          // the instant between this check and the rename.
-          const current = yield* optionalFileMetadata(target)
-          if (!current || Math.floor(current.mtimeMs) !== unchangedSince) {
-            return yield* uploadChangedFailure()
-          }
-        }
-        yield* filesystemOperation("upload.replace", () =>
-          rename(temporary, target)
-        ).pipe(Effect.uninterruptible)
       }),
     (file) =>
       closeHandleEffect(file, "upload.closeTemporary").pipe(

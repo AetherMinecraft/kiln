@@ -40,16 +40,25 @@ import { resolveAuthorizedBackupStorageSelection } from "@/lib/backup-storage-se
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { relayRpc } from "@/lib/relay-connection"
 import { activeRelay } from "@/lib/relay-registry"
+import {
+  rewriteTailscaleDnsOf,
+  tailscaleNetworksOf,
+} from "@/lib/tailscale-dns.server"
 import { currentActingUser } from "@/operations/acting-user"
-import { durableOperation, startDurableOperation } from "@/operations/durable"
+import {
+  durableOperation,
+  queueDurableOperation,
+  startDurableOperation,
+} from "@/operations/durable"
 import { exclusive, resourceKey, type Initiator } from "@/operations/lanes"
+import { inLanes } from "@/operations/operation"
 import { RelayCommandError, relayCommand } from "@/operations/relay-command"
 import { requireBackupTargetPermission } from "@/server/backup-target-access.server"
 import { cleanUpDeletedResourceEffect } from "@/server/resource-deletion-cleanup"
 import { deliverPendingSchedules } from "@/server/schedule-deployment.server"
 
 // Deleting a game server, database, App, or Kiln volume, as one durable
-// operation per attempt (docs/resource-unification.md, Deletion): check the
+// operation per attempt: check the
 // person who asked may still delete it, freeze it on its Relay, take its
 // final backup if one was asked for, delete it on the Relay, then clean up
 // after it in Hearth. Each
@@ -262,6 +271,23 @@ const prepare = (input: DeletionInput, takeFinalBackup: boolean) =>
       recover: Effect.succeed({ frozen: true }),
       timeoutMs: relayControlDeadlineMs("resource.freeze"),
     }).pipe(Effect.mapError(asDeletionError))
+    // Frozen, it has no DNS: its networks' DNS is written without it before
+    // anything of it is backed up or deleted, so its Relay deletes it with
+    // nothing left to ask.
+    yield* rewriteTailscaleDnsOf(
+      { id: input.resourceId, kind: input.kind, relayId: input.relayId },
+      {
+        idempotencyKey: `${input.deletionId}:${input.attempt}:dns`,
+        name: "tailscale-dns",
+      }
+    ).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ResourceDeletionError({
+            message: `Nothing was deleted: its Tailscale DNS couldn't be updated: ${cause.message}`,
+          })
+      )
+    )
     const plan = yield* Activity.make({
       name: "plan",
       success: DeletionPlan,
@@ -513,7 +539,7 @@ const deleteOnRelay = (input: DeletionInput, plan: DeletionPlan) =>
         error: ResourceDeletionError,
         execute: resourceOnRelay(input).pipe(Effect.mapError(asDeletionError)),
       }))
-    const gone = resourceOnRelay(input).pipe(
+    const gone = leftOnRelay(input).pipe(
       Effect.flatMap((present) =>
         present
           ? Effect.fail(
@@ -553,9 +579,7 @@ const deleteOnRelay = (input: DeletionInput, plan: DeletionPlan) =>
           name: "delete/verify",
           success: Schema.Boolean,
           error: ResourceDeletionError,
-          execute: resourceOnRelay(input).pipe(
-            Effect.mapError(asDeletionError)
-          ),
+          execute: leftOnRelay(input).pipe(Effect.mapError(asDeletionError)),
         }).pipe(
           Effect.flatMap((present) =>
             present ? Effect.fail(asDeletionError(refused)) : Effect.void
@@ -634,6 +658,34 @@ const resourceOnRelay = (input: DeletionInput) =>
           message: messageOf(cause),
           retryable: false,
         })
+    )
+  )
+
+// Whether the Relay has anything of the resource left to delete: the
+// resource, or its place on a Tailscale network, which its Relay takes off
+// once it has deleted the resource.
+const leftOnRelay = (input: DeletionInput) =>
+  resourceOnRelay(input).pipe(
+    Effect.flatMap((present) =>
+      present
+        ? Effect.succeed(true)
+        : promiseEffect(() =>
+            tailscaleNetworksOf({
+              id: input.resourceId,
+              kind: input.kind,
+              relayId: input.relayId,
+            })
+          ).pipe(
+            Effect.map((networks) => networks.length > 0),
+            Effect.mapError(
+              (cause) =>
+                new RelayCommandError({
+                  code: "unreadable",
+                  message: messageOf(cause),
+                  retryable: false,
+                })
+            )
+          )
     )
   )
 
@@ -729,6 +781,21 @@ export const keepResource = durableOperation({
         recover: Effect.succeed({ frozen: false }),
         timeoutMs: relayControlDeadlineMs("resource.unfreeze"),
       }).pipe(Effect.mapError(asDeletionError))
+      // Let go, it has DNS again.
+      yield* rewriteTailscaleDnsOf(
+        { id: input.resourceId, kind: input.kind, relayId: input.relayId },
+        {
+          idempotencyKey: `${input.deletionId}:${input.attempt}:keep-dns`,
+          name: "tailscale-dns",
+        }
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ResourceDeletionError({
+              message: `It was let go, but its Tailscale DNS couldn't be updated: ${cause.message}`,
+            })
+        )
+      )
       yield* Activity.make({
         name: "kept",
         execute: recordStatus(input, "cancelled", null, ["cancelling"]),
@@ -753,25 +820,89 @@ export const keepResource = durableOperation({
   version: 1,
 })
 
+// Asks the Relay to stop an App's running build before its deletion is
+// queued behind the deployment that holds the App's `#deploy` until the
+// build ends. Best effort: an App with no build, or a Relay that can't hear
+// it now, leaves the deletion to wait its turn. It changes nothing of
+// Hearth's, and the Relay orders it in its own lanes, so it takes none here.
+const abortAppDeployment = (deletion: ResourceDeletion) =>
+  inLanes(
+    "app.deployment.abort",
+    "Stopping this App's deployment",
+    [],
+    promiseEffect(async () => {
+      const relay = await activeRelay(deletion.relayId)
+      await relayRpc(
+        relay,
+        "app.deployment.abort",
+        { appId: deletion.resourceId },
+        15_000
+      )
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning(
+          "Couldn't stop an App's deployment before deleting it",
+          cause
+        )
+      )
+    )
+  ).pipe(Effect.timeoutOption("10 seconds"), Effect.asVoid)
+
+// Stops the App's build for its deletion, only while whoever asked may
+// still delete it: one who no longer may has it refused, and stops nothing.
+const stopBuildFor = (deletion: ResourceDeletion) =>
+  checkAccess({
+    attempt: deletion.attempt,
+    deletionId: deletion.id,
+    kind: deletion.kind,
+    relayId: deletion.relayId,
+    resourceId: deletion.resourceId,
+  }).pipe(
+    Effect.andThen(abortAppDeployment(deletion)),
+    Effect.catchCause(() => Effect.void)
+  )
+
 // Starts the operation that carries out a deletion's current attempt. One
 // already started under its key is the same operation. A person's attempt
 // is refused while something else changes the resource, and recorded as
 // failed with why, for them to try again; Hearth's own waits.
-const startAttempt = (deletion: ResourceDeletion, initiator: Initiator) =>
-  startDurableOperation(
-    deletion.status === "cancelling" ? keepResource : deleteResource,
-    {
-      attempt: deletion.attempt,
-      deletionId: deletion.id,
-      kind: deletion.kind,
-      relayId: deletion.relayId,
-      resourceId: deletion.resourceId,
-    },
-    {
+//
+// An App's deletion stops its build first, then is queued, to take its
+// turn as Hearth's own work rather than be refused by the deployment it
+// stopped, which ends once it sees that, or by one queued behind it, which
+// finds the App being deleted and sends nothing. Queued under its attempt,
+// it's recorded once, however often it's asked, and taken up again after a
+// restart; whoever asked doesn't wait for it. One asked for `queued`, by
+// work that holds the resource until it ends, as a server migration does,
+// is queued the same way, to run once that work ends.
+const startAttempt = (
+  deletion: ResourceDeletion,
+  initiator: Initiator,
+  queued = false
+) => {
+  const input = {
+    attempt: deletion.attempt,
+    deletionId: deletion.id,
+    kind: deletion.kind,
+    relayId: deletion.relayId,
+    resourceId: deletion.resourceId,
+  }
+  const key = `${deletion.id}:${deletion.attempt}`
+  if ((queued || deletion.kind === "app") && deletion.status !== "cancelling") {
+    const queue = queueDurableOperation(deleteResource, input, {
       actorId: deletion.requestedBy,
-      idempotencyKey: `${deletion.id}:${deletion.attempt}`,
-      initiator,
-    }
+      idempotencyKey: key,
+    })
+    return (
+      deletion.kind === "app"
+        ? stopBuildFor(deletion).pipe(Effect.andThen(queue))
+        : queue
+    ).pipe(Effect.asVoid)
+  }
+  return startDurableOperation(
+    deletion.status === "cancelling" ? keepResource : deleteResource,
+    input,
+    { actorId: deletion.requestedBy, idempotencyKey: key, initiator }
   ).pipe(
     Effect.tapErrorTag("OperationBusyError", (busy) =>
       recordResourceDeletionStatusEffect({
@@ -785,8 +916,10 @@ const startAttempt = (deletion: ResourceDeletion, initiator: Initiator) =>
         Effect.tap(deliverSchedules),
         Effect.ignore
       )
-    )
+    ),
+    Effect.asVoid
   )
+}
 
 /**
  * Admits every running attempt whose operation is missing, as after Hearth
@@ -836,6 +969,12 @@ export const requestResourceDeletionEffect = Effect.fn(
 )(function* (input: {
   finalBackup: boolean
   kind: ResourceDeletionKind
+  /**
+   * Queued to run once whatever holds the resource ends, rather than
+   * refused meanwhile: asked by work that holds it, as a server migration
+   * handing over its old server or undoing its copy does.
+   */
+  queued?: boolean
   relayId: string
   resourceId: string
   /** The failed attempt a retry read: it goes ahead only from that one. */
@@ -867,7 +1006,7 @@ export const requestResourceDeletionEffect = Effect.fn(
   })
   yield* deliverSchedules
   if (unfinishedDeletionStatuses.some((status) => status === deletion.status)) {
-    yield* startAttempt(deletion, "person")
+    yield* startAttempt(deletion, "person", input.queued)
   }
   publishDeletionChange(deletion)
   return deletion

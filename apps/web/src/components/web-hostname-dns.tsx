@@ -8,8 +8,12 @@ import {
   TooltipTrigger,
 } from "@workspace/ui/components/tooltip"
 
+import { CloudflareProxyStatus } from "@/components/cloudflare-proxy-status"
 import { resourceWebHostnamesQueryOptions } from "@/lib/query-options"
-import type { ResourceWebHostname } from "@/server/domains"
+import type {
+  ResourceWebHostname,
+  ResourceWebHostnames,
+} from "@/server/domains"
 
 export interface WebHostnameResourceRef {
   relayId: string
@@ -30,8 +34,8 @@ export const WebHostnameDnsStatus = React.memo(function WebHostnameDnsStatus({
   resource: WebHostnameResourceRef
 }) {
   const selectHostname = React.useCallback(
-    (rows: Array<ResourceWebHostname>) =>
-      rows.find((row) => row.hostname === hostname) ?? null,
+    ({ hostnames }: ResourceWebHostnames) =>
+      hostnames.find((row) => row.hostname === hostname) ?? null,
     [hostname]
   )
   const { data: row } = useQuery({
@@ -56,7 +60,7 @@ export const WebHostnameDnsStatus = React.memo(function WebHostnameDnsStatus({
       {presentation.label}
     </span>
   )
-  return row.lastError ? (
+  const status = row.lastError ? (
     <Tooltip>
       <TooltipTrigger asChild>
         <span tabIndex={0}>{label}</span>
@@ -66,7 +70,44 @@ export const WebHostnameDnsStatus = React.memo(function WebHostnameDnsStatus({
   ) : (
     label
   )
+  return row.proxied === null ? (
+    status
+  ) : (
+    <span className="inline-flex shrink-0 items-center gap-2">
+      {status}
+      <CloudflareProxyStatus iconOnly proxied={row.proxied} />
+    </span>
+  )
 })
+
+/**
+ * Whether a resource's hostname goes through Cloudflare's proxy, as Kiln
+ * keeps it; null when Kiln doesn't keep its record.
+ */
+export function useWebHostnameProxied(
+  resource: WebHostnameResourceRef
+): (hostname: string) => boolean | null {
+  const { data } = useQuery({
+    ...resourceWebHostnamesQueryOptions(
+      resource.relayId,
+      resource.resourceType,
+      resource.resourceId
+    ),
+    select: selectProxied,
+  })
+  return React.useCallback(
+    (hostname: string) => data?.get(hostname) ?? null,
+    [data]
+  )
+}
+
+function selectProxied({ hostnames }: ResourceWebHostnames) {
+  return new Map(
+    hostnames
+      .filter((row) => row.status !== "external")
+      .map((row) => [row.hostname, row.proxied] as const)
+  )
+}
 
 function dnsPresentation(row: ResourceWebHostname) {
   switch (row.status) {
@@ -116,6 +157,6 @@ export function useGeneratedHostname(resource: WebHostnameResourceRef) {
   return data ?? null
 }
 
-function selectGenerated(rows: Array<ResourceWebHostname>) {
-  return rows.find((row) => row.generated) ?? null
+function selectGenerated({ hostnames }: ResourceWebHostnames) {
+  return hostnames.find((row) => row.generated) ?? null
 }

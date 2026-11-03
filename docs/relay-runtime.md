@@ -50,10 +50,10 @@ administrators, Hearth's, both by hostname. A Relay that can't inspect a
 hostname directly, such as a remote Relay asked for Hearth's, lists its running
 containers and inspects each to find it.
 
-The client keeps the Docker CLI's observable behavior where callers rely on it:
+What callers can rely on:
 
-- Daemon errors carry the HTTP status and the CLI's
-  `Error response from daemon: <message>` text.
+- Daemon errors carry the HTTP status and the text
+  `Error response from daemon: <message>`.
 - Force-removing a missing container succeeds. Starting a running container or
   stopping a stopped one succeeds.
 - A non-zero exec exit code fails the call.
@@ -65,12 +65,13 @@ The client keeps the Docker CLI's observable behavior where callers rely on it:
   logs keep their newest 5,000 lines within 16 Mi characters.
 - Execs that read stdin, for database import and export, database backups, the
   SQL browser, platform dump and restore, and password rotation, stream over a
-  connection Docker upgrades, as `docker exec -i` did.
+  connection Docker upgrades.
 - Pulls send credentials for the image's registry only, from the Docker
   config file (see [Private registries](#private-registries)).
 - Containers, networks, and volumes are created from Relay's own description
   of them. The request carries only what Relay sets, and Docker fills in its
-  defaults. Labels are a format other Kiln versions read.
+  defaults. Labels are stored with what they label, so a Relay after an
+  update reads the ones an earlier version wrote.
 
 Self-updates use the API end to end: the Relay pulls and verifies the image and
 launches the update helper, which replaces the container and rolls it back as
@@ -83,17 +84,16 @@ API paths are unversioned, so the daemon answers in its own API version.
 
 The Relay runs only two Docker executables, both for app deployments:
 
-| Executable       | Used for                                                                                                                                  |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `docker-compose` | Compose apps, with the arguments `docker compose` had. Docker has no API for Compose.                                                     |
-| `docker-buildx`  | Dockerfile apps, as `docker build` ran it: BuildKit, `.dockerignore`, and `--progress plain` logs. Compose uses it for `build:` services. |
+| Executable       | Used for                                                                                                        |
+| ---------------- | --------------------------------------------------------------------------------------------------------------- |
+| `docker-compose` | Compose Apps. Docker has no API for Compose.                                                                    |
+| `docker-buildx`  | Dockerfile Apps: BuildKit, `.dockerignore`, and `--progress plain` logs. Compose uses it for `build:` services. |
 
 Dockerfile builds run buildx from its path in the image on Docker's own
 builder (`BUILDX_BUILDER=default`), so the image always lands in Docker.
 
-The Relay image ships no `docker` CLI, so builds and Compose deploys no longer
-start it as a wrapper around the plugin. (Compose still starts buildx for
-`build:` services.) It ships Compose v5.5.1 at
+The Relay image ships no `docker` CLI, so builds and Compose deploys don't
+start it. (Compose still starts buildx for `build:` services.) It ships Compose v5.5.1 at
 `/usr/local/bin/docker-compose` and buildx v0.37.2 at
 `/usr/local/libexec/docker/cli-plugins/docker-buildx`, both pinned by checksum
 for amd64 and arm64. `scripts/relay-docker-cli.test.mjs` fails if Relay code
@@ -129,6 +129,100 @@ Docker Desktop, the login sits in the system keychain instead of the file. To
 pull private images today, mount a config file with inline `auths` into the
 Relay container and point `DOCKER_CONFIG` at its directory.
 
+## Docker cleanup
+
+Kiln removes what it leaves on Docker once it's done with it
+(`apps/relay/src/docker-cleanup.ts`):
+
+- Work that replaces a container removes the old one itself: a deployment
+  its App's previous containers, a database change its old container, and
+  a game server's recreation for ports or routes the container it set
+  aside. A removal Docker refuses is recorded in the Relay's SQLite state
+  and tried again by each cleanup pass until the container is gone, in its
+  owner's lifecycle lane, so it never removes one mid-change.
+- An update's helper runs in its own process and can't record what it
+  couldn't remove. A pass removes an exited `io.kiln.update-helper`
+  container of an update this Relay recorded as finished, and a stopped
+  `<name>-kiln-backup-<time>` container the helper set aside, once a
+  running container has the original name and the set-aside one is a
+  Hearth or Relay container of this installation (`io.kiln.component`, and
+  `io.kiln.installation` absent or this one's). While an update this Relay
+  recorded is starting or running, or any update helper on the host hasn't
+  exited, a pass leaves both alone, since a helper rolling back needs the
+  container it set aside. Only a container an update this Relay recorded
+  replaced counts as set aside, or, from before updates were recorded, a
+  helper or set-aside container named as Kiln's updater names them that has
+  been stopped for a day (by Docker's `FinishedAt`), which no update ever
+  is. Other containers named `kiln-…`, such as game servers, aren't these. Update records live in the Relay's data
+  volume, so this holds for an update a restarted Relay or the helper
+  carries on; while any record can't be read, a pass leaves updates'
+  leftovers and Hearth's and the Relay's images alone. An update writes its
+  records in their turn after any cleanup deciding which images to remove
+  (`relay.update.record`, holding `relay:docker-cleanup` shared), so
+  cleanup either sees the update or is done before it pulls.
+
+Images are removed by unforced removal only, so Docker keeps any a
+container uses, even a stopped one, and never one Kiln can't tell is its
+own:
+
+- **App builds and images.** Each build is recorded as it finishes, and
+  each successful deployment records the image IDs its containers run
+  (`relay_app_deployment_images`). The App keeps the images of its 5 newest
+  successful deployments; any other build for it (`kiln.app.id`) is removed
+  a day after it was built, which keeps a failed deployment's build, its
+  first deployment's too, for a day to look into. An image a deployment
+  pulled goes like any other image Kiln ran (below). Builds from before
+  builds were recorded: for an App with no deployment record yet, its
+  newest 5 stand in until it deploys. After each successful deployment
+  this runs in the background, behind other cleanup but not the App's next
+  deployment, which pulls an image again if it's gone; passes run it too.
+- **Hearth and Relay images.** Only those this Relay's update records name
+  (the image each update replaced, as `previousImageId`, the one it put in
+  place, and the Relay image its helper ran, as `helperImage`) or its own
+  containers ran, so another Kiln installation on the host keeps its own.
+  Of those, each pass removes the ones no container uses and no tag names,
+  keeping a running update's images and, for each of Hearth and the Relay,
+  the image it ran before its latest successful update, for a downgrade.
+  Only when no such image is on the host does the newest stand in for it.
+  A pass leaves them alone while an update this Relay recorded starts or
+  runs.
+- **Every other image Kiln ran.** Each pass notes the image of each of
+  Kiln's containers (the Relay's own and its services, and every App's,
+  database's, and game server's, as the security inventory counts them,
+  `kiln-containers.ts`) with the time (`relay_docker_images`). An image
+  none of Kiln's containers has used for a day is removed: a deleted game
+  server's or database's, an old Traefik or CoreDNS, a turned-off
+  service's. A pass removes at most 50. An image no Kiln container ever
+  ran, such as one a person pulled or one Kiln stopped using before this
+  record existed, is never removed automatically.
+
+Named volumes are never removed by cleanup; they go only with the deletion
+that owns them. Passes leave BuildKit's cache alone too: App builds share
+Docker's default builder with the host, and Docker trims that cache itself.
+
+A Relay's Info page in Hearth shows its Docker storage
+(`relay.docker.storage`, for anyone with `relay.read`): its images, what
+Kiln could remove now, unused images no Kiln container ran, BuildKit's
+cache, leftover containers, and the latest cleanup since the Relay started.
+Someone with `relay.configure` can clean up now (`relay.docker.cleanup`),
+which the Relay starts in the background and answers at once; it runs one
+such cleanup at a time, and while it runs the storage figures stay those it
+last counted and show it running, so Hearth checks for its end every few
+seconds without Docker counting layers mid-removal. It removes what a pass
+removes, without waiting the day for images no Kiln container
+uses, and, if they choose, unused images no Kiln container ran and
+BuildKit's unused cache (`POST /build/prune`, the host's own builds' too).
+App builds keep their day, and retention and volumes stay as above.
+
+A pass runs a minute after the Relay starts and then every hour, and every
+ten minutes while the filesystem holding the Relay's data, usually Docker's
+too, is 90% full. Each part of it waits for nothing: work in its way leaves
+it for the next pass. A container create that finds its image removed
+meanwhile pulls it again (`createContainer` in `docker-container-spec.ts`),
+so a removal racing a create costs a download, never the create.
+Unforced image removal (`removeImage(..., { force: false })`) is refused
+while any container, even a stopped one, uses the image.
+
 ## Health check
 
 The Relay image's Docker `HEALTHCHECK` runs `kiln-relay-healthcheck`, a small
@@ -158,9 +252,8 @@ the same loopback listener with BusyBox `wget`.
 ## Memory reporting
 
 Each snapshot includes the Relay's own memory, separate from the host totals.
-The Relays page shows it in the Memory column on large screens as two lines,
-for example `164 MiB process` above `264 MiB container · 29 MiB cache`. The
-tooltip shows the full breakdown.
+The Relays page shows the process's resident memory in the Memory column, and
+the container, cache and kernel readings in its tooltip.
 
 | Reading      | Source                         | Meaning                                                                                                                                      |
 | ------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -212,3 +305,81 @@ A frozen Relay can't report, so during an outage Hearth's metrics are the ones
 that move. Ten-second samples can miss a spike shorter than that; the refusal
 counters and request durations record every request as it happens, though a
 request Hearth refuses before sending is only counted, not timed.
+
+## Node metrics
+
+To size what Kiln keeps for itself against what workloads may take, the Relay
+also reports what its node spends and who spends it, with the same
+`OTEL_METRICS_EXPORTER=otlp`. It samples every fifteen seconds; OOM kills and
+exits are counted from Docker's events as they happen. Every metric is
+labelled with `relay.id`.
+
+Container metrics carry `kiln.container.group`, one of `relay`, `hearth`,
+`mysql`, `valkey` (the last three in platform mode), `relay_services`
+(Traefik, CoreDNS, Tailscale, Limbo), `game_server`, `app`, `database`, or
+`other` for every container Kiln doesn't run, such as Coolify's. Workloads
+are summed per kind, never labelled per resource, and every group is written
+each sample, so one that empties reads zero.
+
+| Metric                                                                                       | Meaning                                                                                                                                                                                |
+| -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `relay.container.count`                                                                      | Running containers in the group.                                                                                                                                                       |
+| `relay.container.cpu.time`                                                                   | CPU seconds the group used. Its rate is cores in use.                                                                                                                                  |
+| `relay.container.cpu.throttled_time`                                                         | Seconds the group's CPU limits held it back.                                                                                                                                           |
+| `relay.container.memory.usage`, `relay.container.memory.anon`, `relay.container.memory.file` | Container memory, page cache included; the anonymous part, which can't be reclaimed without swap; and the page cache, which can.                                                       |
+| `relay.container.oom_kills`                                                                  | Times the kernel killed a process in the group for want of memory, whether the container's limit or the node ran out.                                                                  |
+| `relay.container.exits`                                                                      | Times one of the group's containers stopped, by `exit.code`. Stops Kiln asks for count too; 137 is a SIGKILL, as an OOM kill sends.                                                    |
+| `relay.host.cpu.time`, `relay.host.cpu.cores`                                                | The node's CPU seconds by `cpu.mode` (`user`, `system`, `iowait`, `steal`, `idle`, ...), across all cores, and its core count.                                                         |
+| `relay.host.memory.total`, `relay.host.memory.available`, `relay.host.swap.used`             | The node's memory, what it can give out without swapping, and the swap in use.                                                                                                         |
+| `relay.host.pressure.stall_time`                                                             | Seconds tasks stalled for `pressure.resource` (`cpu`, `memory`, `io`), by `pressure.scope`: `some` (at least one task waited) or `full` (all did). Its rate is the share of time lost. |
+| `relay.host.oom_kills`                                                                       | Processes the kernel killed for want of memory anywhere on the node, Kiln's containers or not.                                                                                         |
+
+Host readings come from `/proc`, which a container shares with its host, so a
+Relay in a container reports the whole node. Pressure needs Linux's PSI:
+kernel 4.20 or later with it enabled (Debian also needs `psi=1` on the kernel
+command line); without it the pressure metric is absent. Counters start from
+the Relay's first sample, so a restart loses at most one interval.
+
+## Connection drops
+
+Both ends log each control connection that ends, unsampled, so a drop that
+lasts a moment still leaves a record. Both log the same
+`kiln.relay.session_id`, the one the Relay's challenge names, so the two
+sides of one session can be lined up.
+
+| Log                                                               | From   | Says                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Relay connection dropped`                                        | Hearth | The Relay stopped reading as connected. `kiln.relay.control.close_cause` is `liveness` (silent for three 15-second intervals), `closed`, `error`, `failed` (it failed before it was fully up, such as when its first snapshot never came), `hearth_reconnect`, `hearth_closed` or `replacement_failed`. Also logs the close code and reason, session length, and time since the Relay was last heard. |
+| `Relay connection restored`                                       | Hearth | Connected again after a drop, with `kiln.relay.control.downtime_ms`.                                                                                                                                                                                                                                                                                                                                  |
+| `Relay replaced its control connection`                           | Hearth | A connection the Relay dialed took the place of the current one, which isn't a drop.                                                                                                                                                                                                                                                                                                                  |
+| `Relay's address changed, so Hearth reconnects`                   | Hearth | The endpoint Hearth opens its connection to changed, so the old connection was closed.                                                                                                                                                                                                                                                                                                                |
+| `Hearth's control connection opened`                              | Relay  | A session authenticated, with who opened it and its session ID.                                                                                                                                                                                                                                                                                                                                       |
+| `Hearth's control connection closed`                              | Relay  | An authenticated session ended, with its close code and reason, who opened it, and the time since Hearth last answered a ping.                                                                                                                                                                                                                                                                        |
+| `Dropped Hearth's control connection: it stopped answering pings` | Relay  | The Relay's 15-second heartbeat got no pong in time and dropped the session.                                                                                                                                                                                                                                                                                                                          |
+
+## Host access
+
+The Relay workspace includes a root terminal on its Docker host, protected by
+`relay.terminal`. Set `KILN_RELAY_HOST_ACCESS=false` on the Relay to disable host
+access. Its small shell helper is created on first use and removed when host
+access is disabled. Each person's session survives page and Hearth reconnects
+and closes after the configured terminal idle timeout.
+
+The Files page browses and edits the host's files with the same browser and
+editor as game server and App files, protected by `relay.files.read` and
+`relay.files.write`. It needs the host's filesystem mounted at `/host`. Someone
+with `relay.files.mount` (Relay owners and platform admins by default) can turn
+that on from the Files page, which restarts the Relay with the mount and puts it
+back as it was if that fails. With Compose, start it with
+`docker compose -f compose.yaml -f compose.host-files.yaml up -d` instead.
+Recreating the Relay from a Compose file without it removes the mount. Saving a
+host file overwrites it in place, as editors do, so its hard links and
+containers that bind-mount it see the change. Where Docker is rootless, remaps
+users, or SELinux confines the Relay, the Files page says which files it can't
+reach. Links with absolute targets resolve inside the Relay's container, so the
+Files page refuses to open them.
+
+The Database page inspects the live `/data/network/relay.sqlite` file in
+read-only mode. `relay.database.read` grants access to its state, including
+sensitive configuration. When host files are mounted, `relay.files.read` can
+read the same file through Docker's volume directory.

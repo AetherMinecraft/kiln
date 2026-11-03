@@ -140,6 +140,7 @@ export const relayControlOperations = [
   "relay.tailscale.stack.apply",
   "relay.tailscale.stack.dns",
   "relay.tailscale.stack.list",
+  "relay.tailscale.stack.state",
   "relay.tailscale.stack.remove",
   "relay.host.read",
   "relay.host.files.mount",
@@ -151,6 +152,10 @@ export const relayControlOperations = [
   "relay.terminal.write",
   "relay.terminal.claim",
   "relay.terminal.restart",
+  "relay.desktop.read",
+  "relay.desktop.attach",
+  "relay.desktop.heartbeat",
+  "relay.desktop.detach",
   "relay.platform.terminal.attach",
   "relay.platform.terminal.heartbeat",
   "relay.platform.terminal.detach",
@@ -160,7 +165,10 @@ export const relayControlOperations = [
   "relay.proxy.read",
   "relay.proxy.config.read",
   "relay.proxy.write",
+  "relay.certificates.check",
   "relay.volumes.read",
+  "relay.docker.storage",
+  "relay.docker.cleanup",
   "relay.volumes.create",
   "relay.volumes.rename",
   "relay.volumes.delete",
@@ -221,6 +229,7 @@ export const relayControlOperations = [
   "app.volumes.write",
   "app.network.routes.read",
   "app.deployment.read",
+  "app.deployment.abort",
   "app.image.check",
   "app.network.routes.write",
   "app.terminal.attach",
@@ -283,7 +292,6 @@ export const relayControlOperations = [
   "instance.network.routes.read",
   "instance.network.routes.write",
   "instance.network.databases.remove",
-  "hearth.tailscale.member.detach",
   "hearth.database.terminal.output",
   "sftp.authorization.resolve",
   "operation.get",
@@ -295,6 +303,7 @@ export const relayControlOperations = [
 export type RelayControlOperation = (typeof relayControlOperations)[number]
 
 const auditedRelayControlOperations = new Set<RelayControlOperation>([
+  "relay.desktop.attach",
   "relay.rename",
   "relay.update.apply",
   "relay.restart",
@@ -304,6 +313,7 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.clients.update",
   "relay.clients.revoke",
   "relay.networking.write",
+  "relay.docker.cleanup",
   "relay.volumes.create",
   "relay.volumes.rename",
   "relay.volumes.delete",
@@ -406,11 +416,13 @@ export function relayControlOperationChanges(
     case "relay.networking.read":
     case "relay.tailscale.read":
     case "relay.tailscale.stack.list":
+    case "relay.tailscale.stack.state":
     case "relay.host.read":
     case "relay.database.read":
     case "relay.proxy.read":
     case "relay.proxy.config.read":
     case "relay.volumes.read":
+    case "relay.docker.storage":
     case "relay.pairing.list":
     case "relay.clients.list":
     case "relay.platform.read":
@@ -456,6 +468,10 @@ export function relayControlOperationChanges(
     case "relay.terminal.write":
     case "relay.terminal.claim":
     case "relay.terminal.restart":
+    case "relay.desktop.read":
+    case "relay.desktop.attach":
+    case "relay.desktop.heartbeat":
+    case "relay.desktop.detach":
     case "relay.platform.terminal.attach":
     case "relay.platform.terminal.heartbeat":
     case "relay.platform.terminal.detach":
@@ -474,7 +490,6 @@ export function relayControlOperationChanges(
     case "app.terminal.write":
     case "app.terminal.claim":
     case "app.terminal.restart":
-    case "hearth.tailscale.member.detach":
     case "hearth.database.terminal.output":
     case "sftp.authorization.resolve":
     case "operation.get":
@@ -492,9 +507,11 @@ export function relayControlOperationChanges(
     case "relay.host.files.mount":
     case "relay.host.restart":
     case "relay.proxy.write":
+    case "relay.certificates.check":
     case "relay.volumes.create":
     case "relay.volumes.rename":
     case "relay.volumes.delete":
+    case "relay.docker.cleanup":
     case "relay.volumes.references.import":
     case "relay.volumes.references.hold":
     case "relay.pairing.create":
@@ -524,6 +541,7 @@ export function relayControlOperationChanges(
     case "app.provision.cancel":
     case "app.delete":
     case "app.deploy":
+    case "app.deployment.abort":
     case "app.action":
     case "app.limits.write":
     case "app.volumes.write":
@@ -586,7 +604,8 @@ const terminalInputOperations = new Set<RelayControlOperation>([
   "relay.terminal.attach",
   "relay.terminal.claim",
   "relay.terminal.restart",
-  "relay.terminal.write",
+  "relay.terminal.write",  // A desktop stream takes the keyboard and mouse.
+  "relay.desktop.attach",
 ])
 
 /**
@@ -619,6 +638,8 @@ export function relayControlDeadlineMs(
   operation: RelayControlOperation
 ): number {
   if (operation === "relay.terminal.attach") return 360_000
+  // The streamer's image may have to be pulled first.
+  if (operation === "relay.desktop.attach") return 240_000
   if (operation === "relay.update.apply") return 15 * 60_000
   // The host's shell helper may have to be pulled first.
   if (operation === "relay.host.restart") return 120_000
@@ -631,12 +652,13 @@ export function relayControlDeadlineMs(
   if (operation === "relay.networking.write") return 240_000
   if (operation === "relay.tailscale.write") return 90_000
   if (operation === "relay.host.files.mount") return 60_000
+  // Docker counts every image's layers to answer.
+  if (operation === "relay.docker.storage") return 90_000
   // A repair can wait for MySQL to become healthy.
   if (operation === "relay.platform.action") return 240_000
   // An inventory may first wait for the host to be less busy, then reads a
   // whole image through Docker at the lowest priority.
   if (operation === "relay.security.inventory") return 15 * 60_000
-  if (operation === "hearth.tailscale.member.detach") return 60_000
   if (operation === "instance.delete") return 360_000
   // Freezing stops the resource first, as a stop does.
   if (operation === "resource.freeze") return 240_000

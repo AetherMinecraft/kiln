@@ -51,6 +51,8 @@ interface ContainerInspect {
     Labels: Record<string, string | undefined> | null
   }
   Id: string
+  // Its image's ID.
+  Image: string
   Mounts?: Array<{ Destination?: string }> | null
   Name: string
 }
@@ -78,6 +80,12 @@ export interface UpdateOperation {
   // Labels a replacement whose container predates installation IDs.
   installationId?: string
   previousImage: string
+  // The image ID it ran before, kept after a successful update for a
+  // downgrade (docker-cleanup.ts). Records from before don't have it.
+  previousImageId?: string
+  // The Relay image its helper ran, by digest. Records from before, and a
+  // Relay's own replacement, which runs its target image, don't have it.
+  helperImage?: string
   requestedImage: string
   // The Hearth request that started it, so a browser that lost the reply
   // can find it in the Relay's snapshot.
@@ -92,6 +100,15 @@ export interface UpdateOperation {
 interface UpdateBatch {
   id: string
   operationIds: Array<string>
+}
+
+/** What Docker cleanup must know of updates; see `cleanupState`. */
+export interface UpdateCleanupState {
+  readonly finishedHelpers: ReadonlySet<string>
+  readonly kept: ReadonlySet<string>
+  readonly named: ReadonlySet<string>
+  readonly targets: ReadonlySet<string>
+  readonly updating: boolean
 }
 
 interface InstallationIdentity {
@@ -125,6 +142,9 @@ export class SystemUpdateManager {
   // Why a container may not be updated now, such as a Hearth held stopped
   // for an offline restore; null when it may.
   readonly #refuseTarget: (container: string) => Effect.Effect<string | null>
+  readonly #recordOperations: (
+    write: Effect.Effect<void, RelaySystemUpdateError>
+  ) => Effect.Effect<void, RelaySystemUpdateError>
 
   constructor(
     config: {
@@ -136,9 +156,17 @@ export class SystemUpdateManager {
     },
     options: {
       refuseTarget?: (container: string) => Effect.Effect<string | null>
+      /**
+       * Writes a batch's records where Docker cleanup can't be deciding
+       * meanwhile, so it either sees them or is done before the pulls.
+       */
+      recordOperations?: (
+        write: Effect.Effect<void, RelaySystemUpdateError>
+      ) => Effect.Effect<void, RelaySystemUpdateError>
     } = {}
   ) {
     this.#refuseTarget = options.refuseTarget ?? (() => Effect.succeed(null))
+    this.#recordOperations = options.recordOperations ?? ((write) => write)
     this.#engine = new DockerEngine(
       config.dockerSocket ?? "/var/run/docker.sock"
     )
@@ -264,7 +292,12 @@ export class SystemUpdateManager {
               ? -1
               : 1
         )
-        const operations = prepared.map(({ operation }) => operation)
+        // Each names the helper image it runs under, which may never become
+        // the Relay's own, so cleanup knows it's this Relay's.
+        const operations = prepared.map(({ operation }) => ({
+          ...operation,
+          helperImage: input.helperImage,
+        }))
 
         yield* acquireOperationLocksEffect(operationsDirectory, operations)
         for (const { id } of operations) starting.add(id)
@@ -287,11 +320,14 @@ export class SystemUpdateManager {
             }
           }
           // Recorded before the images are pulled, which can take minutes,
-          // so a Relay restarted meanwhile still knows about them.
-          yield* Effect.forEach(
-            operations,
-            (operation) => writeOperationEffect(operationsDirectory, operation),
-            { discard: true }
+          // so a Relay restarted meanwhile, and Docker cleanup, know of them.
+          yield* this.#recordOperations(
+            Effect.forEach(
+              operations,
+              (operation) =>
+                writeOperationEffect(operationsDirectory, operation),
+              { discard: true }
+            )
           )
           this.#remember(operations)
           const images = uniqueUpdateImages(input.helperImage, prepared)
@@ -466,6 +502,93 @@ export class SystemUpdateManager {
     })
   }
 
+  /**
+   * What Docker cleanup must know of updates, from their records on disk,
+   * so it holds for one another process runs too (docker-cleanup.ts):
+   *
+   * - `updating`: one is starting or running, before its helper exists too.
+   * - `named`: every image an update replaced, put in place, or ran its
+   *   helper from, by ID or digest: the Hearth and Relay images that are
+   *   this Relay's to remove.
+   * - `kept`: a running update's images, and the image each component ran
+   *   before its latest successful update, for a downgrade.
+   * - `finishedHelpers`: the helper containers of updates that finished.
+   * - `targets`: the containers finished updates replaced, whose set-aside
+   *   copies are this Relay's to remove.
+   */
+  cleanupState(): Effect.Effect<UpdateCleanupState> {
+    return Effect.all([
+      recordedOperationsEffect(this.#operationsDirectory, { strict: true }),
+      // Clears a finished batch this process started, as a check of its
+      // helper finds it stopped.
+      this.running(),
+    ]).pipe(
+      Effect.map(([operations, batchRunning]) => {
+        const images = (operation: UpdateOperation) => [
+          operation.requestedImage,
+          ...(operation.previousImageId ? [operation.previousImageId] : []),
+          ...(operation.helperImage ? [operation.helperImage] : []),
+        ]
+        const running = operations.filter(
+          (operation) => operation.status === "running"
+        )
+        const latest = new Map<KilnComponent, UpdateOperation>()
+        for (const operation of operations) {
+          if (operation.status !== "succeeded") continue
+          const known = latest.get(operation.component)
+          if (!known || isNewer(operation, known)) {
+            latest.set(operation.component, operation)
+          }
+        }
+        const helpers = new Map<string, boolean>()
+        for (const operation of operations) {
+          const helper = `kiln-updater-${operation.batchId ?? operation.id}`
+          helpers.set(
+            helper,
+            (helpers.get(helper) ?? true) && operation.status !== "running"
+          )
+        }
+        return {
+          finishedHelpers: new Set(
+            [...helpers].flatMap(([helper, finished]) =>
+              finished ? [helper] : []
+            )
+          ),
+          kept: new Set([
+            ...running.flatMap(images),
+            ...[...latest.values()].flatMap(
+              (operation) => operation.previousImageId ?? []
+            ),
+          ]),
+          named: new Set(operations.flatMap(images)),
+          targets: new Set(
+            operations.flatMap((operation) =>
+              operation.status === "running" ? [] : [operation.targetContainer]
+            )
+          ),
+          updating:
+            running.length > 0 || this.#starting.size > 0 || batchRunning,
+        }
+      }),
+      // A record it can't read may be a running update's, or the one that
+      // names the image to keep: cleanup leaves updates' work alone.
+      Effect.catch((cause) =>
+        Effect.logWarning(
+          "Docker cleanup leaves update leftovers alone: an update record can't be read",
+          cause
+        ).pipe(
+          Effect.as({
+            finishedHelpers: new Set<string>(),
+            kept: new Set<string>(),
+            named: new Set<string>(),
+            targets: new Set<string>(),
+            updating: true,
+          })
+        )
+      )
+    )
+  }
+
   #remember(operations: ReadonlyArray<UpdateOperation>) {
     for (const operation of operations) {
       // One that can't be reported can't be compared with later ones either.
@@ -595,7 +718,9 @@ export const replaceRelayEffect = Effect.fn("relay.systemUpdates.replaceRelay")(
       input.targetContainer
     )
     const name = container.Name.replace(/^\//u, "")
-    if (kilnComponent(container.Config.Labels?.["io.kiln.component"]) !== "relay") {
+    if (
+      kilnComponent(container.Config.Labels?.["io.kiln.component"]) !== "relay"
+    ) {
       return yield* systemUpdateFailure(
         "replace.validate",
         `${name} isn't a Kiln Relay`
@@ -654,6 +779,7 @@ export const replaceRelayEffect = Effect.fn("relay.systemUpdates.replaceRelay")(
       id: randomUUID(),
       phase: "Preparing",
       previousImage: container.Config.Image,
+      previousImageId: container.Image,
       requestedImage: imageId,
       startedAt: new Date().toISOString(),
       status: "running",
@@ -811,7 +937,7 @@ const relayDataDirectoryEffect = Effect.fnUntraced(function* (
 })
 
 const recordedOperationsEffect = Effect.fn("relay.systemUpdates.recorded")(
-  function* (directory: string) {
+  function* (directory: string, options: { readonly strict?: boolean } = {}) {
     const names = yield* systemUpdateOperation("operations.list", () =>
       readdir(directory)
     ).pipe(
@@ -825,8 +951,11 @@ const recordedOperationsEffect = Effect.fn("relay.systemUpdates.recorded")(
       names.filter((name) => operationFilePattern.test(name)),
       (name) =>
         readOperationEffect(directory, name.slice(0, -".json".length)).pipe(
-          // One unreadable record must not hide the others.
-          Effect.catch(() => Effect.succeed(null))
+          // One unreadable record must not hide the others, unless the
+          // caller must know of every one.
+          Effect.catch((cause) =>
+            options.strict ? Effect.fail(cause) : Effect.succeed(null)
+          )
         ),
       { concurrency: 8 }
     )
@@ -929,6 +1058,7 @@ const prepareUpdateEffect = Effect.fn("relay.systemUpdates.prepare")(function* (
         ? { installationId: installation.installationId }
         : {}),
       previousImage: container.Config.Image,
+      previousImageId: container.Image,
       requestedImage: input.targetImage,
       ...(requestId ? { requestId } : {}),
       startedAt,
@@ -1736,6 +1866,8 @@ function isUpdateOperation(value: unknown): value is UpdateOperation {
     typeof value.id === "string" &&
     optionalString(value.installationId) &&
     typeof value.previousImage === "string" &&
+    optionalString(value.previousImageId) &&
+    optionalString(value.helperImage) &&
     typeof value.requestedImage === "string" &&
     optionalString(value.requestId) &&
     typeof value.startedAt === "string" &&

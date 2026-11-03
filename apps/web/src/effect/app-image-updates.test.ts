@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 
 import { assert, layer } from "@effect/vitest"
-import { Effect } from "effect"
+import { Clock, Effect } from "effect"
 import { TestClock } from "effect/testing"
 import { vi } from "vite-plus/test"
 
@@ -36,8 +36,16 @@ const seedApp = Effect.gen(function* () {
   })
 })
 
+// A check asked about the image now.
+const record = (result: Parameters<typeof recordAppImageCheckEffect>[2]) =>
+  Clock.currentTimeMillis.pipe(
+    Effect.flatMap((now) =>
+      recordAppImageCheckEffect(appId, image, result, now)
+    )
+  )
+
 const checked = (latest: number, running: Array<number>) =>
-  recordAppImageCheckEffect(appId, image, {
+  record({
     appId,
     latestDigest: digest(latest),
     runningDigests: running.map(digest),
@@ -67,7 +75,7 @@ describeMysql("App image updates", () => {
 
           // A failed check can't say the tag still names it, so it waits for
           // one that gets through, its wait kept.
-          const failed = yield* recordAppImageCheckEffect(appId, image, {
+          const failed = yield* record({
             appId,
             error: "ghcr.io answered 503",
             status: "error",
@@ -85,9 +93,17 @@ describeMysql("App image updates", () => {
           // Skipping what's no longer on offer does nothing.
           assert.isFalse(yield* skipAppImageUpdateEffect(appId, digest(2)))
 
-          // One update claims each digest, before the Relay hears of it.
-          assert.isTrue(yield* claimImageUpdateEffect(appId, digest(3)))
-          assert.isFalse(yield* claimImageUpdateEffect(appId, digest(3)))
+          // One update claims each digest, before the Relay hears of it; the
+          // same deployment, run again after a restart, still has it.
+          assert.isTrue(
+            yield* claimImageUpdateEffect(appId, digest(3), "deployment-one")
+          )
+          assert.isTrue(
+            yield* claimImageUpdateEffect(appId, digest(3), "deployment-one")
+          )
+          assert.isFalse(
+            yield* claimImageUpdateEffect(appId, digest(3), "deployment-two")
+          )
 
           // Still, once the app's history has pruned every record of it.
           for (let index = 1; index <= 200; index += 1) {
@@ -113,7 +129,9 @@ describeMysql("App image updates", () => {
               triggeredBy: null,
             })
           }
-          assert.isFalse(yield* claimImageUpdateEffect(appId, digest(3)))
+          assert.isFalse(
+            yield* claimImageUpdateEffect(appId, digest(3), "deployment-two")
+          )
         })
     )
   })

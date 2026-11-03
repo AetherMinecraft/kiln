@@ -168,6 +168,45 @@ export interface RelayResourceFreezeUndo {
   >
 }
 
+/** The resource a leftover container belonged to. */
+export interface RelayDockerCleanupOwner {
+  readonly id: string
+  readonly kind: "app" | "database" | "instance"
+}
+
+/** A container Docker wouldn't remove when Relay was done with it. */
+export interface RelayDockerCleanupRecord {
+  readonly containerId: string
+  readonly owner: RelayDockerCleanupOwner | null
+  /** Why it was being removed, for logs. */
+  readonly reason: string
+  /** Whether its anonymous volumes go with it. */
+  readonly volumes: boolean
+  /** Docker's latest refusal. */
+  readonly error: string
+  readonly failures: number
+  readonly firstFailedAt: number
+}
+
+/** An image one of an App's deployments ran, kept to choose what to keep. */
+export interface RelayAppDeploymentImage {
+  readonly appId: string
+  readonly deploymentId: string
+  readonly finishedAt: number
+  readonly imageId: string
+}
+
+/**
+ * An image one of Kiln's containers ran, and when Relay last saw one use
+ * it: what makes an image Kiln's to remove once nothing has for a while.
+ */
+export interface RelayDockerImageRecord {
+  readonly imageId: string
+  /** Whose container ran it: `app:<id>`, `database:<id>`, `relay`, … */
+  readonly owner: string
+  readonly lastUsedAt: number
+}
+
 const OPERATION_JOURNAL_METADATA_KEY = "operation_journal_id"
 
 export interface RelayStoredInstanceName {
@@ -598,6 +637,49 @@ export class RelayStateStore extends Context.Service<
       kind: RelayResourceFreezeRecord["kind"],
       id: string
     ) => Effect.Effect<void, RelayStateError>
+    /** Keeps a container Docker wouldn't remove, counting each refusal. */
+    readonly recordDockerCleanup: (
+      input: Pick<
+        RelayDockerCleanupRecord,
+        "containerId" | "error" | "owner" | "reason" | "volumes"
+      >,
+      now: number
+    ) => Effect.Effect<void, RelayStateError>
+    readonly listDockerCleanups: () => Effect.Effect<
+      ReadonlyArray<RelayDockerCleanupRecord>,
+      RelayStateError
+    >
+    /** Forgets a leftover container once it's gone. */
+    readonly forgetDockerCleanup: (
+      containerId: string
+    ) => Effect.Effect<void, RelayStateError>
+    /** Records the images a successful deployment runs. */
+    readonly recordAppDeploymentImages: (
+      input: Omit<RelayAppDeploymentImage, "imageId"> & {
+        readonly imageIds: ReadonlyArray<string>
+      }
+    ) => Effect.Effect<void, RelayStateError>
+    readonly listAppDeploymentImages: () => Effect.Effect<
+      ReadonlyArray<RelayAppDeploymentImage>,
+      RelayStateError
+    >
+    /** Notes that Kiln's containers use these images now. */
+    readonly noteDockerImagesUsed: (
+      images: ReadonlyArray<Omit<RelayDockerImageRecord, "lastUsedAt">>,
+      now: number
+    ) => Effect.Effect<void, RelayStateError>
+    readonly listDockerImages: () => Effect.Effect<
+      ReadonlyArray<RelayDockerImageRecord>,
+      RelayStateError
+    >
+    readonly forgetDockerImage: (
+      imageId: string
+    ) => Effect.Effect<void, RelayStateError>
+    /** Forgets deployments' images: these deployments, or all of the App's. */
+    readonly forgetAppDeploymentImages: (
+      appId: string,
+      deploymentIds: ReadonlyArray<string> | null
+    ) => Effect.Effect<void, RelayStateError>
     readonly createInvitation: (
       input: RelayInvitationInput
     ) => Effect.Effect<void, RelayStateError>
@@ -673,15 +755,6 @@ export class RelayStateStore extends Context.Service<
       errorCode?: BackupFailureCode | null
     ) => Effect.Effect<boolean, RelayStateError>
     /**
-     * Records a task's result. A `prune` is queued with it, in the same
-     * transaction, unless one for the same repository is already waiting.
-     */
-    /**
-     * Marks a restore that startup recovery finished as succeeded: one a
-     * stop cut off while running, or one that failed while swapping its
-     * files in, which recovery finished, saying so.
-     */
-    /**
      * Claims the queued backups of a stopped batch, which run in the stopped
      * window its first claimed backup opened, oldest first.
      */
@@ -689,12 +762,22 @@ export class RelayStateStore extends Context.Service<
       batchId: string,
       now: number
     ) => Effect.Effect<ReadonlyArray<RelayBackupTask>, RelayStateError>
+    /**
+     * Marks a restore that startup recovery finished as succeeded: one a
+     * stop cut off while running, or one that failed while swapping its
+     * files in, which recovery finished, saying so.
+     */
     readonly completeRecoveredRestore: (
       taskId: string,
       now: number,
       /** Its warning, when it's not the one for finishing at startup. */
       warning?: string | null
     ) => Effect.Effect<boolean, RelayStateError>
+    /**
+     * Records a task's result. An optional `prune` is queued with it, in the
+     * same transaction, unless one for the same repository is already
+     * waiting.
+     */
     readonly completeBackupTask: (
       taskId: string,
       result: BackupTaskResult,
@@ -731,13 +814,9 @@ export class RelayStateStore extends Context.Service<
       instanceId: string,
       now: number
     ) => Effect.Effect<RelayProvisioningJob | null, RelayStateError>
-    /**
-     * Takes the oldest queued job, passing over the kinds in `exceptKinds`,
-     * as one whose kind runs a job at a time while one is running.
-     */
+    /** Takes the oldest queued job. */
     readonly claimNextProvisioningJob: (
-      now: number,
-      exceptKinds?: ReadonlyArray<RelayProvisioningKind>
+      now: number
     ) => Effect.Effect<RelayProvisioningJob | null, RelayStateError>
     readonly cancelProvisioningJob: (
       kind: RelayProvisioningKind,
@@ -1665,6 +1744,43 @@ const migrations = SqliteMigrator.fromRecord({
       ALTER TABLE relay_resource_freezes_next
       RENAME TO relay_resource_freezes
     `
+  }),
+  // Containers Relay was done with that Docker wouldn't remove, tried again
+  // until they're gone, so a failed removal doesn't leave one forever.
+  "33_docker_cleanups": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE IF NOT EXISTS relay_docker_cleanups (
+      container_id TEXT PRIMARY KEY NOT NULL,
+      owner_kind TEXT CHECK (owner_kind IN ('app', 'database', 'instance')),
+      owner_id TEXT,
+      reason TEXT NOT NULL,
+      volumes INTEGER NOT NULL,
+      error TEXT NOT NULL,
+      failures INTEGER NOT NULL,
+      first_failed_at INTEGER NOT NULL
+    ) STRICT`
+  }),
+  // The images each App's successful deployments ran, so the newest few
+  // deployments keep theirs and older ones' are removed.
+  "34_app_deployment_images": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE IF NOT EXISTS relay_app_deployment_images (
+      app_id TEXT NOT NULL,
+      deployment_id TEXT NOT NULL,
+      image_id TEXT NOT NULL,
+      finished_at INTEGER NOT NULL,
+      PRIMARY KEY (app_id, deployment_id, image_id)
+    ) STRICT`
+  }),
+  // The images Kiln's containers ran, and when one last did, so an image
+  // nothing has used for a day is removed, and no image Kiln never ran.
+  "35_docker_images": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE IF NOT EXISTS relay_docker_images (
+      image_id TEXT PRIMARY KEY NOT NULL,
+      owner TEXT NOT NULL,
+      last_used_at INTEGER NOT NULL
+    ) STRICT`
   }),
 })
 
@@ -2642,6 +2758,138 @@ const makeRelayStateStore = Effect.gen(function* () {
            WHERE kind = ${kind} AND resource_id = ${id}
         `.pipe(Effect.asVoid)
       ),
+    recordDockerCleanup: (input, now) =>
+      run(
+        "record_docker_cleanup",
+        sql`
+          INSERT INTO relay_docker_cleanups
+            (container_id, owner_kind, owner_id, reason, volumes, error,
+             failures, first_failed_at)
+          VALUES (${input.containerId}, ${input.owner?.kind ?? null},
+                  ${input.owner?.id ?? null}, ${input.reason},
+                  ${input.volumes ? 1 : 0}, ${input.error}, 1, ${now})
+          ON CONFLICT (container_id) DO UPDATE SET
+            error = excluded.error,
+            failures = relay_docker_cleanups.failures + 1
+        `.pipe(Effect.asVoid)
+      ),
+    listDockerCleanups: () =>
+      run(
+        "list_docker_cleanups",
+        sql<{
+          readonly containerId: string
+          readonly ownerKind: RelayDockerCleanupOwner["kind"] | null
+          readonly ownerId: string | null
+          readonly reason: string
+          readonly volumes: number
+          readonly error: string
+          readonly failures: number
+          readonly firstFailedAt: number
+        }>`
+          SELECT container_id AS containerId, owner_kind AS ownerKind,
+                 owner_id AS ownerId, reason, volumes, error, failures,
+                 first_failed_at AS firstFailedAt
+            FROM relay_docker_cleanups
+           ORDER BY first_failed_at
+        `.pipe(
+          Effect.map((rows) =>
+            rows.map(
+              ({
+                ownerId,
+                ownerKind,
+                volumes,
+                ...row
+              }): RelayDockerCleanupRecord => ({
+                ...row,
+                volumes: volumes === 1,
+                owner:
+                  ownerKind && ownerId
+                    ? { id: ownerId, kind: ownerKind }
+                    : null,
+              })
+            )
+          )
+        )
+      ),
+    recordAppDeploymentImages: (input) =>
+      run(
+        "record_app_deployment_images",
+        sql.withTransaction(
+          Effect.forEach(
+            input.imageIds,
+            (imageId) => sql`
+              INSERT OR IGNORE INTO relay_app_deployment_images
+                (app_id, deployment_id, image_id, finished_at)
+              VALUES (${input.appId}, ${input.deploymentId}, ${imageId},
+                      ${input.finishedAt})
+            `,
+            { discard: true }
+          )
+        )
+      ),
+    listAppDeploymentImages: () =>
+      run(
+        "list_app_deployment_images",
+        sql<RelayAppDeploymentImage>`
+          SELECT app_id AS appId, deployment_id AS deploymentId,
+                 image_id AS imageId, finished_at AS finishedAt
+            FROM relay_app_deployment_images
+        `
+      ),
+    noteDockerImagesUsed: (images, now) =>
+      run(
+        "note_docker_images_used",
+        sql.withTransaction(
+          Effect.forEach(
+            images,
+            (image) => sql`
+              INSERT INTO relay_docker_images (image_id, owner, last_used_at)
+              VALUES (${image.imageId}, ${image.owner}, ${now})
+              ON CONFLICT (image_id) DO UPDATE SET
+                owner = excluded.owner,
+                last_used_at = excluded.last_used_at
+            `,
+            { discard: true }
+          )
+        )
+      ),
+    listDockerImages: () =>
+      run(
+        "list_docker_images",
+        sql<RelayDockerImageRecord>`
+          SELECT image_id AS imageId, owner, last_used_at AS lastUsedAt
+            FROM relay_docker_images
+        `
+      ),
+    forgetDockerImage: (imageId) =>
+      run(
+        "forget_docker_image",
+        sql`
+          DELETE FROM relay_docker_images WHERE image_id = ${imageId}
+        `.pipe(Effect.asVoid)
+      ),
+    forgetAppDeploymentImages: (appId, deploymentIds) =>
+      run(
+        "forget_app_deployment_images",
+        deploymentIds === null
+          ? sql`
+              DELETE FROM relay_app_deployment_images WHERE app_id = ${appId}
+            `.pipe(Effect.asVoid)
+          : deploymentIds.length === 0
+            ? Effect.void
+            : sql`
+                DELETE FROM relay_app_deployment_images
+                 WHERE app_id = ${appId}
+                   AND deployment_id IN ${sql.in(deploymentIds)}
+              `.pipe(Effect.asVoid)
+      ),
+    forgetDockerCleanup: (containerId) =>
+      run(
+        "forget_docker_cleanup",
+        sql`
+          DELETE FROM relay_docker_cleanups WHERE container_id = ${containerId}
+        `.pipe(Effect.asVoid)
+      ),
     appendAudit: (input) =>
       run(
         "append_audit",
@@ -3217,7 +3465,7 @@ const makeRelayStateStore = Effect.gen(function* () {
           })
         )
       ),
-    claimNextProvisioningJob: (now, exceptKinds = []) =>
+    claimNextProvisioningJob: (now) =>
       run(
         "claim_next_provisioning_job",
         sql.withTransaction(
@@ -3232,7 +3480,6 @@ const makeRelayStateStore = Effect.gen(function* () {
                 SELECT instance_id
                 FROM relay_instance_provisioning_jobs
                 WHERE status = 'queued'
-                  ${exceptKinds.length > 0 ? sql`AND kind NOT IN ${sql.in(exceptKinds)}` : sql``}
                 ORDER BY created_at ASC, instance_id ASC
                 LIMIT 1
               )

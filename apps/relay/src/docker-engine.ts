@@ -68,6 +68,19 @@ export interface DockerContainerSummary {
   readonly Mounts?: ReadonlyArray<DockerMount>
 }
 
+/** One of Docker's events, as `events` streams them. */
+export interface DockerEvent {
+  readonly Type?: string
+  readonly Action?: string
+  /** When it happened, in nanoseconds since 1970, as Docker's digits. */
+  readonly timeNano?: string
+  readonly Actor?: {
+    readonly ID?: string
+    /** A container's labels, with its `name`, `image`, and `exitCode`. */
+    readonly Attributes?: Readonly<Record<string, string>>
+  }
+}
+
 /** A container's mount, as both container listing and inspection report it. */
 export interface DockerMount {
   readonly Destination: string
@@ -151,6 +164,27 @@ export interface DockerVolumeUsage {
   readonly Name: string
   // Size is -1 when Docker can't measure the volume.
   readonly UsageData?: { readonly Size: number } | null
+}
+
+/** One image, as `GET /images/json` lists it. */
+export interface DockerImageSummary {
+  readonly Id: string
+  readonly Labels?: Readonly<Record<string, string>> | null
+  // Seconds since the epoch.
+  readonly Created?: number
+  // Tags pointing at it; none, or `<none>:<none>`, once every tag moved on.
+  readonly RepoTags?: ReadonlyArray<string> | null
+  readonly RepoDigests?: ReadonlyArray<string> | null
+  readonly Size?: number
+  // What it shares with other images; -1 when Docker didn't count it.
+  readonly SharedSize?: number
+}
+
+/** BuildKit's cache, as `docker system df` reports each record. */
+export interface DockerBuildCacheRecord {
+  readonly InUse?: boolean
+  readonly Shared?: boolean
+  readonly Size?: number
 }
 
 export interface DockerImage {
@@ -437,13 +471,61 @@ export class DockerEngine {
     })
   }
 
-  containerStats(reference: string): Effect.Effect<unknown, DockerEngineError> {
+  /**
+   * A container's stats. Docker waits a second for a second reading, to
+   * work out CPU use since the first, unless `oneShot` asks for the first
+   * alone, whose counters are only totals.
+   */
+  containerStats(
+    reference: string,
+    options: { readonly oneShot?: boolean } = {}
+  ): Effect.Effect<unknown, DockerEngineError> {
     return this.#json({
       maxBytes: 1024 * 1024,
       method: "GET",
-      path: `/containers/${segment(reference)}/stats${query({ stream: false })}`,
+      path: `/containers/${segment(reference)}/stats${query({
+        stream: false,
+        "one-shot": options.oneShot || undefined,
+      })}`,
       timeout: 2_500,
     })
+  }
+
+  /**
+   * Hands each event Docker reports to `onEvent`, until the effect is
+   * interrupted or Docker ends the stream: from now on, or first those it
+   * still holds from `since` (Unix seconds) onwards.
+   */
+  events(
+    filters: DockerFilters,
+    options: { readonly since?: number | undefined },
+    onEvent: (event: DockerEvent) => void
+  ): Effect.Effect<void, DockerEngineError> {
+    const lines = lineReader((line) => {
+      if (!line.trim()) return
+      // A line Docker cut short says nothing to count.
+      const event = Result.try(
+        () =>
+          // As a string, since nanoseconds since 1970 are past what a
+          // number holds exactly.
+          JSON.parse(
+            line.replace(/"timeNano":(\d+)/, '"timeNano":"$1"')
+          ) as DockerEvent
+      )
+      if (Result.isSuccess(event)) onEvent(event.success)
+    })
+    return this.#exchange({
+      method: "GET",
+      onData: (chunk) => {
+        lines.read(chunk)
+        return undefined
+      },
+      path: `/events${query({
+        filters: JSON.stringify(filters),
+        since: options.since,
+      })}`,
+      timeout: null,
+    }).pipe(Effect.asVoid)
   }
 
   resizeContainer(
@@ -1184,6 +1266,42 @@ export class DockerEngine {
     }).pipe(Effect.map((answer) => answer.Volumes ?? []))
   }
 
+  /**
+   * Images and BuildKit's cache, as `docker system df -v` counts them: each
+   * image with what it shares with others. Volumes are left out, since
+   * Docker walks each to measure it.
+   */
+  imageDiskUsage(options: { readonly timeout?: number } = {}): Effect.Effect<
+    {
+      readonly BuildCache?: ReadonlyArray<DockerBuildCacheRecord> | null
+      readonly Images?: ReadonlyArray<DockerImageSummary> | null
+      // Every image's layers, counted once.
+      readonly LayersSize?: number
+    },
+    DockerEngineError
+  > {
+    return this.#json({
+      method: "GET",
+      path: "/system/df?type=image&type=build-cache",
+      timeout: options.timeout,
+    })
+  }
+
+  /**
+   * `docker builder prune`: BuildKit's cache that no build is using, of
+   * every builder on the daemon, the host's own builds' too.
+   */
+  pruneBuildCache(): Effect.Effect<
+    { readonly SpaceReclaimed?: number },
+    DockerEngineError
+  > {
+    return this.#json({
+      method: "POST",
+      path: "/build/prune",
+      timeout: 10 * 60_000,
+    })
+  }
+
   inspectVolume(name: string): Effect.Effect<DockerVolume, DockerEngineError> {
     return this.#json({ method: "GET", path: `/volumes/${segment(name)}` })
   }
@@ -1194,7 +1312,7 @@ export class DockerEngine {
 
   listImages(
     options: { readonly filters?: DockerFilters } = {}
-  ): Effect.Effect<ReadonlyArray<{ readonly Id: string }>, DockerEngineError> {
+  ): Effect.Effect<ReadonlyArray<DockerImageSummary>, DockerEngineError> {
     return this.#json({
       method: "GET",
       path: `/images/json${query({
@@ -1287,11 +1405,17 @@ export class DockerEngine {
     })
   }
 
-  /** `docker image rm --force`. */
-  removeImage(reference: string): Effect.Effect<void, DockerEngineError> {
+  /**
+   * `docker image rm`. Unforced, Docker refuses (409) while any container,
+   * even a stopped one, uses the image, or while other tags still name it.
+   */
+  removeImage(
+    reference: string,
+    options: { readonly force: boolean }
+  ): Effect.Effect<void, DockerEngineError> {
     return this.#empty({
       method: "DELETE",
-      path: `/images/${imageSegment(reference)}${query({ force: true })}`,
+      path: `/images/${imageSegment(reference)}${query({ force: options.force || undefined })}`,
       timeout: 90_000,
     })
   }

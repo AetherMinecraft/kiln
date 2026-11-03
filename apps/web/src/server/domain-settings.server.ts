@@ -26,7 +26,10 @@ import { wakePollingWorker } from "@/lib/polling-worker"
 import { listAppRecordsEffect } from "@/effect/managed-apps"
 import { recoverPromise } from "@/effect/promise"
 import { runAppEffect } from "@/effect/runtime"
-import { listWebHostnamesEffect } from "@/effect/web-hostnames"
+import {
+  listWebHostnamesEffect,
+  webHostnameProxied,
+} from "@/effect/web-hostnames"
 import { isPlatformAdmin } from "@/lib/access-control"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { promiseEffect } from "@/effect/promise"
@@ -45,7 +48,8 @@ import { relayJsonEffect } from "@/lib/relay-client"
 import { shortIdRouteIdentifier } from "@/lib/short-id-route"
 import { requireEligibleResourceUser } from "@/server/auth"
 import { resourceAccess } from "@/server/domain-resource-access.server"
-import { exclusive } from "@/operations/lanes"
+import { outsideOperation } from "@/operations/current"
+import { exclusive, partKey } from "@/operations/lanes"
 import {
   operation,
   runOperationPromise,
@@ -56,6 +60,7 @@ import {
   invalidateManagedDomainAddressesEffect,
   provisionInstanceDomainEffect,
 } from "@/server/domains.server"
+import { pendingWebCertificate } from "@/server/web-certificates.server"
 import { resyncWebHostnamesEffect } from "@/server/web-hostnames.server"
 import type {
   DeleteDomainConnectionInput,
@@ -175,16 +180,27 @@ export async function getDomainSettingsHandler() {
       ? access.app(row.relayId, row.resourceId, false)
       : access.instance(row.relayId, row.resourceId, false)
     if (!readable) return []
+    const canManage = isApp
+      ? access.app(row.relayId, row.resourceId, true)
+      : access.instance(row.relayId, row.resourceId, true)
     return [
       {
-        canManage: isApp
-          ? access.app(row.relayId, row.resourceId, true)
-          : access.instance(row.relayId, row.resourceId, true),
+        // The listed connections are the person's to manage.
+        canAdopt:
+          canManage &&
+          row.status === "external" &&
+          row.existingRecord !== null &&
+          connectionNames.has(row.connectionId),
+        canManage,
+        certificate: pendingWebCertificate(row, row.hostname),
         connectionName: connectionNames.get(row.connectionId) ?? null,
+        existingRecord:
+          row.status === "external" ? row.existingRecord : null,
         generated: row.generated,
         hostname: row.hostname,
         id: row.id,
         lastError: row.lastError,
+        proxied: webHostnameProxied(row),
         relayId: row.relayId,
         routed: row.routed,
         relayName: resources.relayName(row.relayId),
@@ -278,11 +294,22 @@ export async function getManualWebHostnamesHandler(): Promise<
         canManage: isApp
           ? access.app(route.relayId, id, true)
           : access.instance(route.relayId, id, true),
+        certificate: pendingWebCertificate(
+          {
+            relayId: route.relayId,
+            resourceId: id,
+            resourceType: isApp ? "app" : "instance",
+          },
+          hostname
+        ),
+        canAdopt: false,
         connectionName: null,
+        existingRecord: null,
         generated: false,
         hostname,
         id: key,
         lastError: null,
+        proxied: null,
         relayId: route.relayId,
         routed: true,
         relayName: resources.relayName(route.relayId),
@@ -400,11 +427,11 @@ function zoneNameFor(
   return best
 }
 
-// Saving or removing a Cloudflare connection holds it, so two changes to
-// one connection, its token and domains, don't interleave. Reading its
-// zones needs no lock.
-const connectionLock = (connectionId: string) =>
-  exclusive(`cloudflare-connection:${connectionId}`)
+// Saving a Cloudflare connection holds its settings, so two saves of its
+// token and domains don't interleave; removing it holds it whole. Reading
+// its zones needs no lock.
+const connectionKey = (connectionId: string) =>
+  `cloudflare-connection:${connectionId}`
 
 /** The zones a pasted token, or a saved connection's, can manage. */
 export async function discoverCloudflareDomainsHandler(
@@ -519,7 +546,9 @@ const saveConnection = operation<SaveDomainConnectionInput>()({
         promiseEffect(() => prepareConnectionSave(person, input))
       )
     ),
-  locks: ({ context }) => [connectionLock(context.id)],
+  locks: ({ context }) => [
+    exclusive(partKey(connectionKey(context.id), "settings")),
+  ],
   run: ({ context, input }) =>
     saveDomainConnectionEffect({
       apiToken: input.apiToken,
@@ -564,7 +593,7 @@ const deleteConnection = operation<DeleteDomainConnectionInput>()({
       )
     }),
   locks: ({ context: allowed, input }) =>
-    allowed ? [connectionLock(input.id)] : [],
+    allowed ? [exclusive(connectionKey(input.id))] : [],
   run: ({ context: allowed, input }) =>
     allowed
       ? requireConnectionUnusedEffect(input.id).pipe(
@@ -591,8 +620,25 @@ export async function deleteDomainConnectionHandler(
  * with their Relays, retrying failed ones: every one for administrators,
  * otherwise those on what the person can change.
  */
+// The person's request, for its trace and audit. It spans every game server
+// they can change, so it holds none itself: each server's domains and web
+// hostnames change in their own `#dns`, as they do whenever they're synced.
+const resyncDomains = operation<void>()({
+  name: "domains.resync",
+  doing: "Syncing domains",
+  authorize: ({ user }) => signedIn(user),
+  locks: () => [],
+  run: ({ context: person }) =>
+    promiseEffect(() => outsideOperation(() => resyncDomainsFor(person))),
+})
+
 export async function resyncDomainAssignmentsHandler() {
-  const user = await requireEligibleResourceUser()
+  return runOperationPromise(resyncDomains, undefined, {
+    user: await requireEligibleResourceUser(),
+  })
+}
+
+async function resyncDomainsFor(user: AuthenticatedUser) {
   const access = await resourceAccess(user)
   const relays = (await listPersistedRelays()).filter((relay) => relay.enabled)
   // A Relay that can't be reached skips its game servers, not the rest.

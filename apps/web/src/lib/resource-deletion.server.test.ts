@@ -1,13 +1,16 @@
 import { assert, layer } from "@effect/vitest"
-import { Effect, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer } from "effect"
 import { TestClock } from "effect/testing"
 import { afterAll, vi } from "vite-plus/test"
 
 import { Database } from "@/effect/database"
 import { disposeAppRuntime } from "@/effect/runtime"
+import { exclusive, partKey, resourceKey } from "@/operations/lanes"
+import { inLanes } from "@/operations/operation"
 import { testOperationsEngine } from "@/operations/test/engine"
 import { stopScheduleDeliveries } from "@/server/schedule-deployment.server"
 import { TestDatabase, describeMysql } from "@/test/database"
+import { insertRelay, selectRows } from "@/test/seed"
 import {
   appId,
   appRecords,
@@ -15,10 +18,12 @@ import {
   deletionUntil as until,
   finishBackup,
   nextBackup,
+  operationsEnded,
   owner,
   relayId,
   seedApp,
   seedDeletion as seed,
+  seedNetwork,
   serverId,
   serverRecords,
   stranger,
@@ -26,10 +31,13 @@ import {
 } from "@/test/resource-deletion"
 
 import {
+  cancelResourceDeletionEffect,
   deleteResource,
   keepResource,
+  reconcileResourceDeletions,
   requestResourceDeletionEffect,
 } from "./resource-deletion.server"
+import { rewriteTailscaleDns } from "./tailscale-dns.server"
 
 // The Relay is the only fake (test/resource-deletion.ts).
 vi.mock("@/lib/relay-connection", async (importOriginal) => ({
@@ -49,7 +57,11 @@ afterAll(async () => {
 })
 
 const Lanes = testOperationsEngine(
-  Layer.mergeAll(deleteResource.layer, keepResource.layer)
+  Layer.mergeAll(
+    deleteResource.layer,
+    keepResource.layer,
+    rewriteTailscaleDns.layer
+  )
 ).pipe(Layer.provideMerge(TestDatabase))
 
 const deleteServer = (user = owner) =>
@@ -81,6 +93,98 @@ const failBackup = (backupId: string) =>
 
 describeMysql("Deleting a game server or database", () => {
   layer(Lanes, { timeout: 120_000 })((it) => {
+    const network = "e".repeat(40)
+    const peer = `instance:${"f".repeat(40)}`
+
+    it.effect(
+      "writes its Tailscale network's DNS without it, then deletes it and takes it off the network",
+      () =>
+        Effect.gen(function* () {
+          yield* seed
+          yield* seedNetwork(network, [`instance:${serverId}`, peer])
+          // A Relay the network isn't on doesn't answer, and needn't.
+          yield* insertRelay("u".repeat(43))
+          relay.unreachable.add("u".repeat(43))
+
+          yield* deleteServer()
+          const done = yield* until(serverId, ["completed", "failed"])
+
+          assert.strictEqual(done?.status, "completed")
+          // Written once, while it was frozen and still a member.
+          assert.deepStrictEqual(relay.stackDns.get(network), [
+            peer.replaceAll(":", "-"),
+          ])
+          assert.deepStrictEqual(relay.stacks.get(network), [peer])
+        }).pipe(TestClock.withLive),
+      90_000
+    )
+
+    it.effect(
+      "deletes nothing while a Relay its Tailscale network is on is paused",
+      () =>
+        Effect.gen(function* () {
+          const paused = "p".repeat(43)
+          yield* seed
+          yield* insertRelay(paused, { enabled: false })
+          yield* seedNetwork(network, [`instance:${serverId}`, peer], [paused])
+
+          yield* deleteServer()
+          const done = yield* until(serverId, ["completed", "failed"])
+
+          assert.strictEqual(done?.status, "failed")
+          assert.match(done?.error ?? "", /paused/)
+          assert.isTrue(relay.servers.has(serverId))
+          assert.isUndefined(relay.stackDns.get(network))
+        }).pipe(TestClock.withLive),
+      90_000
+    )
+
+    it.effect(
+      "gives a game server it keeps its Tailscale DNS back",
+      () =>
+        Effect.gen(function* () {
+          yield* seed
+          yield* seedNetwork(network, [`instance:${serverId}`, peer])
+
+          yield* requestResourceDeletionEffect({
+            finalBackup: true,
+            kind: "instance",
+            relayId,
+            resourceId: serverId,
+            storageId: null,
+            user: owner,
+          })
+          yield* failBackup(yield* nextBackup(serverId, null))
+          yield* until(serverId, ["failed"])
+          // Its deletion is recorded failed before its operation lets the
+          // game server go; keeping it waits for that.
+          yield* operationsEnded
+          // Frozen and not deleted, it has no DNS.
+          assert.deepStrictEqual(relay.stackDns.get(network), [
+            peer.replaceAll(":", "-"),
+          ])
+
+          yield* cancelResourceDeletionEffect({
+            kind: "instance",
+            relayId,
+            resourceId: serverId,
+            user: owner,
+          })
+          const kept = yield* until(serverId, ["cancelled", "failed"])
+
+          assert.strictEqual(kept?.status, "cancelled")
+          assert.deepStrictEqual(relay.stackDns.get(network), [
+            `instance-${serverId}`,
+            peer.replaceAll(":", "-"),
+          ])
+          assert.deepStrictEqual(relay.stacks.get(network), [
+            `instance:${serverId}`,
+            peer,
+          ])
+        }).pipe(TestClock.withLive),
+      90_000
+    )
+
     it.effect(
       "keeps an App's volume its deletion didn't plan to take, though nothing else uses it any more",
       () =>
@@ -173,8 +277,10 @@ describeMysql("Deleting a game server or database", () => {
 
           assert.strictEqual(app?.status, "failed")
           assert.strictEqual(volume?.status, "failed")
-          // Frozen, and nothing deleted, on the Relay or in Hearth.
+          // The App's build stopped, both frozen, and nothing deleted, on the
+          // Relay or in Hearth.
           assert.deepStrictEqual(relay.changes, [
+            "app.deployment.abort",
             "resource.freeze",
             "resource.freeze",
           ])
@@ -189,6 +295,65 @@ describeMysql("Deleting a game server or database", () => {
     )
 
     it.effect(
+      "deletes an App whose build it stopped, once what deploys it is done",
+      () =>
+        Effect.gen(function* () {
+          yield* seed
+          yield* seedApp([])
+          // A deployment runs, holding the App's #deploy until it sees its
+          // build end, and another waits behind it.
+          const deploy = [
+            exclusive(partKey(resourceKey("app", relayId, appId), "deploy")),
+          ]
+          const ended = yield* Deferred.make<void>()
+          const running = yield* inLanes(
+            "test.deploy",
+            "Deploying this App",
+            deploy,
+            Deferred.await(ended)
+          ).pipe(Effect.forkChild({ startImmediately: true }))
+          yield* Effect.yieldNow
+          const next = yield* inLanes(
+            "test.deploy",
+            "Deploying this App",
+            deploy,
+            Effect.void
+          ).pipe(Effect.forkChild({ startImmediately: true }))
+          yield* Effect.yieldNow
+          yield* requestResourceDeletionEffect({
+            finalBackup: false,
+            kind: "app",
+            relayId,
+            resourceId: appId,
+            storageId: null,
+            user: owner,
+          })
+
+          // It asked for the build to stop, and waits its turn rather than
+          // being refused: queued once, however often it's taken up again.
+          assert.deepStrictEqual(relay.changes, ["app.deployment.abort"])
+          yield* reconcileResourceDeletions()
+          yield* reconcileResourceDeletions()
+          const queued = (yield* selectRows<{ kind: string; state: string }>(
+            "operation"
+          )).filter((row) => row.kind === "resource.delete")
+          assert.deepStrictEqual(
+            queued.map((row) => row.state),
+            ["waiting"]
+          )
+          yield* Deferred.succeed(ended, undefined)
+          yield* Fiber.join(running)
+          yield* Fiber.join(next)
+          assert.strictEqual(
+            (yield* until(appId, ["completed", "failed"]))?.status,
+            "completed"
+          )
+          assert.deepStrictEqual(yield* appRecords, [])
+        }).pipe(TestClock.withLive),
+      60_000
+    )
+
+    it.effect(
       "touches nothing when the person who asked can no longer delete it",
       () =>
         Effect.gen(function* () {
@@ -200,6 +365,20 @@ describeMysql("Deleting a game server or database", () => {
           assert.strictEqual(failed?.status, "failed")
           assert.deepStrictEqual(relay.changes, [])
           assert.deepStrictEqual(yield* serverRecords, [serverId])
+
+          // Nor an App's build stopped for them.
+          yield* seedApp([])
+          yield* requestResourceDeletionEffect({
+            finalBackup: false,
+            kind: "app",
+            relayId,
+            resourceId: appId,
+            storageId: null,
+            user: stranger,
+          }).pipe(Effect.ignore)
+          yield* until(appId, ["failed", "completed"])
+          assert.deepStrictEqual(relay.changes, [])
+          assert.deepStrictEqual(yield* appRecords, [appId])
         }).pipe(TestClock.withLive),
       60_000
     )

@@ -8,6 +8,7 @@ import {
 
 import {
   autoUpdateAt,
+  currentImageUpdate,
   defaultAppImageUpdatePolicy,
   loadAppImageUpdateEffect,
   type AppImageUpdate,
@@ -16,6 +17,7 @@ import {
   latestAppDeploymentsEffect,
   listAppDeploymentsEffect,
   loadAppDeploymentEffect,
+  loadRunningAppDeploymentsEffect,
   loadAppGitHubSourceEffect,
   saveAppGitHubSourceEffect,
   type AppDeploymentRecord,
@@ -30,21 +32,33 @@ import {
   loadGitHubConnectionCredentialEffect,
   loadGitHubConnectionsEffect,
 } from "@/effect/github-sync"
-import { listAppRecordsEffect, updateAppConfigEffect } from "@/effect/managed-apps"
+import {
+  listAppRecordsEffect,
+  updateAppConfigEffect,
+} from "@/effect/managed-apps"
 import { attachRelayOwnersEffect } from "@/effect/relay-owners"
 import { runAppEffect } from "@/effect/runtime"
 import { isPlatformAdmin, listUserGrants } from "@/lib/access-control"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import {
+  appDeployKey,
+  askAppDeploymentEffect,
+  deployAppKind,
   publishAppDeploymentChange,
-  startAppDeploymentEffect,
-  startAppDeploymentWhenReadyEffect,
 } from "@/lib/app-deployments.server"
+import { cancelQueuedOperation } from "@/operations/durable"
+import { activeOperations, waitingOperation } from "@/operations/records"
+import { runOperationPromise } from "@/operations/operation"
+import { askAppDeploy } from "@/server/app-deploy-ask.server"
 import { publishGitHubSyncChange } from "@/lib/github-sync.server"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { relayConnectionFeatures } from "@/lib/relay-connection"
 import { listPersistedRelays } from "@/lib/relay-registry"
-import { authorizedApp, hasAppPermission } from "@/server/app-access"
+import {
+  authorizedApp,
+  authorizedAppFor,
+  hasAppPermission,
+} from "@/server/app-access"
 import { requireEligibleResourceUser } from "@/server/auth"
 import { connectionToken } from "@/server/github-sync.server"
 import { databaseRpc } from "@/server/managed-database-access"
@@ -127,26 +141,83 @@ export async function getAppDeploymentsHandler(data: {
   )
   const last = page.at(-1)
   return {
-    items: page.map(
-      (record, index): AppDeploymentView => ({
-        ...record,
-        appName: appNames.get(record.appId) ?? record.appId.slice(0, 8),
-        canManage: hasAppPermission(user, grants, record, "app.manage"),
-        canReadLogs: hasAppPermission(user, grants, record, "app.logs.read"),
-        commitUrl: commitUrl(record),
-        relayName: relayNames.get(record.relayId) ?? "Relay",
-        triggeredByName: record.triggeredBy
-          ? record.triggeredBy === user.id
-            ? (user.name ?? user.email)
-            : (people[index]?.ownerName ?? "Deleted user")
-          : null,
-      })
-    ),
+    items: page.map((record, index): AppDeploymentView => ({
+      ...record,
+      appName: appNames.get(record.appId) ?? record.appId.slice(0, 8),
+      canManage: hasAppPermission(user, grants, record, "app.manage"),
+      canReadLogs: hasAppPermission(user, grants, record, "app.logs.read"),
+      commitUrl: commitUrl(record),
+      relayName: relayNames.get(record.relayId) ?? "Relay",
+      triggeredByName: record.triggeredBy
+        ? record.triggeredBy === user.id
+          ? (user.name ?? user.email)
+          : (people[index]?.ownerName ?? "Deleted user")
+        : null,
+    })),
     nextCursor:
       records.length > deploymentPageSize && last
         ? { id: last.id, startedAt: last.startedAt }
         : null,
   }
+}
+
+/**
+ * Each app the person can read that has a deploy waiting its turn, or one
+ * Hearth is running, so its Deploy button says so from the moment it's
+ * asked. A waiting one names its operation, to cancel it.
+ */
+export async function getAppDeployStatesHandler(user: AuthenticatedUser) {
+  const [active, running] = await Promise.all([
+    runAppEffect("apps.deploy.active", activeOperations(deployAppKind)),
+    runAppEffect("apps.deployments.running", loadRunningAppDeploymentsEffect()),
+  ])
+  if (active.length === 0 && running.length === 0) return {}
+  const grants = isPlatformAdmin(user) ? [] : await listUserGrants(user.id)
+  const states: Record<
+    string,
+    { deploying: boolean; queuedId: string | null }
+  > = {}
+  const readable = (app: { appId: string; relayId: string }) =>
+    hasAppPermission(user, grants, app, "app.read")
+  for (const record of running) {
+    if (!readable(record)) continue
+    states[record.appId] = { deploying: true, queuedId: null }
+  }
+  // Running from when it starts, before its Relay hears of it.
+  for (const { id, input, state } of active) {
+    const { appId, relayId } = input as { appId?: string; relayId?: string }
+    if (!relayId || !appId || !readable({ appId, relayId })) continue
+    const known = states[appId]
+    states[appId] = {
+      deploying: (known?.deploying ?? false) || state === "running",
+      queuedId: state === "waiting" ? id : (known?.queuedId ?? null),
+    }
+  }
+  return states
+}
+
+/**
+ * Cancels the app's deploy still waiting its turn, the one shown: what's
+ * asked after it queues anew.
+ */
+export async function cancelQueuedAppDeployHandler(
+  user: AuthenticatedUser,
+  data: { appId: string; operationId: string; relayId: string }
+) {
+  const { relay } = await authorizedAppFor(user, data, "app.manage")
+  const waiting = await runAppEffect(
+    "apps.deploy.waiting",
+    waitingOperation(deployAppKind, appDeployKey(relay.id, data.appId))
+  )
+  const cancelled =
+    waiting?.id === data.operationId &&
+    (await runAppEffect(
+      "apps.deploy.cancel",
+      cancelQueuedOperation(waiting.id)
+    ))
+  publishAppDeploymentChange(relay.id)
+  if (!cancelled) throw new Error("That deploy has already started")
+  return { cancelled: true as const }
 }
 
 /** What the app's rail shows: where it deploys from and what it runs. */
@@ -156,10 +227,7 @@ export async function getAppDeploymentSummaryHandler(data: {
 }) {
   const { app, user } = await authorizedApp(data, "app.read")
   const [source, latest, imageUpdate] = await Promise.all([
-    runAppEffect(
-      "apps.github.source",
-      loadAppGitHubSourceEffect(data.appId)
-    ),
+    runAppEffect("apps.github.source", loadAppGitHubSourceEffect(data.appId)),
     runAppEffect(
       "apps.deployments.latest",
       latestAppDeploymentsEffect(data.appId)
@@ -190,7 +258,15 @@ export async function getAppDeploymentSummaryHandler(data: {
     // Nothing to check until it names an image.
     imageUpdates:
       app.config.sourceType === "image" && app.config.image !== ""
-        ? imageUpdatesView(app.config.image, imageUpdate)
+        ? imageUpdatesView(
+            app.config.image,
+            imageUpdate,
+            currentImageUpdate(
+              imageUpdate,
+              app.config.image,
+              latest.latest?.startedAt ?? null
+            )
+          )
         : null,
   }
 }
@@ -200,14 +276,19 @@ export async function getAppDeploymentSummaryHandler(data: {
  * last check found for the image its config names now; one saved since
  * hasn't been checked.
  */
-function imageUpdatesView(image: string, update: AppImageUpdate | null) {
+// The app's saved policy, and what the last check found, if it still
+// describes the app (`currentImageUpdate`).
+function imageUpdatesView(
+  image: string,
+  saved: AppImageUpdate | null,
+  current: AppImageUpdate | null
+) {
   const policy = {
-    delayHours: update?.delayHours ?? defaultAppImageUpdatePolicy.delayHours,
-    mode: update?.mode ?? defaultAppImageUpdatePolicy.mode,
+    delayHours: saved?.delayHours ?? defaultAppImageUpdatePolicy.delayHours,
+    mode: saved?.mode ?? defaultAppImageUpdatePolicy.mode,
   }
   // A digest never moves, so there's nothing to check.
   const pinned = image.includes("@")
-  const current = update && update.image === image ? update : null
   return {
     ...policy,
     autoUpdateAt: current && autoUpdateAt(current),
@@ -290,18 +371,21 @@ const appSourceFileMaxBytes: Record<AppGitHubBuild, number> = {
  * Points the app at a repository and makes it the app's source. Saving one
  * needs the source's owner, or an administrator, like a sync.
  */
-export async function saveAppGitHubSourceHandler(data: {
-  appId: string
-  autoDeploy: boolean
-  branch: string
-  build: AppGitHubBuild
-  connectionId: string
-  deploy: boolean
-  path: string
-  relayId: string
-  repository: string
-}) {
-  const { relay, user } = await authorizedApp(data, "app.manage")
+export async function saveAppGitHubSourceHandler(
+  user: AuthenticatedUser,
+  data: {
+    appId: string
+    autoDeploy: boolean
+    branch: string
+    build: AppGitHubBuild
+    connectionId: string
+    deploy: boolean
+    path: string
+    relayId: string
+    repository: string
+  }
+) {
+  const { relay } = await authorizedAppFor(user, data, "app.manage")
   if (!relayConnectionFeatures(relay.id).has(relayAppGitHubV1Feature)) {
     throw new Error(
       relayConnectionFeatures(relay.id).size === 0
@@ -343,40 +427,64 @@ export async function saveAppGitHubSourceHandler(data: {
   })
   // Sources count the apps that deploy from them.
   publishGitHubSyncChange()
-  // A new app may still be provisioning; it deploys once it's ready.
-  const deployed = data.deploy
-    ? await runAppEffect(
-        "apps.deploy",
-        startAppDeploymentWhenReadyEffect({
-          appId: data.appId,
-          relayId: relay.id,
-          trigger: "manual",
-          userId: user.id,
-        })
-      )
-    : null
-  return { config, deployment: deployed?.deployment ?? null }
+  // Queued, behind any deployment running; a new app may still be
+  // provisioning, and deploys once it's ready.
+  if (data.deploy) {
+    await runAppEffect(
+      "apps.deploy",
+      askAppDeploymentEffect({
+        appId: data.appId,
+        awaitProvisioning: true,
+        relayId: relay.id,
+        trigger: "manual",
+        userId: user.id,
+      })
+    )
+  }
+  return { config, queued: data.deploy === true }
 }
 
-/** Deploys a past deployment's commit again, or the app's config. */
-export async function redeployAppDeploymentHandler(data: {
-  deploymentId: string
-}) {
+/**
+ * Deploys a past deployment's commit or digest again, or the app's config,
+ * queued behind any deployment running.
+ */
+export async function redeployAppDeploymentHandler(
+  user: AuthenticatedUser,
+  data: { deploymentId: string }
+) {
   const record = await recordFor(data.deploymentId)
-  const { relay, user } = await authorizedApp(record, "app.manage")
-  const started = await runAppEffect(
-    "apps.redeploy",
-    startAppDeploymentEffect({
+  const { app, relay } = await authorizedAppFor(user, record, "app.manage")
+  // A commit only of the repository the app deploys from now, which its
+  // deployment names, and again once its turn comes.
+  if (record.commitSha) {
+    const source = await runAppEffect(
+      "apps.github.source",
+      loadAppGitHubSourceEffect(record.appId)
+    )
+    if (
+      app.config.sourceType !== "github" ||
+      source?.repository !== record.repository
+    ) {
+      throw new Error(
+        "This deployment was of another repository; redeploy one of the app's own"
+      )
+    }
+  }
+  return runOperationPromise(
+    askAppDeploy,
+    {
       appId: record.appId,
-      commit: record.commitSha ?? undefined,
-      imageDigest: record.imageDigest ?? undefined,
+      ...(record.commitSha && {
+        commit: { sha: record.commitSha, source: record.repository ?? "" },
+      }),
+      ...(record.imageDigest && {
+        image: { digest: record.imageDigest, source: app.config.image },
+      }),
       relayId: relay.id,
       trigger: "redeploy",
-      userId: user.id,
-    })
+    },
+    { user }
   )
-  publishAppDeploymentChange(relay.id)
-  return { deployment: started?.deployment ?? null }
 }
 
 /** A deployment's log, from its Relay while it keeps it. */
@@ -413,7 +521,7 @@ export async function getAppDeploymentLogHandler(data: {
   }
 }
 
-async function recordFor(deploymentId: string) {
+export async function recordFor(deploymentId: string) {
   const record = await runAppEffect(
     "apps.deployment.load",
     loadAppDeploymentEffect(deploymentId)

@@ -1,31 +1,51 @@
+import { relayCertificateCheckResultSchema } from "@workspace/contracts"
 import { Effect } from "effect"
 
-import { HostnameInUseError } from "@/effect/errors"
+import { DomainConfigurationError, HostnameInUseError } from "@/effect/errors"
 import { promiseEffect, recoverPromise } from "@/effect/promise"
 import { runAppEffect } from "@/effect/runtime"
 import {
   listResourceWebHostnamesEffect,
   loadWebHostnameEffect,
   markResourceWebHostnamesRemovingEffect,
+  webHostnameProxied,
   type WebHostnameResource,
 } from "@/effect/web-hostnames"
 import { requireRelayPermission } from "@/lib/access-control"
 import type { AuthenticatedUser } from "@/lib/auth-session"
+import { dnsKey } from "@/lib/dns-operations"
+import { relayRpc } from "@/lib/relay-connection"
+import { activeRelay } from "@/lib/relay-registry"
+import { exclusive, resourceKey, shared } from "@/operations/lanes"
+import {
+  operation,
+  runOperationPromise,
+  signedIn,
+} from "@/operations/operation"
 import { requireEligibleResourceUser } from "@/server/auth"
 import { domainActor } from "@/server/domain-access.server"
 import { explainHostnameInUseEffect } from "@/server/domain-resource-access.server"
 import type {
+  AdoptWebHostnameRecordInput,
+  CheckWebCertificateInput,
   ReleaseWebHostnameInput,
-  ResourceWebHostname,
+  ResourceWebHostnames,
   ResourceWebHostnamesInput,
+  WebCertificateCheck,
 } from "@/server/domains"
 import {
+  certificateState,
+  pendingWebCertificates,
+} from "@/server/web-certificates.server"
+import {
+  adoptExistingWebRecordEffect,
   deleteResourceWebHostnamesEffect,
   generateAppHostnameEffect,
   publishWebHostnameChange,
   reconcileResourceWebHostnamesEffect,
   releaseWebHostnameEffect,
   saveWebRouteHostnamesEffect,
+  type WebHostnameProxyChange,
 } from "@/server/web-hostnames.server"
 
 function permissionFor(
@@ -59,10 +79,10 @@ function requireResourcePermission(
 /** A game server's or app's web hostnames, for its network page. */
 export async function getResourceWebHostnamesHandler(
   data: ResourceWebHostnamesInput
-): Promise<Array<ResourceWebHostname>> {
+): Promise<ResourceWebHostnames> {
   const user = await requireEligibleResourceUser()
   await requireResourcePermission(user, data, false)
-  const canRelease = await recoverPromise(
+  const canChange = await recoverPromise(
     () => requireResourcePermission(user, data, true).then(() => true),
     () => false
   )
@@ -70,29 +90,162 @@ export async function getResourceWebHostnamesHandler(
     "webHostnames.resource",
     listResourceWebHostnamesEffect(data)
   )
-  return rows.map((row) => ({
-    // Only an app's generated address no route uses.
-    canRelease: canRelease && row.generated && !row.routed,
-    generated: row.generated,
-    hostname: row.hostname,
-    id: row.id,
-    lastError: row.lastError,
-    status: row.status,
-  }))
+  return {
+    canChange,
+    certificates: pendingWebCertificates(data),
+    hostnames: rows.map((row) => ({
+      // Only an app's generated address no route uses.
+      canRelease: canChange && row.generated && !row.routed,
+      generated: row.generated,
+      hostname: row.hostname,
+      id: row.id,
+      lastError: row.lastError,
+      proxied: webHostnameProxied(row),
+      status: row.status,
+    })),
+  }
 }
+
+// The Relay orders it; holding the resource shared lets a deletion turn it away.
+const checkCertificate = operation<CheckWebCertificateInput>()({
+  name: "webHostname.certificate.check",
+  doing: "Checking its certificate",
+  authorize: ({ input, user }) =>
+    signedIn(user).pipe(
+      Effect.flatMap((person) =>
+        promiseEffect(() => requireResourcePermission(person, input, true))
+      )
+    ),
+  locks: ({ input }) => [
+    shared(resourceKey(input.resourceType, input.relayId, input.resourceId)),
+  ],
+  run: ({ input, user }) =>
+    promiseEffect(async (): Promise<WebCertificateCheck> => {
+      const { asked, pending } = relayCertificateCheckResultSchema.parse(
+        await relayRpc(
+          await activeRelay(input.relayId),
+          "relay.certificates.check",
+          {
+            hostname: input.hostname,
+            // The Relay refuses a hostname this resource's routes don't serve.
+            owner: {
+              id: input.resourceId,
+              kind: input.resourceType === "app" ? "app" : "server",
+            },
+          },
+          30_000,
+          user?.id
+        )
+      )
+      return { asked, certificate: pending ? certificateState(pending) : null }
+    }),
+})
+
+/** Has the hostname's Relay check it now and ask for its certificate again. */
+export async function checkWebCertificateHandler(
+  data: CheckWebCertificateInput
+): Promise<WebCertificateCheck> {
+  return runOperationPromise(checkCertificate, data, {
+    user: await requireEligibleResourceUser(),
+  })
+}
+
+// Releasing a hostname changes its game server's or App's DNS, so it holds
+// that `#dns`; one already gone changes nothing.
+const releaseHostname = operation<ReleaseWebHostnameInput>()({
+  name: "webHostname.release",
+  doing: "Changing its DNS records",
+  authorize: ({ input, user }) =>
+    signedIn(user).pipe(
+      Effect.flatMap((person) =>
+        promiseEffect(async () => {
+          const row = await runAppEffect(
+            "webHostnames.load",
+            loadWebHostnameEffect(input.id)
+          )
+          if (row) await requireResourcePermission(person, row, true)
+          return row
+        })
+      )
+    ),
+  locks: ({ context: row }) => (row ? [exclusive(dnsKey(row))] : []),
+  run: ({ context: row }) =>
+    promiseEffect(async () => {
+      if (!row) return
+      await runAppEffect("webHostnames.release", releaseWebHostnameEffect(row))
+      publishWebHostnameChange([row.relayId])
+    }),
+  audit: ({ context: row }) =>
+    row
+      ? {
+          id: row.resourceId,
+          kind: row.resourceType,
+          relayId: row.relayId,
+        }
+      : null,
+})
 
 /** Deletes a hostname's record, such as an app's generated address. */
 export async function releaseWebHostnameHandler(data: ReleaseWebHostnameInput) {
   // Signed in before the lookup, so an ID's existence isn't revealed.
-  const user = await requireEligibleResourceUser()
-  const row = await runAppEffect(
-    "webHostnames.load",
-    loadWebHostnameEffect(data.id)
-  )
-  if (!row) return
-  await requireResourcePermission(user, row, true)
-  await runAppEffect("webHostnames.release", releaseWebHostnameEffect(row))
-  publishWebHostnameChange([row.relayId])
+  return runOperationPromise(releaseHostname, data, {
+    user: await requireEligibleResourceUser(),
+  })
+}
+
+// Taking over a record changes its game server's or App's DNS, so it holds
+// that `#dns`. It also takes owning the domain's Cloudflare connection,
+// which the change checks.
+const adoptRecord = operation<AdoptWebHostnameRecordInput>()({
+  name: "webHostname.adopt",
+  doing: "Taking over its DNS record",
+  authorize: ({ input, user }) =>
+    signedIn(user).pipe(
+      Effect.flatMap((person) =>
+        Effect.gen(function* () {
+          const row = yield* loadWebHostnameEffect(input.id)
+          if (!row) {
+            return yield* DomainConfigurationError.make({
+              message: "This hostname no longer exists",
+            })
+          }
+          yield* promiseEffect(() =>
+            requireResourcePermission(person, row, true)
+          )
+          return { actor: domainActor(person), row }
+        })
+      )
+    ),
+  locks: ({ context: { row } }) => [exclusive(dnsKey(row))],
+  run: ({ context: { actor, row }, input }) =>
+    adoptExistingWebRecordEffect(row, {
+      actor,
+      proxied: input.proxied,
+      record: input.record,
+    }).pipe(
+      Effect.map((after) => ({
+        lastError: after?.lastError ?? null,
+        status: after?.status ?? null,
+      }))
+    ),
+  audit: ({ context: { row } }) => ({
+    id: row.resourceId,
+    kind: row.resourceType,
+    relayId: row.relayId,
+  }),
+})
+
+/**
+ * Lets Kiln manage the record Cloudflare already had under a hostname: it
+ * points it at the Relay, and deletes it with the route.
+ */
+export async function adoptWebHostnameRecordHandler(
+  data: AdoptWebHostnameRecordInput
+) {
+  // Signed in before the lookup, so an ID's existence isn't revealed.
+  return runOperationPromise(adoptRecord, data, {
+    user: await requireEligibleResourceUser(),
+  })
 }
 
 /**
@@ -106,12 +259,13 @@ export async function saveClaimingWebRouteHostnames<T>(
   user: AuthenticatedUser,
   resource: WebHostnameResource,
   hostnames: ReadonlyArray<string>,
-  save: () => Promise<T>
+  save: () => Promise<T>,
+  proxy?: WebHostnameProxyChange
 ): Promise<T> {
   return runAppEffect(
     "webHostnames.claimAndSave",
     saveWebRouteHostnamesEffect(
-      { actor: domainActor(user), hostnames, resource },
+      { actor: domainActor(user), hostnames, proxy, resource },
       promiseEffect(save)
     ).pipe(
       // The save's own failure passes through as it was thrown.

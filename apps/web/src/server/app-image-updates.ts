@@ -6,8 +6,13 @@ import {
 } from "@workspace/contracts"
 import { z } from "zod"
 
+import type { AuthenticatedUser } from "@/lib/auth-session"
+import { runOperationPromise } from "@/operations/operation"
+import { requireEligibleResourceUser } from "@/server/auth"
+import { resourceOperation } from "@/server/resource-operation.server"
 import {
-  checkAppImageUpdateHandler,
+  askAppImageUpdateHandler,
+  recordAppImageCheckHandler,
   deployAppImageUpdateHandler,
   saveAppImageUpdatePolicyHandler,
   skipAppImageUpdateHandler,
@@ -26,18 +31,77 @@ const policyInputSchema = appInputSchema.extend({
 
 const skipInputSchema = appInputSchema.extend({ digest: imageDigestSchema })
 
+// Each holds the App shared: its image updates are its own settings and
+// what a check found. Deploying an update queues a deployment, which takes
+// its own turn.
+const imageOperation = <Input extends z.infer<typeof appInputSchema>, A>(
+  name: string,
+  doing: string,
+  run: (user: AuthenticatedUser, input: Input) => Promise<A>
+) =>
+  resourceOperation({
+    kind: "app",
+    id: (input: Input) => input.appId,
+    name,
+    doing,
+    permission: () => "app.manage",
+    lock: "shared",
+    run,
+  })
+
+const savePolicy = imageOperation(
+  "app.imageUpdates.policy",
+  "Changing this App's image updates",
+  (user, input: z.infer<typeof policyInputSchema>) =>
+    saveAppImageUpdatePolicyHandler(user, input)
+)
+// Records a check asked for just before, so the App is held only while the
+// answer is recorded, not while registries answer.
+const recordCheck = imageOperation(
+  "app.imageUpdates.check",
+  "Checking this App's image",
+  recordAppImageCheckHandler
+)
+const skipUpdate = imageOperation(
+  "app.imageUpdates.skip",
+  "Changing this App's image updates",
+  (user, input: z.infer<typeof skipInputSchema>) =>
+    skipAppImageUpdateHandler(user, input)
+)
+const deployUpdate = imageOperation(
+  "app.imageUpdates.deploy",
+  "Deploying this App",
+  deployAppImageUpdateHandler
+)
+
 export const saveAppImageUpdatePolicy = createServerFn({ method: "POST" })
   .validator(policyInputSchema)
-  .handler(({ data }) => saveAppImageUpdatePolicyHandler(data))
+  .handler(async ({ data }) =>
+    runOperationPromise(savePolicy, data, {
+      user: await requireEligibleResourceUser(),
+    })
+  )
 
 export const checkAppImageUpdate = createServerFn({ method: "POST" })
   .validator(appInputSchema)
-  .handler(({ data }) => checkAppImageUpdateHandler(data))
+  .handler(async ({ data }) => {
+    const user = await requireEligibleResourceUser()
+    const asked = await askAppImageUpdateHandler(user, data)
+    return runOperationPromise(recordCheck, { ...data, asked }, { user })
+  })
 
 export const skipAppImageUpdate = createServerFn({ method: "POST" })
   .validator(skipInputSchema)
-  .handler(({ data }) => skipAppImageUpdateHandler(data))
+  .handler(async ({ data }) =>
+    runOperationPromise(skipUpdate, data, {
+      user: await requireEligibleResourceUser(),
+    })
+  )
 
 export const deployAppImageUpdate = createServerFn({ method: "POST" })
   .validator(appInputSchema)
-  .handler(({ data }) => deployAppImageUpdateHandler(data))
+  .handler(async ({ data }) =>
+    runOperationPromise(deployUpdate, data, {
+      user: await requireEligibleResourceUser(),
+    })
+  )

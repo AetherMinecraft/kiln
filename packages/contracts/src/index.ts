@@ -615,6 +615,44 @@ export const relayHostAccessSchema = z.object({
   dataDirectory: z.string().min(1).optional(),
 })
 
+// The node's desktop, as the Relay finds it (apps/relay/src/desktop.ts):
+// the graphical session someone is signed in to, if any. Only X11 desktops
+// can be streamed. `disabled` means the Relay's host access is off,
+// `unconfigured` that it has no streamer image, and `paused` that it's paused.
+const relayDesktopSessionShape = {
+  displayManager: z.boolean(),
+  desktop: z.string().max(200).nullable(),
+  greeter: z.boolean(),
+  user: z.string().max(200).nullable(),
+}
+export const relayDesktopSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("x11"),
+    display: z.string().max(32),
+    ...relayDesktopSessionShape,
+  }),
+  z.object({ status: z.literal("wayland"), ...relayDesktopSessionShape }),
+  z.object({ status: z.literal("none"), displayManager: z.boolean() }),
+  z.object({ status: z.literal("disabled"), displayManager: z.boolean() }),
+  z.object({ status: z.literal("unconfigured"), displayManager: z.boolean() }),
+  z.object({ status: z.literal("paused"), displayManager: z.boolean() }),
+])
+export type RelayDesktop = z.infer<typeof relayDesktopSchema>
+
+export const relayDesktopTicketSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{43}$/u)
+export const relayDesktopAttachedSchema = z.object({
+  desktop: relayDesktopSchema,
+  ticket: relayDesktopTicketSchema,
+})
+export const relayDesktopHeartbeatSchema = z.object({
+  tickets: z.array(relayDesktopTicketSchema).max(64),
+})
+export const relayDesktopDetachSchema = z.object({
+  ticket: relayDesktopTicketSchema,
+})
+
 // A Docker named volume on a Relay. Kiln manages two kinds, each with a
 // stable ID that names it to backups and deletion:
 //
@@ -751,6 +789,66 @@ export const relayAppVolumesImportSchema = z.strictObject({
   apps: z.array(relayAppVolumesWriteSchema).max(10_000),
   unresolvedAppIds: z.array(volumeAppIdSchema).max(10_000),
 })
+// What a cleanup a person asks for removes beyond what the Relay's passes
+// do (docs/relay-runtime.md#docker-cleanup).
+export const relayDockerCleanupRequestSchema = z.strictObject({
+  // BuildKit's unused cache, the host's own builds' too.
+  buildCache: z.boolean(),
+  // Unused images no Kiln container ran, such as ones pulled by hand.
+  unknownImages: z.boolean(),
+})
+export const relayDockerCleanupResultSchema = z.object({
+  buildCacheBytes: z.number().int().nonnegative(),
+  containers: z.number().int().nonnegative(),
+  // Why it stopped short, when it did.
+  error: z.string().max(2_000).nullable(),
+  // What the removed images held of their own, shared layers left out.
+  imageBytes: z.number().int().nonnegative(),
+  images: z.number().int().nonnegative(),
+})
+// A cleanup someone asked for runs in the background; the Relay answers as
+// it starts, or with the one already running.
+export const relayDockerCleanupStartSchema = z.object({
+  alreadyRunning: z.boolean(),
+  startedAt: z.number().int().nonnegative(),
+})
+const relayDockerAmountSchema = z.object({
+  bytes: z.number().int().nonnegative(),
+  images: z.number().int().nonnegative(),
+})
+// What Docker holds on a Relay's host and what a cleanup could remove.
+export const relayDockerStorageSchema = z.object({
+  buildCache: z.object({
+    bytes: z.number().int().nonnegative(),
+    reclaimableBytes: z.number().int().nonnegative(),
+  }),
+  images: z.object({
+    bytes: z.number().int().nonnegative(),
+    count: z.number().int().nonnegative(),
+  }),
+  // A cleanup someone asked for that's still running in the background.
+  cleaning: z.object({ startedAt: z.number().int().nonnegative() }).nullable(),
+  // The latest cleanup since the Relay started, a pass or asked for.
+  lastCleanup: relayDockerCleanupResultSchema
+    .extend({
+      finishedAt: z.number().int().nonnegative(),
+      requested: z.boolean(),
+    })
+    .nullable(),
+  // Containers Docker refused to remove, which passes try again.
+  leftoverContainers: z.number().int().nonnegative(),
+  // What a cleanup now would remove of Kiln's own.
+  reclaimable: relayDockerAmountSchema,
+  // Unused images no Kiln container ran, removed only when asked.
+  unknown: relayDockerAmountSchema,
+})
+export type RelayDockerCleanupRequest = z.infer<
+  typeof relayDockerCleanupRequestSchema
+>
+export type RelayDockerCleanupResult = z.infer<
+  typeof relayDockerCleanupResultSchema
+>
+export type RelayDockerStorage = z.infer<typeof relayDockerStorageSchema>
 // The Relay's refusal while it waits for that import, followed by why.
 export const RELAY_VOLUME_REFERENCES_PENDING =
   "The Relay doesn't know yet which Apps use its volumes"
@@ -1082,6 +1180,11 @@ export const relayAppImageCheckResultsSchema = z.array(
 // the Relay kept.
 export const relayAppDeploymentReadSchema = z
   .object({ appId: appIdSchema, deploymentId: z.string().min(1).max(64) })
+  .strict()
+
+/** Stops an App's running deployment, as before it's deleted. */
+export const relayAppDeploymentAbortSchema = z
+  .object({ appId: appIdSchema })
   .strict()
 
 export const relayAppLimitsSchema = z
@@ -1868,6 +1971,36 @@ export type RelayProxyConfiguration = z.infer<
   typeof relayProxyConfigurationSchema
 >
 
+/** A web route hostname the bundled Traefik has no certificate for yet. */
+export const relayPendingCertificateSchema = z.object({
+  /** Its name didn't resolve, or Traefik asked over two minutes ago. */
+  failed: z.boolean(),
+  hostname: z.string().min(1).max(253),
+  /** The game server or App whose route serves it. */
+  owner: z.object({
+    id: z.string().min(1),
+    kind: z.enum(["app", "server"]),
+  }),
+  /** `dns`: its name doesn't resolve yet, so Traefik doesn't ask. */
+  waitingFor: z.enum(["certificate", "dns"]),
+})
+
+export type RelayPendingCertificate = z.infer<
+  typeof relayPendingCertificateSchema
+>
+
+export const relayCertificateCheckInputSchema = z.object({
+  hostname: z.string().min(1).max(253),
+  /** The game server or App whose route it should be. */
+  owner: relayPendingCertificateSchema.shape.owner,
+})
+
+/** What a hostname still waits for (null once it has one), and whether Traefik asked. */
+export const relayCertificateCheckResultSchema = z.object({
+  asked: z.boolean(),
+  pending: relayPendingCertificateSchema.nullable(),
+})
+
 export const relayInstanceResourcesSchema = z.object({
   sampledAt: z.string().datetime(),
   cpu: z.object({
@@ -2203,6 +2336,31 @@ export const relayTailscaleStackSchema = z
   .strict()
 
 export const relayTailscaleStacksSchema = z.array(relayTailscaleStackSchema)
+
+/**
+ * What a Tailscale network's DNS is made from on one node
+ * (`relay.tailscale.stack.state`): its members, each marked frozen while its
+ * resource is frozen for deletion, and whether the node is being removed
+ * from the network. Hearth builds every node's records from these: the
+ * enabled members that aren't frozen, of nodes not being removed.
+ */
+export const relayTailscaleStackStateSchema = z
+  .object({
+    bindings: z.array(
+      relayTailscaleStackBindingSchema.extend({ frozen: z.boolean() })
+    ),
+    id: relayTailscaleStackIdSchema,
+    removalPending: z.boolean(),
+  })
+  .strict()
+
+export const relayTailscaleStackStatesSchema = z.array(
+  relayTailscaleStackStateSchema
+)
+
+export type RelayTailscaleStackState = z.infer<
+  typeof relayTailscaleStackStateSchema
+>
 
 export const relayNodeCapabilitySchema = z.enum([
   "schedule-continue-on-failure",
@@ -2540,6 +2698,8 @@ export type RelayPlatformDatabaseWrite = z.infer<
 
 const relaySnapshotRelaySchema = z.object({
   browserOrigin: relayProxyBrowserMetadataSchema.shape.browserOrigin.optional(),
+  /** Optional only so an outdated Relay's snapshot parses while it updates. */
+  certificates: z.array(relayPendingCertificateSchema).optional(),
   id: relayIdSchema,
   name: z.string().min(1).max(120),
   // Held paused by a Hearth, so it runs no changes. See

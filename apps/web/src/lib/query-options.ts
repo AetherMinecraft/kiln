@@ -69,6 +69,7 @@ import {
 } from "@/lib/instance-favorites"
 import { getRelayResources } from "@/server/relay-host"
 import { getRelayVolumes } from "@/server/relay-volumes"
+import { getRelayDockerStorage } from "@/server/relay-docker"
 import { isDatabaseFilePath } from "@/lib/database-files"
 import { traceFileWork } from "@/lib/file-timing"
 import { reconcilePendingPowerSnapshot } from "@/lib/instance-power-state"
@@ -117,6 +118,7 @@ import {
 import {
   getAppDeploymentLog,
   getAppDeployments,
+  getAppDeployStates,
   getAppDeploymentSummary,
   getAppGitHubSourceFile,
 } from "@/server/app-deployments"
@@ -217,6 +219,7 @@ export const queryKeys = {
       ["app-deployments", "log", deploymentId] as const,
     summary: (relayId: string, appId: string) =>
       ["app-deployments", "summary", relayId, appId] as const,
+    states: ["app-deployments", "states"] as const,
   },
   apps: {
     all: ["apps"] as const,
@@ -286,6 +289,8 @@ export const queryKeys = {
   relayControlDial: (relayId: string) =>
     ["relays", "control-dial", relayId] as const,
   relayVolumes: (relayId: string) => ["relays", "volumes", relayId] as const,
+  relayDockerStorage: (relayId: string) =>
+    ["relays", "docker-storage", relayId] as const,
   relayProxyModes: ["relays", "proxy-modes"] as const,
   // Beside each game server's own routes, so route changes refresh both.
   relayWebRoutes: (relayId: string) => ["web-routes", relayId] as const,
@@ -929,6 +934,20 @@ export function relayVolumesQueryOptions(relayId: string) {
   })
 }
 
+// Docker counts every image's layers for these figures, so they're read
+// when someone opens the Relay's Info page and after a cleanup.
+export function relayDockerStorageQueryOptions(relayId: string) {
+  return queryOptions({
+    queryFn: () => getRelayDockerStorage({ data: { relayId } }),
+    queryKey: queryKeys.relayDockerStorage(relayId),
+    // While a cleanup runs in the background the Relay answers from the
+    // figures it last counted, so checking for its end is cheap.
+    refetchInterval: (query) => (query.state.data?.cleaning ? 3_000 : false),
+    retry: false,
+    staleTime: 60_000,
+  })
+}
+
 // Which side opened the Relay's control connection. It changes only when
 // the connection does, so it's read now and then while someone looks.
 export function relayControlDialQueryOptions(relayId: string) {
@@ -1128,6 +1147,14 @@ export function appDeploymentsQueryOptions(scope: {
   })
 }
 
+// Which apps have a deploy waiting its turn or running, as Hearth has it.
+export function appDeployStatesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.appDeployments.states,
+    queryFn: () => getAppDeployStates(),
+  })
+}
+
 export function appDeploymentSummaryQueryOptions(
   relayId: string,
   appId: string
@@ -1228,7 +1255,10 @@ export function hearthEdgeQueryOptions() {
   })
 }
 
-/** The DNS records Kiln keeps for a game server's or app's web routes. */
+/**
+ * The DNS records Kiln keeps for a game server's or app's web routes, and
+ * which of them still wait on a certificate.
+ */
 export function resourceWebHostnamesQueryOptions(
   relayId: string,
   resourceType: "app" | "instance",

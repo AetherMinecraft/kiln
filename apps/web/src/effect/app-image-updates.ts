@@ -138,7 +138,8 @@ export const recordAppImageCheckEffect = Effect.fn("apps.imageUpdates.record")(
   function* (
     appId: string,
     image: string,
-    result: Exclude<RelayAppImageCheckResult, { status: "deploying" }>
+    result: Exclude<RelayAppImageCheckResult, { status: "deploying" }>,
+    askedAt: number
   ) {
     const database = yield* Database
     const now = yield* Clock.currentTimeMillis
@@ -154,7 +155,19 @@ export const recordAppImageCheckEffect = Effect.fn("apps.imageUpdates.record")(
             [appId]
           )
           const previous = row ? toUpdate(row) : null
-          const next = nextUpdate(previous, appId, image, result, now)
+          // One asked before what's recorded, answering later, says less
+          // than it: kept out, its effects with it.
+          if (previous?.checkedAt != null && askedAt < previous.checkedAt) {
+            return {
+              changed: false,
+              newFailure: false,
+              newlySeen: false,
+              update: previous,
+            }
+          }
+          // Checked when it was asked, which is what what it found
+          // describes; a deployment since makes it stale.
+          const next = nextUpdate(previous, appId, image, result, askedAt)
           yield* transaction.execute(
             `INSERT INTO ${databaseTable("app_image_update")}
                (app_id, mode, delay_hours, state, image, running_digest,
@@ -193,7 +206,11 @@ export const recordAppImageCheckEffect = Effect.fn("apps.imageUpdates.record")(
             newlySeen ||
             previous?.state !== next.state ||
             previous?.checkError !== next.checkError
-          return { changed, newlySeen, update: next }
+          // A registry that keeps failing fails every check: only a new
+          // failure is worth reporting.
+          const newFailure =
+            next.checkError !== null && previous?.checkError !== next.checkError
+          return { changed, newFailure, newlySeen, update: next }
         })
     )
   }
@@ -265,6 +282,39 @@ function nextUpdate(
 }
 
 /**
+ * What a check found, if it still describes the App: it asked about the
+ * image the App names now, and no deployment has started since it asked,
+ * which may have changed what runs. Checks take no lock, so what one
+ * recorded is judged here, where it's used, rather than kept from being
+ * recorded.
+ */
+export function currentImageUpdate(
+  update: AppImageUpdate | null,
+  image: string,
+  latestDeploymentStartedAt: string | null
+): AppImageUpdate | null {
+  return update && describesApp(update, image, latestDeploymentStartedAt)
+    ? update
+    : null
+}
+
+/** Whether a check's record still describes the App, as above. */
+export function describesApp(
+  checked: { readonly checkedAt: number | null; readonly image: string | null },
+  image: string,
+  latestDeploymentStartedAt: string | null
+): boolean {
+  return (
+    checked.image === image &&
+    !(
+      latestDeploymentStartedAt !== null &&
+      checked.checkedAt !== null &&
+      Date.parse(latestDeploymentStartedAt) >= checked.checkedAt
+    )
+  )
+}
+
+/**
  * When an update deploys on its own: once it's been out the app's wait,
  * and the last check got through, so it's still what the tag names.
  */
@@ -283,23 +333,33 @@ export function autoUpdateAt(update: AppImageUpdate): number | null {
 }
 
 /**
- * Claims `digest` for an image update to deploy, before it's sent to the
- * Relay. False if an update already claimed it, however that went, so an
- * automatic update never deploys the same digest twice. Kept apart from
- * the deployment history, which is pruned.
+ * Claims `digest` for the image update `deploymentId` deploys, before it's
+ * sent to the Relay. False if another update already claimed it, however
+ * that went, so an automatic update never deploys the same digest twice;
+ * the same deployment claiming again, as when its step runs again after a
+ * restart, still has it. Kept apart from the deployment history, which is
+ * pruned.
  */
 export const claimImageUpdateEffect = Effect.fn("apps.imageUpdates.claim")(
-  function* (appId: string, digest: string) {
+  function* (appId: string, digest: string, deploymentId: string) {
     const database = yield* Database
     const now = yield* Clock.currentTimeMillis
-    const result = yield* database.execute(
+    yield* database.execute(
       "apps.imageUpdates.claim",
       `INSERT IGNORE INTO ${databaseTable("app_image_update_attempt")}
-         (app_id, digest, attempted_at)
-       VALUES (?, ?, ?)`,
-      [appId, digest, now]
+         (app_id, digest, attempted_at, deployment_id)
+       VALUES (?, ?, ?, ?)`,
+      [appId, digest, now, deploymentId]
     )
-    return result.affectedRows === 1
+    const [claim] = yield* database.queryRows<
+      RowDataPacket & { deployment_id: string | null }
+    >(
+      "apps.imageUpdates.claim",
+      `SELECT deployment_id FROM ${databaseTable("app_image_update_attempt")}
+        WHERE app_id = ? AND digest = ?`,
+      [appId, digest]
+    )
+    return claim?.deployment_id === deploymentId
   }
 )
 

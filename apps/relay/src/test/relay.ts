@@ -31,6 +31,7 @@ import { loadConfig, type RelayConfig } from "../config.js"
 import { ContainerCommands } from "../container-commands.js"
 import { DatabaseConnections } from "../database-connections.js"
 import { DatabaseDriver } from "../databases.js"
+import { DockerCleanup } from "../docker-cleanup.js"
 import { DockerDriver } from "../docker.js"
 import { DockerEngine } from "../docker-engine.js"
 import { makeRelayStateLayer, RelayStateStore } from "../effect/state.js"
@@ -41,12 +42,17 @@ import { appRouteOwner, relayResourceNames } from "../relay-resources.js"
 import { ResourcePower } from "../resource-power.js"
 import { RuntimeRecoveryManager } from "../runtime-recovery.js"
 import { ScheduleManager } from "../schedules.js"
+import {
+  WebCertificates,
+  webCertificateStorePath,
+} from "../web-certificates.js"
 import { type ContainerSeed, type FakeContainer, fakeDocker } from "./docker.js"
 
 export const TEST_NAMESPACE = "kiln-test"
 
 export interface RelayDrivers {
   readonly apps: AppDriver
+  readonly cleanup: DockerCleanup
   readonly bricks: BrickCatalog
   readonly commands: ContainerCommands
   readonly databaseConnections: DatabaseConnections
@@ -114,20 +120,40 @@ export async function relayHarness(
     const runtimeRecovery = new RuntimeRecoveryManager(config, state, lanes)
     await Effect.runPromise(runtimeRecovery.initialize())
     const databaseConnections = new DatabaseConnections(config, state)
+    const cleanup = new DockerCleanup({
+      config,
+      engine: new DockerEngine(config.dockerSocket),
+      lanes,
+      state,
+      updates: () =>
+        Effect.succeed({
+          finishedHelpers: new Set<string>(),
+          kept: new Set<string>(),
+          named: new Set<string>(),
+          targets: new Set<string>(),
+          updating: false,
+        }),
+    })
     const docker = new DockerDriver(
       config,
       runtimeRecovery,
       bricks,
       state,
       databaseConnections,
-      lanes
+      lanes,
+      cleanup
     )
     const lifecycle = new LifecycleDriver(
       config,
       docker,
       bricks,
       databaseConnections,
-      lanes
+      lanes,
+      new WebCertificates({
+        // Tests reach no nameservers; Traefik asks as it would without them.
+        resolve: async () => "unknown",
+        storePath: webCertificateStorePath(config),
+      })
     )
     lifecycles.push(lifecycle)
     // What a deployment's external volumes are, as the Relay's own finds.
@@ -164,7 +190,8 @@ export async function relayHarness(
       lanes,
       { allocations: docker.allocations, state },
       databaseConnections,
-      (dockerNames) => Effect.runPromise(volumes.idsByDockerName(dockerNames))
+      (dockerNames) => Effect.runPromise(volumes.idsByDockerName(dockerNames)),
+      cleanup
     )
     lifecycle.useAppServiceContainers(async (appId, service) => {
       await apps.get(appId)
@@ -183,6 +210,7 @@ export async function relayHarness(
     return {
       volumes,
       apps,
+      cleanup,
       bricks,
       commands: new ContainerCommands({
         apps,

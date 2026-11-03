@@ -18,6 +18,7 @@ import { resolveBrick, resolveBrickForProvisioning } from "./bricks.js"
 import { directoryApparentSizeEffect } from "./disk-usage.js"
 import { writeFileAtomic } from "./effect/atomic-file.js"
 import { recoverPromise, tapPromiseError } from "./effect/promise.js"
+import { reportRelayError } from "./effect/runtime.js"
 import type {
   BrickRecipe,
   RelayCreateInstance,
@@ -39,6 +40,7 @@ import type {
   RelayTailscaleStackApply,
   RelayTailscaleStackConfig,
   RelayTailscaleStackDns,
+  RelayTailscaleStackState,
   RelayUpdateInstanceStartup,
   ProvisioningWorkPhase,
   ResourceLimits,
@@ -92,7 +94,13 @@ import {
   resourceLimitLabels,
   widestResourceLimits,
 } from "./resource-limits.js"
-import { exclusive, laneKeys, type OperationLanes } from "./operation-lanes.js"
+import {
+  exclusive,
+  laneKeys,
+  LaneRejectedError,
+  type OperationLanes,
+} from "./operation-lanes.js"
+import { operation, runOperation } from "./operations/operation.js"
 import {
   APP_SERVICE,
   appIdFromRouteOwner,
@@ -102,6 +110,7 @@ import {
   type RelayResourceNames,
 } from "./relay-resources.js"
 import type { RelayStoredWebRoute } from "./effect/state.js"
+import type { WebCertificates } from "./web-certificates.js"
 import { RelayPortAllocationError } from "./effect/errors.js"
 import {
   activeTailscaleStackBindings,
@@ -114,7 +123,7 @@ import {
   tailscaleStackFirewallIsCurrent,
   tailscaleStackFirewallRules,
   tailscaleStackServiceAddress,
-  tailscaleStackWithoutMember,
+  tailscaleStackWithoutMembers,
   TAILSCALE_STACK_FORWARD_CHAIN,
 } from "./private-network.js"
 import {
@@ -373,6 +382,11 @@ interface AllocationRequest {
   holds?: ResourceLimits
 }
 
+/** A new game server's ID, chosen before its create is admitted. */
+export function newInstanceId(): string {
+  return randomBytes(20).toString("hex")
+}
+
 export class LifecycleDriver {
   readonly #bricks: BrickCatalog
   readonly #lanes: OperationLanes
@@ -397,13 +411,16 @@ export class LifecycleDriver {
   #tailscaleConfigsDiscovered = false
   readonly #tailscaleFirewallGenerations = new Map<string, string>()
   #webRoutes: ReadonlyArray<RelayStoredWebRoute> = []
+  /** Certificates for the routes the bundled Traefik serves. */
+  readonly certificates: WebCertificates
 
   constructor(
     config: RelayConfig,
     docker: DockerDriver,
     bricks: BrickCatalog,
     readonly databaseConnections: DatabaseConnections,
-    lanes: OperationLanes
+    lanes: OperationLanes,
+    certificates: WebCertificates
   ) {
     this.#lanes = lanes
     this.#bricks = bricks
@@ -411,6 +428,7 @@ export class LifecycleDriver {
     this.#docker = docker
     this.#engine = new DockerEngine(config.dockerSocket)
     this.#resources = relayResourceNames(config)
+    this.certificates = certificates
   }
 
   async networking(): Promise<RelayNetworking | null> {
@@ -665,6 +683,31 @@ export class LifecycleDriver {
       .sort((left, right) => left.name.localeCompare(right.name))
   }
 
+  /**
+   * What each Tailscale network's DNS is made from on this node, as saved,
+   * whatever its containers are doing: its members, each marked frozen
+   * while it's being deleted, and whether its removal is pending. Hearth
+   * builds every node's records from these.
+   */
+  async tailscaleStackStates(): Promise<Array<RelayTailscaleStackState>> {
+    return Promise.all(
+      (await this.#tailscaleStackConfigs()).map(async (config) => ({
+        bindings: config.bindings.map((binding) => ({
+          ...binding,
+          frozen: this.#frozenMember(binding.memberId),
+        })),
+        id: config.id,
+        removalPending: await this.#tailscaleStackRemovalPending(config.id),
+      }))
+    )
+  }
+
+  /**
+   * Restores each stack's forwarding rules once its container has started
+   * again, as its own operation holding the stack, so it never writes rules
+   * an apply or removal has since replaced. It carries on while the Relay is
+   * paused, and skips a stack something else holds until the next pass.
+   */
   async reconcileTailscaleStackFirewalls(): Promise<void> {
     const configs = await this.#knownTailscaleStackConfigs()
     const stackIds = new Set(configs.map(({ id }) => id))
@@ -672,21 +715,18 @@ export class LifecycleDriver {
       if (!stackIds.has(id)) this.#tailscaleFirewallGenerations.delete(id)
     }
     const results = await Promise.allSettled(
-      configs.map(async (config) => {
-        if (await this.#tailscaleStackRemovalPending(config.id)) return
-        const generation = await this.#tailscaleStackContainerGeneration(
-          config.id
+      configs.map(({ id }) =>
+        Effect.runPromise(
+          runOperation(this.#lanes, this.#repairStackFirewall, id, {
+            kind: "timer",
+          }).pipe(
+            Effect.catchIf(
+              (cause) => cause instanceof LaneRejectedError,
+              () => Effect.void
+            )
+          )
         )
-        if (!generation) {
-          this.#tailscaleFirewallGenerations.delete(config.id)
-          return
-        }
-        if (this.#tailscaleFirewallGenerations.get(config.id) === generation) {
-          return
-        }
-        await this.#ensureTailscaleStackFirewall(config)
-        this.#tailscaleFirewallGenerations.set(config.id, generation)
-      })
+      )
     )
     const failures = results.flatMap((result, index) =>
       result.status === "rejected"
@@ -825,11 +865,8 @@ export class LifecycleDriver {
         "An auth key is required to install Tailscale on this node"
       )
     }
-    const previousDnsRecords = existing
-      ? await this.#readTailscaleStackDnsRecords(existing)
-      : []
     const rollbackStackApply = () =>
-      this.#rollbackTailscaleStackApply(config, existing, previousDnsRecords)
+      this.#rollbackTailscaleStackApply(config, existing)
 
     return runLifecycle(
       lifecycleOperation(async () => {
@@ -853,12 +890,8 @@ export class LifecycleDriver {
           config.bindings
         )
         await this.#configureTailscaleStackRouting(config)
-        await this.#ensureTailscaleStackDns(
-          config,
-          activeTailscaleStackBindings(config.bindings).map(
-            ({ address, hostname }) => ({ address, hostname })
-          )
-        )
+        // Hearth rewrites the records for the new members once this is done.
+        await this.#renderTailscaleStackDns(config)
         return this.#tailscaleStack(config)
       }).pipe(
         Effect.catch((cause) =>
@@ -1003,12 +1036,7 @@ export class LifecycleDriver {
     await this.#restartTailscaleStack(config)
     await this.#reconcileTailscaleStackBindings(id, [], config.bindings)
     await this.#configureTailscaleStackRouting(config)
-    await this.#ensureTailscaleStackDns(
-      config,
-      activeTailscaleStackBindings(config.bindings).map(
-        ({ address, hostname }) => ({ address, hostname })
-      )
-    )
+    await this.#renderTailscaleStackDns(config)
     await rm(this.#tailscaleStackRemovalMarker(id), { force: true })
     await rm(this.#tailscaleStackRemovalSnapshot(id), { force: true })
   }
@@ -1458,18 +1486,10 @@ export class LifecycleDriver {
   ): Promise<void> {
     const settings = configuredSettings ?? (await this.proxySettings())
     this.#webRoutes = routes
-    const directory = join(
-      this.#config.dataDirectory,
-      "infrastructure",
-      "traefik",
-      "dynamic"
+    await this.certificates.track(
+      this.#config.proxyMode === "traefik" ? routes : []
     )
-    await mkdir(directory, { recursive: true, mode: 0o700 })
-    await writeFile(
-      join(directory, "kiln.yaml"),
-      traefikDynamicConfiguration(this.#config, routes, settings),
-      { mode: 0o600 }
-    )
+    await this.#writeTraefikRoutes(routes, settings)
     if (settings.mode === "none" || settings.mode === "coolify") {
       await this.#serializeEdgeMutation(() =>
         this.#reconcileExternalTraefikRoutes(routes, settings)
@@ -1483,6 +1503,36 @@ export class LifecycleDriver {
         await this.#connectTraefikToApps(routes)
       }
     }
+  }
+
+  /** Rewrites the bundled Traefik's routes. The caller holds the routes lock. */
+  async refreshTraefikCertificates(): Promise<void> {
+    if (this.#config.proxyMode !== "traefik") {
+      // No bundled Traefik reads them; nothing is owed.
+      this.certificates.wrote(this.certificates.gate())
+      return
+    }
+    await this.#writeTraefikRoutes(this.#webRoutes, await this.proxySettings())
+  }
+
+  async #writeTraefikRoutes(
+    routes: ReadonlyArray<RelayStoredWebRoute>,
+    settings: RelayProxySettings
+  ): Promise<void> {
+    const directory = join(
+      this.#config.dataDirectory,
+      "infrastructure",
+      "traefik",
+      "dynamic"
+    )
+    await mkdir(directory, { recursive: true, mode: 0o700 })
+    const gate = this.certificates.gate()
+    await writeFile(
+      join(directory, "kiln.yaml"),
+      traefikDynamicConfiguration(this.#config, routes, settings, gate),
+      { mode: 0o600 }
+    )
+    this.certificates.wrote(gate)
   }
 
   // Bundled Traefik reaches routed apps on their own networks.
@@ -2015,7 +2065,8 @@ export class LifecycleDriver {
             ) {
               await this.#reservePublishedPortProtocols(
                 existing.externalPort,
-                addedProtocols
+                addedProtocols,
+                inspected.filter((other) => other.id !== instance.id)
               )
               for (const protocol of addedProtocols) {
                 pending.push({ port: existing.externalPort, protocol })
@@ -2227,11 +2278,6 @@ export class LifecycleDriver {
       .pipe(Effect.withSpan("relay.ports.release"))
   }
 
-  async createInstance(input: RelayCreateInstance): Promise<RelayInstance> {
-    const id = randomBytes(32).toString("hex").slice(0, 40)
-    return this.createInstanceWithId(id, input)
-  }
-
   async prepareInstance(
     id: string,
     input: RelayCreateInstance
@@ -2419,13 +2465,6 @@ export class LifecycleDriver {
             })
             .pipe(Effect.ignore)
         )
-        await runLifecycle(
-          this.#engine.removeContainer(existing.service, {
-            force: true,
-            timeout: 90_000,
-          })
-        )
-
         return runLifecycle(
           lifecycleOperation(async () => {
             const reconfigured = await this.#provisionManagedInstance({
@@ -2436,6 +2475,15 @@ export class LifecycleDriver {
               ports: existing.ports,
               recipe,
               recipeDefinition: definition,
+              // The stopped container keeps its ports and Tailscale address
+              // claimed until the new one takes them, under the routes.
+              replacing: () =>
+                runLifecycle(
+                  this.#engine.removeContainer(existing.service, {
+                    force: true,
+                    timeout: 90_000,
+                  })
+                ),
               skipImagePull: forcePull,
               start,
               tailscale,
@@ -2473,6 +2521,11 @@ export class LifecycleDriver {
     ports?: ReadonlyArray<RelayInstancePortAllocation>
     recipe: string
     recipeDefinition?: BrickRecipe
+    /**
+     * Removes the container this one replaces, first once it holds the
+     * routes, so nothing claims its ports or address in between.
+     */
+    replacing?: () => Promise<void>
     snapshotSha256?: string
     skipImagePull?: boolean
     start: boolean
@@ -2497,24 +2550,17 @@ export class LifecycleDriver {
         `${INSTALLATION_MARKER_ENV} must be a .kiln-* filename containing only letters, numbers, dots, underscores, or hyphens`
       )
     }
-    const existing = await this.#docker.inspectInstances()
     const limits =
       "diskLimitBytes" in input.limits
         ? gameServerLimits(input.limits, resolved.memory)
         : input.limits
-    if (
-      input.tailscale.enabled &&
-      existing.some(
-        (instance) =>
-          instance.managedByRelay &&
-          instance.tailscale.enabled &&
-          instance.tailscale.subdomain === input.tailscale.subdomain
-      )
-    ) {
-      throw new Error(
-        `The Tailscale address ${input.tailscale.subdomain} is already assigned to another server`
-      )
-    }
+    // Checked before the image download too, so a server that can't join
+    // Tailscale fails before it, not after.
+    await this.#tailscaleHostname(
+      await this.#docker.inspectInstances(),
+      input.tailscale,
+      input.id
+    )
     // Held until the container exists, so its capacity stays claimed.
     return this.#holdingAllocation(
       {
@@ -2554,31 +2600,6 @@ export class LifecycleDriver {
           "instances",
           id
         )
-        if (installationMarker) {
-          await rm(join(directory, installationMarker), { force: true })
-        }
-        const networking = await this.networking()
-        const tailscaleSettings = input.tailscale.enabled
-          ? await this.tailscaleSettings()
-          : null
-        if (input.tailscale.enabled && !tailscaleSettings) {
-          throw new Error(
-            "Configure Tailscale infrastructure before connecting this server"
-          )
-        }
-        const hostnamePrefix = input.tailscale.enabled
-          ? input.tailscale.subdomain
-          : undefined
-        if (input.tailscale.enabled && !hostnamePrefix) {
-          throw new Error("Enter a Tailscale subdomain for this server")
-        }
-        const hostname = hostnamePrefix
-          ? `${hostnamePrefix.replace(/\.$/u, "")}.${
-              tailscaleSettings?.domain ??
-              networking?.domain ??
-              this.#config.connectDomain
-            }`
-          : null
         const primaryPort = definition.network.ports.find(
           (port) => port.name === definition.network.primaryPort
         )
@@ -2587,32 +2608,11 @@ export class LifecycleDriver {
             "Brick primary network port disappeared after validation"
           )
         }
-        const webRoutes = this.#webRoutes.filter(
-          (route) => route.instanceId === input.id
-        )
-        const proxySettings = await this.proxySettings()
-        const routeLabels = this.#containerWebRouteLabels(
-          webRoutes,
-          proxySettings
-        )
-        const usesExternalEdge =
-          proxySettings.mode === "none" || proxySettings.mode === "coolify"
-
-        if (input.prepareDirectory) {
-          await mkdir(directory, { recursive: true })
-          if (definition.runtime.user) {
-            const identity = definition.runtime.user.split(":")
-            const user = Number(identity[0])
-            const group = identity.length === 2 ? Number(identity[1]) : user
-            await chown(directory, user, group)
-          }
+        if (installationMarker) {
+          await rm(join(directory, installationMarker), { force: true })
         }
-        await this.#ensureNetwork()
-        if (usesExternalEdge && webRoutes.length > 0) {
-          await this.#ensureEdgeNetwork()
-        }
-        if (networking?.enabled)
-          await this.#ensureInfrastructure(networking, false)
+        // Downloading the image reads nothing the routes guard, so it runs
+        // before them, as the checks above do.
         let managedInstallationMarker: string | null = null
         const pullImage = () =>
           this.#engine.pullImage(image, { timeout: 300_000 })
@@ -2652,213 +2652,255 @@ export class LifecycleDriver {
           }
         }
 
-        const reservedPorts: Array<{
-          port: number
-          protocol: RelayInstancePortAllocation["protocol"]
-        }> = []
-        const portAllocations: Array<RelayInstancePortAllocation> = input.ports
-          ? [...input.ports]
-          : []
-        if (portAllocations.length === 0) {
-          const publishedPorts =
-            definition.network.mode === "direct"
-              ? definition.network.ports
-              : [primaryPort]
-          for (const port of publishedPorts) {
-            const externalPort =
-              port.host ??
-              (await this.#reserveGamePort(id, port.protocol, existing))
-            if (port.host === undefined) {
-              reservedPorts.push({
-                port: externalPort,
+        // The rest reads the game servers, their routes and ports, and the
+        // networking, proxy, and Tailscale settings, and rewrites CoreDNS
+        // from them, so it holds the routes alone and reads them now.
+        await input.onPhase?.("creating_container")
+        await this.#holdingRoutes(id, async () => {
+          await input.replacing?.()
+          const existing = await this.#docker.inspectInstances()
+          const { hostname, networking } = await this.#tailscaleHostname(
+            existing,
+            input.tailscale,
+            input.id
+          )
+          const webRoutes = this.#webRoutes.filter(
+            (route) => route.instanceId === input.id
+          )
+          const proxySettings = await this.proxySettings()
+          const routeLabels = this.#containerWebRouteLabels(
+            webRoutes,
+            proxySettings
+          )
+          const usesExternalEdge =
+            proxySettings.mode === "none" || proxySettings.mode === "coolify"
+
+          if (input.prepareDirectory) {
+            await mkdir(directory, { recursive: true })
+            if (definition.runtime.user) {
+              const identity = definition.runtime.user.split(":")
+              const user = Number(identity[0])
+              const group = identity.length === 2 ? Number(identity[1]) : user
+              await chown(directory, user, group)
+            }
+          }
+          await this.#ensureNetwork()
+          if (usesExternalEdge && webRoutes.length > 0) {
+            await this.#ensureEdgeNetwork()
+          }
+          if (networking?.enabled)
+            await this.#ensureInfrastructure(networking, false)
+
+          const reservedPorts: Array<{
+            port: number
+            protocol: RelayInstancePortAllocation["protocol"]
+          }> = []
+          const portAllocations: Array<RelayInstancePortAllocation> =
+            input.ports ? [...input.ports] : []
+          if (portAllocations.length === 0) {
+            const publishedPorts =
+              definition.network.mode === "direct"
+                ? definition.network.ports
+                : [primaryPort]
+            for (const port of publishedPorts) {
+              const externalPort =
+                port.host ??
+                (await this.#reserveGamePort(id, port.protocol, existing))
+              if (port.host === undefined) {
+                reservedPorts.push({
+                  port: externalPort,
+                  protocol: port.protocol,
+                })
+              }
+              const primary = port.name === definition.network.primaryPort
+              portAllocations.push({
+                externalPort,
+                id: primary ? "primary" : `brick-${port.name}`,
+                internalPort: port.container,
+                kind: primary ? "primary" : "brick",
+                name: port.name.replaceAll("-", " "),
                 protocol: port.protocol,
               })
             }
-            const primary = port.name === definition.network.primaryPort
-            portAllocations.push({
-              externalPort,
-              id: primary ? "primary" : `brick-${port.name}`,
-              internalPort: port.container,
-              kind: primary ? "primary" : "brick",
-              name: port.name.replaceAll("-", " "),
-              protocol: port.protocol,
-            })
           }
-        }
-        const primaryAllocation = portAllocations.find(
-          (allocation) => allocation.kind === "primary"
-        )
-        if (!primaryAllocation) {
-          throw new Error(
-            "Managed server port allocations require a primary port"
+          const primaryAllocation = portAllocations.find(
+            (allocation) => allocation.kind === "primary"
           )
-        }
-        const portLabels = portAllocationContainerLabels(portAllocations)
-        const variablesLabel = JSON.stringify(resolved.values)
-        const labels: Record<string, string> = {
-          "kiln.relay.managed": "true",
-          "kiln.relay.owned": "true",
-          "kiln.server.id": id,
-          "kiln.brick.id": definition.metadata.id,
-          "kiln.brick.format": definition.format,
-          "kiln.brick.source": input.recipe,
-          "kiln.brick.snapshot-sha256": snapshotSha256,
-          "kiln.brick.variables": variablesLabel,
-          "kiln.brick.network-mode": definition.network.mode,
-          "kiln.brick.supports-srv": String(definition.network.supportsSrv),
-          "kiln.traefik.managed": "true",
-          "kiln.traefik.service.port": String(primaryAllocation.internalPort),
-          "kiln.instance.name": defaultInstanceName,
-          "kiln.instance.version": version,
-          "kiln.instance.java": resolved.runtimeName,
-          "kiln.instance.game": definition.metadata.game,
-          "kiln.instance.public-host": this.#config.gameHost,
-          "kiln.instance.directory": id,
-          // Older Relays read these, with 0 for no limit.
-          "kiln.instance.memory-bytes": String(limits.memoryBytes ?? 0),
-          "kiln.instance.disk-bytes": String(limits.diskBytes ?? 0),
-          "kiln.instance.mount": definition.runtime.storage.mount,
-          ...resourceLimitLabels(limits),
-        }
-        if (managedInstallationMarker) {
-          labels[INSTALLATION_MARKER_LABEL] = managedInstallationMarker
-        }
-        Object.assign(labels, portLabels)
-        if (definition.readiness) {
-          labels["kiln.brick.readiness"] = JSON.stringify(definition.readiness)
-        }
-        if (definition.console) {
-          labels["kiln.brick.console-stop-commands"] = JSON.stringify(
-            definition.console.stopCommands
+          if (!primaryAllocation) {
+            throw new Error(
+              "Managed server port allocations require a primary port"
+            )
+          }
+          const portLabels = portAllocationContainerLabels(portAllocations)
+          const variablesLabel = JSON.stringify(resolved.values)
+          const labels: Record<string, string> = {
+            "kiln.relay.managed": "true",
+            "kiln.relay.owned": "true",
+            "kiln.server.id": id,
+            "kiln.brick.id": definition.metadata.id,
+            "kiln.brick.format": definition.format,
+            "kiln.brick.source": input.recipe,
+            "kiln.brick.snapshot-sha256": snapshotSha256,
+            "kiln.brick.variables": variablesLabel,
+            "kiln.brick.network-mode": definition.network.mode,
+            "kiln.brick.supports-srv": String(definition.network.supportsSrv),
+            "kiln.traefik.managed": "true",
+            "kiln.traefik.service.port": String(primaryAllocation.internalPort),
+            "kiln.instance.name": defaultInstanceName,
+            "kiln.instance.version": version,
+            "kiln.instance.java": resolved.runtimeName,
+            "kiln.instance.game": definition.metadata.game,
+            "kiln.instance.public-host": this.#config.gameHost,
+            "kiln.instance.directory": id,
+            // Older Relays read these, with 0 for no limit.
+            "kiln.instance.memory-bytes": String(limits.memoryBytes ?? 0),
+            "kiln.instance.disk-bytes": String(limits.diskBytes ?? 0),
+            "kiln.instance.mount": definition.runtime.storage.mount,
+            ...resourceLimitLabels(limits),
+          }
+          if (managedInstallationMarker) {
+            labels[INSTALLATION_MARKER_LABEL] = managedInstallationMarker
+          }
+          Object.assign(labels, portLabels)
+          if (definition.readiness) {
+            labels["kiln.brick.readiness"] = JSON.stringify(
+              definition.readiness
+            )
+          }
+          if (definition.console) {
+            labels["kiln.brick.console-stop-commands"] = JSON.stringify(
+              definition.console.stopCommands
+            )
+          }
+          if (hostname) {
+            const privatePort =
+              definition.network.mode === "direct"
+                ? primaryAllocation.internalPort
+                : this.#config.connectPort
+            labels["kiln.instance.hostname"] =
+              privatePort === 25_565 ? hostname : `${hostname}:${privatePort}`
+          }
+          labels["kiln.instance.tailscale-enabled"] = String(
+            input.tailscale.enabled
           )
-        }
-        if (hostname) {
-          const privatePort =
-            definition.network.mode === "direct"
-              ? primaryAllocation.internalPort
-              : this.#config.connectPort
-          labels["kiln.instance.hostname"] =
-            privatePort === 25_565 ? hostname : `${hostname}:${privatePort}`
-        }
-        labels["kiln.instance.tailscale-enabled"] = String(
-          input.tailscale.enabled
-        )
-        if (input.tailscale.subdomain) {
-          labels["kiln.instance.tailscale-subdomain"] =
-            input.tailscale.subdomain
-        }
-        Object.assign(labels, relayOwnerLabels(this.#config), routeLabels)
-        Object.assign(labels, await this.databaseConnections.labels(id))
-        const ports = Object.entries(
-          dockerPortBindingsForAllocations(portAllocations)
-        ).flatMap(([binding, candidates]) => {
-          const hostPort = candidates[0]?.HostPort
-          const [containerPort, protocol] = binding.split("/")
-          return hostPort
-            ? [
-                {
-                  containerPort: Number(containerPort),
-                  hostPort,
-                  protocol:
-                    protocol === "udp" ? ("udp" as const) : ("tcp" as const),
-                },
-              ]
-            : []
-        })
-        const spec: ContainerSpec = {
-          binds: [`${hostDirectory}:${definition.runtime.storage.mount}`],
-          capDrop: ["ALL"],
-          command: [
-            ...(definition.runtime.entrypoint?.slice(1) ?? []),
-            ...(definition.runtime.command ?? []),
-          ],
-          ...(definition.runtime.entrypoint?.[0] && {
-            entrypoint: definition.runtime.entrypoint[0],
-          }),
-          env: resolved.environment,
-          hostname: containerName,
-          image,
-          interactive: true,
-          labels,
-          ...containerLimitSpec(limits),
-          name: containerName,
-          network: {
-            aliases: [containerName],
-            name: this.#resources.gameNetwork,
-          },
-          pidsLimit: definition.runtime.resources.pids,
-          ports,
-          readOnly: true,
-          restart: "no",
-          securityOpt: ["no-new-privileges:true"],
-          ...(definition.runtime.stopSignal && {
-            stopSignal: definition.runtime.stopSignal,
-          }),
-          tmpfs: { "/tmp": "rw,exec,nosuid,nodev,size=128m" },
-          tty: true,
-          ...(definition.runtime.user && { user: definition.runtime.user }),
-          ...(definition.runtime.workingDirectory && {
-            workdir: definition.runtime.workingDirectory,
-          }),
-        }
+          if (input.tailscale.subdomain) {
+            labels["kiln.instance.tailscale-subdomain"] =
+              input.tailscale.subdomain
+          }
+          Object.assign(labels, relayOwnerLabels(this.#config), routeLabels)
+          Object.assign(labels, await this.databaseConnections.labels(id))
+          const ports = Object.entries(
+            dockerPortBindingsForAllocations(portAllocations)
+          ).flatMap(([binding, candidates]) => {
+            const hostPort = candidates[0]?.HostPort
+            const [containerPort, protocol] = binding.split("/")
+            return hostPort
+              ? [
+                  {
+                    containerPort: Number(containerPort),
+                    hostPort,
+                    protocol:
+                      protocol === "udp" ? ("udp" as const) : ("tcp" as const),
+                  },
+                ]
+              : []
+          })
+          const spec: ContainerSpec = {
+            binds: [`${hostDirectory}:${definition.runtime.storage.mount}`],
+            capDrop: ["ALL"],
+            command: [
+              ...(definition.runtime.entrypoint?.slice(1) ?? []),
+              ...(definition.runtime.command ?? []),
+            ],
+            ...(definition.runtime.entrypoint?.[0] && {
+              entrypoint: definition.runtime.entrypoint[0],
+            }),
+            env: resolved.environment,
+            hostname: containerName,
+            image,
+            interactive: true,
+            labels,
+            ...containerLimitSpec(limits),
+            name: containerName,
+            network: {
+              aliases: [containerName],
+              name: this.#resources.gameNetwork,
+            },
+            pidsLimit: definition.runtime.resources.pids,
+            ports,
+            readOnly: true,
+            restart: "no",
+            securityOpt: ["no-new-privileges:true"],
+            ...(definition.runtime.stopSignal && {
+              stopSignal: definition.runtime.stopSignal,
+            }),
+            tmpfs: { "/tmp": "rw,exec,nosuid,nodev,size=128m" },
+            tty: true,
+            ...(definition.runtime.user && { user: definition.runtime.user }),
+            ...(definition.runtime.workingDirectory && {
+              workdir: definition.runtime.workingDirectory,
+            }),
+          }
 
-        await input.onPhase?.("creating_container")
-        await runLifecycle(
-          lifecycleOperation(async () => {
-            await runLifecycle(createContainer(this.#engine, spec))
-            await input.onPhase?.("finalizing")
-            if (usesExternalEdge && webRoutes.length > 0) {
-              await runLifecycle(
-                this.#engine.connectNetwork(
-                  this.#resources.edgeNetwork,
-                  containerName,
-                  { aliases: [containerName] }
+          await runLifecycle(
+            lifecycleOperation(async () => {
+              await runLifecycle(createContainer(this.#engine, spec))
+              await input.onPhase?.("finalizing")
+              if (usesExternalEdge && webRoutes.length > 0) {
+                await runLifecycle(
+                  this.#engine.connectNetwork(
+                    this.#resources.edgeNetwork,
+                    containerName,
+                    { aliases: [containerName] }
+                  )
                 )
+              }
+              await this.databaseConnections.reconcile(
+                { id, kind: "instance" },
+                [{ container: containerName }]
               )
-            }
-            await this.databaseConnections.reconcile({ id, kind: "instance" }, [
-              { container: containerName },
-            ])
-            if (input.start) {
-              await runLifecycle(
-                this.#engine.startContainer(containerName, { timeout: 120_000 })
+              if (input.start) {
+                await runLifecycle(
+                  this.#engine.startContainer(containerName, {
+                    timeout: 120_000,
+                  })
+                )
+              }
+              await this.#docker.recordProvisionedState(
+                id,
+                input.start ? "running" : "stopped"
               )
-            }
-            await this.#docker.recordProvisionedState(
-              id,
-              input.start ? "running" : "stopped"
-            )
-            if (networking?.enabled) {
-              await this.#refreshCoreDnsConfiguration(networking)
-            }
-            await this.#refreshTailscaleDns()
-          }).pipe(
-            Effect.catch((error) =>
-              this.#engine.removeContainer(containerName, { force: true }).pipe(
-                Effect.ignore,
-                Effect.flatMap(() =>
-                  input.prepareDirectory
-                    ? lifecycleOperation(() =>
-                        rm(directory, { recursive: true, force: true })
+              await this.#refreshDns()
+            }).pipe(
+              Effect.catch((error) =>
+                this.#engine
+                  .removeContainer(containerName, { force: true })
+                  .pipe(
+                    Effect.ignore,
+                    Effect.flatMap(() =>
+                      input.prepareDirectory
+                        ? lifecycleOperation(() =>
+                            rm(directory, { recursive: true, force: true })
+                          )
+                        : Effect.void
+                    ),
+                    Effect.flatMap(() => Effect.fail(error))
+                  )
+              ),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  for (const allocation of reservedPorts) {
+                    for (const protocol of portProtocols(allocation.protocol)) {
+                      this.#pendingGamePorts.delete(
+                        `${protocol}:${allocation.port}`
                       )
-                    : Effect.void
-                ),
-                Effect.flatMap(() => Effect.fail(error))
-              )
-            ),
-            Effect.ensuring(
-              Effect.sync(() => {
-                for (const allocation of reservedPorts) {
-                  for (const protocol of portProtocols(allocation.protocol)) {
-                    this.#pendingGamePorts.delete(
-                      `${protocol}:${allocation.port}`
-                    )
+                    }
                   }
-                }
-              })
+                })
+              )
             )
           )
-        )
+        })
 
         const created = (await this.#docker.inspectInstances()).find(
           (instance) => instance.id === id
@@ -2870,6 +2912,82 @@ export class LifecycleDriver {
         return created
       }
     )
+  }
+
+  // The private hostname a new container gets, checked against the game
+  // servers already using its Tailscale address, and the networking
+  // settings it's named under.
+  async #tailscaleHostname(
+    existing: ReadonlyArray<RelayInstance>,
+    tailscale: RelayInstanceTailscale,
+    // The server taking the address, which may still hold it.
+    instanceId: string
+  ): Promise<{ hostname: string | null; networking: RelayNetworking | null }> {
+    if (
+      tailscale.enabled &&
+      existing.some(
+        (instance) =>
+          instance.id !== instanceId &&
+          instance.managedByRelay &&
+          instance.tailscale.enabled &&
+          instance.tailscale.subdomain === tailscale.subdomain
+      )
+    ) {
+      throw new Error(
+        `The Tailscale address ${tailscale.subdomain} is already assigned to another server`
+      )
+    }
+    const networking = await this.networking()
+    const tailscaleSettings = tailscale.enabled
+      ? await this.tailscaleSettings()
+      : null
+    if (tailscale.enabled && !tailscaleSettings) {
+      throw new Error(
+        "Configure Tailscale infrastructure before connecting this server"
+      )
+    }
+    const hostnamePrefix = tailscale.enabled ? tailscale.subdomain : undefined
+    if (tailscale.enabled && !hostnamePrefix) {
+      throw new Error("Enter a Tailscale subdomain for this server")
+    }
+    const hostname = hostnamePrefix
+      ? `${hostnamePrefix.replace(/\.$/u, "")}.${
+          tailscaleSettings?.domain ??
+          networking?.domain ??
+          this.#config.connectDomain
+        }`
+      : null
+    return { hostname, networking }
+  }
+
+  /**
+   * Runs the part of a game server's create, startup change, or deletion
+   * that reads the game servers and the networking, proxy, or Tailscale
+   * settings and rewrites CoreDNS from them, holding the routes alone. The
+   * operation it runs in holds the server, never the routes: the lanes
+   * don't know it's the same operation, so it would wait for itself.
+   */
+  #holdingRoutes<A>(instanceId: string, run: () => Promise<A>): Promise<A> {
+    return runLifecycle(
+      this.#lanes
+        .runNested(
+          { label: "instance.dns", locks: [exclusive(laneKeys.routes)] },
+          lifecycleOperation(run)
+        )
+        .pipe(
+          Effect.withSpan("relay.instance.dns", {
+            attributes: { "kiln.instance_id": instanceId },
+          })
+        )
+    )
+  }
+
+  // Rewrites the Relay's CoreDNS from the game servers and settings as they
+  // are now.
+  async #refreshDns(): Promise<void> {
+    const networking = await this.networking()
+    if (networking?.enabled) await this.#refreshCoreDnsConfiguration(networking)
+    await this.#refreshTailscaleDns()
   }
 
   async #reserveGamePort(
@@ -2885,13 +3003,16 @@ export class LifecycleDriver {
 
   async #reservePublishedPortProtocols(
     port: number,
-    protocols: ReadonlyArray<"tcp" | "udp">
+    protocols: ReadonlyArray<"tcp" | "udp">,
+    // The other game servers, whose ports stay theirs while they're stopped.
+    others: ReadonlyArray<RelayInstance>
   ): Promise<void> {
     await this.#withGamePortLock(async () => {
       for (const protocol of protocols) {
         const key = `${protocol}:${port}`
         if (
           this.#pendingGamePorts.has(key) ||
+          others.some((other) => allocatesPort(other, port, protocol)) ||
           (
             await this.#docker.publishedHostPorts(protocol, {
               end: port,
@@ -2970,16 +3091,13 @@ export class LifecycleDriver {
         unavailable.add(Number(key.slice(pendingPrefix.length)))
       }
     }
+    // Every port a game server is allocated stays its own while it's
+    // stopped, when Docker publishes none of them.
     for (const instance of existing) {
-      const instanceProtocol = instance.brickPrimaryPortProtocol
-      if (
-        instance.publicPort &&
-        instanceProtocol &&
-        protocols.some((candidate) =>
-          portProtocols(instanceProtocol).includes(candidate)
-        )
-      ) {
-        unavailable.add(instance.publicPort)
+      for (const candidate of protocols) {
+        for (const port of allocatedPorts(instance, candidate)) {
+          unavailable.add(port)
+        }
       }
     }
     if (
@@ -3131,16 +3249,19 @@ export class LifecycleDriver {
     )
   }
 
-  async deleteInstance(
-    id: string,
-    deleteData: boolean,
-    synchronizeTailscaleDns?: (input: {
-      mode: "prepare" | "rollback"
-      stackIds: ReadonlyArray<string>
-    }) => Promise<void>
-  ): Promise<void> {
+  /**
+   * Deletes a game server Hearth froze for its deletion and whose DNS
+   * records Hearth already removed from every node, then takes it off its
+   * Tailscale networks. A server already gone still leaves its networks, so
+   * a deletion sent again finishes.
+   */
+  async deleteInstance(id: string, deleteData: boolean): Promise<void> {
+    const member = instanceTailscaleMemberId(id)
     const instance = await this.#docker.findInstance(id)
-    if (!instance) throw new Error("Instance not found")
+    if (!instance) {
+      await this.removeFromTailscale((memberId) => memberId === member)
+      throw new Error("Instance not found")
+    }
     if (!instance.managedByRelay) {
       throw new Error("Relay can only delete containers it created")
     }
@@ -3149,92 +3270,21 @@ export class LifecycleDriver {
         "Remove this logical network from Infrastructure → Tailscale so every node is cleaned up"
       )
     }
-    const affectedStackIds = (await this.#tailscaleStackConfigs())
-      .filter((config) =>
-        config.bindings.some(
-          (binding) =>
-            binding.memberId === instanceTailscaleMemberId(instance.id)
-        )
-      )
-      .map(({ id: stackId }) => stackId)
-    if (affectedStackIds.length > 0 && !synchronizeTailscaleDns) {
-      throw new Error(
-        "Hearth must synchronize peer Tailscale DNS before deleting this server"
-      )
-    }
-    let tailscalePrepareAttempted = false
-    let detachedStacks: Array<{
-      next: RelayTailscaleStackConfig
-      previous: RelayTailscaleStackConfig
-      records: Array<{ address: string; hostname: string }>
-    }> = []
     await runLifecycle(
-      lifecycleOperation(async () => {
-        if (affectedStackIds.length > 0) {
-          tailscalePrepareAttempted = true
-          await synchronizeTailscaleDns?.({
-            mode: "prepare",
-            stackIds: affectedStackIds,
-          })
-        }
-        detachedStacks = await this.#detachMemberFromTailscaleStacks(
-          instanceTailscaleMemberId(instance.id)
-        )
-        await runLifecycle(
-          this.#engine
-            .stopContainer(instance.service, {
-              seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
-              timeout: (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000,
-            })
-            .pipe(Effect.ignore)
-        )
-        await runLifecycle(
-          this.#engine.removeContainer(instance.service, {
-            force: true,
-            timeout: 90_000,
-          })
-        )
-      }).pipe(
-        Effect.catch((cause) =>
-          lifecycleOperation(async () => {
-            const rollbackFailures =
-              await this.#restoreInstanceTailscaleStacks(detachedStacks)
-            if (tailscalePrepareAttempted && synchronizeTailscaleDns) {
-              const rollbackFailure = await runLifecycle(
-                lifecycleOperation(() =>
-                  synchronizeTailscaleDns({
-                    mode: "rollback",
-                    stackIds: affectedStackIds,
-                  })
-                ).pipe(
-                  Effect.as(null),
-                  Effect.catch((rollbackCause) =>
-                    Effect.succeed(
-                      `peer DNS: ${
-                        rollbackCause instanceof Error
-                          ? rollbackCause.message
-                          : "unknown rollback error"
-                      }`
-                    )
-                  )
-                )
-              )
-              if (rollbackFailure) rollbackFailures.push(rollbackFailure)
-            }
-            throw new Error(
-              `Could not delete the server: ${
-                cause instanceof Error ? cause.message : "unknown error"
-              }${
-                rollbackFailures.length > 0
-                  ? `. Tailscale rollback also failed: ${rollbackFailures.join("; ")}`
-                  : ""
-              }`,
-              { cause }
-            )
-          })
-        )
-      )
+      this.#engine
+        .stopContainer(instance.service, {
+          seconds: INSTANCE_STOP_TIMEOUT_SECONDS,
+          timeout: (INSTANCE_STOP_TIMEOUT_SECONDS + 15) * 1_000,
+        })
+        .pipe(Effect.ignore)
     )
+    await runLifecycle(
+      this.#engine.removeContainer(instance.service, {
+        force: true,
+        timeout: 90_000,
+      })
+    )
+    await this.removeFromTailscale((memberId) => memberId === member)
     await this.#docker.forgetRecoveryState(instance.id)
     if (deleteData) {
       await rm(join(this.#config.rootDirectory, instance.directory), {
@@ -3243,9 +3293,9 @@ export class LifecycleDriver {
       })
       await removeResticRepository(this.#config, instance.id)
     }
-    const networking = await this.networking()
-    if (networking?.enabled) await this.#refreshCoreDnsConfiguration(networking)
-    await this.#refreshTailscaleDns()
+    // The server is gone; only rewriting CoreDNS without it waits for the
+    // routes.
+    await this.#holdingRoutes(id, () => this.#refreshDns())
   }
 
   async deletePreparedInstance(id: string, deleteData: boolean): Promise<void> {
@@ -3378,17 +3428,19 @@ export class LifecycleDriver {
         staticConfiguration,
       () => true
     )
+    const gate = this.certificates.gate()
     await Promise.all([
       writeFile(join(infrastructure, "traefik.yaml"), staticConfiguration, {
         mode: 0o600,
       }),
       writeFile(
         join(infrastructure, "dynamic", "kiln.yaml"),
-        traefikDynamicConfiguration(this.#config, routes, settings),
+        traefikDynamicConfiguration(this.#config, routes, settings, gate),
         { mode: 0o600 }
       ),
       ensureProtectedFile(join(infrastructure, "state", "acme.json")),
     ])
+    this.certificates.wrote(gate)
 
     const traefik: InfrastructureContainer = {
       binds: [
@@ -3554,26 +3606,44 @@ export class LifecycleDriver {
     this.#edgeReconciliationFiber?.interruptUnsafe()
     this.#edgeReconciliationFiber = null
     if (settings.mode !== "coolify") return
-    const reconcile = Effect.tryPromise({
-      try: () =>
-        this.#serializeEdgeMutation(() =>
-          this.#reconcileExternalTraefikRoutes(this.#webRoutes, settings)
-        ),
-      catch: (cause) => cause,
-    }).pipe(
+    const reconcile = runOperation(
+      this.#lanes,
+      this.#reconcileCoolifyEdge,
+      undefined,
+      { kind: "timer" }
+    ).pipe(
       Effect.catch((cause) =>
-        Effect.sync(() => {
-          console.error(
-            "Relay could not reconcile the Coolify Traefik edge",
-            cause
-          )
-        })
+        cause instanceof LaneRejectedError
+          ? Effect.void
+          : Effect.sync(() =>
+              reportRelayError(cause, { operation: "relay.edge.reconcile" })
+            )
       )
     )
     this.#edgeReconciliationFiber = Effect.runFork(
       Effect.sleep("30 seconds").pipe(Effect.andThen(reconcile), Effect.forever)
     )
   }
+
+  // Keeps routed game servers on the edge Coolify's Traefik reaches. Each
+  // pass takes its turn with route and proxy changes and reads them once it
+  // has it; one that would wait, or a paused Relay's, is skipped.
+  readonly #reconcileCoolifyEdge = operation<void>()({
+    name: "relay.edge.reconcile",
+    locks: () => [exclusive(laneKeys.routes)],
+    onlyIfFree: true,
+    run: () =>
+      Effect.tryPromise({
+        try: async () => {
+          const settings = await this.proxySettings()
+          if (settings.mode !== "coolify") return
+          await this.#serializeEdgeMutation(() =>
+            this.#reconcileExternalTraefikRoutes(this.#webRoutes, settings)
+          )
+        },
+        catch: (cause) => cause,
+      }),
+  })
 
   #serializeEdgeMutation(operation: () => Promise<void>): Promise<void> {
     const result = recoverPromise(
@@ -3762,19 +3832,29 @@ export class LifecycleDriver {
     })
   }
 
-  async #refreshTailscaleDns(): Promise<void> {
-    const overview = await this.tailscaleOverview()
-    if (
-      !overview.settings ||
-      !overview.status.connected ||
-      !overview.status.dnsAddress
-    ) {
-      return
-    }
-    await this.#ensureTailscaleDns(
-      overview.settings,
-      overview.status.dnsAddress,
-      true
+  // Reads the settings once it holds the permit, so a save of new ones that
+  // got in first is never overwritten with those it replaced.
+  #refreshTailscaleDns(): Promise<void> {
+    return Effect.runPromise(
+      this.#tailscaleDnsSemaphore
+        .withPermit(
+          lifecycleOperation(async () => {
+            const overview = await this.tailscaleOverview()
+            if (
+              !overview.settings ||
+              !overview.status.connected ||
+              !overview.status.dnsAddress
+            ) {
+              return
+            }
+            await this.#ensureTailscaleDnsNow(
+              overview.settings,
+              overview.status.dnsAddress,
+              true
+            )
+          })
+        )
+        .pipe(Effect.withSpan("relay.tailscale.refreshDns"))
     )
   }
 
@@ -4144,6 +4224,36 @@ export class LifecycleDriver {
     )
   }
 
+  readonly #repairStackFirewall = operation<string>()({
+    name: "relay.tailscale.stack.firewall",
+    locks: ({ input: stackId }) => [exclusive(laneKeys.instance(stackId))],
+    onlyIfFree: true,
+    carriesOnWhilePaused: true,
+    run: ({ input: stackId }) =>
+      Effect.annotateCurrentSpan("kiln.instance_id", stackId).pipe(
+        Effect.andThen(
+          lifecycleOperation(() => this.#repairTailscaleStackFirewall(stackId))
+        )
+      ),
+  })
+
+  // Reads the stack again holding it, so the rules match what an apply or
+  // removal that ran before left.
+  async #repairTailscaleStackFirewall(id: string): Promise<void> {
+    const config = await this.#readTailscaleStackConfig(id)
+    const generation =
+      config && !(await this.#tailscaleStackRemovalPending(id))
+        ? await this.#tailscaleStackContainerGeneration(id)
+        : null
+    if (!config || !generation) {
+      this.#tailscaleFirewallGenerations.delete(id)
+      return
+    }
+    if (this.#tailscaleFirewallGenerations.get(id) === generation) return
+    await this.#ensureTailscaleStackFirewall(config)
+    this.#tailscaleFirewallGenerations.set(id, generation)
+  }
+
   async #ensureTailscaleStackFirewall(
     config: RelayTailscaleStackConfig
   ): Promise<void> {
@@ -4188,8 +4298,7 @@ export class LifecycleDriver {
 
   async #rollbackTailscaleStackApply(
     attempted: RelayTailscaleStackConfig,
-    existing: RelayTailscaleStackConfig | null,
-    previousDnsRecords: ReadonlyArray<{ address: string; hostname: string }>
+    existing: RelayTailscaleStackConfig | null
   ): Promise<void> {
     if (existing) {
       await this.#writeTailscaleStackConfig(existing)
@@ -4200,7 +4309,7 @@ export class LifecycleDriver {
         existing.bindings
       )
       await this.#configureTailscaleStackRouting(existing)
-      await this.#ensureTailscaleStackDns(existing, previousDnsRecords)
+      await this.#renderTailscaleStackDns(existing)
       return
     }
 
@@ -4251,6 +4360,9 @@ export class LifecycleDriver {
     )
   }
 
+  // Saves the records Hearth sent and serves them. Hearth is their only
+  // writer: it builds every node's records from what each node reports
+  // (`tailscaleStackStates`), in the network's lane.
   async #ensureTailscaleStackDns(
     config: RelayTailscaleStackConfig,
     records: ReadonlyArray<{ address: string; hostname: string }>
@@ -4289,6 +4401,17 @@ export class LifecycleDriver {
         restart: "unless-stopped",
         securityOpt: ["no-new-privileges:true"],
       }
+    )
+  }
+
+  // Serves the records Hearth last sent again, as the stack's CoreDNS is
+  // (re)created.
+  async #renderTailscaleStackDns(
+    config: RelayTailscaleStackConfig
+  ): Promise<void> {
+    await this.#ensureTailscaleStackDns(
+      config,
+      await this.#readTailscaleStackDnsRecords(config)
     )
   }
 
@@ -4361,207 +4484,16 @@ export class LifecycleDriver {
               )
             )
           ).pipe(
+            // Hearth hasn't sent any yet.
             Effect.catch((fallbackCause) =>
               hasErrorCode(fallbackCause, "ENOENT")
-                ? Effect.succeed(
-                    activeTailscaleStackBindings(config.bindings).map(
-                      ({ address, hostname }) => ({ address, hostname })
-                    )
-                  )
+                ? Effect.succeed([])
                 : Effect.fail(fallbackCause)
             )
           )
         })
       )
     )
-  }
-
-  async #detachMemberFromTailscaleStacks(memberId: string): Promise<
-    Array<{
-      next: RelayTailscaleStackConfig
-      previous: RelayTailscaleStackConfig
-      records: Array<{ address: string; hostname: string }>
-    }>
-  > {
-    const configs = (await this.#tailscaleStackConfigs()).filter((config) =>
-      config.bindings.some((binding) => binding.memberId === memberId)
-    )
-    const completed: Array<{
-      next: RelayTailscaleStackConfig
-      previous: RelayTailscaleStackConfig
-      records: Array<{ address: string; hostname: string }>
-    }> = []
-    return runLifecycle(
-      lifecycleOperation(async () => {
-        for (const candidate of configs) {
-          await runLifecycle(
-            this.#lanes.runNested(
-              {
-                label: "tailscale.member.detach",
-                locks: [exclusive(laneKeys.instance(candidate.id))],
-              },
-              lifecycleOperation(async () => {
-                const previous = await this.#readTailscaleStackConfig(
-                  candidate.id
-                )
-                if (
-                  !previous ||
-                  !previous.bindings.some(
-                    (binding) => binding.memberId === memberId
-                  )
-                )
-                  return
-                if (await this.#tailscaleStackRemovalPending(previous.id)) {
-                  throw new Error(
-                    `Finish removing ${previous.name} from Tailscale before deleting this`
-                  )
-                }
-                const records =
-                  await this.#readTailscaleStackDnsRecords(previous)
-                const detached = tailscaleStackWithoutMember(
-                  previous,
-                  records,
-                  memberId
-                )
-                const next = detached.config
-                completed.push({ next, previous, records })
-                await this.#reconcileTailscaleStackBindings(
-                  previous.id,
-                  previous.bindings,
-                  next.bindings
-                )
-                await this.#writeTailscaleStackConfig(next)
-                await this.#configureTailscaleStackRouting(next)
-                await this.#ensureTailscaleStackDns(next, detached.records)
-              })
-            )
-          )
-        }
-        return completed
-      }).pipe(
-        Effect.catch((cause) =>
-          lifecycleOperation(async () => {
-            const rollbackFailures =
-              await this.#restoreInstanceTailscaleStacks(completed)
-            throw new Error(
-              `Could not remove it from its Tailscale networks: ${
-                cause instanceof Error ? cause.message : "unknown error"
-              }${
-                rollbackFailures.length > 0
-                  ? `. Rollback also failed: ${rollbackFailures.join("; ")}`
-                  : ""
-              }`,
-              { cause }
-            )
-          })
-        )
-      )
-    )
-  }
-
-  async #restoreInstanceTailscaleStacks(
-    changes: ReadonlyArray<{
-      next: RelayTailscaleStackConfig
-      previous: RelayTailscaleStackConfig
-      records: Array<{ address: string; hostname: string }>
-    }>
-  ): Promise<Array<string>> {
-    const failures: Array<string> = []
-    for (const change of [...changes].reverse()) {
-      await runLifecycle(
-        this.#lanes
-          .runNested(
-            {
-              label: "tailscale.member.rollback",
-              locks: [exclusive(laneKeys.instance(change.previous.id))],
-            },
-            lifecycleOperation(async () => {
-              const current = await this.#readTailscaleStackConfig(
-                change.previous.id
-              )
-              if (!current) return
-              // Restore only this detach's members. Other deletions or applies
-              // may have changed the stack while Docker removed the resource.
-              const removed = change.previous.bindings.filter(
-                (binding) =>
-                  !change.next.bindings.some(
-                    (next) => next.memberId === binding.memberId
-                  )
-              )
-              const restored = removed.filter(
-                (binding) =>
-                  !current.bindings.some(
-                    (saved) => saved.memberId === binding.memberId
-                  )
-              )
-              const previous = {
-                ...current,
-                bindings: [...current.bindings, ...restored],
-              }
-              const records = await this.#readTailscaleStackDnsRecords(current)
-              const restoredAddresses = new Set(
-                restored.map((binding) => binding.address)
-              )
-              const mergedRecords = [
-                ...records,
-                ...change.records.filter((record) =>
-                  restoredAddresses.has(record.address)
-                ),
-              ]
-              // Validate before writing or reconnecting: an apply may have
-              // claimed a detached member's hostname meanwhile.
-              Effect.runSync(
-                Effect.try({
-                  try: () => {
-                    relayTailscaleStackConfigSchema.parse(previous)
-                    this.#assertUniqueTailscaleHostnames(
-                      previous.domain,
-                      previous.bindings
-                    )
-                    relayTailscaleStackDnsSchema.parse({
-                      id: previous.id,
-                      records: mergedRecords,
-                    })
-                    this.#assertUniqueTailscaleHostnames(
-                      previous.domain,
-                      mergedRecords
-                    )
-                  },
-                  catch: (cause) =>
-                    new Error(
-                      `Could not restore Tailscale membership on ${current.name}: ${
-                        cause instanceof Error
-                          ? cause.message
-                          : "invalid configuration"
-                      }. The removed members stay off the network; finishing the deletion removes them for good`,
-                      { cause }
-                    ),
-                })
-              )
-              await this.#writeTailscaleStackConfig(previous)
-              await this.#reconcileTailscaleStackBindings(
-                change.previous.id,
-                current.bindings,
-                previous.bindings
-              )
-              await this.#configureTailscaleStackRouting(previous)
-              await this.#ensureTailscaleStackDns(previous, mergedRecords)
-            })
-          )
-          .pipe(
-            Effect.catch((cause) =>
-              Effect.sync(() => {
-                failures.push(
-                  cause instanceof Error
-                    ? cause.message
-                    : "unknown rollback error"
-                )
-              })
-            )
-          )
-      )
-    }
-    return failures
   }
 
   async #waitForTailscaleStackConnection(
@@ -4929,43 +4861,42 @@ export class LifecycleDriver {
     }
   }
 
-  // Takes members off their Tailscale networks before what they run in is
-  // deleted: an App's services, or a database. Hearth drops their DNS
-  // records from every node first, and puts them back if the detach fails.
-  async detachFromTailscale(
-    matches: (memberId: string) => boolean,
-    synchronize: (input: {
-      memberId: string
-      mode: "prepare" | "rollback"
-      stackIds: ReadonlyArray<string>
-    }) => Promise<void>
+  /**
+   * Takes every matching member off its Tailscale networks, once what it ran
+   * in is gone: a deleted game server, App, or database. Hearth removed its
+   * DNS records from every node before the deletion, and the member stays
+   * frozen until it's done, so this only changes the network: each stack in
+   * its own lane, even one whose removal is pending.
+   */
+  async removeFromTailscale(
+    matches: (memberId: string) => boolean
   ): Promise<void> {
-    const configs = await this.#tailscaleStackConfigs()
-    const memberIds = [
-      ...new Set(
-        configs.flatMap((config) =>
-          config.bindings
-            .map((binding) => binding.memberId)
-            .filter((memberId) => matches(memberId))
-        )
-      ),
-    ]
-    for (const memberId of memberIds) {
-      const stackIds = configs
-        .filter((config) =>
-          config.bindings.some((binding) => binding.memberId === memberId)
-        )
-        .map((config) => config.id)
-      await synchronize({ memberId, mode: "prepare", stackIds })
+    for (const candidate of await this.#tailscaleStackConfigs()) {
+      if (!candidate.bindings.some((binding) => matches(binding.memberId))) {
+        continue
+      }
       await runLifecycle(
-        lifecycleOperation(() =>
-          this.#detachMemberFromTailscaleStacks(memberId)
-        ).pipe(
-          Effect.tapError(() =>
-            lifecycleOperation(() =>
-              synchronize({ memberId, mode: "rollback", stackIds })
-            ).pipe(Effect.ignore)
-          )
+        this.#lanes.runNested(
+          {
+            label: "tailscale.member.remove",
+            locks: [exclusive(laneKeys.instance(candidate.id))],
+          },
+          lifecycleOperation(async () => {
+            const previous = await this.#readTailscaleStackConfig(candidate.id)
+            if (!previous) return
+            const next = tailscaleStackWithoutMembers(previous, matches)
+            if (next.bindings.length === previous.bindings.length) return
+            await this.#reconcileTailscaleStackBindings(
+              previous.id,
+              previous.bindings,
+              next.bindings
+            )
+            await this.#writeTailscaleStackConfig(next)
+            // A stack being removed is stopped. Rolling its removal back
+            // routes what's saved then.
+            if (await this.#tailscaleStackRemovalPending(next.id)) return
+            await this.#configureTailscaleStackRouting(next)
+          })
         )
       )
     }
@@ -5207,4 +5138,34 @@ function appServiceRoutes<
   return routes.filter(
     (route) => route.redirect || (route.service ?? APP_SERVICE) === service
   )
+}
+
+// The public ports a game server is allocated for `protocol`, whether or not
+// it's running: its primary one and every other allocation.
+function allocatedPorts(
+  instance: RelayInstance,
+  protocol: "tcp" | "udp"
+): Array<number> {
+  const ports = instance.ports
+    .filter((allocation) =>
+      portProtocols(allocation.protocol).includes(protocol)
+    )
+    .map((allocation) => allocation.externalPort)
+  const primaryProtocol = instance.brickPrimaryPortProtocol
+  if (
+    instance.publicPort &&
+    primaryProtocol &&
+    portProtocols(primaryProtocol).includes(protocol)
+  ) {
+    ports.push(instance.publicPort)
+  }
+  return ports
+}
+
+function allocatesPort(
+  instance: RelayInstance,
+  port: number,
+  protocol: "tcp" | "udp"
+): boolean {
+  return allocatedPorts(instance, protocol).includes(port)
 }

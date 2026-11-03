@@ -4,6 +4,7 @@ import { Effect } from "effect"
 import { z } from "zod"
 
 import { kilnReleaseManifestEffect } from "@/effect/github-releases"
+import { promiseEffect } from "@/effect/promise"
 import {
   checkKilnReleasesEffect,
   listKilnReleasesEffect,
@@ -32,6 +33,12 @@ import {
   updateTargetVersion,
   validateUpdateManifest,
 } from "@/lib/update-manifest"
+import { exclusive, hearthKey, partKey, relayKey } from "@/operations/lanes"
+import {
+  operation,
+  runOperationPromise,
+  signedIn,
+} from "@/operations/operation"
 import { requireEligibleResourceUser } from "@/server/auth"
 import { authorizedRelay } from "@/server/relay-access"
 
@@ -276,41 +283,62 @@ export const getUpdateOverview = createServerFn({ method: "GET" }).handler(
  * rather than waiting for Hearth's next check. `failed` says GitHub couldn't
  * be asked and the releases Hearth had are still shown.
  */
-export const checkForKilnReleases = createServerFn({ method: "POST" }).handler(
-  async () => {
-    const user = await requireUpdateAccess()
-    // Checks spend Hearth's GitHub requests, so only those who can update
-    // something may ask for one.
-    if (
-      !isPlatformAdmin(user) &&
-      (await updateRelaysForUser(user)).length === 0
-    ) {
-      throw PermissionDeniedError.make({
-        message: "You don't have permission to update Kiln",
-      })
-    }
-    const checked = await runAppEffect(
-      "updates.check-releases",
-      checkKilnReleasesEffect()
-    )
-    // The admin who checked sees what it found; the others hear of it now.
-    if (!checked.failed && isPlatformAdmin(user)) {
-      const { notifyLatestKilnReleaseEffect } =
-        await import("@/lib/kiln-update-notifications")
-      await runAppEffect(
-        "updates.check-releases.notify",
-        notifyLatestKilnReleaseEffect(
-          import.meta.env.VITE_KILN_VERSION,
-          user.id
-        ).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("Could not announce Kiln releases", cause)
+// It changes nothing a lane orders: the release feed is a cache Hearth's
+// pages read too, and shares one GitHub request among those asking at once,
+// and each release is announced once however many checks find it.
+const checkReleases = operation<void>()({
+  name: "updates.checkReleases",
+  doing: "Checking for Kiln releases",
+  authorize: ({ user }) =>
+    signedIn(user).pipe(
+      Effect.tap((person) =>
+        promiseEffect(async () => {
+          // Checks spend Hearth's GitHub requests, so only those who can
+          // update something may ask for one.
+          if (
+            !isPlatformAdmin(person) &&
+            (await updateRelaysForUser(person)).length === 0
+          ) {
+            throw PermissionDeniedError.make({
+              message: "You don't have permission to update Kiln",
+            })
+          }
+        })
+      )
+    ),
+  locks: () => [],
+  run: ({ context: user }) =>
+    promiseEffect(async () => {
+      const checked = await runAppEffect(
+        "updates.check-releases",
+        checkKilnReleasesEffect()
+      )
+      // The admin who checked sees what it found; the others hear of it now.
+      if (!checked.failed && isPlatformAdmin(user)) {
+        const { notifyLatestKilnReleaseEffect } =
+          await import("@/lib/kiln-update-notifications")
+        await runAppEffect(
+          "updates.check-releases.notify",
+          notifyLatestKilnReleaseEffect(
+            import.meta.env.VITE_KILN_VERSION,
+            user.id
+          ).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Could not announce Kiln releases", cause)
+            )
           )
         )
-      )
-    }
-    return checked
-  }
+      }
+      return checked
+    }),
+  audit: () => ({ id: "releases", kind: "platform" }),
+})
+
+export const checkForKilnReleases = createServerFn({ method: "POST" }).handler(
+  async () =>
+    runOperationPromise(checkReleases, undefined, {
+      user: await requireUpdateAccess(),
+    })
 )
 
 // The release this Relay runs, by name, and for those who can update it the
@@ -354,13 +382,95 @@ export const getReleaseHistory = createServerFn({ method: "GET" })
 
 const releaseHistoryPageSize = 60
 
+// Hands one Relay its updates, holding its process, as restarting it does,
+// and Hearth itself when it's among them. The Relay runs them from there and
+// refuses another meanwhile, so the next Relay's needn't wait on this one.
+const handOverUpdates = operation<{
+  readonly components: ReadonlyArray<"hearth" | "relay">
+  readonly relay: PersistedRelay
+  readonly request: Record<string, unknown>
+}>()({
+  name: "updates.start",
+  doing: "Updating Kiln",
+  authorize: ({ input, user }) =>
+    signedIn(user).pipe(
+      Effect.filterOrFail(
+        (person) =>
+          isPlatformAdmin(person) || !input.components.includes("hearth"),
+        () => new Error("Only a platform administrator can update Hearth")
+      ),
+      Effect.tap((person) =>
+        promiseEffect(() =>
+          requireRelayPermission({
+            user: person,
+            relayId: input.relay.id,
+            permission: "relay.update",
+          })
+        )
+      )
+    ),
+  // The Relay's process even for Hearth's update alone: the Relay runs
+  // it, so it mustn't restart or go meanwhile.
+  locks: ({ input }) => [
+    exclusive(partKey(relayKey(input.relay.id), "process")),
+    ...(input.components.includes("hearth") ? [exclusive(hearthKey)] : []),
+  ],
+  run: ({ context: user, input }) =>
+    Effect.gen(function* () {
+      // The Hearth that starts next shouldn't tell this admin about the
+      // update they started.
+      if (input.components.includes("hearth")) {
+        const { recordHearthUpdateRequestEffect } = yield* promiseEffect(
+          () => import("@/lib/kiln-update-notifications")
+        )
+        yield* recordHearthUpdateRequestEffect(user.id).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Could not record who updated Hearth", cause)
+          )
+        )
+      }
+      // This Hearth may be replaced before every Relay answers. Each Relay
+      // still finishes what it accepted and reports it, named by the
+      // request, in its snapshot, which the browser reads back
+      // (getSystemUpdates).
+      return yield* promiseEffect(async () => {
+        const { relayRpc } = await import("@/lib/relay-connection")
+        return relayRpc(
+          input.relay,
+          "relay.update.apply",
+          input.request,
+          15 * 60_000,
+          user.id
+        )
+      }).pipe(
+        Effect.flatMap((response) =>
+          Effect.try({
+            try: () => parseUpdateOperations(response),
+            catch: (cause) => cause,
+          })
+        ),
+        Effect.mapError(
+          (cause) =>
+            new UpdateApplyError(
+              errorMessage(cause),
+              !relayAnsweredRequest(cause)
+            )
+        )
+      )
+    }),
+  audit: ({ input }) => ({
+    id: input.relay.id,
+    kind: "relay",
+    relayId: input.relay.id,
+  }),
+})
+
 export const startSystemUpdates = createServerFn({ method: "POST" })
   .validator(startUpdatesSchema)
   .handler(async ({ data }) => {
     const user = await requireUpdateAccess()
-    const platformAdmin = isPlatformAdmin(user)
     if (
-      !platformAdmin &&
+      !isPlatformAdmin(user) &&
       data.targets.some((target) => target.component === "hearth")
     ) {
       throw new Error("Only a platform administrator can update Hearth")
@@ -488,93 +598,34 @@ export const startSystemUpdates = createServerFn({ method: "POST" })
         (group) =>
           Effect.tryPromise({
             try: async () => {
-              const currentUser = await requireEligibleResourceUser()
-              if (currentUser.id !== user.id)
-                throw new Error("The authenticated user changed")
-              if (
-                group.targets.some((target) => target.component === "hearth") &&
-                !isPlatformAdmin(currentUser)
-              ) {
-                throw new Error(
-                  "Only a platform administrator can update Hearth"
-                )
-              }
-              await requireRelayPermission({
-                user: currentUser,
-                relayId: group.relay.id,
-                permission: "relay.update",
-              })
               const legacyTarget =
                 group.targets.length === 1 ? group.targets[0] : undefined
-              // The Hearth that starts next shouldn't tell this admin about
-              // the update they started.
-              if (
-                group.targets.some(({ component }) => component === "hearth")
-              ) {
-                const { recordHearthUpdateRequestEffect } =
-                  await import("@/lib/kiln-update-notifications")
-                await runAppEffect(
-                  "updates.record-request",
-                  recordHearthUpdateRequestEffect(user.id).pipe(
-                    Effect.catchCause((cause) =>
-                      Effect.logWarning(
-                        "Could not record who updated Hearth",
-                        cause
-                      )
-                    )
-                  )
-                )
-              }
-              // This Hearth may be replaced before every Relay answers. Each
-              // Relay still finishes what it accepted and reports it, named
-              // by the request, in its snapshot, which the browser reads
-              // back (getSystemUpdates).
-              const operations = await runAppEffect(
-                "updates.apply",
-                Effect.tryPromise({
-                  try: () =>
-                    relayRpc(
-                      group.relay,
-                      "relay.update.apply",
-                      {
-                        helperImage: immutableImage(manifest.components.relay),
-                        ...(data.requestId
-                          ? { requestId: data.requestId }
-                          : {}),
-                        targets: group.targets.map((target) => ({
-                          targetContainer: target.targetContainer,
-                          targetImage: target.targetImage,
+              const operations = await runOperationPromise(
+                handOverUpdates,
+                {
+                  components: group.targets.map(({ component }) => component),
+                  relay: group.relay,
+                  request: {
+                    helperImage: immutableImage(manifest.components.relay),
+                    ...(data.requestId ? { requestId: data.requestId } : {}),
+                    targets: group.targets.map((target) => ({
+                      targetContainer: target.targetContainer,
+                      targetImage: target.targetImage,
+                      version: targetVersion,
+                    })),
+                    // A single target can also be understood by Relays from
+                    // before batched updates, preserving the rolling upgrade
+                    // path.
+                    ...(legacyTarget
+                      ? {
+                          targetContainer: legacyTarget.targetContainer,
+                          targetImage: legacyTarget.targetImage,
                           version: targetVersion,
-                        })),
-                        // A single target can also be understood by Relays from before
-                        // batched updates, preserving the rolling upgrade path.
-                        ...(legacyTarget
-                          ? {
-                              targetContainer: legacyTarget.targetContainer,
-                              targetImage: legacyTarget.targetImage,
-                              version: targetVersion,
-                            }
-                          : {}),
-                      },
-                      15 * 60_000,
-                      user.id
-                    ),
-                  catch: (cause) => cause,
-                }).pipe(
-                  Effect.flatMap((response) =>
-                    Effect.try({
-                      try: () => parseUpdateOperations(response),
-                      catch: (cause) => cause,
-                    })
-                  ),
-                  Effect.mapError(
-                    (cause) =>
-                      new UpdateApplyError(
-                        errorMessage(cause),
-                        !relayAnsweredRequest(cause)
-                      )
-                  )
-                )
+                        }
+                      : {}),
+                  },
+                },
+                { user }
               )
               return { group, operations }
             },
@@ -613,7 +664,7 @@ export const startSystemUpdates = createServerFn({ method: "POST" })
     }
   })
 
-export const getSystemUpdateStatus = createServerFn({ method: "POST" })
+export const getSystemUpdateStatus = createServerFn({ method: "GET" })
   .validator(updateStatusSchema)
   .handler(async ({ data }) => {
     const user = await requireUpdateAccess()
