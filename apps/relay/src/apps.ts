@@ -34,6 +34,7 @@ import type {
   ServiceResourceLimits,
 } from "@workspace/contracts"
 import {
+  appMountFileName,
   appServiceNameSchema,
   appVolumeId,
   CPU_LIMIT_MILLIS_PER_CORE,
@@ -59,7 +60,12 @@ import {
   type DockerConsoleSession,
 } from "./docker.js"
 import type { DockerCleanup } from "./docker-cleanup.js"
-import { createContainer, ramInBytes } from "./docker-container-spec.js"
+import {
+  createContainer,
+  ramInBytes,
+  WORKLOAD_SLICE_LABEL,
+  type ContainerSpec,
+} from "./docker-container-spec.js"
 import {
   DockerEngine,
   isDockerNotFound,
@@ -119,9 +125,11 @@ const COMMIT_LABEL = "kiln.app.commit"
 const IMAGE_LABEL = "kiln.app.image"
 const IMAGE_DIGEST_LABEL = "kiln.app.image.digest"
 const COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
-// The console stream that follows an app's deployments; its services'
-// streams are `service:<name>`.
+// The console stream that follows an app's deployments; `deployment:<id>`
+// shows only that one while it's the latest, and its services' streams are
+// `service:<name>`.
 export const APP_DEPLOYMENT_STREAM = "deployment"
+const DEPLOYMENT_STREAM_PREFIX = `${APP_DEPLOYMENT_STREAM}:`
 const SERVICE_STREAM_PREFIX = "service:"
 const MAX_DEPLOYMENT_LINES = 5_000
 // Finished deployments' logs kept per app, newest first.
@@ -453,6 +461,17 @@ export class AppDriver {
       throw new Error("App already exists")
     }
     await this.#ensureResources(input.id)
+    // Saved, for its deployments to join: it has no containers yet, and a
+    // database created with it may have no network yet. One deleted since
+    // Hearth asked stays deleted.
+    for (const databaseId of input.databaseIds ?? []) {
+      if (!(await this.#connections.databaseExists(databaseId))) continue
+      await this.#connections.set(
+        { id: input.id, kind: "app" },
+        databaseId,
+        true
+      )
+    }
     return this.get(input.id)
   }
 
@@ -749,8 +768,11 @@ export class AppDriver {
             locks: [exclusive(laneKeys.allocations)],
           },
           promiseEffect(async () => {
-            await this.#assertLimitsFit(appId, services)
             const containers = await this.#appContainers(appId)
+            const keeps = combinedLimits(
+              containers.map((container) => container.limits)
+            ).memoryBytes
+            await this.#assertLimitsFit(appId, services, [], keeps)
             const running = containers
               .filter((container) => container.running)
               .map((container) => container.limits)
@@ -759,7 +781,7 @@ export class AppDriver {
               running.length > 0 &&
               (await recoverPromise(
                 () =>
-                  this.#assertLimitsFit(appId, services, running).then(
+                  this.#assertLimitsFit(appId, services, running, null).then(
                     () => true
                   ),
                 () => false
@@ -798,13 +820,22 @@ export class AppDriver {
     appId: string,
     services: ReadonlyArray<ServiceResourceLimits>,
     // Containers that keep running beside the new ones.
-    alongside: ReadonlyArray<ServiceResourceLimits> = []
+    alongside: ReadonlyArray<ServiceResourceLimits>,
+    // The App's memory limits now, all together, which it may keep however
+    // full the node has since become.
+    keepsMemoryBytes: number | null
   ): Promise<void> {
     const [filesystem, others] = await Promise.all([
       statfs(this.#config.rootDirectory),
       this.#limits.allocations.others(APP_KIND, appId),
     ])
     const nodeDiskBytes = filesystem.blocks * filesystem.bsize
+    const allocations = this.#limits.allocations
+    const requested = combinedLimits(services).memoryBytes
+    const keeps =
+      keepsMemoryBytes !== null &&
+      requested !== null &&
+      requested <= keepsMemoryBytes
     // Each service's memory counts against the node, with the others'.
     const allocated: Array<typeof NO_RESOURCE_LIMITS> = [
       ...others,
@@ -813,7 +844,9 @@ export class AppDriver {
     for (const service of services) {
       const limits = { ...NO_RESOURCE_LIMITS, ...service }
       assertResourceLimitsFit({
+        assignableMemoryBytes: allocations.assignableMemoryBytes,
         currentDiskBytes: null,
+        currentMemoryBytes: keeps ? limits.memoryBytes : null,
         limits,
         nodeDiskBytes,
         others: allocated,
@@ -981,6 +1014,13 @@ export class AppDriver {
     if (!stream || stream === APP_DEPLOYMENT_STREAM) {
       await this.#restoreDeployment(appId)
       return this.#deploymentSession(appId)
+    }
+    if (stream.startsWith(DEPLOYMENT_STREAM_PREFIX)) {
+      await this.#restoreDeployment(appId)
+      const id = stream.slice(DEPLOYMENT_STREAM_PREFIX.length)
+      return this.#deployments.get(appId)?.id === id
+        ? this.#deploymentSession(appId)
+        : this.#idleSession(appId)
     }
     if (!stream.startsWith(SERVICE_STREAM_PREFIX)) {
       throw new Error("Unknown app log stream")
@@ -1611,7 +1651,11 @@ export class AppDriver {
       })
       await writeFile(dockerfile, input.config.dockerfile, { mode: 0o600 })
     }
-    this.#log(input.appId, deployment, `Building ${tag}`)
+    this.#log(
+      input.appId,
+      deployment,
+      `Building ${tag}${input.noCache ? " without the cache" : ""}`
+    )
     await this.#stream(
       input.appId,
       deployment,
@@ -1620,6 +1664,7 @@ export class AppDriver {
         "build",
         "--progress",
         "plain",
+        ...(input.noCache ? ["--no-cache"] : []),
         ...labelArguments(this.#imageLabels(input.appId)),
         "--tag",
         tag,
@@ -1693,6 +1738,7 @@ export class AppDriver {
           ...NO_RESOURCE_LIMITS,
           ...config.serviceLimits[APP_SERVICE],
         }),
+        ...this.#limits.allocations.workloadSpec(),
         labels: {
           ...routes.labels(APP_SERVICE),
           ...image.labels,
@@ -2071,6 +2117,7 @@ export class AppDriver {
           databases,
           deploymentId: deployment.id,
           mounts,
+          noCache: input.noCache === true,
           routes,
           serviceLimits: input.config.serviceLimits,
           tailscale,
@@ -2099,6 +2146,7 @@ export class AppDriver {
               ),
             { surge }
           )
+        if (input.noCache) log("Building without the cache")
         if (running && blocker === null) {
           // Its own project, so its networks and containers stand apart from
           // the running ones until it takes over.
@@ -2425,6 +2473,7 @@ export class AppDriver {
       deploymentId: string
       // The config's mounts, beside the Compose file's own.
       mounts: ReadonlyArray<ConfigMount>
+      noCache: boolean
       routes: AppRoutePlan
       serviceLimits: AppConfig["serviceLimits"]
       tailscale: ReadonlyArray<{
@@ -2454,6 +2503,9 @@ export class AppDriver {
         )
       }
     }
+    const { labels: placementLabels, ...placement } = composePlacement(
+      this.#limits.allocations.workloadSpec()
+    )
     const services: Record<string, ComposeService> = {}
     for (const [name, service] of Object.entries(normalized.services ?? {})) {
       if (!appServiceNameSchema.safeParse(name).success) {
@@ -2504,7 +2556,13 @@ export class AppDriver {
           }
       services[name] = {
         ...service,
+        // `up` has no flag for this; a service's build says it itself.
+        ...(options.noCache &&
+          service.build !== undefined && {
+            build: { ...(service.build as object), no_cache: true },
+          }),
         ...composeLimits(service, options.serviceLimits[name]),
+        ...placement,
         container_name: this.#containerName(
           options.appId,
           name,
@@ -2519,6 +2577,7 @@ export class AppDriver {
             options.deploymentId,
             options.commit
           ),
+          ...placementLabels,
         },
         restart: service.restart ?? "unless-stopped",
         ...(service.network_mode ? {} : { networks }),
@@ -2670,20 +2729,32 @@ export class AppDriver {
   ) {
     const parsed = parseConsoleLine(raw)
     if (!parsed) return
-    this.#log(appId, deployment, parsed.text, level ?? parsed.level)
+    this.#appendLine(appId, deployment, {
+      level: level ?? parsed.level,
+      ...(parsed.segments && { segments: parsed.segments }),
+      text: parsed.text,
+    })
   }
 
+  // One of Kiln's own steps, as opposed to the output of what it ran.
   #log(
     appId: string,
     deployment: Deployment,
     text: string,
     level: RelayConsoleLevel = "info"
   ) {
+    this.#appendLine(appId, deployment, { level, origin: "kiln", text })
+  }
+
+  #appendLine(
+    appId: string,
+    deployment: Deployment,
+    content: Omit<RelayConsoleLine, "id" | "timestamp">
+  ) {
     const index = deployment.dropped + deployment.lines.length
-    const line = {
+    const line: RelayConsoleLine = {
+      ...content,
       id: `${deployment.id}-${index}`,
-      level,
-      text,
       timestamp: new Date().toISOString(),
     }
     deployment.lines.push(line)
@@ -3012,18 +3083,13 @@ export class AppDriver {
           break
         case "file":
           await mkdir(directory, { recursive: true })
-          await writeFile(join(directory, mount.id), source.content)
+          const file = appMountFileName(mount.id, source.content)
+          await writeFile(join(directory, file), source.content)
           mounts.push({
             kind: "file",
             readOnly,
             service,
-            source: join(
-              host,
-              "app-mounts",
-              input.appId,
-              deployment.id,
-              mount.id
-            ),
+            source: join(host, "app-mounts", input.appId, deployment.id, file),
             target,
             type: "bind",
           })
@@ -3543,6 +3609,26 @@ function composeNumber(
   return Result.isSuccess(parsed) && Number.isFinite(parsed.success)
     ? parsed.success
     : null
+}
+
+// Where a service's container runs, as Compose sets it. Kiln's placement
+// replaces anything the Compose file says, which can't name a parent even
+// when Kiln has none for it: the label is how the Relay finds what could
+// start in the node's workload slice.
+function composePlacement(
+  placement: Pick<ContainerSpec, "cgroupParent" | "oomScoreAdj">
+): {
+  cgroup_parent: string | undefined
+  labels: Record<string, string>
+  oom_score_adj: number | undefined
+} {
+  return {
+    cgroup_parent: placement.cgroupParent,
+    labels: placement.cgroupParent
+      ? { [WORKLOAD_SLICE_LABEL]: placement.cgroupParent }
+      : {},
+    oom_score_adj: placement.oomScoreAdj,
+  }
 }
 
 // A service's limits as Compose sets them; a limit Kiln doesn't set leaves

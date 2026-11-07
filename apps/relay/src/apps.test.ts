@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -134,6 +135,99 @@ function appContainers(id = appId) {
   )
 }
 
+describe("an App created with a database", () => {
+  const databaseId = "d".repeat(40)
+  const addDatabaseNetwork = (name: string) =>
+    fakeDocker.addNetwork({
+      internal: true,
+      labels: {
+        "kiln.database.id": databaseId,
+        "kiln.database.network": name,
+        "kiln.relay.owner": TEST_NAMESPACE,
+        "kiln.resource.kind": "database",
+      },
+      name,
+    })
+
+  it("keeps the connection to one still provisioning", async () => {
+    const harness = await relayHarness()
+    const database = {
+      databaseName: "kiln_main",
+      engine: "postgres",
+      id: databaseId,
+      name: "Main",
+      password: "p".repeat(24),
+      username: "kiln_main",
+    } as const
+    await Effect.runPromise(
+      harness.state.enqueueProvisioningJob(
+        {
+          idempotencyKey: randomUUID(),
+          input: database,
+          instanceId: databaseId,
+          kind: "database",
+          placeholder: harness.databases.placeholder(database),
+        },
+        Date.now()
+      )
+    )
+
+    await harness.apps.create({
+      databaseIds: [databaseId],
+      id: appId,
+      name: "Website",
+    })
+
+    expect((await harness.apps.get(appId)).savedDatabaseIds).toEqual([
+      databaseId,
+    ])
+  })
+
+  it("keeps the connection to one whose container is being replaced", async () => {
+    const harness = await relayHarness()
+    // Between containers, as when a limit comes off, only its network shows.
+    addDatabaseNetwork("database-network")
+
+    await harness.apps.create({
+      databaseIds: [databaseId],
+      id: appId,
+      name: "Website",
+    })
+
+    expect((await harness.apps.get(appId)).savedDatabaseIds).toEqual([
+      databaseId,
+    ])
+  })
+
+  it("keeps the connection to one with more networks than it should have", async () => {
+    const harness = await relayHarness()
+    addDatabaseNetwork("database-network")
+    addDatabaseNetwork("database-network-again")
+
+    await harness.apps.create({
+      databaseIds: [databaseId],
+      id: appId,
+      name: "Website",
+    })
+
+    expect((await harness.apps.get(appId)).savedDatabaseIds).toEqual([
+      databaseId,
+    ])
+  })
+
+  it("doesn't bring back a connection to one deleted meanwhile", async () => {
+    const harness = await relayHarness()
+
+    await harness.apps.create({
+      databaseIds: [databaseId],
+      id: appId,
+      name: "Website",
+    })
+
+    expect((await harness.apps.get(appId)).savedDatabaseIds).toEqual([])
+  })
+})
+
 describe("rolling deployments", () => {
   it("stops the running container first when it writes to a mounted path, but not when it only reads one", async () => {
     const harness = await createdApp()
@@ -195,6 +289,23 @@ describe("deployment logs", () => {
       })
     ).toBeNull()
   })
+
+  it("streams a deployment by its id only while it's the latest", async () => {
+    const harness = await createdApp()
+    const first = await deploy(harness, {})
+    const second = await deploy(harness, { command: "serve --v2" })
+    const history = async (id: string) => {
+      const session = await harness.apps.consoleSession(
+        appId,
+        `deployment:${id}`,
+        () => Promise.reject(new Error("Not a container's stream"))
+      )
+      return session.history()
+    }
+
+    expect((await history(second.deployment!.id)).lines).not.toHaveLength(0)
+    expect((await history(first.deployment!.id)).lines).toEqual([])
+  })
 })
 
 describe("App volumes", () => {
@@ -210,6 +321,43 @@ describe("App volumes", () => {
     "  data: {}",
     "",
   ].join("\n")
+
+  it("runs a Compose App's services in the node's workload slice", async () => {
+    const removeCompose = await composeConfigCommand()
+    const harness = await createdApp()
+    const slice = "kilnworkloads.slice"
+    harness.docker.allocations.setWorkloadLimit(slice, 1024 ** 3)
+
+    await deploy(harness, {
+      compose:
+        "services:\n  web:\n    image: nginx:alpine\n    cgroup_parent: elsewhere\n",
+      sourceType: "compose",
+    })
+
+    const [container] = [...fakeDocker.containers.values()].filter(
+      (candidate) => candidate.labels["kiln.app.id"] === appId
+    )
+    expect(container?.cgroupParent).toBe(slice)
+    expect(container?.labels["kiln.relay.workload-slice"]).toBe(slice)
+    await removeCompose()
+  })
+
+  it("won't let a Compose file put a service in the slice itself", async () => {
+    const removeCompose = await composeConfigCommand()
+    const harness = await createdApp()
+
+    await deploy(harness, {
+      compose:
+        "services:\n  web:\n    image: nginx:alpine\n    cgroup_parent: kilnworkloads.slice\n",
+      sourceType: "compose",
+    })
+
+    const [container] = [...fakeDocker.containers.values()].filter(
+      (candidate) => candidate.labels["kiln.app.id"] === appId
+    )
+    expect(container?.cgroupParent).toBe("")
+    await removeCompose()
+  })
 
   it("keeps a Compose volume's ID and data through redeploys and a rolled deployment", async () => {
     const removeCompose = await composeConfigCommand()

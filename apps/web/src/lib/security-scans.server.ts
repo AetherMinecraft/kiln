@@ -37,6 +37,7 @@ import {
   syncSecurityTargetsEffect,
   pendingSecurityAnnouncementsEffect,
   recordSecurityAnnouncementsEffect,
+  requestHostInventoryEffect,
   type AnnouncedFinding,
   type DueInventory,
   type SecurityAnnouncement,
@@ -52,7 +53,7 @@ import {
   type PersistedRelay,
 } from "@/lib/relay-registry"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
-import { resourceAudienceEffect } from "@/lib/resource-audience.server"
+import { notificationAudienceEffect } from "@/lib/resource-audience.server"
 import {
   defaultSecurityNotificationSettings,
   severityAt,
@@ -136,6 +137,9 @@ const syncRelayEffect = Effect.fnUntraced(function* (relay: PersistedRelay) {
     catch: relayFailure("Could not list what the Relay runs"),
   }).pipe(Effect.map((answer) => relaySecurityTargetsSchema.parse(answer)))
   yield* syncSecurityTargetsEffect(relay.id, report)
+  if (report.hostPackagesUpdatedAt !== null) {
+    yield* requestHostInventoryEffect(relay.id, report.hostPackagesUpdatedAt)
+  }
   const due = yield* dueInventoriesEffect(relay.id)
   const deadline = (yield* Clock.currentTimeMillis) + collectBudgetMs
   let busy = false
@@ -188,14 +192,15 @@ const collectInventoryEffect = Effect.fn("Security.collectInventory")(
           }
     const now = yield* Clock.currentTimeMillis
     // An image's inventory never changes; the host's is wanted newer than
-    // the one Hearth has, or than a day old.
+    // the one Hearth has, than a day old, and than whatever asked for it: one
+    // the Relay collected before a package update doesn't show that update.
     const collectedAfter =
       target.kind === "image"
         ? null
-        : (inventory.collectedAt ??
-          (inventory.requested
-            ? now - 60_000
-            : now - HOST_INVENTORY_MAX_AGE_MS))
+        : Math.max(
+            inventory.collectedAt ?? now - HOST_INVENTORY_MAX_AGE_MS,
+            inventory.requestedAt ?? 0
+          )
     const read = (offset: number, after: number | null) =>
       Effect.tryPromise({
         try: (signal) =>
@@ -436,9 +441,10 @@ const newsEffect = Effect.fnUntraced(function* (
   const news = new Map<string, Array<ResourceNews>>()
   for (const announcement of announcements) {
     const { resourceId, resourceType } = announcement
-    const recipients = yield* resourceAudienceEffect(
+    const recipients = yield* notificationAudienceEffect(
       { relayId, resourceId, resourceType },
-      securityNotifyPermissions[resourceType]
+      securityNotifyPermissions[resourceType],
+      "security.report"
     )
     // Whether it reaches their inbox and devices is the notification's own
     // choice; which vulnerabilities notify at all is the security one.

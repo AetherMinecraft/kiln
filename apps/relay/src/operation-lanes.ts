@@ -36,10 +36,17 @@ export const laneKeys = {
   /** The Kiln volumes an App's configuration mounts, as Hearth last sent. */
   appVolumes: (id: string) => `app:${id}/volumes`,
   database: (id: string) => `database:${id}`,
+  /**
+   * Who may join it, apart from the database itself, so that a new App can
+   * join one still provisioning and only a deletion waits for it.
+   */
+  databaseConnections: (id: string) => `database:${id}/connections`,
   /** Power and commands: anything that changes the running process. */
   databaseLifecycle: (id: string) => `database:${id}/lifecycle`,
   /** The Relay host's own files, under the host file root. */
   hostFiles: "relay:host-files",
+  /** Starting an update of the host's OS packages. See host-packages.ts. */
+  hostPackages: "relay:host-packages",
   instance: (id: string) => `instance:${id}`,
   instanceFiles: (id: string) => `instance:${id}/files`,
   /** Power and console input: anything that changes the running process. */
@@ -61,12 +68,16 @@ export const laneKeys = {
   platform: "relay:platform",
   /** One of the Relay's Docker named volumes. */
   volume: (id: string) => `volume:${id}`,
+  /** Writes to a volume's files through an App that uses it. */
+  volumeFiles: (id: string) => `volume:${id}/files`,
   /**
    * Removing what Kiln left on Docker: leftover containers no resource owns
    * and, later, images. See docker-cleanup.ts.
    */
   dockerCleanup: "relay:docker-cleanup",
   desktop: "relay:desktop",
+  /** Downloading the desktop image, which nobody attaching should wait for. */
+  desktopImage: "relay:desktop-image",
 } as const
 
 /**

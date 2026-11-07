@@ -70,6 +70,7 @@ const deleteServer = (user = owner) =>
     kind: "instance",
     relayId,
     resourceId: serverId,
+    storageId: null,
     user,
   })
 
@@ -92,7 +93,7 @@ const failBackup = (backupId: string) =>
   })
 
 describeMysql("Deleting a game server or database", () => {
-  layer(Lanes, { timeout: 120_000 })((it) => {
+  layer(Lanes)((it) => {
     const network = "e".repeat(40)
     const peer = `instance:${"f".repeat(40)}`
 

@@ -62,7 +62,7 @@ const changeDns = operation<void>()({
 })
 
 describeMysql("Hearth operations", () => {
-  layer(TestDatabase, { timeout: 60_000 })((it) => {
+  layer(TestDatabase)((it) => {
     it.effect(
       "refuses a person's conflicting change with what's running, while Hearth's own waits",
       () =>
@@ -249,8 +249,8 @@ describeMysql("Hearth operations", () => {
           ).pipe(Effect.forkChild({ startImmediately: true }))
           yield* Effect.yieldNow
 
-          // A backup to the preferred destination, which changes while it
-          // waits for the first one's save.
+          // Work whose lock follows a setting, which changes while it waits
+          // for the first one's save.
           let preferred = "first"
           const backingUp = yield* runOperation(
             operation<void>()({

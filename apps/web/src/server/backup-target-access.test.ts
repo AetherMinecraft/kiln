@@ -32,6 +32,7 @@ vi.mock("@/lib/relay-connection", async (importOriginal) => ({
   relayRpc: async (_relay: unknown, operation: string) => {
     if (operation !== "relay.volumes.read") throw new Error("Relay is offline")
     return {
+      filesAvailable: false,
       measuring: false,
       protection: relay.protectionReady
         ? { ready: true, reason: null }
@@ -183,6 +184,7 @@ describeMysql("App and volume backup authorization", () => {
               createResourceBackupHandler(user, {
                 name: "Before the upgrade",
                 relayId,
+                storageIds: [null],
                 target,
               })
             )

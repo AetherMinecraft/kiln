@@ -9,7 +9,7 @@ import { kilnReleaseLabel } from "@/lib/release-version"
 // What a notification says in a line or two, shared by the inbox and the
 // push notifications Hearth sends to devices.
 
-const resourceTypeLabels = {
+export const resourceTypeLabels = {
   app: "App",
   database: "Database",
   instance: "Game Server",
@@ -20,6 +20,17 @@ const resourceTypeLabels = {
 // made from its version for notifications written without it.
 function releaseName(name: string | undefined, version: string) {
   return name ?? kilnReleaseLabel(version)
+}
+
+// "Hearth and 3 Relays", "Frankfurt".
+function updatedParts({
+  hearth = true,
+  relays = [],
+}: Extract<NotificationContent, { kind: "kiln.updated" }>) {
+  const relayPart =
+    relays.length > 1 ? `${relays.length} Relays` : relays[0]?.name
+  if (!hearth) return relayPart ?? "Kiln"
+  return relayPart ? `Hearth and ${relayPart}` : "Hearth"
 }
 
 // "a Game Server", "an App".
@@ -34,7 +45,7 @@ export function notificationTitle(content: NotificationContent): string {
     case "kiln.release":
       return "Your Kiln has an update available"
     case "kiln.updated":
-      return "Your Kiln has been updated"
+      return "Kiln has been updated"
     case "access.invited": {
       const type = resourceTypeLabels[content.resource.type]
       switch (content.outcome) {
@@ -61,12 +72,13 @@ export function notificationTitle(content: NotificationContent): string {
     }
     case "app.image-update":
       return "Your App has an update available"
-    case "app.deployed":
-      return content.status === "failed"
-        ? "Your App failed to deploy"
-        : content.update
-          ? "Your App has been updated"
-          : "Your App has been deployed"
+    case "app.deployed": {
+      if (content.status === "failed") return "Your App failed to deploy"
+      const times = (content.count ?? 1) > 1 ? ` ${content.count} times` : ""
+      return content.update
+        ? `Your App has been updated${times}`
+        : `Your App has been deployed${times}`
+    }
     case "security.report":
       return content.count === 1
         ? "1 new vulnerability found"
@@ -94,7 +106,7 @@ export function notificationDetail(
     case "kiln.release":
       return releaseName(content.name, content.version)
     case "kiln.updated":
-      return `to ${releaseName(content.name, content.version)}`
+      return `${releaseName(content.previousName, content.previousVersion)} to ${releaseName(content.name, content.version)} · ${updatedParts(content)}`
     case "access.invited":
       return `${content.resource.name} - ${
         content.outcome === undefined ? "by" : "from"
@@ -104,11 +116,15 @@ export function notificationDetail(
     case "resource.disk-limit":
       return `${content.resource.name} - ${formatBytes(content.usedBytes)} of ${formatBytes(content.limitBytes)}`
     case "app.image-update":
-      return `Image - ${content.image}`
-    case "app.deployed":
-      return content.status === "failed"
-        ? `${content.resource.name} couldn't deploy`
-        : `${content.resource.name} has deployed successfully`
+      return `${content.resource.name} - ${content.image}`
+    case "app.deployed": {
+      const { count = 1, failures, resource, status } = content
+      if (failures && count > 1)
+        return `${resource.name} - ${failures} of ${count} failed`
+      return status === "failed"
+        ? `${resource.name} couldn't deploy`
+        : `${resource.name} has deployed successfully`
+    }
     case "security.report": {
       // "Up to critical in Survival and 2 more, 1 exploited".
       const { count, knownExploited, resources, severity } = content

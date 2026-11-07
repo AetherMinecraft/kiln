@@ -9,7 +9,8 @@ task model.
 - Back up game servers, managed databases, and the Kiln installation.
 - Store backups on the Relay or in an S3-compatible bucket.
 - Allow a platform S3 destination or a user-owned S3 destination to be chosen
-  per resource.
+  for each backup. Every backup names its destinations: there is no default to
+  fall back on, and a schedule's backup step names its own.
 - Let Relay finish work while Hearth is disconnected and reconcile the result
   after reconnecting.
 - Serialize backup and restore work per Relay to bound disk, CPU, and network
@@ -113,10 +114,9 @@ Artifact kinds are `archive`, `database_dump`, `platform_bundle`,
 A backup's `full`/`incremental` mode is recorded separately from its artifact
 kind; incremental game-server backups are `restic_snapshot`s.
 
-Each resource can set a preferred destination, exclude patterns, and its
-retention (see [Retention](#retention)): the most backups it keeps, the most
-logical space they take together, and the longest it keeps them. Platform
-admins can set a ceiling on each; the lower non-null value applies, and
+Each resource can set exclude patterns and its retention (see
+[Retention](#retention)): the most backups it keeps, the most logical space
+they take together, and the longest it keeps them. Platform admins can set a ceiling on each; the lower non-null value applies, and
 `null` keeps without that limit. A ceiling of no backups at all turns
 backups off for the resource, and is the only limit that refuses a new one.
 A backup can be at most as large as all the space kept. Final-deletion
@@ -369,7 +369,8 @@ as well as `backup.create`.
 ## Restore and deletion safety
 
 Game-server restore requires the instance to be stopped. Hearth can enqueue a
-full safety backup first; restore is submitted only after that task succeeds.
+full safety backup first, kept on the Relay; restore is submitted only after
+that task succeeds.
 Restore extracts into a sibling staging directory, validates every path and the
 manifest, then swaps directories where the filesystem permits. If an atomic
 swap is unavailable, Relay records the restore phase so recovery can complete
@@ -638,17 +639,13 @@ object versions after DeleteObjects; configure a bucket lifecycle rule if that
 storage must not remain billable.
 
 Destination deletion is two-phase: the row is marked `deleting` so new backups
-cannot select it, preferred destination policies that pointed at it are cleared,
-S3 repository prefixes are purged, then foreign keys on deleted catalog rows are
-cleared and the destination is removed. A purge failure leaves the destination
+cannot select it, S3 repository prefixes are purged, then foreign keys on
+deleted catalog rows are cleared and the destination is removed. A purge failure leaves the destination
 listed as `deleting` with `last_error` so the operator can retry instead of
 silently orphaning data.
 
-Development preview (`pnpm dev:docker`) starts a TLS MinIO at
-`https://minio:9000`. Register it as a platform destination with path-style
-access, private-network allowed, bucket `kiln-backups`, region `us-east-1`,
-access key `kiln`, and secret `kilnminiodevpassword`. Hearth and the Relay's
-full-archive uploads trust the generated certificate through
-`NODE_EXTRA_CA_CERTS`; Relay restic uses `RESTIC_CACERT`.
+Development stacks have no S3 of their own. They share one RustFS endpoint on
+the maintainers' tailnet; see
+[Tailnet S3](development.md#tailnet-s3) for it, and for running your own.
 
 Ceph RGW works through the S3-compatible destination.

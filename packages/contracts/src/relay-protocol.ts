@@ -165,6 +165,7 @@ export const relayControlOperations = [
   "relay.proxy.read",
   "relay.proxy.config.read",
   "relay.proxy.write",
+  "relay.proxy.trial",
   "relay.certificates.check",
   "relay.volumes.read",
   "relay.docker.storage",
@@ -189,6 +190,8 @@ export const relayControlOperations = [
   "relay.installation.replace",
   "relay.security.targets",
   "relay.security.inventory",
+  "relay.host.packages.read",
+  "relay.host.packages.update",
   "browser.authorization.revise",
   "brick.catalog",
   "brick.recipe",
@@ -261,6 +264,7 @@ export const relayControlOperations = [
   "instance.provision.cancel",
   "instance.startup.write",
   "instance.rename",
+  "instance.limits.write",
   "instance.delete",
   "instance.action",
   "instance.resources.read",
@@ -308,6 +312,7 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.update.apply",
   "relay.restart",
   "relay.host.restart",
+  "relay.host.packages.update",
   "relay.pairing.create",
   "relay.pairing.revoke",
   "relay.clients.update",
@@ -325,6 +330,7 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "relay.tailscale.stack.remove",
   "relay.tailscale.write",
   "relay.proxy.write",
+  "relay.proxy.trial",
   "relay.platform.action",
   "relay.terminal.attach",
   "relay.terminal.restart",
@@ -338,6 +344,7 @@ const auditedRelayControlOperations = new Set<RelayControlOperation>([
   "instance.provision.cancel",
   "instance.startup.write",
   "instance.rename",
+  "instance.limits.write",
   "instance.delete",
   "instance.action",
   "instance.files.write",
@@ -431,6 +438,7 @@ export function relayControlOperationChanges(
     case "relay.platform.database.read":
     case "relay.security.targets":
     case "relay.security.inventory":
+    case "relay.host.packages.read":
     case "brick.catalog":
     case "brick.recipe":
     case "database.list":
@@ -506,7 +514,9 @@ export function relayControlOperationChanges(
     case "relay.tailscale.stack.remove":
     case "relay.host.files.mount":
     case "relay.host.restart":
+    case "relay.host.packages.update":
     case "relay.proxy.write":
+    case "relay.proxy.trial":
     case "relay.certificates.check":
     case "relay.volumes.create":
     case "relay.volumes.rename":
@@ -562,6 +572,7 @@ export function relayControlOperationChanges(
     case "instance.provision.cancel":
     case "instance.startup.write":
     case "instance.rename":
+    case "instance.limits.write":
     case "instance.delete":
     case "instance.action":
     case "instance.files.write":
@@ -604,7 +615,7 @@ const terminalInputOperations = new Set<RelayControlOperation>([
   "relay.terminal.attach",
   "relay.terminal.claim",
   "relay.terminal.restart",
-  "relay.terminal.write",  // A desktop stream takes the keyboard and mouse.
+  "relay.terminal.write", // A desktop stream takes the keyboard and mouse.
   "relay.desktop.attach",
 ])
 
@@ -649,6 +660,7 @@ export function relayControlDeadlineMs(
   if (operation === "relay.tailscale.stack.dns") return 60_000
   // Proxy and networking writes can pull and start edge containers.
   if (operation === "relay.proxy.write") return 240_000
+  if (operation === "relay.proxy.trial") return 240_000
   if (operation === "relay.networking.write") return 240_000
   if (operation === "relay.tailscale.write") return 90_000
   if (operation === "relay.host.files.mount") return 60_000
@@ -659,9 +671,16 @@ export function relayControlDeadlineMs(
   // An inventory may first wait for the host to be less busy, then reads a
   // whole image through Docker at the lowest priority.
   if (operation === "relay.security.inventory") return 15 * 60_000
+  // Refreshing asks the host's package mirrors what's new.
+  if (operation === "relay.host.packages.read") return 120_000
+  // The shell helper may have to be pulled first; the update itself goes on
+  // without the Relay.
+  if (operation === "relay.host.packages.update") return 120_000
   if (operation === "instance.delete") return 360_000
   // Freezing stops the resource first, as a stop does.
   if (operation === "resource.freeze") return 240_000
+  // Waits its turn behind a restart in progress.
+  if (operation === "instance.limits.write") return 240_000
   if (operation === "database.create") return 360_000
   if (operation === "database.delete") return 180_000
   if (operation === "app.delete") return 180_000
@@ -771,6 +790,9 @@ export const RelayAuthResponseSchema = Schema.Struct({
   // Hearth's installation ID, which the Relay saves as its own. Relays
   // validate it themselves so an ID they can't use never fails authentication.
   installationId: Schema.optionalKey(Schema.String),
+  // What Hearth calls this Relay, which it saves as its own name. Hearth
+  // names a Relay when someone confirms it, after the Relay chose a default.
+  relayName: Schema.optionalKey(Schema.String),
   // The container Hearth runs in, and an HMAC of
   // `relayHearthContainerTranscript` keyed by its BETTER_AUTH_SECRETS, which
   // a Relay on the same host checks against that container's environment.

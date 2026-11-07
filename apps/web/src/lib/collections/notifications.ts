@@ -8,9 +8,10 @@ import type { QueryClient } from "@tanstack/react-query"
 import { queryCollectionOptions } from "@tanstack/query-db-collection"
 
 import { forkPromise } from "@/effect/promise"
-import type {
-  NotificationPreferences,
-  NotificationPreferencesUpdate,
+import {
+  mergeResourcePreferences,
+  type NotificationPreferences,
+  type NotificationPreferencesUpdate,
 } from "@/lib/notification-preferences"
 import type { InvitationOutcome, KilnNotification } from "@/lib/notifications"
 import { queryKeys } from "@/lib/query-options"
@@ -152,6 +153,19 @@ export function setCachedInvitationOutcome(
   )
 }
 
+/** Marks one notification read, for acting on it outside the inbox. */
+export function markCachedNotificationRead(
+  queryClient: QueryClient,
+  id: string
+) {
+  const observer = new MutationObserver(
+    queryClient,
+    markNotificationsReadMutationOptions(queryClient)
+  )
+  // A failure only rolls the read mark back; nothing to tell the user.
+  forkPromise(() => observer.mutate([id]))
+}
+
 /** How many of the newest notifications the popover lists. */
 export const notificationsPopoverLimit = 10
 
@@ -264,6 +278,11 @@ function applyPreferences(
   return {
     idleMinutes: update.idleMinutes ?? preferences.idleMinutes,
     kinds: { ...preferences.kinds, ...update.kinds },
+    resources: mergeResourcePreferences(
+      preferences.resources,
+      update.resources
+    ),
+    scope: update.scope ?? preferences.scope,
     security: { ...preferences.security, ...update.security },
     skipPushWhileActive:
       update.skipPushWhileActive ?? preferences.skipPushWhileActive,

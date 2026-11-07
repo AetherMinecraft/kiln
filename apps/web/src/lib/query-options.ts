@@ -68,7 +68,7 @@ import {
   type InstanceFavorite,
 } from "@/lib/instance-favorites"
 import { getRelayResources } from "@/server/relay-host"
-import { getRelayVolumes } from "@/server/relay-volumes"
+import { getAppVolumes, getRelayVolumes } from "@/server/relay-volumes"
 import { getRelayDockerStorage } from "@/server/relay-docker"
 import { isDatabaseFilePath } from "@/lib/database-files"
 import { traceFileWork } from "@/lib/file-timing"
@@ -215,8 +215,8 @@ export const queryKeys = {
   appDeployments: {
     list: (scope: { appId?: string; relayId?: string }) =>
       ["app-deployments", "list", scope] as const,
-    log: (deploymentId: string) =>
-      ["app-deployments", "log", deploymentId] as const,
+    log: (appId: string, deploymentId: string) =>
+      ["app-deployments", "log", appId, deploymentId] as const,
     summary: (relayId: string, appId: string) =>
       ["app-deployments", "summary", relayId, appId] as const,
     states: ["app-deployments", "states"] as const,
@@ -237,9 +237,6 @@ export const queryKeys = {
     // Outside "databases", so list refreshes don't measure the volume again.
     container: (relayId: string, databaseId: string) =>
       ["database-container", relayId, databaseId] as const,
-    // Outside "databases": it asks the Relay for every instance's limits.
-    capacity: (relayId: string, databaseId: string) =>
-      resourceLimitsCapacityKey(relayId, "database", databaseId),
   },
   fileActivity: (relayId: string, instanceId: string) =>
     ["file-activity", relayId, instanceId] as const,
@@ -288,6 +285,9 @@ export const queryKeys = {
   relayProxy: (relayId: string) => ["relays", "proxy", relayId] as const,
   relayControlDial: (relayId: string) =>
     ["relays", "control-dial", relayId] as const,
+  // Under the Relay's, so whatever refreshes those refreshes these.
+  appVolumes: (relayId: string, appId: string) =>
+    ["relays", "volumes", relayId, "app", appId] as const,
   relayVolumes: (relayId: string) => ["relays", "volumes", relayId] as const,
   relayDockerStorage: (relayId: string) =>
     ["relays", "docker-storage", relayId] as const,
@@ -711,34 +711,20 @@ export function managedDatabaseContainerQueryOptions(
   })
 }
 
-function resourceLimitsCapacityKey(
-  relayId: string,
-  kind: "app" | "database",
-  id: string
-) {
-  return ["resource-limits-capacity", relayId, kind, id] as const
-}
-
-// What the node can still give an app or database, for its limits editor;
-// null for those who can't see the node.
+// What the node can still give an instance, for its limits; null for those
+// who can't see the node. Its own key, as it asks the Relay for every
+// instance's limits, so list refreshes shouldn't repeat it.
 export function resourceLimitsCapacityQueryOptions(
   relayId: string,
-  kind: "app" | "database",
+  kind: "app" | "database" | "server",
   id: string
 ) {
   return queryOptions({
-    queryKey: resourceLimitsCapacityKey(relayId, kind, id),
+    queryKey: ["resource-limits-capacity", relayId, kind, id] as const,
     queryFn: () => getResourceLimitsCapacity({ data: { id, kind, relayId } }),
     retry: false,
     staleTime: 30_000,
   })
-}
-
-export function managedDatabaseCapacityQueryOptions(
-  relayId: string,
-  databaseId: string
-) {
-  return resourceLimitsCapacityQueryOptions(relayId, "database", databaseId)
 }
 
 export function accessCapabilitiesQueryOptions() {
@@ -913,6 +899,22 @@ export function unfinishedRestoresQueryOptions() {
   return queryOptions({
     queryFn: () => getUnfinishedRestores(),
     queryKey: queryKeys.backups.unfinished,
+    staleTime: 30_000,
+  })
+}
+
+// What one App owns or uses, which takes only reading that App.
+export function appVolumesQueryOptions(relayId: string, appId: string) {
+  return queryOptions({
+    queryFn: () => getAppVolumes({ data: { appId, relayId } }),
+    queryKey: queryKeys.appVolumes(relayId, appId),
+    refetchInterval: (query) =>
+      query.state.data?.measuring
+        ? 2_000
+        : query.state.data?.referencesKnown === false
+          ? 10_000
+          : false,
+    retry: false,
     staleTime: 30_000,
   })
 }
@@ -1183,11 +1185,17 @@ export function appGitHubSourceFileQueryOptions(
   })
 }
 
-export function appDeploymentLogQueryOptions(deploymentId: string) {
+export function appDeploymentLogQueryOptions(
+  appId: string,
+  deploymentId: string
+) {
   return queryOptions({
-    queryKey: queryKeys.appDeployments.log(deploymentId),
-    queryFn: () => getAppDeploymentLog({ data: { deploymentId } }),
+    queryKey: queryKeys.appDeployments.log(appId, deploymentId),
+    queryFn: () => getAppDeploymentLog({ data: { appId, deploymentId } }),
     retry: false,
+    // A finished log never changes; one that couldn't be read may come back.
+    staleTime: (query) =>
+      query.state.data?.log?.deployment.finishedAt ? Infinity : 0,
   })
 }
 

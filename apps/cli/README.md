@@ -215,15 +215,16 @@ kiln files sync <relay-id>:<instance-id> ./server --exclude 'logs/**' --exclude 
 kiln files sync <relay-id>:<instance-id> ./server --atomic --json
 kiln files sync <relay-id>:<instance-id> ./server --atomic --delete-managed --manifest ./managed.json --max-delete 5
 kiln backups list --limit 200
-kiln backups create server <relay-id>:<instance-id> --name "Before update"
+kiln backups create server <relay-id>:<instance-id> --storage local --name "Before update"
 kiln backups create server <relay-id>:<instance-id> --storage <destination-uuid>
-kiln backups create server <relay-id>:<instance-id> --mode full
+kiln backups create server <relay-id>:<instance-id> --storage local --mode full
 kiln backup download <backup-id>
-kiln server delete <relay-id>:<instance-id> --confirm "<server name>"
+kiln server delete <relay-id>:<instance-id> --confirm "<server name>" --storage local
 ```
 
 Deleting a server asks for its exact name with `--confirm` and your account
-password, prompted for in a terminal or piped with `--password-stdin`.
+password, prompted for in a terminal or piped with `--password-stdin`, and
+`--storage` for where its final backup goes.
 
 Disk quotas must be at least `0.1GiB`, matching the Relay allocation minimum.
 Server backups default to incremental restic snapshots and accept exactly one

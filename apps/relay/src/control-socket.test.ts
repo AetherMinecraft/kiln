@@ -133,6 +133,28 @@ describe("Relay control socket", () => {
     expect(code).toBe(4401)
   })
 
+  it("takes its name from a full-access Hearth, never a read-only one", async () => {
+    const adopted: Array<string> = []
+    const relay = await startRelay({
+      adoptRelayName: async (name) => {
+        adopted.push(name)
+      },
+    })
+    for (const role of ["read_only", "full_access"] as const) {
+      const hearth = await relay.pair({ role })
+      const { inbox, socket } = await relay.open()
+      const challenge = (await inbox.next()) as RelayAuthChallenge
+      socket.send(
+        JSON.stringify({
+          ...authResponse(challenge, hearth),
+          relayName: `Named by ${role}`,
+        })
+      )
+      expect(await inbox.next()).toMatchObject({ type: "auth.ready" })
+    }
+    expect(adopted).toEqual(["Named by full_access"])
+  })
+
   it("refuses the host shell to a read-only client", async () => {
     const relay = await startRelay()
     const hearth = await relay.pair({ role: "read_only" })
@@ -217,6 +239,36 @@ describe("Relay control socket", () => {
     expect(await inbox.next()).toMatchObject({
       code: "forbidden",
       replyTo: server,
+      type: "error",
+    })
+  })
+
+  it("takes a database's network permission to create an App connected to it", async () => {
+    const relay = await startRelay({
+      execute: async () => ({ prepared: true }),
+    })
+    const hearth = await relay.pair({ role: "custom", actions: ["app.create"] })
+    const { inbox, socket } = await relay.connect(hearth)
+    const app = {
+      id: "a".repeat(40),
+      idempotencyKey: randomUUID(),
+      name: "Blog",
+    }
+    const alone = sendRequest(socket, "app.provision.prepare", {
+      ...app,
+      databaseIds: [],
+    })
+    expect(await inbox.next()).toMatchObject({
+      replyTo: alone,
+      type: "response",
+    })
+    const connected = sendRequest(socket, "app.provision.prepare", {
+      ...app,
+      databaseIds: ["d".repeat(40)],
+    })
+    expect(await inbox.next()).toMatchObject({
+      code: "forbidden",
+      replyTo: connected,
       type: "error",
     })
   })
@@ -623,6 +675,7 @@ async function startFakeHearth() {
 
 async function startRelay(
   options: {
+    readonly adoptRelayName?: ControlSocketOptions["adoptRelayName"]
     readonly execute?: ControlSocketOptions["execute"]
     /** Dials the Hearths that ask it to, as the Relay does. */
     readonly dials?: boolean
@@ -641,6 +694,7 @@ async function startRelay(
   const lanes = options.lanes ?? new OperationLanes()
   let dials: ControlDials | null = null
   const control = attachControlSocket({
+    adoptRelayName: options.adoptRelayName,
     execute: options.execute ?? (async () => ({ ok: true })),
     lanes,
     requestLocks: (request) =>

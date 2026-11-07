@@ -619,6 +619,8 @@ class RelayConnection {
   >()
   #hasPushedSnapshot = false
   #pushedSnapshot: RelaySnapshot | null = null
+  #recordedVersion: string | null = null
+  #recordingVersion = false
   #eventSequence = 0
   #features = new Set<string>()
   // The journal the Relay keeps this Hearth's changes in (`auth.ready`).
@@ -689,6 +691,25 @@ class RelayConnection {
   /** Whether the Relay said, on its last connection, that it can dial. */
   get relayDials(): boolean {
     return this.#relayDials
+  }
+
+  // Once per connection, the first time the Relay says where it is.
+  #rememberBrowserOrigin(snapshot: RelaySnapshot): void {
+    const reported = snapshot.relay?.browserOrigin
+    if (!reported) return
+    const relayId = this.#relay.id
+    forkPromise(
+      async () => {
+        const { rememberRelayBrowserOrigin } =
+          await import("@/lib/relay-registry")
+        await rememberRelayBrowserOrigin(relayId, new URL(reported).origin)
+      },
+      (cause) => {
+        Effect.runFork(
+          Effect.logWarning("Couldn't save the Relay's browser origin", cause)
+        )
+      }
+    )
   }
 
   prefer(direction: RelayControlDirection): void {
@@ -916,6 +937,37 @@ class RelayConnection {
   }
 
   // Lets browsers know when the Relay's pause changes.
+  // A Relay says what it runs as it connects and with each sample, so a
+  // version Hearth hasn't recorded means it was updated. One that couldn't be
+  // recorded is tried again by the next sample. Imported here, since its
+  // notification reads access, which reaches Relays through this module.
+  #noticeVersion(version: string): void {
+    if (version === this.#recordedVersion || this.#recordingVersion) return
+    this.#recordingVersion = true
+    const { id } = this.#relay
+    forkAppEffect(
+      "relay.recordVersion",
+      Effect.promise(() => import("@/lib/relay-update-notifications")).pipe(
+        Effect.flatMap(({ recordConnectedRelayVersionEffect }) =>
+          recordConnectedRelayVersionEffect(id)
+        ),
+        Effect.tap((recorded) =>
+          Effect.sync(() => {
+            this.#recordedVersion = recorded
+          })
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logWarning(`Could not record Relay ${id}'s version`, cause)
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#recordingVersion = false
+          })
+        )
+      )
+    )
+  }
+
   #noticePause(previous: RelaySnapshot | null): void {
     const was = previous?.relay?.paused === true
     const is = this.#pushedSnapshot?.relay?.paused === true
@@ -1649,7 +1701,9 @@ class RelayConnection {
             this.#pushedSnapshot = pushed
             this.#hasPushedSnapshot = true
             this.#noticePause(previousSnapshot)
+            this.#noticeVersion(pushed.node.version)
             if (!previousSnapshot) {
+              this.#rememberBrowserOrigin(pushed)
               publishRealtimeChange({
                 relayId: this.#relay.id,
                 type: "relay.snapshot.reset",
@@ -1689,6 +1743,7 @@ class RelayConnection {
               previousSnapshot,
               delta
             )
+            if (node) this.#noticeVersion(node.version)
             // Most deltas are node samples; only the Relay's own part
             // carries certificates.
             if (delta.relay) {
@@ -1850,6 +1905,11 @@ class RelayConnection {
     const installationId = credentials.sendInstallationId
       ? loadedKilnInstallationId()
       : null
+    // Likewise its name, which its telemetry carries: a Relay that kept its
+    // ID belongs to another installation, which named it.
+    const relayName = credentials.sendInstallationId
+      ? credentials.relayName
+      : null
     const hearthContainer = hearthContainerClaim(
       challenge,
       credentials.clientId
@@ -1876,6 +1936,7 @@ class RelayConnection {
         type: "auth.response",
         v: 1,
         ...(installationId ? { installationId } : {}),
+        ...(relayName ? { relayName } : {}),
         ...(hearthContainer ? { hearthContainer } : {}),
         dial: dialTarget(),
       })

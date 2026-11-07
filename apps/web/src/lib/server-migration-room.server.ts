@@ -11,7 +11,6 @@ import {
 } from "@workspace/contracts"
 import { Schema } from "effect"
 
-import { resolveBackupStorageSelection } from "@/lib/backup-storage-selection.server"
 import { relayConnectionFeatures, relayRpc } from "@/lib/relay-connection"
 import type { PersistedRelay } from "@/lib/relay-registry"
 import { relayAllocations } from "@/lib/resource-limits.server"
@@ -94,7 +93,7 @@ export function migrationSourceRoom(
   rootBytes: number | null,
   given: ResourceLimits | null = null
 ): MigrationSourceRoom {
-  const limits = given ?? instance.limits
+  const limits = given ?? instance.pendingLimits ?? instance.limits
   const ownDisk = instance.limits.diskBytes ?? DEFAULT_INSTANCE_DISK_LIMIT_BYTES
   if (rootBytes !== null) {
     return { limits, usedBytes: rootBytes, usedFrom: "measured" }
@@ -104,19 +103,6 @@ export function migrationSourceRoom(
     return { limits, usedBytes: live, usedFrom: "running" }
   }
   return { limits, usedBytes: ownDisk, usedFrom: "limit" }
-}
-
-/** Whether the server's backups go to its own Relay by default. */
-export async function defaultBackupIsLocal(
-  relayId: string,
-  instanceId: string
-): Promise<boolean> {
-  const [storageId] = await resolveBackupStorageSelection({
-    relayId,
-    targetId: instanceId,
-    targetKind: "instance",
-  })
-  return storageId === null
 }
 
 /**
@@ -134,17 +120,12 @@ export async function checkMigrationRoom(input: {
   readonly subject?: string
 }): Promise<Array<MigrationRoomProblem>> {
   const same = input.source.id === input.destination.id
-  const [source, destination, backupLocal] = await Promise.all([
+  const [source, destination] = await Promise.all([
     loadRelayRoom(input.source, {
       rootId: input.instanceId,
       subject: input.subject,
     }),
     same ? null : loadRelayRoom(input.destination, { subject: input.subject }),
-    input.backup === null
-      ? false
-      : input.backup.storageId === undefined
-        ? defaultBackupIsLocal(input.source.id, input.instanceId)
-        : input.backup.storageId === null,
   ])
   const instance = source.snapshot.instances.find(
     (item) => item.id === input.instanceId
@@ -153,7 +134,7 @@ export async function checkMigrationRoom(input: {
   return migrationRoomProblems({
     destination: (destination ?? source).room,
     limits: input.limits,
-    localBackups: backupLocal ? 1 : 0,
+    localBackups: input.backup?.storageId === null ? 1 : 0,
     server: migrationSourceRoom(instance, source.rootBytes, input.copyLimits),
     source: source.room,
   })

@@ -4,6 +4,8 @@ import { isIP } from "node:net"
 import { hostname } from "node:os"
 import { Effect, Result } from "effect"
 
+import { ramInBytes } from "./docker-container-spec.js"
+
 import type {
   BrickReadiness,
   RelayInstancePortAllocation,
@@ -16,6 +18,7 @@ import {
   decodeRelayJoinLink,
   isKilnInstallationId,
   kilnGitRepositoryRawUrl,
+  kilnDesktopImage,
   resolveKilnGitRepository,
 } from "@workspace/contracts"
 
@@ -106,6 +109,7 @@ export interface ProvenContainer {
 }
 
 export interface RelayConfig {
+  checksPublicRoute: boolean
   advertisedHost: string
   advertisedHostInferred: boolean
   backupTimeoutMs: number
@@ -141,8 +145,17 @@ export interface RelayConfig {
   // Relay runs on. Docker access already amounts to root there; this lets an
   // operator keep it out of the panel.
   hostAccess: boolean
-  /** The voxl image that streams the node's desktop; none turns it off. */
-  desktopImage: string | null
+  /**
+   * The memory to leave for Kiln and the OS, from
+   * KILN_RELAY_RESERVED_MEMORY, or null for the default.
+   */
+  reservedMemoryBytes: number | null
+  /** Whether workloads run under a memory limit on the node. */
+  workloadMemoryLimit: boolean
+  /** The voxl image that streams the node's desktop. */
+  desktopImage: string
+  /** Where a Relay in Docker on a Mac reaches the Mac's Screen Sharing. */
+  screenSharingAddress: { readonly host: string; readonly port: number }
   // Where the host's filesystem is mounted; Files are off when it isn't.
   hostRootDirectory: string
   gameHost: string
@@ -182,6 +195,11 @@ export interface RelayConfig {
   nodeName: string
   port: number
   platformBackupKey: string | null
+  /**
+   * The database platform backups use when Hearth's sits on a MySQL it
+   * shares, as development stacks do, which no label or proof can name.
+   */
+  platformDatabase: { container: string; name: string } | null
   /**
    * Hearth behind bundled Traefik, by the host people open it at; set from
    * the installation record once platform mode starts.
@@ -306,6 +324,9 @@ export function loadConfig(
           ? (coolifyPublicOrigin ?? `https://${formatUrlHost(advertisedHost)}`)
           : directBrowserOrigin,
     browserLimits: relayBrowserLimits(environment),
+    // The installer sets it on a Relay it added connecting to Hearth by
+    // default, not on one someone asked to keep that way.
+    checksPublicRoute: environment.KILN_RELAY_PUBLIC_ROUTE?.trim() === "check",
     canProvisionInstances: booleanEnvironment(
       environment.KILN_RELAY_ALLOW_PROVISIONING,
       true
@@ -319,7 +340,15 @@ export function loadConfig(
     dockerSocket: "/var/run/docker.sock",
     dataDirectory,
     hostAccess: booleanEnvironment(environment.KILN_RELAY_HOST_ACCESS, true),
-    desktopImage: environment.KILN_RELAY_DESKTOP_IMAGE?.trim() || null,
+    reservedMemoryBytes: reservedMemory(environment),
+    workloadMemoryLimit: booleanEnvironment(
+      environment.KILN_RELAY_WORKLOAD_MEMORY_LIMIT,
+      true
+    ),
+    desktopImage:
+      environment.KILN_RELAY_DESKTOP_IMAGE?.trim() ||
+      kilnDesktopImage(gitRepository),
+    screenSharingAddress: screenSharingAddress(environment),
     hostRootDirectory: environment.KILN_RELAY_HOST_ROOT?.trim() || "/host",
     gameHost,
     gamePortRange: relayGamePortRange(environment),
@@ -340,6 +369,7 @@ export function loadConfig(
     nodeName: environment.KILN_RELAY_NAME?.trim() || "",
     port,
     platformBackupKey: optionalPlatformBackupKey(environment),
+    platformDatabase: platformDatabase(environment),
     platformEdge: null,
     platformProxy: mode === "platform" ? platformProxy(environment) : "none",
     publicPort,
@@ -518,6 +548,28 @@ function optionalInstallationId(environment: NodeJS.ProcessEnv): string | null {
   return value
 }
 
+function platformDatabase(
+  environment: NodeJS.ProcessEnv
+): RelayConfig["platformDatabase"] {
+  const container = optionalDockerIdentifier(
+    environment,
+    "KILN_RELAY_PLATFORM_DATABASE_CONTAINER"
+  )
+  const name = environment.KILN_RELAY_PLATFORM_DATABASE_NAME?.trim() || null
+  if (!container && !name) return null
+  if (!container || !name) {
+    throw new Error(
+      "KILN_RELAY_PLATFORM_DATABASE_CONTAINER and KILN_RELAY_PLATFORM_DATABASE_NAME must be set together"
+    )
+  }
+  if (!/^[A-Za-z0-9_]{1,64}$/u.test(name)) {
+    throw new Error(
+      "KILN_RELAY_PLATFORM_DATABASE_NAME must be at most 64 letters, numbers, or underscores"
+    )
+  }
+  return { container, name }
+}
+
 function optionalDockerIdentifier(
   environment: NodeJS.ProcessEnv,
   name: string
@@ -623,6 +675,17 @@ function parseCoolifyPublicOrigin(raw: string): string {
 function effectiveUrlPort(url: URL): number {
   if (url.port) return Number(url.port)
   return url.protocol === "https:" ? 443 : 80
+}
+
+function screenSharingAddress(environment: NodeJS.ProcessEnv) {
+  const value =
+    environment.KILN_RELAY_SCREEN_SHARING_ADDRESS?.trim() ||
+    "host.docker.internal:5900"
+  const [, host, port] = /^([A-Za-z0-9.-]+):(\d{1,5})$/u.exec(value) ?? []
+  if (!host || !port || Number(port) > 65_535) {
+    throw new Error("KILN_RELAY_SCREEN_SHARING_ADDRESS must be host:port")
+  }
+  return { host, port: Number(port) }
 }
 
 function traefikImage(environment: NodeJS.ProcessEnv): string {
@@ -855,6 +918,18 @@ function sftpDevAuthentication(environment: NodeJS.ProcessEnv): boolean {
     throw new Error("Development SFTP authentication cannot run in production")
   }
   return enabled
+}
+
+function reservedMemory(environment: NodeJS.ProcessEnv): number | null {
+  const value = environment.KILN_RELAY_RESERVED_MEMORY?.trim()
+  if (!value) return null
+  const bytes = Result.try(() => ramInBytes(value))
+  if (Result.isFailure(bytes)) {
+    throw new Error(
+      `KILN_RELAY_RESERVED_MEMORY must be a size like 3g, received ${value}`
+    )
+  }
+  return bytes.success
 }
 
 function booleanEnvironment(value: string | undefined, fallback: boolean) {

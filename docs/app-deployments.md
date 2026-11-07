@@ -5,9 +5,11 @@ a GitHub repository. Each deployment is recorded in Hearth
 (`app_deployment`) and listed under **Infrastructure → Deployments**, across
 every Relay the person can read apps on. Scoped to one app, from the
 Deployment card on its Info rail, it's that app's history. The Relay keeps
-the logs of each app's 20 latest deployments; the list opens them. It keeps
-the images of each app's 5 newest successful deployments, and any build for
-a day; older ones are removed (see
+the logs of each app's 20 latest deployments. They open on the app's Logs
+page, which lists them beside its containers: the one the Relay is on is
+followed live, and any other reads the log the Relay saved. It keeps the
+images of each app's 5 newest successful deployments, and any build for a
+day; older ones are removed (see
 [Relay runtime](relay-runtime.md#docker-cleanup)). Deploying an older one
 again builds or pulls it again.
 
@@ -138,14 +140,22 @@ reserves both copies' memory.
 The Relay manages two kinds of Docker named volume, each with an ID that
 backups and deletion name it by:
 
-- **Kiln volumes**, made on the Relay's Volumes page and mounted from an
-  app's Volumes section. A Kiln volume's ID is the one it was made with. No
+- **Kiln volumes**, made on the Relay's Volumes page or while adding one to
+  an app, and mounted from an app's Volumes section, which also reads a line
+  from a Compose file such as `site-data:/var/www/data:ro`. A Kiln volume's
+  ID is the one it was made with. No
   app owns one: any app's configuration may mount it.
 - **An app's Compose volumes**, those its Compose file declares. The app
   owns them, and their ID is the app's ID and the volume's key in the file,
   `<app ID>/<key>`. Compose labels each volume with its project and key, and
   the Relay reads the owner from those labels, so the ID holds whatever
   Docker name the file gives the volume.
+
+A volume an app owns or uses opens in that app's Files page, as a file root
+of its own, `app:<app ID>:volume:<volume ID>`. It takes the app's file
+permissions, and the Relay refuses any volume the app neither owns nor uses.
+Docker keeps volumes on the host, so this needs the Relay's host files
+mounted, as the Relay's own Files page does.
 
 A redeploy keeps an app's Compose volumes: Compose runs under the app's own
 project name and finds them again. A rolled deployment runs as a project of
@@ -200,6 +210,24 @@ it per app: volumes Docker named itself, such as those an image declares,
 named volumes Kiln doesn't manage, and paths on the node outside the app's
 folder. Files an app's configuration mounts and a repository checkout don't
 count; each deployment writes them again.
+
+## Starting with a database
+
+**Add App** can start an app connected to a database: a new one on its Relay,
+or one already there. Connecting to an existing database copies its
+credentials, so it takes that database's `database.network.write` and
+`database.credentials.read`; creating one takes `database.create`.
+
+Hearth creates a new database first, so one that can't be made leaves no app,
+then records the app with the connection's variables in its environment:
+`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, and `DB_NAME`, which Redis and
+Valkey don't have. They're an ordinary part of the environment, copied once:
+edit them like any other, and change `DB_PASS` after rotating the password.
+
+The Relay saves the connection when the app's provisioning job runs, whether
+or not the database exists yet. A deployment waits while a database the app
+is connected to is still provisioning, since its containers couldn't join a
+network that isn't there; one whose provisioning failed doesn't hold it up.
 
 ## How deployments queue
 

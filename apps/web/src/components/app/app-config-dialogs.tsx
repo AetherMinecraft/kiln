@@ -24,6 +24,7 @@ import {
 } from "@/components/app/app-presentation"
 import { CodeDocumentPanel } from "@/components/code-document-panel"
 import { recoverPromise } from "@/effect/promise"
+import { environmentWrapPreference } from "@/lib/environment-wrap-preference"
 import { instanceInventoryScope } from "@/lib/instance-inventory"
 import {
   GitHubSourceFields,
@@ -42,7 +43,7 @@ import { deployApp, updateAppConfig } from "@/server/apps"
 // deploys when asked; changes otherwise apply on the next deploy.
 
 export type EditableAppConfig = AppConfig
-type SaveNext = "deploy" | "stay"
+export type SaveNext = "deploy" | "stay"
 
 export function useAppConfigSave(
   app: Pick<App, "id" | "permissions" | "relayId">,
@@ -81,7 +82,13 @@ export function useAppConfigSave(
       }
       return { config: result.config, next }
     },
-    onSuccess: async ({ config, next }) => {
+    onSuccess: async ({ config, next }, { config: changed }) => {
+      // First, so a volume just added is known before a row shows it.
+      if (changed.mounts) {
+        await queryClient.invalidateQueries({
+          queryKey: queryKeys.appVolumes(app.relayId, app.id),
+        })
+      }
       queryClient.setQueryData(
         queryKeys.apps.config(app.relayId, app.id),
         (current: { environmentHidden: boolean } | undefined) => ({
@@ -141,6 +148,7 @@ export const appDocuments = {
     noun: "environment",
     path: ".env",
     placeholder: "DATABASE_URL=postgres://…\nNODE_ENV=production",
+    wrapPreference: environmentWrapPreference,
   },
 } as const
 
@@ -152,9 +160,11 @@ export function AppDocumentDialog({
   kind,
   ...props
 }: {
-  app: Pick<App, "id" | "permissions" | "relayId">
+  app: Pick<App, "containers" | "id" | "permissions" | "relayId">
   canManage: boolean
   deploying: boolean
+  // Where the cursor opens, such as at a volume's definition.
+  cursorAt?: number | undefined
   kind: AppDocumentKind
   onOpenChange: (open: boolean) => void
   routeId: string
@@ -177,15 +187,25 @@ export function AppCodeDialog({
   configFor,
   deploying,
   document,
+  cursorAt,
   onOpenChange,
   routeId,
   saved,
 }: {
-  app: Pick<App, "id" | "permissions" | "relayId">
+  app: Pick<App, "containers" | "id" | "permissions" | "relayId">
   canManage: boolean
   configFor: (draft: string) => Partial<EditableAppConfig>
   deploying: boolean
-  document: { hint: string; noun: string; path: string; placeholder: string }
+  cursorAt?: number | undefined
+  document: {
+    hint: string
+    noun: string
+    path: string
+    placeholder: string
+    wrapPreference?: React.ComponentProps<
+      typeof CodeDocumentPanel
+    >["wrapPreference"]
+  }
   onOpenChange: (open: boolean) => void
   routeId: string
   saved: string
@@ -205,13 +225,14 @@ export function AppCodeDialog({
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className="gap-0 overflow-hidden p-0 sm:max-w-5xl">
+      <DialogContent className="gap-0 overflow-hidden p-0 sm:max-w-6xl">
         <DialogHeader className="sr-only">
           <DialogTitle>{document.path}</DialogTitle>
           <DialogDescription>{document.hint}</DialogDescription>
         </DialogHeader>
         <CodeDocumentPanel
-          actions={
+          className="h-[min(84dvh,52rem)] min-h-0"
+          footer={
             canManage ? (
               <>
                 <Button
@@ -237,7 +258,9 @@ export function AppCodeDialog({
                   ) : (
                     <Rocket />
                   )}
-                  Save and deploy
+                  {app.containers.length > 0
+                    ? "Save and redeploy"
+                    : "Save and deploy"}
                 </Button>
               </>
             ) : null
@@ -252,9 +275,11 @@ export function AppCodeDialog({
                 }
               : undefined
           }
+          cursorAt={cursorAt}
           languagePath={document.path}
           noun={document.noun}
           title={document.path}
+          wrapPreference={document.wrapPreference}
         />
       </DialogContent>
     </Dialog>

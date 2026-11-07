@@ -315,11 +315,19 @@ exits are counted from Docker's events as they happen. Every metric is
 labelled with `relay.id`.
 
 Container metrics carry `kiln.container.group`, one of `relay`, `hearth`,
-`mysql`, `valkey` (the last three in platform mode), `relay_services`
-(Traefik, CoreDNS, Tailscale, Limbo), `game_server`, `app`, `database`, or
-`other` for every container Kiln doesn't run, such as Coolify's. Workloads
-are summed per kind, never labelled per resource, and every group is written
-each sample, so one that empties reads zero.
+`mysql`, `valkey`, `relay_services` (Traefik, CoreDNS, Tailscale, Limbo),
+`game_server`, `app`, `database`, or `other` for every container Kiln doesn't
+run, such as Coolify's. Workloads are summed per kind, never labelled per
+resource, and every group is written each sample, so one that empties reads
+zero.
+
+`hearth`, `mysql`, and `valkey` are Hearth and the database and cache it uses,
+whatever their engine (`mysql` includes MariaDB, `valkey` includes Redis) and
+however they were deployed. The Relay on their Docker host finds them the way
+[Kiln's pages](self-hosting.md#installs-that-run-hearth-by-hand) do, once a
+minute, so Hearth, MySQL, and Valkey deployed by Coolify report without any
+labels. Only a Relay on their host can see them: without one these groups read
+zero on every Relay, and only Hearth's own process metrics below report.
 
 | Metric                                                                                       | Meaning                                                                                                                                                                                |
 | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -340,6 +348,20 @@ kernel 4.20 or later with it enabled (Debian also needs `psi=1` on the kernel
 command line); without it the pressure metric is absent. Counters start from
 the Relay's first sample, so a restart loses at most one interval.
 
+## Hearth's process metrics
+
+With the same `OTEL_METRICS_EXPORTER=otlp`, Hearth reports its own process
+every fifteen seconds, from inside it, so these report however Hearth was
+deployed and whether or not a Relay shares its host. Its container's numbers
+are the `hearth` group above, which also counts child processes such as Grype:
+expect that group's CPU to run well above `hearth.cpu.time` while Grype
+updates its database.
+
+| Metric                                                                   | Meaning                                                      |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| `hearth.memory.rss`, `hearth.memory.heap_used`, `hearth.memory.external` | Resident memory, the JavaScript heap, and native memory.     |
+| `hearth.cpu.time`                                                        | CPU seconds Hearth's process used. Its rate is cores in use. |
+
 ## Connection drops
 
 Both ends log each control connection that ends, unsampled, so a drop that
@@ -356,6 +378,77 @@ sides of one session can be lined up.
 | `Hearth's control connection opened`                              | Relay  | A session authenticated, with who opened it and its session ID.                                                                                                                                                                                                                                                                                                                                       |
 | `Hearth's control connection closed`                              | Relay  | An authenticated session ended, with its close code and reason, who opened it, and the time since Hearth last answered a ping.                                                                                                                                                                                                                                                                        |
 | `Dropped Hearth's control connection: it stopped answering pings` | Relay  | The Relay's 15-second heartbeat got no pong in time and dropped the session.                                                                                                                                                                                                                                                                                                                          |
+
+## Workload memory limit
+
+Game servers, Apps, and databases on a node run under one systemd slice,
+`kilnworkloads.slice`, with a memory ceiling they share, which leaves the rest
+to Kiln and the OS. Its size is the node's memory less a reserve (see
+[Memory for Kiln and the OS](self-hosting.md#memory-for-kiln-and-the-os)).
+The slice takes no memory itself; it's a ceiling, not a set-aside amount. Each
+workload keeps its own limit.
+
+The Relay sets the slice up each time it starts, as a short-lived privileged
+container that enters the host, like [host access](#host-access) and under
+the same `KILN_RELAY_HOST_ACCESS` setting:
+
+    systemctl set-property kilnworkloads.slice MemoryMax=<bytes> MemorySwapMax=0 CPUWeight=50
+
+The name has no hyphen because systemd reads one as nesting. It needs Docker
+on systemd's cgroup driver and cgroup v2, not rootless, and a Relay with no
+`KILN_RELAY_RESOURCE_NAMESPACE`, since a namespaced Relay shares its Docker
+host. Anywhere else the Relay logs why and runs without it. Hearth's assignable
+memory applies either way.
+
+New workloads go in the slice only once the kernel is seen enforcing it: a
+probe container has to land in the slice with `memory.max` at the right value.
+If that fails on a first setup, the change is undone. If it fails on a node with
+a limit already, the limit stays, and new workloads stay out of the slice until
+a later start confirms it. The same probe failing never stops the Relay or a
+workload starting.
+
+**What it covers.** Only memory charged inside the slice. App builds run in
+Docker's daemon, and other software on the host and Kiln's own containers run
+outside it, so they aren't held back, and a runaway Kiln container can still
+press on workloads. Workloads with no memory limit share what the others
+leave, so one can still starve another; the ceiling holds them all together.
+The Relay also sets `OomScoreAdj=300` on workloads, which makes them likelier
+victims of a node-wide out-of-memory kill but doesn't guarantee it. `CPUWeight=50`
+gives everything outside the slice, as a whole, twice the slice's share while
+CPUs are contended, and nothing while they aren't.
+
+**Existing workloads** need a new container to enter the slice, and the Relay
+never restarts one for it. A game server moves the next time it starts or
+restarts, an App on its next deployment, and a database when its container is
+next replaced. Until then it runs outside the ceiling, and the Node card counts
+it.
+
+**Size changes.** The ceiling stays as high as the memory limits already
+assigned, up to the node's memory and rounded down to a whole MiB, so a node
+over budget when this arrives keeps what they promise. Bringing those limits
+down doesn't bring the ceiling with them. The Node card shows it above its
+target until someone lowers it. Raising it takes effect at once, without
+restarting anything.
+
+The Relay never lowers a ceiling, because that can kill workloads. Raising the
+reserve therefore leaves an existing ceiling as it is, and the Node card shows
+it above its target. To lower it, accepting that risk, run this on the host. The
+Relay keeps a ceiling set this way, as long as it isn't below the target:
+
+    systemctl set-property kilnworkloads.slice MemoryMax=<bytes>
+
+**Turning it off.** Set `KILN_RELAY_WORKLOAD_MEMORY_LIMIT=false` and restart the
+Relay, which removes the limit from the running slice. Workloads stay in the
+slice, unlimited. With host access off, or to remove it by hand, run both of
+these on the host, since `systemctl revert` alone leaves the kernel enforcing
+the old limit:
+
+    systemctl set-property kilnworkloads.slice MemoryMax=infinity MemorySwapMax=infinity CPUWeight=100
+    systemctl revert kilnworkloads.slice
+
+Kiln owns the slice's settings: each Relay start sets its swap and CPU weight
+again, and raises a ceiling that's below the target. Use
+`KILN_RELAY_RESERVED_MEMORY` to change the target.
 
 ## Host access
 

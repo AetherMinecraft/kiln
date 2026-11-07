@@ -236,7 +236,10 @@ export class DockerEngine {
   info(options: { readonly timeout?: number } = {}): Effect.Effect<
     {
       readonly Architecture?: string
+      readonly CgroupDriver?: string
+      readonly CgroupVersion?: string
       readonly KernelVersion?: string
+      readonly Labels?: ReadonlyArray<string> | null
       readonly OperatingSystem?: string
       readonly SecurityOptions?: ReadonlyArray<string> | null
       readonly ServerVersion?: string

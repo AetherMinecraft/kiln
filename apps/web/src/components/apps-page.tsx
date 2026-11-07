@@ -57,6 +57,12 @@ import {
 import { useAppDeployState } from "@/components/app/use-app-deploy-state"
 import { DeleteAppDialog } from "@/components/app/app-dialogs"
 import {
+  AppDatabaseFields,
+  appDatabaseInput,
+  noAppDatabase,
+  type AppDatabaseDraft,
+} from "@/components/app/app-database-fields"
+import {
   GitHubSourceFields,
   emptyGitHubSourceDraft,
   githubSourceDraftReady,
@@ -477,15 +483,17 @@ const AppActions = React.memo(function AppActions({
         id: app.id,
       }),
     })
+  const deployName =
+    (app.detail?.containerCount ?? 0) > 0 ? "Redeploy" : "Deploy"
   const deploy = useMutation({
     mutationFn: () =>
       deployApp({ data: { appId: app.id, relayId: app.relayId } }),
     onSuccess: async () => {
       // It runs once any deployment running ends.
-      showToast({ message: "Deploy queued", type: "success" })
+      showToast({ message: `${deployName} queued`, type: "success" })
       await invalidate()
     },
-    onError: (error) => showAppOperationError("Deploy failed", error),
+    onError: (error) => showAppOperationError(`${deployName} failed`, error),
   })
   const action = useMutation({
     mutationFn: (nextAction: "restart" | "start" | "stop") =>
@@ -504,7 +512,7 @@ const AppActions = React.memo(function AppActions({
   const deploying = app.detail?.deploying === true || hearth?.deploying === true
   // Waiting its turn: asking again would only join it.
   const queued = !deploying && hearth?.queuedId != null
-  const deployLabel = deploying ? "Deploying" : queued ? "Queued" : "Deploy"
+  const deployLabel = deploying ? "Deploying" : queued ? "Queued" : deployName
   const running =
     state.phase === "ready" && state.observation.runtime === "running"
   const busy = deploy.isPending || action.isPending
@@ -520,7 +528,7 @@ const AppActions = React.memo(function AppActions({
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
-                aria-label={`Deploy ${app.name}`}
+                aria-label={`${deployName} ${app.name}`}
                 className="text-muted-foreground hover:text-primary-ink"
                 disabled={deployDisabled}
                 size="icon-sm"
@@ -715,10 +723,18 @@ function CreateAppDialog({
     () => availableRelays.at(0)?.id ?? ""
   )
   const [github, setGitHub] = React.useState(emptyGitHubSourceDraft)
+  const [database, setDatabase] =
+    React.useState<AppDatabaseDraft>(noAppDatabase)
   const relayLabelId = React.useId()
   const create = useMutation({
     mutationFn: async () => {
-      const created = await createApp({ data: { name: name.trim(), relayId } })
+      const created = await createApp({
+        data: {
+          database: appDatabaseInput(database, name.trim()),
+          name: name.trim(),
+          relayId,
+        },
+      })
       if (kind !== "github") return { created, sourceError: null }
       // The app exists by now; a source it can't save is set on its page.
       const saved = await recoverPromise(
@@ -815,7 +831,14 @@ function CreateAppDialog({
             <span id={relayLabelId} className="mb-2 block text-xs font-medium">
               Relay
             </span>
-            <Select value={relayId} onValueChange={setRelayId}>
+            <Select
+              value={relayId}
+              onValueChange={(next) => {
+                setRelayId(next)
+                // What's on one Relay, or allowed there, isn't on another.
+                setDatabase(noAppDatabase)
+              }}
+            >
               <SelectTrigger
                 aria-labelledby={relayLabelId}
                 className="h-9 w-full px-3"
@@ -831,6 +854,12 @@ function CreateAppDialog({
               </SelectContent>
             </Select>
           </div>
+          <AppDatabaseFields
+            appName={name.trim()}
+            draft={database}
+            relayId={relayId}
+            onChange={setDatabase}
+          />
           {kind === "github" ? (
             <GitHubSourceFields draft={github} onChange={setGitHub} />
           ) : null}

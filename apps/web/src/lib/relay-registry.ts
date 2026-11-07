@@ -1063,6 +1063,23 @@ export async function updatePersistedRelay(input: {
   return relay
 }
 
+// Keeps what a connected Relay reports as where browsers reach it, so it
+// follows a Relay that moved even if Hearth was away when it did.
+export async function rememberRelayBrowserOrigin(
+  id: string,
+  browserOrigin: string
+): Promise<void> {
+  const [result] = await databasePool.execute<
+    import("mysql2/promise").ResultSetHeader
+  >(
+    `UPDATE ${databaseTable("relay")}
+        SET browser_origin = ?, updated_at = ?
+      WHERE id = ? AND browser_origin <> ?`,
+    [browserOrigin, Date.now(), id, browserOrigin]
+  )
+  if (result.affectedRows > 0) publishRelayCollectionChange(id)
+}
+
 export async function setPersistedRelayEnabled(
   id: string,
   enabled: boolean
@@ -1256,7 +1273,7 @@ export async function inspectPersistedRelay(
         `UPDATE ${databaseTable("relay")}
           SET last_connected_at = ?, last_error = NULL,
               managed_ember_count = ?, node_arch = ?,
-              node_platform = ?, node_version = ?, updated_at = ?
+              node_platform = ?, updated_at = ?
         WHERE id = ?`,
         [
           now,
@@ -1264,7 +1281,6 @@ export async function inspectPersistedRelay(
             .length,
           snapshot.node.arch,
           snapshot.node.platform,
-          snapshot.node.version,
           now,
           id,
         ]
@@ -1327,11 +1343,12 @@ export function loadRelayCredentials(
 }
 
 /**
- * What Hearth connects to a Relay with: its credentials, and whether it
- * sends its installation ID (`send_installation_id`), which a Relay with
- * none saves as its own.
+ * What Hearth connects to a Relay with: its credentials, its name for the
+ * Relay, and whether it sends its installation ID (`send_installation_id`),
+ * which a Relay with none saves as its own.
  */
 export type RelayConnectionCredentials = RelayCredentials & {
+  relayName: string
   sendInstallationId: boolean
 }
 
@@ -1361,6 +1378,7 @@ export const loadRelayCredentialsEffect = Effect.fn("relays.credentials")(
     }
     return {
       ...(yield* decryptRelayCredentialsEffect(encryptedRelayCredentials(row))),
+      relayName: row.name,
       sendInstallationId: Boolean(row.send_installation_id),
     } satisfies RelayConnectionCredentials
   }

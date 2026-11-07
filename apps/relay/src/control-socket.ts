@@ -139,6 +139,8 @@ export interface ControlSocketOptions {
   // Saves the installation ID a full-access Hearth authenticated with. The
   // session is ready only once this settles; it reports its own failures.
   readonly adoptInstallationId?: (installationId: string) => Promise<void>
+  // Saves the name a full-access Hearth calls this Relay, the same way.
+  readonly adoptRelayName?: (name: string) => Promise<void>
   /**
    * Checks, in the background, the container a full-access Hearth says it
    * runs in: `proof` must be an HMAC of `transcript` keyed by that
@@ -545,6 +547,7 @@ function authenticateSocket(
           message.signature,
           message.features ?? [],
           message.installationId,
+          message.relayName,
           message.hearthContainer
         ).pipe(
           Effect.tap(() =>
@@ -793,6 +796,7 @@ function authenticateSocket(
     signature: string,
     features: ReadonlyArray<string>,
     installationId: string | undefined,
+    relayName: string | undefined,
     hearthContainer: { readonly id: string; readonly proof: string } | undefined
   ): EffectType.Effect<void, Error> {
     return Effect.gen(function* () {
@@ -827,6 +831,7 @@ function authenticateSocket(
       yield* completedAuthenticationEffect(
         client,
         installationId,
+        relayName,
         hearthContainer
       )
     })
@@ -1262,6 +1267,7 @@ function authenticateSocket(
   function completedAuthenticationEffect(
     client: RelayClientGrant,
     installationId: string | undefined,
+    relayName: string | undefined,
     hearthContainer: { readonly id: string; readonly proof: string } | undefined
   ): EffectType.Effect<void, Error> {
     return Effect.gen(function* () {
@@ -1283,6 +1289,10 @@ function authenticateSocket(
       const adopt = options.adoptInstallationId
       if (adopt && installationId && client.role === "full_access") {
         yield* promiseOperation(() => adopt(installationId)).pipe(Effect.ignore)
+      }
+      const adoptName = options.adoptRelayName
+      if (adoptName && relayName && client.role === "full_access") {
+        yield* promiseOperation(() => adoptName(relayName)).pipe(Effect.ignore)
       }
       if (
         options.identifyHearth &&
@@ -1697,6 +1707,17 @@ function memberActionsForRequest(
     // It connects Apps.
     case "database.network.import":
       return ["app.manage"]
+    // A new App connected to databases changes their connections too.
+    case "app.create":
+    case "app.provision.prepare": {
+      const databaseIds =
+        request.payload && typeof request.payload === "object"
+          ? (request.payload as Record<string, unknown>).databaseIds
+          : undefined
+      return Array.isArray(databaseIds) && databaseIds.length > 0
+        ? ["database.network.write"]
+        : []
+    }
     default:
       return []
   }
@@ -1789,8 +1810,10 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "relay.platform.terminal.claim":
     case "relay.platform.terminal.restart":
       return "relay.terminal"
-    // A root shell on the host could reboot it anyway.
+    // A root shell on the host could reboot it anyway, or update it.
     case "relay.host.restart":
+    case "relay.host.packages.read":
+    case "relay.host.packages.update":
       return "relay.terminal"
     case "relay.database.read":
       return "relay.database.read"
@@ -1804,6 +1827,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "relay.proxy.config.read":
       return "instance.network.read"
     case "relay.proxy.write":
+    case "relay.proxy.trial":
       return "relay.configure"
     // Has Traefik ask again for a route's certificate: what changing that
     // route takes. Hearth checks the person may.
@@ -2001,6 +2025,7 @@ function actionForRequest(request: RelayControlRequest): RelayAction | null {
     case "instance.provision.prepare":
     case "instance.provision.claim":
     case "instance.startup.write":
+    case "instance.limits.write":
       return "instance.create"
     case "instance.provision.cancel":
       return "instance.delete"

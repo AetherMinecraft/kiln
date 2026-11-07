@@ -95,6 +95,7 @@ import {
 } from "@/components/backups/table-row"
 import { formatBytes } from "@/lib/format-bytes"
 import { BackupToolbar } from "@/components/backups/toolbar"
+import { notALoginField } from "@/lib/not-a-login-field"
 import { grantHasPermission } from "@/lib/permissions"
 import {
   backupTargetApp,
@@ -1510,13 +1511,9 @@ function CreateBackupDialog({
       const data = {
         name: configuration.name,
         relayId: target.relayId,
-        ...(configuration.destinationKeys.includes("default")
-          ? {}
-          : {
-              storageIds: configuration.destinationKeys.map((destination) =>
-                destination === "local" ? null : destination
-              ),
-            }),
+        storageIds: configuration.destinationKeys.map((destination) =>
+          destination === "local" ? null : destination
+        ),
       }
       if (target.kind === "instance") {
         return createInstanceBackup({
@@ -1586,7 +1583,6 @@ export const BackupSettingsPage = React.memo(function BackupSettingsPage({
   filters: BackupFilters
   onFiltersChange: (change: Partial<BackupFilters>) => void
 }) {
-  const { data: storage } = useSuspenseQuery(backupStorageQueryOptions())
   const { data: backupScope } = useSuspenseQuery({
     ...relaySnapshotQueryOptions(),
     notifyOnChangeProps: ["data"],
@@ -1680,7 +1676,6 @@ export const BackupSettingsPage = React.memo(function BackupSettingsPage({
       {selectedTarget ? (
         <BackupSettingsSurface
           isPlatformAdmin={capabilities.isPlatformAdmin}
-          storage={storage}
           target={selectedTarget}
         />
       ) : (
@@ -1700,11 +1695,9 @@ export const BackupSettingsPage = React.memo(function BackupSettingsPage({
 function BackupSettingsSurface({
   isPlatformAdmin,
   target,
-  storage,
 }: {
   isPlatformAdmin: boolean
   target: BackupScopeOption
-  storage: Array<BackupStorage>
 }) {
   if (target.kind === "app") {
     return (
@@ -1712,7 +1705,6 @@ function BackupSettingsSurface({
         appId={target.id}
         isPlatformAdmin={isPlatformAdmin}
         relayId={target.relayId}
-        storage={storage}
       />
     )
   }
@@ -1721,7 +1713,6 @@ function BackupSettingsSurface({
       <KilnVolumesSettings
         isPlatformAdmin={isPlatformAdmin}
         relayId={target.relayId}
-        storage={storage}
       />
     )
   }
@@ -1730,7 +1721,6 @@ function BackupSettingsSurface({
       isPlatformAdmin={isPlatformAdmin}
       name={target.name}
       relayId={target.relayId}
-      storage={storage}
       target={backupPolicyTarget(target)}
     />
   )
@@ -1742,14 +1732,12 @@ function TargetSettings({
   isPlatformAdmin,
   name,
   relayId,
-  storage,
   target,
   titled = false,
 }: {
   isPlatformAdmin: boolean
   name: string
   relayId: string
-  storage: Array<BackupStorage>
   target: BackupTarget
   titled?: boolean
 }) {
@@ -1767,7 +1755,6 @@ function TargetSettings({
           name={name}
           policy={policy.data}
           relayId={relayId}
-          storage={storage}
           target={target}
         />
       ) : policy.error ? (
@@ -1787,12 +1774,10 @@ function AppTargetsSettings({
   appId,
   isPlatformAdmin,
   relayId,
-  storage,
 }: {
   appId: string
   isPlatformAdmin: boolean
   relayId: string
-  storage: Array<BackupStorage>
 }) {
   const targets = useQuery(appBackupsQueryOptions(relayId, appId))
   if (!targets.data) {
@@ -1816,7 +1801,6 @@ function AppTargetsSettings({
               : `Volume ${target.name ?? target.id}`
           }
           relayId={relayId}
-          storage={storage}
           target={{ id: target.id, kind: target.kind }}
           titled
         />
@@ -1829,11 +1813,9 @@ function AppTargetsSettings({
 function KilnVolumesSettings({
   isPlatformAdmin,
   relayId,
-  storage,
 }: {
   isPlatformAdmin: boolean
   relayId: string
-  storage: Array<BackupStorage>
 }) {
   const volumes = useQuery(relayVolumesQueryOptions(relayId))
   const kilnVolumes = React.useMemo(
@@ -1869,7 +1851,6 @@ function KilnVolumesSettings({
           isPlatformAdmin={isPlatformAdmin}
           name={`Volume ${volume.name}`}
           relayId={relayId}
-          storage={storage}
           target={{ id: volume.id, kind: "volume" }}
           titled
         />
@@ -2149,7 +2130,12 @@ function BackupStorageEditor({
         </p>
       </div>
       <div className="grid gap-4 p-5 sm:grid-cols-2">
-        <StorageTextField label="Name" value={name} onChange={setName} />
+        <StorageTextField
+          label="Name"
+          notALogin
+          value={name}
+          onChange={setName}
+        />
         <StorageTextField
           disabled={locationLocked}
           label="Region"
@@ -2180,15 +2166,15 @@ function BackupStorageEditor({
           onChange={setObjectPrefix}
         />
         <StorageTextField
-          autoComplete="off"
           label="Access key ID"
+          notALogin
           placeholder={existing ? "Leave blank to keep current key" : ""}
           value={accessKeyId}
           onChange={setAccessKeyId}
         />
         <StorageTextField
-          autoComplete="new-password"
           label="Secret access key"
+          notALogin
           placeholder={existing ? "Leave blank to keep current key" : ""}
           type="password"
           value={secretAccessKey}
@@ -2254,17 +2240,18 @@ function BackupStorageEditor({
 }
 
 function StorageTextField({
-  autoComplete,
   disabled = false,
   label,
+  notALogin = false,
   onChange,
   placeholder,
   type = "text",
   value,
 }: {
-  autoComplete?: string
   disabled?: boolean
   label: string
+  /** Keep password managers out of a name or credential that isn't a login. */
+  notALogin?: boolean
   onChange: (value: string) => void
   placeholder?: string
   type?: React.HTMLInputTypeAttribute
@@ -2275,7 +2262,7 @@ function StorageTextField({
       <span className="mb-2 block text-xs font-medium">{label}</span>
       <Input
         aria-label={label}
-        autoComplete={autoComplete}
+        {...(notALogin ? notALoginField : null)}
         disabled={disabled}
         placeholder={placeholder}
         type={type}
@@ -2436,7 +2423,8 @@ function RestoreBackupDialog({
           <span>
             <span className="block text-xs font-semibold">Safety backup</span>
             <span className="type-meta mt-1 block text-muted-foreground">
-              Take a new full backup immediately before restoring.
+              Take a new full backup on this Relay immediately before
+              restoring.
             </span>
           </span>
           <Switch

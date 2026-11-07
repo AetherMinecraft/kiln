@@ -4,13 +4,15 @@ import {
   HOST_TERMINAL_KEY,
   HostAccessDisabledError,
 } from "./host-shell.js"
+import { ScreenSharingDesktop } from "./desktop-screen-sharing.js"
+import { VoxlDesktop } from "./desktop-voxl.js"
 import { Desktop } from "./desktop.js"
 import { createServer as createHttpServer } from "node:http"
 import { createServer as createHttpsServer } from "node:https"
 import { createHmac, randomBytes, randomUUID } from "node:crypto"
 import { mkdir } from "node:fs/promises"
 import { hostname } from "node:os"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import { Cause, Effect, Predicate, Schema } from "effect"
 import { logException } from "@workspace/telemetry"
 
@@ -42,6 +44,7 @@ import {
   relayPrepareAppSchema,
   relayProvisionAppSchema,
   appIdFromFileRoot,
+  appVolumeFromFileRoot,
   databaseIdFromFileRoot,
   isRelayFileRoot,
   RelayTransferPullStartSchema,
@@ -58,10 +61,13 @@ import {
   relayAppDeploymentAbortSchema,
   relayAppDeploymentReadSchema,
   relayAppImageCheckSchema,
+  relayHostPackagesRequestSchema,
   relaySecurityInventoryRequestSchema,
   relayDeployAppSchema,
   relayDatabaseActionSchema,
   relayDatabaseLimitsSchema,
+  relayInstanceLimitsWriteSchema,
+  type ResourceLimits,
   relayDatabaseDataReadSchema,
   relayDatabaseDataWriteSchema,
   relayPlatformDatabaseReadSchema,
@@ -104,7 +110,11 @@ import {
   relayCertificateCheckInputSchema,
   relayCertificateCheckResultSchema,
   relayProxyConfigurationSchema,
+  RELAY_PROXY_TRIAL_PATH,
   relayProxySettingsSchema,
+  relayProxyTrialInputSchema,
+  relayProxyTrialResultSchema,
+  type RelayProxyTrialInput,
   relayVolumeCreateSchema,
   relayVolumeDeleteSchema,
   relayDockerCleanupRequestSchema,
@@ -216,7 +226,12 @@ import {
   WebCertificates,
   webCertificateStorePath,
 } from "./web-certificates.js"
-import { forkPromise, promiseEffect, recoverPromise } from "./effect/promise.js"
+import {
+  forkPromise,
+  promiseEffect,
+  recoverPromise,
+  tapPromiseError,
+} from "./effect/promise.js"
 import { DockerCleanup } from "./docker-cleanup.js"
 import { DockerEngine } from "./docker-engine.js"
 import { RelayVolumes } from "./volumes.js"
@@ -227,6 +242,7 @@ import {
 import { FilesystemDriver, type FileRoot } from "./files.js"
 import { DeploymentFileSyncDriver } from "./file-sync.js"
 import { HostFiles } from "./host-files.js"
+import { HostPackages } from "./host-packages.js"
 import { SecurityInventory } from "./security-inventory.js"
 import {
   adoptInstallationId,
@@ -239,6 +255,7 @@ import { nodeSnapshot } from "./node.js"
 import { reportRelayMemoryMetrics } from "./relay-memory.js"
 import { sampleRelayCapacity } from "./relay-capacity.js"
 import { sampleNodeMetrics, watchContainerEvents } from "./node-metrics.js"
+import { WorkloadSlice } from "./workload-slice.js"
 import { RelayPairingError, RelaySystemUpdateError } from "./effect/errors.js"
 import {
   loadOrCreateRelayIdentity,
@@ -484,7 +501,14 @@ const docker = new DockerDriver(
 )
 const databases = new DatabaseDriver(config, docker, databaseConnections)
 const hostShell = new HostShell(config)
-const desktop = new Desktop(config, hostShell, lanes)
+const desktop = new Desktop(
+  [
+    new ScreenSharingDesktop(config, hostShell, lanes),
+    new VoxlDesktop(config, hostShell),
+  ],
+  config,
+  lanes
+)
 const relayEngine = new DockerEngine(config.dockerSocket)
 const terminals = new ContainerTerminals(config)
 // The config itself, not a copy: it reads the installation ID Hearth gives
@@ -522,6 +546,108 @@ let restarting = false
 
 // Reserves the restart before anything is awaited, so concurrent requests
 // can't both begin one, and releases it if the restart never begins.
+// Fails here, while Hearth is still waiting, when the Relay isn't a
+// container Docker can restart.
+const reserveRelayRestart = () =>
+  reserveRestart(
+    "relay.restart.inspect",
+    relayEngine.inspectContainer(hostname())
+  )
+
+// Docker restarts the Relay once Hearth has its answer. `onFailure` replaces
+// giving up, for a restart the Relay can't go without.
+function restartRelayContainer(
+  container: { readonly Id: string },
+  onFailure: () => void = () => {
+    restarting = false
+  }
+) {
+  forkRelayEffect(
+    "relay.restart",
+    Effect.sleep("1 second").pipe(
+      Effect.andThen(
+        relayEngine.restartContainer(container.Id, { seconds: 15 })
+      ),
+      Effect.withSpan("Relay.restart"),
+      Effect.catch((cause) =>
+        Effect.sync(() => {
+          onFailure()
+          reportRelayError(cause, { operation: "relay.restart" })
+        })
+      )
+    )
+  )
+}
+
+// Longer than Hearth keeps a trial open, so this only ends one Hearth lost
+// track of, by restarting partway through.
+const PROXY_TRIAL_LIMIT = "5 minutes"
+
+const expireProxyTrial = operation<string>()({
+  name: "relay.proxy.trial.expire",
+  locks: () => [exclusive(laneKeys.routes)],
+  carriesOnWhilePaused: true,
+  run: ({ input }) => relayOperation(() => lifecycle.stopProxyTrial(input)),
+})
+
+async function runProxyTrialStep(
+  input: RelayProxyTrialInput
+): Promise<string | null> {
+  switch (input.step) {
+    case "start": {
+      if (input.automatic && !config.checksPublicRoute) {
+        return "This Relay wasn't installed to look for a public route."
+      }
+      const problem = await lifecycle.startProxyTrial({
+        answer: input.answer,
+        id: input.id,
+        upstreamTls: activeTls !== null,
+      })
+      if (problem) return problem
+      forkRelayEffect(
+        "relay.proxy.trial.expire",
+        Effect.sleep(PROXY_TRIAL_LIMIT).pipe(
+          Effect.andThen(
+            runOperation(lanes, expireProxyTrial, input.id, { kind: "timer" })
+          ),
+          Effect.catch((cause) =>
+            Effect.sync(() =>
+              reportRelayError(cause, {
+                operation: "relay.proxy.trial.expire",
+              })
+            )
+          )
+        )
+      )
+      return null
+    }
+    case "certificate":
+      return lifecycle.requestProxyTrialCertificate(input.id)
+    case "stop":
+      await lifecycle.stopProxyTrial(input.id)
+      return null
+    case "commit": {
+      const relayContainer = await reserveRelayRestart()
+      const problem = await tapPromiseError(
+        () => lifecycle.commitProxyTrial(input.id),
+        () => {
+          restarting = false
+        }
+      )
+      if (problem) {
+        restarting = false
+        return problem
+      }
+      // Its saved mode and running listener now differ, so it can't stay up.
+      // Exiting has Docker's restart policy start it instead.
+      restartRelayContainer(relayContainer, () => {
+        process.kill(process.pid, "SIGTERM")
+      })
+      return null
+    }
+  }
+}
+
 function reserveRestart<A, E>(
   name: string,
   begin: Effect.Effect<A, E, RelayStateStore>
@@ -645,6 +771,7 @@ const hostFilesystem = new FilesystemDriver(
 )
 const hostFiles = new HostFiles(config)
 const securityInventory = new SecurityInventory(config)
+const hostPackages = new HostPackages(hostShell)
 const hostDatabaseBrowser = new DatabaseBrowser(hostFilesystem)
 async function hostFileRoot(id: string): Promise<FileRoot> {
   if (!config.hostAccess) throw new HostAccessDisabledError()
@@ -652,6 +779,21 @@ async function hostFileRoot(id: string): Promise<FileRoot> {
   return { id, directory: "." }
 }
 const appDatabaseBrowser = new DatabaseBrowser(appFilesystem)
+// A volume opened through an App that owns or uses it. Its files are on the
+// host, so they read and save as the host's do, confined to the volume.
+async function appVolumeFileRoot(rootId: string): Promise<FileRoot> {
+  const volume = appVolumeFromFileRoot(rootId)
+  if (!volume) throw new Error("Volume not found")
+  if (!(await hostFiles.ready())) {
+    throw new Error("Mount this Relay's host files to open its volumes")
+  }
+  await apps.get(volume.appId)
+  const mountpoint = await runRelayEffect(
+    "relay.apps.volume.mountpoint",
+    volumes.appVolumeMountpoint(volume.appId, volume.volumeId)
+  )
+  return { directory: relative("/", mountpoint), id: rootId }
+}
 const databaseDumpFilesystem = new FilesystemDriver({
   ...config,
   rootDirectory: databases.dumpDirectory,
@@ -914,6 +1056,10 @@ const transferRoot: TransferRootResolver = async (rootId) => {
       packLocks: transferPackLocks(rootId),
       root: await hostFileRoot(rootId),
     }
+  }
+  // A volume moves with the App that owns it, or stays with its Relay.
+  if (appVolumeFromFileRoot(rootId)) {
+    throw new Error("A volume's files can't be transferred between Relays")
   }
   const appId = appIdFromFileRoot(rootId)
   if (appId) {
@@ -1349,6 +1495,7 @@ const requestHandler = (
     relayOperation(async () => {
       if (handleHealthRequest(request, response)) return
       if (trustProbe(request, response)) return
+      if (proxyTrialProbe(request, response)) return
       if (bootstrapDiscovery(request, response)) return
       if (await pairingRequest(request, response)) return
       if (await backupDownloads.handleRequest(request, response)) return
@@ -1386,6 +1533,15 @@ const server = activeTls
     )
   : createHttpServer(requestHandler)
 
+async function renameRelay(name: string) {
+  relayIdentity = await runRelayEffect(
+    "relay.control.rename",
+    renameRelayIdentity(config, relayIdentity, name)
+  )
+  config.nodeName = relayIdentity.name
+  config.nodeId = relayIdentity.fingerprint
+}
+
 const controlSocket = attachControlSocket({
   adoptInstallationId: (installationId) =>
     recoverPromise(
@@ -1396,6 +1552,24 @@ const controlSocket = attachControlSocket({
         ),
       (cause) => {
         reportRelayError(cause, { operation: "relay.installation.adopt" })
+      }
+    ),
+  adoptRelayName: (name) =>
+    recoverPromise(
+      async () => {
+        if (name.trim() === relayIdentity.name) return
+        await renameRelay(name)
+        // Not awaited: this runs under the connection's authentication
+        // deadline, and a snapshot waits on Docker.
+        forkPromise(
+          () => snapshotHub.refresh(),
+          (cause) => {
+            reportRelayError(cause, { operation: "relay.name.adopt" })
+          }
+        )
+      },
+      (cause) => {
+        reportRelayError(cause, { operation: "relay.name.adopt" })
       }
     ),
   identifyHearth: (claim) => {
@@ -1479,6 +1653,7 @@ const browserSocket = attachBrowserSocket({
     filesystem: appFilesystem,
     root: (appId) => apps.fileRoot(appId),
   },
+  appVolumeFiles: { filesystem: hostFilesystem, root: appVolumeFileRoot },
   databaseFiles: {
     filesystem: databaseDumpFilesystem,
     root: (databaseId) => databases.dumpFileRoot(databaseId),
@@ -1535,7 +1710,23 @@ const capacityMetricsFiber = forkRelayEffect(
 // What the node and its containers spend, for its metrics.
 const nodeMetricsFiber = forkRelayEffect(
   "relay.node.metrics",
-  sampleNodeMetrics(() => config.nodeId, relayEngine, config)
+  sampleNodeMetrics(
+    () => config.nodeId,
+    relayEngine,
+    config,
+    docker.allocations
+  )
+)
+// The ceiling on what the node's workloads use together.
+const workloadSliceFiber = forkRelayEffect(
+  "relay.workload-slice",
+  new WorkloadSlice(
+    config,
+    relayEngine,
+    hostShell,
+    docker.allocations,
+    lanes
+  ).reconcile()
 )
 const containerEventsFiber = forkRelayEffect(
   "relay.container.events",
@@ -1588,6 +1779,7 @@ const sftpServer = await Effect.runPromise(
         capacityMetricsFiber.interruptUnsafe()
         nodeMetricsFiber.interruptUnsafe()
         containerEventsFiber.interruptUnsafe()
+        workloadSliceFiber.interruptUnsafe()
         operationPruneFiber.interruptUnsafe()
         backupFiber.interruptUnsafe()
         transferSweepFiber.interruptUnsafe()
@@ -1684,6 +1876,19 @@ const platformContext: PlatformContext = {
   config,
   engine: relayEngine,
 }
+// Starts bundled Traefik for Hearth, or joins it to Kiln's network, after a
+// platform pass. It changes the routes and reads Kiln's services.
+const repairPlatformEdge = operation<void>()({
+  name: "relay.platform.edge",
+  locks: () => [exclusive(laneKeys.routes), shared(laneKeys.platform)],
+  run: () =>
+    Effect.tryPromise(() => lifecycle.reconcilePlatformEdge()).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("Traefik couldn't serve Hearth", cause)
+      )
+    ),
+})
+
 const platformFiber = forkRelayEffect("relay.platform", platformLoop())
 // See web-certificates.ts.
 const certificateFiber = forkRelayEffect(
@@ -1727,6 +1932,37 @@ async function pairingRequest(
     )
   )
   json(response, 201, result)
+  return true
+}
+
+// Answers a trial of the Relay's public route (lifecycle.ts). The path names
+// the trial, so anyone along the route may see it; what answers it they
+// can't have, which is how Hearth knows the route ends at this Relay.
+function proxyTrialProbe(
+  request: IncomingMessage,
+  response: ServerResponse
+): boolean {
+  const { pathname } = new URL(request.url ?? "/", "http://relay")
+  if (
+    request.method !== "GET" ||
+    !pathname.startsWith(`${RELAY_PROXY_TRIAL_PATH}/`)
+  ) {
+    return false
+  }
+  const answer = lifecycle.proxyTrialAnswer(
+    pathname.slice(RELAY_PROXY_TRIAL_PATH.length + 1)
+  )
+  if (!answer) {
+    json(response, 404, { error: "No such trial" })
+    return true
+  }
+  response
+    .writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Length": String(Buffer.byteLength(answer)),
+      "Content-Type": "text/plain",
+    })
+    .end(answer)
   return true
 }
 
@@ -1880,6 +2116,7 @@ function shutdownRelay(signal: NodeJS.Signals): Promise<void> {
         capacityMetricsFiber.interruptUnsafe()
         nodeMetricsFiber.interruptUnsafe()
         containerEventsFiber.interruptUnsafe()
+        workloadSliceFiber.interruptUnsafe()
         operationPruneFiber.interruptUnsafe()
         tlsRefreshFiber.interruptUnsafe()
         joinFiber?.interruptUnsafe()
@@ -1929,6 +2166,7 @@ async function relaySnapshot() {
     instances,
     storedNames,
     pendingPrimaryPorts,
+    pendingLimits,
     provisioningJobs,
     sftpPublication,
     updates,
@@ -1944,6 +2182,9 @@ async function relaySnapshot() {
           runRelayEffectUntraced(startup.state.listPendingPrimaryPorts())
         ),
         relayOperation(() =>
+          runRelayEffectUntraced(startup.state.listPendingLimits())
+        ),
+        relayOperation(() =>
           runRelayEffectUntraced(startup.state.listProvisioningJobs())
         ),
         relayOperation(() => docker.relaySftpPublication(sftpServer.port)),
@@ -1952,9 +2193,12 @@ async function relaySnapshot() {
       { concurrency: 4 }
     )
   )
-  const visibleInstances = applyStoredPendingPrimaryPorts(
-    applyStoredInstanceNames(instances, storedNames),
-    pendingPrimaryPorts
+  const visibleInstances = applyPendingLimits(
+    applyStoredPendingPrimaryPorts(
+      applyStoredInstanceNames(instances, storedNames),
+      pendingPrimaryPorts
+    ),
+    pendingLimits
   )
   const retained = Array.from(retainedInstances.values())
   const provisioningById = new Map(
@@ -2123,28 +2367,7 @@ async function executeControlRequest(
         systemUpdates.status(requiredString(payload, "operationId"))
       )
     case "relay.restart": {
-      // Fails here, while Hearth is still waiting, when the Relay isn't a
-      // container Docker can restart.
-      const relayContainer = await reserveRestart(
-        "relay.restart.inspect",
-        relayEngine.inspectContainer(hostname())
-      )
-      // Docker restarts the Relay once Hearth has its answer.
-      forkRelayEffect(
-        "relay.restart",
-        Effect.sleep("1 second").pipe(
-          Effect.andThen(
-            relayEngine.restartContainer(relayContainer.Id, { seconds: 15 })
-          ),
-          Effect.withSpan("Relay.restart"),
-          Effect.catch((cause) =>
-            Effect.sync(() => {
-              restarting = false
-              reportRelayError(cause, { operation: "relay.restart" })
-            })
-          )
-        )
-      )
+      restartRelayContainer(await reserveRelayRestart())
       return { restarting: true }
     }
     case "relay.host.restart":
@@ -2220,11 +2443,23 @@ async function executeControlRequest(
         dataDirectory: await lifecycle.hostDataDirectory(),
       }
     case "relay.security.targets":
-      return securityInventory.targets()
+      return {
+        ...(await securityInventory.targets()),
+        hostPackagesUpdatedAt: await recoverPromise(
+          () => hostPackages.updatedAt(),
+          () => null
+        ),
+      }
     case "relay.security.inventory":
       return securityInventory.inventory(
         relaySecurityInventoryRequestSchema.parse(request.payload)
       )
+    case "relay.host.packages.read":
+      return hostPackages.read(
+        relayHostPackagesRequestSchema.parse(request.payload)
+      )
+    case "relay.host.packages.update":
+      return hostPackages.update()
     case "relay.host.files.mount":
       await hostFiles.mount()
       return { started: true }
@@ -2361,6 +2596,12 @@ async function executeControlRequest(
       await snapshotHub.refresh()
       return proxy
     }
+    case "relay.proxy.trial":
+      return relayProxyTrialResultSchema.parse({
+        problem: await runProxyTrialStep(
+          relayProxyTrialInputSchema.parse(request.payload)
+        ),
+      })
     case "relay.certificates.check": {
       const { hostname, owner } = relayCertificateCheckInputSchema.parse(
         request.payload
@@ -2382,7 +2623,10 @@ async function executeControlRequest(
       })
     }
     case "relay.volumes.read":
-      return runRelayEffect("relay.volumes.read", volumes.list())
+      return {
+        ...(await runRelayEffect("relay.volumes.read", volumes.list())),
+        filesAvailable: await hostFiles.ready(),
+      }
     case "relay.docker.storage":
       return runRelayEffect("relay.docker.storage", dockerCleanup.storage())
     case "relay.docker.cleanup":
@@ -2698,6 +2942,9 @@ async function executeControlRequest(
         )
       )
       if (discarded) {
+        // One that never finished has no container for its delete to find,
+        // and an App created with it may be connected to it.
+        await databases.connections.forgetDatabase(input.databaseId)
         await resourceFreezes.forget("database", input.databaseId)
         return { databaseId: input.databaseId, deleted: true }
       }
@@ -3319,6 +3566,16 @@ async function executeControlRequest(
         return relayInstanceWithStoredName(instance)
       })
     }
+    case "instance.limits.write": {
+      const { limits } = relayInstanceLimitsWriteSchema.parse(payload)
+      const instance = await requiredInstance(payload)
+      await lifecycle.setInstanceLimits(instance, limits)
+      const updated = (await docker.inspectInstances()).find(
+        (candidate) => candidate.id === instance.id
+      )
+      if (!updated) throw new Error("Instance not found")
+      return refreshRelayInstance(updated)
+    }
     case "instance.rename": {
       const instance = await requiredInstance(payload)
       const name = relayInstanceNameSchema.parse(payload.name)
@@ -3367,6 +3624,7 @@ async function executeControlRequest(
           "relay.instance.deletePreparedName",
           startup.state.deleteInstanceName(instanceId)
         )
+        await docker.setPendingLimits(instanceId, null)
         await resourceFreezes.forget("instance", instanceId)
         return { deleted: true, instanceId }
       }
@@ -3379,6 +3637,7 @@ async function executeControlRequest(
         "relay.instance.deletePendingPrimaryPort",
         startup.state.deletePendingPrimaryPort(instanceId)
       )
+      await docker.setPendingLimits(instanceId, null)
       // Its routes go with it, so their hostnames are free again.
       await withRoutesLock("instance.delete.routes", async () => {
         await runRelayEffect(
@@ -4000,16 +4259,7 @@ async function executeControlRequest(
       )
     }
     case "relay.rename": {
-      relayIdentity = await runRelayEffect(
-        "relay.control.rename",
-        renameRelayIdentity(
-          config,
-          relayIdentity,
-          requiredString(payload, "name")
-        )
-      )
-      config.nodeName = relayIdentity.name
-      config.nodeId = relayIdentity.fingerprint
+      await renameRelay(requiredString(payload, "name"))
       await snapshotHub.refresh()
       await appendRelayAudit("relay.renamed", client.id, request.id, {
         name: relayIdentity.name,
@@ -4105,19 +4355,6 @@ function notePlatformPass(result: PlatformPassResult): void {
     state: result.state ?? platformPass.state,
   }
 }
-
-// Starts bundled Traefik for Hearth, or joins it to Kiln's network, after a
-// platform pass. It changes the routes and reads Kiln's services.
-const repairPlatformEdge = operation<void>()({
-  name: "relay.platform.edge",
-  locks: () => [exclusive(laneKeys.routes), shared(laneKeys.platform)],
-  run: () =>
-    Effect.tryPromise(() => lifecycle.reconcilePlatformEdge()).pipe(
-      Effect.catch((cause) =>
-        Effect.logWarning("Traefik couldn't serve Hearth", cause)
-      )
-    ),
-})
 
 /**
  * Passes over Kiln's services every 30 seconds in platform mode. Otherwise
@@ -4428,7 +4665,14 @@ async function withFileTarget<T>(
 ): Promise<T> {
   const id = requiredString(payload, "instanceId")
   const appId = appIdFromFileRoot(id)
-  const kind = isRelayFileRoot(id) ? "relay" : appId ? "app" : "instance"
+  const appVolume = appVolumeFromFileRoot(id) !== null
+  const kind = isRelayFileRoot(id)
+    ? "relay"
+    : appVolume
+      ? "app-volume"
+      : appId
+        ? "app"
+        : "instance"
   // Every file operation first finds its root; a game server's is found by
   // looking up its container.
   const target = await traceRelayPromise(
@@ -4440,17 +4684,23 @@ async function withFileTarget<T>(
             filesystem: hostFilesystem,
             root: await hostFileRoot(id),
           }
-        : appId
+        : appVolume
           ? {
-              databaseBrowser: appDatabaseBrowser,
-              filesystem: appFilesystem,
-              root: await apps.fileRoot(appId),
+              databaseBrowser: hostDatabaseBrowser,
+              filesystem: hostFilesystem,
+              root: await appVolumeFileRoot(id),
             }
-          : {
-              databaseBrowser,
-              filesystem,
-              root: await requiredFileRoot(id),
-            },
+          : appId
+            ? {
+                databaseBrowser: appDatabaseBrowser,
+                filesystem: appFilesystem,
+                root: await apps.fileRoot(appId),
+              }
+            : {
+                databaseBrowser,
+                filesystem,
+                root: await requiredFileRoot(id),
+              },
     { "kiln.files.root": kind }
   )
   return run(target)
@@ -4538,7 +4788,7 @@ async function requiredInstance(payload: Readonly<Record<string, unknown>>) {
 }
 
 async function relayInstanceWithStoredName(instance: RelayInstance) {
-  const [names, pendingPrimaryPorts] = await Effect.runPromise(
+  const [names, pendingPrimaryPorts, pendingLimits] = await Effect.runPromise(
     Effect.all(
       [
         relayOperation(() =>
@@ -4553,14 +4803,23 @@ async function relayInstanceWithStoredName(instance: RelayInstance) {
             startup.state.listPendingPrimaryPorts()
           )
         ),
+        relayOperation(() =>
+          runRelayEffect(
+            "relay.instance.pendingLimits",
+            startup.state.listPendingLimits()
+          )
+        ),
       ] as const,
-      { concurrency: 2 }
+      { concurrency: 3 }
     )
   )
   return (
-    applyStoredPendingPrimaryPorts(
-      applyStoredInstanceNames([instance], names),
-      pendingPrimaryPorts
+    applyPendingLimits(
+      applyStoredPendingPrimaryPorts(
+        applyStoredInstanceNames([instance], names),
+        pendingPrimaryPorts
+      ),
+      pendingLimits
     )[0] ?? instance
   )
 }
@@ -4569,6 +4828,16 @@ async function refreshRelayInstance(instance: RelayInstance) {
   const updated = await relayInstanceWithStoredName(instance)
   await snapshotHub.refresh()
   return updated
+}
+
+function applyPendingLimits(
+  instances: ReadonlyArray<RelayInstance>,
+  pendingLimits: ReadonlyMap<string, ResourceLimits>
+): Array<RelayInstance> {
+  return instances.map((instance) => {
+    const limits = pendingLimits.get(instance.id)
+    return limits ? { ...instance, pendingLimits: limits } : instance
+  })
 }
 
 function applyStoredPendingPrimaryPorts(

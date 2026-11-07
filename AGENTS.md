@@ -135,14 +135,19 @@ How to write them:
   it, or fake it at that single boundary.
 - Web code that touches MySQL runs against a real database with
   `apps/web/src/test/database.ts`; assert rows and results. CI runs these
-  suites on MySQL and MariaDB; locally run `pnpm dev:docker:test` against the
-  dev stack's MySQL. Hearth's SQL must work on both, so write
+  suites on MySQL and MariaDB; locally run `pnpm dev:docker:test` on the box's
+  shared MySQL. Hearth's SQL must work on both, so write
   `LOCK IN SHARE MODE`, `JSON_UNQUOTE(JSON_EXTRACT(...))` and
   `JSON_EXTRACT(?, '$')`, not `FOR SHARE`, `->>` or `CAST(? AS JSON)`.
 - Relay code that drives Docker uses the stateful fake in
   `apps/relay/src/test/docker.ts`; assert the resulting container state.
 - Control time with Effect's `TestClock` or `vi.useFakeTimers`, never real
   sleeps. Keep tests independent of each other and of run order.
+- A durable operation's row says it ended just before its lanes are free. To
+  start something after one, wait with `operationsAtRest`
+  (`apps/web/src/operations/test/at-rest.ts`), not on the row alone.
+- Timeouts only catch hangs, so leave room for a busy box: don't set one below
+  the defaults in each app's `vite.config.ts`.
 - Every server function must authenticate and every mutating CLI endpoint
   must refuse read-only links; `apps/web/src/server/auth-coverage.test.ts`
   enforces both. Intentional exceptions go in its allowlists with a reason.

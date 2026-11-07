@@ -21,6 +21,9 @@ import {
   compareKilnReleaseVersions,
 } from "../packages/contracts/src/release-version.ts"
 
+const PUBLISH_WAIT_MS = 20 * 60_000
+const PUBLISH_POLL_MS = 20_000
+
 const execFileAsync = promisify(execFile)
 const runAsync = async (file, args) => {
   const { stdout } = await execFileAsync(file, args, {
@@ -290,6 +293,47 @@ async function assertPublicManifest(image, digest) {
     )
 }
 
+/**
+ * The desktop image tags a release's Relays need, from that release's own
+ * contracts: a nightly promoted later may name another version, or predate
+ * Relays having a default.
+ */
+export function desktopImageTags(contracts) {
+  const tag = /KILN_DESKTOP_IMAGE_TAG = "([^"]+)"/u.exec(contracts)?.[1]
+  return tag ? [tag, `${tag}-source`] : []
+}
+
+// Relays pull the streamer themselves, the first time someone opens a desktop,
+// so a release can't go out naming one nobody can download, or without its
+// source beside it.
+function assertPublicDesktopImage(repository, commit) {
+  const image = kilnImageRepository("desktop", repository)
+  const contracts = run("git", [
+    "show",
+    `${commit}:packages/contracts/src/git-repository.ts`,
+  ])
+  return Promise.all(
+    desktopImageTags(contracts).map((tag) => assertPublicManifest(image, tag))
+  )
+}
+
+/**
+ * Runs `check` until it passes. A push that changes the desktop image publishes
+ * it and starts a nightly at once, and nothing would run a nightly again that
+ * got here first. An image that never comes still fails the release.
+ */
+export async function untilPublished(check) {
+  const deadline = Date.now() + PUBLISH_WAIT_MS
+  for (;;) {
+    try {
+      return await check()
+    } catch (cause) {
+      if (Date.now() >= deadline) throw cause
+      await new Promise((resolve) => setTimeout(resolve, PUBLISH_POLL_MS))
+    }
+  }
+}
+
 function publishRelease(manifest, existing, title, repository) {
   const tag = `v${manifest.version}`
   if (existing) {
@@ -418,6 +462,7 @@ async function nightly() {
       compatibility: { relayProtocol: protocol },
     }
     validateReleaseManifest(manifest, repository, version)
+    await untilPublished(() => assertPublicDesktopImage(repository, commit))
     reserveTag(tag, commit)
     publishRelease(
       manifest,
@@ -466,11 +511,12 @@ async function stable() {
     run("git", ["rev-list", "-n", "1", selected.tag_name]) !== manifest.commit
   )
     throw new Error("Nightly tag and manifest disagree")
-  await Promise.all(
-    Object.values(manifest.components).map(({ image, digest }) =>
+  await Promise.all([
+    assertPublicDesktopImage(repository, manifest.commit),
+    ...Object.values(manifest.components).map(({ image, digest }) =>
       assertPublicManifest(image, digest)
-    )
-  )
+    ),
+  ])
   const promoted = {
     ...manifest,
     version,

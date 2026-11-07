@@ -11,6 +11,7 @@ import {
   NO_RESOURCE_LIMITS,
   observedResourceLimitsSchema,
   resourceLimitsInputSchema,
+  resourceLimitsSchema,
   serviceResourceLimitsSchema,
 } from "./resource-limits.js"
 import { relayInstanceStateReasonSchema } from "./instance-state-reason.js"
@@ -23,6 +24,10 @@ import {
   databaseReadRequestSchema,
   databaseWriteRequestSchema,
 } from "./database-browser.js"
+import {
+  databaseNameFieldSchema,
+  databaseUsernameSchema,
+} from "./database-login.js"
 import {
   appServiceNameSchema,
   fileRootIdSchema,
@@ -47,6 +52,7 @@ export * from "./minecraft-java.js"
 export * from "./cli.js"
 export * from "./instance-limits.js"
 export * from "./resource-limits.js"
+export * from "./database-login.js"
 export * from "./security.js"
 export * from "./instance-overview.js"
 export * from "./icon-images.js"
@@ -209,7 +215,7 @@ export const relayManagedDatabaseSchema = z
   .object({
     containerId: z.string().nullable(),
     createdAt: z.string().datetime(),
-    databaseName: z.string().regex(/^[a-z][a-z0-9_]{0,47}$/u),
+    databaseName: databaseNameFieldSchema,
     engine: databaseEngineSchema,
     hostname: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/u),
     id: databaseIdSchema,
@@ -240,12 +246,12 @@ export const relayManagedDatabaseSchema = z
 
 export const relayCreateDatabaseSchema = z
   .object({
-    databaseName: z.string().regex(/^[a-z][a-z0-9_]{0,47}$/u),
+    databaseName: databaseNameFieldSchema,
     engine: databaseEngineSchema,
     id: databaseIdSchema,
     name: relayDatabaseNameSchema,
     password: z.string().min(24).max(256),
-    username: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/u),
+    username: databaseUsernameSchema,
   })
   .strict()
 
@@ -300,7 +306,7 @@ export const relayRotateDatabaseCredentialsSchema = z
     currentPassword: z.string().min(24).max(256),
     databaseId: databaseIdSchema,
     nextPassword: z.string().min(24).max(256),
-    username: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/u),
+    username: databaseUsernameSchema,
   })
   .strict()
 
@@ -350,7 +356,7 @@ export const relayDatabaseExportSchema = z
   .object({
     databaseId: databaseIdSchema,
     password: z.string().min(24).max(256),
-    username: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/u),
+    username: databaseUsernameSchema,
   })
   .strict()
 
@@ -617,31 +623,56 @@ export const relayHostAccessSchema = z.object({
 
 // The node's desktop, as the Relay finds it (apps/relay/src/desktop.ts):
 // the graphical session someone is signed in to, if any. Only X11 desktops
-// can be streamed. `disabled` means the Relay's host access is off,
-// `unconfigured` that it has no streamer image, and `paused` that it's paused.
+// can be streamed. On a Mac, where Docker runs in a VM, it's the Mac's own
+// Screen Sharing: `screen-sharing`, or `screen-sharing-off` until the Mac's
+// owner turns it on. `disabled` means the Relay's host access is off, and
+// `paused` that it's paused.
 const relayDesktopSessionShape = {
   displayManager: z.boolean(),
   desktop: z.string().max(200).nullable(),
   greeter: z.boolean(),
   user: z.string().max(200).nullable(),
 }
+// One display's place in the image a desktop's client shows, in its pixels.
+export const relayDesktopMonitorSchema = z.object({
+  height: z.number().int().positive(),
+  width: z.number().int().positive(),
+  x: z.number().int().nonnegative(),
+  y: z.number().int().nonnegative(),
+})
+export type RelayDesktopMonitor = z.infer<typeof relayDesktopMonitorSchema>
+// Arrangements a node's displays may be in. A Mac keeps every one it has had,
+// so the client takes the one that fits the image it's sent.
+const relayDesktopLayoutsSchema = z
+  .array(z.array(relayDesktopMonitorSchema).max(16))
+  .max(64)
+
 export const relayDesktopSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("x11"),
     display: z.string().max(32),
+    layouts: relayDesktopLayoutsSchema,
     ...relayDesktopSessionShape,
   }),
   z.object({ status: z.literal("wayland"), ...relayDesktopSessionShape }),
+  z.object({
+    status: z.literal("screen-sharing"),
+    // Accounts the Mac has, to offer at sign-in.
+    accounts: z.array(z.string().max(64)).max(32),
+    displayManager: z.boolean(),
+    layouts: relayDesktopLayoutsSchema,
+  }),
+  z.object({
+    status: z.literal("screen-sharing-off"),
+    displayManager: z.boolean(),
+  }),
   z.object({ status: z.literal("none"), displayManager: z.boolean() }),
   z.object({ status: z.literal("disabled"), displayManager: z.boolean() }),
-  z.object({ status: z.literal("unconfigured"), displayManager: z.boolean() }),
   z.object({ status: z.literal("paused"), displayManager: z.boolean() }),
 ])
 export type RelayDesktop = z.infer<typeof relayDesktopSchema>
 
-export const relayDesktopTicketSchema = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{43}$/u)
+export const relayDesktopTicketSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/u)
 export const relayDesktopAttachedSchema = z.object({
   desktop: relayDesktopSchema,
   ticket: relayDesktopTicketSchema,
@@ -741,6 +772,8 @@ export const relayUncoveredMountSchema = z.object({
   source: z.string(),
 })
 export const relayVolumesSchema = z.object({
+  // Whether the Relay can reach its host's files, and so volumes' contents.
+  filesAvailable: z.boolean(),
   // Whether Docker is measuring the volumes, so sizes are on their way.
   measuring: z.boolean(),
   // Whether every paired Hearth that can configure Apps has told the Relay
@@ -944,6 +977,9 @@ export const appPortSchema = z
 
 // Memory and CPU limits by service name. A service without an entry has
 // none.
+// Image and Dockerfile apps run one service under this name.
+export const APP_SERVICE = "app"
+
 export const appServiceLimitsSchema = z
   .record(appServiceNameSchema, serviceResourceLimitsSchema)
   .refine((limits) => Object.keys(limits).length <= 64, "Too many services")
@@ -973,6 +1009,21 @@ export const appMountSourceSchema = z.discriminatedUnion("type", [
     type: z.literal("file"),
   }),
 ])
+
+// The name a file mount has on the node, which says which version of it a
+// container has. It only tells versions apart, so a small hash will do; a
+// mount's ID has no dash, which sets one with this name apart from one
+// deployed before files carried it.
+export function appMountFileName(mountId: string, content: string): string {
+  let low = 0xdeadbeef
+  let high = 0x41c6ce57
+  for (let index = 0; index < content.length; index += 1) {
+    const code = content.charCodeAt(index)
+    low = Math.imul(low ^ code, 2_654_435_761)
+    high = Math.imul(high ^ code, 1_597_334_677)
+  }
+  return `${mountId}-${(low >>> 0).toString(36)}${(high >>> 0).toString(36)}`
+}
 
 export const appMountSchema = z.strictObject({
   // Stable across edits; a file mount is kept on the Relay under it.
@@ -1106,7 +1157,13 @@ export const relayAppSchema = z.object({
 })
 
 export const relayCreateAppSchema = z
-  .object({ id: appIdSchema, name: appNameSchema })
+  .object({
+    // The databases it's connected to from the start, which may still be
+    // provisioning. Jobs saved before this have none.
+    databaseIds: z.array(databaseIdSchema).max(32).default([]),
+    id: appIdSchema,
+    name: appNameSchema,
+  })
   .strict()
 
 export const relayPrepareAppSchema = relayCreateAppSchema.extend({
@@ -1128,6 +1185,8 @@ export const relayDeployAppSchema = z
     // tag names when the deployment pulls it.
     imageDigest: imageDigestSchema.optional(),
     name: appNameSchema,
+    // Build every layer afresh, ignoring Docker's build cache.
+    noCache: z.boolean().optional(),
   })
   .strict()
 
@@ -1541,6 +1600,13 @@ export const relayProvisionInstanceSchema = z.object({
   instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
 })
 
+export const relayInstanceLimitsWriteSchema = z
+  .object({
+    instanceId: z.string().regex(/^[a-f0-9]{40}$/u),
+    limits: resourceLimitsSchema,
+  })
+  .strict()
+
 export const relayUpdateInstanceStartupSchema = z
   .object({
     diskLimitBytes: relayRequestedDiskLimitBytesSchema.optional(),
@@ -1704,6 +1770,43 @@ export const relayConnectionSettingsSchema = z
     useTls: z.boolean(),
   })
   .strict()
+
+// What a trial of a Relay's public route is named by, in the path anyone on
+// that route sees, and what only the Relay answers with.
+const relayProxyTrialSecretSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{32,64}$/u, "Use a random URL-safe value")
+
+/**
+ * One step of trying a Hearth-mode Relay's public route: its Traefik comes
+ * up beside the Relay's own listener, Hearth reaches it from outside on port
+ * 80 (`start`) and then over HTTPS (`certificate`), and only then does the
+ * Relay move to Traefik mode (`commit`). `stop` ends it with nothing changed.
+ * `automatic` asks only of a Relay installed to look for one.
+ */
+export const relayProxyTrialInputSchema = z.discriminatedUnion("step", [
+  z
+    .object({
+      answer: relayProxyTrialSecretSchema,
+      automatic: z.boolean(),
+      id: relayProxyTrialSecretSchema,
+      step: z.literal("start"),
+    })
+    .strict(),
+  z
+    .object({
+      id: relayProxyTrialSecretSchema,
+      step: z.enum(["certificate", "commit", "stop"]),
+    })
+    .strict(),
+])
+
+/** Why the step couldn't happen; null when it did. */
+export const relayProxyTrialResultSchema = z
+  .object({ problem: z.string().max(1024).nullable() })
+  .strict()
+
+export type RelayProxyTrialInput = z.infer<typeof relayProxyTrialInputSchema>
 
 export const relayProxySettingsSchema = z
   .object({
@@ -1918,6 +2021,8 @@ export const relayAppWebRoutesWriteSchema = z
     routes: relayInstanceWebRouteArraySchema(relayAppWebRouteInputSchema),
   })
   .strict()
+
+export const RELAY_PROXY_TRIAL_PATH = "/.well-known/kiln-route"
 
 export const relayProxyDiagnosticsSchema = z
   .object({
@@ -2242,6 +2347,9 @@ export const relayInstanceSchema = z.object({
   tailscale: relayInstanceTailscaleSchema.default({ enabled: false }),
   variables: brickVariableValuesSchema.optional(),
   managedByRelay: z.boolean().default(false),
+  // Limits saved since its container was made, which it takes when it next
+  // restarts. Absent when `limits` are the ones saved.
+  pendingLimits: resourceLimitsSchema.optional(),
   limits: relayInstanceLimitsSchema.default({
     cpuMillis: null,
     diskBytes: DEFAULT_INSTANCE_DISK_LIMIT_BYTES,
@@ -2446,8 +2554,27 @@ export const relayNodeSchema = z.object({
     model: z.string().min(1).max(200).optional(),
   }),
   memory: z.object({
+    /**
+     * What instances' limits may assign, after what's left for Kiln and the
+     * OS. Absent from Relays that predate it, which an update reaches.
+     */
+    assignableBytes: z.number().nonnegative().optional(),
     totalBytes: z.number().nonnegative(),
     usedBytes: z.number().nonnegative(),
+    /**
+     * The ceiling on the node's workloads together. Absent from Relays that
+     * predate it, which an update reaches.
+     */
+    workloadLimit: z
+      .object({
+        /** The limit in force, or null when workloads have none. */
+        limitBytes: z.number().nonnegative().nullable(),
+        /** The limit the node's reserve asks for. */
+        targetBytes: z.number().nonnegative(),
+        /** Running workloads outside it, which it doesn't hold. */
+        outsideCount: z.number().int().nonnegative(),
+      })
+      .optional(),
   }),
   storage: z.object({
     totalBytes: z.number().nonnegative(),
@@ -3045,6 +3172,9 @@ export const relayConsoleLineSchema = z.object({
   id: z.string().min(1),
   timestamp: z.string().datetime().nullable(),
   level: relayConsoleLevelSchema,
+  // A step Kiln itself reports in a deployment's log, rather than the output
+  // of what it ran.
+  origin: z.literal("kiln").optional(),
   service: z.enum(["tailscale", "coredns"]).optional(),
   text: z.string(),
   segments: z.array(relayConsoleSegmentSchema).optional(),
@@ -3327,7 +3457,7 @@ export type RelayApp = z.infer<typeof relayAppSchema>
 export type RelayAppContainer = z.infer<typeof relayAppContainerSchema>
 export type RelayAppLimits = z.infer<typeof relayAppLimitsSchema>
 export type RelayAppDeployment = z.infer<typeof relayAppDeploymentSchema>
-export type RelayCreateApp = z.infer<typeof relayCreateAppSchema>
+export type RelayCreateApp = z.input<typeof relayCreateAppSchema>
 export type RelayDeployApp = z.infer<typeof relayDeployAppSchema>
 export type AppGitHubBuild = z.infer<typeof appGitHubBuildSchema>
 export type RelayAppGitHubCheckout = z.infer<

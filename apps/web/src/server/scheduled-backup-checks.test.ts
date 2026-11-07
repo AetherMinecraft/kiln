@@ -50,6 +50,7 @@ vi.mock("@/lib/relay-connection", async (importOriginal) => ({
   ) => {
     if (operation === "relay.volumes.read") {
       return {
+        filesAvailable: false,
         measuring: false,
         protection: { ready: true, reason: null },
         uncovered: [],
@@ -177,7 +178,7 @@ const repositoryId = "44444444-4444-4444-8444-444444444444"
 
 describeMysql("Scheduled backups, checked before they run", () => {
   // Migrating a fresh database can take a while on a busy host.
-  layer(TestDatabase, { timeout: 120_000 })((it) => {
+  layer(TestDatabase)((it) => {
     it.effect(
       "refuses, in the schedule it sends, a backup Hearth would refuse by hand",
       () =>
@@ -276,8 +277,7 @@ describeMysql("Scheduled backups, checked before they run", () => {
             executions()[capped]?.refusal,
             "its backup destination is being deleted"
           )
-        }),
-      30_000
+        })
     )
 
     it.effect(

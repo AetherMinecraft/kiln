@@ -1,49 +1,37 @@
-import { randomBytes, randomUUID } from "node:crypto"
-
 import { createServerFn } from "@tanstack/react-start"
 import {
-  appConfigSchema,
   appIdSchema,
   appNameSchema,
   appServiceNameSchema,
+  databaseEngineSchema,
   databaseIdSchema,
+  newDatabaseNamesShape,
   appServiceLimitsSchema,
   relayAppLimitsV1Feature,
-  relayAppProvisioningV1Feature,
   relayAppSchema,
   relayAppTerminalClaimSchema,
   relayAppTerminalRestartSchema,
   relayAppTerminalWriteSchema,
   relayAppWebRoutesWriteSchema,
   relayAppWebRouteStateSchema,
+  relayDatabaseNameSchema,
   relayIdSchema,
   webRouteHostnames,
 } from "@workspace/contracts"
 import type { RelayApp } from "@workspace/contracts"
-import { Effect, Result } from "effect"
+import { Effect } from "effect"
 import { z } from "zod"
 
 import {
-  appNameExistsEffect,
-  createAppRecordEffect,
-  deleteAppRecordEffect,
   listAppRecordsEffect,
   renameAppRecordEffect,
   updateAppConfigEffect,
 } from "@/effect/managed-apps"
 import { promiseEffect } from "@/effect/promise"
 import { runAppEffect } from "@/effect/runtime"
-import {
-  isPlatformAdmin,
-  listUserGrants,
-  requireRelayPermission,
-} from "@/lib/access-control"
+import { isPlatformAdmin, listUserGrants } from "@/lib/access-control"
 import { accessPermissions } from "@/lib/permissions"
 import type { AccessPermission } from "@/lib/permissions"
-import {
-  abandonPreparedProvisioning,
-  claimPreparedProvisioning,
-} from "@/lib/provisioning.server"
 import { deleteConfirmationSchema } from "@/lib/delete-confirmation"
 import { webRouteProxySchema } from "@/lib/domain-schemas"
 import { requireDeleteConfirmation } from "@/lib/delete-confirmation.server"
@@ -61,18 +49,19 @@ import {
   getAppConfigHandler,
   getAppOwnerHandler,
   hasAppPermission,
+  publishAppChange,
   updateAppConfigHandler,
 } from "@/server/app-access"
 import { requireEligibleResourceUser } from "@/server/auth"
 import { askAppDeploy } from "@/server/app-deploy-ask.server"
 import { resourceOperation } from "@/server/resource-operation.server"
+import { createAppOperation, withNewAppIds } from "@/server/app-create.server"
 import { connectDatabase } from "@/server/database-connections.server"
 import { requireBackupTargetPermission } from "@/server/backup-target-access.server"
-import { databaseRpc, requiredRelay } from "@/server/managed-database-access"
+import { databaseRpc } from "@/server/managed-database-access"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { dnsKey } from "@/lib/dns-operations"
-import { outsideOperation } from "@/operations/current"
-import { exclusive, relayKey, resourceKey, shared } from "@/operations/lanes"
+import { exclusive } from "@/operations/lanes"
 import {
   operation,
   runOperationPromise,
@@ -83,7 +72,23 @@ const appInputSchema = z.strictObject({
   appId: appIdSchema,
   relayId: relayIdSchema,
 })
+const deployAppInputSchema = appInputSchema.extend({
+  noCache: z.boolean().optional(),
+})
 const createAppInputSchema = z.strictObject({
+  // A database to connect it to from the start, a new one or one on its
+  // Relay, whose credentials go in its environment.
+  database: z
+    .discriminatedUnion("kind", [
+      z.strictObject({
+        ...newDatabaseNamesShape,
+        engine: databaseEngineSchema,
+        kind: z.literal("new"),
+        name: relayDatabaseNameSchema,
+      }),
+      z.strictObject({ id: databaseIdSchema, kind: z.literal("existing") }),
+    ])
+    .optional(),
   name: appNameSchema,
   relayId: relayIdSchema,
 })
@@ -167,172 +172,13 @@ export const getAppOwner = createServerFn({ method: "GET" })
     getAppOwnerHandler(await requireEligibleResourceUser(), data)
   )
 
-const cancelledSchema = z.object({ cancelled: z.boolean() })
-
-// Holds the App it creates, by the ID it settles first, and its Relay
-// shared, so the Relay isn't removed meanwhile. The Relay is read once
-// admitted, so one removed since can't gain the App.
-const createAppNow = operation<z.infer<typeof createAppInputSchema>>()({
-  name: "app.create",
-  doing: "Creating this App",
-  authorize: ({ input, user }) =>
-    signedIn(user).pipe(
-      Effect.tap((person) =>
-        promiseEffect(() =>
-          requireRelayPermission({
-            permission: "app.create",
-            relayId: input.relayId,
-            user: person,
-          })
-        )
-      ),
-      Effect.map((person) => ({
-        id: randomBytes(20).toString("hex"),
-        user: person,
-      }))
-    ),
-  locks: ({ context, input }) => [
-    exclusive(resourceKey("app", input.relayId, context.id)),
-    shared(relayKey(input.relayId)),
-  ],
-  run: ({ context, input }) =>
-    promiseEffect(() => createAppHandler(context.user, input, context.id)),
-  audit: ({ context, input }) => ({
-    id: context.id,
-    kind: "app",
-    relayId: input.relayId,
-  }),
-})
-
 export const createApp = createServerFn({ method: "POST" })
   .validator(createAppInputSchema)
   .handler(async ({ data }) =>
-    runOperationPromise(createAppNow, data, {
+    runOperationPromise(createAppOperation, withNewAppIds(data), {
       user: await requireEligibleResourceUser(),
     })
   )
-
-async function createAppHandler(
-  user: AuthenticatedUser,
-  data: z.infer<typeof createAppInputSchema>,
-  id: string
-) {
-  const relay = await requiredRelay(data.relayId)
-  const nameExists = await runAppEffect(
-    "apps.name.preflight",
-    appNameExistsEffect(relay.id, data.name)
-  )
-  if (nameExists) {
-    throw new Error(
-      `An app named "${data.name}" already exists on ${relay.name}`
-    )
-  }
-  const register = () =>
-    runAppEffect(
-      "apps.record.create",
-      createAppRecordEffect({
-        appId: id,
-        createdBy: user.id,
-        name: data.name,
-        relayId: relay.id,
-      })
-    )
-  const { relayConnectionFeatures } = await import("@/lib/relay-connection")
-  if (relayConnectionFeatures(relay.id).has(relayAppProvisioningV1Feature)) {
-    // The Relay creates it in the background; it opens on its
-    // provisioning page at once.
-    const cancel = () =>
-      databaseRpc(
-        relay,
-        "app.provision.cancel",
-        { appId: id },
-        30_000,
-        user.id
-      ).then((result) => cancelledSchema.parse(result).cancelled)
-    const unregister = () =>
-      runAppEffect("apps.record.delete", deleteAppRecordEffect(relay.id, id))
-    // Recorded first, so a job the Relay holds always has an app in
-    // Hearth to show it and delete it from.
-    await register()
-    const placeholder = await Effect.runPromise(
-      promiseEffect(() =>
-        databaseRpc(
-          relay,
-          "app.provision.prepare",
-          { id, idempotencyKey: randomUUID(), name: data.name },
-          30_000,
-          user.id
-        )
-      ).pipe(
-        Effect.map((value) => relayAppSchema.parse(value)),
-        Effect.tapError(() => abandonPreparedProvisioning(cancel, unregister))
-      )
-    )
-    await claimPreparedProvisioning({
-      cancel,
-      claim: () =>
-        databaseRpc(
-          relay,
-          "app.provision.claim",
-          { appId: id },
-          30_000,
-          user.id
-        ),
-      unconfirmed: "If it stays waiting, delete it and create it again.",
-      unregister,
-    })
-    publishAppChange(relay.id, true)
-    generateAppHostname(relay.id, id)
-    return {
-      id: placeholder.id,
-      relayId: relay.id,
-      shortId: placeholder.shortId,
-    }
-  }
-  const created = relayAppSchema.parse(
-    await databaseRpc(
-      relay,
-      "app.create",
-      { id, name: data.name },
-      60_000,
-      user.id
-    )
-  )
-  const persisted = await promiseResult(register)
-  if (Result.isFailure(persisted)) {
-    await ignorePromise(() =>
-      databaseRpc(
-        relay,
-        "app.delete",
-        { appId: id, deleteData: true },
-        180_000,
-        user.id
-      )
-    )
-    throw persisted.failure
-  }
-  publishAppChange(relay.id, true)
-  generateAppHostname(relay.id, id)
-  return { id: created.id, relayId: relay.id, shortId: created.shortId }
-}
-
-// A new app gets an address under a vanity domain, as game servers do. In
-// the background: it calls Cloudflare, and the app opens without it.
-function generateAppHostname(relayId: string, appId: string) {
-  // Creating the App doesn't wait for it: it takes the App's DNS lane on
-  // its own, once creating it is done.
-  outsideOperation(
-    () =>
-      void import("@/server/web-hostname-access.server").then(
-        ({ generateAppHostnameBestEffort }) =>
-          generateAppHostnameBestEffort({
-            relayId,
-            resourceId: appId,
-            resourceType: "app",
-          })
-      )
-  )
-}
 
 // A host mount it adds also needs relay.files.write, which the run checks.
 const changeAppConfig = resourceOperation({
@@ -392,11 +238,16 @@ export const renameApp = createServerFn({ method: "POST" })
 // already asked for. Its log and the app's state follow it from there, and
 // Hearth records how it ends.
 export const deployApp = createServerFn({ method: "POST" })
-  .validator(appInputSchema)
+  .validator(deployAppInputSchema)
   .handler(async ({ data }) => {
     const queued = await runOperationPromise(
       askAppDeploy,
-      { appId: data.appId, relayId: data.relayId, trigger: "manual" },
+      {
+        appId: data.appId,
+        ...(data.noCache && { noCache: true }),
+        relayId: data.relayId,
+        trigger: "manual",
+      },
       { user: await requireEligibleResourceUser() }
     )
     publishAppChange(data.relayId, false)
@@ -417,7 +268,7 @@ const changeAppLimits = resourceOperation({
     if (!(await relayAppLimitsSupported(relay.id))) {
       throw new Error("Update this Relay to set app limits")
     }
-    const limits = appConfigSchema.pick({ serviceLimits: true }).parse(data)
+    const limits = { serviceLimits: data.serviceLimits }
     // Saved once the Relay applies them, so limits it refuses aren't used
     // by the next deployment, and into the config saved by then, so other
     // edits made meanwhile stay.
@@ -598,7 +449,7 @@ export const deleteApp = createServerFn({ method: "POST" })
   .validator(
     appInputSchema.extend(deleteConfirmationSchema.shape).extend({
       createBackup: z.boolean().default(true),
-      storageId: z.uuid().nullable().optional(),
+      storageId: z.uuid().nullable(),
     })
   )
   .handler(async ({ data }) => {
@@ -625,10 +476,8 @@ export const deleteApp = createServerFn({ method: "POST" })
       kind: "app",
       relayId: relay.id,
       resourceId: data.appId,
+      storageId: data.storageId,
       user,
-      ...(data.createBackup && data.storageId !== undefined
-        ? { storageId: data.storageId }
-        : {}),
     })
     await awaitResourceDeletion(deletion)
     return { deleted: true }
@@ -691,15 +540,6 @@ export const restartAppTerminal = createServerFn({ method: "POST" })
     return { restarted: true }
   })
 
-function publishAppChange(relayId: string, directoryChanged: boolean): void {
-  publishRealtimeChange({
-    audience: { kind: "relays", relayIds: [relayId] },
-    scope: { relayId },
-    topics: directoryChanged ? ["apps", "app-directory"] : ["apps"],
-    type: "hearth.invalidate",
-  })
-}
-
 function publishRelayVolumesChange(relayId: string): void {
   publishRealtimeChange({
     audience: { kind: "relays", relayIds: [relayId] },
@@ -707,18 +547,6 @@ function publishRelayVolumesChange(relayId: string): void {
     topics: ["relay-volumes"],
     type: "hearth.invalidate",
   })
-}
-
-function promiseResult<TResult>(run: () => Promise<TResult>) {
-  return Effect.runPromise(
-    Effect.result(Effect.tryPromise({ try: run, catch: (cause) => cause }))
-  )
-}
-
-async function ignorePromise(run: () => Promise<unknown>): Promise<void> {
-  await Effect.runPromise(
-    Effect.tryPromise({ try: run, catch: (cause) => cause }).pipe(Effect.ignore)
-  )
 }
 
 async function relayAppLimitsSupported(relayId: string): Promise<boolean> {

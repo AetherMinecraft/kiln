@@ -1,12 +1,18 @@
 import assert from "node:assert/strict"
-import { test } from "vite-plus/test"
+import { readFile } from "node:fs/promises"
+import { test, vi } from "vite-plus/test"
 
 import {
+  desktopImageTags,
   nightlyRollingTags,
+  untilPublished,
   validateReleaseManifest,
   validateStablePromotion,
 } from "./release.mjs"
-import { kilnImageRepository } from "../packages/contracts/src/git-repository.ts"
+import {
+  KILN_DESKTOP_IMAGE_TAG,
+  kilnImageRepository,
+} from "../packages/contracts/src/git-repository.ts"
 
 const repository = "https://github.com/example/fork"
 
@@ -164,4 +170,44 @@ test("stable promotion requires the newest nightly in its line and cannot roll b
         name
       )
   }
+})
+
+test("a nightly waits for an image still publishing, but not for ever", async () => {
+  vi.useFakeTimers()
+  try {
+    let checks = 0
+    const waited = untilPublished(async () => {
+      checks += 1
+      if (checks < 3) throw new Error("not yet")
+      return "public"
+    })
+    await vi.advanceTimersByTimeAsync(60_000)
+    assert.equal(await waited, "public")
+
+    const never = untilPublished(async () => {
+      throw new Error("Anonymous pull failed")
+    })
+    const refused = assert.rejects(never, /Anonymous pull failed/u)
+    await vi.advanceTimersByTimeAsync(21 * 60_000)
+    await refused
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+test("a release needs the desktop image its own code names", async () => {
+  const contracts = await readFile(
+    new URL("../packages/contracts/src/git-repository.ts", import.meta.url),
+    "utf8"
+  )
+  assert.deepEqual(desktopImageTags(contracts), [
+    KILN_DESKTOP_IMAGE_TAG,
+    `${KILN_DESKTOP_IMAGE_TAG}-source`,
+  ])
+  assert.deepEqual(
+    desktopImageTags('export const KILN_DESKTOP_IMAGE_TAG = "0.3.1"'),
+    ["0.3.1", "0.3.1-source"]
+  )
+  // A nightly from before Relays had a default needs no image to be promoted.
+  assert.deepEqual(desktopImageTags("export const other = 1"), [])
 })

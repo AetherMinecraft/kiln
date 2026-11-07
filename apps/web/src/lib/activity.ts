@@ -234,6 +234,7 @@ export function activityLabelForAudit(audit: RelayAuditRecord): string {
   }
   if (operation === "relay.rename") return "Renamed a Relay"
   if (operation === "relay.proxy.write") return "Updated Relay proxy settings"
+  if (operation === "relay.proxy.trial") return "Tried a Relay's public route"
   if (operation === "relay.networking.write") {
     return "Updated Relay networking"
   }
@@ -254,6 +255,8 @@ export function activityLabelForAudit(audit: RelayAuditRecord): string {
   if (operation === "relay.restart") return "Restarted the Relay"
   if (operation === "relay.docker.cleanup") return "Started Docker cleanup"
   if (operation === "relay.host.restart") return "Restarted the Relay’s host"
+  if (operation === "relay.host.packages.update")
+    return "Updated the Relay’s host packages"
   if (operation === "relay.pairing.create") {
     return "Created a Relay invitation"
   }
@@ -313,12 +316,14 @@ export function activityPermissionForAudit(
   if (operation === "relay.restart") return "relay.update"
   if (operation === "relay.docker.cleanup") return "relay.configure"
   if (operation === "relay.host.restart") return "relay.terminal"
+  if (operation === "relay.host.packages.update") return "relay.terminal"
   if (operation === "relay.rename") return "relay.rename"
   if (operation === "relay.networking.write") return "relay.configure"
   if (
     operation === "relay.tailscale.install" ||
     operation === "relay.tailscale.write" ||
-    operation === "relay.proxy.write"
+    operation === "relay.proxy.write" ||
+    operation === "relay.proxy.trial"
   ) {
     return "relay.configure"
   }

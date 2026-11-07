@@ -5,6 +5,7 @@
  */
 import {
   appIdFromFileRoot,
+  appVolumeFromFileRoot,
   appTailscaleMember,
   databaseIdFromFileRoot,
   databaseTailscaleMember,
@@ -77,6 +78,17 @@ export function appReplaceLocks(appId: string): Array<LaneLock> {
   return [exclusive(laneKeys.app(appId))]
 }
 
+/** Creating an App connected to databases, which may still be provisioning. */
+export function appCreateLocks(
+  appId: string,
+  databaseIds: ReadonlyArray<string>
+): Array<LaneLock> {
+  return [
+    ...appReplaceLocks(appId),
+    ...databaseIds.map((id) => shared(laneKeys.databaseConnections(id))),
+  ]
+}
+
 /**
  * Starting an App, which also reads every volume it mounts: a restore of one
  * holds it alone, so the App waits for it rather than start on half its
@@ -93,6 +105,14 @@ export function appStartLocks(
 /** Changing a database itself: its settings, data, or container. */
 export function databaseLocks(databaseId: string): Array<LaneLock> {
   return [exclusive(laneKeys.database(databaseId))]
+}
+
+/** Deleting a database forgets its connections, so none is added meanwhile. */
+export function databaseDeleteLocks(databaseId: string): Array<LaneLock> {
+  return [
+    ...databaseLocks(databaseId),
+    exclusive(laneKeys.databaseConnections(databaseId)),
+  ]
 }
 
 /** Changing a database's running process: power and commands. */
@@ -150,12 +170,26 @@ export function resourceLaneKey(kind: PowerResourceKind, id: string): string {
   return laneKeys.database(id)
 }
 
+/**
+ * A volume opened through an App: several Apps can share one, so its writers
+ * wait for each other, and it can't be deleted or restored meanwhile.
+ */
+function appVolumeFileLocks(appId: string, volumeId: string): Array<LaneLock> {
+  return [
+    ...appFileLocks(appId),
+    shared(laneKeys.volume(volumeId)),
+    exclusive(laneKeys.volumeFiles(volumeId)),
+  ]
+}
+
 /** Writes under a file root, which is a game server, an App, or the host. */
 export function fileRootWriteLocks(
   rootId: string,
   resolveInstance: InstanceResolver
 ): ReadonlyArray<LaneLock> | Promise<ReadonlyArray<LaneLock>> {
   if (isRelayFileRoot(rootId)) return [exclusive(laneKeys.hostFiles)]
+  const volume = appVolumeFromFileRoot(rootId)
+  if (volume) return appVolumeFileLocks(volume.appId, volume.volumeId)
   const appId = appIdFromFileRoot(rootId)
   if (appId) return appFileLocks(appId)
   return withInstance(resolveInstance(rootId), instanceFileLocks)
@@ -243,6 +277,13 @@ export function fileRootTransferLocks(rootId: string): Array<LaneLock> {
   // import, which reads the uploaded dump, waits for them.
   const databaseId = databaseIdFromFileRoot(rootId)
   if (databaseId) return databaseReadLocks(databaseId)
+  const volume = appVolumeFromFileRoot(rootId)
+  if (volume) {
+    return [
+      shared(laneKeys.app(volume.appId)),
+      shared(laneKeys.volume(volume.volumeId)),
+    ]
+  }
   const appId = appIdFromFileRoot(rootId)
   return [shared(appId ? laneKeys.app(appId) : laneKeys.instance(rootId))]
 }
@@ -255,6 +296,13 @@ export function fileRootTransferLocks(rootId: string): Array<LaneLock> {
  */
 export function fileRootCommitLocks(rootId: string): Array<LaneLock> {
   if (isRelayFileRoot(rootId) || databaseIdFromFileRoot(rootId)) return []
+  const volume = appVolumeFromFileRoot(rootId)
+  if (volume) {
+    return [
+      exclusive(laneKeys.appFiles(volume.appId)),
+      exclusive(laneKeys.volumeFiles(volume.volumeId)),
+    ]
+  }
   const appId = appIdFromFileRoot(rootId)
   return [
     exclusive(
@@ -463,6 +511,8 @@ export function controlRequestLocks(
     // one at a time in their own helper.
     case "relay.security.targets":
     case "relay.security.inventory":
+    // Asks the package manager what's new, changing only its package lists.
+    case "relay.host.packages.read":
     case "relay.platform.logs":
     case "relay.platform.database.read":
     case "relay.installation.read":
@@ -543,6 +593,10 @@ export function controlRequestLocks(
     case "relay.installation.replace":
       return [exclusive(laneKeys.platform)]
 
+    // The host holds the run itself, and answers that one is going.
+    case "relay.host.packages.update":
+      return [exclusive(laneKeys.hostPackages)]
+
     // Updates and restarts replace the Relay itself and reserve themselves.
     case "relay.update.apply":
     case "relay.restart":
@@ -610,6 +664,7 @@ export function controlRequestLocks(
 
     case "relay.networking.write":
     case "relay.proxy.write":
+    case "relay.proxy.trial":
     // May write the bundled Traefik's routes again.
     case "relay.certificates.check":
       return [exclusive(laneKeys.routes)]
@@ -680,6 +735,7 @@ export function controlRequestLocks(
       )
     case "database.wipe":
     case "database.delete":
+      return database(databaseDeleteLocks)
     case "database.credentials.rotate":
     case "database.dump.import":
     case "database.data.write":
@@ -732,8 +788,12 @@ export function controlRequestLocks(
       ]
     }
 
-    case "app.create":
-      return app(appReplaceLocks, "id")
+    case "app.create": {
+      const databaseIds = Array.isArray(payload.databaseIds)
+        ? payload.databaseIds.filter(Predicate.isString)
+        : []
+      return app((id) => appCreateLocks(id, databaseIds), "id")
+    }
     // Stops the running build beside it, which holds the App's lifecycle,
     // so a deletion needn't wait for the build it removes.
     case "app.deployment.abort":
@@ -772,6 +832,11 @@ export function controlRequestLocks(
       return instance(instanceReplaceLocks)
     // These recreate the container with new labels, as a start does.
     case "instance.network.databases.remove":
+      return instance(instanceLifecycleLocks)
+    // Saved for the next restart, so it leaves the container alone but waits
+    // for one in progress, which clears what it applied. Taking the node's
+    // allocations happens in its turn, once its files are measured.
+    case "instance.limits.write":
       return instance(instanceLifecycleLocks)
     case "instance.rename":
       return instance((id) => [

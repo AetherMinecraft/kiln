@@ -57,8 +57,8 @@ Every run goes through the same steps, in one `Operations.<name>` span:
      turn, and is authorized again once it has, since what it read may have
      changed. One that waits over 30 seconds logs what it waits behind. A
      person's that waited is authorized again too. If what it found then
-     needs locks it doesn't hold, as a backup whose preferred destination
-     changed, it takes its turn again with them rather than run without.
+     needs locks it doesn't hold, it takes its turn again with them rather
+     than run without.
    - An operation run **inside another** runs under its parent's locks and
      takes none of its own. It may only need what its parent holds: the same
      keys, or parts of a whole its parent holds exclusively. Needing more is
@@ -194,6 +194,7 @@ request is answered once.
 | `relay:<id>#docker-cleanup`         | A cleanup of its Docker someone asked for              |
 | `relay:<id>#authorization`          | What a Relay holds of who may do what                  |
 | `relay:<id>#database-connections`   | Apps' database connections handover                    |
+| `relay:<id>#version`                | The version Hearth has recorded for a Relay            |
 | `cloudflare-connection:<id>`        | A Cloudflare connection                                |
 | `hearth`                            | Hearth: its update, backups, services and database     |
 | `backup:<id>`                       | A backup: changing it, or restoring from it            |
@@ -225,6 +226,12 @@ the App takes them with it.
 An App's changes take its parts too: `#config` for its configuration and
 limits, `#name`, `#power`, and `#deploy` for starting a deployment. Its image
 update settings hold it shared.
+
+Creating an App with a database holds that database too: a new one whole, by
+the ID it settles first, and an existing one's `#connections`, with its
+`#credentials` shared while they're copied into the App's environment. A new
+database is created as an operation of its own inside the App's, under those
+locks.
 
 An image check is a read: it asks the registry with no lane held and
 records what it found holding the App shared, so it conflicts with nothing

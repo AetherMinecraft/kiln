@@ -40,6 +40,7 @@ import {
   DatabaseKindIcon,
   RelayKindIcon,
   ServerKindIcon,
+  VolumeKindIcon,
 } from "@/components/instance-kind-icon"
 import { instanceFavoriteKey, kilnFavorite } from "@/lib/instance-favorites"
 import {
@@ -51,28 +52,44 @@ import {
   instancePickerFilterIdsSnapshot,
   subscribeInstancePickerFilterIds,
   writeInstancePickerFilterIds,
+  type AnyInstancePickerItem,
   type InstancePickerFilter,
   type InstancePickerItem,
   type InstancePickerKind,
 } from "@/lib/instance-picker-filters"
 import { accessCapabilitiesQueryOptions } from "@/lib/query-options"
 
-export type { InstancePickerItem } from "@/lib/instance-picker-filters"
+export type {
+  InstancePickerItem,
+  VolumePickerIdentity,
+} from "@/lib/instance-picker-filters"
 
 /** A whole type of instance, including ones added later. */
 export type InstancePickerGroup = "all" | InstancePickerKind
 
-interface InstancePickerContentProps {
+interface InstancePickerContentProps<Item extends AnyInstancePickerItem> {
   ariaLabel?: string
   emptyMessage?: string
   /** Shows the "Show favorites only" filter. Off ignores a saved choice. */
   favoritesFilter?: boolean
-  items: ReadonlyArray<InstancePickerItem>
+  /**
+   * Shows the bar saying which filters apply and how many rows they leave.
+   * Off suits a list too short to need it; the filter buttons still show
+   * what's on.
+   */
+  filterBar?: boolean
+  /** Stays below the list, whatever it's searched for or filtered by. */
+  footer?: React.ReactNode
+  /** Stays above the list, whatever it's searched for or filtered by. */
+  header?: React.ReactNode
+  items: ReadonlyArray<Item>
   /** Multi-select shows checkboxes and keeps the picker open on select. */
   multiple?: boolean
   /** Called after the footer link navigates, usually to close the popover. */
   onNavigate?: () => void
-  onSelect: (item: InstancePickerItem) => void
+  onSelect: (item: Item) => void
+  /** Text pasted into search, which can act on it and cancel the paste. */
+  onSearchPaste?: (event: React.ClipboardEvent<HTMLInputElement>) => void
   /**
    * Enables the split "All game servers | All databases | All Relays" row. Unlike
    * selecting every row, a group also covers instances added later.
@@ -86,6 +103,13 @@ interface InstancePickerContentProps {
   includeKindGroups?: boolean
   /** Row being saved; shows a spinner and locks every row until it settles. */
   pendingKey?: string
+  /**
+   * A row made from what's typed, such as creating what it names, listed
+   * after the matches so Enter reaches it once none are left.
+   */
+  searchItem?: (search: string) => Item | null
+  /** In place of "Search <ariaLabel>". */
+  searchPlaceholder?: string
   selectedGroups?: ReadonlySet<InstancePickerGroup>
   selectedKeys: ReadonlySet<string>
   /** Shows a "View all" footer that follows the active type filter. */
@@ -94,7 +118,7 @@ interface InstancePickerContentProps {
 
 // Kind `server` is shown to users as "Game Server". See AGENTS.md Naming.
 const kindPresentation: Record<
-  InstancePickerKind,
+  AnyInstancePickerItem["identity"]["kind"],
   { Icon: typeof ServerKindIcon; label: string; plural: string }
 > = {
   app: { Icon: AppKindIcon, label: "App", plural: "apps" },
@@ -109,6 +133,7 @@ const kindPresentation: Record<
     label: "Game Server",
     plural: "game servers",
   },
+  volume: { Icon: VolumeKindIcon, label: "Volume", plural: "volumes" },
 }
 
 const kindOrder: ReadonlyArray<InstancePickerKind> = [
@@ -121,23 +146,31 @@ const emptyGroups: ReadonlySet<InstancePickerGroup> = new Set()
 const emptyGroupList: ReadonlyArray<InstancePickerGroup> = []
 const emptyFilterList: ReadonlyArray<InstancePickerFilter> = []
 
-export const InstancePickerContent = React.memo(function InstancePickerContent({
+function InstancePickerContentView<
+  Item extends AnyInstancePickerItem = InstancePickerItem,
+>({
   ariaLabel = "Instances",
   emptyMessage = "No instances found",
   favoritesFilter = true,
+  filterBar: showFilterBar = true,
+  footer,
+  header,
   includeAllGroup = false,
   includeKindGroups = true,
   items: sourceItems,
   multiple = false,
   onNavigate,
+  onSearchPaste,
   onSelect,
   onSelectGroup,
   onSelectMany,
   pendingKey,
+  searchItem,
+  searchPlaceholder,
   selectedGroups = emptyGroups,
   selectedKeys,
   viewAll = false,
-}: InstancePickerContentProps) {
+}: InstancePickerContentProps<Item>) {
   const listId = React.useId()
   const searchInputRef = React.useRef<HTMLInputElement>(null)
   const [search, setSearch] = React.useState("")
@@ -181,13 +214,15 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
   const noFavorites =
     appliedFilters.includes(favoriteInstancePickerFilter) &&
     !items.some((item) => item.favorite === true)
-  const visibleItems = React.useMemo(
-    () =>
-      query
-        ? items.filter((item) => matchesInstancePickerSearch(item, query))
-        : filterInstancePickerItems(items, activeFilters),
-    [activeFilters, items, query]
-  )
+  const typedSearch = search.trim()
+  const visibleItems = React.useMemo(() => {
+    if (!query) return filterInstancePickerItems(items, activeFilters)
+    const matches = items.filter((item) =>
+      matchesInstancePickerSearch(item, query)
+    )
+    const typed = searchItem?.(typedSearch)
+    return typed ? [...matches, typed] : matches
+  }, [activeFilters, items, query, searchItem, typedSearch])
   const selectableIndexes = React.useMemo(
     () => visibleItems.flatMap((item, index) => (item.disabled ? [] : [index])),
     [visibleItems]
@@ -316,8 +351,7 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
   const activeKind = query ? undefined : filteredKind
   // "View all" follows the top search result, then the type filter.
   const viewAllKind = query
-    ? (visibleItems.find((item) => !isKilnIdentity(item.identity))?.identity
-        .kind ?? filteredKind)
+    ? (visibleItems.flatMap(listableKind)[0] ?? filteredKind)
     : filteredKind
   const activeItem = visibleItems[activeItemIndex]
   // In a phone drawer the search field sits last, next to the keyboard, and
@@ -353,7 +387,10 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
           value={search}
           onChange={handleSearchChange}
           onKeyDown={handleSearchKeyDown}
-          placeholder={`Search ${ariaLabel.toLocaleLowerCase()}`}
+          onPaste={onSearchPaste}
+          placeholder={
+            searchPlaceholder ?? `Search ${ariaLabel.toLocaleLowerCase()}`
+          }
           aria-label={`Search ${ariaLabel.toLocaleLowerCase()}`}
           className={cn(
             "bg-input/14 pr-2 pl-8",
@@ -393,7 +430,7 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
   // Saved filters carry across pickers, so the bar always says what's
   // applied, even when nothing is, and that a search looks past them.
   const filterBar =
-    items.length > 0 ? (
+    showFilterBar && items.length > 0 ? (
       <InstancePickerFilterBar
         activeFilters={activeFilters}
         atBottom={searchAtBottom}
@@ -424,6 +461,7 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
           onSelect={onSelectGroup}
         />
       ) : null}
+      {header}
       {visibleItems.length > 0 ? (
         <div
           ref={scrollElementRef}
@@ -464,7 +502,7 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
                     pending={pendingKey === item.key}
                     selected={selectedKeys.has(item.key)}
                     showKind={showKind}
-                    onSelect={onSelect}
+                    onSelect={onSelect as (item: AnyInstancePickerItem) => void}
                   />
                 </div>
               )
@@ -488,11 +526,16 @@ export const InstancePickerContent = React.memo(function InstancePickerContent({
           onNavigate={onNavigate}
         />
       ) : null}
+      {footer}
       {searchAtBottom ? filterBar : null}
       {searchAtBottom ? searchBar : null}
     </>
   )
-})
+}
+
+export const InstancePickerContent = React.memo(
+  InstancePickerContentView
+) as typeof InstancePickerContentView
 
 function useInstancePickerFilterIds() {
   const { data: userId } = useQuery({
@@ -526,14 +569,26 @@ function useInstancePickerFilterIds() {
 
 const kilnFavoriteKey = instanceFavoriteKey(kilnFavorite)
 
-function instancePickerFavoriteKey(item: InstancePickerItem): string {
-  return isKilnIdentity(item.identity)
+function instancePickerFavoriteKey(item: AnyInstancePickerItem): string {
+  const { identity } = item
+  // Only an instance can be a favorite.
+  if (identity.kind === "volume") return ""
+  return isKilnIdentity(identity)
     ? kilnFavoriteKey
-    : instanceFavoriteKey(item.identity)
+    : instanceFavoriteKey(identity)
+}
+
+/** What "View all" can list this row under; Kiln isn't a Relay to list. */
+function listableKind({
+  identity,
+}: AnyInstancePickerItem): ReadonlyArray<InstancePickerKind> {
+  return identity.kind === "volume" || isKilnIdentity(identity)
+    ? []
+    : [identity.kind]
 }
 
 function matchesInstancePickerSearch(
-  item: InstancePickerItem,
+  item: AnyInstancePickerItem,
   query: string
 ): boolean {
   return `${item.name} ${item.meta} ${item.searchText ?? ""}`
@@ -916,15 +971,17 @@ const InstancePickerRowButton = React.memo(function InstancePickerRowButton({
 }: {
   active: boolean
   id: string
-  item: InstancePickerItem
+  item: AnyInstancePickerItem
   locked: boolean
   multiple: boolean
-  onSelect: (item: InstancePickerItem) => void
+  onSelect: (item: AnyInstancePickerItem) => void
   pending: boolean
   selected: boolean
   showKind: boolean
 }) {
-  const kind = kindPresentation[item.identity.kind]
+  const { identity } = item
+  const kind = kindPresentation[identity.kind]
+  const kiln = identity.kind !== "volume" && isKilnIdentity(identity)
 
   return (
     <button
@@ -947,17 +1004,20 @@ const InstancePickerRowButton = React.memo(function InstancePickerRowButton({
       {multiple ? (
         <InstancePickerCheckbox state={selected ? "all" : "none"} />
       ) : null}
-      <InstanceCard
-        className="min-w-0 flex-1 gap-2"
-        iconClassName="border-0 bg-muted/55"
-        instance={item.identity}
-        meta={item.meta}
-        metaClassName="font-mono"
-        name={item.name}
-        nameClassName="type-control-sm"
-        status={item.status}
-        statusClassName="ring-popover"
-      />
+      {item.card ??
+        (identity.kind === "volume" ? null : (
+          <InstanceCard
+            className="min-w-0 flex-1 gap-2"
+            iconClassName="border-0 bg-muted/55"
+            instance={identity}
+            meta={item.meta}
+            metaClassName="font-mono"
+            name={item.name}
+            nameClassName="type-control-sm"
+            status={item.status}
+            statusClassName="ring-popover"
+          />
+        ))}
       {pending ? (
         <LoaderCircle
           className="size-3.5 shrink-0 animate-spin text-primary-ink"
@@ -965,14 +1025,12 @@ const InstancePickerRowButton = React.memo(function InstancePickerRowButton({
         />
       ) : showKind ? (
         <span className="shrink-0 text-muted-foreground/70 light:text-muted-foreground/85">
-          {isKilnIdentity(item.identity) ? (
+          {kiln ? (
             <HearthMark className="size-3.5 text-current" />
           ) : (
             <kind.Icon className="size-3.5" aria-hidden="true" />
           )}
-          <span className="sr-only">
-            {isKilnIdentity(item.identity) ? "Kiln" : kind.label}
-          </span>
+          <span className="sr-only">{kiln ? "Kiln" : kind.label}</span>
         </span>
       ) : null}
     </button>
@@ -1093,6 +1151,67 @@ function InstancePickerEmptyState({
   )
 }
 
+const footerRowClassName =
+  "type-control-sm group flex h-9 w-full items-center gap-2 rounded-md bg-muted/45 px-2.5 text-foreground transition-colors outline-none hover:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring/40"
+
+const footerRowArrowClassName =
+  "ml-auto size-3.5 text-muted-foreground transition-transform duration-150 group-hover:translate-x-0.5 group-focus-visible:translate-x-0.5"
+
+/** A choice beside the instances, for the picker's `header`. */
+export const InstancePickerHeaderAction = React.memo(
+  function InstancePickerHeaderAction({
+    label,
+    onClick,
+    selected,
+  }: {
+    label: string
+    onClick: () => void
+    selected: boolean
+  }) {
+    return (
+      <div className="border-b border-border/70 p-1.5">
+        <button
+          type="button"
+          aria-pressed={selected}
+          className="type-control-sm flex h-9 w-full items-center gap-2 rounded-md px-2.5 text-foreground transition-colors outline-none hover:bg-muted/55 focus-visible:ring-2 focus-visible:ring-ring/40"
+          onClick={onClick}
+        >
+          <span>{label}</span>
+          {selected ? (
+            <Check
+              className="ml-auto size-3.5 text-primary-ink"
+              aria-hidden="true"
+            />
+          ) : null}
+        </button>
+      </div>
+    )
+  }
+)
+
+/** Something to do instead of choosing, for the picker's `footer`. */
+export const InstancePickerFooterAction = React.memo(
+  function InstancePickerFooterAction({
+    icon: Icon,
+    label,
+    onClick,
+  }: {
+    icon: React.ComponentType<LucideProps>
+    label: string
+    onClick: () => void
+  }) {
+    return (
+      <div className="border-t border-border/70 p-1.5">
+        <button type="button" className={footerRowClassName} onClick={onClick}>
+          <Icon className="size-3.5" aria-hidden="true" />
+          <span>{label}</span>
+          <ArrowRight className={footerRowArrowClassName} aria-hidden="true" />
+        </button>
+      </div>
+    )
+  }
+)
+
 const viewAllDestinations = {
   app: { label: "View all apps", to: "/infra/apps" },
   database: { label: "View all databases", to: "/infra/databases" },
@@ -1107,15 +1226,11 @@ const InstancePickerViewAll = React.memo(function InstancePickerViewAll({
   search,
 }: {
   activeKind?: InstancePickerKind
-  items: ReadonlyArray<InstancePickerItem>
+  items: ReadonlyArray<AnyInstancePickerItem>
   onNavigate?: () => void
   search: string
 }) {
-  // Kiln shows as a Relay, but isn't one to list.
-  const kind =
-    activeKind ??
-    items.find((item) => !isKilnIdentity(item.identity))?.identity.kind ??
-    "server"
+  const kind = activeKind ?? items.flatMap(listableKind)[0] ?? "server"
   const destination = viewAllDestinations[kind]
   const { Icon } = kindPresentation[kind]
 
@@ -1125,14 +1240,11 @@ const InstancePickerViewAll = React.memo(function InstancePickerViewAll({
         to={destination.to}
         search={search ? { search } : {}}
         onClick={onNavigate}
-        className="type-control-sm group flex h-9 w-full items-center gap-2 rounded-md bg-muted/45 px-2.5 text-foreground transition-colors outline-none hover:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring/40"
+        className={footerRowClassName}
       >
         <Icon className="size-3.5" aria-hidden="true" />
         <span>{destination.label}</span>
-        <ArrowRight
-          className="ml-auto size-3.5 text-muted-foreground transition-transform duration-150 group-hover:translate-x-0.5 group-focus-visible:translate-x-0.5"
-          aria-hidden="true"
-        />
+        <ArrowRight className={footerRowArrowClassName} aria-hidden="true" />
       </Link>
     </div>
   )

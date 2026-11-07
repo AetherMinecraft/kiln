@@ -56,6 +56,7 @@ import {
   relayProxySettingsSchema,
   relayInstanceSchema,
   resolveResourceLimits,
+  resourceLimitsEqual,
   relayTailscaleOverviewSchema,
   relayTailscaleSettingsSchema,
   migrateLegacyTailscaleBindings,
@@ -132,9 +133,13 @@ import {
   routeLabelsRequireRestart,
   traefikDynamicConfiguration,
   traefikRouteLabels,
+  traefikServesRelay,
   traefikStaticConfiguration,
+  traefikTrialConfiguration,
   type TraefikLabelProfile,
 } from "./traefik.js"
+
+import type { TraefikCertificateGate } from "./web-certificates.js"
 
 // Containers Relay runs for its own infrastructure, named when created.
 type InfrastructureContainer = Omit<ContainerSpec, "name">
@@ -372,6 +377,7 @@ interface AllocationRequest {
   /** Whether its data must already fit the disk limit. */
   checkExistingUsage: boolean
   currentDiskLimitBytes: number | null
+  currentMemoryLimitBytes: number | null
   directory: string
   id: string
   limits: ResourceLimits
@@ -398,6 +404,16 @@ export class LifecycleDriver {
   #edgeReconciliationFiber: Fiber.Fiber<void> | null = null
   #hostDataDirectoryPromise: Promise<string> | null = null
   #listenerMode: RelayProxySettings["mode"] | null = null
+  // A trial of this Relay's public route, in memory: a restart ends it, and
+  // a Relay in Hearth mode removes the Traefik it left.
+  #proxyTrial: {
+    readonly answer: string
+    certificate: boolean
+    readonly id: string
+    // Traefik joins this, the Relay's own network, and reaches it there.
+    readonly relayNetwork: string
+    readonly upstream: string
+  } | null = null
   // The last reason Traefik couldn't serve Hearth, logged once.
   #platformEdgeError: string | null = null
   readonly #gamePortSemaphore = Semaphore.makeUnsafe(1)
@@ -1215,6 +1231,7 @@ export class LifecycleDriver {
         "Switching proxy TLS termination on or off changes Relay's private listener protocol. Set KILN_RELAY_PROXY, remove /data/proxy.json once, and restart Relay."
       )
     }
+    this.#proxyTrial = null
     await this.#writeProxySettings(settings)
     this.hydrateProxySettings(settings)
     await this.configureWebRoutes(routes, settings)
@@ -1230,6 +1247,119 @@ export class LifecycleDriver {
     }
     this.#scheduleEdgeReconciliation(settings)
     return { diagnostics: await this.proxyDiagnostics(settings), settings }
+  }
+
+  /**
+   * Starts a trial of this Relay's public route, while it stays in Hearth
+   * mode: Traefik comes up on ports 80 and 443 and answers only the trial's
+   * path. Returns why it can't, with nothing left running.
+   */
+  async startProxyTrial(input: {
+    readonly answer: string
+    readonly id: string
+    readonly upstreamTls: boolean
+  }): Promise<string | null> {
+    const settings = await this.proxySettings()
+    if (settings.mode !== "hearth") {
+      return "This Relay already has a route of its own."
+    }
+    if (!traefikServesRelay(this.#config, settings.traefikImage)) {
+      return `This Relay's Traefik can't serve ${this.#config.advertisedHost}.`
+    }
+    const { conflicts } = await this.#traefikPortConflicts(settings)
+    if (conflicts) return conflicts
+    // Traefik mode refuses to start with it published.
+    if ((await this.#publishedListenerBindings()).length > 0) {
+      return `This Relay's port ${this.#config.port} is published, so it can't use its Traefik. Run the install command again to set it up without it.`
+    }
+    const listener = await this.#relayListenerOnItsNetwork(input.upstreamTls)
+    if (!listener) return "This Relay isn't on a network Traefik can join."
+    this.#proxyTrial = {
+      answer: input.answer,
+      certificate: false,
+      id: input.id,
+      relayNetwork: listener.network,
+      upstream: listener.upstream,
+    }
+    const problem = await recoverPromise(
+      async () => {
+        await this.#ensureTraefik(settings, [], true)
+        return null
+      },
+      (cause) => (cause instanceof Error ? cause.message : String(cause))
+    )
+    if (problem) {
+      this.#proxyTrial = null
+      await this.#removeBundledTraefik()
+    }
+    return problem
+  }
+
+  /** What the trial named `id` answers, if it's the one running. */
+  proxyTrialAnswer(id: string): string | null {
+    return this.#proxyTrial?.id === id ? this.#proxyTrial.answer : null
+  }
+
+  /** Has the trial's Traefik ask for the certificate the Relay will need. */
+  async requestProxyTrialCertificate(id: string): Promise<string | null> {
+    const trial = this.#proxyTrial
+    if (trial?.id !== id) return "That trial is over."
+    trial.certificate = true
+    await this.#writeTraefikRoutes(this.#webRoutes, await this.proxySettings())
+    return null
+  }
+
+  /**
+   * Keeps what the trial proved: the Relay next starts in Traefik mode, on
+   * the Traefik and certificate already in place. The caller restarts it,
+   * which is what changes its listener's protocol.
+   */
+  async commitProxyTrial(id: string): Promise<string | null> {
+    const trial = this.#proxyTrial
+    if (trial?.id !== id || !trial.certificate) return "That trial is over."
+    await this.#writeProxySettings({
+      ...(await this.proxySettings()),
+      mode: "traefik",
+    })
+    // Decided: neither a late `stop` nor the trial's expiry may undo it.
+    this.#proxyTrial = null
+    // From its restart Traefik reaches the Relay on their own network.
+    await recoverPromise(
+      () =>
+        disconnectNetwork(
+          this.#engine,
+          this.#resources.traefikContainer,
+          trial.relayNetwork
+        ),
+      () => undefined
+    )
+    return null
+  }
+
+  // Where Traefik can reach this Relay without it joining anything: a
+  // network change can take the Relay's connections down with it, and a
+  // trial leaves it connected throughout.
+  async #relayListenerOnItsNetwork(upstreamTls: boolean) {
+    const networks = await containerNetworks(
+      this.#engine,
+      requiredRelayContainerReference()
+    )
+    const found = Object.entries(networks).find(
+      ([, network]) => network.IPAddress
+    )
+    if (!found) return null
+    const [network, { IPAddress: address }] = found
+    return {
+      network,
+      upstream: `${upstreamTls ? "https" : "http"}://${address}:${this.#config.port}`,
+    }
+  }
+
+  /** Ends the trial named `id`, if it's still running, changing nothing. */
+  async stopProxyTrial(id: string): Promise<void> {
+    if (this.#proxyTrial?.id !== id) return
+    this.#proxyTrial = null
+    await this.#removeBundledTraefik()
   }
 
   async initializeProxy(
@@ -1328,6 +1458,15 @@ export class LifecycleDriver {
 
   async assertPrivateProxyListener(): Promise<void> {
     if (!usesProxyTlsTermination(this.#config.proxyMode)) return
+    if ((await this.#publishedListenerBindings()).length > 0) {
+      throw new Error(
+        `Proxy TLS mode refuses to start because Relay's private HTTP port ${this.#config.port} is published on the host. Remove the host port mapping and expose the port only to the private Traefik network.`
+      )
+    }
+  }
+
+  // Where the host publishes the Relay's listener, beyond its own loopback.
+  async #publishedListenerBindings() {
     const reference = process.env.HOSTNAME?.trim()
     if (!reference) {
       throw new Error(
@@ -1345,14 +1484,9 @@ export class LifecycleDriver {
     )
     const bindings = inspected.HostConfig?.PortBindings
     const published = bindings?.[`${this.#config.port}/tcp`] ?? []
-    const unsafe = published.filter(
+    return published.filter(
       (binding) => binding.HostIp !== "127.0.0.1" && binding.HostIp !== "::1"
     )
-    if (unsafe.length > 0) {
-      throw new Error(
-        `Proxy TLS mode refuses to start because Relay's private HTTP port ${this.#config.port} is published on the host. Remove the host port mapping and expose the port only to the private Traefik network.`
-      )
-    }
   }
 
   hydrateProxySettings(settings: RelayProxySettings): void {
@@ -1529,10 +1663,20 @@ export class LifecycleDriver {
     const gate = this.certificates.gate()
     await writeFile(
       join(directory, "kiln.yaml"),
-      traefikDynamicConfiguration(this.#config, routes, settings, gate),
+      this.#traefikDynamicConfiguration(routes, settings, gate),
       { mode: 0o600 }
     )
     this.certificates.wrote(gate)
+  }
+
+  #traefikDynamicConfiguration(
+    routes: ReadonlyArray<RelayStoredWebRoute>,
+    settings: RelayProxySettings,
+    gate: TraefikCertificateGate
+  ): string {
+    return this.#proxyTrial
+      ? traefikTrialConfiguration(this.#config, settings, this.#proxyTrial)
+      : traefikDynamicConfiguration(this.#config, routes, settings, gate)
   }
 
   // Bundled Traefik reaches routed apps on their own networks.
@@ -1821,18 +1965,20 @@ export class LifecycleDriver {
       )
       return updated
     }
+    const pendingLimits =
+      action === "start" || action === "restart"
+        ? await this.#docker.pendingLimits(instance.id)
+        : null
     if (action === "start" || action === "restart") {
       const usedBytes = await runLifecycle(
         directoryApparentSizeEffect(
           join(this.#config.rootDirectory, instance.directory)
         )
       )
-      if (
-        instance.limits.diskBytes !== null &&
-        usedBytes > instance.limits.diskBytes
-      ) {
+      const { diskBytes } = pendingLimits ?? instance.limits
+      if (diskBytes !== null && usedBytes > diskBytes) {
         throw new Error(
-          `Cannot ${action} ${instance.name}: its ${formatAllocationBytes(usedBytes)} of files exceed the ${formatAllocationBytes(instance.limits.diskBytes)} disk quota`
+          `Cannot ${action} ${instance.name}: its ${formatAllocationBytes(usedBytes)} of files exceed the ${formatAllocationBytes(diskBytes)} disk quota`
         )
       }
     }
@@ -1889,8 +2035,16 @@ export class LifecycleDriver {
                   },
                 }
               : undefined
+          // Only when it's stopping anyway: a start sent to a running server
+          // mustn't take it down for these.
+          const stopping =
+            action === "restart" ||
+            !(await this.#containerRunning(instance.service))
+          const limits = pendingLimits && stopping ? pendingLimits : undefined
           if (
             pendingExternalPort ||
+            limits ||
+            (this.#docker.allocations.wouldMoveWorkload(labels) && stopping) ||
             routeLabelsRequireRestart(labels, routes, desiredLabels) ||
             (desiredPortLabels &&
               portLabelsRequireRestart(labels, desiredPortLabels))
@@ -1907,8 +2061,10 @@ export class LifecycleDriver {
                 ? this.#resources.edgeNetwork
                 : null,
               action,
-              portConfiguration
+              portConfiguration,
+              limits
             )
+            if (limits) await this.#docker.setPendingLimits(instance.id, null)
             await this.reattachTailscaleMember(
               instanceTailscaleMemberId(instance.id)
             )
@@ -2119,6 +2275,7 @@ export class LifecycleDriver {
         if (usesExternalEdge && routes.length > 0) {
           await this.#ensureEdgeNetwork()
         }
+        const limits = await this.#pendingLimitsThatFit(instance)
         const updated = await this.#docker.recreateOwnedInstance(
           instance,
           routeLabels,
@@ -2132,8 +2289,10 @@ export class LifecycleDriver {
               ...portAllocationContainerLabels(allocations),
               "kiln.traefik.service.port": String(primary.internalPort),
             },
-          }
+          },
+          limits
         )
+        if (limits) await this.#docker.setPendingLimits(instance.id, null)
         await this.reattachTailscaleMember(
           instanceTailscaleMemberId(instance.id)
         )
@@ -2381,6 +2540,7 @@ export class LifecycleDriver {
     }
     return this.#provisionManagedInstance({
       grandfatheredDiskLimitBytes: null,
+      grandfatheredMemoryLimitBytes: null,
       id,
       limits: input,
       onPhase,
@@ -2391,6 +2551,57 @@ export class LifecycleDriver {
       tailscale: input.tailscale ?? { enabled: false },
       variables: input.variables,
     })
+  }
+
+  // Limits saved for a container being replaced anyway. A disk limit its
+  // files have since outgrown keeps waiting, for the start that says so.
+  async #pendingLimitsThatFit(
+    instance: RelayInstanceConfig
+  ): Promise<ResourceLimits | undefined> {
+    const limits = await this.#docker.pendingLimits(instance.id)
+    if (!limits) return undefined
+    if (limits.diskBytes === null) return limits
+    const usedBytes = await runLifecycle(
+      directoryApparentSizeEffect(
+        join(this.#config.rootDirectory, instance.directory)
+      )
+    )
+    return usedBytes > limits.diskBytes ? undefined : limits
+  }
+
+  /**
+   * Saves a game server's limits for its next restart, leaving its container
+   * alone. They're checked and their capacity held from here, so the restart
+   * can't fail for want of room.
+   */
+  async setInstanceLimits(
+    instance: RelayInstanceConfig,
+    limits: ResourceLimits
+  ): Promise<void> {
+    if (!instance.managedByRelay) {
+      throw new Error("Relay can only change containers it created")
+    }
+    if (instance.brickId === builtinTailscaleBrickId) {
+      throw new Error("A Tailscale network's limits are its own")
+    }
+    if (resourceLimitsEqual(limits, instance.limits)) {
+      await this.#docker.setPendingLimits(instance.id, null)
+      return
+    }
+    const release = await this.#reserveAllocation({
+      checkExistingUsage: true,
+      currentDiskLimitBytes: instance.limits.diskBytes,
+      currentMemoryLimitBytes: instance.limits.memoryBytes,
+      directory: join(this.#config.rootDirectory, instance.directory),
+      holds: widestResourceLimits(instance.limits, limits),
+      id: instance.id,
+      limits,
+    })
+    await Effect.runPromise(
+      Effect.promise(() =>
+        this.#docker.setPendingLimits(instance.id, limits)
+      ).pipe(Effect.ensuring(Effect.sync(release)))
+    )
   }
 
   async reconfigureInstance(
@@ -2422,7 +2633,14 @@ export class LifecycleDriver {
       start,
       tailscale,
       variables,
-    } = resolveInstanceStartupReconfigure(existing, input)
+    } = resolveInstanceStartupReconfigure(
+      {
+        ...existing,
+        limits:
+          (await this.#docker.pendingLimits(instanceId)) ?? existing.limits,
+      },
+      input
+    )
     if (tailscale.enabled) {
       const duplicate = inspected.find(
         (instance) =>
@@ -2445,6 +2663,7 @@ export class LifecycleDriver {
       {
         checkExistingUsage: true,
         currentDiskLimitBytes: existing.limits.diskBytes,
+        currentMemoryLimitBytes: existing.limits.memoryBytes,
         directory: join(this.#config.rootDirectory, existing.directory),
         holds: widestResourceLimits(existing.limits, limits),
         id: existing.id,
@@ -2469,6 +2688,7 @@ export class LifecycleDriver {
           lifecycleOperation(async () => {
             const reconfigured = await this.#provisionManagedInstance({
               grandfatheredDiskLimitBytes: existing.limits.diskBytes,
+              grandfatheredMemoryLimitBytes: existing.limits.memoryBytes,
               id: existing.id,
               limits,
               prepareDirectory: false,
@@ -2494,6 +2714,7 @@ export class LifecycleDriver {
             await this.reattachTailscaleMember(
               instanceTailscaleMemberId(existing.id)
             )
+            await this.#docker.setPendingLimits(existing.id, null)
             return reconfigured
           }).pipe(
             Effect.mapError(
@@ -2511,6 +2732,7 @@ export class LifecycleDriver {
 
   async #provisionManagedInstance(input: {
     grandfatheredDiskLimitBytes: number | null
+    grandfatheredMemoryLimitBytes: number | null
     id: string
     /** Limits to apply, or a create request to take them from. */
     limits:
@@ -2566,6 +2788,7 @@ export class LifecycleDriver {
       {
         checkExistingUsage: !input.prepareDirectory,
         currentDiskLimitBytes: input.grandfatheredDiskLimitBytes,
+        currentMemoryLimitBytes: input.grandfatheredMemoryLimitBytes,
         directory: join(this.#config.rootDirectory, input.id),
         id: input.id,
         limits,
@@ -2821,6 +3044,7 @@ export class LifecycleDriver {
             interactive: true,
             labels,
             ...containerLimitSpec(limits),
+            ...this.#docker.allocations.workloadSpec(),
             name: containerName,
             network: {
               aliases: [containerName],
@@ -3234,7 +3458,10 @@ export class LifecycleDriver {
             this.#docker.allocations.others("server", input.id),
           ])
           assertResourceLimitsFit({
+            assignableMemoryBytes:
+              this.#docker.allocations.assignableMemoryBytes,
             currentDiskBytes: input.currentDiskLimitBytes,
+            currentMemoryBytes: input.currentMemoryLimitBytes,
             limits: input.limits,
             nodeDiskBytes: filesystem.blocks * filesystem.bsize,
             others,
@@ -3370,33 +3597,43 @@ export class LifecycleDriver {
     })
   }
 
+  // What already holds a port Traefik needs, for saying so.
+  async #traefikPortConflicts(
+    settings: RelayProxySettings
+  ): Promise<{ readonly conflicts: string | null }> {
+    const diagnostics = await this.proxyDiagnostics(settings)
+    const conflicts = diagnostics.ports.filter((port) => !port.available)
+    return {
+      conflicts:
+        conflicts.length > 0
+          ? conflicts
+              .map(
+                (port) =>
+                  `Bundled Traefik cannot start because port ${port.port} is already in use by ${port.owner ?? "another process"}. Choose KILN_RELAY_PROXY=none for an existing proxy, or free ports 80 and 443.`
+              )
+              .join(" ")
+          : null,
+    }
+  }
+
   async #ensureTraefik(
     settings: RelayProxySettings,
     routes: ReadonlyArray<RelayStoredWebRoute>,
     replace: boolean
   ): Promise<void> {
-    const diagnostics = await this.proxyDiagnostics(settings)
-    const conflicts = diagnostics.ports.filter((port) => !port.available)
-    if (conflicts.length > 0) {
-      throw new Error(
-        conflicts
-          .map(
-            (port) =>
-              `Bundled Traefik cannot start because port ${port.port} is already in use by ${port.owner ?? "another process"}. Choose KILN_RELAY_PROXY=none for an existing proxy, or free ports 80 and 443.`
-          )
-          .join(" ")
-      )
-    }
+    const { conflicts } = await this.#traefikPortConflicts(settings)
+    if (conflicts) throw new Error(conflicts)
 
     await this.#ensureNetwork()
     await this.#ensureRelayEdgeNetwork()
-    const relayContainer = requiredRelayContainerReference()
-    await connectNetworkWithAlias(
-      this.#engine,
-      relayContainer,
-      this.#resources.relayEdgeNetwork,
-      this.#resources.relayEdgeAlias
-    )
+    if (!this.#proxyTrial) {
+      await connectNetworkWithAlias(
+        this.#engine,
+        requiredRelayContainerReference(),
+        this.#resources.relayEdgeNetwork,
+        this.#resources.relayEdgeAlias
+      )
+    }
     const infrastructure = join(
       this.#config.dataDirectory,
       "infrastructure",
@@ -3417,9 +3654,12 @@ export class LifecycleDriver {
         mode: 0o700,
       }),
     ])
+    // A trial's Traefik is the one the Relay keeps, resolvers and all.
     const staticConfiguration = traefikStaticConfiguration(
       settings,
-      this.#config
+      this.#proxyTrial
+        ? { ...this.#config, proxyMode: "traefik" }
+        : this.#config
     )
     // Traefik reads its static configuration only when it starts.
     const staticChanged = await recoverPromise(
@@ -3435,7 +3675,7 @@ export class LifecycleDriver {
       }),
       writeFile(
         join(infrastructure, "dynamic", "kiln.yaml"),
-        traefikDynamicConfiguration(this.#config, routes, settings, gate),
+        this.#traefikDynamicConfiguration(routes, settings, gate),
         { mode: 0o600 }
       ),
       ensureProtectedFile(join(infrastructure, "state", "acme.json")),
@@ -3487,6 +3727,13 @@ export class LifecycleDriver {
           this.#resources.traefikContainer,
           this.#resources.gameNetwork
         )
+        if (this.#proxyTrial) {
+          await connectNetwork(
+            this.#engine,
+            this.#resources.traefikContainer,
+            this.#proxyTrial.relayNetwork
+          )
+        }
         // A new Traefik container joins routed apps' networks too.
         await this.#connectTraefikToApps(routes)
       }).pipe(

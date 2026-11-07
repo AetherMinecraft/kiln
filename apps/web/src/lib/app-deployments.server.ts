@@ -3,7 +3,9 @@ import {
   relayAppDeploymentLogSchema,
   relayAppImageUpdatesV1Feature,
   relayAppSchema,
+  relayManagedDatabaseSchema,
   type AppConfig,
+  type RelayApp,
 } from "@workspace/contracts"
 import { logException } from "@workspace/telemetry"
 import {
@@ -48,8 +50,9 @@ import {
 import { loadGitHubConnectionCredentialEffect } from "@/effect/github-sync"
 import { loadAppConfigEffect } from "@/effect/managed-apps"
 import {
-  notifyUsersEffect,
   publishNotificationChange,
+  replaceNotificationEffect,
+  settleNotificationsEffect,
 } from "@/effect/notifications"
 import { promiseEffect } from "@/effect/promise"
 import {
@@ -69,13 +72,14 @@ import { loadOperation } from "@/operations/records"
 import { RelayCommandError, relayCommand } from "@/operations/relay-command"
 import { appDeploymentLocks } from "@/lib/app-lanes"
 import { appDatabaseConnectionsHandedOverEffect } from "@/lib/app-database-connections.server"
+import type { NotificationContent } from "@/lib/notifications"
 import { publishRealtimeChange } from "@/lib/realtime-source.server"
 import { relayConnectionFeatures, relayRpc } from "@/lib/relay-connection"
 import {
   listPersistedRelaysEffect,
   type PersistedRelay,
 } from "@/lib/relay-registry"
-import { resourceAudienceEffect } from "@/lib/resource-audience.server"
+import { notificationAudiencesEffect } from "@/lib/resource-audience.server"
 
 // Deploys apps and records each deployment. Every ask, whatever asked,
 // joins the app's one request, and one durable operation takes it up,
@@ -107,6 +111,8 @@ export interface AppDeploymentRequest {
   pinned?: { commitSha: string; source: string }
   /** An image digest to deploy again, as a rollback of an image update. */
   imageDigest?: string
+  /** Builds every layer afresh, ignoring Docker's build cache. */
+  noCache?: boolean
   relayId: string
   trigger: AppDeploymentTrigger
   /** Who asked, for the record and the Relay's audit; null for automation. */
@@ -146,6 +152,7 @@ const DeployPlan = Schema.Struct({
     ),
     imageDigest: Schema.optionalKey(Schema.String),
     name: Schema.String,
+    noCache: Schema.optionalKey(Schema.Boolean),
   }),
   record: Schema.Struct({
     appId: Schema.String,
@@ -243,6 +250,7 @@ const prepareAppDeploymentEffect = Effect.fn("Apps.deploy.prepare")(function* (
       }),
       ...(imageDigest && { imageDigest }),
       name: app.name,
+      ...(request.noCache && { noCache: true }),
     },
     record: {
       appId: request.appId,
@@ -323,11 +331,31 @@ const recordRefusal = (
     Effect.ignore
   )
 
+// What a deployment's notification adds up with the unread ones it replaces.
+function mergedDeployments(
+  unread: ReadonlyArray<NotificationContent>,
+  failed: boolean
+) {
+  let count = 1
+  let failures = failed ? 1 : 0
+  for (const previous of unread) {
+    if (previous.kind !== "app.deployed") continue
+    count += previous.count ?? 1
+    failures += previous.failures ?? (previous.status === "failed" ? 1 : 0)
+  }
+  return {
+    ...(count > 1 && { count }),
+    ...(failures > 0 && { failures }),
+  }
+}
+
 /**
  * Tells everyone who can deploy the app how a deployment ended, unless they
- * started it. An image update that deployed answers the app's update
- * notifications: the app runs the newest image now. Other deployments leave
- * them to the check that follows, since a rollback runs an older image.
+ * started it. Each App has one such notification, which adds up deployments
+ * while it's unread; the Deployments page keeps each of them. An image update
+ * that deployed answers the app's update notifications: the app runs the
+ * newest image now. Other deployments leave them to the check that follows,
+ * since a rollback runs an older image.
  */
 const announceDeploymentEffect = Effect.fnUntraced(
   function* (
@@ -338,36 +366,65 @@ const announceDeploymentEffect = Effect.fnUntraced(
     status: AppDeploymentStatus
   ) {
     if (status !== "succeeded" && status !== "failed") return
-    const [app, recipients] = yield* Effect.all([
+    const [app, { audience, wanted: recipients }] = yield* Effect.all([
       loadAppConfigEffect(record.relayId, record.appId),
-      resourceAudienceEffect(
+      notificationAudiencesEffect(
         {
           relayId: record.relayId,
           resourceId: record.appId,
           resourceType: "app",
         },
-        "app.manage"
+        "app.manage",
+        "app.deployed"
       ),
     ])
     if (!app) return
-    const delivered = yield* notifyUsersEffect(
-      recipients,
-      `app.deployed:${record.id}`,
-      {
-        deploymentId: record.id,
-        kind: "app.deployed",
-        resource: {
-          id: record.appId,
-          name: app.name,
-          relayId: record.relayId,
-          type: "app",
-        },
-        status,
-        update: record.trigger === "update",
-      },
-      { actorUserId: record.triggeredBy }
+    const resource = {
+      id: record.appId,
+      name: app.name,
+      relayId: record.relayId,
+      type: "app",
+    } as const
+    const sameApp = (content: NotificationContent) =>
+      content.kind === "app.deployed" &&
+      content.resource.relayId === record.relayId &&
+      content.resource.id === record.appId
+    // A deployment that worked answers the one that didn't.
+    const settles = (content: NotificationContent) =>
+      status === "succeeded" &&
+      content.kind === "app.deployed" &&
+      content.status === "failed" &&
+      sameApp(content)
+    const notified = new Set<string>()
+    for (const userId of new Set(recipients)) {
+      const changed = yield* replaceNotificationEffect(
+        userId,
+        "app.deployed",
+        (unread) => ({
+          ...mergedDeployments(unread, status === "failed"),
+          deploymentId: record.id,
+          kind: "app.deployed",
+          resource,
+          status,
+          update: record.trigger === "update",
+        }),
+        {
+          actorUserId: record.triggeredBy,
+          matches: sameApp,
+          settles,
+          sourceKey: `app.deployed:${record.id}`,
+        }
+      )
+      if (changed) notified.add(userId)
+    }
+    // Who turned this off doesn't hear of it, but what they have still ended.
+    const leftOut = audience.filter((userId) => !recipients.includes(userId))
+    const settled = yield* settleNotificationsEffect(
+      leftOut,
+      "app.deployed",
+      settles
     )
-    if (delivered > 0) publishNotificationChange(recipients)
+    publishNotificationChange([...notified, ...settled])
     // The update it deployed is installed. Other deployments are settled
     // by the check that follows them.
     if (
@@ -697,6 +754,8 @@ const DeployInput = Schema.Struct({
   requestedBy: Schema.NullOr(Schema.String),
   /** A new app's first deploy, once its Relay has provisioned it. */
   awaitProvisioning: Schema.optionalKey(Schema.Boolean),
+  /** Builds without the cache, whatever joins it: it's how, not what. */
+  noCache: Schema.optionalKey(Schema.Boolean),
 })
 type DeployInput = typeof DeployInput.Type
 
@@ -727,6 +786,7 @@ export const deployAppOperation = durableOperation({
           ...((waiting.awaitProvisioning || asked.awaitProvisioning) && {
             awaitProvisioning: true,
           }),
+          ...((waiting.noCache || asked.noCache) && { noCache: true }),
         },
   doing: () => "Deploying this App",
   input: DeployInput,
@@ -734,11 +794,12 @@ export const deployAppOperation = durableOperation({
   locks: (input) => appDeploymentLocks(input.relayId, input.appId),
   // Starts once its Relay is there to deploy it, has the databases it
   // keeps for the app (handed over as its own operation, started here if
-  // it's not), and runs no deployment from before deployments queued,
-  // which nothing holds: the minute sweep settles that. Until then it
-  // waits, holding nothing, so what's asked meanwhile joins it, it can be
-  // cancelled, and a deletion of the app isn't kept waiting. One whose
-  // Relay is gone starts, to find nothing to deploy.
+  // it's not), runs no deployment from before deployments queued, which
+  // nothing holds: the minute sweep settles that, and has no database of
+  // the app still provisioning, whose network its containers couldn't join.
+  // Until then it waits, holding nothing, so what's asked meanwhile joins
+  // it, it can be cancelled, and a deletion of the app isn't kept waiting.
+  // One whose Relay is gone starts, to find nothing to deploy.
   ready: (input) =>
     Effect.gen(function* () {
       const relays = yield* listPersistedRelaysEffect()
@@ -749,7 +810,9 @@ export const deployAppOperation = durableOperation({
       }
       if (!(yield* appDatabaseConnectionsHandedOverEffect(relay))) return false
       const { latest } = yield* latestAppDeploymentsEffect(input.appId)
-      return latest?.status !== "running"
+      if (latest?.status === "running") return false
+      const app = yield* readRelayApp(relay, input.appId)
+      return app === null || !(yield* awaitsDatabase(relay, app))
     }).pipe(Effect.catch(() => Effect.succeed(false))),
   // A failure ends it failed, so what it was for is asked again.
   run: (input, operation) =>
@@ -828,8 +891,39 @@ const provisioningState = (input: DeployInput) =>
     if (app === null || app.provisioning?.phase === "failed") {
       return "gone" as const
     }
-    return app.provisioning ? ("waiting" as const) : ("ready" as const)
+    return app.provisioning || (yield* awaitsDatabase(relay, app))
+      ? ("waiting" as const)
+      : ("ready" as const)
   }).pipe(Effect.catch(() => Effect.succeed("waiting" as const)))
+
+// Whether a database the app is connected to is still being created. One
+// whose provisioning failed won't get a network, so nothing waits for it.
+const awaitsDatabase = Effect.fnUntraced(function* (
+  relay: PersistedRelay,
+  app: RelayApp
+) {
+  if (app.savedDatabaseIds.length === 0) return false
+  const response = yield* Effect.tryPromise({
+    try: (signal) =>
+      relayRpc(relay, "database.list", {}, 10_000, undefined, signal),
+    catch: (cause) =>
+      ExternalServiceError.make({
+        cause,
+        message: "Could not read the app's databases from its Relay",
+        service: "Relay",
+      }),
+  })
+  const parsed = relayManagedDatabaseSchema.array().safeParse(response)
+  return (
+    parsed.success &&
+    parsed.data.some(
+      ({ id, provisioning }) =>
+        app.savedDatabaseIds.includes(id) &&
+        provisioning !== undefined &&
+        provisioning.phase !== "failed"
+    )
+  )
+})
 
 // Takes what the app's request asks and decides what that deploys, as one
 // step: nothing for an app being deleted, which settles what was asked, so
@@ -932,7 +1026,12 @@ const askedDeployment = (input: DeployInput) =>
     // One who may no longer is refused, as who asked; a push or poll that
     // joined their ask is Kiln's own.
     const userId = allowed || !automatic ? input.requestedBy : null
-    const base = { appId: input.appId, relayId: input.relayId, userId }
+    const base = {
+      appId: input.appId,
+      ...(input.noCache && { noCache: true }),
+      relayId: input.relayId,
+      userId,
+    }
     const request: AppDeploymentRequest = automatic
       ? {
           ...base,
@@ -1119,6 +1218,14 @@ const deployPlanned = (input: DeployInput, plan: DeployPlan) =>
         )
       ),
     })
+    // What it runs now is checked for vulnerabilities at once, so a fix
+    // shows without waiting for the next sweep.
+    yield* Activity.make({
+      name: "scanSecurity",
+      execute: Effect.promise(() => import("@/lib/security-scans.server")).pipe(
+        Effect.map(({ scanRelaySoon }) => scanRelaySoon(record.relayId))
+      ),
+    })
   })
 
 // The payload as it's sent: the app's saved configuration, read now, and a
@@ -1248,6 +1355,7 @@ export const askAppDeploymentEffect = Effect.fn("Apps.deploy.ask")(
     awaitProvisioning?: boolean
     commit?: { sha: string; source: string }
     image?: { digest: string; source: string }
+    noCache?: boolean
     relayId: string
     trigger: AppDeploymentAsk
     userId?: string | null
@@ -1266,6 +1374,7 @@ export const askAppDeploymentEffect = Effect.fn("Apps.deploy.ask")(
         }),
         requestedBy: ask.userId ?? null,
         ...(ask.awaitProvisioning && { awaitProvisioning: true }),
+        ...(ask.noCache && { noCache: true }),
       },
       { key: appDeployKey(ask.relayId, ask.appId) }
     )

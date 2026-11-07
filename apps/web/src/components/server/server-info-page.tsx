@@ -12,6 +12,7 @@ import {
 } from "@/components/info-page"
 import { ServerDeleteDialog } from "@/components/server-delete-dialog"
 import { ServerInfoRail } from "@/components/server/server-info-rail"
+import { ServerLimitsSection } from "@/components/server/server-limits-section"
 import {
   ServerMigrationDialog,
   type ServerMigrationMode,
@@ -27,7 +28,6 @@ import type {
   RelayNodeSummary,
 } from "@/lib/relay-selectors"
 import { ResourceDeletionAlert } from "@/components/resource-deletion-alert"
-import { ResourceSecurityAlert } from "@/components/resource-security-alert"
 import { ensuringPromise, recoverPromise } from "@/effect/promise"
 import { serverMigrationPreviewQueryOptions } from "@/lib/server-migration-queries"
 
@@ -49,7 +49,9 @@ export function ServerInfoPage({
     configurationWrite: boolean
     copyServer: boolean
     deleteServer: boolean
+    limitsWrite: boolean
     networkRead: boolean
+    powerRestart: boolean
     shareLogs: boolean
   }
   relayConnected: boolean
@@ -63,11 +65,6 @@ export function ServerInfoPage({
         kind="instance"
         relayId={instance.relayId}
         resourceId={instance.id}
-      />
-      <ResourceSecurityAlert
-        relayId={instance.relayId}
-        resourceId={instance.id}
-        resourceType="instance"
       />
       <ServerProvisioningSection instance={instance} />
       <ServerGeneralSettings
@@ -86,6 +83,14 @@ export function ServerInfoPage({
         canViewStartup={permissions.configurationRead}
         instance={instance}
       />
+      {provisioning ? null : (
+        <ServerLimitsSection
+          canRestart={permissions.powerRestart}
+          editable={permissions.limitsWrite}
+          instance={instance}
+          relayConnected={relayConnected}
+        />
+      )}
       {permissions.copyServer && !provisioning ? (
         <ServerMigrationSection
           instance={instance}

@@ -29,8 +29,13 @@ export const notificationContentSchema = z.discriminatedUnion("kind", [
     url: releaseUrlSchema,
     version: z.string(),
   }),
+  // Kiln moved to a newer version: Hearth, unless `hearth` says otherwise, and
+  // `relays`. Each person has one, showing what they can update. A newer
+  // update replaces it, adding in what it said while it's unread.
   z.object({
+    hearth: z.boolean().optional(),
     kind: z.literal("kiln.updated"),
+    relays: z.array(notificationResourceSchema).optional(),
     // Release names, e.g. "v0.1.0 Nightly #17", when GitHub listed them.
     name: z.string().optional(),
     previousName: z.string().optional(),
@@ -54,7 +59,8 @@ export const notificationContentSchema = z.discriminatedUnion("kind", [
     resource: notificationResourceSchema,
   }),
   // An instance's data outgrew its disk limit. Instances that keep running
-  // past it, such as databases, warn this way.
+  // past it, such as databases, warn this way. `usedBytes` stays current, and
+  // it goes away once the data fits again.
   z.object({
     kind: z.literal("resource.disk-limit"),
     limitBytes: z.number(),
@@ -70,9 +76,13 @@ export const notificationContentSchema = z.discriminatedUnion("kind", [
     resource: notificationResourceSchema,
   }),
   // An app finished deploying when someone else, or Kiln itself, started
-  // it. `update` marks an image update, which says the app was updated.
+  // it. `update` marks an image update, which says the app was updated. The
+  // newest deployment replaces the App's last one, and `count` and `failures`
+  // add in what the replaced one said while it was unread.
   z.object({
+    count: z.number().int().positive().optional(),
     deploymentId: z.string(),
+    failures: z.number().int().positive().optional(),
     kind: z.literal("app.deployed"),
     resource: notificationResourceSchema,
     status: z.enum(["succeeded", "failed"]),
@@ -128,10 +138,29 @@ const legacyVulnerabilitiesSchema = z
     })
   )
 
+// Relay updates had a notification of their own, one per Relay. Ones still
+// stored read as a Kiln update of their Relay.
+const legacyRelayUpdatedSchema = z
+  .object({
+    kind: z.literal("relay.updated"),
+    previousVersion: z.string(),
+    resource: notificationResourceSchema,
+    version: z.string(),
+  })
+  .transform(({ previousVersion, resource, version }): NotificationContent => ({
+    hearth: false,
+    kind: "kiln.updated",
+    previousVersion,
+    relays: [resource],
+    url: null,
+    version,
+  }))
+
 /** A stored notification's content, including kinds a newer one replaced. */
 export const storedNotificationContentSchema = z.union([
   notificationContentSchema,
   legacyVulnerabilitiesSchema,
+  legacyRelayUpdatedSchema,
 ])
 
 /**
@@ -140,6 +169,7 @@ export const storedNotificationContentSchema = z.union([
 export const formerNotificationKinds: Partial<
   Record<NotificationKind, ReadonlyArray<string>>
 > = {
+  "kiln.updated": ["relay.updated"],
   "security.report": ["security.vulnerabilities"],
 }
 
@@ -147,6 +177,15 @@ export type NotificationResource = z.infer<typeof notificationResourceSchema>
 export type InvitationOutcome = NonNullable<
   Extract<NotificationContent, { kind: "access.invited" }>["outcome"]
 >
+
+/** Names a resource in a person's notification settings. */
+export function notificationResourceKey({
+  id,
+  relayId,
+  type,
+}: Pick<NotificationResource, "id" | "relayId" | "type">) {
+  return `${type}:${relayId}:${id}`
+}
 
 export interface KilnNotification {
   content: NotificationContent

@@ -152,6 +152,7 @@ import {
 } from "@/lib/data-table-search"
 import type { DataTableSource } from "@/lib/data-table-source"
 import type { InstancePickerKind } from "@/lib/instance-picker-filters"
+import { notALoginField } from "@/lib/not-a-login-field"
 import { scheduleBackupDestination } from "@/lib/schedule-backup-configuration"
 import {
   removeScheduleFromCache,
@@ -2680,10 +2681,7 @@ const ScheduleDetailsFields = React.memo(function ScheduleDetailsFields({
         <Field label="Name">
           <Input
             aria-label="Schedule name"
-            autoComplete="off"
-            data-1p-ignore
-            data-bwignore
-            data-lpignore="true"
+            {...notALoginField}
             name="schedule-name"
             value={name}
             maxLength={120}
@@ -3274,7 +3272,6 @@ const ActionEditor = React.memo(function ActionEditor({
       </div>
       {action.type === "backup" ? (
         <BackupConfigurationDialog
-          allowDefaultDestination={false}
           allowIncremental
           // A step that backs up only Apps takes them live or stopped, each
           // App's folder and owned volumes together; Hearth checks stopping

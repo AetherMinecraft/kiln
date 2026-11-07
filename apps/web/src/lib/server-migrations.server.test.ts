@@ -16,6 +16,7 @@ import { Database } from "@/effect/database"
 import { disposeAppRuntime } from "@/effect/runtime"
 import type { AuthenticatedUser } from "@/lib/auth-session"
 import { encryptPrivateKey } from "@/lib/relay-registry"
+import { explicitBackupDestinations } from "@/migrations/0054_explicit_backup_destinations"
 import { deleteResource, keepResource } from "@/lib/resource-deletion.server"
 import type { ServerMigrationOptions } from "@/lib/server-migration-input"
 import {
@@ -30,6 +31,7 @@ import {
   OperationsEngineService,
   type OperationsEngineContext,
 } from "@/operations/engine-service"
+import { operationsAtRest } from "@/operations/test/at-rest"
 import { startRelayTransfer } from "@/server/relay-transfers.server"
 import { stopScheduleDeliveries } from "@/server/schedule-deployment.server"
 import { TestDatabase, describeMysql, resetDatabase } from "@/test/database"
@@ -426,10 +428,7 @@ const stopHearth = (scope: Scope.Closeable) =>
 
 const operationsEnded = until(
   selectRows<{ state: string }>("operation"),
-  (rows) =>
-    rows.every((row) =>
-      ["cancelled", "failed", "interrupted", "succeeded"].includes(row.state)
-    )
+  operationsAtRest
 )
 
 // A fresh database with the mover, both Relays, and two game servers on the
@@ -525,6 +524,7 @@ const deletions = selectRows<{
   requested_by: string
   resource_id: string
   status: string
+  storage_id: string | null
 }>("resource_deletion")
 
 const deletionUntil = (resourceId: string, statuses: Array<string>) =>
@@ -550,7 +550,64 @@ const serverState = (relayId: string, id: string) =>
   relay.servers.get(serverKey(relayId, id))?.state ?? "gone"
 
 describeMysql("Server migrations", () => {
-  layer(TestDatabase, { timeout: 180_000 })((it) => {
+  layer(TestDatabase)((it) => {
+    it.effect(
+      "resumes a move an upgrade cut off with what that upgrade settled",
+      () =>
+        Effect.gen(function* () {
+          const { service, startHearth } = yield* hearths
+          const sql = yield* SqlClient.SqlClient
+          yield* seed
+          const before = yield* startHearth
+
+          // The engine keeps what this run read, a destination that's gone.
+          relay.provisioningHeld.add("Moved")
+          const move = yield* start(service, {
+            chosen: {
+              deleteSource: {
+                storageId: "22222222-2222-4222-8222-222222222222",
+              },
+            },
+            mode: "migrate",
+            name: "Moved",
+          })
+          yield* migrationUntil(move, (row) => row.step === "provision")
+          yield* stopHearth(before)
+
+          // Its records as they stood before a destination was required,
+          // its server without a preferred one.
+          yield* sql`UPDATE kiln_operation
+            SET input = JSON_REMOVE(input, '$.options.deleteSource.storageId')
+            WHERE kind = 'server.migration'`
+          yield* sql`UPDATE kiln_server_migration
+            SET options = JSON_REMOVE(options, '$.deleteSource.storageId')`
+          yield* sql`ALTER TABLE kiln_backup_policy
+            ADD COLUMN storage_id char(36) DEFAULT NULL`
+          yield* explicitBackupDestinations.run
+
+          const after = yield* startHearth
+          releaseProvisioning("Moved")
+          const moved = yield* migrationUntil(move, ended)
+          const { backup_id: finalBackup } = yield* until(
+            deletions.pipe(
+              Effect.map((rows) =>
+                rows.find((deletion) => deletion.resource_id === survival)
+              )
+            ),
+            (deletion) => deletion?.backup_id != null
+          ).pipe(Effect.map((deletion) => deletion!))
+          yield* finishBackup(finalBackup!)
+          const deletion = yield* deletionUntil(survival, ["completed"])
+          yield* operationsEnded
+          yield* stopHearth(after)
+
+          assert.strictEqual(moved.state, "completed")
+          assert.isNull(deletion.storage_id)
+          assert.strictEqual(serverState(oldRelay, survival), "gone")
+        }),
+      180_000
+    )
+
     it.effect(
       "copies one server once at a time, while another server copies alongside",
       () =>
@@ -758,7 +815,7 @@ describeMysql("Server migrations", () => {
           const { service, startHearth } = yield* hearths
           yield* seed
           const hearth = yield* startHearth
-          const deleting = { deleteSource: {} }
+          const deleting = { deleteSource: { storageId: null } }
 
           // Cancelled just before its files finish copying, the old server
           // stopped for it: it ends cancelled, never handing the old server
@@ -963,7 +1020,9 @@ function insertLegacy(row: {
     id: row.id,
     mode: "migrate",
     options: JSON.stringify(
-      options("migrate", { deleteSource: row.deleteSource ? {} : null })
+      options("migrate", {
+        deleteSource: row.deleteSource ? { storageId: null } : null,
+      })
     ),
     requested_by: mover.id,
     source_instance_id: row.source,
